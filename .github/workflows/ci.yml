@@ -31,12 +31,29 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm-dev clang
-          # apt installs versioned llvm-config (e.g. llvm-config-19); surface it.
           LLVM_CFG=$(command -v llvm-config || ls /usr/bin/llvm-config* | head -1)
           echo "LLVM_CONFIG=$LLVM_CFG" >> "$GITHUB_ENV"
 
-      - name: Set up Bazel (bazelisk)
-        uses: bazelbuild/setup-bazelisk@v3
+      # Install Bazelisk manually instead of via setup-bazelisk action.
+      # The runner is failing to download third-party actions from
+      # codeload.github.com for this repo (suspected new-account
+      # / new-repo throttle), so we bypass actions and curl the binary
+      # directly from GitHub Releases.
+      - name: Install Bazelisk
+        shell: bash
+        run: |
+          set -euo pipefail
+          BAZELISK_VERSION="v1.29.0"
+          case "$RUNNER_OS" in
+            Linux)  ASSET="bazelisk-linux-amd64" ;;
+            macOS)  ASSET="bazelisk-darwin-arm64" ;;
+            *)      echo "Unsupported runner OS: $RUNNER_OS" >&2; exit 1 ;;
+          esac
+          URL="https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/${ASSET}"
+          echo "Downloading $URL"
+          sudo curl -fsSL -o /usr/local/bin/bazel "$URL"
+          sudo chmod +x /usr/local/bin/bazel
+          bazel --version
 
       - name: Bazel build
         run: bazel build //...
