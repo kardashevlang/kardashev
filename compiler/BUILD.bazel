@@ -27,6 +27,26 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "types",
+    srcs = ["src/types.cpp"],
+    hdrs = ["include/kardashev/types.hpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "typecheck",
+    srcs = ["src/typecheck.cpp"],
+    hdrs = ["include/kardashev/typecheck.hpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":ast",
+        ":types",
+    ],
+)
+
 cc_binary(
     name = "kardc",
     srcs = ["src/main.cpp"],

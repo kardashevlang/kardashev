@@ -18,3 +18,12 @@ cc_test(
     srcs = ["parser_test.cpp"],
     deps = ["//compiler:parser"],
 )
+
+cc_test(
+    name = "typecheck_test",
+    srcs = ["typecheck_test.cpp"],
+    deps = [
+        "//compiler:parser",
+        "//compiler:typecheck",
+    ],
+)
