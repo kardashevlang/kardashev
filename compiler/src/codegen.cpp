@@ -28,6 +28,7 @@ public:
 
     void run(const ast::Program& program) {
         declareAllStructs();
+        declareAllEnums();
         declareAllFunctions(program);
         for (const auto& fn : program.functions) {
             emitFunction(fn);
@@ -56,6 +57,18 @@ private:
     // Module-wide: struct name -> LLVM struct type.
     std::unordered_map<std::string, llvm::StructType*> structTypes_;
 
+    // Module-wide: enum name -> LLVM struct type.
+    // The struct layout is `{ i32 tag, payload_slots... }` where every
+    // variant's payload slots are flattened in declaration order (variant
+    // 0's payloads first, then variant 1's, etc.). For V1 we don't union/
+    // overlap slots — wasteful in memory but trivial to codegen.
+    std::unordered_map<std::string, llvm::StructType*> enumTypes_;
+
+    // enumName -> for each variant index: vector of LLVM field indices in
+    // the flat struct (one per payload slot). Index 0 is the tag.
+    std::unordered_map<std::string, std::vector<std::vector<unsigned>>>
+        enumPayloadIndices_;
+
     // Per-fn locals: variable name -> alloca pointer.
     std::unordered_map<std::string, llvm::AllocaInst*> locals_;
     llvm::Function* currentFn_ = nullptr;
@@ -77,6 +90,31 @@ private:
         }
     }
 
+    // Two-phase like declareAllStructs: opaque types first, bodies after,
+    // so enum payloads can mention any struct/enum regardless of order.
+    void declareAllEnums() {
+        for (const auto& [name, _ty] : tc_.enums) {
+            enumTypes_[name] = llvm::StructType::create(*ctx_, name);
+        }
+        for (const auto& [name, ty] : tc_.enums) {
+            std::vector<llvm::Type*> elems;
+            elems.push_back(llvm::Type::getInt32Ty(*ctx_)); // tag at slot 0
+            std::vector<std::vector<unsigned>> perVariantSlots;
+            perVariantSlots.reserve(ty->enumVariants.size());
+            for (const auto& v : ty->enumVariants) {
+                std::vector<unsigned> slots;
+                slots.reserve(v.payloadTypes.size());
+                for (const auto& pt : v.payloadTypes) {
+                    slots.push_back(static_cast<unsigned>(elems.size()));
+                    elems.push_back(mapKardashevType(pt));
+                }
+                perVariantSlots.push_back(std::move(slots));
+            }
+            enumTypes_[name]->setBody(elems);
+            enumPayloadIndices_[name] = std::move(perVariantSlots);
+        }
+    }
+
     llvm::Type* mapKardashevType(const TypePtr& t) {
         auto r = resolve(t);
         switch (r->kind) {
@@ -89,6 +127,12 @@ private:
                 errors_.push_back("codegen: unresolved struct " + r->structName);
                 return llvm::Type::getInt64Ty(*ctx_);
             }
+            case TypeKind::Enum: {
+                auto it = enumTypes_.find(r->enumName);
+                if (it != enumTypes_.end()) return it->second;
+                errors_.push_back("codegen: unresolved enum " + r->enumName);
+                return llvm::Type::getInt64Ty(*ctx_);
+            }
             default:
                 errors_.push_back("codegen: unsupported type for codegen");
                 return llvm::Type::getInt64Ty(*ctx_);
@@ -98,8 +142,10 @@ private:
     llvm::Type* mapTypeRef(const ast::TypeRef& tr) {
         if (tr.name == "i64") return llvm::Type::getInt64Ty(*ctx_);
         if (tr.name == "bool") return llvm::Type::getInt1Ty(*ctx_);
-        auto it = structTypes_.find(tr.name);
-        if (it != structTypes_.end()) return it->second;
+        if (auto it = structTypes_.find(tr.name); it != structTypes_.end())
+            return it->second;
+        if (auto it = enumTypes_.find(tr.name); it != enumTypes_.end())
+            return it->second;
         errors_.push_back("codegen: unknown type " + tr.name);
         return llvm::Type::getInt64Ty(*ctx_);
     }
@@ -215,6 +261,11 @@ private:
                 return builder_->CreateLoad(alloca->getAllocatedType(),
                                             alloca, id->name);
             }
+            // Fall back to unit-variant constructor (e.g. `None`).
+            auto vit = tc_.variantIndex.find(id->name);
+            if (vit != tc_.variantIndex.end()) {
+                return emitUnitCtor(vit->second.first, vit->second.second);
+            }
             errors_.push_back("codegen: undefined identifier " + id->name);
             return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
         }
@@ -235,6 +286,9 @@ private:
         }
         if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
             return emitFieldAccess(*fe);
+        }
+        if (auto* m = dynamic_cast<const ast::MatchExpr*>(&e)) {
+            return emitMatch(*m);
         }
         errors_.push_back("codegen: unknown expression kind");
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
@@ -312,18 +366,170 @@ private:
     }
 
     llvm::Value* emitCall(const ast::CallExpr& call) {
-        auto it = declaredFns_.find(call.callee);
-        if (it == declaredFns_.end()) {
-            errors_.push_back("codegen: undefined function " + call.callee);
-            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        if (auto it = declaredFns_.find(call.callee);
+            it != declaredFns_.end()) {
+            llvm::Function* fn = it->second;
+            std::vector<llvm::Value*> args;
+            args.reserve(call.args.size());
+            for (const auto& a : call.args) {
+                args.push_back(emitExpr(*a));
+            }
+            return builder_->CreateCall(fn, args, "call_" + call.callee);
         }
-        llvm::Function* fn = it->second;
-        std::vector<llvm::Value*> args;
-        args.reserve(call.args.size());
-        for (const auto& a : call.args) {
-            args.push_back(emitExpr(*a));
+        // Constructor with payload (e.g. `Some(42)`).
+        if (auto vit = tc_.variantIndex.find(call.callee);
+            vit != tc_.variantIndex.end()) {
+            return emitCtorCall(call, vit->second.first, vit->second.second);
         }
-        return builder_->CreateCall(fn, args, "call_" + call.callee);
+        errors_.push_back("codegen: undefined function " + call.callee);
+        return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+    }
+
+    llvm::Value* emitUnitCtor(const std::string& enumName,
+                              unsigned variantIdx) {
+        auto* st = enumTypes_[enumName];
+        llvm::Value* agg = llvm::UndefValue::get(st);
+        return builder_->CreateInsertValue(
+            agg,
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_), variantIdx),
+            {0}, "ctor_" + enumName);
+    }
+
+    llvm::Value* emitCtorCall(const ast::CallExpr& call,
+                              const std::string& enumName,
+                              unsigned variantIdx) {
+        auto* st = enumTypes_[enumName];
+        const auto& payloadSlots = enumPayloadIndices_[enumName][variantIdx];
+        llvm::Value* agg = llvm::UndefValue::get(st);
+        agg = builder_->CreateInsertValue(
+            agg,
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_), variantIdx),
+            {0}, "ctor_" + enumName);
+        for (unsigned i = 0; i < call.args.size() && i < payloadSlots.size();
+             ++i) {
+            llvm::Value* v = emitExpr(*call.args[i]);
+            agg = builder_->CreateInsertValue(agg, v, {payloadSlots[i]},
+                                              "pld");
+        }
+        return agg;
+    }
+
+    llvm::Value* emitMatch(const ast::MatchExpr& me) {
+        llvm::Value* scrutinee = emitExpr(*me.scrutinee);
+        auto* mergeBB = llvm::BasicBlock::Create(*ctx_, "matchmerge",
+                                                  currentFn_);
+
+        std::vector<std::pair<llvm::BasicBlock*, llvm::Value*>> incoming;
+
+        for (std::size_t i = 0; i < me.arms.size(); ++i) {
+            const auto& arm = me.arms[i];
+            const bool isLast = (i + 1 == me.arms.size());
+            llvm::BasicBlock* failBB = llvm::BasicBlock::Create(
+                *ctx_, isLast ? "matchfail" : "armnext", currentFn_);
+
+            auto savedLocals = locals_;
+            emitPatternMatch(*arm.pattern, scrutinee, failBB);
+
+            llvm::Value* bodyVal = emitExpr(*arm.body);
+            auto* bodyEnd = builder_->GetInsertBlock();
+            if (!bodyEnd->getTerminator()) {
+                builder_->CreateBr(mergeBB);
+                if (bodyVal) incoming.push_back({bodyEnd, bodyVal});
+            }
+            locals_ = savedLocals;
+
+            builder_->SetInsertPoint(failBB);
+        }
+        // Whatever fell off the last arm is unreachable territory in V1
+        // (no exhaustiveness yet — that arrives in Phase 2.3).
+        builder_->CreateUnreachable();
+
+        builder_->SetInsertPoint(mergeBB);
+        if (incoming.empty()) {
+            return llvm::UndefValue::get(llvm::Type::getInt64Ty(*ctx_));
+        }
+        if (incoming.size() == 1) return incoming[0].second;
+        auto* phi = builder_->CreatePHI(incoming[0].second->getType(),
+                                         incoming.size(), "matchval");
+        for (auto& [bb, val] : incoming) phi->addIncoming(val, bb);
+        return phi;
+    }
+
+    // After this returns, the builder's insertion block is the success
+    // path for `pat` (with bindings present in `locals_`); any failure
+    // along the way branched to `failBB`.
+    void emitPatternMatch(const ast::Pattern& pat, llvm::Value* scrutinee,
+                          llvm::BasicBlock* failBB) {
+        if (auto* lit = dynamic_cast<const ast::LitIntPat*>(&pat)) {
+            llvm::Value* litV = llvm::ConstantInt::get(
+                llvm::Type::getInt64Ty(*ctx_),
+                static_cast<uint64_t>(lit->value), /*isSigned=*/true);
+            llvm::Value* eq = builder_->CreateICmpEQ(scrutinee, litV,
+                                                     "litmatch");
+            auto* okBB = llvm::BasicBlock::Create(*ctx_, "litok", currentFn_);
+            builder_->CreateCondBr(eq, okBB, failBB);
+            builder_->SetInsertPoint(okBB);
+            return;
+        }
+        if (dynamic_cast<const ast::WildPat*>(&pat)) {
+            return;
+        }
+        if (auto* var = dynamic_cast<const ast::VarPat*>(&pat)) {
+            // The typechecker has already validated whether this is a
+            // real binding or a unit-ctor masquerading as a VarPat. We
+            // re-do the lookup to drive the lowering.
+            auto vit = tc_.variantIndex.find(var->name);
+            if (vit != tc_.variantIndex.end()) {
+                emitTagCheck(scrutinee, vit->second.second, failBB);
+                return;
+            }
+            auto* alloca = builder_->CreateAlloca(scrutinee->getType(),
+                                                   nullptr, var->name);
+            builder_->CreateStore(scrutinee, alloca);
+            locals_[var->name] = alloca;
+            return;
+        }
+        if (auto* cp = dynamic_cast<const ast::CtorPat*>(&pat)) {
+            auto vit = tc_.variantIndex.find(cp->ctorName);
+            if (vit == tc_.variantIndex.end()) {
+                errors_.push_back("codegen: unknown constructor " +
+                                  cp->ctorName);
+                builder_->CreateBr(failBB);
+                auto* dead = llvm::BasicBlock::Create(*ctx_, "dead",
+                                                      currentFn_);
+                builder_->SetInsertPoint(dead);
+                return;
+            }
+            const auto& [enumName, variantIdx] = vit->second;
+            emitTagCheck(scrutinee, variantIdx, failBB);
+            const auto& payloadSlots =
+                enumPayloadIndices_[enumName][variantIdx];
+            for (std::size_t i = 0;
+                 i < cp->subpatterns.size() && i < payloadSlots.size(); ++i) {
+                llvm::Value* sub = builder_->CreateExtractValue(
+                    scrutinee, {payloadSlots[i]}, "pld");
+                emitPatternMatch(*cp->subpatterns[i], sub, failBB);
+            }
+            return;
+        }
+        errors_.push_back("codegen: unknown pattern kind");
+        builder_->CreateBr(failBB);
+        auto* dead = llvm::BasicBlock::Create(*ctx_, "dead", currentFn_);
+        builder_->SetInsertPoint(dead);
+    }
+
+    void emitTagCheck(llvm::Value* scrutinee, unsigned expectedIdx,
+                       llvm::BasicBlock* failBB) {
+        llvm::Value* tag = builder_->CreateExtractValue(scrutinee, {0},
+                                                         "tag");
+        llvm::Value* eq = builder_->CreateICmpEQ(
+            tag,
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_),
+                                    expectedIdx),
+            "tagmatch");
+        auto* okBB = llvm::BasicBlock::Create(*ctx_, "tagok", currentFn_);
+        builder_->CreateCondBr(eq, okBB, failBB);
+        builder_->SetInsertPoint(okBB);
     }
 
     llvm::Value* emitIf(const ast::IfExpr& ie) {

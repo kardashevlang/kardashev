@@ -48,6 +48,14 @@ TypePtr makeStruct(std::string name, std::vector<std::pair<std::string, TypePtr>
     return t;
 }
 
+TypePtr makeEnum(std::string name, std::vector<EnumVariantType> variants) {
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Enum;
+    t->enumName = std::move(name);
+    t->enumVariants = std::move(variants);
+    return t;
+}
+
 TypePtr resolve(const TypePtr& t) {
     if (t->kind != TypeKind::Var || !t->link) return t;
     TypePtr rep = resolve(t->link);
@@ -104,6 +112,19 @@ bool unify(const TypePtr& a, const TypePtr& b) {
         return true;
     }
 
+    if (ra->kind == TypeKind::Enum) {
+        if (ra->enumName != rb->enumName) return false;
+        if (ra->enumVariants.size() != rb->enumVariants.size()) return false;
+        for (std::size_t i = 0; i < ra->enumVariants.size(); ++i) {
+            if (ra->enumVariants[i].name != rb->enumVariants[i].name) return false;
+            if (ra->enumVariants[i].payloadTypes.size() != rb->enumVariants[i].payloadTypes.size()) return false;
+            for (std::size_t j = 0; j < ra->enumVariants[i].payloadTypes.size(); ++j) {
+                if (!unify(ra->enumVariants[i].payloadTypes[j], rb->enumVariants[i].payloadTypes[j])) return false;
+            }
+        }
+        return true;
+    }
+
     // Same primitive kind (Int=Int, Bool=Bool, Unit=Unit).
     return true;
 }
@@ -126,6 +147,7 @@ std::string typeToString(const TypePtr& t) {
         return s;
     }
     case TypeKind::Struct: return r->structName;
+    case TypeKind::Enum: return r->enumName;
     }
     return "?";
 }

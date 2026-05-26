@@ -3,9 +3,9 @@
 // Recognized tokens:
 //   - Integer literals: [0-9]+
 //   - Identifiers:      [A-Za-z_][A-Za-z0-9_]*
-//   - Keywords:         fn let if else return struct
-//   - Operators:        +  -  *  /  <  <=  >  >=  ==  !=  =  ->
-//   - Punctuation:      (  )  {  }  ,  ;  :  .
+//   - Keywords:         fn let if else return struct enum match
+//   - Operators:        +  -  *  /  <  <=  >  >=  ==  !=  =  ->  =>
+//   - Punctuation:      (  )  {  }  ,  ;  :  .  _
 //   - Skipped:          whitespace, `// ... \n` line comments
 //
 // Line / column counts start at 1.
@@ -31,6 +31,8 @@ enum class TokenKind {
     KwElse,
     KwReturn,
     KwStruct,
+    KwEnum,
+    KwMatch,
 
     // Operators
     Plus,
@@ -45,6 +47,7 @@ enum class TokenKind {
     NotEq,
     Eq,
     Arrow, // ->
+    FatArrow, // =>
 
     // Punctuation
     LParen,
@@ -55,6 +58,7 @@ enum class TokenKind {
     Semi,
     Colon,
     Dot,
+    Underscore,
 
     // Sentinel
     EndOfInput,

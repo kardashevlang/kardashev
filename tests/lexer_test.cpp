@@ -172,6 +172,80 @@ void test_struct_decl_and_member_access() {
     ASSERT_KIND(t[10], TokenKind::EndOfInput);
 }
 
+void test_enum_keyword() {
+    auto t = lex("enum");
+    assert(t.size() == 2);
+    ASSERT_KIND(t[0], TokenKind::KwEnum);
+    assert(t[0].lexeme == "enum");
+    ASSERT_KIND(t[1], TokenKind::EndOfInput);
+}
+
+void test_match_keyword() {
+    auto t = lex("match");
+    assert(t.size() == 2);
+    ASSERT_KIND(t[0], TokenKind::KwMatch);
+    assert(t[0].lexeme == "match");
+    ASSERT_KIND(t[1], TokenKind::EndOfInput);
+}
+
+void test_fat_arrow_token() {
+    auto t = lex("=>");
+    assert(t.size() == 2);
+    ASSERT_KIND(t[0], TokenKind::FatArrow);
+    assert(t[0].lexeme == "=>");
+    ASSERT_KIND(t[1], TokenKind::EndOfInput);
+}
+
+void test_underscore_token() {
+    auto t = lex("_");
+    assert(t.size() == 2);
+    ASSERT_KIND(t[0], TokenKind::Underscore);
+    assert(t[0].lexeme == "_");
+    ASSERT_KIND(t[1], TokenKind::EndOfInput);
+}
+
+void test_underscore_prefix_is_ident() {
+    // Regression: `_foo` must remain an Identifier, not Underscore + foo.
+    auto t = lex("_foo");
+    assert(t.size() == 2);
+    ASSERT_KIND(t[0], TokenKind::Identifier);
+    assert(t[0].lexeme == "_foo");
+    ASSERT_KIND(t[1], TokenKind::EndOfInput);
+}
+
+void test_eqeq_not_split_by_fat_arrow() {
+    // Regression: adding `=>` must not break `==` lexing.
+    auto t = lex("==");
+    assert(t.size() == 2);
+    ASSERT_KIND(t[0], TokenKind::EqEq);
+    assert(t[0].lexeme == "==");
+    ASSERT_KIND(t[1], TokenKind::EndOfInput);
+}
+
+void test_match_arm_combined() {
+    auto t = lex("match m { Some(x) => x, _ => 0 }");
+    ASSERT_KIND(t[0], TokenKind::KwMatch);
+    ASSERT_KIND(t[1], TokenKind::Identifier);
+    assert(t[1].lexeme == "m");
+    ASSERT_KIND(t[2], TokenKind::LBrace);
+    ASSERT_KIND(t[3], TokenKind::Identifier);
+    assert(t[3].lexeme == "Some");
+    ASSERT_KIND(t[4], TokenKind::LParen);
+    ASSERT_KIND(t[5], TokenKind::Identifier);
+    assert(t[5].lexeme == "x");
+    ASSERT_KIND(t[6], TokenKind::RParen);
+    ASSERT_KIND(t[7], TokenKind::FatArrow);
+    ASSERT_KIND(t[8], TokenKind::Identifier);
+    assert(t[8].lexeme == "x");
+    ASSERT_KIND(t[9], TokenKind::Comma);
+    ASSERT_KIND(t[10], TokenKind::Underscore);
+    ASSERT_KIND(t[11], TokenKind::FatArrow);
+    ASSERT_KIND(t[12], TokenKind::Integer);
+    assert(t[12].lexeme == "0");
+    ASSERT_KIND(t[13], TokenKind::RBrace);
+    ASSERT_KIND(t[14], TokenKind::EndOfInput);
+}
+
 } // namespace
 
 int main() {
@@ -187,6 +261,13 @@ int main() {
     test_struct_keyword();
     test_dot_token();
     test_struct_decl_and_member_access();
-    std::cout << "All lexer tests passed (12 cases)\n";
+    test_enum_keyword();
+    test_match_keyword();
+    test_fat_arrow_token();
+    test_underscore_token();
+    test_underscore_prefix_is_ident();
+    test_eqeq_not_split_by_fat_arrow();
+    test_match_arm_combined();
+    std::cout << "All lexer tests passed (19 cases)\n";
     return 0;
 }

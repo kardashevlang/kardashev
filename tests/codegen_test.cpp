@@ -281,6 +281,106 @@ void test_nested_struct() {
     expectEquals(v, 42, "nested_struct");
 }
 
+void test_enum_unwrap_or_some() {
+    auto v = compileAndRun(
+        "enum Maybe { Some(i64), None }\n"
+        "fn unwrap_or(m: Maybe, d: i64) -> i64 {\n"
+        "    match m { Some(x) => x, None => d, }\n"
+        "}\n"
+        "fn main() -> i64 { unwrap_or(Some(42), 0) }",
+        "main", "enum_unwrap_or_some");
+    expectEquals(v, 42, "enum_unwrap_or_some");
+}
+
+void test_enum_unwrap_or_none() {
+    auto v = compileAndRun(
+        "enum Maybe { Some(i64), None }\n"
+        "fn unwrap_or(m: Maybe, d: i64) -> i64 {\n"
+        "    match m { Some(x) => x, None => d, }\n"
+        "}\n"
+        "fn main() -> i64 { unwrap_or(None, 99) }",
+        "main", "enum_unwrap_or_none");
+    expectEquals(v, 99, "enum_unwrap_or_none");
+}
+
+void test_match_literal_arms() {
+    auto v = compileAndRun(
+        "fn classify(n: i64) -> i64 {\n"
+        "    match n { 0 => 100, 1 => 200, 2 => 300, _ => 999 }\n"
+        "}\n"
+        "fn main() -> i64 { classify(1) }",
+        "main", "match_literal_arms");
+    expectEquals(v, 200, "match_literal_arms");
+}
+
+void test_match_literal_wildcard_fallthrough() {
+    auto v = compileAndRun(
+        "fn classify(n: i64) -> i64 {\n"
+        "    match n { 0 => 100, 1 => 200, _ => 999 }\n"
+        "}\n"
+        "fn main() -> i64 { classify(42) }",
+        "main", "match_literal_wildcard_fallthrough");
+    expectEquals(v, 999, "match_literal_wildcard_fallthrough");
+}
+
+void test_match_var_binds_scrutinee() {
+    auto v = compileAndRun(
+        "fn dbl(n: i64) -> i64 { match n { x => x + x } }\n"
+        "fn main() -> i64 { dbl(21) }",
+        "main", "match_var_binds_scrutinee");
+    expectEquals(v, 42, "match_var_binds_scrutinee");
+}
+
+void test_enum_multi_arg_variant() {
+    auto v = compileAndRun(
+        "enum Pair { Two(i64, i64), Empty }\n"
+        "fn sum(p: Pair) -> i64 {\n"
+        "    match p { Two(a, b) => a + b, Empty => 0 }\n"
+        "}\n"
+        "fn main() -> i64 { sum(Two(15, 27)) }",
+        "main", "enum_multi_arg_variant");
+    expectEquals(v, 42, "enum_multi_arg_variant");
+}
+
+void test_enum_all_unit() {
+    auto v = compileAndRun(
+        "enum Color { Red, Green, Blue }\n"
+        "fn rank(c: Color) -> i64 {\n"
+        "    match c { Red => 1, Green => 2, Blue => 3 }\n"
+        "}\n"
+        "fn main() -> i64 { rank(Blue) }",
+        "main", "enum_all_unit");
+    expectEquals(v, 3, "enum_all_unit");
+}
+
+void test_nested_ctor_pattern() {
+    auto v = compileAndRun(
+        "enum Maybe { Some(Maybe2), None }\n"
+        "enum Maybe2 { Just(i64), Nope }\n"
+        "fn deep(m: Maybe) -> i64 {\n"
+        "    match m {\n"
+        "        Some(Just(x)) => x,\n"
+        "        Some(Nope) => 1,\n"
+        "        None => 2,\n"
+        "    }\n"
+        "}\n"
+        "fn main() -> i64 { deep(Some(Just(42))) }",
+        "main", "nested_ctor_pattern");
+    expectEquals(v, 42, "nested_ctor_pattern");
+}
+
+void test_enum_with_struct_payload() {
+    auto v = compileAndRun(
+        "struct Point { x: i64, y: i64 }\n"
+        "enum Geo { Pt(Point), Origin }\n"
+        "fn get_x(g: Geo) -> i64 {\n"
+        "    match g { Pt(p) => p.x, Origin => 0 }\n"
+        "}\n"
+        "fn main() -> i64 { get_x(Pt(Point { x: 42, y: 99 })) }",
+        "main", "enum_with_struct_payload");
+    expectEquals(v, 42, "enum_with_struct_payload");
+}
+
 } // namespace
 
 int main() {
@@ -304,6 +404,15 @@ int main() {
     test_struct_literal_field_order_swapped();
     test_struct_return_from_fn();
     test_nested_struct();
-    std::cout << "All codegen tests passed (20 cases) — Phase 2.1 structs\n";
+    test_enum_unwrap_or_some();
+    test_enum_unwrap_or_none();
+    test_match_literal_arms();
+    test_match_literal_wildcard_fallthrough();
+    test_match_var_binds_scrutinee();
+    test_enum_multi_arg_variant();
+    test_enum_all_unit();
+    test_nested_ctor_pattern();
+    test_enum_with_struct_payload();
+    std::cout << "All codegen tests passed (29 cases) — Phase 2.2 enums + match\n";
     return 0;
 }

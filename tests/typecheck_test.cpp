@@ -226,6 +226,260 @@ void test_typeref_unknown_struct_name() {
         "typeref_unknown_struct_name");
 }
 
+// ---- Phase 2.2: enums + minimal pattern matching ----
+
+void test_enum_decl_empty() {
+    expectOk("enum Empty {}", "enum_decl_empty");
+}
+
+void test_enum_decl_unit_variants() {
+    expectOk("enum Color { Red, Green, Blue }",
+             "enum_decl_unit_variants");
+}
+
+void test_enum_decl_payload_variant() {
+    expectOk("enum Maybe { Some(i64), None }",
+             "enum_decl_payload_variant");
+}
+
+void test_enum_unwrap_or_program() {
+    expectOk(
+        "enum Maybe { Some(i64), None }\n"
+        "fn unwrap_or(m: Maybe, d: i64) -> i64 {\n"
+        "    match m { Some(x) => x, None => d }\n"
+        "}",
+        "enum_unwrap_or_program");
+}
+
+void test_enum_nested_ctor_pattern() {
+    // Distinct variant names to avoid the Phase 2.2 global-uniqueness rule.
+    expectOk(
+        "enum Inner { I(i64), IN }\n"
+        "enum Outer { O(Inner), ON }\n"
+        "fn f(o: Outer) -> i64 {\n"
+        "    match o { O(I(x)) => x, _ => 0 }\n"
+        "}",
+        "enum_nested_ctor_pattern");
+}
+
+void test_enum_typeref_resolution() {
+    expectOk(
+        "enum Maybe { Some(i64), None }\n"
+        "fn id(m: Maybe) -> Maybe { m }",
+        "enum_typeref_resolution");
+}
+
+void test_enum_unit_ctor_value() {
+    // Bare `None` (no parens) is the value of the unit constructor.
+    expectOk(
+        "enum Maybe { Some(i64), None }\n"
+        "fn nothing() -> Maybe { None }",
+        "enum_unit_ctor_value");
+}
+
+void test_enum_ctor_call_value() {
+    expectOk(
+        "enum Maybe { Some(i64), None }\n"
+        "fn one() -> Maybe { Some(1) }",
+        "enum_ctor_call_value");
+}
+
+void test_enum_exposed_in_result() {
+    auto pr = kardashev::parse(
+        "enum Maybe { Some(i64), None }");
+    assert(pr.ok());
+    auto r = kardashev::typecheck(pr.program);
+    if (!r.ok()) {
+        std::cerr << "[enum_exposed_in_result] expected ok, got errors:\n";
+        dump(r);
+        std::abort();
+    }
+    assert(r.enums.count("Maybe") == 1);
+    assert(r.enums["Maybe"]->kind == kardashev::TypeKind::Enum);
+    assert(r.enums["Maybe"]->enumVariants.size() == 2);
+    assert(r.variantIndex.count("Some") == 1);
+    assert(r.variantIndex.count("None") == 1);
+    assert(r.variantIndex["Some"].first == "Maybe");
+    assert(r.variantIndex["None"].first == "Maybe");
+    // Discriminants reflect source order.
+    assert(r.variantIndex["Some"].second == 0);
+    assert(r.variantIndex["None"].second == 1);
+}
+
+void test_enum_cross_ref_struct_holds_enum() {
+    // Struct field of enum type; enum payload references separately
+    // resolvable types. Validates the two-phase opaque-then-resolve pass.
+    expectOk(
+        "struct W { m: Maybe }\n"
+        "enum Maybe { Some(i64), None }",
+        "enum_cross_ref_struct_holds_enum");
+}
+
+void test_enum_cross_ref_enum_holds_struct() {
+    expectOk(
+        "enum E { V(P) }\n"
+        "struct P { x: i64 }",
+        "enum_cross_ref_enum_holds_struct");
+}
+
+void test_enum_cyclic_struct_decl_typechecks() {
+    // Phase 2.2 accepts cyclic value-type decls; size analysis is out of
+    // scope (codegen would diverge but typechecker is purely nominal).
+    expectOk(
+        "struct A { b: B }\n"
+        "struct B { a: A }",
+        "enum_cyclic_struct_decl_typechecks");
+}
+
+void test_enum_duplicate_decl_name() {
+    expectErr(
+        "enum E { A } enum E { B }",
+        "enum_duplicate_decl_name");
+}
+
+void test_enum_duplicate_name_against_struct() {
+    expectErr(
+        "struct E { x: i64 }\n"
+        "enum E { A }",
+        "enum_duplicate_name_against_struct");
+}
+
+void test_enum_duplicate_variant_within_enum() {
+    expectErr(
+        "enum E { A, A }",
+        "enum_duplicate_variant_within_enum");
+}
+
+void test_enum_duplicate_variant_across_enums() {
+    expectErr(
+        "enum One { A } enum Two { A }",
+        "enum_duplicate_variant_across_enums");
+}
+
+void test_enum_ctor_call_wrong_arity_too_many() {
+    expectErr(
+        "enum Maybe { Some(i64), None }\n"
+        "fn f() -> Maybe { Some(1, 2) }",
+        "enum_ctor_call_wrong_arity_too_many");
+}
+
+void test_enum_ctor_call_wrong_payload_type() {
+    expectErr(
+        "enum Maybe { Some(i64), None }\n"
+        "fn f() -> Maybe { Some(true) }",
+        "enum_ctor_call_wrong_payload_type");
+}
+
+void test_enum_unit_ctor_called_with_args() {
+    expectErr(
+        "enum Maybe { Some(i64), None }\n"
+        "fn f() -> Maybe { None(1) }",
+        "enum_unit_ctor_called_with_args");
+}
+
+void test_enum_payload_ctor_bare_ident() {
+    expectErr(
+        "enum Maybe { Some(i64), None }\n"
+        "fn f() -> Maybe { Some }",
+        "enum_payload_ctor_bare_ident");
+}
+
+void test_match_zero_arms() {
+    expectErr(
+        "enum Maybe { Some(i64), None }\n"
+        "fn f(m: Maybe) -> i64 { match m {} }",
+        "match_zero_arms");
+}
+
+void test_match_arm_body_type_mismatch() {
+    expectErr(
+        "enum Maybe { Some(i64), None }\n"
+        "fn f(m: Maybe) -> i64 {\n"
+        "    match m { Some(x) => x, None => true }\n"
+        "}",
+        "match_arm_body_type_mismatch");
+}
+
+void test_match_pattern_arity_mismatch() {
+    expectErr(
+        "enum Maybe { Some(i64), None }\n"
+        "fn f(m: Maybe) -> i64 {\n"
+        "    match m { Some(x, y) => x, None => 0 }\n"
+        "}",
+        "match_pattern_arity_mismatch");
+}
+
+void test_match_unknown_ctor_in_pattern() {
+    expectErr(
+        "enum Maybe { Some(i64), None }\n"
+        "fn f(m: Maybe) -> i64 {\n"
+        "    match m { Nope(x) => 0, _ => 1 }\n"
+        "}",
+        "match_unknown_ctor_in_pattern");
+}
+
+void test_match_duplicate_binding_in_pattern() {
+    expectErr(
+        "enum Pair { P(i64, i64) }\n"
+        "fn f(p: Pair) -> i64 {\n"
+        "    match p { P(x, x) => x }\n"
+        "}",
+        "match_duplicate_binding_in_pattern");
+}
+
+void test_match_integer_literal_pattern() {
+    expectOk(
+        "fn f(n: i64) -> i64 {\n"
+        "    match n { 0 => 1, _ => 2 }\n"
+        "}",
+        "match_integer_literal_pattern");
+}
+
+void test_match_var_binding_pattern() {
+    // A bare Ident pattern is a variable binding when not a known ctor.
+    expectOk(
+        "fn f(n: i64) -> i64 {\n"
+        "    match n { x => x + 1 }\n"
+        "}",
+        "match_var_binding_pattern");
+}
+
+void test_match_integer_pattern_on_enum_errors() {
+    // Integer literal pattern on an enum scrutinee fails to unify.
+    expectErr(
+        "enum Maybe { Some(i64), None }\n"
+        "fn f(m: Maybe) -> i64 {\n"
+        "    match m { 0 => 1, _ => 2 }\n"
+        "}",
+        "match_integer_pattern_on_enum_errors");
+}
+
+void test_match_records_unified_result_type() {
+    auto pr = kardashev::parse(
+        "enum Maybe { Some(i64), None }\n"
+        "fn unwrap_or(m: Maybe, d: i64) -> i64 {\n"
+        "    match m { Some(x) => x, None => d }\n"
+        "}");
+    assert(pr.ok());
+    auto r = kardashev::typecheck(pr.program);
+    if (!r.ok()) {
+        std::cerr << "[match_records_unified_result_type] expected ok, got "
+                     "errors:\n";
+        dump(r);
+        std::abort();
+    }
+    // Spot-check: the match expression appears in exprTypes with type i64.
+    bool sawMatch = false;
+    for (const auto& kv : r.exprTypes) {
+        if (dynamic_cast<const kardashev::ast::MatchExpr*>(kv.first)) {
+            sawMatch = true;
+            assert(kardashev::resolve(kv.second)->kind ==
+                   kardashev::TypeKind::Int);
+        }
+    }
+    assert(sawMatch);
+}
+
 } // namespace
 
 int main() {
@@ -257,6 +511,36 @@ int main() {
     test_field_access_on_non_struct();
     test_field_access_missing_field();
     test_typeref_unknown_struct_name();
-    std::cout << "All typecheck tests passed (28 cases)\n";
+    // Phase 2.2
+    test_enum_decl_empty();
+    test_enum_decl_unit_variants();
+    test_enum_decl_payload_variant();
+    test_enum_unwrap_or_program();
+    test_enum_nested_ctor_pattern();
+    test_enum_typeref_resolution();
+    test_enum_unit_ctor_value();
+    test_enum_ctor_call_value();
+    test_enum_exposed_in_result();
+    test_enum_cross_ref_struct_holds_enum();
+    test_enum_cross_ref_enum_holds_struct();
+    test_enum_cyclic_struct_decl_typechecks();
+    test_enum_duplicate_decl_name();
+    test_enum_duplicate_name_against_struct();
+    test_enum_duplicate_variant_within_enum();
+    test_enum_duplicate_variant_across_enums();
+    test_enum_ctor_call_wrong_arity_too_many();
+    test_enum_ctor_call_wrong_payload_type();
+    test_enum_unit_ctor_called_with_args();
+    test_enum_payload_ctor_bare_ident();
+    test_match_zero_arms();
+    test_match_arm_body_type_mismatch();
+    test_match_pattern_arity_mismatch();
+    test_match_unknown_ctor_in_pattern();
+    test_match_duplicate_binding_in_pattern();
+    test_match_integer_literal_pattern();
+    test_match_var_binding_pattern();
+    test_match_integer_pattern_on_enum_errors();
+    test_match_records_unified_result_type();
+    std::cout << "All typecheck tests passed (56 cases)\n";
     return 0;
 }

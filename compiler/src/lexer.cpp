@@ -21,6 +21,10 @@ TokenKind keywordOrIdent(std::string_view s) {
     if (s == "else") return TokenKind::KwElse;
     if (s == "return") return TokenKind::KwReturn;
     if (s == "struct") return TokenKind::KwStruct;
+    if (s == "enum") return TokenKind::KwEnum;
+    if (s == "match") return TokenKind::KwMatch;
+    // A bare `_` is the wildcard pattern; `_foo` stays an Identifier.
+    if (s == "_") return TokenKind::Underscore;
     return TokenKind::Identifier;
 }
 
@@ -108,6 +112,10 @@ std::vector<Token> lex(std::string_view source) {
             push2(TokenKind::EqEq, startCol);
             continue;
         }
+        if (c == '=' && n == '>') {
+            push2(TokenKind::FatArrow, startCol);
+            continue;
+        }
         if (c == '!' && n == '=') {
             push2(TokenKind::NotEq, startCol);
             continue;
@@ -161,6 +169,8 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::KwElse: return "KwElse";
     case TokenKind::KwReturn: return "KwReturn";
     case TokenKind::KwStruct: return "KwStruct";
+    case TokenKind::KwEnum: return "KwEnum";
+    case TokenKind::KwMatch: return "KwMatch";
     case TokenKind::Plus: return "Plus";
     case TokenKind::Minus: return "Minus";
     case TokenKind::Star: return "Star";
@@ -173,6 +183,7 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::NotEq: return "NotEq";
     case TokenKind::Eq: return "Eq";
     case TokenKind::Arrow: return "Arrow";
+    case TokenKind::FatArrow: return "FatArrow";
     case TokenKind::LParen: return "LParen";
     case TokenKind::RParen: return "RParen";
     case TokenKind::LBrace: return "LBrace";
@@ -181,6 +192,7 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::Semi: return "Semi";
     case TokenKind::Colon: return "Colon";
     case TokenKind::Dot: return "Dot";
+    case TokenKind::Underscore: return "Underscore";
     case TokenKind::EndOfInput: return "EndOfInput";
     case TokenKind::Invalid: return "Invalid";
     }

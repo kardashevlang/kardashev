@@ -21,8 +21,10 @@ public:
                 prog.functions.push_back(parseFnDecl());
             } else if (check(TokenKind::KwStruct)) {
                 prog.structs.push_back(parseStructDecl());
+            } else if (check(TokenKind::KwEnum)) {
+                prog.enums.push_back(parseEnumDecl());
             } else {
-                errorHere(std::string("expected 'fn' or 'struct' at top level, got ") +
+                errorHere(std::string("expected 'fn', 'struct' or 'enum' at top level, got ") +
                           std::string(tokenKindName(peek().kind)));
                 advance();
             }
@@ -124,6 +126,46 @@ private:
         }
         expect(TokenKind::RBrace, "}");
         return decl;
+    }
+
+    ast::EnumDecl parseEnumDecl() {
+        Token enumTok = expect(TokenKind::KwEnum, "enum");
+        ast::EnumDecl decl;
+        decl.line = enumTok.line;
+        decl.column = enumTok.column;
+
+        Token nameTok = expect(TokenKind::Identifier, "enum name");
+        decl.name = nameTok.lexeme;
+
+        expect(TokenKind::LBrace, "{");
+        if (!check(TokenKind::RBrace)) {
+            while (true) {
+                decl.variants.push_back(parseEnumVariant());
+                if (!accept(TokenKind::Comma)) break;
+                if (check(TokenKind::RBrace)) break; // trailing comma
+            }
+        }
+        expect(TokenKind::RBrace, "}");
+        return decl;
+    }
+
+    ast::EnumVariant parseEnumVariant() {
+        Token nameTok = expect(TokenKind::Identifier, "variant name");
+        ast::EnumVariant v;
+        v.name = nameTok.lexeme;
+        v.line = nameTok.line;
+        v.column = nameTok.column;
+        if (accept(TokenKind::LParen)) {
+            if (!check(TokenKind::RParen)) {
+                while (true) {
+                    v.payloadTypes.push_back(parseTypeRef());
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::RParen)) break; // trailing comma
+                }
+            }
+            expect(TokenKind::RParen, ")");
+        }
+        return v;
     }
 
     ast::TypeRef parseTypeRef() {
@@ -333,6 +375,10 @@ private:
             return parseIfExpr();
         }
 
+        if (t.kind == TokenKind::KwMatch) {
+            return parseMatchExpr();
+        }
+
         if (t.kind == TokenKind::LBrace) {
             return parseBlockExpr();
         }
@@ -363,6 +409,99 @@ private:
         ie->thenBranch = std::move(thenBlock);
         ie->elseBranch = std::move(elseBlock);
         return ie;
+    }
+
+    ast::ExprPtr parseMatchExpr() {
+        Token matchTok = expect(TokenKind::KwMatch, "match");
+        bool prev = restrictStructLit_;
+        restrictStructLit_ = true;
+        auto scrutinee = parseExpr();
+        restrictStructLit_ = prev;
+        auto me = std::make_unique<ast::MatchExpr>();
+        me->line = matchTok.line;
+        me->column = matchTok.column;
+        me->scrutinee = std::move(scrutinee);
+        expect(TokenKind::LBrace, "{");
+        bool prevArm = restrictStructLit_;
+        restrictStructLit_ = false;
+        if (!check(TokenKind::RBrace)) {
+            while (true) {
+                me->arms.push_back(parseMatchArm());
+                if (!accept(TokenKind::Comma)) break;
+                if (check(TokenKind::RBrace)) break; // trailing comma
+            }
+        }
+        restrictStructLit_ = prevArm;
+        expect(TokenKind::RBrace, "}");
+        return me;
+    }
+
+    ast::MatchArm parseMatchArm() {
+        auto pat = parsePattern();
+        std::size_t line = pat ? pat->line : peek().line;
+        std::size_t col = pat ? pat->column : peek().column;
+        expect(TokenKind::FatArrow, "=>");
+        auto body = parseExpr();
+        ast::MatchArm arm;
+        arm.line = line;
+        arm.column = col;
+        arm.pattern = std::move(pat);
+        arm.body = std::move(body);
+        return arm;
+    }
+
+    ast::PatternPtr parsePattern() {
+        const Token& t = peek();
+        if (t.kind == TokenKind::Integer) {
+            Token tok = consume();
+            auto p = std::make_unique<ast::LitIntPat>();
+            p->line = tok.line;
+            p->column = tok.column;
+            try {
+                p->value = std::stoll(tok.lexeme);
+            } catch (const std::exception&) {
+                errorHere("integer literal out of range: " + tok.lexeme);
+                p->value = 0;
+            }
+            return p;
+        }
+        if (t.kind == TokenKind::Underscore) {
+            Token tok = consume();
+            auto p = std::make_unique<ast::WildPat>();
+            p->line = tok.line;
+            p->column = tok.column;
+            return p;
+        }
+        if (t.kind == TokenKind::Identifier) {
+            Token tok = consume();
+            if (accept(TokenKind::LParen)) {
+                auto p = std::make_unique<ast::CtorPat>();
+                p->line = tok.line;
+                p->column = tok.column;
+                p->ctorName = tok.lexeme;
+                if (!check(TokenKind::RParen)) {
+                    while (true) {
+                        p->subpatterns.push_back(parsePattern());
+                        if (!accept(TokenKind::Comma)) break;
+                        if (check(TokenKind::RParen)) break; // trailing comma
+                    }
+                }
+                expect(TokenKind::RParen, ")");
+                return p;
+            }
+            auto p = std::make_unique<ast::VarPat>();
+            p->line = tok.line;
+            p->column = tok.column;
+            p->name = tok.lexeme;
+            return p;
+        }
+        errorHere(std::string("expected pattern, got ") +
+                  std::string(tokenKindName(t.kind)));
+        auto p = std::make_unique<ast::WildPat>();
+        p->line = t.line;
+        p->column = t.column;
+        advance();
+        return p;
     }
 
     ast::ExprPtr parseStructLit(const Token& nameTok) {

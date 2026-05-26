@@ -1,5 +1,6 @@
 #include "kardashev/typecheck.hpp"
 
+#include <algorithm>
 #include <unordered_set>
 #include <utility>
 
@@ -9,14 +10,37 @@ namespace {
 class TypeChecker {
 public:
     TypeCheckResult check(const ast::Program& program) {
-        // Pass 1a: register every struct declaration so subsequent
-        // TypeRef resolution (in fn signatures and other struct fields)
-        // can see them.
+        // Pass 1a: register every struct and enum decl. To allow free
+        // cross-references (struct field of enum type, enum payload of
+        // struct type), we do this in two phases:
+        //   (i)  create opaque Type entries for every struct/enum just by
+        //        name; the inner field/variant vectors stay empty.
+        //   (ii) resolve the field types / variant payload types now that
+        //        every name is bound. Mutate the entries in-place.
+        //
+        // Phase (i): opaque registration.
         for (const auto& sd : program.structs) {
-            if (structs_.count(sd.name)) {
+            if (structs_.count(sd.name) || enums_.count(sd.name)) {
                 error("struct redefined: " + sd.name, sd.line, sd.column);
                 continue;
             }
+            structs_[sd.name] = makeStruct(sd.name, {});
+        }
+        for (const auto& ed : program.enums) {
+            if (structs_.count(ed.name) || enums_.count(ed.name)) {
+                error("enum redefined: " + ed.name, ed.line, ed.column);
+                continue;
+            }
+            enums_[ed.name] = makeEnum(ed.name, {});
+        }
+
+        // Phase (ii): resolve struct field types and enum variant payloads.
+        for (const auto& sd : program.structs) {
+            auto it = structs_.find(sd.name);
+            if (it == structs_.end()) continue; // duplicate
+            // Only resolve fields once: if the registered entry was already
+            // populated by a previous decl with the same name, skip.
+            if (!it->second->structFields.empty()) continue;
             std::vector<std::pair<std::string, TypePtr>> resolvedFields;
             resolvedFields.reserve(sd.fields.size());
             std::unordered_set<std::string> seen;
@@ -29,8 +53,52 @@ public:
                 }
                 resolvedFields.emplace_back(f.name, resolveTypeRef(f.type));
             }
-            structs_[sd.name] = makeStruct(sd.name, std::move(resolvedFields));
+            it->second->structFields = std::move(resolvedFields);
         }
+
+        for (const auto& ed : program.enums) {
+            auto it = enums_.find(ed.name);
+            if (it == enums_.end()) continue; // duplicate
+            if (!it->second->enumVariants.empty()) continue;
+            std::vector<EnumVariantType> resolvedVariants;
+            resolvedVariants.reserve(ed.variants.size());
+            std::unordered_set<std::string> seenVariant;
+            for (unsigned vi = 0; vi < ed.variants.size(); ++vi) {
+                const auto& v = ed.variants[vi];
+                if (!seenVariant.insert(v.name).second) {
+                    error("duplicate variant '" + v.name + "' in enum '" +
+                              ed.name + "'",
+                          v.line, v.column);
+                    continue;
+                }
+                // Cross-enum uniqueness: globally each variant name binds
+                // to exactly one enum (Phase 2.2 simplification — no path
+                // syntax).
+                auto existing = variantIndex_.find(v.name);
+                if (existing != variantIndex_.end()) {
+                    error("variant '" + v.name +
+                              "' is already defined in enum '" +
+                              existing->second.first +
+                              "'; cannot redefine in enum '" + ed.name + "'",
+                          v.line, v.column);
+                    continue;
+                }
+                std::vector<TypePtr> payload;
+                payload.reserve(v.payloadTypes.size());
+                for (const auto& pt : v.payloadTypes) {
+                    payload.push_back(resolveTypeRef(pt));
+                }
+                EnumVariantType evt;
+                evt.name = v.name;
+                evt.payloadTypes = payload;
+                resolvedVariants.push_back(std::move(evt));
+                variantIndex_[v.name] = {ed.name,
+                                         static_cast<unsigned>(
+                                             resolvedVariants.size() - 1)};
+            }
+            it->second->enumVariants = std::move(resolvedVariants);
+        }
+
         // Pass 1b: register every fn signature so calls can see siblings
         // (and the function can recurse into itself).
         for (const auto& fn : program.functions) {
@@ -49,7 +117,9 @@ public:
         for (const auto& fn : program.functions) {
             checkFunction(fn);
         }
-        return {std::move(errors_), std::move(exprTypes_), std::move(structs_)};
+        return {std::move(errors_), std::move(exprTypes_),
+                std::move(structs_), std::move(enums_),
+                std::move(variantIndex_)};
     }
 
 private:
@@ -57,6 +127,10 @@ private:
 
     std::unordered_map<std::string, TypePtr> functions_;
     std::unordered_map<std::string, TypePtr> structs_;
+    std::unordered_map<std::string, TypePtr> enums_;
+    // Variant name -> {enumName, index within that enum}.
+    std::unordered_map<std::string, std::pair<std::string, unsigned>>
+        variantIndex_;
     std::unordered_map<const ast::Expr*, TypePtr> exprTypes_;
     std::vector<TypeError> errors_;
     std::vector<Scope> scopes_;
@@ -69,8 +143,10 @@ private:
     TypePtr resolveTypeRef(const ast::TypeRef& tr) {
         if (tr.name == "i64") return makeInt();
         if (tr.name == "bool") return makeBool();
-        auto it = structs_.find(tr.name);
-        if (it != structs_.end()) return it->second;
+        auto sit = structs_.find(tr.name);
+        if (sit != structs_.end()) return sit->second;
+        auto eit = enums_.find(tr.name);
+        if (eit != enums_.end()) return eit->second;
         error("unknown type: " + tr.name, tr.line, tr.column);
         return makeInt(); // fallback so downstream code keeps running
     }
@@ -81,6 +157,20 @@ private:
             if (found != it->end()) return found->second;
         }
         return nullptr;
+    }
+
+    // Look up a variant by name in the global variant table. Returns the
+    // (enumType, variant) pair, or {nullptr, nullptr} if unknown.
+    std::pair<TypePtr, const EnumVariantType*> lookupVariant(
+        const std::string& name) {
+        auto it = variantIndex_.find(name);
+        if (it == variantIndex_.end()) return {nullptr, nullptr};
+        auto enumIt = enums_.find(it->second.first);
+        if (enumIt == enums_.end()) return {nullptr, nullptr};
+        const auto& variants = enumIt->second->enumVariants;
+        unsigned idx = it->second.second;
+        if (idx >= variants.size()) return {nullptr, nullptr};
+        return {enumIt->second, &variants[idx]};
     }
 
     void checkFunction(const ast::FnDecl& fn) {
@@ -121,6 +211,19 @@ private:
             if (auto t = lookupLocal(id->name)) return t;
             auto fnIt = functions_.find(id->name);
             if (fnIt != functions_.end()) return fnIt->second;
+            // Fall through to variant table: a bare Ident resolving to a
+            // unit constructor is the value of that constructor.
+            auto [enumType, variant] = lookupVariant(id->name);
+            if (variant) {
+                if (!variant->payloadTypes.empty()) {
+                    error("constructor " + id->name + " requires " +
+                              std::to_string(variant->payloadTypes.size()) +
+                              " argument(s)",
+                          e.line, e.column);
+                    return makeInt();
+                }
+                return enumType;
+            }
             error("unknown identifier: " + id->name, e.line, e.column);
             return makeInt();
         }
@@ -141,6 +244,9 @@ private:
         }
         if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
             return checkField(*fe);
+        }
+        if (auto* me = dynamic_cast<const ast::MatchExpr*>(&e)) {
+            return checkMatch(*me);
         }
         error("unknown expression kind", e.line, e.column);
         return makeInt();
@@ -233,36 +339,63 @@ private:
 
     TypePtr checkCall(const ast::CallExpr& call) {
         auto fnIt = functions_.find(call.callee);
-        if (fnIt == functions_.end()) {
-            error("unknown function: " + call.callee, call.line, call.column);
-            // Still type-check the args so secondary errors surface.
-            for (const auto& a : call.args) checkExpr(*a);
-            return makeInt();
-        }
-        const TypePtr& fnType = fnIt->second;
-        if (fnType->args.size() != call.args.size()) {
-            error("function '" + call.callee + "' expects " +
-                      std::to_string(fnType->args.size()) +
-                      " arg(s), got " + std::to_string(call.args.size()),
-                  call.line, call.column);
-        }
-        const std::size_t n =
-            std::min(fnType->args.size(), call.args.size());
-        for (std::size_t i = 0; i < n; ++i) {
-            TypePtr argType = checkExpr(*call.args[i]);
-            if (!unify(argType, fnType->args[i])) {
-                error("argument " + std::to_string(i + 1) + " to '" +
-                          call.callee + "' has type " +
-                          typeToString(argType) + ", expected " +
-                          typeToString(fnType->args[i]),
-                      call.args[i]->line, call.args[i]->column);
+        if (fnIt != functions_.end()) {
+            const TypePtr& fnType = fnIt->second;
+            if (fnType->args.size() != call.args.size()) {
+                error("function '" + call.callee + "' expects " +
+                          std::to_string(fnType->args.size()) +
+                          " arg(s), got " + std::to_string(call.args.size()),
+                      call.line, call.column);
             }
+            const std::size_t n =
+                std::min(fnType->args.size(), call.args.size());
+            for (std::size_t i = 0; i < n; ++i) {
+                TypePtr argType = checkExpr(*call.args[i]);
+                if (!unify(argType, fnType->args[i])) {
+                    error("argument " + std::to_string(i + 1) + " to '" +
+                              call.callee + "' has type " +
+                              typeToString(argType) + ", expected " +
+                              typeToString(fnType->args[i]),
+                          call.args[i]->line, call.args[i]->column);
+                }
+            }
+            for (std::size_t i = n; i < call.args.size(); ++i) {
+                checkExpr(*call.args[i]);
+            }
+            return fnType->ret;
         }
-        // Type-check any extra args even though we already errored on arity.
-        for (std::size_t i = n; i < call.args.size(); ++i) {
-            checkExpr(*call.args[i]);
+        // Not a fn — fall back to variant constructor.
+        auto [enumType, variant] = lookupVariant(call.callee);
+        if (variant) {
+            if (variant->payloadTypes.size() != call.args.size()) {
+                error("constructor " + call.callee + " expects " +
+                          std::to_string(variant->payloadTypes.size()) +
+                          " arg(s), got " +
+                          std::to_string(call.args.size()),
+                      call.line, call.column);
+            }
+            const std::size_t n =
+                std::min(variant->payloadTypes.size(), call.args.size());
+            for (std::size_t i = 0; i < n; ++i) {
+                TypePtr argType = checkExpr(*call.args[i]);
+                if (!unify(argType, variant->payloadTypes[i])) {
+                    error("argument " + std::to_string(i + 1) +
+                              " to constructor " + call.callee +
+                              " has type " + typeToString(argType) +
+                              ", expected " +
+                              typeToString(variant->payloadTypes[i]),
+                          call.args[i]->line, call.args[i]->column);
+                }
+            }
+            for (std::size_t i = n; i < call.args.size(); ++i) {
+                checkExpr(*call.args[i]);
+            }
+            return enumType;
         }
-        return fnType->ret;
+
+        error("unknown function: " + call.callee, call.line, call.column);
+        for (const auto& a : call.args) checkExpr(*a);
+        return makeInt();
     }
 
     TypePtr checkIf(const ast::IfExpr& ie) {
@@ -304,6 +437,123 @@ private:
         }
         scopes_.pop_back();
         return result;
+    }
+
+    TypePtr checkMatch(const ast::MatchExpr& me) {
+        TypePtr scrutT = checkExpr(*me.scrutinee);
+        if (me.arms.empty()) {
+            error("match expression must have at least one arm",
+                  me.line, me.column);
+            return makeFreshVar();
+        }
+        TypePtr unified;
+        for (const auto& arm : me.arms) {
+            scopes_.push_back({});
+            // Type the pattern against the scrutinee type. Errors are
+            // recorded inline; we still process the body so secondary
+            // type errors surface.
+            Scope bindings;
+            checkPattern(*arm.pattern, scrutT, bindings);
+            for (auto& kv : bindings) {
+                scopes_.back()[kv.first] = kv.second;
+            }
+            TypePtr bodyT = checkExpr(*arm.body);
+            scopes_.pop_back();
+            if (!unified) {
+                unified = bodyT;
+            } else if (!unify(bodyT, unified)) {
+                error("arm body type mismatch: got " + typeToString(bodyT) +
+                          ", expected " + typeToString(unified),
+                      arm.line, arm.column);
+            }
+        }
+        if (!unified) unified = makeFreshVar();
+        return unified;
+    }
+
+    // Walk a pattern, unify against the expected type, and populate
+    // `bindings` with name -> type for any VarPat encountered.
+    //
+    // VarPat-rewrite rule: a bare Ident in pattern position is parsed as
+    // VarPat. If the name resolves to a known UNIT variant, we treat it
+    // as a unit-CtorPat (matches the variant, no binding). Names that
+    // collide with non-unit variants are likely a forgotten parenthesis
+    // and are flagged as an arity error rather than silently binding.
+    void checkPattern(const ast::Pattern& pat, const TypePtr& expected,
+                      Scope& bindings) {
+        if (dynamic_cast<const ast::LitIntPat*>(&pat)) {
+            if (!unify(expected, makeInt())) {
+                error("integer pattern requires i64, scrutinee is " +
+                          typeToString(expected),
+                      pat.line, pat.column);
+            }
+            return;
+        }
+        if (dynamic_cast<const ast::WildPat*>(&pat)) {
+            return;
+        }
+        if (auto* vp = dynamic_cast<const ast::VarPat*>(&pat)) {
+            auto [enumType, variant] = lookupVariant(vp->name);
+            if (variant) {
+                if (!variant->payloadTypes.empty()) {
+                    error("constructor " + vp->name + " requires " +
+                              std::to_string(variant->payloadTypes.size()) +
+                              " argument(s) in pattern",
+                          pat.line, pat.column);
+                    return;
+                }
+                if (!unify(expected, enumType)) {
+                    error("pattern matches enum " + enumType->enumName +
+                              ", scrutinee is " + typeToString(expected),
+                          pat.line, pat.column);
+                }
+                return;
+            }
+            if (bindings.count(vp->name)) {
+                error("duplicate binding '" + vp->name + "' in pattern",
+                      pat.line, pat.column);
+                return;
+            }
+            bindings[vp->name] = expected;
+            return;
+        }
+        if (auto* cp = dynamic_cast<const ast::CtorPat*>(&pat)) {
+            auto [enumType, variant] = lookupVariant(cp->ctorName);
+            if (!variant) {
+                error("unknown constructor " + cp->ctorName,
+                      pat.line, pat.column);
+                // Still walk subpatterns so nested errors / bindings surface
+                // against fresh vars.
+                for (const auto& sp : cp->subpatterns) {
+                    checkPattern(*sp, makeFreshVar(), bindings);
+                }
+                return;
+            }
+            if (!unify(expected, enumType)) {
+                error("pattern matches enum " + enumType->enumName +
+                          ", scrutinee is " + typeToString(expected),
+                      pat.line, pat.column);
+            }
+            if (cp->subpatterns.size() != variant->payloadTypes.size()) {
+                error("constructor " + cp->ctorName + " expects " +
+                          std::to_string(variant->payloadTypes.size()) +
+                          " arg(s), got " +
+                          std::to_string(cp->subpatterns.size()),
+                      pat.line, pat.column);
+            }
+            const std::size_t n =
+                std::min(cp->subpatterns.size(), variant->payloadTypes.size());
+            for (std::size_t i = 0; i < n; ++i) {
+                checkPattern(*cp->subpatterns[i], variant->payloadTypes[i],
+                             bindings);
+            }
+            // Walk any extras against fresh vars to surface their bindings/errors.
+            for (std::size_t i = n; i < cp->subpatterns.size(); ++i) {
+                checkPattern(*cp->subpatterns[i], makeFreshVar(), bindings);
+            }
+            return;
+        }
+        error("unknown pattern kind", pat.line, pat.column);
     }
 
     void checkStmt(const ast::Stmt& s) {

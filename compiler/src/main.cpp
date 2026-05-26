@@ -104,14 +104,17 @@ std::optional<std::int64_t> compileAndRun(const std::string& src,
     return fn();
 }
 
-// Heuristic: a line whose first non-whitespace token is `fn ` or
-// `struct ` is treated as a top-level decl to add to the accumulator.
-// Anything else is parsed as an expression and evaluated.
+// Heuristic: a line whose first non-whitespace token is `fn `,
+// `struct `, or `enum ` is treated as a top-level decl to add to
+// the accumulator. Anything else is parsed as an expression and
+// evaluated.
 bool looksLikeTopLevelDecl(const std::string& line) {
     std::size_t i = 0;
     while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
     const auto rest = std::string_view(line).substr(i);
-    return rest.substr(0, 3) == "fn " || rest.substr(0, 7) == "struct ";
+    return rest.substr(0, 3) == "fn " ||
+           rest.substr(0, 7) == "struct " ||
+           rest.substr(0, 5) == "enum ";
 }
 
 int runREPL() {

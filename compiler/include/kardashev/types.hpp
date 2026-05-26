@@ -32,10 +32,16 @@ enum class TypeKind {
     Function,
     Var,
     Struct,
+    Enum,
 };
 
 struct Type;
 using TypePtr = std::shared_ptr<Type>;
+
+struct EnumVariantType {
+    std::string name;
+    std::vector<TypePtr> payloadTypes; // empty payloadTypes = unit variant
+};
 
 struct Type {
     TypeKind kind = TypeKind::Unit;
@@ -51,6 +57,10 @@ struct Type {
     // Struct:
     std::string structName;
     std::vector<std::pair<std::string, TypePtr>> structFields;
+
+    // Enum:
+    std::string enumName;
+    std::vector<EnumVariantType> enumVariants;
 };
 
 TypePtr makeInt();
@@ -59,6 +69,7 @@ TypePtr makeUnit();
 TypePtr makeFunction(std::vector<TypePtr> args, TypePtr ret);
 TypePtr makeFreshVar();
 TypePtr makeStruct(std::string name, std::vector<std::pair<std::string, TypePtr>> fields);
+TypePtr makeEnum(std::string name, std::vector<EnumVariantType> variants);
 
 // Follow the union-find link chain to the representative. Performs
 // path compression as a side effect.

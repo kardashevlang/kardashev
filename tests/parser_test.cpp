@@ -353,6 +353,187 @@ void test_mixed_program_fn_then_struct() {
     assert(r.program.functions[0].name == "f");
 }
 
+void test_enum_decl_empty() {
+    auto r = parse("enum Empty {}");
+    assert(r.ok());
+    assert(r.program.enums.size() == 1);
+    assert(r.program.functions.empty());
+    assert(r.program.structs.empty());
+    const auto& e = r.program.enums[0];
+    assert(e.name == "Empty");
+    assert(e.variants.empty());
+}
+
+void test_enum_decl_single_unit_variant() {
+    auto r = parse("enum E { A }");
+    assert(r.ok());
+    assert(r.program.enums.size() == 1);
+    const auto& e = r.program.enums[0];
+    assert(e.name == "E");
+    assert(e.variants.size() == 1);
+    assert(e.variants[0].name == "A");
+    assert(e.variants[0].payloadTypes.empty());
+}
+
+void test_enum_decl_multi_unit_trailing_comma() {
+    auto r = parse("enum E { A, B, C, }");
+    assert(r.ok());
+    assert(r.program.enums.size() == 1);
+    const auto& e = r.program.enums[0];
+    assert(e.variants.size() == 3);
+    assert(e.variants[0].name == "A");
+    assert(e.variants[1].name == "B");
+    assert(e.variants[2].name == "C");
+    for (const auto& v : e.variants) assert(v.payloadTypes.empty());
+}
+
+void test_enum_decl_tuple_payload() {
+    auto r = parse("enum Maybe { Some(i64), None }");
+    assert(r.ok());
+    assert(r.program.enums.size() == 1);
+    const auto& e = r.program.enums[0];
+    assert(e.name == "Maybe");
+    assert(e.variants.size() == 2);
+    assert(e.variants[0].name == "Some");
+    assert(e.variants[0].payloadTypes.size() == 1);
+    assert(e.variants[0].payloadTypes[0].name == "i64");
+    assert(e.variants[1].name == "None");
+    assert(e.variants[1].payloadTypes.empty());
+}
+
+void test_enum_decl_multi_arg_tuple_variant() {
+    auto r = parse("enum Pair { P(i64, bool) }");
+    assert(r.ok());
+    const auto& e = r.program.enums[0];
+    assert(e.variants.size() == 1);
+    assert(e.variants[0].name == "P");
+    assert(e.variants[0].payloadTypes.size() == 2);
+    assert(e.variants[0].payloadTypes[0].name == "i64");
+    assert(e.variants[0].payloadTypes[1].name == "bool");
+}
+
+void test_match_literal_pats() {
+    auto r = parseWrapped("match x { 0 => 1, 1 => 2, _ => 3 }");
+    const auto* me = dynamic_cast<const ast::MatchExpr*>(tailExprOf(r));
+    assert(me != nullptr);
+    const auto* sc = dynamic_cast<const ast::IdentExpr*>(me->scrutinee.get());
+    assert(sc && sc->name == "x");
+    assert(me->arms.size() == 3);
+    const auto* p0 = dynamic_cast<const ast::LitIntPat*>(me->arms[0].pattern.get());
+    assert(p0 && p0->value == 0);
+    const auto* b0 = dynamic_cast<const ast::IntLitExpr*>(me->arms[0].body.get());
+    assert(b0 && b0->value == 1);
+    const auto* p1 = dynamic_cast<const ast::LitIntPat*>(me->arms[1].pattern.get());
+    assert(p1 && p1->value == 1);
+    const auto* p2 = dynamic_cast<const ast::WildPat*>(me->arms[2].pattern.get());
+    assert(p2 != nullptr);
+    const auto* b2 = dynamic_cast<const ast::IntLitExpr*>(me->arms[2].body.get());
+    assert(b2 && b2->value == 3);
+}
+
+void test_match_wildcard_only() {
+    auto r = parseWrapped("match x { _ => 0 }");
+    const auto* me = dynamic_cast<const ast::MatchExpr*>(tailExprOf(r));
+    assert(me != nullptr);
+    assert(me->arms.size() == 1);
+    assert(dynamic_cast<const ast::WildPat*>(me->arms[0].pattern.get()) != nullptr);
+    const auto* b = dynamic_cast<const ast::IntLitExpr*>(me->arms[0].body.get());
+    assert(b && b->value == 0);
+}
+
+void test_match_var_binding() {
+    auto r = parseWrapped("match x { y => y + 1 }");
+    const auto* me = dynamic_cast<const ast::MatchExpr*>(tailExprOf(r));
+    assert(me != nullptr);
+    assert(me->arms.size() == 1);
+    const auto* vp = dynamic_cast<const ast::VarPat*>(me->arms[0].pattern.get());
+    assert(vp && vp->name == "y");
+    const auto* bin = dynamic_cast<const ast::BinaryExpr*>(me->arms[0].body.get());
+    assert(bin && bin->op == ast::BinOp::Add);
+}
+
+void test_match_ctor_pat_unit() {
+    auto r = parseWrapped("match m { None => 0, Some(v) => v }");
+    const auto* me = dynamic_cast<const ast::MatchExpr*>(tailExprOf(r));
+    assert(me != nullptr);
+    assert(me->arms.size() == 2);
+    // Bare Ident in pattern position is always VarPat at parse time.
+    const auto* p0 = dynamic_cast<const ast::VarPat*>(me->arms[0].pattern.get());
+    assert(p0 && p0->name == "None");
+    const auto* p1 = dynamic_cast<const ast::CtorPat*>(me->arms[1].pattern.get());
+    assert(p1 && p1->ctorName == "Some");
+    assert(p1->subpatterns.size() == 1);
+    const auto* inner = dynamic_cast<const ast::VarPat*>(p1->subpatterns[0].get());
+    assert(inner && inner->name == "v");
+    const auto* b1 = dynamic_cast<const ast::IdentExpr*>(me->arms[1].body.get());
+    assert(b1 && b1->name == "v");
+}
+
+void test_match_ctor_pat_nested() {
+    auto r = parseWrapped("match m { Some(Some(x)) => x, _ => 0 }");
+    const auto* me = dynamic_cast<const ast::MatchExpr*>(tailExprOf(r));
+    assert(me != nullptr);
+    assert(me->arms.size() == 2);
+    const auto* outer = dynamic_cast<const ast::CtorPat*>(me->arms[0].pattern.get());
+    assert(outer && outer->ctorName == "Some");
+    assert(outer->subpatterns.size() == 1);
+    const auto* inner = dynamic_cast<const ast::CtorPat*>(outer->subpatterns[0].get());
+    assert(inner && inner->ctorName == "Some");
+    assert(inner->subpatterns.size() == 1);
+    const auto* innerVar = dynamic_cast<const ast::VarPat*>(inner->subpatterns[0].get());
+    assert(innerVar && innerVar->name == "x");
+    assert(dynamic_cast<const ast::WildPat*>(me->arms[1].pattern.get()) != nullptr);
+}
+
+void test_match_scrutinee_no_struct_lit_without_parens() {
+    // Following Rust: an unparenthesized struct literal in match scrutinee
+    // would be ambiguous with the match arm braces, so it's disallowed.
+    auto r = parse("fn f() -> i64 { match Point { x: 1, y: 2 } { _ => 0 } }");
+    assert(!r.ok());
+    assert(!r.errors.empty());
+}
+
+void test_match_scrutinee_struct_lit_parenthesized() {
+    // Parenthesizing makes the struct literal unambiguous.
+    auto r = parse("fn f() -> i64 { match (Point { x: 1, y: 2 }) { _ => 0 } }");
+    assert(r.ok());
+    const auto& body = *r.program.functions[0].body;
+    const auto* me = dynamic_cast<const ast::MatchExpr*>(body.tail.get());
+    assert(me != nullptr);
+    const auto* sc = dynamic_cast<const ast::StructLitExpr*>(me->scrutinee.get());
+    assert(sc && sc->structName == "Point");
+    assert(sc->fields.size() == 2);
+    assert(me->arms.size() == 1);
+    assert(dynamic_cast<const ast::WildPat*>(me->arms[0].pattern.get()) != nullptr);
+}
+
+void test_match_trailing_comma() {
+    auto r = parseWrapped("match x { 0 => 1, _ => 2, }");
+    const auto* me = dynamic_cast<const ast::MatchExpr*>(tailExprOf(r));
+    assert(me != nullptr);
+    assert(me->arms.size() == 2);
+}
+
+void test_mixed_program_enum_and_fn() {
+    auto r = parse(
+        "enum Maybe { Some(i64), None } "
+        "struct S { x: i64 } "
+        "fn f(m: Maybe) -> i64 { match m { Some(v) => v, None => 0 } }");
+    assert(r.ok());
+    assert(r.program.enums.size() == 1);
+    assert(r.program.structs.size() == 1);
+    assert(r.program.functions.size() == 1);
+    assert(r.program.enums[0].name == "Maybe");
+    assert(r.program.enums[0].variants.size() == 2);
+    assert(r.program.structs[0].name == "S");
+    const auto& fn = r.program.functions[0];
+    assert(fn.name == "f");
+    assert(fn.params.size() == 1 && fn.params[0].type.name == "Maybe");
+    const auto* me = dynamic_cast<const ast::MatchExpr*>(fn.body->tail.get());
+    assert(me != nullptr);
+    assert(me->arms.size() == 2);
+}
+
 } // namespace
 
 int main() {
@@ -381,6 +562,20 @@ int main() {
     test_if_cond_no_struct_lit();
     test_mixed_program_struct_then_fn();
     test_mixed_program_fn_then_struct();
-    std::cout << "All parser tests passed (24 cases)\n";
+    test_enum_decl_empty();
+    test_enum_decl_single_unit_variant();
+    test_enum_decl_multi_unit_trailing_comma();
+    test_enum_decl_tuple_payload();
+    test_enum_decl_multi_arg_tuple_variant();
+    test_match_literal_pats();
+    test_match_wildcard_only();
+    test_match_var_binding();
+    test_match_ctor_pat_unit();
+    test_match_ctor_pat_nested();
+    test_match_scrutinee_no_struct_lit_without_parens();
+    test_match_scrutinee_struct_lit_parenthesized();
+    test_match_trailing_comma();
+    test_mixed_program_enum_and_fn();
+    std::cout << "All parser tests passed (37 cases)\n";
     return 0;
 }

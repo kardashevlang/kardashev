@@ -1,10 +1,12 @@
 // Untyped AST for the kardashev V1 surface syntax.
 //
 // Grammar (informal):
-//   program       := (fn_decl | struct_decl)*
+//   program       := (fn_decl | struct_decl | enum_decl)*
 //   fn_decl       := 'fn' Ident '(' params? ')' '->' type_ref block_expr
 //   struct_decl   := 'struct' Ident '{' field_decl (',' field_decl)* ','? '}'
 //   field_decl    := Ident ':' type_ref
+//   enum_decl     := 'enum' Ident '{' (variant (',' variant)* ','?)? '}'
+//   variant       := Ident ('(' type_ref (',' type_ref)* ','? ')')?
 //   params        := param (',' param)*
 //   param         := Ident ':' type_ref
 //   type_ref      := Ident                       -- e.g. i64
@@ -17,12 +19,16 @@
 //   expr          := <pratt-parsed binary>
 //                 |  postfix
 //   postfix       := primary ('.' Ident)*        -- field access
-//   primary       := Integer | Ident | call | struct_lit | '(' expr ')' | if_expr | block_expr
+//   primary       := Integer | Ident | call | struct_lit | '(' expr ')' | if_expr | block_expr | match_expr
 //   call          := Ident '(' arglist? ')'
 //   arglist       := expr (',' expr)*
 //   struct_lit    := Ident '{' (field_init (',' field_init)* ','?)? '}'
 //   field_init    := Ident ':' expr
 //   if_expr       := 'if' expr block_expr 'else' block_expr
+//   match_expr    := 'match' expr '{' (arm (',' arm)* ','?)? '}'
+//   arm           := pattern '=>' expr
+//   pattern       := Integer | '_' | Ident                       -- LitInt, Wild, or VarBind
+//                 |  Ident '(' (pattern (',' pattern)* ','?)? ')' -- Ctor
 //
 // Precedence (low to high): comparisons < additive < multiplicative.
 //
@@ -62,6 +68,38 @@ struct Stmt {
     virtual ~Stmt() = default;
 };
 using StmtPtr = std::unique_ptr<Stmt>;
+
+// --- Patterns ---
+//
+// Patterns form their own polymorphic hierarchy, used as the left-hand side
+// of match arms. A bare `Ident` in pattern position is intentionally
+// ambiguous between a variable binding (`VarPat`) and a unit constructor
+// (`CtorPat` with zero subpatterns). The parser always produces `VarPat`
+// at parse time (simpler grammar, no constructor-table lookup mid-parse);
+// the typechecker rewrites the semantics to a unit-ctor match when the
+// name resolves to a known constructor in scope. Parenthesized
+// `Ident(...)` forms are unambiguously `CtorPat` from the start.
+struct Pattern {
+    std::size_t line = 1;
+    std::size_t column = 1;
+    virtual ~Pattern() = default;
+};
+using PatternPtr = std::unique_ptr<Pattern>;
+
+struct LitIntPat : Pattern {
+    std::int64_t value = 0;
+};
+
+struct WildPat : Pattern {};
+
+struct VarPat : Pattern {
+    std::string name;
+};
+
+struct CtorPat : Pattern {
+    std::string ctorName;
+    std::vector<PatternPtr> subpatterns;
+};
 
 // --- Expressions ---
 
@@ -105,6 +143,18 @@ struct IfExpr : Expr {
 struct BlockExpr : Expr {
     std::vector<StmtPtr> stmts;
     ExprPtr tail; // optional; null means the block has no value (unit)
+};
+
+struct MatchArm {
+    PatternPtr pattern;
+    ExprPtr body;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
+struct MatchExpr : Expr {
+    ExprPtr scrutinee;
+    std::vector<MatchArm> arms;
 };
 
 // --- Statements ---
@@ -151,9 +201,24 @@ struct StructDecl {
     std::size_t column = 1;
 };
 
+struct EnumVariant {
+    std::string name;
+    std::vector<TypeRef> payloadTypes; // empty => unit variant; non-empty => tuple-payload
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
+struct EnumDecl {
+    std::string name;
+    std::vector<EnumVariant> variants;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
 struct Program {
     std::vector<FnDecl> functions;
     std::vector<StructDecl> structs;
+    std::vector<EnumDecl> enums;
 };
 
 } // namespace kardashev::ast
