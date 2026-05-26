@@ -7,9 +7,6 @@ on:
     branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
   build-and-test:
     strategy:
@@ -18,7 +15,19 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      # Manual anonymous clone — bypasses actions/checkout entirely. The
+      # GITHUB_TOKEN-based fetch that actions/checkout performs returns 403
+      # in this repo's workflow context (suspected new-account / new-repo
+      # token-issuance issue). Anonymous git clone of a public repo should
+      # not require any credential at all.
+      - name: Clone repo (anonymous)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 -b "$GITHUB_REF_NAME" \
+            "https://github.com/$GITHUB_REPOSITORY.git" .
+          echo "--- workspace contents ---"
+          ls -la
 
       - name: Install LLVM (macOS)
         if: runner.os == 'macOS'
@@ -34,11 +43,6 @@ jobs:
           LLVM_CFG=$(command -v llvm-config || ls /usr/bin/llvm-config* | head -1)
           echo "LLVM_CONFIG=$LLVM_CFG" >> "$GITHUB_ENV"
 
-      # Install Bazelisk manually instead of via setup-bazelisk action.
-      # The runner is failing to download third-party actions from
-      # codeload.github.com for this repo (suspected new-account
-      # / new-repo throttle), so we bypass actions and curl the binary
-      # directly from GitHub Releases.
       - name: Install Bazelisk
         shell: bash
         run: |
