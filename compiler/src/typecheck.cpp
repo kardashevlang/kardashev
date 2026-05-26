@@ -4,6 +4,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include "kardashev/pattern_match.hpp"
+
 namespace kardashev {
 namespace {
 
@@ -468,6 +470,11 @@ private:
             }
         }
         if (!unified) unified = makeFreshVar();
+        if (auto w = pattern_match::checkExhaustiveness(
+                scrutT, me.arms, enums_, variantIndex_)) {
+            error("non-exhaustive match: missing pattern `" + w->text + "`",
+                  me.line, me.column);
+        }
         return unified;
     }
 

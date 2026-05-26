@@ -43,6 +43,19 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":ast",
+        ":pattern_match",
+        ":types",
+    ],
+)
+
+cc_library(
+    name = "pattern_match",
+    srcs = ["src/pattern_match.cpp"],
+    hdrs = ["include/kardashev/pattern_match.hpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":ast",
         ":types",
     ],
 )

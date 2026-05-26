@@ -454,6 +454,100 @@ void test_match_integer_pattern_on_enum_errors() {
         "match_integer_pattern_on_enum_errors");
 }
 
+// ---- Phase 2.3a: exhaustiveness ----
+
+void expectErrContains(const std::string& src, const std::string& needle,
+                       const char* label) {
+    auto r = tc(src);
+    if (r.ok()) {
+        std::cerr << "[" << label << "] expected typecheck error, none "
+                     "raised\n";
+        std::abort();
+    }
+    for (const auto& e : r.errors) {
+        if (e.message.find(needle) != std::string::npos) return;
+    }
+    std::cerr << "[" << label << "] expected error containing \"" << needle
+              << "\", got:\n";
+    dump(r);
+    std::abort();
+}
+
+void test_exhaustive_missing_none() {
+    expectErrContains(
+        "enum Maybe { Some(i64), None }\n"
+        "fn f(m: Maybe) -> i64 {\n"
+        "    match m { Some(x) => x, }\n"
+        "}",
+        "None",
+        "exhaustive_missing_none");
+}
+
+void test_exhaustive_missing_some() {
+    expectErrContains(
+        "enum Maybe { Some(i64), None }\n"
+        "fn f(m: Maybe) -> i64 {\n"
+        "    match m { None => 0, }\n"
+        "}",
+        "Some(_)",
+        "exhaustive_missing_some");
+}
+
+void test_exhaustive_missing_wildcard_int() {
+    expectErrContains(
+        "fn f(n: i64) -> i64 {\n"
+        "    match n { 0 => 0, 1 => 1, }\n"
+        "}",
+        "_",
+        "exhaustive_missing_wildcard_int");
+}
+
+void test_exhaustive_int_with_wildcard_ok() {
+    expectOk(
+        "fn f(n: i64) -> i64 {\n"
+        "    match n { 0 => 0, 1 => 1, _ => 99 }\n"
+        "}",
+        "exhaustive_int_with_wildcard_ok");
+}
+
+void test_exhaustive_missing_color() {
+    expectErrContains(
+        "enum Color { Red, Green, Blue }\n"
+        "fn f(c: Color) -> i64 {\n"
+        "    match c { Red => 1, Green => 2, }\n"
+        "}",
+        "Blue",
+        "exhaustive_missing_color");
+}
+
+void test_exhaustive_color_full_ok() {
+    expectOk(
+        "enum Color { Red, Green, Blue }\n"
+        "fn f(c: Color) -> i64 {\n"
+        "    match c { Red => 1, Green => 2, Blue => 3 }\n"
+        "}",
+        "exhaustive_color_full_ok");
+}
+
+void test_exhaustive_nested_missing_inner() {
+    expectErrContains(
+        "enum I { A, B }\n"
+        "enum O { O(I), N }\n"
+        "fn f(o: O) -> i64 {\n"
+        "    match o { O(A) => 1, N => 0, }\n"
+        "}",
+        "O(B)",
+        "exhaustive_nested_missing_inner");
+}
+
+void test_exhaustive_var_binding_catchall_ok() {
+    expectOk(
+        "fn f(n: i64) -> i64 {\n"
+        "    match n { x => x }\n"
+        "}",
+        "exhaustive_var_binding_catchall_ok");
+}
+
 void test_match_records_unified_result_type() {
     auto pr = kardashev::parse(
         "enum Maybe { Some(i64), None }\n"
@@ -541,6 +635,15 @@ int main() {
     test_match_var_binding_pattern();
     test_match_integer_pattern_on_enum_errors();
     test_match_records_unified_result_type();
-    std::cout << "All typecheck tests passed (56 cases)\n";
+    // Phase 2.3a exhaustiveness
+    test_exhaustive_missing_none();
+    test_exhaustive_missing_some();
+    test_exhaustive_missing_wildcard_int();
+    test_exhaustive_int_with_wildcard_ok();
+    test_exhaustive_missing_color();
+    test_exhaustive_color_full_ok();
+    test_exhaustive_nested_missing_inner();
+    test_exhaustive_var_binding_catchall_ok();
+    std::cout << "All typecheck tests passed (64 cases)\n";
     return 0;
 }
