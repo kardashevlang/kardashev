@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          echo "/opt/homebrew/opt/llvm/bin" >> "$GITHUB_PATH"
+
+      - name: Install LLVM (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev clang
+          # apt installs versioned llvm-config (e.g. llvm-config-19); surface it.
+          LLVM_CFG=$(command -v llvm-config || ls /usr/bin/llvm-config* | head -1)
+          echo "LLVM_CONFIG=$LLVM_CFG" >> "$GITHUB_ENV"
+
+      - name: Set up Bazel (bazelisk)
+        uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Bazel build
+        run: bazel build //...
+
+      - name: Bazel test
+        run: bazel test //... --test_output=errors

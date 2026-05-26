@@ -1,0 +1,16 @@
+common --color=yes
+test --test_output=errors
+
+build --cxxopt=-std=c++17
+build --host_cxxopt=-std=c++17
+
+# Useful baseline warnings; -Werror is opt-in per-target via copts.
+build --cxxopt=-Wall
+build --cxxopt=-Wextra
+build --host_cxxopt=-Wall
+build --host_cxxopt=-Wextra
+
+# LLVM headers emit thousands of -Wunused-parameter warnings; silence them
+# globally since they are out of our control and dominate the build log.
+build --cxxopt=-Wno-unused-parameter
+build --host_cxxopt=-Wno-unused-parameter

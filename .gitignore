@@ -1,6 +1,6 @@
 # Bazel
 bazel-*
-MODULE.bazel.lock
+# MODULE.bazel.lock is committed for reproducible dependency resolution.
 
 # Build artifacts
 build/
