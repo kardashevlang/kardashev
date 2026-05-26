@@ -35,8 +35,12 @@ jobs:
           LLVM_CFG=$(command -v llvm-config || ls /usr/bin/llvm-config* | head -1)
           echo "LLVM_CONFIG=$LLVM_CFG" >> "$GITHUB_ENV"
 
-      - name: Set up Bazel (bazelisk)
-        uses: bazelbuild/setup-bazelisk@v3
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@0.10.0
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+          disk-cache: ${{ github.workflow }}-${{ matrix.os }}
 
       - name: Bazel build
         run: bazel build //...
