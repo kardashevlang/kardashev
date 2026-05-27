@@ -27,6 +27,7 @@ TokenKind keywordOrIdent(std::string_view s) {
     if (s == "impl") return TokenKind::KwImpl;
     if (s == "for") return TokenKind::KwFor;
     if (s == "mod") return TokenKind::KwMod;
+    if (s == "pub") return TokenKind::KwPub;
     // A bare `_` is the wildcard pattern; `_foo` stays an Identifier.
     if (s == "_") return TokenKind::Underscore;
     return TokenKind::Identifier;
@@ -132,6 +133,10 @@ std::vector<Token> lex(std::string_view source) {
             push2(TokenKind::Ge, startCol);
             continue;
         }
+        if (c == ':' && n == ':') {
+            push2(TokenKind::DoubleColon, startCol);
+            continue;
+        }
 
         // Single-char tokens.
         switch (c) {
@@ -182,6 +187,8 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::KwImpl: return "KwImpl";
     case TokenKind::KwFor: return "KwFor";
     case TokenKind::KwMod: return "KwMod";
+    case TokenKind::KwPub: return "KwPub";
+    case TokenKind::DoubleColon: return "DoubleColon";
     case TokenKind::Plus: return "Plus";
     case TokenKind::Minus: return "Minus";
     case TokenKind::Star: return "Star";

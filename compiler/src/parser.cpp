@@ -29,6 +29,29 @@ public:
                 prog.impls.push_back(parseImplDecl());
             } else if (check(TokenKind::KwMod)) {
                 prog.mods.push_back(parseModDecl());
+            } else if (check(TokenKind::KwPub)) {
+                // Phase 7.2: `pub` accepted as a visibility marker but,
+                // because Phase 7.1 still flat-merges all modules into
+                // one namespace, treated as a no-op for routing. Drives
+                // the right surface syntax for libraries that want to
+                // declare public APIs explicitly today and pick up
+                // enforcement when path-qualified resolution lands.
+                advance();
+                if (check(TokenKind::KwFn)) {
+                    prog.functions.push_back(parseFnDecl());
+                } else if (check(TokenKind::KwStruct)) {
+                    prog.structs.push_back(parseStructDecl());
+                } else if (check(TokenKind::KwEnum)) {
+                    prog.enums.push_back(parseEnumDecl());
+                } else if (check(TokenKind::KwTrait)) {
+                    prog.traits.push_back(parseTraitDecl());
+                } else if (check(TokenKind::KwImpl)) {
+                    prog.impls.push_back(parseImplDecl());
+                } else {
+                    errorHere("`pub` must precede fn / struct / enum / "
+                              "trait / impl");
+                    advance();
+                }
             } else {
                 errorHere(std::string("expected 'fn', 'struct', 'enum', "
                                       "'trait', 'impl' or 'mod' at top "
@@ -219,6 +242,21 @@ private:
         return v;
     }
 
+    // Phase 7.2 helper: consume `foo::bar::baz` and return just the last
+    // segment as the name. Phase 7.1 flat-merges modules into a single
+    // namespace, so a path qualifier is currently informational only —
+    // it documents intent without changing resolution. When modules
+    // gain real namespacing the path can be plumbed through unchanged.
+    Token consumePathName(const char* what) {
+        Token first = expect(TokenKind::Identifier, what);
+        Token last = first;
+        while (check(TokenKind::DoubleColon)) {
+            consume();
+            last = expect(TokenKind::Identifier, "identifier after `::`");
+        }
+        return last;
+    }
+
     ast::TypeRef parseTypeRef() {
         // Reference prefix: `&` or `&mut` wraps the rest of the type.
         // Phase 2.4b: shared `&T`. Phase 2.4c: `&mut T`. Currently we
@@ -235,7 +273,7 @@ private:
                 refIsMut = true;
             }
         }
-        Token t = expect(TokenKind::Identifier, "type name");
+        Token t = consumePathName("type name");
         ast::TypeRef tr;
         tr.name = t.lexeme;
         tr.isRef = isRef;
@@ -599,7 +637,21 @@ private:
         }
 
         if (t.kind == TokenKind::Identifier) {
-            Token tok = consume();
+            // Phase 7.2: paths (`foo::bar`) collapse to their last
+            // segment because modules currently flat-merge into one
+            // namespace. We still consume the path so the grammar
+            // accepts canonical multi-segment names without complaint.
+            Token first = consume();
+            Token tok = first;
+            while (check(TokenKind::DoubleColon)) {
+                consume();
+                tok = expect(TokenKind::Identifier,
+                              "identifier after `::`");
+            }
+            // Preserve the first-segment's position for diagnostics
+            // since that's where the user's path begins.
+            tok.line = first.line;
+            tok.column = first.column;
             if (check(TokenKind::LParen)) {
                 advance(); // consume '('
                 auto call = std::make_unique<ast::CallExpr>();

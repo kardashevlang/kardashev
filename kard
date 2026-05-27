@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# kard — thin user-facing driver around the kardc binary.
+#
+# Subcommands:
+#   kard build <file.kd>     # AOT-compile to ./<file> (drops .kd)
+#   kard build <file.kd> -o <out>
+#                            # AOT-compile to a custom path
+#   kard run   <file.kd>     # JIT-run main()
+#   kard repl                # interactive REPL
+#   kard help                # this message
+#
+# Resolves kardc by checking, in order:
+#   1. $KARDC env var, if set
+#   2. ./compiler/kardc (Bazel default output)
+#   3. ./build.local/kardc (Makefile.local output)
+#   4. kardc on PATH
+set -euo pipefail
+
+find_kardc() {
+    if [[ -n "${KARDC:-}" ]]; then
+        echo "$KARDC"
+        return
+    fi
+    local here
+    here=$(cd "$(dirname "$0")" && pwd)
+    for candidate in \
+        "$here/compiler/kardc" \
+        "$here/build.local/kardc" \
+        "$here/bazel-bin/compiler/kardc"; do
+        if [[ -x "$candidate" ]]; then
+            echo "$candidate"
+            return
+        fi
+    done
+    if command -v kardc >/dev/null 2>&1; then
+        command -v kardc
+        return
+    fi
+    echo "kard: cannot find a kardc binary. Set \$KARDC or run from the repo." >&2
+    exit 1
+}
+
+KARDC_BIN=$(find_kardc)
+
+usage() {
+    sed -n '2,11p' "$0" | sed 's/^# *//'
+}
+
+cmd=${1:-help}
+shift || true
+
+case "$cmd" in
+    build)
+        if [[ $# -eq 0 ]]; then
+            echo "kard build: missing file" >&2
+            exit 2
+        fi
+        file=$1; shift
+        if [[ $# -ge 2 && "$1" == "-o" ]]; then
+            out=$2; shift 2
+        else
+            out=$(basename "$file" .kd)
+        fi
+        exec "$KARDC_BIN" -o "$out" "$file" "$@"
+        ;;
+    run)
+        if [[ $# -eq 0 ]]; then
+            echo "kard run: missing file" >&2
+            exit 2
+        fi
+        exec "$KARDC_BIN" "$@"
+        ;;
+    repl)
+        exec "$KARDC_BIN"
+        ;;
+    help|--help|-h)
+        usage
+        ;;
+    *)
+        echo "kard: unknown subcommand `$cmd`" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
