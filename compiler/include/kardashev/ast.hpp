@@ -182,6 +182,14 @@ struct RefExpr : Expr {
     bool isMut = false;
 };
 
+// Phase 6 (stub): `expr.await` postfix. Today this is a no-op at both
+// typecheck and codegen (the operand's type / value flow through
+// unchanged); once a state-machine transform lands this becomes the
+// suspend point of the enclosing async fn.
+struct AwaitExpr : Expr {
+    ExprPtr operand;
+};
+
 struct MatchExpr : Expr {
     ExprPtr scrutinee;
     std::vector<MatchArm> arms;
@@ -260,6 +268,8 @@ struct FnDecl {
     std::vector<Param> params;
     TypeRef returnType;
     EffectRow effects; // Phase 4: declared effect row; empty = pure
+    bool isAsync = false; // Phase 6 (stub): `async fn` desugars to a fn
+                            // that implicitly carries the `async` effect.
     std::unique_ptr<BlockExpr> body;
     std::size_t line = 1;
     std::size_t column = 1;

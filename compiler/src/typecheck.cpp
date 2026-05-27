@@ -335,6 +335,11 @@ public:
             schema.declaredEffects = buildEffectSet(fn.effects,
                                                        fn.genericParams,
                                                        fn.name);
+            // Phase 6 (stub): `async fn` implicitly carries the
+            // `async` effect, so a caller still has to opt in via
+            // its own effect row. Adding it here piggybacks on the
+            // existing Phase 4 inference / propagation machinery.
+            if (fn.isAsync) schema.declaredEffects.add("async");
             fnSchemas_[fn.name] = std::move(schema);
         }
         // Pass 1e: register each impl method as a regular fn schema under
@@ -377,6 +382,7 @@ public:
                 sch.declaredEffects = buildEffectSet(fn.effects,
                                                        fn.genericParams,
                                                        fn.name);
+                if (fn.isAsync) sch.declaredEffects.add("async");
                 fnSchemas_[mangled] = std::move(sch);
                 implMethodMangled_[&fn] = mangled;
             }
@@ -577,6 +583,10 @@ private:
         }
         if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
             collectEffects(*re->operand, out);
+            return;
+        }
+        if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
+            collectEffects(*ae->operand, out);
             return;
         }
     }
@@ -1019,6 +1029,13 @@ private:
             // borrowing temporaries — would require a stack-spill rule).
             TypePtr inner = checkExpr(*re->operand);
             return makeRef(inner, re->isMut);
+        }
+        if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
+            // Phase 6 (stub): `expr.await` passes its operand's type
+            // through. When a state-machine transform lands this will
+            // strip a `Future<T>` wrapper and yield `T`; today the
+            // operand IS the value.
+            return checkExpr(*ae->operand);
         }
         error("unknown expression kind", e.line, e.column);
         return makeInt();

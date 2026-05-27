@@ -212,6 +212,12 @@ private:
             prePass(*re->operand);
             return;
         }
+        if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
+            // Phase 6 (stub): `.await` consumes its operand. Walk to
+            // keep lastUsePos accurate.
+            prePass(*ae->operand);
+            return;
+        }
     }
 
     void prePassBlock(const ast::BlockExpr& block) {
@@ -366,6 +372,11 @@ private:
         }
         if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
             return handleRefExpr(*re, expectExpire);
+        }
+        if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
+            // Phase 6 (stub): `.await` consumes its operand.
+            return std::max(lastInSubtree,
+                            consume(*ae->operand, expectExpire));
         }
         return lastInSubtree;
     }

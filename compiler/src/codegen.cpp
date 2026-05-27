@@ -907,6 +907,13 @@ private:
         if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
             return emitRef(*re);
         }
+        if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
+            // Phase 6 (stub): `.await` is currently a value-pass-
+            // through. Once the state-machine transform lands this will
+            // become the suspend point that yields control to the
+            // executor; today it's just emitExpr(operand).
+            return emitExpr(*ae->operand);
+        }
         errors_.push_back("codegen: unknown expression kind");
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
     }

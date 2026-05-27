@@ -17,7 +17,10 @@ public:
         ast::Program prog;
         while (!check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
-            if (check(TokenKind::KwFn)) {
+            if (check(TokenKind::KwFn) ||
+                (peek().kind == TokenKind::Identifier &&
+                 peek().lexeme == "async" &&
+                 peek(1).kind == TokenKind::KwFn)) {
                 prog.functions.push_back(parseFnDecl());
             } else if (check(TokenKind::KwStruct)) {
                 prog.structs.push_back(parseStructDecl());
@@ -121,8 +124,22 @@ private:
     }
 
     ast::FnDecl parseFnDecl() {
+        // Phase 6 (stub): `async fn` optional prefix marks the fn body
+        // for state-machine transform. Today the transform is a no-op
+        // but the typechecker implicitly adds `async` to the effect row.
+        // `async` stays as an Identifier (not a keyword) so it can also
+        // appear in effect-row labels like `! { async }`; we detect it
+        // by lexeme here.
+        bool isAsync = false;
+        if (peek().kind == TokenKind::Identifier &&
+            peek().lexeme == "async" &&
+            peek(1).kind == TokenKind::KwFn) {
+            advance();
+            isAsync = true;
+        }
         Token fnTok = expect(TokenKind::KwFn, "fn");
         ast::FnDecl decl;
+        decl.isAsync = isAsync;
         decl.line = fnTok.line;
         decl.column = fnTok.column;
 
@@ -403,8 +420,16 @@ private:
     // Like parseFnDecl but with parseSelfOrParam for the first param so
     // the `self` shorthand works.
     ast::FnDecl parseImplFnDecl() {
+        bool isAsync = false;
+        if (peek().kind == TokenKind::Identifier &&
+            peek().lexeme == "async" &&
+            peek(1).kind == TokenKind::KwFn) {
+            advance();
+            isAsync = true;
+        }
         Token fnTok = expect(TokenKind::KwFn, "fn");
         ast::FnDecl decl;
+        decl.isAsync = isAsync;
         decl.line = fnTok.line;
         decl.column = fnTok.column;
         Token nameTok = expect(TokenKind::Identifier, "function name");
@@ -556,6 +581,25 @@ private:
         while (true) {
             if (check(TokenKind::Dot)) {
                 Token dotTok = consume();
+                // Phase 6 (stub): `.await` is a postfix operator. We
+                // recognise `await` by lexeme (it stays an Identifier
+                // so the same word can appear as an effect label).
+                // Distinguish from a field literally named `await` by
+                // the fact that AwaitExpr is consumed without args; if
+                // a future syntax wants `obj.await(x)` we'll branch on
+                // a following `(`.
+                if (peek().kind == TokenKind::Identifier &&
+                    peek().lexeme == "await" &&
+                    peek(1).kind != TokenKind::LParen) {
+                    Token awTok = consume();
+                    auto ae = std::make_unique<ast::AwaitExpr>();
+                    ae->line = dotTok.line;
+                    ae->column = dotTok.column;
+                    ae->operand = std::move(expr);
+                    (void)awTok;
+                    expr = std::move(ae);
+                    continue;
+                }
                 Token nameTok = expect(TokenKind::Identifier, "field name after '.'");
                 // `.name(args)` is a method call; `.name` alone is field
                 // access. The distinction matters: method calls route
