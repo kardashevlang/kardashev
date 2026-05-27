@@ -1483,6 +1483,43 @@ private:
     }
 
     TypePtr checkCall(const ast::CallExpr& call) {
+        // Phase 4.3: first-class fn values. If the call's callee name
+        // resolves to a local binding with a Function type, this is an
+        // indirect call through a fn pointer. We type-check the arg
+        // list against the binding's signature and return its ret type.
+        // Bare names still resolve through fnSchemas_ first (so a let-
+        // shadowing a top-level fn doesn't accidentally indirect-call
+        // when the user expected the direct one — symmetry with the
+        // expression-eval path).
+        if (auto local = lookupLocal(call.callee)) {
+            TypePtr r = resolve(local);
+            if (r->kind == TypeKind::Function) {
+                if (r->args.size() != call.args.size()) {
+                    error("indirect call to '" + call.callee +
+                              "' expects " +
+                              std::to_string(r->args.size()) +
+                              " arg(s), got " +
+                              std::to_string(call.args.size()),
+                          call.line, call.column);
+                }
+                const std::size_t n =
+                    std::min(r->args.size(), call.args.size());
+                for (std::size_t i = 0; i < n; ++i) {
+                    TypePtr argType = checkExpr(*call.args[i]);
+                    if (!unify(argType, r->args[i])) {
+                        error("argument " + std::to_string(i + 1) +
+                                  " of indirect call to '" + call.callee +
+                                  "' has type " + typeToString(argType) +
+                                  ", expected " + typeToString(r->args[i]),
+                              call.args[i]->line, call.args[i]->column);
+                    }
+                }
+                for (std::size_t i = n; i < call.args.size(); ++i) {
+                    checkExpr(*call.args[i]);
+                }
+                return r->ret;
+            }
+        }
         auto fnIt = fnSchemas_.find(call.callee);
         if (fnIt != fnSchemas_.end()) {
             const FnSchema& schema = fnIt->second;

@@ -189,6 +189,10 @@ private:
 
     // Per-fn locals: variable name -> alloca pointer.
     std::unordered_map<std::string, llvm::AllocaInst*> locals_;
+    // Phase 4.3: per-fn binding -> kardashev TypePtr, used by emitCall
+    // to recover the FunctionType for indirect calls through a let-bound
+    // fn-pointer. Empty for non-fn-typed bindings; we just don't query.
+    std::unordered_map<std::string, TypePtr> localTypes_;
     llvm::Function* currentFn_ = nullptr;
     // Kardashev-level return type of currentFn_, resolved through the
     // instance substitution. Used by emitTry to build the propagated
@@ -999,6 +1003,12 @@ private:
                 builder_->CreateAlloca(v->getType(), nullptr, let->name);
             builder_->CreateStore(v, alloca);
             locals_[let->name] = alloca;
+            // Phase 4.3: remember the kardashev type so emitCall can
+            // do indirect dispatch through fn-pointer locals.
+            auto tyIt = tc_.exprTypes.find(let->value.get());
+            if (tyIt != tc_.exprTypes.end()) {
+                localTypes_[let->name] = tyIt->second;
+            }
             return;
         }
         if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(&s)) {
@@ -1031,6 +1041,13 @@ private:
                 auto* alloca = it->second;
                 return builder_->CreateLoad(alloca->getAllocatedType(),
                                             alloca, id->name);
+            }
+            // Phase 4.3: a bare fn name evaluated in expression
+            // position yields the LLVM Function* (already a pointer).
+            // That lets `let f = my_fn` capture a callable by value.
+            if (auto fnIt = declaredFns_.find(id->name);
+                fnIt != declaredFns_.end()) {
+                return fnIt->second;
             }
             // Fall back to unit-variant constructor (e.g. `None`).
             auto vit = tc_.variantIndex.find(id->name);
@@ -1072,15 +1089,58 @@ private:
             return emitRef(*re);
         }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
-            // Phase 6.1: `.await` extracts the inner result field of
-            // the Future the operand evaluates to. With no real
-            // suspension primitives in kardashev today, the executor
-            // is the calling code itself — every Future is already
-            // Ready when produced, so the unwrap is a single
-            // ExtractValue. The state slot stays in the IR for future
-            // expansion (suspension points, drop ordering, etc).
+            // Phase 6.2: `.await` lowers to an inline poll loop — the
+            // synchronous "executor" baked into the call site. Future
+            // is spilled to a stack alloca so a future suspension
+            // primitive can swap state across iterations; today every
+            // Future is built with state == READY (1), so the loop
+            // exits on the first check. The IR shape is the textbook
+            // state-machine + executor pairing:
+            //
+            //   alloca Future fut_slot
+            //   store <operand result>, fut_slot
+            //   br .poll
+            // .poll:
+            //   state = load fut_slot.state
+            //   br state == READY, .done, .pending
+            // .pending:
+            //   ; future: yield to scheduler, advance state via poll()
+            //   br .poll
+            // .done:
+            //   result = load fut_slot.result
+            auto& ctx = *ctx_;
+            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+            auto* futureTy = structTypes_["Future"];
             llvm::Value* fut = emitExpr(*ae->operand);
-            return builder_->CreateExtractValue(fut, {1}, "await_result");
+            auto* slot = builder_->CreateAlloca(
+                futureTy, nullptr, "fut_slot");
+            builder_->CreateStore(fut, slot);
+            auto* pollBB = llvm::BasicBlock::Create(ctx, "await.poll",
+                                                     currentFn_);
+            auto* pendingBB = llvm::BasicBlock::Create(ctx, "await.pending",
+                                                        currentFn_);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "await.done",
+                                                     currentFn_);
+            builder_->CreateBr(pollBB);
+            builder_->SetInsertPoint(pollBB);
+            auto* statePtr = builder_->CreateStructGEP(
+                futureTy, slot, 0, "fut_state_ptr");
+            auto* state = builder_->CreateLoad(i64Ty, statePtr, "fut_state");
+            auto* isReady = builder_->CreateICmpEQ(
+                state, llvm::ConstantInt::get(i64Ty, 1),
+                "await.is_ready");
+            builder_->CreateCondBr(isReady, doneBB, pendingBB);
+            builder_->SetInsertPoint(pendingBB);
+            // No scheduler primitive yet — spin back to poll. This
+            // branch is unreachable for any Future our codegen builds
+            // today (they all initialise to state=READY), but the IR
+            // is shaped so a future `kd_yield`-style intrinsic plugs
+            // in here.
+            builder_->CreateBr(pollBB);
+            builder_->SetInsertPoint(doneBB);
+            auto* resultPtr = builder_->CreateStructGEP(
+                futureTy, slot, 1, "fut_result_ptr");
+            return builder_->CreateLoad(i64Ty, resultPtr, "await_result");
         }
         errors_.push_back("codegen: unknown expression kind");
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
@@ -1231,6 +1291,37 @@ private:
     }
 
     llvm::Value* emitCall(const ast::CallExpr& call) {
+        // Phase 4.3: indirect call through a let-bound fn-pointer. We
+        // try this BEFORE the direct/generic paths so a binding that
+        // shadows a top-level fn dispatches through the binding (matches
+        // the typechecker's order).
+        if (auto localIt = locals_.find(call.callee);
+            localIt != locals_.end()) {
+            auto tyIt = localTypes_.find(call.callee);
+            if (tyIt != localTypes_.end()) {
+                TypePtr fnTy = resolve(tyIt->second);
+                if (fnTy->kind == TypeKind::Function) {
+                    std::vector<llvm::Type*> argTs;
+                    argTs.reserve(fnTy->args.size());
+                    for (const auto& a : fnTy->args) {
+                        argTs.push_back(mapKardashevType(a));
+                    }
+                    auto* retT = mapKardashevType(fnTy->ret);
+                    auto* llvmFnTy = llvm::FunctionType::get(
+                        retT, argTs, /*isVarArg=*/false);
+                    auto* fnPtr = builder_->CreateLoad(
+                        localIt->second->getAllocatedType(),
+                        localIt->second, call.callee);
+                    std::vector<llvm::Value*> args;
+                    args.reserve(call.args.size());
+                    for (const auto& a : call.args) {
+                        args.push_back(emitExpr(*a));
+                    }
+                    return builder_->CreateCall(
+                        llvmFnTy, fnPtr, args, "indir_" + call.callee);
+                }
+            }
+        }
         // Generic callee: pick the right monomorphic instance from the
         // call-site type args recorded by the typechecker, resolving them
         // through the current instance's substitution so a generic fn
