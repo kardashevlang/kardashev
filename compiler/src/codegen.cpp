@@ -14,8 +14,11 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Passes/OptimizationLevel.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace kardashev {
@@ -104,6 +107,26 @@ public:
         llvm::raw_string_ostream os(verifyErrs);
         if (llvm::verifyModule(*module_, &os)) {
             errors_.push_back("module verification failed: " + verifyErrs);
+        } else {
+            // Phase 8.1: run LLVM's default O2 pipeline so the module
+            // codegen hands off to JIT / AOT is release-quality (mem2reg
+            // collapses our alloca-heavy bindings, inliner cleans up the
+            // built-in `print` wrapper, instcombine + GVN + DCE handle
+            // the rest). Skip optimizing if verification already failed
+            // — opt passes would compound the diagnostic.
+            llvm::PassBuilder pb;
+            llvm::LoopAnalysisManager lam;
+            llvm::FunctionAnalysisManager fam;
+            llvm::CGSCCAnalysisManager cam;
+            llvm::ModuleAnalysisManager mam;
+            pb.registerModuleAnalyses(mam);
+            pb.registerCGSCCAnalyses(cam);
+            pb.registerFunctionAnalyses(fam);
+            pb.registerLoopAnalyses(lam);
+            pb.crossRegisterProxies(lam, fam, cam, mam);
+            auto mpm = pb.buildPerModuleDefaultPipeline(
+                llvm::OptimizationLevel::O2);
+            mpm.run(*module_, mam);
         }
         return {std::move(ctx_), std::move(module_), std::move(errors_)};
     }

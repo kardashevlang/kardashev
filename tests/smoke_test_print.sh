@@ -78,8 +78,8 @@ if [[ "$rc" -eq 0 ]]; then
     echo "FAIL: pure caller of print should be a typecheck error"
     exit 1
 fi
-if ! echo "$ERR_OUT" | grep -q "effect \`io\`"; then
-    echo "FAIL: expected `io` effect-undeclared diagnostic, got:"
+if ! echo "$ERR_OUT" | grep -q 'effect `io`'; then
+    echo 'FAIL: expected `io` effect-undeclared diagnostic, got:'
     echo "$ERR_OUT"
     exit 1
 fi
