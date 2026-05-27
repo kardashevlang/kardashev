@@ -841,6 +841,37 @@ void test_try_chained_after_dot() {
     assert(call->args.empty());
 }
 
+void test_effect_row_on_fn_decl() {
+    auto r = parse("fn f() -> i64 ! { io, alloc } { 0 }");
+    if (!r.ok()) {
+        std::cerr << "parse failed\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": "
+                      << e.message << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.functions.size() == 1);
+    const auto& fn = r.program.functions[0];
+    assert(fn.effects.labels.size() == 2);
+    assert(fn.effects.labels[0] == "io");
+    assert(fn.effects.labels[1] == "alloc");
+}
+
+void test_effect_row_empty_braces() {
+    // `! { }` is allowed and means an empty effect row (same as omitted).
+    auto r = parse("fn f() -> i64 ! { } { 0 }");
+    assert(r.ok());
+    const auto& fn = r.program.functions[0];
+    assert(fn.effects.labels.empty());
+}
+
+void test_no_effect_row_defaults_pure() {
+    auto r = parse("fn f() -> i64 { 0 }");
+    assert(r.ok());
+    assert(r.program.functions[0].effects.labels.empty());
+}
+
 } // namespace
 
 int main() {
@@ -899,6 +930,10 @@ int main() {
     // Phase 3.4 try operator
     test_try_postfix();
     test_try_chained_after_dot();
-    std::cout << "All parser tests passed (51 cases)\n";
+    // Phase 4 effect labels
+    test_effect_row_on_fn_decl();
+    test_effect_row_empty_braces();
+    test_no_effect_row_defaults_pure();
+    std::cout << "All parser tests passed (54 cases)\n";
     return 0;
 }

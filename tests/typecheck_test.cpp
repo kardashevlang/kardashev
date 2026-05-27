@@ -1000,6 +1000,55 @@ void test_try_err_payload_mismatch_errors() {
         "try_err_payload_mismatch_errors");
 }
 
+// --- Phase 4: effect labels ---
+
+void test_pure_fn_no_effects_ok() {
+    expectOk("fn add(a: i64, b: i64) -> i64 { a + b }\n"
+             "fn main() -> i64 { add(2, 3) }",
+             "pure_fn_no_effects_ok");
+}
+
+void test_callee_io_caller_declares_io_ok() {
+    expectOk("fn raw_read() -> i64 ! { io } { 42 }\n"
+             "fn main() -> i64 ! { io, alloc } { raw_read() }",
+             "callee_io_caller_declares_io_ok");
+}
+
+void test_callee_io_caller_pure_errors() {
+    expectErr("fn raw_read() -> i64 ! { io } { 42 }\n"
+              "fn main() -> i64 { raw_read() }",
+              "callee_io_caller_pure_errors");
+}
+
+void test_undeclared_effect_label_errors() {
+    // `foo` isn't a built-in and isn't declared as a generic param.
+    expectErr("fn bad() -> i64 ! { foo } { 0 }\n"
+              "fn main() -> i64 { 0 }",
+              "undeclared_effect_label_errors");
+}
+
+void test_multiple_effects_union_ok() {
+    expectOk("fn alloc_one() -> i64 ! { alloc } { 1 }\n"
+             "fn io_one() -> i64 ! { io } { 2 }\n"
+             "fn both() -> i64 ! { io, alloc } { alloc_one() + io_one() }\n"
+             "fn main() -> i64 ! { io, alloc } { both() }",
+             "multiple_effects_union_ok");
+}
+
+void test_effect_row_recorded_in_schema() {
+    auto r = tc("fn f() -> i64 ! { io, alloc } { 0 }");
+    if (!r.ok()) {
+        std::cerr << "[effect_row_recorded_in_schema] tc failed\n";
+        dump(r);
+        std::abort();
+    }
+    auto it = r.fnSchemas.find("f");
+    assert(it != r.fnSchemas.end());
+    assert(it->second.declaredEffects.contains("io"));
+    assert(it->second.declaredEffects.contains("alloc"));
+    assert(!it->second.declaredEffects.contains("panic"));
+}
+
 } // namespace
 
 int main() {
@@ -1106,6 +1155,13 @@ int main() {
     test_try_outside_fn_with_result_errors();
     test_try_on_non_result_enum_errors();
     test_try_err_payload_mismatch_errors();
-    std::cout << "All typecheck tests passed (95 cases)\n";
+    // Phase 4 effect labels
+    test_pure_fn_no_effects_ok();
+    test_callee_io_caller_declares_io_ok();
+    test_callee_io_caller_pure_errors();
+    test_undeclared_effect_label_errors();
+    test_multiple_effects_union_ok();
+    test_effect_row_recorded_in_schema();
+    std::cout << "All typecheck tests passed (101 cases)\n";
     return 0;
 }

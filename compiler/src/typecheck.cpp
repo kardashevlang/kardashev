@@ -276,6 +276,9 @@ public:
             schema.signature = makeFunction(std::move(argTypes), ret);
             schema.genericVars = std::move(genVars);
             schema.genericBounds = std::move(genBounds);
+            schema.declaredEffects = buildEffectSet(fn.effects,
+                                                       fn.genericParams,
+                                                       fn.name);
             fnSchemas_[fn.name] = std::move(schema);
         }
         // Pass 1e: register each impl method as a regular fn schema under
@@ -315,6 +318,9 @@ public:
                 sch.signature = makeFunction(std::move(argTypes), ret);
                 sch.genericVars = std::move(genVars);
                 sch.genericBounds = std::move(genBounds);
+                sch.declaredEffects = buildEffectSet(fn.effects,
+                                                       fn.genericParams,
+                                                       fn.name);
                 fnSchemas_[mangled] = std::move(sch);
                 implMethodMangled_[&fn] = mangled;
             }
@@ -330,6 +336,27 @@ public:
             TypePtr selfTy = resolveTypeRef(impl.forType);
             for (const auto& fn : impl.methods) {
                 checkImplMethod(fn, impl.traitName, impl.forType, selfTy);
+            }
+        }
+        // Phase 4: effect-inference pass. For each fn body, collect the
+        // union of every callee's declared effects and verify it's a
+        // subset of the fn's own declared effects.
+        for (const auto& fn : program.functions) checkEffects(fn, fn.name);
+        for (const auto& impl : program.impls) {
+            for (const auto& fn : impl.methods) {
+                auto it = implMethodMangled_.find(&fn);
+                if (it != implMethodMangled_.end()) {
+                    checkEffects(fn, it->second);
+                }
+            }
+        }
+        // Validate trait method signatures don't declare unknown effects
+        // (the dispatching impl method's effects already get checked
+        // above via its FnSchema; the trait sig's effects are advisory
+        // until Phase 4.3 ties row-vars in).
+        for (const auto& td : program.traits) {
+            for (const auto& m : td.methods) {
+                (void)buildEffectSet(m.effects, {}, td.name + "::" + m.name);
             }
         }
         TypeCheckResult result;
@@ -404,6 +431,148 @@ private:
 
     void error(std::string msg, std::size_t line, std::size_t col) {
         errors_.push_back({std::move(msg), line, col});
+    }
+
+    // Phase 4: built-in effect labels recognized by the typechecker.
+    // Anything else in an `! { ... }` row must match a row-variable name
+    // declared in the fn's generic-parameter list (Phase 4.3).
+    static bool isBuiltinEffect(const std::string& l) {
+        return l == "alloc" || l == "io" || l == "panic" ||
+               l == "async" || l == "unwind";
+    }
+
+    // Phase 4.2: walk a function body and collect the effects induced by
+    // every call inside it (direct CallExpr to a free fn, MethodCallExpr
+    // to an impl method, and constructor calls which are pure). For
+    // unknown callees (the typechecker already errored on them) we skip.
+    void collectEffects(const ast::Expr& e, EffectSet& out) {
+        if (dynamic_cast<const ast::IntLitExpr*>(&e)) return;
+        if (dynamic_cast<const ast::IdentExpr*>(&e)) return;
+        if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+            collectEffects(*bin->lhs, out);
+            collectEffects(*bin->rhs, out);
+            return;
+        }
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            for (const auto& a : call->args) collectEffects(*a, out);
+            auto fnIt = fnSchemas_.find(call->callee);
+            if (fnIt != fnSchemas_.end()) {
+                out.unionWith(fnIt->second.declaredEffects);
+            }
+            // Constructor calls don't go through fnSchemas_; they're
+            // pure (no effect added).
+            return;
+        }
+        if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
+            collectEffects(*mc->receiver, out);
+            for (const auto& a : mc->args) collectEffects(*a, out);
+            // Resolve the impl method via the typechecker's recorded
+            // resolution and union in its declared effects.
+            auto mit = methodResolutions_.find(mc);
+            if (mit != methodResolutions_.end()) {
+                ast::TypeRef forTy;
+                forTy.name = mit->second.concreteTypeName;
+                std::string mangled = implMethodMangledName(
+                    mit->second.traitName, forTy, mit->second.methodName);
+                auto sit = fnSchemas_.find(mangled);
+                if (sit != fnSchemas_.end()) {
+                    out.unionWith(sit->second.declaredEffects);
+                }
+            }
+            return;
+        }
+        if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
+            collectEffects(*ie->cond, out);
+            collectEffects(*ie->thenBranch, out);
+            collectEffects(*ie->elseBranch, out);
+            return;
+        }
+        if (auto* block = dynamic_cast<const ast::BlockExpr*>(&e)) {
+            for (const auto& stmt : block->stmts) {
+                if (auto* let = dynamic_cast<const ast::LetStmt*>(stmt.get())) {
+                    collectEffects(*let->value, out);
+                } else if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(
+                               stmt.get())) {
+                    if (ret->value) collectEffects(*ret->value, out);
+                } else if (auto* es = dynamic_cast<const ast::ExprStmt*>(
+                               stmt.get())) {
+                    collectEffects(*es->expr, out);
+                }
+            }
+            if (block->tail) collectEffects(*block->tail, out);
+            return;
+        }
+        if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
+            for (const auto& [_n, v] : sl->fields) collectEffects(*v, out);
+            return;
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
+            collectEffects(*fe->object, out);
+            return;
+        }
+        if (auto* me = dynamic_cast<const ast::MatchExpr*>(&e)) {
+            collectEffects(*me->scrutinee, out);
+            for (const auto& arm : me->arms) collectEffects(*arm.body, out);
+            return;
+        }
+        if (auto* te = dynamic_cast<const ast::TryExpr*>(&e)) {
+            collectEffects(*te->operand, out);
+            return;
+        }
+        if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
+            collectEffects(*re->operand, out);
+            return;
+        }
+    }
+
+    void checkEffects(const ast::FnDecl& fn,
+                       const std::string& schemaKey) {
+        auto it = fnSchemas_.find(schemaKey);
+        if (it == fnSchemas_.end() || !fn.body) return;
+        EffectSet inferred;
+        collectEffects(*fn.body, inferred);
+        const EffectSet& declared = it->second.declaredEffects;
+        for (const auto& l : inferred.labels) {
+            if (!declared.contains(l)) {
+                error("function '" + fn.name +
+                          "' uses effect `" + l +
+                          "` but does not declare it; add `! { " + l +
+                          (declared.labels.empty()
+                               ? " }"
+                               : ", ... }") +
+                          "` to the signature",
+                      fn.line, fn.column);
+            }
+        }
+    }
+
+    EffectSet buildEffectSet(const ast::EffectRow& row,
+                              const std::vector<ast::TypeParam>& genericParams,
+                              const std::string& fnName) {
+        EffectSet result;
+        for (const auto& l : row.labels) {
+            if (isBuiltinEffect(l)) {
+                result.add(l);
+                continue;
+            }
+            // Effect-row variable: must match a generic parameter name.
+            // (Phase 4.3 wires these into instantiation; Phase 4.2 only
+            // validates the label is declared.)
+            bool isRowVar = false;
+            for (const auto& gp : genericParams) {
+                if (gp.name == l) { isRowVar = true; break; }
+            }
+            if (isRowVar) {
+                result.add(l);
+            } else {
+                error("unknown effect label `" + l + "` on fn '" + fnName +
+                          "' (built-ins: alloc, io, panic, async, unwind; or "
+                          "declare `" + l + "` as a generic effect-row "
+                          "parameter)",
+                      row.line, row.column);
+            }
+        }
+        return result;
     }
 
     // Mangle an impl method into a globally-unique fn name. Format:

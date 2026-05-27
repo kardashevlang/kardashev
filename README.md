@@ -50,21 +50,62 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-Design phase. No code yet. Development follows a phase-by-phase issue-tracked roadmap.
+Phases 0–4 (concrete effects) land; row-polymorphic effects (`! {e}`) wait
+for first-class function values in Phase 6. Built locally with `bazel
+build //... && bazel test //...` or, when Bazel isn't available, the
+`Makefile.local` shim (LLVM + clang). The CI matrix runs both
+ubuntu-latest and macos-latest via Bazel on every push.
+
+What works today:
+
+```rust
+// Generics + traits + bounded params (Phase 3)
+trait Show { fn show(self) -> i64; }
+struct Point { x: i64, y: i64 }
+impl Show for Point { fn show(self) -> i64 { self.x + self.y } }
+fn use_show<T: Show>(t: T) -> i64 { t.show() }
+
+// Result + ? operator (Phase 3.4)
+enum Result<T, E> { Ok(T), Err(E) }
+fn double(n: i64) -> Result<i64, i64> {
+    let x = parse(n)?;        // early-returns Err if parse fails
+    Ok(x + x)
+}
+
+// References + NLL borrow check (Phase 2.4)
+fn read(p: &Point) -> i64 { p.x + p.y }
+fn main() -> i64 {
+    let p = Point { x: 3, y: 4 };
+    let r = &p;
+    let a = read(r);          // r's last use here; borrow is now dead
+    let b = consume(p);       // OK to move — NLL allows it
+    a + b
+}
+
+// Effect labels (Phase 4) — pure by default; explicit effects propagate
+fn raw_read() -> i64 ! { io } { 42 }
+fn main() -> i64 ! { io, alloc } { raw_read() }    // pure-caller would error
+```
+
+Run the REPL with `bazel run //compiler:kardc` (or `./build.local/kardc`
+after `make -f Makefile.local kardc`); type a `fn` to define it, type
+any expression to evaluate. Programs compile through lexer → parser →
+HM typechecker → NLL borrow-checker → effect inference → LLVM IR →
+ORC v2 JIT.
 
 ## Roadmap
 
-| Phase | Goal |
-|-------|------|
-| 0 | Scaffold: Bazel + LLVM toolchain + CI + a JIT binary returning `42` |
-| 1 | MVP: JIT REPL running `fib` (lexer + parser + monotype HM + LLVM IR + ORC JIT) |
-| 2 | Ownership + NLL borrow check + structs + enums + pattern matching |
-| 3 | Traits + generics + `Result` + `?` operator + monomorphization |
-| 4 | Effect labels in signatures (the signature feature lands here) |
-| 5 | AOT pipeline + minimal stdlib (`Option`, `Result`, `Vec`, `String`) |
-| 6 | `async` / `await` + state-machine transform + basic executor |
-| 7 | Module system + complete `rules_kardashev` + `kard` CLI |
-| 8 | Optimization passes + LSP + docs site |
+| Phase | Goal | Status |
+|-------|------|--------|
+| 0 | Scaffold: Bazel + LLVM toolchain + CI + a JIT binary returning `42` | ✅ |
+| 1 | MVP: JIT REPL running `fib` (lexer + parser + monotype HM + LLVM IR + ORC JIT) | ✅ |
+| 2 | Ownership + NLL borrow check + structs + enums + pattern matching | ✅ |
+| 3 | Traits + generics + `Result` + `?` operator + monomorphization | ✅ |
+| 4 | Effect labels in signatures (the signature feature lands here) | ✅ (concrete labels; row-polymorphic `! {e}` waits for fn-pointer values in Phase 6) |
+| 5 | AOT pipeline + minimal stdlib (`Option`, `Result`, `Vec`, `String`) | — |
+| 6 | `async` / `await` + state-machine transform + basic executor | — |
+| 7 | Module system + complete `rules_kardashev` + `kard` CLI | — |
+| 8 | Optimization passes + LSP + docs site | — |
 
 ## Why "kardashev"?
 

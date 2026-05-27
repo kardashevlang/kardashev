@@ -39,6 +39,26 @@ struct TypeError {
     std::size_t column = 1;
 };
 
+// Phase 4: a function's declared / inferred effect row. Concrete built-
+// in labels are `alloc`, `io`, `panic`, `async`, `unwind`; effect-row
+// variables (Phase 4.3) appear here as their source-level name (e.g.
+// `e`) and the typechecker validates them against the enclosing fn's
+// generic-parameter list. `pure` is the empty set — i.e. omitting
+// `! { ... }` on a fn.
+struct EffectSet {
+    std::vector<std::string> labels;
+    bool contains(const std::string& l) const {
+        for (const auto& x : labels) if (x == l) return true;
+        return false;
+    }
+    void add(const std::string& l) {
+        if (!contains(l)) labels.push_back(l);
+    }
+    void unionWith(const EffectSet& other) {
+        for (const auto& l : other.labels) add(l);
+    }
+};
+
 // Schema of a function as the typechecker resolved it. For monomorphic
 // functions, `genericVars` is empty and `signature` is the concrete
 // `fn(args...) -> ret` Type. For generic functions, `genericVars` holds the
@@ -53,6 +73,8 @@ struct FnSchema {
     // unbounded param). Phase 3.3 only supports a single trait bound per
     // param; multi-bounds (`T: A + B`) can append entries here later.
     std::vector<std::string> genericBounds;
+    // Phase 4: effects declared in the fn's `! { ... }` row. Empty = pure.
+    EffectSet declaredEffects;
 };
 
 // Schema of a generic struct. For monomorphic structs, `genericVars` is

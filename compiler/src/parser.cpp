@@ -107,8 +107,33 @@ private:
         expect(TokenKind::RParen, ")");
         expect(TokenKind::Arrow, "->");
         decl.returnType = parseTypeRef();
+        decl.effects = parseOptionalEffectRow();
         decl.body = parseBlockExpr();
         return decl;
+    }
+
+    // Phase 4: parse an optional `! { e1, e2, ... }` effect row. Returns
+    // an EffectRow with empty `labels` when the `!` is absent — meaning
+    // the function is pure. Effect labels are stored as raw strings; the
+    // typechecker validates them against the built-in set + any
+    // declared effect-row variables.
+    ast::EffectRow parseOptionalEffectRow() {
+        ast::EffectRow row;
+        if (!check(TokenKind::Bang)) return row;
+        Token bangTok = consume();
+        row.line = bangTok.line;
+        row.column = bangTok.column;
+        expect(TokenKind::LBrace, "{");
+        if (!check(TokenKind::RBrace)) {
+            while (true) {
+                Token lbl = expect(TokenKind::Identifier, "effect label");
+                row.labels.push_back(lbl.lexeme);
+                if (!accept(TokenKind::Comma)) break;
+                if (check(TokenKind::RBrace)) break; // trailing comma
+            }
+        }
+        expect(TokenKind::RBrace, "}");
+        return row;
     }
 
     ast::Param parseParam() {
@@ -283,6 +308,7 @@ private:
         expect(TokenKind::RParen, ")");
         expect(TokenKind::Arrow, "->");
         sig.returnType = parseTypeRef();
+        sig.effects = parseOptionalEffectRow();
         expect(TokenKind::Semi, ";");
         return sig;
     }
@@ -342,6 +368,7 @@ private:
         expect(TokenKind::RParen, ")");
         expect(TokenKind::Arrow, "->");
         decl.returnType = parseTypeRef();
+        decl.effects = parseOptionalEffectRow();
         decl.body = parseBlockExpr();
         return decl;
     }

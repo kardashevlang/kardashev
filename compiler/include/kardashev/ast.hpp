@@ -2,14 +2,17 @@
 //
 // Grammar (informal):
 //   program       := (fn_decl | struct_decl | enum_decl | trait_decl | impl_decl)*
-//   fn_decl       := 'fn' Ident generic_params? '(' params? ')' '->' type_ref block_expr
+//   fn_decl       := 'fn' Ident generic_params? '(' params? ')' '->' type_ref effect_row? block_expr
 //   generic_params:= '<' generic_param (',' generic_param)* ','? '>'
 //   generic_param := Ident (':' Ident)?           -- optional single-trait bound
 //   trait_decl    := 'trait' Ident '{' method_sig* '}'
-//   method_sig    := 'fn' Ident '(' params? ')' '->' type_ref ';'
+//   method_sig    := 'fn' Ident '(' params? ')' '->' type_ref effect_row? ';'
 //   impl_decl     := 'impl' Ident 'for' type_ref '{' fn_decl* '}'
 //   type_ref      := Ident type_args?
 //   type_args     := '<' type_ref (',' type_ref)* ','? '>'
+//   effect_row    := '!' '{' (effect_label (',' effect_label)* ','?)? '}'
+//   effect_label  := Ident                        -- built-in: alloc, io, panic, async, unwind
+//                 |  row variable bound by generic_params
 //   postfix       := primary ( '.' Ident method_call_args? | '?' )*
 //   method_call_args := '(' arglist? ')'
 //   struct_decl   := 'struct' Ident '{' field_decl (',' field_decl)* ','? '}'
@@ -223,6 +226,22 @@ struct Param {
     TypeRef type;
 };
 
+// Phase 4: a function's declared effect row. `labels` carries the
+// built-in concrete effects (`alloc`, `io`, `panic`, `async`, `unwind`)
+// PLUS any effect-row variable names introduced via the fn's
+// genericParams. An empty EffectRow means `pure` — no effects declared.
+//
+// Surface syntax: `! { io, alloc }` after the return type. Effect-row
+// variables (`! {e}`) become first-class generic parameters declared
+// alongside type parameters; the parser treats unknown labels in an
+// effect_row as row-variable references and validates them against the
+// enclosing fn's genericParams at typecheck time.
+struct EffectRow {
+    std::vector<std::string> labels;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
 // A generic type parameter binding, e.g. `T` in `fn id<T>(x: T) -> T` or
 // `T: Show` in `fn use_show<T: Show>(t: T) -> i64`. Phase 3.3 adds a
 // single optional trait bound per param; multiple bounds (`T: A + B`)
@@ -239,6 +258,7 @@ struct FnDecl {
     std::vector<TypeParam> genericParams; // empty = monomorphic fn
     std::vector<Param> params;
     TypeRef returnType;
+    EffectRow effects; // Phase 4: declared effect row; empty = pure
     std::unique_ptr<BlockExpr> body;
     std::size_t line = 1;
     std::size_t column = 1;
@@ -275,6 +295,7 @@ struct MethodSig {
     std::string name;
     std::vector<Param> params;
     TypeRef returnType;
+    EffectRow effects; // Phase 4: declared effect row on trait methods
     std::size_t line = 1;
     std::size_t column = 1;
 };
