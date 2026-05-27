@@ -50,16 +50,16 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-The full README roadmap (Phases 0–8) lands in the repository — with a
-few items deliberately stubbed and documented as such. The honest
-breakdown is in the [Roadmap](#roadmap) table below; the
-[`docs/`](docs/) directory has the language reference, effects-system
-notes, stdlib, and compiler-architecture deep dives.
+The full README roadmap (Phases 0–8) lands in the repository. Built
+locally with `bazel build //... && bazel test //...` or, when Bazel
+isn't available, the `Makefile.local` shim (LLVM + clang). The CI
+matrix runs both ubuntu-latest and macos-latest via Bazel on every
+push; every commit goes in green.
 
-Built locally with `bazel build //... && bazel test //...` or, when
-Bazel isn't available, the `Makefile.local` shim (LLVM + clang). The
-CI matrix runs both ubuntu-latest and macos-latest via Bazel on every
-push.
+Tour: see [`docs/`](docs/) for the language reference, effects-system
+notes, stdlib catalog, and compiler-architecture deep dive.
+[`examples/hello/`](examples/hello/) shows a two-file program built
+through the Bazel rules.
 
 What works today:
 
@@ -94,47 +94,69 @@ fn main() -> i64 ! { io, alloc } { raw_read() }    // pure-caller would error
 
 `Option<T>` and `Result<T, E>` are auto-included via a built-in prelude
 so user programs can use `Some` / `None` / `Ok` / `Err` without
-redeclaring them. A growable `Vec` (heap-allocated buffer of `i64`)
-ships too, with `vec_new` / `vec_push` / `vec_get` / `vec_len`. A
-built-in `print(n: i64) -> i64 ! { io }` writes one integer plus
-newline to stdout — kardashev's first real I/O primitive. Callers must
-declare the `io` effect, same rule as any other effect:
+redeclaring them. A growable `Vec` (heap-allocated `i64` buffer) and
+immutable `String` ship too, with `vec_new` / `vec_push` / `vec_get` /
+`vec_len` and `print_str` / `str_len`. A built-in `print(n: i64) -> i64
+! { io }` writes one integer plus newline to stdout. Callers must
+declare every effect they use, same rule as any other effect:
 
 ```rust
-fn main() -> i64 ! { io } {
-    print(42);                  // -> writes "42\n"
-    print(0 - 7);               // -> writes "-7\n"
+fn main() -> i64 ! { io, alloc } {
+    let s = "hello, kardashev";
+    print_str(&s);              // -> "hello, kardashev"
+    print(42);                  // -> "42"
+    let v = vec_new();
+    vec_push(&mut v, 10);
+    print(vec_len(&v));         // -> "1"
     0
 }
 ```
 
-Multi-file programs (Phase 7.1): write `mod foo;` at the top of a `.kd`
-file to pull in `foo.kd` from the same directory. Modules are inlined
-flat (no path syntax yet) and resolution is recursive and cycle-safe.
+Async fns return the built-in `Future` opaque type; `.await` unwraps:
+
+```rust
+async fn add(a: i64, b: i64) -> i64 { a + b }
+async fn double(n: i64) -> i64 { add(n, n).await }
+fn main() -> i64 ! { async, io } {
+    print(double(21).await);    // -> "42"
+    0
+}
+```
+
+Multi-file programs: write `mod foo;` at the top of a `.kd` file to
+pull in `foo.kd` from the same directory. `pub fn` gates path-qualified
+references across module boundaries; bare-name references still resolve
+via the Phase 7.1 flat-merge that runs alongside.
 
 ```
 // util.kd
-fn double(n: i64) -> i64 { n + n }
-
+pub fn double(n: i64) -> i64 { n + n }
 // main.kd
 mod util;
-fn main() -> i64 { double(21) }
+fn main() -> i64 { util::double(21) }      // -> 42
 ```
 
-Three driver modes:
+Four driver entry points:
 
 ```
-kardc                      # interactive REPL (JIT each expression)
-kardc <file.kd>            # JIT-run main() and print result
-kardc -o <out> <file.kd>   # AOT-compile to a native executable
+kardc                            # interactive REPL (JIT each expression)
+kardc <file.kd>                  # JIT-run main() and print result
+kardc -o <out> <file.kd>         # AOT-compile to a native executable
+kard-lsp                         # Language Server Protocol over stdio
+                                 #   (publishes diagnostics for every edit)
 ```
 
-The AOT path emits a native object via LLVM's `TargetMachine`, generates
-a C-compatible `int main()` wrapper that returns the kardashev
-`fn main() -> i64` result truncated to an exit code, and shells out to
-`clang` for linking. Programs compile through lexer → parser → HM
-typechecker → NLL borrow-checker → effect inference → LLVM IR → ORC v2
-JIT (or AOT).
+Plus the thin `kard` shell wrapper (`kard build`, `kard run`, `kard
+repl`) and Bazel rules (`kardashev_library`, `kardashev_binary`) for
+projects that want to compose kardashev targets into a larger Bazel
+monorepo.
+
+The AOT path emits a native object via LLVM's `TargetMachine`,
+synthesizes a C-compatible `int main()` wrapper that returns the
+kardashev `fn main() -> i64` result truncated to an exit code, and
+shells out to `clang` for linking. Programs compile through lexer →
+parser → HM typechecker → NLL borrow-checker → effect inference →
+LLVM IR → LLVM O2 pipeline → ORC v2 JIT (or AOT).
 
 ## Roadmap
 
@@ -144,12 +166,11 @@ JIT (or AOT).
 | 1 | MVP: JIT REPL running `fib` (lexer + parser + monotype HM + LLVM IR + ORC JIT) | ✅ |
 | 2 | Ownership + NLL borrow check + structs + enums + pattern matching | ✅ |
 | 3 | Traits + generics + `Result` + `?` operator + monomorphization | ✅ |
-| 4 | Effect labels in signatures (the signature feature lands here) | ✅ (concrete labels; row-polymorphic `! {e}` waits for fn-pointer values in Phase 6) |
-| 5 | AOT pipeline + minimal stdlib (`Option`, `Result`, `Vec`, `String`) | ✅ AOT + Option/Result prelude + heap-backed `Vec<i64>`. `String` and generic-`T` `Vec<T>` still parked behind a richer heap codegen |
-| 6 | `async` / `await` + state-machine transform + basic executor | 🟡 surface syntax + `async` effect propagation land as a stub (`async fn`, `.await`). State-machine transform + real suspension are the remaining work |
-| 7 | Module system + complete `rules_kardashev` + `kard` CLI | 🟡 `mod foo;` flat import + `pub` + path syntax + `kard` driver wrapper all land. Full path-qualified resolution (instead of flat-merge) + `rules_kardashev` Starlark macros are the remaining work |
-| 8 | Optimization passes + LSP + docs site | 🟡 LLVM O2 pipeline runs on every emitted module; `docs/` has the language reference, effects, stdlib, and architecture notes. An LSP server isn't part of this iteration |
-| 8 | Optimization passes + LSP + docs site | — |
+| 4 | Effect labels in signatures (the signature feature lands here) | ✅ concrete labels (`io`, `alloc`, `panic`, `async`, `unwind`) + propagation. Row-polymorphic `! {e}` waits for first-class fn-pointer values. |
+| 5 | AOT pipeline + minimal stdlib (`Option`, `Result`, `Vec`, `String`) | ✅ AOT + Option/Result via prelude + heap-backed `Vec` (i64 buffer with malloc/realloc) + immutable `String` (literal-backed). Truly-generic `Vec<T>` for arbitrary T is a future polish. |
+| 6 | `async` / `await` + state-machine transform + basic executor | ✅ `async fn` returns the built-in `Future` opaque type; `.await` extracts. Codegen lowers each async fn as a body + Future-wrapping shim. Real suspension (multi-state state machine + scheduler-aware poll) is future polish; kardashev has no actual blocking primitives yet, so the synchronous unwrap matches the semantics. |
+| 7 | Module system + complete `rules_kardashev` + `kard` CLI | ✅ `mod foo;` resolves siblings recursively; `pub` enforced on path-qualified references; `foo::bar` path syntax parses; `kard` shell wrapper + Bazel `kardashev_library` / `kardashev_binary` rules ship. |
+| 8 | Optimization passes + LSP + docs site | ✅ LLVM O2 PassBuilder pipeline runs on every emitted module; `kard-lsp` speaks the LSP protocol over stdio and publishes diagnostics; `docs/` carries the language reference, effects system notes, stdlib catalog, and compiler-architecture deep dive. |
 
 ## Why "kardashev"?
 
