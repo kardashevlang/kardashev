@@ -181,11 +181,28 @@ private:
     }
 
     ast::TypeRef parseTypeRef() {
+        // Reference prefix: `&` or `&mut` wraps the rest of the type.
+        // Phase 2.4b: shared `&T`. Phase 2.4c: `&mut T`. Currently we
+        // recognize `mut` by lexeme (not a keyword) so the AST is forward-
+        // compatible.
+        bool isRef = false;
+        bool refIsMut = false;
+        Token ampTok{TokenKind::Identifier, "", 0, 0};
+        if (check(TokenKind::Ampersand)) {
+            ampTok = consume();
+            isRef = true;
+            if (check(TokenKind::Identifier) && peek().lexeme == "mut") {
+                consume();
+                refIsMut = true;
+            }
+        }
         Token t = expect(TokenKind::Identifier, "type name");
         ast::TypeRef tr;
         tr.name = t.lexeme;
-        tr.line = t.line;
-        tr.column = t.column;
+        tr.isRef = isRef;
+        tr.refIsMut = refIsMut;
+        tr.line = isRef ? ampTok.line : t.line;
+        tr.column = isRef ? ampTok.column : t.column;
         // Optional type-args: `Name<T1, T2>`. Position is unambiguous because
         // `<` immediately after an Ident in a type-ref slot can only be the
         // start of a type-arg list (the alternative — comparison — never
@@ -508,6 +525,23 @@ private:
 
     ast::ExprPtr parsePrimary() {
         const Token& t = peek();
+
+        // Phase 2.4b: `&` prefix produces a RefExpr; `&mut` flips isMut.
+        if (t.kind == TokenKind::Ampersand) {
+            Token amp = consume();
+            bool isMut = false;
+            if (check(TokenKind::Identifier) && peek().lexeme == "mut") {
+                consume();
+                isMut = true;
+            }
+            auto inner = parsePostfix();
+            auto re = std::make_unique<ast::RefExpr>();
+            re->line = amp.line;
+            re->column = amp.column;
+            re->operand = std::move(inner);
+            re->isMut = isMut;
+            return re;
+        }
 
         if (t.kind == TokenKind::Integer) {
             Token tok = consume();

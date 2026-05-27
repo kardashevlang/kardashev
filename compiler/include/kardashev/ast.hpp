@@ -170,6 +170,14 @@ struct TryExpr : Expr {
     ExprPtr operand;
 };
 
+// Phase 2.4b: `&expr` (and Phase 2.4c `&mut expr`). Phase 2.4b restricts
+// `operand` to a bare Ident — borrowing a temporary expression doesn't
+// have a useful semantics until we have a stack-spill rule.
+struct RefExpr : Expr {
+    ExprPtr operand;
+    bool isMut = false;
+};
+
 struct MatchExpr : Expr {
     ExprPtr scrutinee;
     std::vector<MatchArm> arms;
@@ -198,9 +206,14 @@ struct ExprStmt : Stmt {
 // type-args on names that do. Type parameter names (e.g. `T` inside
 // `fn id<T>(x: T)`) are written as bare `Ident` references and resolved
 // against the enclosing fn/struct/enum's generic-param env first.
+//
+// `&T` and `&mut T` (Phase 2.4b/c) set isRef + refIsMut on the same node.
+// Nested references (`&&T`) aren't yet on the grammar.
 struct TypeRef {
     std::string name;
     std::vector<TypeRef> typeArgs;
+    bool isRef = false;
+    bool refIsMut = false;
     std::size_t line = 1;
     std::size_t column = 1;
 };

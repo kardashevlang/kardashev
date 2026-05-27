@@ -575,6 +575,14 @@ private:
     }
 
     TypePtr resolveTypeRef(const ast::TypeRef& tr) {
+        // Phase 2.4b: peel off the reference wrapper and wrap the inner
+        // resolution. Recursive in case nested refs are introduced later.
+        if (tr.isRef) {
+            ast::TypeRef inner = tr;
+            inner.isRef = false;
+            inner.refIsMut = false;
+            return makeRef(resolveTypeRef(inner), tr.refIsMut);
+        }
         // Generic params from the enclosing fn/struct/enum decl.
         if (currentGenericEnv_) {
             auto git = currentGenericEnv_->find(tr.name);
@@ -780,6 +788,13 @@ private:
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
             return checkMethodCall(*mc);
         }
+        if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
+            // Phase 2.4b: `&x` produces `&T` where T is x's type. The
+            // operand is normally a bare Ident (we don't yet support
+            // borrowing temporaries — would require a stack-spill rule).
+            TypePtr inner = checkExpr(*re->operand);
+            return makeRef(inner, re->isMut);
+        }
         error("unknown expression kind", e.line, e.column);
         return makeInt();
     }
@@ -788,6 +803,11 @@ private:
     TypePtr checkMethodCall(const ast::MethodCallExpr& mc) {
         TypePtr recvT = checkExpr(*mc.receiver);
         TypePtr r = resolve(recvT);
+        // Phase 2.4b auto-deref: if the receiver is `&T` (or `&mut T`),
+        // dispatch as though the receiver were the underlying `T`. Phase
+        // 2.4c will refine this so impls of `Trait for &T` (when written
+        // explicitly) take precedence over implicit deref.
+        while (r->kind == TypeKind::Ref) r = resolve(r->refInner);
 
         // Case A: receiver is a generic-param Var. The fn must have a
         // trait bound for this Var, the bound trait must declare the
@@ -1100,6 +1120,9 @@ private:
     TypePtr checkField(const ast::FieldExpr& fe) {
         TypePtr objT = checkExpr(*fe.object);
         TypePtr r = resolve(objT);
+        // Phase 2.4b auto-deref: `(&p).x` works the same as `p.x`. Peel
+        // off any reference layer before the struct lookup.
+        while (r->kind == TypeKind::Ref) r = resolve(r->refInner);
         if (r->kind != TypeKind::Struct) {
             error("field access on non-struct type " + typeToString(objT),
                   fe.line, fe.column);

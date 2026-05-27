@@ -277,6 +277,15 @@ private:
             case TypeKind::Int:  return llvm::Type::getInt64Ty(*ctx_);
             case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
             case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
+            case TypeKind::Ref:
+                // Phase 2.4b: `&T` lowers to an opaque pointer. LLVM 15+
+                // tracks pointee types only at load/GEP sites, not on the
+                // pointer type itself. We don't need the pointee here —
+                // emitFieldAccess / emitMethodCall pass the right element
+                // type at the load site.
+                (void)mapKardashevType(r->refInner); // ensure inner is
+                                                       // declared
+                return llvm::PointerType::get(*ctx_, /*AS=*/0);
             case TypeKind::Struct: {
                 // Generic instance (typeArgs non-empty): lazily declare a
                 // dedicated LLVM struct per (name, typeArgs) tuple so
@@ -308,6 +317,12 @@ private:
     // the current generic-instance substitution and recursively
     // instantiating generic struct / enum references like `Pair<X, Y>`.
     TypePtr astTypeRefToConcrete(const ast::TypeRef& tr) {
+        if (tr.isRef) {
+            ast::TypeRef inner = tr;
+            inner.isRef = false;
+            inner.refIsMut = false;
+            return makeRef(astTypeRefToConcrete(inner), tr.refIsMut);
+        }
         if (auto it = currentInstanceTypeMap_.find(tr.name);
             it != currentInstanceTypeMap_.end()) {
             if (!tr.typeArgs.empty()) {
@@ -383,6 +398,9 @@ private:
         case TypeKind::Enum:   return r->enumName;
         case TypeKind::Var:    return "_var" + std::to_string(r->varId);
         case TypeKind::Function: return "_fn";
+        case TypeKind::Ref:    return std::string(r->refIsMut ? "refmut_"
+                                                              : "ref_") +
+                                      mangleType(r->refInner);
         }
         return "_unknown";
     }
@@ -414,6 +432,11 @@ private:
                 return resolveInInstance(it->second);
             }
             return r;
+        }
+        case TypeKind::Ref: {
+            TypePtr inner = resolveInInstance(r->refInner);
+            if (inner.get() == r->refInner.get()) return r;
+            return makeRef(inner, r->refIsMut);
         }
         case TypeKind::Struct: {
             if (r->typeArgs.empty() && r->structFields.empty()) return r;
@@ -678,6 +701,9 @@ private:
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
             return emitMethodCall(*mc);
         }
+        if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
+            return emitRef(*re);
+        }
         errors_.push_back("codegen: unknown expression kind");
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
     }
@@ -730,7 +756,17 @@ private:
             errors_.push_back("codegen: no type for field-access object");
             return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
         }
-        TypePtr objTy = resolve(tyIt->second);
+        TypePtr objTy = resolveInInstance(tyIt->second);
+        // Phase 2.4b: auto-deref. If the object is `&T` (possibly nested),
+        // peel each layer and emit a load through the pointer before the
+        // ExtractValue. `objTy` after the loop describes the underlying
+        // struct; the value emitted gets dereferenced the right number of
+        // times in lock-step.
+        unsigned refDepth = 0;
+        while (objTy->kind == TypeKind::Ref) {
+            objTy = resolveInInstance(objTy->refInner);
+            ++refDepth;
+        }
         if (objTy->kind != TypeKind::Struct) {
             errors_.push_back("codegen: field access on non-struct value");
             return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
@@ -738,6 +774,13 @@ private:
         for (unsigned i = 0; i < objTy->structFields.size(); ++i) {
             if (objTy->structFields[i].first == fe.fieldName) {
                 llvm::Value* obj = emitExpr(*fe.object);
+                // Each `&` layer is one load through the pointer to the
+                // underlying value.
+                llvm::Type* underlying = mapKardashevType(objTy);
+                for (unsigned d = 0; d < refDepth; ++d) {
+                    obj = builder_->CreateLoad(underlying, obj,
+                                                "deref" + std::to_string(d));
+                }
                 return builder_->CreateExtractValue(obj, {i},
                                                     "f_" + fe.fieldName);
             }
@@ -745,6 +788,28 @@ private:
         errors_.push_back("codegen: no field " + fe.fieldName + " on struct " +
                           objTy->structName);
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+    }
+
+    // Phase 2.4b: `&x` lowers to the alloca address of x (a stack slot).
+    // We restrict the operand to a bare Ident — borrowing temporaries
+    // would require a stack-spill, which lands in Phase 2.4c alongside
+    // `&mut` extensions.
+    llvm::Value* emitRef(const ast::RefExpr& re) {
+        auto* id = dynamic_cast<const ast::IdentExpr*>(re.operand.get());
+        if (!id) {
+            errors_.push_back(
+                "codegen: `&` operand must be a binding (Phase 2.4b)");
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        }
+        auto it = locals_.find(id->name);
+        if (it == locals_.end()) {
+            errors_.push_back("codegen: `&` operand unknown binding " +
+                              id->name);
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        }
+        // The alloca's value is already a pointer to the binding's stack
+        // slot — exactly what `&T` should be at the LLVM level.
+        return it->second;
     }
 
     llvm::Value* emitBinary(const ast::BinaryExpr& bin) {
@@ -1164,7 +1229,25 @@ private:
         llvm::Function* fn = fnIt->second;
         std::vector<llvm::Value*> args;
         args.reserve(mc.args.size() + 1);
-        args.push_back(emitExpr(*mc.receiver));
+        // Phase 2.4b: auto-deref the receiver. If the receiver expression
+        // has type `&T` (possibly nested) but the impl takes self by
+        // value (`fn show(self)`), we need to load through the pointer so
+        // the call site provides a `T` value. If the impl was written for
+        // `&T` itself, the type-checker would route directly to that impl
+        // and no extra deref is needed.
+        llvm::Value* recv = emitExpr(*mc.receiver);
+        TypePtr recvTy = lookupExprType(*mc.receiver);
+        unsigned refDepth = 0;
+        while (recvTy && recvTy->kind == TypeKind::Ref) {
+            recvTy = resolveInInstance(recvTy->refInner);
+            ++refDepth;
+        }
+        for (unsigned d = 0; d < refDepth; ++d) {
+            llvm::Type* underlying = mapKardashevType(recvTy);
+            recv = builder_->CreateLoad(underlying, recv,
+                                         "deref" + std::to_string(d));
+        }
+        args.push_back(recv);
         for (const auto& a : mc.args) args.push_back(emitExpr(*a));
         return builder_->CreateCall(fn, args, "mcall_" + mc.methodName);
     }

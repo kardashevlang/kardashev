@@ -56,6 +56,14 @@ TypePtr makeEnum(std::string name, std::vector<EnumVariantType> variants) {
     return t;
 }
 
+TypePtr makeRef(TypePtr inner, bool isMut) {
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Ref;
+    t->refInner = std::move(inner);
+    t->refIsMut = isMut;
+    return t;
+}
+
 TypePtr resolve(const TypePtr& t) {
     if (t->kind != TypeKind::Var || !t->link) return t;
     TypePtr rep = resolve(t->link);
@@ -134,6 +142,13 @@ bool unify(const TypePtr& a, const TypePtr& b) {
             if (!unify(ra->structFields[i].second, rb->structFields[i].second)) return false;
         }
         return true;
+    }
+
+    if (ra->kind == TypeKind::Ref) {
+        // Phase 2.4b: `&T ~ &U` iff T ~ U and mutability matches. Phase
+        // 2.4c may relax this to allow `&mut T` subtyping into `&T`.
+        if (ra->refIsMut != rb->refIsMut) return false;
+        return unify(ra->refInner, rb->refInner);
     }
 
     if (ra->kind == TypeKind::Enum) {
@@ -229,6 +244,11 @@ TypePtr instantiate(const TypePtr& t,
         res->typeArgs = std::move(newTypeArgs);
         return res;
     }
+    case TypeKind::Ref: {
+        TypePtr inner = instantiate(r->refInner, subst);
+        if (inner.get() == r->refInner.get()) return r;
+        return makeRef(inner, r->refIsMut);
+    }
     default:
         return r;
     }
@@ -265,6 +285,9 @@ std::string typeToString(const TypePtr& t) {
         s += ">";
         return s;
     }
+    case TypeKind::Ref:
+        return std::string(r->refIsMut ? "&mut " : "&") +
+               typeToString(r->refInner);
     }
     return "?";
 }

@@ -34,6 +34,7 @@ enum class TypeKind {
     Var,
     Struct,
     Enum,
+    Ref,
 };
 
 struct Type;
@@ -71,6 +72,11 @@ struct Type {
     // `resolveTypeRef` materializes a generic type at a use site
     // (e.g. `Box<i64>` -> typeArgs=[i64]).
     std::vector<TypePtr> typeArgs;
+
+    // Ref (Phase 2.4b): inner type + mutability flag. `refIsMut` toggles
+    // between `&T` (false) and `&mut T` (true, Phase 2.4c).
+    TypePtr refInner;
+    bool refIsMut = false;
 };
 
 TypePtr makeInt();
@@ -80,6 +86,7 @@ TypePtr makeFunction(std::vector<TypePtr> args, TypePtr ret);
 TypePtr makeFreshVar();
 TypePtr makeStruct(std::string name, std::vector<std::pair<std::string, TypePtr>> fields);
 TypePtr makeEnum(std::string name, std::vector<EnumVariantType> variants);
+TypePtr makeRef(TypePtr inner, bool isMut);
 
 // Follow the union-find link chain to the representative. Performs
 // path compression as a side effect.

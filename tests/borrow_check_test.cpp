@@ -260,6 +260,72 @@ void test_try_operator_ok() {
              "try_operator_ok");
 }
 
+// --- Phase 2.4b: shared references (&T) don't move the borrowed value. ---
+
+void test_ref_param_ok() {
+    expectOk("struct P { x: i64 }\n"
+             "fn read(p: &P) -> i64 { p.x }\n"
+             "fn main() -> i64 { let p = P { x: 7 }; read(&p) }",
+             "ref_param_ok");
+}
+
+void test_multiple_borrows_ok() {
+    // `&p` is a temporary borrow that ends with the statement; multiple
+    // shared borrows of the same binding are fine.
+    expectOk("struct P { x: i64 }\n"
+             "fn read(p: &P) -> i64 { p.x }\n"
+             "fn main() -> i64 {\n"
+             "    let p = P { x: 7 };\n"
+             "    let a = read(&p);\n"
+             "    let b = read(&p);\n"
+             "    a + b\n"
+             "}",
+             "multiple_borrows_ok");
+}
+
+void test_borrow_then_move_ok() {
+    // Temporary borrows (used as fn args) don't outlive the statement, so
+    // moving the binding afterwards is fine.
+    expectOk("struct P { x: i64 }\n"
+             "fn read(p: &P) -> i64 { p.x }\n"
+             "fn consume(p: P) -> i64 { p.x }\n"
+             "fn main() -> i64 {\n"
+             "    let p = P { x: 7 };\n"
+             "    let a = read(&p);\n"
+             "    let b = consume(p);\n"
+             "    a + b\n"
+             "}",
+             "borrow_then_move_ok");
+}
+
+void test_borrow_of_moved_errors() {
+    // Borrowing a value that's been moved is itself a use-after-move.
+    expectErr("struct P { x: i64 }\n"
+              "fn consume(p: P) -> i64 { p.x }\n"
+              "fn read(p: &P) -> i64 { p.x }\n"
+              "fn main() -> i64 {\n"
+              "    let p = P { x: 7 };\n"
+              "    let a = consume(p);\n"
+              "    let b = read(&p);\n"
+              "    a + b\n"
+              "}",
+              "borrow_of_moved_errors");
+}
+
+void test_ref_is_copy_ok() {
+    // `&T` is Copy: assigning a ref to another binding doesn't move the
+    // original ref.
+    expectOk("struct P { x: i64 }\n"
+             "fn add_x(a: &P, b: &P) -> i64 { a.x + b.x }\n"
+             "fn main() -> i64 {\n"
+             "    let p = P { x: 7 };\n"
+             "    let r = &p;\n"
+             "    let r2 = r;\n"
+             "    add_x(r, r2)\n"
+             "}",
+             "ref_is_copy_ok");
+}
+
 } // namespace
 
 int main() {
@@ -281,7 +347,12 @@ int main() {
     test_return_then_use_errors();
     test_generic_box_use_after_move_errors();
     test_try_operator_ok();
-    std::cout << "All borrow_check tests passed (18 cases) — Phase 2.4a "
-                 "move semantics\n";
+    test_ref_param_ok();
+    test_multiple_borrows_ok();
+    test_borrow_then_move_ok();
+    test_borrow_of_moved_errors();
+    test_ref_is_copy_ok();
+    std::cout << "All borrow_check tests passed (23 cases) — Phase 2.4b "
+                 "shared references\n";
     return 0;
 }

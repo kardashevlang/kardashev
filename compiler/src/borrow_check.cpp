@@ -31,6 +31,11 @@ bool isCopyType(const TypePtr& t) {
     case TypeKind::Bool:
     case TypeKind::Unit:
         return true;
+    case TypeKind::Ref:
+        // Phase 2.4b: `&T` is Copy (shared references can be freely
+        // copied — `let a = r; let b = r;` works). `&mut T` (Phase 2.4c)
+        // is intentionally NOT Copy to enforce single-active-mut.
+        return !r->refIsMut;
     case TypeKind::Var:
         // Generic Vars (in a generic body) are conservatively Move so the
         // most-restrictive case is enforced. Codegen monomorphizes; the
@@ -117,14 +122,22 @@ private:
     // enough to drive Copy/Move classification (we only care which
     // category, not the full structure).
     TypePtr paramTypeFromAst(const ast::TypeRef& tr) {
+        // Phase 2.4b: `&T` is Copy at the value level, so a parameter
+        // typed `&P` becomes a Copy binding (multiple uses are fine).
+        if (tr.isRef) {
+            ast::TypeRef inner = tr;
+            inner.isRef = false;
+            inner.refIsMut = false;
+            return makeRef(paramTypeFromAst(inner), tr.refIsMut);
+        }
         if (tr.name == "i64") return makeInt();
         if (tr.name == "bool") return makeBool();
-        // Anything else (struct, enum, generic param, &T-once-we-have-it) is
-        // conservatively Move-typed. A schema-lookup against tc_.structs /
-        // tc_.enums would refine this, but for classification we only need
-        // "is this Copy?" — the answer for compounds is `no`.
+        // Anything else (struct, enum, generic param) is conservatively
+        // Move-typed. A schema-lookup against tc_.structs / tc_.enums
+        // would refine this, but for classification we only need "is this
+        // Copy?" — the answer for compounds is `no`.
         auto t = std::make_shared<Type>();
-        t->kind = TypeKind::Struct; // any non-Copy kind picks the Move side
+        t->kind = TypeKind::Struct;
         t->structName = tr.name;
         return t;
     }
@@ -207,6 +220,19 @@ private:
             // `expr?` consumes the operand (either unwraps Ok or early-
             // returns Err).
             consume(*te->operand);
+            return;
+        }
+        if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
+            // Phase 2.4b: `&x` borrows x without consuming it. We still
+            // verify the binding hasn't already been moved. Borrow-while-
+            // moved would be a use-after-move; move-while-borrowed lands
+            // in Phase 2.4c alongside NLL.
+            if (auto* id = dynamic_cast<const ast::IdentExpr*>(
+                    re->operand.get())) {
+                checkRead(*id);
+            } else {
+                consume(*re->operand);
+            }
             return;
         }
     }

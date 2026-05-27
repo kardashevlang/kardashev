@@ -5,7 +5,7 @@
 //   - Identifiers:      [A-Za-z_][A-Za-z0-9_]*
 //   - Keywords:         fn let if else return struct enum match trait impl for
 //   - Operators:        +  -  *  /  <  <=  >  >=  ==  !=  =  ->  =>  ?
-//   - Punctuation:      (  )  {  }  ,  ;  :  .  _
+//   - Punctuation:      (  )  {  }  ,  ;  :  .  _  &
 //   - Skipped:          whitespace, `// ... \n` line comments
 //
 // Line / column counts start at 1.
@@ -55,6 +55,7 @@ enum class TokenKind {
     Arrow, // ->
     FatArrow, // =>
     Question, // ? — Phase 3.4 try operator
+    Ampersand, // & — Phase 2.4b shared borrow / reference type
 
     // Punctuation
     LParen,
