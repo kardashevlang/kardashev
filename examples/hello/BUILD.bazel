@@ -1,0 +1,12 @@
+load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary", "kardashev_library")
+
+kardashev_library(
+    name = "util",
+    srcs = ["util.kd"],
+)
+
+kardashev_binary(
+    name = "hello",
+    src = "main.kd",
+    deps = [":util"],
+)
