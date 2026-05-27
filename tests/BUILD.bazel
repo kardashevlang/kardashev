@@ -35,6 +35,16 @@ cc_test(
 )
 
 cc_test(
+    name = "borrow_check_test",
+    srcs = ["borrow_check_test.cpp"],
+    deps = [
+        "//compiler:borrow_check",
+        "//compiler:parser",
+        "//compiler:typecheck",
+    ],
+)
+
+cc_test(
     name = "codegen_test",
     srcs = ["codegen_test.cpp"],
     deps = [

@@ -19,6 +19,7 @@
 // The REPL prompt is only emitted when stdin is a TTY, so piped input
 // works cleanly (smoke_test exercises this).
 
+#include "kardashev/borrow_check.hpp"
 #include "kardashev/codegen.hpp"
 #include "kardashev/parser.hpp"
 #include "kardashev/typecheck.hpp"
@@ -54,6 +55,13 @@ void reportTypeErrors(const kardashev::TypeCheckResult& r) {
     }
 }
 
+void reportBorrowErrors(const kardashev::BorrowCheckResult& r) {
+    for (const auto& e : r.errors) {
+        std::cerr << "borrow error " << e.line << ":" << e.column << ": "
+                  << e.message << '\n';
+    }
+}
+
 // Compile `src` through the full pipeline and JIT-call the named entry
 // (which must be a no-arg function returning i64). Diagnostics go to
 // stderr. Returns the i64 result on success, nullopt otherwise.
@@ -67,6 +75,11 @@ std::optional<std::int64_t> compileAndRun(const std::string& src,
     auto tcr = kardashev::typecheck(pr.program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr);
+        return std::nullopt;
+    }
+    auto bcr = kardashev::borrow_check(pr.program, tcr);
+    if (!bcr.ok()) {
+        reportBorrowErrors(bcr);
         return std::nullopt;
     }
     auto cgr = kardashev::codegen(pr.program, tcr);
@@ -144,6 +157,11 @@ int runREPL() {
             auto tcr = kardashev::typecheck(pr.program);
             if (!tcr.ok()) {
                 reportTypeErrors(tcr);
+                continue;
+            }
+            auto bcr = kardashev::borrow_check(pr.program, tcr);
+            if (!bcr.ok()) {
+                reportBorrowErrors(bcr);
                 continue;
             }
             accumulated = std::move(trial);
