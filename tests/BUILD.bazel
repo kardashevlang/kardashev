@@ -19,6 +19,12 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+sh_test(
+    name = "smoke_test_print",
+    srcs = ["smoke_test_print.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

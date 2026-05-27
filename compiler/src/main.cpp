@@ -389,12 +389,18 @@ bool emitObject(llvm::Module& module, const std::string& outObjPath) {
         return false;
     }
     llvm::TargetOptions opts;
+    // Phase 6.0 added a global string constant for `print`'s format
+    // literal. Linux distros' default linker config builds PIE
+    // executables; non-PIC object code with absolute relocations is
+    // rejected. Compiling the emitted object as PIC fixes the link
+    // without forcing `-no-pie` on the clang invocation (which would
+    // also affect platforms — like macOS — that don't need the flag).
 #if LLVM_VERSION_MAJOR >= 21
     auto* tm = target->createTargetMachine(
-        triple, "generic", "", opts, std::nullopt);
+        triple, "generic", "", opts, llvm::Reloc::PIC_);
 #else
     auto* tm = target->createTargetMachine(
-        tripleStr, "generic", "", opts, std::nullopt);
+        tripleStr, "generic", "", opts, llvm::Reloc::PIC_);
 #endif
     module.setDataLayout(tm->createDataLayout());
 

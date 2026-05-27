@@ -91,7 +91,17 @@ fn main() -> i64 ! { io, alloc } { raw_read() }    // pure-caller would error
 
 `Option<T>` and `Result<T, E>` are auto-included via a built-in prelude
 so user programs can use `Some` / `None` / `Ok` / `Err` without
-redeclaring them.
+redeclaring them. A built-in `print(n: i64) -> i64 ! { io }` writes one
+integer plus newline to stdout — kardashev's first real I/O primitive.
+Callers must declare the `io` effect, same rule as any other effect:
+
+```rust
+fn main() -> i64 ! { io } {
+    print(42);                  // -> writes "42\n"
+    print(0 - 7);               // -> writes "-7\n"
+    0
+}
+```
 
 Multi-file programs (Phase 7.1): write `mod foo;` at the top of a `.kd`
 file to pull in `foo.kd` from the same directory. Modules are inlined

@@ -12,6 +12,18 @@ namespace {
 class TypeChecker {
 public:
     TypeCheckResult check(const ast::Program& program) {
+        // Phase 6.0 built-ins: register stdlib primitives the user can
+        // call without ever declaring them. Today: `print(i64) -> i64 ! { io }`.
+        // The implementation lives in codegen (a generated wrapper that
+        // calls libc's `printf`); we only commit a schema here so the
+        // typechecker accepts the calls + propagates effects.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["print"] = std::move(sch);
+        }
+
         // Pass 1a: register every struct and enum decl. To allow free
         // cross-references (struct field of enum type, enum payload of
         // struct type), we do this in two phases:

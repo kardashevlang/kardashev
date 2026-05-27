@@ -51,6 +51,7 @@ public:
         }
         declareAllStructs();
         declareAllEnums();
+        declareBuiltins();
         // Declare monomorphic top-level functions and impl methods.
         for (const auto& fn : program.functions) {
             if (fn.genericParams.empty()) declareMonoFn(fn);
@@ -177,6 +178,45 @@ private:
     // existing pattern); GENERIC type instances are realized on demand by
     // `getOrDeclareStructInstance` / `getOrDeclareEnumInstance` when
     // mapKardashevType encounters a typeArgs-bearing Struct/Enum.
+    // Phase 6.0 built-in: emit a `print` function that wraps libc's
+    // `printf` to write one i64 + newline. The typechecker registered a
+    // matching schema so user calls type-check; we materialize the body
+    // here so both JIT and AOT resolve it without external runtime
+    // files. libc's `printf` is always linked into the host process
+    // (kardc) for JIT, and clang links libc into AOT outputs by default.
+    void declareBuiltins() {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+
+        // Declare `int printf(const char*, ...)`.
+        auto* printfTy =
+            llvm::FunctionType::get(i32Ty, {i8PtrTy}, /*isVarArg=*/true);
+        auto* printfFn = llvm::Function::Create(
+            printfTy, llvm::Function::ExternalLinkage, "printf", module_.get());
+
+        // Define `int64_t print(int64_t)` that calls printf("%lld\n", n)
+        // and returns 0. Naming it `print` directly is fine because no
+        // C runtime symbol conflicts with it.
+        auto* printTy =
+            llvm::FunctionType::get(i64Ty, {i64Ty}, /*isVarArg=*/false);
+        auto* printFn = llvm::Function::Create(
+            printTy, llvm::Function::ExternalLinkage, "print", module_.get());
+        printFn->getArg(0)->setName("n");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", printFn);
+        llvm::IRBuilder<> b(entry);
+        // %lld matches Linux's int64_t; PRId64 from <inttypes.h> would
+        // be more portable but `%lld` is universally accepted on the
+        // 64-bit platforms our CI matrix targets (Ubuntu + macOS).
+        auto* fmt = b.CreateGlobalString("%lld\n", "kd_print_fmt", 0,
+                                           module_.get());
+        b.CreateCall(printfFn, {fmt, printFn->getArg(0)});
+        b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+
+        declaredFns_["print"] = printFn;
+    }
+
     void declareAllStructs() {
         for (const auto& [name, schema] : tc_.structs) {
             if (!schema.genericVars.empty()) continue;
