@@ -37,6 +37,7 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
@@ -270,9 +271,17 @@ bool emitObject(llvm::Module& module, const std::string& outObjPath) {
     llvm::InitializeAllAsmParsers();
     llvm::InitializeAllAsmPrinters();
 
+    // LLVM 21+ switched setTargetTriple / createTargetMachine to take a
+    // `Triple` value; older LLVMs (Ubuntu CI's apt-installed 18/19/20)
+    // only accept `StringRef`. Branch on LLVM_VERSION_MAJOR so the same
+    // source compiles against both ends of the matrix.
     std::string tripleStr = llvm::sys::getDefaultTargetTriple();
+#if LLVM_VERSION_MAJOR >= 21
     llvm::Triple triple(tripleStr);
     module.setTargetTriple(triple);
+#else
+    module.setTargetTriple(tripleStr);
+#endif
     std::string err;
     const auto* target = llvm::TargetRegistry::lookupTarget(tripleStr, err);
     if (!target) {
@@ -280,8 +289,13 @@ bool emitObject(llvm::Module& module, const std::string& outObjPath) {
         return false;
     }
     llvm::TargetOptions opts;
+#if LLVM_VERSION_MAJOR >= 21
     auto* tm = target->createTargetMachine(
         triple, "generic", "", opts, std::nullopt);
+#else
+    auto* tm = target->createTargetMachine(
+        tripleStr, "generic", "", opts, std::nullopt);
+#endif
     module.setDataLayout(tm->createDataLayout());
 
     std::error_code ec;
