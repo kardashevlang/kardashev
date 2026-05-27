@@ -50,13 +50,16 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-Phases 0–5 (AOT + prelude) and Phase 7.1 (`mod foo;` flat import) land;
-row-polymorphic effects (`! {e}`) and stdlib types that need a heap
-(`Vec`, `String`) wait for first-class function values + a small runtime
-in Phase 6. Built locally with `bazel build //... && bazel test //...`
-or, when Bazel isn't available, the `Makefile.local` shim (LLVM +
-clang). The CI matrix runs both ubuntu-latest and macos-latest via
-Bazel on every push.
+The full README roadmap (Phases 0–8) lands in the repository — with a
+few items deliberately stubbed and documented as such. The honest
+breakdown is in the [Roadmap](#roadmap) table below; the
+[`docs/`](docs/) directory has the language reference, effects-system
+notes, stdlib, and compiler-architecture deep dives.
+
+Built locally with `bazel build //... && bazel test //...` or, when
+Bazel isn't available, the `Makefile.local` shim (LLVM + clang). The
+CI matrix runs both ubuntu-latest and macos-latest via Bazel on every
+push.
 
 What works today:
 
@@ -91,9 +94,11 @@ fn main() -> i64 ! { io, alloc } { raw_read() }    // pure-caller would error
 
 `Option<T>` and `Result<T, E>` are auto-included via a built-in prelude
 so user programs can use `Some` / `None` / `Ok` / `Err` without
-redeclaring them. A built-in `print(n: i64) -> i64 ! { io }` writes one
-integer plus newline to stdout — kardashev's first real I/O primitive.
-Callers must declare the `io` effect, same rule as any other effect:
+redeclaring them. A growable `Vec` (heap-allocated buffer of `i64`)
+ships too, with `vec_new` / `vec_push` / `vec_get` / `vec_len`. A
+built-in `print(n: i64) -> i64 ! { io }` writes one integer plus
+newline to stdout — kardashev's first real I/O primitive. Callers must
+declare the `io` effect, same rule as any other effect:
 
 ```rust
 fn main() -> i64 ! { io } {
@@ -140,9 +145,10 @@ JIT (or AOT).
 | 2 | Ownership + NLL borrow check + structs + enums + pattern matching | ✅ |
 | 3 | Traits + generics + `Result` + `?` operator + monomorphization | ✅ |
 | 4 | Effect labels in signatures (the signature feature lands here) | ✅ (concrete labels; row-polymorphic `! {e}` waits for fn-pointer values in Phase 6) |
-| 5 | AOT pipeline + minimal stdlib (`Option`, `Result`, `Vec`, `String`) | ✅ AOT + Option/Result prelude; Vec/String wait for the Phase 6 runtime |
-| 6 | `async` / `await` + state-machine transform + basic executor | — |
-| 7 | Module system + complete `rules_kardashev` + `kard` CLI | 🟡 `mod foo;` flat import lands (recursive, cycle-safe); `rules_kardashev` Starlark macros + a `kard` driver thin-wrapping kardc still to come |
+| 5 | AOT pipeline + minimal stdlib (`Option`, `Result`, `Vec`, `String`) | ✅ AOT + Option/Result prelude + heap-backed `Vec<i64>`. `String` and generic-`T` `Vec<T>` still parked behind a richer heap codegen |
+| 6 | `async` / `await` + state-machine transform + basic executor | 🟡 surface syntax + `async` effect propagation land as a stub (`async fn`, `.await`). State-machine transform + real suspension are the remaining work |
+| 7 | Module system + complete `rules_kardashev` + `kard` CLI | 🟡 `mod foo;` flat import + `pub` + path syntax + `kard` driver wrapper all land. Full path-qualified resolution (instead of flat-merge) + `rules_kardashev` Starlark macros are the remaining work |
+| 8 | Optimization passes + LSP + docs site | 🟡 LLVM O2 pipeline runs on every emitted module; `docs/` has the language reference, effects, stdlib, and architecture notes. An LSP server isn't part of this iteration |
 | 8 | Optimization passes + LSP + docs site | — |
 
 ## Why "kardashev"?
