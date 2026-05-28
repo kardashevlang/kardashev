@@ -1496,6 +1496,129 @@ void test_unparameterized_bound_has_no_args() {
     assert(fn.genericParams[0].boundTypeArgs.empty());
 }
 
+// --- Phase 21b: where clauses ---
+
+void test_where_clause_desugars_onto_param() {
+    // A `where C: Container<T>` clause must land on the matching generic param's
+    // bound / boundTypeArgs, identically to the inline `<C: Container<T>>` form.
+    auto r = parse("fn head<T, C>(c: C) -> T where C: Container<T> { c.first() }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors)
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message << '\n';
+        std::abort();
+    }
+    assert(r.program.functions.size() == 1);
+    const auto& fn = r.program.functions[0];
+    assert(fn.genericParams.size() == 2);
+    assert(fn.genericParams[0].name == "T" && fn.genericParams[0].bound.empty());
+    assert(fn.genericParams[1].name == "C");
+    assert(fn.genericParams[1].bound == "Container");
+    assert(fn.genericParams[1].boundTypeArgs.size() == 1);
+    assert(fn.genericParams[1].boundTypeArgs[0].name == "T");
+}
+
+void test_where_clause_multi_constraint() {
+    // Two comma-separated constraints, each onto its own param.
+    auto r = parse("fn f<G, S>(g: G, s: S) -> i64 where G: Getter, S: Show { 0 }");
+    assert(r.ok());
+    const auto& fn = r.program.functions[0];
+    assert(fn.genericParams.size() == 2);
+    assert(fn.genericParams[0].bound == "Getter");
+    assert(fn.genericParams[1].bound == "Show");
+}
+
+void test_where_clause_equals_inline() {
+    // The where form and the inline form must produce byte-identical generic
+    // params (the desugar is exact).
+    auto inl = parse("fn f<T, C: Container<T>>(c: C) -> T { c.first() }");
+    auto whr = parse("fn f<T, C>(c: C) -> T where C: Container<T> { c.first() }");
+    assert(inl.ok() && whr.ok());
+    const auto& a = inl.program.functions[0].genericParams;
+    const auto& b = whr.program.functions[0].genericParams;
+    assert(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        assert(a[i].name == b[i].name);
+        assert(a[i].bound == b[i].bound);
+        assert(a[i].boundTypeArgs.size() == b[i].boundTypeArgs.size());
+    }
+}
+
+void test_where_clause_unknown_param_errors() {
+    // A `where` constraint naming an unknown generic param is a parse error.
+    auto r = parse("fn f<T>(x: T) -> i64 where U: Show { 0 }");
+    assert(!r.ok());
+    bool found = false;
+    for (const auto& e : r.errors)
+        if (e.message.find("unknown generic parameter") != std::string::npos)
+            found = true;
+    assert(found);
+}
+
+void test_where_clause_on_impl_method() {
+    // `where` works on impl methods too.
+    auto r = parse(
+        "impl Foo for Bar { fn m<T, C>(&self, c: C) -> T where C: Container<T> "
+        "{ c.first() } }");
+    assert(r.ok());
+    assert(r.program.impls.size() == 1);
+    const auto& m = r.program.impls[0].methods[0];
+    assert(m.genericParams.size() == 2);
+    assert(m.genericParams[1].bound == "Container");
+    assert(m.genericParams[1].boundTypeArgs.size() == 1);
+}
+
+// --- Phase 21b: associated types ---
+
+void test_trait_assoc_type_decl() {
+    // `trait Container { type Item; fn get(&self) -> Self::Item; }`.
+    auto r = parse(
+        "trait Container { type Item; fn get(&self) -> Self::Item; }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors)
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message << '\n';
+        std::abort();
+    }
+    assert(r.program.traits.size() == 1);
+    const auto& t = r.program.traits[0];
+    assert(t.assocTypes.size() == 1);
+    assert(t.assocTypes[0].name == "Item");
+    assert(t.methods.size() == 1 && t.methods[0].name == "get");
+    // The method return type is the projection `Self::Item`.
+    assert(t.methods[0].returnType.name == "Self");
+    assert(t.methods[0].returnType.assocName == "Item");
+}
+
+void test_impl_assoc_type_def() {
+    // `impl Container for IntBox { type Item = i64; fn get(...) ... }`.
+    auto r = parse(
+        "impl Container for IntBox { type Item = i64; fn get(&self) -> "
+        "Self::Item { self.v } }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors)
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message << '\n';
+        std::abort();
+    }
+    assert(r.program.impls.size() == 1);
+    const auto& im = r.program.impls[0];
+    assert(im.assocTypes.size() == 1);
+    assert(im.assocTypes[0].name == "Item");
+    assert(im.assocTypes[0].type.name == "i64");
+    assert(im.methods.size() == 1);
+}
+
+void test_assoc_projection_on_generic_param() {
+    // `fn first<C: Container>(c: C) -> C::Item { c.get() }` — the return type is
+    // the projection `C::Item`.
+    auto r = parse("fn first<C: Container>(c: C) -> C::Item { c.get() }");
+    assert(r.ok());
+    const auto& fn = r.program.functions[0];
+    assert(fn.returnType.name == "C");
+    assert(fn.returnType.assocName == "Item");
+}
+
 } // namespace
 
 int main() {
@@ -1616,6 +1739,15 @@ int main() {
     test_generic_inherent_impl_unaffected();
     test_parameterized_trait_bound();
     test_unparameterized_bound_has_no_args();
-    std::cout << "All parser tests passed (103 cases)\n";
+    // Phase 21b: where clauses + associated types.
+    test_where_clause_desugars_onto_param();
+    test_where_clause_multi_constraint();
+    test_where_clause_equals_inline();
+    test_where_clause_unknown_param_errors();
+    test_where_clause_on_impl_method();
+    test_trait_assoc_type_decl();
+    test_impl_assoc_type_def();
+    test_assoc_projection_on_generic_param();
+    std::cout << "All parser tests passed (111 cases)\n";
     return 0;
 }

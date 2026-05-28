@@ -607,6 +607,30 @@ public:
                 tparams.push_back(gp.name);
             }
             traitGenericParams_[td.name] = std::move(tparams);
+            // Phase 21b: record the trait's associated-type names. Reject
+            // duplicates and a clash with a generic-trait param name (both live
+            // in the trait's type namespace).
+            std::vector<std::string> atypes;
+            std::unordered_set<std::string> seenAt;
+            for (const auto& at : td.assocTypes) {
+                if (!seenAt.insert(at.name).second) {
+                    error("duplicate associated type '" + at.name +
+                              "' in trait '" + td.name + "'",
+                          at.line, at.column);
+                    continue;
+                }
+                bool clashesParam = false;
+                for (const auto& gp : td.genericParams)
+                    if (gp.name == at.name) { clashesParam = true; break; }
+                if (clashesParam) {
+                    error("associated type '" + at.name + "' in trait '" +
+                              td.name + "' clashes with a generic parameter",
+                          at.line, at.column);
+                    continue;
+                }
+                atypes.push_back(at.name);
+            }
+            traitAssocTypes_[td.name] = std::move(atypes);
             std::unordered_set<std::string> seenMethod;
             std::vector<ast::MethodSig> uniqueMethods;
             uniqueMethods.reserve(td.methods.size());
@@ -673,6 +697,59 @@ public:
                 error("impl for unsupported type " + typeToString(forTy),
                       impl.forType.line, impl.forType.column);
                 continue;
+            }
+            // Phase 21b: associated types. For a trait impl, resolve each
+            // `type Item = T;` (with `Self` -> forType and the trait's generic
+            // params bound to the impl's trait-args, so a definition may name
+            // `Self`/`T`), validate exact coverage of the trait's declared
+            // associated types, and stash the concrete choices for use-site
+            // resolution of `Self::Item` / `C::Item`.
+            if (!inherent) {
+                const std::vector<std::string>& wantAssoc =
+                    traitAssocTypes_.count(impl.traitName)
+                        ? traitAssocTypes_[impl.traitName]
+                        : std::vector<std::string>{};
+                std::unordered_set<std::string> wantSet(wantAssoc.begin(),
+                                                        wantAssoc.end());
+                GenericEnv assocEnv;
+                assocEnv["Self"] = forTy;
+                bindTraitParamsForImpl(impl, assocEnv);
+                const GenericEnv* savedEnv = currentGenericEnv_;
+                currentGenericEnv_ = &assocEnv;
+                std::unordered_map<std::string, TypePtr> resolvedAssoc;
+                std::unordered_set<std::string> seenAssoc;
+                for (const auto& at : impl.assocTypes) {
+                    if (!wantSet.count(at.name)) {
+                        error("impl of trait '" + impl.traitName + "' for '" +
+                                  typeName + "' defines associated type '" +
+                                  at.name + "' which the trait does not declare",
+                              at.line, at.column);
+                        continue;
+                    }
+                    if (!seenAssoc.insert(at.name).second) {
+                        error("associated type '" + at.name +
+                                  "' defined more than once in impl of '" +
+                                  impl.traitName + "' for '" + typeName + "'",
+                              at.line, at.column);
+                        continue;
+                    }
+                    resolvedAssoc[at.name] = resolveTypeRef(at.type);
+                }
+                currentGenericEnv_ = savedEnv;
+                for (const auto& want : wantAssoc) {
+                    if (!resolvedAssoc.count(want)) {
+                        error("impl of trait '" + impl.traitName + "' for '" +
+                                  typeName + "' is missing associated type '" +
+                                  want + "'",
+                              impl.line, impl.column);
+                    }
+                }
+                if (!resolvedAssoc.empty())
+                    implAssocTypes_[typeName][impl.traitName] =
+                        std::move(resolvedAssoc);
+            } else if (!impl.assocTypes.empty()) {
+                error("inherent impl cannot define associated types",
+                      impl.assocTypes[0].line, impl.assocTypes[0].column);
             }
             // Key inherent impls under an internal-only sentinel so user-defined
             // trait names can never collide with inherent impl registrations.
@@ -845,6 +922,14 @@ public:
                 genBoundArgs[i] = std::move(resolved);
             }
 
+            // Phase 21b: expose each bounded param's trait to `resolveTypeRef`
+            // so a `C::Item` projection in this signature resolves C's bound.
+            currentVarBound_.clear();
+            for (std::size_t i = 0; i < genVars.size(); ++i) {
+                if (i < genBounds.size() && !genBounds[i].empty())
+                    currentVarBound_[genVars[i]->varId] = genBounds[i];
+            }
+
             std::vector<TypePtr> argTypes;
             argTypes.reserve(fn.params.size());
             for (const auto& p : fn.params) {
@@ -854,6 +939,7 @@ public:
 
             currentGenericEnv_ = nullptr;
             currentEffectRowVarNames_ = nullptr;
+            currentVarBound_.clear();
 
             FnSchema schema;
             schema.signature = makeFunction(std::move(argTypes), ret);
@@ -1017,6 +1103,8 @@ public:
         result.methodResolutions = std::move(methodResolutions_);
         result.dynCoercions = std::move(dynCoercions_);
         result.dynVtablesNeeded = std::move(dynVtablesNeeded_);
+        result.assocProjections = std::move(assocProjections_);
+        result.implAssocTypes = std::move(implAssocTypes_);
         return result;
     }
 
@@ -1038,6 +1126,32 @@ private:
     // paths read `traits_` exactly as before.
     std::unordered_map<std::string, std::vector<std::string>>
         traitGenericParams_;
+    // Phase 21b: traitName -> its associated-type names (declaration order).
+    // `trait Container { type Item; ... }` records {"Item"}. Empty for a trait
+    // with no associated types. Distinct from `traitGenericParams_`: associated
+    // types are chosen per-impl (`type Item = i64;`), not supplied at the use
+    // site like generic-trait args.
+    std::unordered_map<std::string, std::vector<std::string>> traitAssocTypes_;
+    // Phase 21b: per (implementing-type-name, trait-name), the concrete type
+    // each associated type resolves to in that impl. Resolved with `Self` bound
+    // to the impl's forType (and the trait's generic params bound to the impl's
+    // trait-args). `Self::Item` inside an impl method, and `C::Item` through a
+    // `C: Trait` bound at a monomorphic instance, both read this table.
+    std::unordered_map<
+        std::string,
+        std::unordered_map<std::string,
+                           std::unordered_map<std::string, TypePtr>>>
+        implAssocTypes_;
+    // Phase 21b: during signature resolution of a generic fn / impl method, the
+    // bound trait of each in-scope generic param's schema Var, keyed by var id.
+    // Lets `resolveTypeRef` resolve a `C::Item` projection (C a Var) to the
+    // correct trait before the fn's schema is fully built. Cleared after each
+    // signature resolves. Persisted long-term in `assocProjections_` for the
+    // projection Vars that survive into bodies / codegen.
+    std::unordered_map<int, std::string> currentVarBound_;
+    // Phase 21b: placeholder-Var id -> how to resolve that `C::Item` projection
+    // at codegen. Survives into the TypeCheckResult.
+    std::unordered_map<int, AssocProjection> assocProjections_;
     // Impl registration: per implementing-type-name, per-trait-name, the
     // method-AST table. Indexed twice so method-call resolution can hop
     // typeName -> impl in O(1) and a missing method tells us the impl
@@ -1687,6 +1801,87 @@ private:
         return inst;
     }
 
+    // Phase 21b: resolve an associated-type projection `Base::Assoc`.
+    //   - If `Base` resolves to a concrete type (e.g. `Self` inside an impl
+    //     method, or a named struct/enum), find the trait among that type's
+    //     impls that declares `Assoc` and return the impl's chosen type. This
+    //     fully handles `Self::Item` (Self is concretely bound in impl methods).
+    //   - If `Base` resolves to a trait-bounded generic param Var (`C::Item`),
+    //     the concrete type isn't known until monomorphization: allocate a
+    //     placeholder Var and record an AssocProjection for codegen to resolve.
+    TypePtr resolveAssocProjection(const ast::TypeRef& tr) {
+        // Resolve the base path segment via the active generic env (Self / a
+        // generic param) or as a named type.
+        TypePtr base;
+        if (currentGenericEnv_) {
+            auto git = currentGenericEnv_->find(tr.name);
+            if (git != currentGenericEnv_->end()) base = git->second;
+        }
+        if (!base) {
+            // Fall back to resolving `tr.name` as a standalone type name.
+            ast::TypeRef baseRef;
+            baseRef.name = tr.name;
+            baseRef.line = tr.line;
+            baseRef.column = tr.column;
+            base = resolveTypeRef(baseRef);
+        }
+        TypePtr rb = resolve(base);
+        if (rb->kind == TypeKind::Var) {
+            // `C::Item`: find C's bound trait, confirm it declares `Item`, and
+            // record a projection placeholder for codegen.
+            auto bit = currentVarBound_.find(rb->varId);
+            std::string traitName =
+                bit != currentVarBound_.end() ? bit->second : std::string{};
+            if (traitName.empty()) {
+                error("associated type projection '" + tr.name + "::" +
+                          tr.assocName +
+                          "' requires a trait bound on '" + tr.name + "'",
+                      tr.line, tr.column);
+                return makeInt();
+            }
+            auto ait = traitAssocTypes_.find(traitName);
+            bool declared =
+                ait != traitAssocTypes_.end() &&
+                std::find(ait->second.begin(), ait->second.end(),
+                          tr.assocName) != ait->second.end();
+            if (!declared) {
+                error("trait '" + traitName + "' (bound of '" + tr.name +
+                          "') has no associated type '" + tr.assocName + "'",
+                      tr.line, tr.column);
+                return makeInt();
+            }
+            TypePtr placeholder = makeFreshVar();
+            assocProjections_[placeholder->varId] =
+                AssocProjection{rb->varId, traitName, tr.assocName};
+            return placeholder;
+        }
+        // Concrete base. Determine its type name, then find a trait among its
+        // impls that declares `assocName` and look up the impl's choice.
+        std::string typeName;
+        if (rb->kind == TypeKind::Struct) typeName = rb->structName;
+        else if (rb->kind == TypeKind::Enum) typeName = rb->enumName;
+        else if (rb->kind == TypeKind::Int) typeName = "i64";
+        else if (rb->kind == TypeKind::Bool) typeName = "bool";
+        else {
+            error("associated type projection on unsupported base type " +
+                      typeToString(base),
+                  tr.line, tr.column);
+            return makeInt();
+        }
+        auto tyIt = implAssocTypes_.find(typeName);
+        if (tyIt != implAssocTypes_.end()) {
+            // Prefer a trait that actually declares `assocName`.
+            for (const auto& [traitName, table] : tyIt->second) {
+                auto entry = table.find(tr.assocName);
+                if (entry != table.end()) return entry->second;
+            }
+        }
+        error("type '" + typeName + "' has no associated type '" +
+                  tr.assocName + "' (no impl defines it)",
+              tr.line, tr.column);
+        return makeInt();
+    }
+
     TypePtr resolveTypeRef(const ast::TypeRef& tr) {
         // Phase 13b: slice type `&[T]`. The `&` is part of the slice spelling
         // (a slice is its own fat-pointer borrow), so handle it before the
@@ -1704,6 +1899,10 @@ private:
             inner.isRef = false;
             inner.refIsMut = false;
             return makeRef(resolveTypeRef(inner), tr.refIsMut);
+        }
+        // Phase 21b: an associated-type projection `Base::Assoc`.
+        if (!tr.assocName.empty()) {
+            return resolveAssocProjection(tr);
         }
         // Phase 11: `dyn Trait` — validate the trait exists and is object-
         // safe (dyn-safe), then build the unsized trait-object type. Only
@@ -1977,6 +2176,18 @@ private:
         currentGenericEnv_ = &genEnv;
         currentEffectRowVarNames_ = &rowVarNames;
         currentFnIsAsync_ = fn.isAsync;
+        // Phase 21b: expose bounded params' traits so a `C::Item` projection in
+        // the body / return type resolves C's bound (mirrors Pass 1b).
+        currentVarBound_.clear();
+        for (std::size_t i = 0;
+             i < fn.genericParams.size() && i < schema.genericVars.size();
+             ++i) {
+            if (!fn.genericParams[i].bound.empty()) {
+                TypePtr v = resolve(schema.genericVars[i]);
+                if (v->kind == TypeKind::Var)
+                    currentVarBound_[v->varId] = fn.genericParams[i].bound;
+            }
+        }
 
         pushScope();
         for (const auto& p : fn.params) {
@@ -2022,6 +2233,7 @@ private:
         currentGenericEnv_ = nullptr;
         currentEffectRowVarNames_ = nullptr;
         currentEffectRowVarById_.clear();
+        currentVarBound_.clear();
     }
 
     TypePtr checkExpr(const ast::Expr& e) {
@@ -3531,6 +3743,25 @@ private:
                     subst[resolvedRv->varId] = makeFreshVar();
                 }
             }
+            // Phase 21b: a `C::Item` projection in the callee's signature is a
+            // placeholder Var keyed on `C`'s schema Var. Give it a fresh Var
+            // per call so the call's result type isn't shared across sites;
+            // after arg unification (below) we'll resolve `C` to a concrete
+            // type at this site and pin the fresh Var to the impl's chosen
+            // associated type. Only projections over THIS callee's generic
+            // params apply.
+            std::vector<std::pair<TypePtr, AssocProjection>> callProjections;
+            {
+                std::unordered_set<int> calleeVarIds;
+                for (const auto& gv : schema.genericVars)
+                    calleeVarIds.insert(gv->varId);
+                for (const auto& [phId, proj] : assocProjections_) {
+                    if (!calleeVarIds.count(proj.baseVarId)) continue;
+                    TypePtr fresh = makeFreshVar();
+                    subst[phId] = fresh;
+                    callProjections.emplace_back(fresh, proj);
+                }
+            }
             TypePtr instSig = instantiate(schema.signature, subst);
             if (instSig->args.size() != call.args.size()) {
                 error("function '" + call.callee + "' expects " +
@@ -3554,6 +3785,32 @@ private:
             }
             for (std::size_t i = n; i < call.args.size(); ++i) {
                 checkExpr(*call.args[i]);
+            }
+            // Phase 21b: now that args are unified, the callee's generic params
+            // are pinned. Resolve each `C::Item` projection at this call site:
+            // C's call-fresh Var (subst[baseVar]) resolves to a concrete type;
+            // look up that type's impl's chosen associated type and unify the
+            // projection's fresh result Var with it. Leaves it unbound (an
+            // error already reported elsewhere) if C isn't concrete here.
+            for (const auto& [resultVar, proj] : callProjections) {
+                auto baseIt = subst.find(proj.baseVarId);
+                if (baseIt == subst.end()) continue;
+                TypePtr concrete = resolve(baseIt->second);
+                std::string typeName;
+                if (concrete->kind == TypeKind::Struct)
+                    typeName = concrete->structName;
+                else if (concrete->kind == TypeKind::Enum)
+                    typeName = concrete->enumName;
+                else if (concrete->kind == TypeKind::Int) typeName = "i64";
+                else if (concrete->kind == TypeKind::Bool) typeName = "bool";
+                else continue; // still a Var / unsupported — leave unbound
+                auto tyIt = implAssocTypes_.find(typeName);
+                if (tyIt == implAssocTypes_.end()) continue;
+                auto trIt = tyIt->second.find(proj.traitName);
+                if (trIt == tyIt->second.end()) continue;
+                auto aIt = trIt->second.find(proj.assocName);
+                if (aIt == trIt->second.end()) continue;
+                unify(resultVar, aIt->second);
             }
             // Phase 19 (Send / compile-time data-race freedom): the closure
             // handed to `thread_spawn` must be `Send` — i.e. it must not

@@ -167,6 +167,21 @@ struct DynCoercion {
     bool isBox = false;           // false => &dyn, true => Box<dyn>
 };
 
+// Phase 21b: an unresolved associated-type projection `C::Item` where `C` is a
+// trait-bounded generic param. The typechecker can't pin the concrete type
+// until monomorphization, so it allocates a placeholder Type Var (the map key)
+// and records how to resolve it: `baseVarId` is the schema Var of the generic
+// param (`C`); `traitName` is its bound; `assocName` is the projected member.
+// Codegen, at each instance, resolves `baseVarId` to a concrete type via the
+// instance substitution, then looks up that type's impl's chosen associated
+// type. `Self::Item` inside an impl (Self concretely known) never needs this —
+// it resolves to a concrete type directly during checking.
+struct AssocProjection {
+    int baseVarId = -1;
+    std::string traitName;
+    std::string assocName;
+};
+
 struct TypeCheckResult {
     std::vector<TypeError> errors;
     // Per-expression resolved type, for codegen.
@@ -201,6 +216,18 @@ struct TypeCheckResult {
     // global emitted. Populated as coercions are discovered. Codegen walks
     // this to emit one `__vtable_<Trait>_<Type>` constant + its thunks.
     std::vector<std::pair<std::string, std::string>> dynVtablesNeeded;
+    // Phase 21b: associated-type projection Vars (`C::Item`) the typechecker
+    // couldn't resolve until monomorphization, keyed by the placeholder Var id.
+    // Codegen resolves each via the instance substitution + `implAssocTypes`.
+    std::unordered_map<int, AssocProjection> assocProjections;
+    // Phase 21b: per (implementing-type-name, trait-name) the concrete TypePtr
+    // each associated type resolves to. Codegen consults this to materialize a
+    // resolved `AssocProjection` for the current instance.
+    std::unordered_map<
+        std::string,
+        std::unordered_map<std::string,
+                           std::unordered_map<std::string, TypePtr>>>
+        implAssocTypes;
     // Global variant table: variant name -> (enumName, discriminant index).
     // Codegen reads this to map a constructor name to its enum and tag.
     // Phase 2.2 keeps variant names globally unique across all enums to

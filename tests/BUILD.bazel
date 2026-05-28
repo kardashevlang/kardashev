@@ -142,6 +142,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 21b: `where` clauses (desugared onto the inline bound machinery —
+# verified by byte-identical IR) + associated types (`type Item;` / `Self::Item`
+# / `C::Item` at a bounded call site).
+sh_test(
+    name = "smoke_test_where",
+    srcs = ["smoke_test_where.sh"],
+    data = ["//compiler:kardc"],
+)
+
 sh_test(
     name = "smoke_test_fmt",
     srcs = ["smoke_test_fmt.sh"],

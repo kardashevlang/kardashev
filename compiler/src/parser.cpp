@@ -125,6 +125,10 @@ private:
         errors_.push_back({std::move(msg), t.line, t.column});
     }
 
+    void errorAt(std::string msg, std::size_t line, std::size_t column) {
+        errors_.push_back({std::move(msg), line, column});
+    }
+
     // --- Top-level ---
 
     ast::ModDecl parseModDecl() {
@@ -176,6 +180,9 @@ private:
         expect(TokenKind::RParen, ")");
         decl.returnType = parseOptionalReturnType();
         decl.effects = parseOptionalEffectRow();
+        // Phase 21b: a `where` clause desugars its constraints onto the generic
+        // params we just parsed, so it behaves identically to the inline form.
+        parseOptionalWhereClause(decl.genericParams);
         decl.body = parseBlockExpr();
         return decl;
     }
@@ -375,13 +382,24 @@ private:
             tr.column = isRef ? ampTok.column : traitTok.column;
             return tr;
         }
-        Token t = consumePathName("type name");
+        Token t = expect(TokenKind::Identifier, "type name");
         ast::TypeRef tr;
         tr.name = t.lexeme;
         tr.isRef = isRef;
         tr.refIsMut = refIsMut;
         tr.line = isRef ? ampTok.line : t.line;
         tr.column = isRef ? ampTok.column : t.column;
+        // Phase 21b: an associated-type projection `Base::Assoc` in type
+        // position (e.g. `Self::Item`, `C::Item`). A single `::` segment names
+        // the projected associated type; `name` keeps the base. (Type position
+        // has no module-qualified-type form today, so a `::` here is
+        // unambiguously a projection. Chains `A::B::C` aren't supported.)
+        if (check(TokenKind::DoubleColon)) {
+            consume();
+            Token assocTok = expect(TokenKind::Identifier,
+                                    "associated type name after `::`");
+            tr.assocName = assocTok.lexeme;
+        }
         // Optional type-args: `Name<T1, T2>`. Position is unambiguous because
         // `<` immediately after an Ident in a type-ref slot can only be the
         // start of a type-arg list (the alternative — comparison — never
@@ -400,6 +418,29 @@ private:
         return tr;
     }
 
+    // Parse a single trait bound `Bound` or `Bound<Args...>` (the right side
+    // of a `T: ...` constraint) into the given TypeParam's `bound` /
+    // `boundTypeArgs`. Shared by inline generic params and `where` clauses so
+    // a `where T: Bound<U>` desugars to exactly the inline `<T: Bound<U>>`
+    // form (Phase 21b).
+    void parseTraitBoundInto(ast::TypeParam& tp) {
+        Token boundTok = expect(TokenKind::Identifier, "trait name after ':'");
+        tp.bound = boundTok.lexeme;
+        // Phase 21a: a parameterized trait bound `I: Iterator<T>`. The trait's
+        // type args follow the bound name; they typically name another generic
+        // param of this same decl.
+        if (accept(TokenKind::Lt)) {
+            if (!check(TokenKind::Gt)) {
+                while (true) {
+                    tp.boundTypeArgs.push_back(parseTypeRef());
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::Gt)) break; // trailing ,
+                }
+            }
+            expect(TokenKind::Gt, ">");
+        }
+    }
+
     // Helper for fn/struct/enum decls: parse optional `<T1, T2: Bound>`
     // generic params after the type name. The optional `: TraitName`
     // single-trait bound lands in TypeParam.bound; multiple bounds (`T:
@@ -416,22 +457,7 @@ private:
                 tp.line = tpTok.line;
                 tp.column = tpTok.column;
                 if (accept(TokenKind::Colon)) {
-                    Token boundTok = expect(TokenKind::Identifier,
-                                             "trait name after ':'");
-                    tp.bound = boundTok.lexeme;
-                    // Phase 21a: a parameterized trait bound `I: Iterator<T>`.
-                    // The trait's type args follow the bound name; they
-                    // typically name another generic param of this same decl.
-                    if (accept(TokenKind::Lt)) {
-                        if (!check(TokenKind::Gt)) {
-                            while (true) {
-                                tp.boundTypeArgs.push_back(parseTypeRef());
-                                if (!accept(TokenKind::Comma)) break;
-                                if (check(TokenKind::Gt)) break; // trailing ,
-                            }
-                        }
-                        expect(TokenKind::Gt, ">");
-                    }
+                    parseTraitBoundInto(tp);
                 }
                 result.push_back(std::move(tp));
                 if (!accept(TokenKind::Comma)) break;
@@ -440,6 +466,54 @@ private:
         }
         expect(TokenKind::Gt, ">");
         return result;
+    }
+
+    // Phase 21b: parse an optional `where` clause and DESUGAR each constraint
+    // onto the matching generic param's bound list, so a `where`-bounded fn is
+    // byte-for-byte identical to the inline-bounded form downstream. The clause
+    // sits after a fn's return type / effect row and before the body `{`:
+    //
+    //   fn f<T, U>(...) -> R where T: Show, U: Iterator<T> { ... }
+    //
+    // `where` is an Identifier at the lexer level (like `mut`/`dyn`/`self`), so
+    // we detect it by lexeme. Each constraint is `Param: Bound` /
+    // `Param: Bound<Args>`; `Param` must name one of `params`, else it's an
+    // error. A param may carry at most one bound (single-bound limit, matching
+    // the inline grammar); a second constraint on the same param is rejected.
+    void parseOptionalWhereClause(std::vector<ast::TypeParam>& params) {
+        if (!(check(TokenKind::Identifier) && peek().lexeme == "where")) return;
+        consume(); // `where`
+        while (true) {
+            Token nameTok = expect(TokenKind::Identifier,
+                                   "generic parameter name in `where` clause");
+            // Find the matching generic param.
+            ast::TypeParam* target = nullptr;
+            for (auto& p : params) {
+                if (p.name == nameTok.lexeme) { target = &p; break; }
+            }
+            expect(TokenKind::Colon, ":");
+            if (target == nullptr) {
+                errorAt(std::string("`where` clause names unknown generic "
+                                    "parameter '") +
+                            nameTok.lexeme + "'",
+                        nameTok.line, nameTok.column);
+                // Still consume the bound so parsing can continue.
+                ast::TypeParam scratch;
+                parseTraitBoundInto(scratch);
+            } else if (!target->bound.empty()) {
+                errorAt(std::string("generic parameter '") + nameTok.lexeme +
+                            "' already has a trait bound (only one bound per "
+                            "parameter is supported)",
+                        nameTok.line, nameTok.column);
+                ast::TypeParam scratch;
+                parseTraitBoundInto(scratch);
+            } else {
+                parseTraitBoundInto(*target);
+            }
+            if (!accept(TokenKind::Comma)) break;
+            // A trailing comma right before the body `{` ends the clause.
+            if (check(TokenKind::LBrace)) break;
+        }
     }
 
     ast::TraitDecl parseTraitDecl() {
@@ -455,6 +529,21 @@ private:
         expect(TokenKind::LBrace, "{");
         while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
+            // Phase 21b: an associated-type declaration `type Item;`. `type` is
+            // an Identifier at the lexer level, so detect it by lexeme (like
+            // `mut`/`dyn`). Methods otherwise start with `fn`.
+            if (check(TokenKind::Identifier) && peek().lexeme == "type") {
+                Token typeTok = consume();
+                ast::AssocTypeDecl at;
+                at.line = typeTok.line;
+                at.column = typeTok.column;
+                Token nameTok =
+                    expect(TokenKind::Identifier, "associated type name");
+                at.name = nameTok.lexeme;
+                expect(TokenKind::Semi, ";");
+                decl.assocTypes.push_back(std::move(at));
+                continue;
+            }
             decl.methods.push_back(parseMethodSig());
         }
         expect(TokenKind::RBrace, "}");
@@ -578,6 +667,21 @@ private:
         expect(TokenKind::LBrace, "{");
         while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
+            // Phase 21b: an associated-type definition `type Item = i64;`.
+            if (check(TokenKind::Identifier) && peek().lexeme == "type") {
+                Token typeTok = consume();
+                ast::AssocTypeDef at;
+                at.line = typeTok.line;
+                at.column = typeTok.column;
+                Token nameTok =
+                    expect(TokenKind::Identifier, "associated type name");
+                at.name = nameTok.lexeme;
+                expect(TokenKind::Eq, "=");
+                at.type = parseTypeRef();
+                expect(TokenKind::Semi, ";");
+                decl.assocTypes.push_back(std::move(at));
+                continue;
+            }
             decl.methods.push_back(parseImplFnDecl());
         }
         expect(TokenKind::RBrace, "}");
@@ -612,6 +716,8 @@ private:
         expect(TokenKind::RParen, ")");
         decl.returnType = parseOptionalReturnType();
         decl.effects = parseOptionalEffectRow();
+        // Phase 21b: `where` clause on an impl method, desugared as for free fns.
+        parseOptionalWhereClause(decl.genericParams);
         decl.body = parseBlockExpr();
         return decl;
     }

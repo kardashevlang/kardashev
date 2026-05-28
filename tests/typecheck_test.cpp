@@ -1057,6 +1057,121 @@ void test_generic_trait_bound_effects_compose() {
         "generic_trait_bound_effects_compose");
 }
 
+// --- Phase 21b: where clauses ---
+
+// A `where C: Container<T>` fn type-checks exactly like the inline-bounded one
+// (the bound was desugared onto the param at parse time).
+void test_where_clause_bounded_fn_ok() {
+    expectOk(
+        "trait Container<T> { fn first(&self) -> T; }\n"
+        "struct IntBox { v: i64 }\n"
+        "impl Container<i64> for IntBox { fn first(&self) -> i64 { self.v } }\n"
+        "fn head<T, C>(c: C) -> T where C: Container<T> { c.first() }\n"
+        "fn main() -> i64 { let ib = IntBox { v: 7 }; head(ib) }",
+        "where_clause_bounded_fn_ok");
+}
+
+// A multi-constraint `where` over two distinct bounded params.
+void test_where_clause_multi_ok() {
+    expectOk(
+        "trait Getter { fn get(&self) -> i64; }\n"
+        "trait Show { fn show(&self) -> i64; }\n"
+        "struct IB { v: i64 }\n"
+        "impl Getter for IB { fn get(&self) -> i64 { self.v } }\n"
+        "struct Tag { t: i64 }\n"
+        "impl Show for Tag { fn show(&self) -> i64 { self.t } }\n"
+        "fn combine<G, S>(g: G, s: S) -> i64 where G: Getter, S: Show {\n"
+        "    g.get() + s.show()\n"
+        "}\n"
+        "fn main() -> i64 { combine(IB { v: 40 }, Tag { t: 2 }) }",
+        "where_clause_multi_ok");
+}
+
+// A `where`-bounded call still enforces the bound: calling a method the bound
+// trait doesn't declare is rejected (the bound flowed onto the param).
+void test_where_clause_bound_enforced() {
+    expectErr(
+        "trait Getter { fn get(&self) -> i64; }\n"
+        "fn f<C>(c: C) -> i64 where C: Getter { c.nonexistent() }",
+        "where_clause_bound_enforced");
+}
+
+// --- Phase 21b: associated types ---
+
+// `trait Container { type Item; fn get(&self) -> Self::Item; }` with two impls
+// choosing different Item types; both impl methods + a use type-check.
+void test_assoc_self_item_two_impls_ok() {
+    expectOk(
+        "trait Container { type Item; fn get(&self) -> Self::Item; }\n"
+        "struct IntBox { v: i64 }\n"
+        "struct BoolBox { b: bool }\n"
+        "impl Container for IntBox { type Item = i64; fn get(&self) -> "
+        "Self::Item { self.v } }\n"
+        "impl Container for BoolBox { type Item = bool; fn get(&self) -> "
+        "Self::Item { self.b } }\n"
+        "fn main() -> i64 {\n"
+        "    let ib = IntBox { v: 1 };\n"
+        "    let bb = BoolBox { b: true };\n"
+        "    if bb.get() { ib.get() } else { 0 }\n"
+        "}",
+        "assoc_self_item_two_impls_ok");
+}
+
+// `C::Item` at a bounded call site resolves to each impl's associated type.
+void test_assoc_c_item_bounded_ok() {
+    expectOk(
+        "trait Container { type Item; fn get(&self) -> Self::Item; }\n"
+        "struct IntBox { v: i64 }\n"
+        "struct BoolBox { b: bool }\n"
+        "impl Container for IntBox { type Item = i64; fn get(&self) -> "
+        "Self::Item { self.v } }\n"
+        "impl Container for BoolBox { type Item = bool; fn get(&self) -> "
+        "Self::Item { self.b } }\n"
+        "fn first<C: Container>(c: C) -> C::Item { c.get() }\n"
+        "fn main() -> i64 {\n"
+        "    let ib = IntBox { v: 1 };\n"
+        "    let bb = BoolBox { b: true };\n"
+        "    if first(bb) { first(ib) } else { 0 }\n"
+        "}",
+        "assoc_c_item_bounded_ok");
+}
+
+// An impl that omits a declared associated type is rejected.
+void test_assoc_impl_missing_item_errors() {
+    expectErr(
+        "trait Container { type Item; fn get(&self) -> Self::Item; }\n"
+        "struct IntBox { v: i64 }\n"
+        "impl Container for IntBox { fn get(&self) -> Self::Item { self.v } }",
+        "assoc_impl_missing_item_errors");
+}
+
+// An impl that defines an associated type the trait does not declare is
+// rejected.
+void test_assoc_impl_extra_item_errors() {
+    expectErr(
+        "trait Container { fn get(&self) -> i64; }\n"
+        "struct IntBox { v: i64 }\n"
+        "impl Container for IntBox { type Item = i64; fn get(&self) -> i64 "
+        "{ self.v } }",
+        "assoc_impl_extra_item_errors");
+}
+
+// A `C::Item` projection on an UNBOUNDED generic param is rejected (no bound to
+// resolve the associated type through).
+void test_assoc_projection_unbounded_errors() {
+    expectErr(
+        "trait Container { type Item; fn get(&self) -> Self::Item; }\n"
+        "fn first<C>(c: C) -> C::Item { c.get() }",
+        "assoc_projection_unbounded_errors");
+}
+
+// A duplicate associated-type declaration in a trait is rejected.
+void test_assoc_dup_decl_errors() {
+    expectErr(
+        "trait Container { type Item; type Item; }",
+        "assoc_dup_decl_errors");
+}
+
 // ---- Phase 11: dyn Trait + trait objects ----
 
 void test_dyn_ref_param_ok() {
@@ -2217,6 +2332,16 @@ int main() {
     test_dyn_generic_trait_rejected();
     test_dyn_nongeneric_trait_still_ok();
     test_generic_trait_bound_effects_compose();
+    // Phase 21b: where clauses + associated types
+    test_where_clause_bounded_fn_ok();
+    test_where_clause_multi_ok();
+    test_where_clause_bound_enforced();
+    test_assoc_self_item_two_impls_ok();
+    test_assoc_c_item_bounded_ok();
+    test_assoc_impl_missing_item_errors();
+    test_assoc_impl_extra_item_errors();
+    test_assoc_projection_unbounded_errors();
+    test_assoc_dup_decl_errors();
     // Phase 11 dyn Trait + trait objects
     test_dyn_ref_param_ok();
     test_dyn_box_ok();
@@ -2337,6 +2462,6 @@ int main() {
     test_thread_spawn_propagates_closure_io_effect();
     test_mutex_ops_typecheck_ok();
     test_mutex_new_requires_alloc_effect();
-    std::cout << "All typecheck tests passed (207 cases)\n";
+    std::cout << "All typecheck tests passed (217 cases)\n";
     return 0;
 }

@@ -386,6 +386,15 @@ struct TypeRef {
     std::vector<TypeRef> typeArgs;
     bool isRef = false;
     bool refIsMut = false;
+    // Phase 21b: an associated-type projection `Base::Assoc`, e.g. `Self::Item`
+    // inside an impl method or `C::Item` at a bounded call site. When
+    // `assocName` is non-empty, `name` holds the base path segment (a type
+    // param like `C`, or `Self`) and `assocName` the projected member. The
+    // typechecker resolves `Self::Item` (Self concretely bound) directly to the
+    // impl's chosen type, and `C::Item` (C a bounded generic param) to a
+    // projection Var that codegen materializes per monomorphic instance.
+    // Empty for an ordinary (non-projection) type reference.
+    std::string assocName;
     // Phase 11: `dyn Trait` — an unsized trait-object type. When `isDyn` is
     // true, `name` holds the trait name and `typeArgs` is empty. Combine with
     // `isRef` for `&dyn Trait`, or nest in `Box<...>` for `Box<dyn Trait>`.
@@ -547,6 +556,25 @@ struct MethodSig {
     std::size_t column = 1;
 };
 
+// Phase 21b: a trait's associated-type declaration `type Item;`. The name
+// becomes a member projectable as `Self::Item` in the trait's method sigs and
+// `C::Item` through a `C: Trait` bound. No default / bounds on associated types
+// (`type Item: Bound` / `type Item = Default`) this phase.
+struct AssocTypeDecl {
+    std::string name;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
+// Phase 21b: an impl's associated-type definition `type Item = i64;`. `name`
+// matches a trait `AssocTypeDecl`; `type` is the concrete choice for this impl.
+struct AssocTypeDef {
+    std::string name;
+    TypeRef type;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
 struct TraitDecl {
     std::string name;
     // Phase 21a: generic trait type parameters, e.g. the `T` in
@@ -557,6 +585,10 @@ struct TraitDecl {
     // bodies / calls. These are bound names only — bounds-on-trait-params
     // (`trait T<X: Bound>`) aren't in the grammar.
     std::vector<TypeParam> genericParams;
+    // Phase 21b: associated-type declarations `type Item;`. Empty for a trait
+    // with no associated types (orthogonal to genericParams — a trait may use
+    // either, both, or neither).
+    std::vector<AssocTypeDecl> assocTypes;
     std::vector<MethodSig> methods;
     bool isPub = false; // Phase 15: `pub trait` — parsed + stored.
     std::size_t line = 1;
@@ -583,6 +615,10 @@ struct ImplDecl {
     // as before) while resolving each impl method's signature, so a method
     // returning `Option<T>` lands as `Option<i64>` for this impl.
     std::vector<TypeRef> traitTypeArgs;
+    // Phase 21b: associated-type definitions `type Item = i64;`. Each name must
+    // match one of the trait's `AssocTypeDecl`s; the typechecker validates
+    // coverage. Empty for a trait with no associated types / an inherent impl.
+    std::vector<AssocTypeDef> assocTypes;
     TypeRef forType;
     std::vector<FnDecl> methods;
     bool isPub = false; // Phase 15: `pub impl` — parsed + stored.

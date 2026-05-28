@@ -97,6 +97,8 @@ private:
             core = "dyn " + t.name;
         } else {
             core = t.name;
+            // Phase 21b: an associated-type projection `Base::Assoc`.
+            if (!t.assocName.empty()) core += "::" + t.assocName;
             if (!t.typeArgs.empty()) {
                 core += "<";
                 for (std::size_t i = 0; i < t.typeArgs.size(); ++i) {
@@ -216,11 +218,16 @@ private:
     void printTrait(const TraitDecl& t) {
         if (t.isPub) out_ += "pub ";
         out_ += "trait " + t.name + genericParamsToString(t.genericParams);
-        if (t.methods.empty()) {
+        if (t.methods.empty() && t.assocTypes.empty()) {
             out_ += " {}\n";
             return;
         }
         out_ += " {\n";
+        // Phase 21b: associated-type declarations precede the methods.
+        for (const auto& at : t.assocTypes) {
+            indent(1);
+            out_ += "type " + at.name + ";\n";
+        }
         for (const auto& m : t.methods) {
             indent(1);
             out_ += "fn " + m.name + "(" + paramsToString(m.params) + ") -> " +
@@ -247,11 +254,16 @@ private:
             }
             out_ += "impl " + traitRef + " for " + typeToString(im.forType);
         }
-        if (im.methods.empty()) {
+        if (im.methods.empty() && im.assocTypes.empty()) {
             out_ += " {}\n";
             return;
         }
         out_ += " {\n";
+        // Phase 21b: associated-type definitions precede the methods.
+        for (const auto& at : im.assocTypes) {
+            indent(1);
+            out_ += "type " + at.name + " = " + typeToString(at.type) + ";\n";
+        }
         bool firstMethod = true;
         for (const auto& m : im.methods) {
             if (!firstMethod) out_ += "\n";

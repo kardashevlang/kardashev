@@ -3267,6 +3267,46 @@ private:
         }
     }
 
+    // Phase 21b: resolve an associated-type projection `Base::Assoc` to a
+    // concrete type for the current instance. `Base` (`Self` or a generic
+    // param) is mapped through `currentInstanceTypeMap_` to a concrete type;
+    // we then look up that type's impl's chosen associated type via the trait
+    // among its impls that declares `Assoc`.
+    TypePtr resolveAssocConcrete(const ast::TypeRef& tr) {
+        TypePtr base;
+        if (auto it = currentInstanceTypeMap_.find(tr.name);
+            it != currentInstanceTypeMap_.end()) {
+            base = it->second;
+        } else {
+            ast::TypeRef baseRef;
+            baseRef.name = tr.name;
+            base = astTypeRefToConcrete(baseRef);
+        }
+        TypePtr rb = resolveInInstance(base);
+        std::string typeName;
+        if (rb->kind == TypeKind::Struct) typeName = rb->structName;
+        else if (rb->kind == TypeKind::Enum) typeName = rb->enumName;
+        else if (rb->kind == TypeKind::Int) typeName = "i64";
+        else if (rb->kind == TypeKind::Bool) typeName = "bool";
+        else {
+            errors_.push_back("codegen: associated type projection '" +
+                              tr.name + "::" + tr.assocName +
+                              "' base is not a concrete type");
+            return makeInt();
+        }
+        auto tyIt = tc_.implAssocTypes.find(typeName);
+        if (tyIt != tc_.implAssocTypes.end()) {
+            for (const auto& [traitName, table] : tyIt->second) {
+                auto entry = table.find(tr.assocName);
+                if (entry != table.end())
+                    return resolveInInstance(entry->second);
+            }
+        }
+        errors_.push_back("codegen: no associated type '" + tr.assocName +
+                          "' for type '" + typeName + "'");
+        return makeInt();
+    }
+
     // Build a fully-concrete Kardashev TypePtr for an AST TypeRef, honoring
     // the current generic-instance substitution and recursively
     // instantiating generic struct / enum references like `Pair<X, Y>`.
@@ -3284,6 +3324,12 @@ private:
             inner.isRef = false;
             inner.refIsMut = false;
             return makeRef(astTypeRefToConcrete(inner), tr.refIsMut);
+        }
+        // Phase 21b: an associated-type projection `Base::Assoc`. Resolve the
+        // base to a concrete type (via the instance map for `Self` / a generic
+        // param) then look up the impl's chosen associated type.
+        if (!tr.assocName.empty()) {
+            return resolveAssocConcrete(tr);
         }
         // Phase 11: `dyn Trait` and the built-in `Box<T>` (a user-declared
         // `Box` struct/enum shadows the built-in — mirror typecheck).
@@ -3429,6 +3475,38 @@ private:
             if (auto it = currentSchemaVarSubst_.find(r->varId);
                 it != currentSchemaVarSubst_.end()) {
                 return resolveInInstance(it->second);
+            }
+            // Phase 21b: a `C::Item` projection placeholder. Resolve C (the
+            // base schema Var) to a concrete type in this instance, then look
+            // up the impl's chosen associated type.
+            if (auto pit = tc_.assocProjections.find(r->varId);
+                pit != tc_.assocProjections.end()) {
+                const AssocProjection& proj = pit->second;
+                TypePtr base;
+                if (auto bit = currentSchemaVarSubst_.find(proj.baseVarId);
+                    bit != currentSchemaVarSubst_.end()) {
+                    base = resolveInInstance(bit->second);
+                }
+                if (base) {
+                    std::string typeName;
+                    if (base->kind == TypeKind::Struct)
+                        typeName = base->structName;
+                    else if (base->kind == TypeKind::Enum)
+                        typeName = base->enumName;
+                    else if (base->kind == TypeKind::Int) typeName = "i64";
+                    else if (base->kind == TypeKind::Bool) typeName = "bool";
+                    if (!typeName.empty()) {
+                        auto tyIt = tc_.implAssocTypes.find(typeName);
+                        if (tyIt != tc_.implAssocTypes.end()) {
+                            auto trIt = tyIt->second.find(proj.traitName);
+                            if (trIt != tyIt->second.end()) {
+                                auto aIt = trIt->second.find(proj.assocName);
+                                if (aIt != trIt->second.end())
+                                    return resolveInInstance(aIt->second);
+                            }
+                        }
+                    }
+                }
             }
             return r;
         }

@@ -611,6 +611,66 @@ void test_generic_trait_bounded_head_both_elems() {
     expectEquals(v, 42, "generic_trait_bounded_head_both_elems");
 }
 
+// --- Phase 21b: associated types, end to end ---
+
+// `Self::Item` resolved per-impl: two impls choose different Item types (i64 +
+// bool); `.get()` on each lands the right-typed value. The bool path gates the
+// i64 path -> 42.
+void test_assoc_self_item_two_impls() {
+    auto v = compileAndRun(
+        "trait Container { type Item; fn get(&self) -> Self::Item; }\n"
+        "struct IntBox { v: i64 }\n"
+        "struct BoolBox { b: bool }\n"
+        "impl Container for IntBox { type Item = i64; fn get(&self) -> "
+        "Self::Item { self.v } }\n"
+        "impl Container for BoolBox { type Item = bool; fn get(&self) -> "
+        "Self::Item { self.b } }\n"
+        "fn main() -> i64 {\n"
+        "    let ib = IntBox { v: 42 };\n"
+        "    let bb = BoolBox { b: true };\n"
+        "    let a = ib.get();\n"
+        "    if bb.get() { a } else { 0 }\n"
+        "}",
+        "main", "assoc_self_item_two_impls");
+    expectEquals(v, 42, "assoc_self_item_two_impls");
+}
+
+// `C::Item` at a bounded call site: `first<C: Container>(c: C) -> C::Item` used
+// at both impls. Each call's result type resolves to that impl's associated
+// type at its monomorphic instance. The bool path gates the i64 path -> 42.
+void test_assoc_c_item_bounded_call_site() {
+    auto v = compileAndRun(
+        "trait Container { type Item; fn get(&self) -> Self::Item; }\n"
+        "struct IntBox { v: i64 }\n"
+        "struct BoolBox { b: bool }\n"
+        "impl Container for IntBox { type Item = i64; fn get(&self) -> "
+        "Self::Item { self.v } }\n"
+        "impl Container for BoolBox { type Item = bool; fn get(&self) -> "
+        "Self::Item { self.b } }\n"
+        "fn first<C: Container>(c: C) -> C::Item { c.get() }\n"
+        "fn main() -> i64 {\n"
+        "    let ib = IntBox { v: 42 };\n"
+        "    let bb = BoolBox { b: true };\n"
+        "    let a = first(ib);\n"
+        "    if first(bb) { a } else { 0 }\n"
+        "}",
+        "main", "assoc_c_item_bounded_call_site");
+    expectEquals(v, 42, "assoc_c_item_bounded_call_site");
+}
+
+// `where` clause runs identically to the inline-bounded form (uses a generic
+// trait Container<T>). -> 77, the value stored in the box.
+void test_where_clause_runs_like_inline() {
+    auto v = compileAndRun(
+        "trait Container<T> { fn first(&self) -> T; }\n"
+        "struct IntBox { v: i64 }\n"
+        "impl Container<i64> for IntBox { fn first(&self) -> i64 { self.v } }\n"
+        "fn head<U, C>(c: C) -> U where C: Container<U> { c.first() }\n"
+        "fn main() -> i64 { let ib = IntBox { v: 77 }; head(ib) }",
+        "main", "where_clause_runs_like_inline");
+    expectEquals(v, 77, "where_clause_runs_like_inline");
+}
+
 // A custom `impl Iterator<bool> for Count`, iterated with `for x in c`. The
 // `for` desugar derives the bool element type from `next()`'s Option<bool>.
 // Count{n:5} yields elements for n=4,3,2,1,0; isEven is true for 4,2,0 -> 3.
@@ -2071,6 +2131,10 @@ int main() {
     test_generic_iterator_bool_for_loop();
     test_generic_fold_over_bool();
     test_iterator_unparam_bound_i64_regression();
+    // Phase 21b: associated types + where clauses end to end
+    test_assoc_self_item_two_impls();
+    test_assoc_c_item_bounded_call_site();
+    test_where_clause_runs_like_inline();
     test_trait_multi_method();
     test_trait_method_with_args();
     // Phase 3.4 try operator
@@ -2171,13 +2235,15 @@ int main() {
     test_mutex_roundtrip_single_thread();
     test_mutex_mutual_exclusion_two_threads();
     test_thread_runtime_emits_pthread_externs();
-    std::cout << "All codegen tests passed (131 cases) — Phase 16 Drop/RAII: "
+    std::cout << "All codegen tests passed (134 cases) — Phase 16 Drop/RAII: "
                  "reverse-order scope drops, move semantics, conditional-move "
                  "drop flags, Vec/Box free, scalar codegen unchanged; Phase "
                  "17a fn-value field calls + FnMut captures; Phase 17b generic "
                  "Future<T> (bool/struct) + HashMap<i64,V> (bool/struct); "
                  "Phase 19 OS threads + Mutex mutual exclusion; Phase 21a "
                  "generic trait params (Container<T>/Iterator<T>: bounded fn, "
-                 "for-loop, fold over bool, <I: Iterator> regression)\n";
+                 "for-loop, fold over bool, <I: Iterator> regression); Phase "
+                 "21b associated types (Self::Item + C::Item at i64/bool) + "
+                 "where-clause equivalence\n";
     return 0;
 }
