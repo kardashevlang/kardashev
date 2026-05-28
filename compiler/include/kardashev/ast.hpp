@@ -179,6 +179,22 @@ struct CallExpr : Expr {
     bool wasPath = false;
 };
 
+// Phase 17a: call a fn VALUE produced by an arbitrary expression — e.g.
+// `(s.f)(args)`, `(getCallback())(args)`. The plain CallExpr above is keyed
+// by a callee *name* (direct fn, path fn, indirect call through a let-bound
+// name, or a variant constructor); this node handles the cases where the
+// callee is itself a sub-expression (a parenthesized expr or a postfix field
+// access) of `Function` type. Parsed in postfix position when a `(arglist)`
+// follows any non-name-callable primary; typecheck resolves the callee's
+// Function type and unifies args; codegen evaluates the callee to a fat
+// pointer `{ fn, env }` and dispatches through it (the same path Phase 10b
+// uses for fn-typed locals). This unblocks lazy iterator adaptors (a struct
+// holding a source + a closure field, stepped via `(self.f)(x)`).
+struct CallValueExpr : Expr {
+    ExprPtr callee;
+    std::vector<ExprPtr> args;
+};
+
 struct StructLitExpr : Expr {
     std::string structName;
     std::vector<std::pair<std::string, ExprPtr>> fields;
@@ -416,9 +432,21 @@ struct ClosureParam {
 // One captured free variable: its source name plus its resolved type
 // (filled by the typechecker). Codegen mirrors this order when building
 // the env struct and when loading captures in the closure prologue.
+//
+// Phase 17a: `byRef` distinguishes a capture-by-reference (FnMut) from the
+// Phase 10b capture-by-value. When the closure body ASSIGNS to (or takes
+// `&mut` of) a captured `let mut` binding, the typechecker marks that
+// capture `byRef`: the env slot stores a POINTER to the variable's enclosing
+// alloca instead of a copied value, so reads/writes in the body go through
+// the original storage and mutations persist after the call. Variables only
+// read stay `byRef = false` (by value). The typechecker rejects a by-ref
+// capture of a non-`mut` binding (you cannot mutate it) and rejects a
+// closure with any by-ref capture from escaping its defining scope (the env
+// would hold a dangling stack pointer — see checkClosure).
 struct ClosureCapture {
     std::string name;
-    TypePtr type; // resolved at typecheck time
+    TypePtr type;       // resolved at typecheck time
+    bool byRef = false; // Phase 17a: captured by reference (FnMut)
 };
 
 struct ClosureExpr : Expr {

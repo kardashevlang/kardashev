@@ -1351,6 +1351,113 @@ void test_closure_arg_arity_mismatch_errors() {
               "closure_arg_arity_mismatch_errors");
 }
 
+// --- Phase 17a: richer closures & first-class fn values ---
+
+void test_field_held_fn_value_call_ok() {
+    // A fn value held in a struct field is callable via `(s.f)(x)`.
+    expectOk("struct Adder { f: fn(i64) -> i64 }\n"
+             "fn inc(x: i64) -> i64 { x + 1 }\n"
+             "fn main() -> i64 { let a = Adder { f: inc }; (a.f)(10) }",
+             "field_held_fn_value_call_ok");
+}
+
+void test_field_held_closure_call_ok() {
+    // A struct field holding a capturing closure is also callable.
+    expectOk("struct Adder { f: fn(i64) -> i64 }\n"
+             "fn main() -> i64 { let b = 100; "
+             "let a = Adder { f: |x| x + b }; (a.f)(5) }",
+             "field_held_closure_call_ok");
+}
+
+void test_call_value_through_self_ok() {
+    // `(self.f)(self.base)` inside an inherent method type-checks.
+    expectOk("struct MapIter { base: i64, f: fn(i64) -> i64 }\n"
+             "impl MapIter { fn step(self) -> i64 { (self.f)(self.base) } }\n"
+             "fn dbl(x: i64) -> i64 { x + x }\n"
+             "fn main() -> i64 { let m = MapIter { base: 4, f: dbl }; m.step() }",
+             "call_value_through_self_ok");
+}
+
+void test_call_value_non_function_errors() {
+    // Calling a non-function value as `(x)(...)` is rejected.
+    expectErrContains("fn main() -> i64 { let x = 5; (x)(1) }",
+                      "not a function", "call_value_non_function_errors");
+}
+
+void test_call_value_arg_type_mismatch_errors() {
+    // The args of an indirect call through a field are unified against the
+    // fn type's params; a bool arg to an i64 param is rejected.
+    expectErr("struct Adder { f: fn(i64) -> i64 }\n"
+              "fn inc(x: i64) -> i64 { x + 1 }\n"
+              "fn main() -> i64 { let a = Adder { f: inc }; (a.f)(true) }",
+              "call_value_arg_type_mismatch_errors");
+}
+
+void test_fnmut_by_ref_capture_ok() {
+    // A closure mutating a `let mut` capture by reference type-checks, and
+    // calling it multiple times is fine (FnMut).
+    expectOk("fn main() -> i64 { let mut n = 0; let mut inc = || { n = n + 1; };"
+             " inc(); inc(); n }",
+             "fnmut_by_ref_capture_ok");
+}
+
+void test_fnmut_records_byref_on_node() {
+    // The mutated capture is recorded with byRef = true; a read-only capture
+    // stays byRef = false.
+    auto pr = parse("fn main() -> i64 { let mut n = 0; let r = 7; "
+                    "let mut f = || { n = n + r; }; f(); n }");
+    assert(pr.ok());
+    auto res = typecheck(pr.program);
+    if (!res.ok()) {
+        std::cerr << "[fnmut_records_byref_on_node] tc failed\n";
+        dump(res);
+        std::abort();
+    }
+    const auto& mainFn = pr.program.functions.back();
+    const kardashev::ast::ClosureExpr* found = nullptr;
+    for (const auto& stmt : mainFn.body->stmts) {
+        if (auto* let =
+                dynamic_cast<const kardashev::ast::LetStmt*>(stmt.get())) {
+            if (auto* cl = dynamic_cast<const kardashev::ast::ClosureExpr*>(
+                    let->value.get())) {
+                found = cl;
+            }
+        }
+    }
+    assert(found != nullptr);
+    assert(found->captures.size() == 2);
+    // `n` is mutated => byRef; `r` is only read => by value.
+    bool sawNByRef = false, sawRByValue = false;
+    for (const auto& cap : found->captures) {
+        if (cap.name == "n") sawNByRef = cap.byRef;
+        if (cap.name == "r") sawRByValue = !cap.byRef;
+    }
+    assert(sawNByRef);
+    assert(sawRByValue);
+}
+
+void test_fnmut_non_mut_capture_errors() {
+    // Mutating a non-`mut` captured binding is rejected.
+    expectErrContains(
+        "fn main() -> i64 { let n = 0; let f = || { n = n + 1; }; f(); n }",
+        "not declared `let mut`", "fnmut_non_mut_capture_errors");
+}
+
+void test_fnmut_return_byref_closure_errors() {
+    // Returning a closure that captures by reference would dangle; rejected.
+    expectErrContains(
+        "fn bad() -> fn() -> i64 { let mut n = 0; || { n = n + 1; n } }\n"
+        "fn main() -> i64 { 0 }",
+        "by reference", "fnmut_return_byref_closure_errors");
+}
+
+void test_return_byvalue_closure_ok() {
+    // Returning a by-VALUE capturing closure is still fine (no dangling ptr).
+    expectOk("fn make() -> fn(i64) -> i64 { let k = 1; |x| x + k }\n"
+             "fn main() -> i64 { (make())(41) }",
+             "return_byvalue_closure_ok");
+}
+
 // --- Phase 9: loops, ranges, assignment, mutability ---
 
 void test_while_basic_ok() {
@@ -1862,6 +1969,17 @@ int main() {
     test_closure_io_effect_via_higher_order_negative_errors();
     test_closure_aggregate_capture_rejected();
     test_closure_arg_arity_mismatch_errors();
+    // Phase 17a richer closures & first-class fn values
+    test_field_held_fn_value_call_ok();
+    test_field_held_closure_call_ok();
+    test_call_value_through_self_ok();
+    test_call_value_non_function_errors();
+    test_call_value_arg_type_mismatch_errors();
+    test_fnmut_by_ref_capture_ok();
+    test_fnmut_records_byref_on_node();
+    test_fnmut_non_mut_capture_errors();
+    test_fnmut_return_byref_closure_errors();
+    test_return_byvalue_closure_ok();
     // Phase 9 loops + ranges + assignment + mutability
     test_while_basic_ok();
     test_while_cond_must_be_bool();
@@ -1907,6 +2025,6 @@ int main() {
     test_inherent_and_trait_method_coexist();
     test_inherent_unknown_method_errors();
     test_duplicate_method_across_impls_errors();
-    std::cout << "All typecheck tests passed (174 cases)\n";
+    std::cout << "All typecheck tests passed (184 cases)\n";
     return 0;
 }

@@ -187,6 +187,13 @@ private:
             for (const auto& a : call->args) prePass(*a);
             return;
         }
+        if (auto* cv = dynamic_cast<const ast::CallValueExpr*>(&e)) {
+            // Phase 17a: walk the callee expression and the args (same order
+            // as consume) so position counters stay in sync.
+            prePass(*cv->callee);
+            for (const auto& a : cv->args) prePass(*a);
+            return;
+        }
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
             prePass(*mc->receiver);
             for (const auto& a : mc->args) prePass(*a);
@@ -388,6 +395,17 @@ private:
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             for (const auto& a : call->args) {
+                lastInSubtree = std::max(lastInSubtree,
+                                           consume(*a, expectExpire));
+            }
+            return lastInSubtree;
+        }
+        if (auto* cv = dynamic_cast<const ast::CallValueExpr*>(&e)) {
+            // Phase 17a: the callee expression is read (its fn value is used),
+            // then each arg is moved by value.
+            lastInSubtree = std::max(lastInSubtree,
+                                       consume(*cv->callee, expectExpire));
+            for (const auto& a : cv->args) {
                 lastInSubtree = std::max(lastInSubtree,
                                            consume(*a, expectExpire));
             }

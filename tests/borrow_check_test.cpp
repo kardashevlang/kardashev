@@ -600,6 +600,26 @@ void test_drop_impl_move_into_fn_ok() {
              "drop_impl_move_into_fn_ok");
 }
 
+// --- Phase 17a: richer closures & first-class fn values ---
+
+void test_call_value_through_field_ok() {
+    // Calling a fn value held in a struct field via `(s.f)(x)` borrow-checks
+    // (the callee field-access reads the struct; the i64 arg is Copy).
+    expectOk("struct Adder { f: fn(i64) -> i64 }\n"
+             "fn inc(x: i64) -> i64 { x + 1 }\n"
+             "fn main() -> i64 { let a = Adder { f: inc }; (a.f)(10) }",
+             "call_value_through_field_ok");
+}
+
+void test_fnmut_closure_borrow_ok() {
+    // An FnMut closure that captures `n` by reference and is called several
+    // times does not trip the move/borrow checker (closures are opaque to it,
+    // the by-ref capture borrows `n` for the closure's in-scope lifetime).
+    expectOk("fn main() -> i64 { let mut n = 0; let mut inc = || { n = n + 1; };"
+             " inc(); inc(); inc(); n }",
+             "fnmut_closure_borrow_ok");
+}
+
 } // namespace
 
 int main() {
@@ -649,9 +669,13 @@ int main() {
     // Phase 16: Drop trait + move analysis
     test_drop_impl_type_use_after_move_errors();
     test_drop_impl_move_into_fn_ok();
-    std::cout << "All borrow_check tests passed (43 cases) — Phase 2.4c "
+    // Phase 17a: richer closures & first-class fn values
+    test_call_value_through_field_ok();
+    test_fnmut_closure_borrow_ok();
+    std::cout << "All borrow_check tests passed (45 cases) — Phase 2.4c "
                  "NLL + mutable references; Phase 9 loops; Phase 13a "
                  "method-receiver autoref; Phase 15 inherent &mut self + "
-                 "unary operands; Phase 16 Drop-typed move tracking\n";
+                 "unary operands; Phase 16 Drop-typed move tracking; "
+                 "Phase 17a fn-value calls + FnMut captures\n";
     return 0;
 }

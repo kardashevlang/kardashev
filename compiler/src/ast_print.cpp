@@ -422,6 +422,20 @@ private:
             out_ += ")";
             return;
         }
+        // Phase 17a: a call through a fn-value expression — `(callee)(args)`.
+        // Parenthesize the callee so a field access / parenthesized expr keeps
+        // the call grammar unambiguous when re-parsed.
+        if (auto* cv = dynamic_cast<const CallValueExpr*>(&e)) {
+            out_ += "(";
+            printExpr(*cv->callee, depth, 0);
+            out_ += ")(";
+            for (std::size_t i = 0; i < cv->args.size(); ++i) {
+                if (i) out_ += ", ";
+                printExpr(*cv->args[i], depth, 0);
+            }
+            out_ += ")";
+            return;
+        }
         if (auto* mc = dynamic_cast<const MethodCallExpr*>(&e)) {
             printExpr(*mc->receiver, depth, /*parentPrec=*/100); // bind tight
             out_ += "." + mc->methodName + "(";

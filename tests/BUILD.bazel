@@ -92,6 +92,12 @@ sh_test(
 )
 
 sh_test(
+    name = "smoke_test_closures2",
+    srcs = ["smoke_test_closures2.sh"],
+    data = ["//compiler:kardc"],
+)
+
+sh_test(
     name = "smoke_test_dyn",
     srcs = ["smoke_test_dyn.sh"],
     data = ["//compiler:kardc"],

@@ -80,6 +80,16 @@ public:
                 }
             }
         }
+        // Phase 17a: the fat-pointer fn-value type `fnValTy_` must exist
+        // BEFORE user structs are laid out, because a user struct may have a
+        // function-typed field (`struct Adder { f: fn(i64)->i64 }`) that maps
+        // to `fnValTy_`; otherwise setBody() would receive a null element type
+        // and crash. `declareBuiltins` (below) also needs it, so create it
+        // once here and have declareBuiltins reuse it (guarded). We keep
+        // declareBuiltins AFTER struct/enum declaration to preserve the
+        // existing lazy `Option<i64>` instantiation order the HashMap
+        // built-ins depend on.
+        ensureFnValTy();
         declareAllStructs();
         declareAllEnums();
         declareBuiltins();
@@ -349,6 +359,17 @@ private:
     // Per-fn locals: variable name -> alloca pointer.
     std::unordered_map<std::string, llvm::AllocaInst*> locals_;
 
+    // Phase 17a (FnMut): by-reference closure captures. Inside a closure body,
+    // a by-ref capture's storage is NOT a local alloca but a POINTER (loaded
+    // from the env) into the enclosing variable's alloca. Maps the captured
+    // name -> { pointer-to-storage, value's LLVM type }. Reads/writes/`&`/`&mut`
+    // of such a name go through this pointer so mutations persist after the
+    // call. Consulted before `locals_` in the IdentExpr read, emitPlaceAddr,
+    // emitPlaceBase, and emitRef paths. Saved/cleared/restored across closure
+    // body emission exactly like `locals_`.
+    std::unordered_map<std::string, std::pair<llvm::Value*, llvm::Type*>>
+        refLocals_;
+
     // --- Phase 16: deterministic Drop (RAII) ---
     // implementing-type base name -> mangled LLVM name of its `drop(&mut self)`
     // method. Populated in run() from `impl Drop for T` blocks.
@@ -485,6 +506,17 @@ private:
     // struct layout for Vec + the four operations (vec_new / vec_push /
     // vec_get / vec_len). The implementation depends on libc's malloc +
     // realloc; same linkage logic as printf above.
+    // Phase 17a: create the fat-pointer fn-value type `{ i8* fn, i8* env }`
+    // exactly once. Called from run() before user-struct layout (so an
+    // fn-typed struct field maps to a non-null type) and again (idempotently)
+    // from declareBuiltins.
+    void ensureFnValTy() {
+        if (fnValTy_) return;
+        auto* i8PtrTy = llvm::PointerType::get(*ctx_, 0);
+        fnValTy_ = llvm::StructType::create(*ctx_, {i8PtrTy, i8PtrTy},
+                                            "kd.fnval");
+    }
+
     void declareBuiltins() {
         auto& ctx = *ctx_;
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
@@ -533,8 +565,10 @@ private:
         freeFn_ = freeFn;     // Phase 16: drop glue
 
         // --- Phase 10b: fat-pointer type for fn VALUES: { i8* fn, i8* env }
-        fnValTy_ = llvm::StructType::create(
-            ctx, {i8PtrTy, i8PtrTy}, "kd.fnval");
+        // Phase 17a: may already be created by ensureFnValTy() (run() builds
+        // it before user structs so an fn-typed struct field can reference
+        // it); create only if not yet present so we keep a single type.
+        ensureFnValTy();
 
         // --- Phase 11: trait-object fat pointer: { i8* data, i8* vtable }.
         // Both `&dyn Trait` and `Box<dyn Trait>` lower to this. `data` points
@@ -3094,6 +3128,11 @@ private:
     // if the target shape isn't supported.
     llvm::Value* emitPlaceAddr(const ast::Expr& e) {
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
+            // Phase 17a: a by-ref capture's slot address IS the env pointer
+            // into the enclosing variable's storage; storing through it makes
+            // the mutation visible after the closure call.
+            if (auto rit = refLocals_.find(id->name); rit != refLocals_.end())
+                return rit->second.first;
             auto it = locals_.find(id->name);
             if (it == locals_.end()) return nullptr;
             return it->second; // the alloca is the slot's address
@@ -3125,6 +3164,12 @@ private:
     // field accesses recurse through emitPlaceAddr.
     llvm::Value* emitPlaceBase(const ast::Expr& e, TypePtr& outTy) {
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
+            // Phase 17a: a by-ref capture roots a field chain at the env
+            // pointer (it addresses the enclosing variable's value directly).
+            if (auto rit = refLocals_.find(id->name); rit != refLocals_.end()) {
+                outTy = lookupExprType(e);
+                return rit->second.first;
+            }
             auto it = locals_.find(id->name);
             if (it == locals_.end()) return nullptr;
             TypePtr t = lookupExprType(e);
@@ -3201,6 +3246,12 @@ private:
             return emitStringLit(*sl);
         }
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
+            // Phase 17a: a by-ref capture reads through the env pointer into
+            // the enclosing variable's storage.
+            if (auto rit = refLocals_.find(id->name); rit != refLocals_.end()) {
+                return builder_->CreateLoad(rit->second.second,
+                                            rit->second.first, id->name);
+            }
             auto it = locals_.find(id->name);
             if (it != locals_.end()) {
                 auto* alloca = it->second;
@@ -3242,6 +3293,9 @@ private:
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             return emitCall(*call);
+        }
+        if (auto* cv = dynamic_cast<const ast::CallValueExpr*>(&e)) {
+            return emitCallValue(*cv);
         }
         if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
             return emitIf(*ie);
@@ -3422,6 +3476,10 @@ private:
                 "codegen: `&` operand must be a binding (Phase 2.4b)");
             return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
         }
+        // Phase 17a: `&x` / `&mut x` of a by-ref capture is the env pointer —
+        // it already addresses the enclosing variable's storage.
+        if (auto rit = refLocals_.find(id->name); rit != refLocals_.end())
+            return rit->second.first;
         auto it = locals_.find(id->name);
         if (it == locals_.end()) {
             errors_.push_back("codegen: `&` operand unknown binding " +
@@ -3723,8 +3781,13 @@ private:
                     for (const auto& a : call.args) {
                         args.push_back(emitConsume(*a)); // Phase 16: by-value move
                     }
-                    return builder_->CreateCall(
-                        llvmFnTy, fnPtr, args, "indir_" + call.callee);
+                    // A void-returning call must NOT be named (LLVM rejects a
+                    // name on a value-less instruction — e.g. a unit-returning
+                    // FnMut closure like `inc()`).
+                    const char* nm = llvmFnTy->getReturnType()->isVoidTy()
+                                         ? ""
+                                         : "indir_call";
+                    return builder_->CreateCall(llvmFnTy, fnPtr, args, nm);
                 }
             }
         }
@@ -3815,6 +3878,38 @@ private:
         }
         errors_.push_back("codegen: undefined function " + call.callee);
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+    }
+
+    // Phase 17a: call a fn VALUE produced by an arbitrary expression
+    // (`(s.f)(x)`, `(getCallback())(args)`). We evaluate the callee to its
+    // fat pointer `{ fn, env }` (emitExpr already lowers a field-held fn
+    // value, a closure, or a bare fn name to this representation), then
+    // dispatch exactly like the Phase 10b indirect-call path: extract fn +
+    // env, and call `fn(env, args...)` through the env-calling convention
+    // type rebuilt from the callee's Kardashev Function type.
+    llvm::Value* emitCallValue(const ast::CallValueExpr& cv) {
+        TypePtr fnTy = lookupExprType(*cv.callee);
+        if (fnTy) fnTy = resolve(fnTy);
+        if (!fnTy || fnTy->kind != TypeKind::Function) {
+            errors_.push_back(
+                "codegen: called value has no Function type at call site");
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        }
+        auto* llvmFnTy = envCalleeType(fnTy);
+        llvm::Value* fatVal = emitExpr(*cv.callee); // the `{ fn, env }` value
+        auto* fnPtr = builder_->CreateExtractValue(fatVal, {0}, "callee.fn");
+        auto* envPtr = builder_->CreateExtractValue(fatVal, {1}, "callee.env");
+        std::vector<llvm::Value*> args;
+        args.reserve(cv.args.size() + 1);
+        args.push_back(envPtr);
+        for (const auto& a : cv.args) {
+            args.push_back(emitConsume(*a)); // Phase 16: by-value move
+        }
+        // A void-returning call must not be named (LLVM rejects a name on a
+        // value-less instruction).
+        const char* nm =
+            llvmFnTy->getReturnType()->isVoidTy() ? "" : "indir_call";
+        return builder_->CreateCall(llvmFnTy, fnPtr, args, nm);
     }
 
     // Resolve a ctor-bearing expression's inferred Kardashev type via the
@@ -4648,14 +4743,23 @@ private:
         fnTy = resolve(fnTy);
 
         // Build the env struct type from the captures (in declaration order).
-        std::vector<llvm::Type*> capLlvmTys;
+        // Phase 17a: a by-VALUE capture stores the value (its mapped LLVM
+        // type); a by-REFERENCE (FnMut) capture stores a POINTER to the
+        // enclosing variable's alloca (an opaque `ptr`), so the slot type is
+        // i8* regardless of the captured value's type.
+        std::vector<llvm::Type*> capLlvmTys;   // env slot type per capture
+        std::vector<llvm::Type*> capValueTys;  // captured value's own type
         std::vector<TypePtr> capKdTys;
         capLlvmTys.reserve(cl.captures.size());
+        capValueTys.reserve(cl.captures.size());
         capKdTys.reserve(cl.captures.size());
         for (const auto& cap : cl.captures) {
             TypePtr ct = resolveInInstance(cap.type);
             capKdTys.push_back(ct);
-            capLlvmTys.push_back(mapKardashevType(ct));
+            llvm::Type* valTy = mapKardashevType(ct);
+            capValueTys.push_back(valTy);
+            capLlvmTys.push_back(cap.byRef ? static_cast<llvm::Type*>(i8PtrTy)
+                                           : valTy);
         }
         std::string envName = "kd.closure_env." + std::to_string(nextClosureId_);
         auto* envTy = llvm::StructType::create(ctx, capLlvmTys, envName);
@@ -4673,8 +4777,6 @@ private:
                 mallocFn_, {llvm::ConstantInt::get(i64Ty, envBytes)},
                 "closure_env");
             for (unsigned i = 0; i < cl.captures.size(); ++i) {
-                // Load the captured local from the enclosing scope and copy
-                // it (by value) into the env slot.
                 const std::string& name = cl.captures[i].name;
                 auto lit = locals_.find(name);
                 if (lit == locals_.end()) {
@@ -4683,11 +4785,22 @@ private:
                         "' not a local in the enclosing scope");
                     continue;
                 }
+                auto* slot = builder_->CreateStructGEP(
+                    envTy, envPtr, i, "cap_slot_" + name);
+                if (cl.captures[i].byRef) {
+                    // Phase 17a (FnMut): store a POINTER to the enclosing
+                    // alloca. Reads/writes in the body go through it, so
+                    // mutations persist after the call. The original binding
+                    // keeps ownership (no move, no drop-flag clear) — it is
+                    // borrowed for the closure's lifetime, which (MVP) does not
+                    // outlive this scope.
+                    builder_->CreateStore(lit->second, slot);
+                    continue;
+                }
+                // By-value capture (Phase 10b): load + copy the value in.
                 llvm::Value* loaded = builder_->CreateLoad(
                     lit->second->getAllocatedType(), lit->second,
                     "cap_" + name);
-                auto* slot = builder_->CreateStructGEP(
-                    envTy, envPtr, i, "cap_slot_" + name);
                 builder_->CreateStore(loaded, slot);
                 // Phase 16: a `move`-style capture takes the value by value
                 // into the heap env. If the captured local is droppable, treat
@@ -4726,6 +4839,7 @@ private:
         auto* savedBB = builder_->GetInsertBlock();
         auto savedLocals = std::move(locals_);
         auto savedLocalTypes = std::move(localTypes_);
+        auto savedRefLocals = std::move(refLocals_); // Phase 17a
         auto savedLoopFrames = std::move(loopFrames_);
         TypePtr savedRetTy = currentFnReturnType_;
         // Phase 16: the closure body is a sibling function with its own Drop
@@ -4735,6 +4849,7 @@ private:
 
         locals_.clear();
         localTypes_.clear();
+        refLocals_.clear();
         loopFrames_.clear();
         dropScopes_.clear();
         loopDropDepth_.clear();
@@ -4757,6 +4872,18 @@ private:
             const std::string& name = cl.captures[i].name;
             auto* slot = builder_->CreateStructGEP(
                 envTy, envArg, i, "cap_slot_" + name);
+            if (cl.captures[i].byRef) {
+                // Phase 17a (FnMut): the env slot holds a POINTER to the
+                // enclosing variable's storage. Load it and register the name
+                // as a by-ref local; reads/writes go straight through the
+                // pointer (no local copy), so the mutation is observed by the
+                // enclosing scope across calls. The value type drives loads
+                // (capValueTys[i], e.g. i64), not the i8* slot type.
+                llvm::Value* ptr = builder_->CreateLoad(
+                    capLlvmTys[i], slot, "capref_" + name);
+                refLocals_[name] = {ptr, capValueTys[i]};
+                continue;
+            }
             llvm::Value* val = builder_->CreateLoad(
                 capLlvmTys[i], slot, "cap_" + name);
             auto* alloca =
@@ -4806,6 +4933,7 @@ private:
         currentFn_ = savedFn;
         locals_ = std::move(savedLocals);
         localTypes_ = std::move(savedLocalTypes);
+        refLocals_ = std::move(savedRefLocals); // Phase 17a
         loopFrames_ = std::move(savedLoopFrames);
         currentFnReturnType_ = savedRetTy;
         dropScopes_ = std::move(savedDropScopes);

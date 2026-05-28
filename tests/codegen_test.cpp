@@ -883,6 +883,90 @@ void test_closure_block_body() {
     expectEquals(v, 13, "closure_block_body");
 }
 
+// --- Phase 17a: richer closures & first-class fn values ---
+
+// A fn value held in a struct field, called via `(a.f)(10)`. The field type is
+// `fn(i64)->i64`; the value is a top-level fn. 10 + 1 == 11.
+void test_field_held_fn_value_toplevel() {
+    auto v = compileAndRun(
+        "struct Adder { f: fn(i64) -> i64 }\n"
+        "fn inc(x: i64) -> i64 { x + 1 }\n"
+        "fn main() -> i64 {\n"
+        "    let a = Adder { f: inc };\n"
+        "    (a.f)(10)\n"
+        "}",
+        "main", "field_held_fn_value_toplevel");
+    expectEquals(v, 11, "field_held_fn_value_toplevel");
+}
+
+// A struct field holding a CAPTURING closure, called via `(b.f)(5)`. The
+// closure captures `base` by value. 5 + 100 == 105.
+void test_field_held_closure_value() {
+    auto v = compileAndRun(
+        "struct Adder { f: fn(i64) -> i64 }\n"
+        "fn main() -> i64 {\n"
+        "    let base = 100;\n"
+        "    let b = Adder { f: |x| x + base };\n"
+        "    (b.f)(5)\n"
+        "}",
+        "main", "field_held_closure_value");
+    expectEquals(v, 105, "field_held_closure_value");
+}
+
+// Lazy-adaptor shape: an inherent method applies `(self.f)(self.base)`.
+// A stored closure field is callable through `self`. 5 + 100 == 105.
+void test_field_fn_called_through_self() {
+    auto v = compileAndRun(
+        "struct MapIter { base: i64, f: fn(i64) -> i64 }\n"
+        "impl MapIter { fn step(self) -> i64 { (self.f)(self.base) } }\n"
+        "fn main() -> i64 {\n"
+        "    let bump = 100;\n"
+        "    let m = MapIter { base: 5, f: |x| x + bump };\n"
+        "    m.step()\n"
+        "}",
+        "main", "field_fn_called_through_self");
+    expectEquals(v, 105, "field_fn_called_through_self");
+}
+
+// Call a fn value returned by an expression: `(make_adder())(41)` == 42.
+void test_call_value_of_expression() {
+    auto v = compileAndRun(
+        "fn make_adder() -> fn(i64) -> i64 { |x| x + 1 }\n"
+        "fn main() -> i64 { (make_adder())(41) }",
+        "main", "call_value_of_expression");
+    expectEquals(v, 42, "call_value_of_expression");
+}
+
+// FnMut counter: a closure that mutates a captured `let mut` binding by
+// reference; calling it three times leaves n == 3 (visible after the calls).
+void test_fnmut_counter() {
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "    let mut n = 0;\n"
+        "    let mut inc = || { n = n + 1; };\n"
+        "    inc(); inc(); inc();\n"
+        "    n\n"
+        "}",
+        "main", "fnmut_counter");
+    expectEquals(v, 3, "fnmut_counter");
+}
+
+// FnMut accumulator: a closure adding its arg to a captured running total
+// across calls; the total accumulates to 18 (5 + 10 + 3).
+void test_fnmut_accumulator() {
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "    let mut total = 0;\n"
+        "    let mut add = |x| { total = total + x; total };\n"
+        "    let a = add(5);\n"
+        "    let b = add(10);\n"
+        "    let c = add(3);\n"
+        "    a + b + c + total\n" // 5 + 15 + 18 + 18 == 56
+        "}",
+        "main", "fnmut_accumulator");
+    expectEquals(v, 56, "fnmut_accumulator");
+}
+
 // --- Phase 11: dyn Trait + vtable dynamic dispatch ---
 
 // The headline acceptance test: ONE `describe` call site dispatches to two
@@ -1711,6 +1795,13 @@ int main() {
     test_closure_no_capture();
     test_closure_selected_by_if();
     test_closure_block_body();
+    // Phase 17a richer closures & first-class fn values
+    test_field_held_fn_value_toplevel();
+    test_field_held_closure_value();
+    test_field_fn_called_through_self();
+    test_call_value_of_expression();
+    test_fnmut_counter();
+    test_fnmut_accumulator();
     // Phase 11 dyn Trait + vtable dynamic dispatch
     test_dyn_dispatch_two_impls();
     test_dyn_box();
@@ -1764,8 +1855,9 @@ int main() {
     test_drop_user_impl_emits_call();
     test_drop_emits_free_for_vec();
     test_no_drop_glue_for_scalars();
-    std::cout << "All codegen tests passed (111 cases) — Phase 16 Drop/RAII: "
+    std::cout << "All codegen tests passed (117 cases) — Phase 16 Drop/RAII: "
                  "reverse-order scope drops, move semantics, conditional-move "
-                 "drop flags, Vec/Box free, scalar codegen unchanged\n";
+                 "drop flags, Vec/Box free, scalar codegen unchanged; Phase "
+                 "17a fn-value field calls + FnMut captures\n";
     return 0;
 }

@@ -575,6 +575,12 @@ private:
             for (const auto& a : call->args) walkExpr(*a);
             return;
         }
+        if (auto* cv = dynamic_cast<const ast::CallValueExpr*>(&e)) {
+            // Phase 17a: indirect call through a fn-value expression.
+            if (cv->callee) walkExpr(*cv->callee);
+            for (const auto& a : cv->args) walkExpr(*a);
+            return;
+        }
         if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
             if (bin->lhs) walkExpr(*bin->lhs);
             if (bin->rhs) walkExpr(*bin->rhs);

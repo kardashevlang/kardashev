@@ -969,6 +969,17 @@ private:
             // pure (no effect added).
             return;
         }
+        if (auto* cv = dynamic_cast<const ast::CallValueExpr*>(&e)) {
+            // Phase 17a: an indirect call through a fn-value expression. The
+            // callee sub-expression and the args contribute their own
+            // effects; the call itself contributes the fn value's effect row,
+            // recorded per-site during checkCallValue.
+            collectEffects(*cv->callee, out);
+            for (const auto& a : cv->args) collectEffects(*a, out);
+            auto eit = exprEffects_.find(cv);
+            if (eit != exprEffects_.end()) out.unionWith(eit->second);
+            return;
+        }
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
             collectEffects(*mc->receiver, out);
             for (const auto& a : mc->args) collectEffects(*a, out);
@@ -1210,6 +1221,12 @@ private:
         currentReturnType_ = resolveTypeRef(fn.returnType);
         TypePtr bodyType = checkBlock(*fn.body);
         if (fn.body->tail) {
+            if (closureEscapesByRef(*fn.body->tail)) {
+                error("cannot return a closure that captures a variable by "
+                      "reference (FnMut); its environment would point into the "
+                      "dead stack frame",
+                      fn.body->tail->line, fn.body->tail->column);
+            }
             if (!coerceOrUnify(*fn.body->tail, bodyType, currentReturnType_)) {
                 error("impl method '" + fn.name + "' body type " +
                           typeToString(bodyType) +
@@ -1604,6 +1621,13 @@ private:
         // return type. If not (body ends with a stmt — typically a
         // `return`), we rely on the per-`return` check inside checkStmt.
         if (fn.body->tail) {
+            // Phase 17a: reject returning an FnMut closure (see ReturnStmt).
+            if (closureEscapesByRef(*fn.body->tail)) {
+                error("cannot return a closure that captures a variable by "
+                      "reference (FnMut); its environment would point into the "
+                      "dead stack frame",
+                      fn.body->tail->line, fn.body->tail->column);
+            }
             // Phase 11: coerce a thin-pointer tail into a `&dyn`/`Box<dyn>`
             // return type (otherwise plain unification).
             if (!coerceOrUnify(*fn.body->tail, bodyType, currentReturnType_)) {
@@ -1682,6 +1706,9 @@ private:
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             return checkCall(*call);
+        }
+        if (auto* cv = dynamic_cast<const ast::CallValueExpr*>(&e)) {
+            return checkCallValue(*cv);
         }
         if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
             return checkIf(*ie);
@@ -2494,6 +2521,14 @@ private:
                 collectFreeVars(*a, bound, order, seen);
             return;
         }
+        if (auto* cv = dynamic_cast<const ast::CallValueExpr*>(&e)) {
+            // Phase 17a: the callee is an expression — it (and the args) may
+            // reference free variables of the enclosing scope.
+            collectFreeVars(*cv->callee, bound, order, seen);
+            for (const auto& a : cv->args)
+                collectFreeVars(*a, bound, order, seen);
+            return;
+        }
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
             collectFreeVars(*mc->receiver, bound, order, seen);
             for (const auto& a : mc->args)
@@ -2624,6 +2659,164 @@ private:
         // LitIntPat / WildPat: no bindings.
     }
 
+    // Phase 17a: does the closure body mutate the free variable `name` — i.e.
+    // assign to it (`name = ...`) or take a `&mut` of it (`&mut name`)? Such a
+    // variable must be captured BY REFERENCE so the mutation is visible after
+    // the call (FnMut). `bound` tracks names that shadow `name` as we descend
+    // (closure params, nested `let`s, match/for pattern bindings, nested
+    // closures' params) so a write to a *shadowing* `name` does not count.
+    // Only the ROOT place of an assignment counts (`name = ...` and
+    // `name.field = ...` both mutate the binding `name`; `other.f = name`
+    // does not). Reads never count — they may stay by value.
+    bool bodyMutatesCapture(const ast::Expr& e, const std::string& name,
+                            std::unordered_set<std::string>& bound) {
+        // The root binding of an assignable place (Ident or field chain).
+        auto rootName = [](const ast::Expr& place) -> const std::string* {
+            const ast::Expr* root = &place;
+            while (auto* fe = dynamic_cast<const ast::FieldExpr*>(root))
+                root = fe->object.get();
+            if (auto* id = dynamic_cast<const ast::IdentExpr*>(root))
+                return &id->name;
+            return nullptr;
+        };
+        if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
+            if (re->isMut) {
+                if (auto* id =
+                        dynamic_cast<const ast::IdentExpr*>(re->operand.get())) {
+                    if (id->name == name && !bound.count(name)) return true;
+                }
+            }
+            return bodyMutatesCapture(*re->operand, name, bound);
+        }
+        if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+            return bodyMutatesCapture(*bin->lhs, name, bound) ||
+                   bodyMutatesCapture(*bin->rhs, name, bound);
+        }
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e))
+            return bodyMutatesCapture(*un->operand, name, bound);
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            for (const auto& a : call->args)
+                if (bodyMutatesCapture(*a, name, bound)) return true;
+            return false;
+        }
+        if (auto* cv = dynamic_cast<const ast::CallValueExpr*>(&e)) {
+            if (bodyMutatesCapture(*cv->callee, name, bound)) return true;
+            for (const auto& a : cv->args)
+                if (bodyMutatesCapture(*a, name, bound)) return true;
+            return false;
+        }
+        if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
+            if (bodyMutatesCapture(*mc->receiver, name, bound)) return true;
+            for (const auto& a : mc->args)
+                if (bodyMutatesCapture(*a, name, bound)) return true;
+            return false;
+        }
+        if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
+            return bodyMutatesCapture(*ie->cond, name, bound) ||
+                   bodyMutatesCapture(*ie->thenBranch, name, bound) ||
+                   bodyMutatesCapture(*ie->elseBranch, name, bound);
+        }
+        if (auto* block = dynamic_cast<const ast::BlockExpr*>(&e)) {
+            std::vector<std::string> added;
+            bool hit = false;
+            for (const auto& stmt : block->stmts) {
+                if (auto* let = dynamic_cast<const ast::LetStmt*>(stmt.get())) {
+                    if (bodyMutatesCapture(*let->value, name, bound)) hit = true;
+                    if (bound.insert(let->name).second)
+                        added.push_back(let->name);
+                } else if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(
+                               stmt.get())) {
+                    if (ret->value &&
+                        bodyMutatesCapture(*ret->value, name, bound))
+                        hit = true;
+                } else if (auto* as = dynamic_cast<const ast::AssignStmt*>(
+                               stmt.get())) {
+                    const std::string* rn = rootName(*as->target);
+                    if (rn && *rn == name && !bound.count(name)) hit = true;
+                    if (bodyMutatesCapture(*as->value, name, bound)) hit = true;
+                    // The target may itself read sub-expressions (field
+                    // indices etc.) but our places have no such reads in V1.
+                } else if (auto* es = dynamic_cast<const ast::ExprStmt*>(
+                               stmt.get())) {
+                    if (bodyMutatesCapture(*es->expr, name, bound)) hit = true;
+                }
+            }
+            if (block->tail && bodyMutatesCapture(*block->tail, name, bound))
+                hit = true;
+            for (const auto& n : added) bound.erase(n);
+            return hit;
+        }
+        if (auto* me = dynamic_cast<const ast::MatchExpr*>(&e)) {
+            if (bodyMutatesCapture(*me->scrutinee, name, bound)) return true;
+            for (const auto& arm : me->arms) {
+                std::vector<std::string> added;
+                collectPatternBindings(*arm.pattern, bound, added);
+                bool hit = bodyMutatesCapture(*arm.body, name, bound);
+                for (const auto& n : added) bound.erase(n);
+                if (hit) return true;
+            }
+            return false;
+        }
+        if (auto* we = dynamic_cast<const ast::WhileExpr*>(&e)) {
+            return bodyMutatesCapture(*we->cond, name, bound) ||
+                   bodyMutatesCapture(*we->body, name, bound);
+        }
+        if (auto* le = dynamic_cast<const ast::LoopExpr*>(&e))
+            return bodyMutatesCapture(*le->body, name, bound);
+        if (auto* fe = dynamic_cast<const ast::ForExpr*>(&e)) {
+            if (bodyMutatesCapture(*fe->iter, name, bound)) return true;
+            std::vector<std::string> added;
+            collectPatternBindings(*fe->pattern, bound, added);
+            bool hit = bodyMutatesCapture(*fe->body, name, bound);
+            for (const auto& n : added) bound.erase(n);
+            return hit;
+        }
+        if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
+            return bodyMutatesCapture(*re->start, name, bound) ||
+                   bodyMutatesCapture(*re->end, name, bound);
+        }
+        if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e))
+            return be->value ? bodyMutatesCapture(*be->value, name, bound)
+                             : false;
+        if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
+            for (const auto& [_n, v] : sl->fields)
+                if (bodyMutatesCapture(*v, name, bound)) return true;
+            return false;
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e))
+            return bodyMutatesCapture(*fe->object, name, bound);
+        if (auto* te = dynamic_cast<const ast::TryExpr*>(&e))
+            return bodyMutatesCapture(*te->operand, name, bound);
+        if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e))
+            return bodyMutatesCapture(*ae->operand, name, bound);
+        if (auto* cl = dynamic_cast<const ast::ClosureExpr*>(&e)) {
+            // A nested closure shadows `name` with its own params; a write to
+            // OUR `name` from inside it would itself be a by-ref capture of
+            // the nested closure (transitively reaching our binding), so it
+            // still counts as a mutation of `name` from our perspective.
+            std::vector<std::string> added;
+            for (const auto& p : cl->params)
+                if (bound.insert(p.name).second) added.push_back(p.name);
+            bool hit = bodyMutatesCapture(*cl->body, name, bound);
+            for (const auto& n : added) bound.erase(n);
+            return hit;
+        }
+        // IntLit / BoolLit / StringLit / Ident / Continue: never a mutation.
+        return false;
+    }
+
+    // Phase 17a: true if the expression IS a closure (possibly parenthesized
+    // away by the parser — parens are transparent in the AST) whose capture
+    // list includes a by-reference capture. Used to reject returning such a
+    // closure (its env would hold a dangling pointer into the dead frame).
+    bool closureEscapesByRef(const ast::Expr& e) {
+        if (auto* cl = dynamic_cast<const ast::ClosureExpr*>(&e)) {
+            for (const auto& cap : cl->captures)
+                if (cap.byRef) return true;
+        }
+        return false;
+    }
+
     // Phase 10b: type-check a capturing closure `|params| body`. Determines
     // the captured free variables (recorded on the AST node for codegen),
     // checks the body in a scope holding ONLY the params + captures (so an
@@ -2642,40 +2835,62 @@ private:
 
         // Snapshot each capture's (resolved-enough) type from the enclosing
         // scope. We record the capture list on the node for codegen.
+        //
+        // Phase 17a: classify each capture as by-value (Phase 10b) or by-ref
+        // (FnMut). A capture is by-ref iff the body mutates it (assigns to it
+        // or takes `&mut` of it). By-ref captures store a pointer to the
+        // enclosing alloca, so writes persist after the call. A by-ref
+        // capture requires the enclosing binding be `let mut` (otherwise the
+        // mutation is illegal). `captureMut[i]` records whether the capture's
+        // enclosing binding was `mut`, so the body's scope marks it mutable
+        // (so `name = ...` inside the body type-checks).
         cl.captures.clear();
         cl.captures.reserve(order.size());
         std::vector<std::pair<std::string, TypePtr>> captureTypes;
+        std::vector<bool> captureMut; // parallel to captureTypes
         for (const auto& name : order) {
             TypePtr t = lookupLocal(name);
             if (!t) continue; // defensive — collectFreeVars only adds locals
-            // MVP capture-by-value rule: only Copy types (i64, bool, &T) may
-            // be captured. Capturing a non-Copy aggregate (struct / enum /
-            // &mut / fn-value) by value would be a move the borrow checker
-            // cannot currently see (it does not descend into closure bodies),
-            // so we reject it with a clear error rather than risk an
-            // untracked use-after-move. (Documented Phase 10b limitation;
-            // capture-by-reference / FnMut are deferred.)
+            std::unordered_set<std::string> shadow;
+            bool mutated = bodyMutatesCapture(*cl.body, name, shadow);
+            bool enclosingMut = isMutLocal(name);
             TypePtr rt = resolve(t);
             bool copyable = rt->kind == TypeKind::Int ||
                             rt->kind == TypeKind::Bool ||
                             rt->kind == TypeKind::Unit ||
                             (rt->kind == TypeKind::Ref && !rt->refIsMut);
-            if (!copyable) {
+            if (mutated) {
+                // FnMut: capture by reference. The mutation requires the
+                // enclosing binding be `let mut`.
+                if (!enclosingMut) {
+                    error("closure mutates captured `" + name +
+                              "`, but it is not declared `let mut` in the "
+                              "enclosing scope; a by-reference (FnMut) capture "
+                              "needs a mutable binding",
+                          cl.line, cl.column);
+                }
+            } else if (!copyable) {
+                // By-value capture: keep the Phase 10b Copy-only rule.
+                // Capturing a non-Copy aggregate (struct / enum / &mut /
+                // fn-value) by value would be a move the borrow checker cannot
+                // currently see (it does not descend into closure bodies), so
+                // we reject it rather than risk an untracked use-after-move.
+                // (FnMut covers the mutate-in-place case; this branch is the
+                // read-only non-Copy case, still deferred.)
                 error("closure captures `" + name + "` of type " +
                           typeToString(t) +
                           ", but only Copy types (i64, bool, &T) may be "
-                          "captured by value in this MVP; aggregate / mutable "
-                          "captures are not yet supported",
+                          "captured by value in this MVP; aggregate captures "
+                          "are not yet supported",
                       cl.line, cl.column);
-                // Continue recording it so codegen still gets a consistent
-                // capture list (codegen is only invoked when typecheck is
-                // clean, so this error blocks codegen anyway).
             }
             ast::ClosureCapture cap;
             cap.name = name;
             cap.type = t;
+            cap.byRef = mutated;
             cl.captures.push_back(std::move(cap));
             captureTypes.emplace_back(name, t);
+            captureMut.push_back(enclosingMut);
         }
 
         // 2) Resolve param types: annotated -> that type; else a fresh Var
@@ -2706,7 +2921,13 @@ private:
         mutScopes_.clear();
         loopStack_.clear();
         pushScope();
-        for (const auto& [name, t] : captureTypes) scopes_.back()[name] = t;
+        for (std::size_t i = 0; i < captureTypes.size(); ++i) {
+            scopes_.back()[captureTypes[i].first] = captureTypes[i].second;
+            // Phase 17a: a `let mut` capture stays mutable inside the body so
+            // an assignment to it type-checks (and is lowered as a by-ref
+            // capture writing through the pointer to the enclosing alloca).
+            if (captureMut[i]) markMut(captureTypes[i].first);
+        }
         for (std::size_t i = 0; i < cl.params.size(); ++i) {
             scopes_.back()[cl.params[i].name] = paramTypes[i];
         }
@@ -2926,6 +3147,49 @@ private:
         error("unknown function: " + call.callee, call.line, call.column);
         for (const auto& a : call.args) checkExpr(*a);
         return makeInt();
+    }
+
+    // Phase 17a: type-check a call whose callee is an arbitrary EXPRESSION
+    // (a parenthesized expr or a field access), e.g. `(s.f)(x)`. The callee
+    // must resolve to a `Function` type; we unify the args against its
+    // params and yield its return — the same indirect-call discipline
+    // `checkCall` uses for fn-typed locals, lifted to a general callee expr.
+    TypePtr checkCallValue(const ast::CallValueExpr& cv) {
+        TypePtr calleeT = resolve(checkExpr(*cv.callee));
+        if (calleeT->kind != TypeKind::Function) {
+            error("called value is not a function (its type is " +
+                      typeToString(calleeT) + ")",
+                  cv.callee->line, cv.callee->column);
+            for (const auto& a : cv.args) checkExpr(*a);
+            return makeInt();
+        }
+        if (calleeT->args.size() != cv.args.size()) {
+            error("indirect call expects " +
+                      std::to_string(calleeT->args.size()) + " arg(s), got " +
+                      std::to_string(cv.args.size()),
+                  cv.line, cv.column);
+        }
+        const std::size_t n = std::min(calleeT->args.size(), cv.args.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            TypePtr argType = checkExpr(*cv.args[i]);
+            if (!unify(argType, calleeT->args[i])) {
+                error("argument " + std::to_string(i + 1) +
+                          " of indirect call has type " + typeToString(argType) +
+                          ", expected " + typeToString(calleeT->args[i]),
+                      cv.args[i]->line, cv.args[i]->column);
+            }
+        }
+        for (std::size_t i = n; i < cv.args.size(); ++i) checkExpr(*cv.args[i]);
+        // Phase 10a: an indirect call performs the effects carried by the fn
+        // value's type. Mirror recordCallEffectsFromFnType against this node.
+        {
+            EffectSet contrib;
+            for (const auto& l : calleeT->effectLabels) contrib.add(l);
+            if (calleeT->effectRowVar)
+                addRowVarContribution(calleeT->effectRowVar, contrib);
+            if (!contrib.labels.empty()) exprEffects_[&cv] = contrib;
+        }
+        return calleeT->ret;
     }
 
     // Phase 15: prefix unary operators. `-x` negates an i64; `!x` logically
@@ -3481,6 +3745,15 @@ private:
         if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(&s)) {
             if (ret->value) {
                 TypePtr valT = checkExpr(*ret->value);
+                // Phase 17a: a closure that captures BY REFERENCE holds a
+                // pointer into its defining frame; returning it would dangle.
+                // Reject (MVP keeps such closures non-escaping).
+                if (closureEscapesByRef(*ret->value)) {
+                    error("cannot return a closure that captures a variable by "
+                          "reference (FnMut); its environment would point into "
+                          "the dead stack frame",
+                          ret->value->line, ret->value->column);
+                }
                 // Phase 11: `return &concrete;` from a `-> &dyn Trait` fn
                 // coerces just like an argument / annotated let.
                 if (currentReturnType_ &&

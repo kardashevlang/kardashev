@@ -967,6 +967,47 @@ void test_closure_as_call_argument() {
     assert(dynamic_cast<const ast::ClosureExpr*>(call->args[0].get()));
 }
 
+// --- Phase 17a: call a fn VALUE produced by an expression ---
+
+void test_call_value_field() {
+    // `(s.f)(x)` parses to a CallValueExpr whose callee is a FieldExpr.
+    auto r = parseWrapped("(s.f)(10)");
+    auto* cv = dynamic_cast<const ast::CallValueExpr*>(tailExprOf(r));
+    assert(cv);
+    assert(cv->args.size() == 1);
+    auto* fe = dynamic_cast<const ast::FieldExpr*>(cv->callee.get());
+    assert(fe && fe->fieldName == "f");
+    auto* obj = dynamic_cast<const ast::IdentExpr*>(fe->object.get());
+    assert(obj && obj->name == "s");
+}
+
+void test_call_value_field_through_self() {
+    // `(self.f)(self.base)` — callee is a field of `self`, arg is a field too.
+    auto r = parseWrapped("(self.f)(self.base)");
+    auto* cv = dynamic_cast<const ast::CallValueExpr*>(tailExprOf(r));
+    assert(cv);
+    assert(cv->args.size() == 1);
+    assert(dynamic_cast<const ast::FieldExpr*>(cv->callee.get()));
+    assert(dynamic_cast<const ast::FieldExpr*>(cv->args[0].get()));
+}
+
+void test_call_value_of_call_result() {
+    // `(getCb())(41)` — callee is itself a CallExpr; outer is a CallValueExpr.
+    auto r = parseWrapped("(getCb())(41)");
+    auto* cv = dynamic_cast<const ast::CallValueExpr*>(tailExprOf(r));
+    assert(cv);
+    assert(cv->args.size() == 1);
+    auto* inner = dynamic_cast<const ast::CallExpr*>(cv->callee.get());
+    assert(inner && inner->callee == "getCb");
+}
+
+void test_bare_call_still_callexpr() {
+    // Regression: a plain `foo(1)` must stay a CallExpr, NOT a CallValueExpr.
+    auto r = parseWrapped("foo(1)");
+    assert(dynamic_cast<const ast::CallExpr*>(tailExprOf(r)));
+    assert(!dynamic_cast<const ast::CallValueExpr*>(tailExprOf(r)));
+}
+
 void test_mod_decl_basic() {
     auto r = parse("mod util;\nfn main() -> i64 { 0 }");
     if (!r.ok()) {
@@ -1422,6 +1463,11 @@ int main() {
     test_closure_zero_param();
     test_closure_block_body();
     test_closure_as_call_argument();
+    // Phase 17a call a fn value produced by an expression
+    test_call_value_field();
+    test_call_value_field_through_self();
+    test_call_value_of_call_result();
+    test_bare_call_still_callexpr();
     // Phase 7 mod
     test_mod_decl_basic();
     test_mod_multiple();
@@ -1459,6 +1505,6 @@ int main() {
     // Phase 16: optional return type (the Drop-method surface)
     test_optional_return_type_fn();
     test_optional_return_type_drop_trait();
-    std::cout << "All parser tests passed (93 cases)\n";
+    std::cout << "All parser tests passed (97 cases)\n";
     return 0;
 }

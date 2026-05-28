@@ -904,6 +904,33 @@ private:
                 expr = std::move(se);
                 continue;
             }
+            // Phase 17a: a `(arglist)` in postfix position calls the fn VALUE
+            // produced by the preceding expression — e.g. `(s.f)(x)` or
+            // `(getCallback())(args)`. Bare `ident(args)` / `path::f(args)`
+            // were already consumed as a CallExpr in parsePrimary, and
+            // `recv.method(args)` as a MethodCallExpr in the `.` arm above, so
+            // reaching here means the callee is a parenthesized expr, a field
+            // access, or the result of another call — all dispatched at
+            // runtime through the fat pointer.
+            if (check(TokenKind::LParen)) {
+                Token lp = consume();
+                auto cv = std::make_unique<ast::CallValueExpr>();
+                cv->line = lp.line;
+                cv->column = lp.column;
+                cv->callee = std::move(expr);
+                bool prevCallRestrict = restrictStructLit_;
+                restrictStructLit_ = false;
+                if (!check(TokenKind::RParen)) {
+                    while (true) {
+                        cv->args.push_back(parseExpr());
+                        if (!accept(TokenKind::Comma)) break;
+                    }
+                }
+                restrictStructLit_ = prevCallRestrict;
+                expect(TokenKind::RParen, ")");
+                expr = std::move(cv);
+                continue;
+            }
             break;
         }
         return expr;
