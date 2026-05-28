@@ -54,6 +54,15 @@ void reportTypeErrors(const kardashev::TypeCheckResult& r) {
     }
 }
 
+bool hasSupportedEntrySignature(const kardashev::ast::Program& program,
+                                const std::string& entry) {
+    for (const auto& fn : program.functions) {
+        if (fn.name != entry) continue;
+        return fn.params.empty() && fn.returnType.name == "i64";
+    }
+    return false;
+}
+
 // Compile `src` through the full pipeline and JIT-call the named entry
 // (which must be a no-arg function returning i64). Diagnostics go to
 // stderr. Returns the i64 result on success, nullopt otherwise.
@@ -62,6 +71,12 @@ std::optional<std::int64_t> compileAndRun(const std::string& src,
     auto pr = kardashev::parse(src);
     if (!pr.ok()) {
         reportParseErrors(pr);
+        return std::nullopt;
+    }
+    if (!hasSupportedEntrySignature(pr.program, entry)) {
+        std::cerr << "kardc: entry `" << entry
+                  << "` must have signature `fn " << entry
+                  << "() -> i64` for JIT execution\n";
         return std::nullopt;
     }
     auto tcr = kardashev::typecheck(pr.program);
