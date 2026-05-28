@@ -5,6 +5,7 @@ cc_library(
     hdrs = ["include/kardashev/ast.hpp"],
     strip_include_prefix = "include",
     visibility = ["//visibility:public"],
+    deps = [":types"],
 )
 
 cc_library(
