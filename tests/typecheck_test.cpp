@@ -1694,6 +1694,13 @@ void test_async_implicit_effect_ok() {
         "async_implicit_effect_ok");
 }
 
+// Source code cannot forge runtime Future values via struct literals.
+void test_async_future_struct_literal_errors() {
+    expectErr(
+        "fn main() -> i64 { block_on(Future {}) }",
+        "async_future_struct_literal_errors");
+}
+
 // `.await` requires a Future operand.
 void test_async_await_non_future_errors() {
     expectErr(
@@ -2170,6 +2177,7 @@ int main() {
     test_async_await_outside_async_fn_errors();
     test_async_block_on_in_sync_main_ok();
     test_async_implicit_effect_ok();
+    test_async_future_struct_literal_errors();
     test_async_await_non_future_errors();
     test_async_call_returns_future_not_int();
     test_async_sync_fn_awaiting_errors();

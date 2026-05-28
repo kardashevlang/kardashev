@@ -2541,6 +2541,16 @@ private:
             for (const auto& f : sl.fields) checkExpr(*f.second);
             return makeInt();
         }
+        // Built-in runtime Future values are compiler-constructed and carry
+        // executable state ({poll fn ptr, frame ptr}). Reject source-level
+        // literals so users cannot forge invalid futures like `Future {}`.
+        if (sl.structName == "Future") {
+            error("`Future` values are runtime-only and cannot be constructed "
+                  "with a struct literal",
+                  sl.line, sl.column);
+            for (const auto& f : sl.fields) checkExpr(*f.second);
+            return freshInstantiateStruct(it->second);
+        }
         // For generic structs, build a fresh instantiation so field-type
         // unification with each literal expr leaves the instance's
         // typeArgs in a fully-solved state.
