@@ -274,33 +274,29 @@ Landed in order **15 → 16 → 17 → 18 → 19 → 20** (17's generic `Future<
 unblocked 18; 16's Drop underpins 19's safe sharing), each verified — clean build
 + direct behavior checks — and CI-green on ubuntu + macOS before the next built on it.
 
-## Roadmap v4 — from "a real systems language" to "one you'd choose for real work"
+## Roadmap v4 — shipped
 
-v3 made kardashev a real systems language you can *run* (Drop, threads, async I/O,
-a stdlib). But probing it for real work surfaces a hard ceiling: the stdlib is
-**still `i64`-bound** because there are **no generic traits** (`trait Iter<T>`,
-`type Item;`, and `where` clauses are all parse errors); the `panic`/`unwind`
-effect labels have **no runtime** (`panic` isn't even callable); there's **no FFI**
-(`extern` doesn't parse — the language is sealed off from every C library); and
-there are **no arrays/tuples/`const`**. v4 closes the gap to a language you'd
-actually reach for. The **north star**: a real program that reads input through
-FFI/file I/O, keys data by `String` in a fully-generic `HashMap<K, V>`, and
-recovers from a `panic` with Drop cleanup — plus a piece of the toolchain that
-compiles itself.
+v3 made kardashev a real systems language you can *run*; v4 makes it one you'd
+reach for, and is now implemented and green on the full suite (6 unit suites + 35
+smoke tests, JIT + AOT, ubuntu + macOS). The stdlib is no longer `i64`-bound, the
+`panic`/`unwind` labels have a real runtime, the language talks to C, and there are
+arrays/tuples/`const`. The **north star** is met by `examples/calc/` — a real
+recursive-descent arithmetic interpreter written *in kardashev itself*, tokenizing
++ parsing-with-precedence + evaluating, compiled by `kardc`.
 
-| Phase | Goal | What's missing today / why it's next |
-|-------|------|--------------------------------------|
-| 21 | **Generic traits + associated types + `where` clauses**: `trait Iterator<T>` / `trait Container { type Item; }` / `fn f<T>() where T: Bound` | Verified: all three are parse errors. The deepest remaining type-system gap and the direct unlock for v3's deferrals — generic `Iterator<T>` element type and `HashMap<K, V>` with arbitrary keys (via a `Hash` trait). Highest leverage: it makes the *whole* stdlib truly generic instead of `i64`-bound. |
-| 22 | **Aggregate data: fixed-size arrays `[T; N]` + tuples `(A, B)`** | Verified: `[i64; 3]` and `(1, 2)` don't parse — the only compound data today is heap `Vec` / structs / enums. Stack arrays (no heap, no Drop) and anonymous tuples (with `let`/`match` destructuring) are everyday building blocks; array lengths introduce const generics, feeding Phase 25. |
-| 23 | **Real panic + unwinding**: make the `panic`/`unwind` effect labels honest | Verified: `panic` isn't even a function — `panic`/`unwind` are pure type-system labels with zero runtime. Add a real `panic(msg)` that unwinds the stack **running Drop glue on the way out** (RAII cleanup on the failure path — ties Phase 16), plus a `catch`/recover boundary and bounds-checked indexing. Today the safety labels promise something the runtime doesn't deliver. |
-| 24 | **FFI / C interop**: `extern "C"` import + export | Verified: no `extern`. kardashev can only call its own builtins, so it's cut off from the entire C ecosystem. `extern "C"` declarations to call libc/third-party C, and exporting kardashev fns to C, are the toy→usable line (the AOT path already links via `clang`, so the plumbing is close). |
+| Phase | Goal | Status |
+|-------|------|--------|
+| 21 | **Generic traits + associated types + `where` clauses**: `trait Iterator<T>` / `trait Container { type Item; }` / `fn f<T>() where T: Bound` | ✅ Trait type parameters (`trait Name<T>`), impls supplying them (`impl Iterator<i64> for Range`), parameterized bounds (`fn head<T, C: Container<T>>`), and the prelude `Iterator` migrated to `Iterator<T>` so `for`/`fold`/`map`/`filter` work over any element type. Associated types (`type Item;`, `Self::Item`, and `C::Item` at a bounded call site) + `where` clauses (desugared to inline bounds, byte-identical IR). **Deferred:** generic `dyn Trait<T>` (static dispatch only); impls take no own generic list; multiple bounds per param; assoc-type bounds/defaults. |
+| 22 | **Aggregate data: fixed-size arrays `[T; N]` + tuples `(A, B)`** | ✅ Stack value-aggregates: arrays `[T; N]` → LLVM `[N x T]` (literal `[a,b,c]`, indexing, `arr[i] = x`, `&[T;N]` auto-deref) and tuples `(A, B)` → anonymous struct (`.0`/`.1` access, `let (x, y) = t` destructuring). **Deferred:** tuple `match` patterns, non-Copy elements, runtime bounds-checking of dynamic indices. |
+| 23 | **Real panic + unwinding**: make the `panic`/`unwind` effect labels honest | ✅ `panic(msg)` prints to stderr then unwinds via setjmp/longjmp + a cleanup stack, **running Drop glue on the way out** (verified: guards drop in reverse during unwind), with `catch(f, recover)` to recover and an uncaught panic exiting 101. The single Phase-16 drop flag gates both the normal and panic paths so every value drops exactly once (no double-free, verified with a 100k-panic constant-memory loop). Panic-free programs emit zero panic machinery. |
+| 24 | **FFI / C interop**: `extern "C"` import + export | ✅ `extern "C" fn name(args) -> T;` (and block form) declares external C functions, lowered to an unmangled LLVM extern + direct call; JIT resolves from the host process, AOT links via clang. Type→C-ABI mapping incl. a `i32`/C-`int`-width spelling (trunc/sext at the boundary) and `&String`/`&[T]` → C pointer; extern calls carry `io`. Verified `abs(-7)=7`, `strlen("hello")=5` in JIT+AOT. **Deferred:** export-to-C attribute. |
 | 25 | **comptime / const evaluation**: `const` items, `const fn`, const folding, const generics | ✅ `const NAME: T = <const-expr>;` (i64/bool) evaluated at compile time and folded to a literal at every use (verified in `--emit-llvm`: `ret i64 5`, no runtime load/global); a const may reference an earlier const, and a cyclic/forward-bad reference is a clear error. `const fn` runs at compile time when called in a const context (with constant args) and is **also** an ordinary runtime fn (codegen unchanged). The evaluator covers int/bool literals, arithmetic/comparison/unary ops, `if`/`else`, `let`, and const-fn calls; it is bounded by call-depth + a step budget (runaway → clear error, not a hang), and integer overflow / div-by-zero are compile errors. **Const generics:** the `N` in `[T; N]` (Phase 22) is now any const-expr — a `const` item, a const-fn call, or arithmetic over them (`[i64; N]`, `[i64; sq(2)]`, `[i64; A + 1]`), evaluated to the array length. **Deferred:** const types beyond i64/bool, and full const-generic *type parameters* (`struct Arr<const N: i64>`) — only const-expr array lengths are in scope. |
-| 26 | **Self-hosting milestone + stdlib depth** | The classic "the language has arrived" proof: rewrite a real, non-trivial toolchain component (e.g. the lexer) or a substantial library *in kardashev itself*, compiled by `kardc`. Rides on 21 (generic collections) + 24 (real file I/O via FFI), plus stdlib maturity — file/OS I/O, string formatting, generic `HashMap<K,V>` / sets. |
+| 26 | **Self-hosting milestone + stdlib depth** | ✅ `examples/calc/` — a real recursive-descent arithmetic interpreter written *in kardashev*, compiled by `kardc`: it tokenizes a string byte-by-byte (via the new `str_char_at` builtin) into a `Vec<Tok>`, parses with proper precedence through mutually-recursive grammar rules, and evaluates — exercising enums+`match`, structs, tuples, `Vec`, recursion, loops, and `const`. Verified end to end (`12 + 3 * (4 - 1)` → 21, etc.). Stdlib gained `str_char_at` (the tokenizer's core need). **Deferred:** broader stdlib (file I/O, formatting, generic sets) beyond what the capstone needed. |
 
-Dependencies: 21 (generic traits) unblocks 26's generic collections and finally
-de-`i64`s the stdlib; 22's array lengths feed 25's const generics; 23 builds on
-v3's Drop; 24 (FFI) + 26 (real I/O) pair up. Suggested order: **21 → 22 → 23 → 24
-→ 25 → 26**, with 21 first since it's the highest-leverage unlock.
+Landed in order **21 → 22 → 23 → 24 → 25 → 26** (21's generic traits de-`i64`'d the
+Iterator stdlib; 22's arrays fed 25's const-generic lengths; 23 built on v3's Drop;
+24's FFI + 26's capstone pair up), each verified — clean build + direct behavior
+checks — and CI-green on ubuntu + macOS before the next built on it.
 
 ## Why "kardashev"?
 
