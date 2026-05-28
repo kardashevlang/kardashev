@@ -184,6 +184,13 @@ std::vector<Token> lex(std::string_view source) {
             push2(TokenKind::DoubleColon, startCol);
             continue;
         }
+        // Phase 10b: `||` (zero-param closure) before `|` so the longer
+        // match wins. There is no bitwise / logical-or operator in the
+        // language, so both forms are unambiguously closure syntax.
+        if (c == '|' && n == '|') {
+            push2(TokenKind::PipePipe, startCol);
+            continue;
+        }
 
         // Single-char tokens.
         switch (c) {
@@ -205,6 +212,7 @@ std::vector<Token> lex(std::string_view source) {
         case '?': push1(TokenKind::Question, startCol); continue;
         case '&': push1(TokenKind::Ampersand, startCol); continue;
         case '!': push1(TokenKind::Bang, startCol); continue;
+        case '|': push1(TokenKind::Pipe, startCol); continue;
         default: break;
         }
 
@@ -267,6 +275,8 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::Question: return "Question";
     case TokenKind::Ampersand: return "Ampersand";
     case TokenKind::Bang: return "Bang";
+    case TokenKind::Pipe: return "Pipe";
+    case TokenKind::PipePipe: return "PipePipe";
     case TokenKind::Underscore: return "Underscore";
     case TokenKind::EndOfInput: return "EndOfInput";
     case TokenKind::Invalid: return "Invalid";

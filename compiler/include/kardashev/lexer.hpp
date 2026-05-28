@@ -72,6 +72,9 @@ enum class TokenKind {
     Ampersand, // & — Phase 2.4b shared borrow / reference type
     Bang, // ! — Phase 4 effect-row introducer (the `!=` two-char form has
           // its own token so this is unambiguous)
+    Pipe,     // | — Phase 10b closure-param delimiter (no bitwise-or yet, so
+              //     this token is unambiguous outside closure syntax)
+    PipePipe, // || — Phase 10b zero-param closure `|| expr`
 
     // Punctuation
     LParen,

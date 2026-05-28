@@ -864,6 +864,14 @@ private:
             collectEffects(*ae->operand, out);
             return;
         }
+        if (dynamic_cast<const ast::ClosureExpr*>(&e)) {
+            // Phase 10b: defining a closure is pure. The effects of the
+            // closure's body are encapsulated in the closure value's
+            // Function-type effect row; they only reach the enclosing fn
+            // when the closure is *called* (an indirect call, whose effect
+            // contribution is recorded against that call site, not here).
+            return;
+        }
     }
 
     void checkEffects(const ast::FnDecl& fn,
@@ -1419,6 +1427,9 @@ private:
         if (auto* ce = dynamic_cast<const ast::ContinueExpr*>(&e)) {
             return checkContinue(*ce);
         }
+        if (auto* cl = dynamic_cast<const ast::ClosureExpr*>(&e)) {
+            return checkClosure(*cl);
+        }
         if (auto* te = dynamic_cast<const ast::TryExpr*>(&e)) {
             return checkTry(*te);
         }
@@ -1882,6 +1893,301 @@ private:
         for (const auto& l : fnTy->effectLabels) contrib.add(l);
         if (fnTy->effectRowVar) addRowVarContribution(fnTy->effectRowVar, contrib);
         if (!contrib.labels.empty()) exprEffects_[&call] = contrib;
+    }
+
+    // Phase 10b: walk a closure body and collect the names that refer to
+    // FREE variables — identifiers (or call callees) that are bound in an
+    // enclosing local scope and are neither the closure's own params nor a
+    // name bound within the body before use. `bound` tracks names that are
+    // locally introduced as we descend (closure params, nested `let`s,
+    // match/for pattern bindings, nested-closure params); a use of a name
+    // not in `bound` is a capture iff `lookupLocal` finds it (i.e. it is an
+    // enclosing local, not a global fn / constructor). Order of first
+    // appearance is preserved via `order` so codegen's env layout is stable.
+    void collectFreeVars(const ast::Expr& e,
+                         std::unordered_set<std::string>& bound,
+                         std::vector<std::string>& order,
+                         std::unordered_set<std::string>& seen) {
+        auto noteUse = [&](const std::string& name) {
+            if (bound.count(name)) return;
+            if (seen.count(name)) return;
+            if (lookupLocal(name)) { // an enclosing local => capture
+                seen.insert(name);
+                order.push_back(name);
+            }
+        };
+        if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
+            noteUse(id->name);
+            return;
+        }
+        if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+            collectFreeVars(*bin->lhs, bound, order, seen);
+            collectFreeVars(*bin->rhs, bound, order, seen);
+            return;
+        }
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            // The callee name can itself be a captured fn value.
+            noteUse(call->callee);
+            for (const auto& a : call->args)
+                collectFreeVars(*a, bound, order, seen);
+            return;
+        }
+        if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
+            collectFreeVars(*mc->receiver, bound, order, seen);
+            for (const auto& a : mc->args)
+                collectFreeVars(*a, bound, order, seen);
+            return;
+        }
+        if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
+            collectFreeVars(*ie->cond, bound, order, seen);
+            collectFreeVars(*ie->thenBranch, bound, order, seen);
+            collectFreeVars(*ie->elseBranch, bound, order, seen);
+            return;
+        }
+        if (auto* block = dynamic_cast<const ast::BlockExpr*>(&e)) {
+            // A block opens a fresh binding scope; names `let`-bound inside
+            // it shadow captures for the remainder of the block. We add to
+            // `bound` as we go and restore afterwards.
+            std::vector<std::string> added;
+            for (const auto& stmt : block->stmts) {
+                if (auto* let = dynamic_cast<const ast::LetStmt*>(stmt.get())) {
+                    collectFreeVars(*let->value, bound, order, seen);
+                    if (bound.insert(let->name).second)
+                        added.push_back(let->name);
+                } else if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(
+                               stmt.get())) {
+                    if (ret->value)
+                        collectFreeVars(*ret->value, bound, order, seen);
+                } else if (auto* as = dynamic_cast<const ast::AssignStmt*>(
+                               stmt.get())) {
+                    collectFreeVars(*as->target, bound, order, seen);
+                    collectFreeVars(*as->value, bound, order, seen);
+                } else if (auto* es = dynamic_cast<const ast::ExprStmt*>(
+                               stmt.get())) {
+                    collectFreeVars(*es->expr, bound, order, seen);
+                }
+            }
+            if (block->tail) collectFreeVars(*block->tail, bound, order, seen);
+            for (const auto& n : added) bound.erase(n);
+            return;
+        }
+        if (auto* me = dynamic_cast<const ast::MatchExpr*>(&e)) {
+            collectFreeVars(*me->scrutinee, bound, order, seen);
+            for (const auto& arm : me->arms) {
+                std::vector<std::string> added;
+                collectPatternBindings(*arm.pattern, bound, added);
+                collectFreeVars(*arm.body, bound, order, seen);
+                for (const auto& n : added) bound.erase(n);
+            }
+            return;
+        }
+        if (auto* we = dynamic_cast<const ast::WhileExpr*>(&e)) {
+            collectFreeVars(*we->cond, bound, order, seen);
+            collectFreeVars(*we->body, bound, order, seen);
+            return;
+        }
+        if (auto* le = dynamic_cast<const ast::LoopExpr*>(&e)) {
+            collectFreeVars(*le->body, bound, order, seen);
+            return;
+        }
+        if (auto* fe = dynamic_cast<const ast::ForExpr*>(&e)) {
+            collectFreeVars(*fe->iter, bound, order, seen);
+            std::vector<std::string> added;
+            collectPatternBindings(*fe->pattern, bound, added);
+            collectFreeVars(*fe->body, bound, order, seen);
+            for (const auto& n : added) bound.erase(n);
+            return;
+        }
+        if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
+            collectFreeVars(*re->start, bound, order, seen);
+            collectFreeVars(*re->end, bound, order, seen);
+            return;
+        }
+        if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e)) {
+            if (be->value) collectFreeVars(*be->value, bound, order, seen);
+            return;
+        }
+        if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
+            for (const auto& [_n, v] : sl->fields)
+                collectFreeVars(*v, bound, order, seen);
+            return;
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
+            collectFreeVars(*fe->object, bound, order, seen);
+            return;
+        }
+        if (auto* te = dynamic_cast<const ast::TryExpr*>(&e)) {
+            collectFreeVars(*te->operand, bound, order, seen);
+            return;
+        }
+        if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
+            collectFreeVars(*re->operand, bound, order, seen);
+            return;
+        }
+        if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
+            collectFreeVars(*ae->operand, bound, order, seen);
+            return;
+        }
+        if (auto* cl = dynamic_cast<const ast::ClosureExpr*>(&e)) {
+            // Nested closure: its params shadow within its body. A name it
+            // captures from OUR enclosing scope is also a capture of ours
+            // (transitively). We add the nested params to `bound` so they
+            // don't leak out as captures of the outer closure.
+            std::vector<std::string> added;
+            for (const auto& p : cl->params)
+                if (bound.insert(p.name).second) added.push_back(p.name);
+            collectFreeVars(*cl->body, bound, order, seen);
+            for (const auto& n : added) bound.erase(n);
+            return;
+        }
+        // IntLit / StringLit / Continue: no identifiers.
+    }
+
+    // Add the variable bindings a pattern introduces to `bound` (recording
+    // newly-added names in `added` for later removal). Constructor names are
+    // not bindings; only VarPats that aren't unit-variant constructors bind.
+    void collectPatternBindings(const ast::Pattern& pat,
+                                std::unordered_set<std::string>& bound,
+                                std::vector<std::string>& added) {
+        if (auto* vp = dynamic_cast<const ast::VarPat*>(&pat)) {
+            if (variantIndex_.count(vp->name)) return; // unit ctor, not a bind
+            if (bound.insert(vp->name).second) added.push_back(vp->name);
+            return;
+        }
+        if (auto* cp = dynamic_cast<const ast::CtorPat*>(&pat)) {
+            for (const auto& sp : cp->subpatterns)
+                collectPatternBindings(*sp, bound, added);
+            return;
+        }
+        // LitIntPat / WildPat: no bindings.
+    }
+
+    // Phase 10b: type-check a capturing closure `|params| body`. Determines
+    // the captured free variables (recorded on the AST node for codegen),
+    // checks the body in a scope holding ONLY the params + captures (so an
+    // un-captured enclosing local can't accidentally be referenced — it
+    // would be an unknown identifier), infers param/return types and the
+    // body's effect row, and returns a Function type carrying that row. The
+    // closure value is first-class and interoperates with the Phase 4.3
+    // fn-value machinery (indirect calls, if-selection, higher-order args).
+    TypePtr checkClosure(const ast::ClosureExpr& cl) {
+        // 1) Determine captures against the CURRENT (enclosing) scope.
+        std::unordered_set<std::string> bound;
+        for (const auto& p : cl.params) bound.insert(p.name);
+        std::vector<std::string> order;
+        std::unordered_set<std::string> seen;
+        collectFreeVars(*cl.body, bound, order, seen);
+
+        // Snapshot each capture's (resolved-enough) type from the enclosing
+        // scope. We record the capture list on the node for codegen.
+        cl.captures.clear();
+        cl.captures.reserve(order.size());
+        std::vector<std::pair<std::string, TypePtr>> captureTypes;
+        for (const auto& name : order) {
+            TypePtr t = lookupLocal(name);
+            if (!t) continue; // defensive — collectFreeVars only adds locals
+            // MVP capture-by-value rule: only Copy types (i64, bool, &T) may
+            // be captured. Capturing a non-Copy aggregate (struct / enum /
+            // &mut / fn-value) by value would be a move the borrow checker
+            // cannot currently see (it does not descend into closure bodies),
+            // so we reject it with a clear error rather than risk an
+            // untracked use-after-move. (Documented Phase 10b limitation;
+            // capture-by-reference / FnMut are deferred.)
+            TypePtr rt = resolve(t);
+            bool copyable = rt->kind == TypeKind::Int ||
+                            rt->kind == TypeKind::Bool ||
+                            rt->kind == TypeKind::Unit ||
+                            (rt->kind == TypeKind::Ref && !rt->refIsMut);
+            if (!copyable) {
+                error("closure captures `" + name + "` of type " +
+                          typeToString(t) +
+                          ", but only Copy types (i64, bool, &T) may be "
+                          "captured by value in this MVP; aggregate / mutable "
+                          "captures are not yet supported",
+                      cl.line, cl.column);
+                // Continue recording it so codegen still gets a consistent
+                // capture list (codegen is only invoked when typecheck is
+                // clean, so this error blocks codegen anyway).
+            }
+            ast::ClosureCapture cap;
+            cap.name = name;
+            cap.type = t;
+            cl.captures.push_back(std::move(cap));
+            captureTypes.emplace_back(name, t);
+        }
+
+        // 2) Resolve param types: annotated -> that type; else a fresh Var
+        // that unification with the use-context (e.g. a higher-order fn's
+        // param signature) will pin down.
+        std::vector<TypePtr> paramTypes;
+        paramTypes.reserve(cl.params.size());
+        for (const auto& p : cl.params) {
+            if (p.hasAnnotation) {
+                paramTypes.push_back(resolveTypeRef(p.type));
+            } else {
+                paramTypes.push_back(makeFreshVar());
+            }
+        }
+
+        // 3) Check the body in a fresh scope containing only params +
+        // captures. A new scope frame on top of the existing stack would
+        // also expose un-captured outer locals to the body; to enforce
+        // capture-by-value semantics (and avoid silently reading a local
+        // we didn't capture), we temporarily swap in a scope stack that
+        // holds ONLY the params + captures.
+        std::vector<Scope> savedScopes = std::move(scopes_);
+        std::vector<std::unordered_set<std::string>> savedMut =
+            std::move(mutScopes_);
+        std::vector<LoopCtx> savedLoops = std::move(loopStack_);
+        TypePtr savedRet = currentReturnType_;
+        scopes_.clear();
+        mutScopes_.clear();
+        loopStack_.clear();
+        pushScope();
+        for (const auto& [name, t] : captureTypes) scopes_.back()[name] = t;
+        for (std::size_t i = 0; i < cl.params.size(); ++i) {
+            scopes_.back()[cl.params[i].name] = paramTypes[i];
+        }
+        // A closure body's `return` would conceptually return from the
+        // closure; the MVP has no such tests, but binding currentReturnType_
+        // to the body's inferred type would create a chicken-and-egg. Leave
+        // it null so a stray `return` inside a closure body is reported as
+        // "outside any function" only if it also uses `?`; a plain
+        // `return e;` is checked loosely (its value type is free).
+        currentReturnType_ = nullptr;
+        TypePtr bodyType = checkExpr(*cl.body);
+
+        // 4) Infer the body's effect row.
+        EffectSet bodyEffects;
+        collectEffects(*cl.body, bodyEffects);
+
+        // Restore the enclosing context.
+        scopes_ = std::move(savedScopes);
+        mutScopes_ = std::move(savedMut);
+        loopStack_ = std::move(savedLoops);
+        currentReturnType_ = savedRet;
+
+        // 5) Build the closure's Function type. Concrete built-in effect
+        // labels become the closed row; effect-row-var names (e.g. a still-
+        // polymorphic `e` captured from the enclosing fn) attach as the row
+        // var tail so row polymorphism composes. The closure expression
+        // itself contributes no effects to the enclosing fn (handled in
+        // collectEffects); only CALLING it does.
+        std::vector<std::string> labels;
+        TypePtr rowVar;
+        for (const auto& l : bodyEffects.labels) {
+            if (isBuiltinEffect(l)) {
+                if (std::find(labels.begin(), labels.end(), l) == labels.end())
+                    labels.push_back(l);
+            } else if (currentGenericEnv_) {
+                // A row-var name flowing out of the body (e.g. via an
+                // indirect call to a captured effect-polymorphic fn).
+                auto git = currentGenericEnv_->find(l);
+                if (git != currentGenericEnv_->end()) rowVar = git->second;
+            }
+        }
+        return makeFunction(std::move(paramTypes), bodyType, std::move(labels),
+                            rowVar);
     }
 
     TypePtr checkCall(const ast::CallExpr& call) {

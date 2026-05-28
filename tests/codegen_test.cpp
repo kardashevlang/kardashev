@@ -805,6 +805,81 @@ void test_concrete_effect_fn_type_param() {
     expectEquals(v, 22, "concrete_effect_fn_type_param");
 }
 
+// --- Phase 10b: capturing closures (fat-pointer fn values) ---
+
+// Single capture: `|x| x + n` closes over `n` by value.
+void test_closure_single_capture() {
+    auto v = compileAndRun(
+        "fn main() -> i64 { let n = 5; let add_n = |x| x + n; add_n(10) }",
+        "main", "closure_single_capture");
+    expectEquals(v, 15, "closure_single_capture");
+}
+
+// Multi-capture: two free variables copied into the env struct.
+void test_closure_multi_capture() {
+    auto v = compileAndRun(
+        "fn main() -> i64 { let a = 3; let b = 4; let f = |x| x + a + b; "
+        "f(10) }",
+        "main", "closure_multi_capture");
+    expectEquals(v, 17, "closure_multi_capture");
+}
+
+// Closure passed to a higher-order fn with an effect-row-polymorphic
+// fn-typed param — exercises the fat pointer flowing as a by-value arg.
+void test_closure_passed_to_higher_order() {
+    auto v = compileAndRun(
+        "fn apply(f: fn(i64) -> i64 ! {e}) -> i64 ! {e} { f(10) }\n"
+        "fn main() -> i64 { let k = 7; apply(|x| x + k) }",
+        "main", "closure_passed_to_higher_order");
+    expectEquals(v, 17, "closure_passed_to_higher_order");
+}
+
+// Multiple params + a capture, with a param type annotation.
+void test_closure_multi_param_annotated() {
+    auto v = compileAndRun(
+        "fn main() -> i64 { let base = 100; let f = |x: i64, y| x + y + base; "
+        "f(3, 4) }",
+        "main", "closure_multi_param_annotated");
+    expectEquals(v, 107, "closure_multi_param_annotated");
+}
+
+// A zero-capture closure: env is null, dispatch still goes through the fat
+// pointer uniformly.
+void test_closure_no_capture() {
+    auto v = compileAndRun(
+        "fn main() -> i64 { let f = |x| x + 1; f(41) }",
+        "main", "closure_no_capture");
+    expectEquals(v, 42, "closure_no_capture");
+}
+
+// A closure selected by `if` and then invoked — both branches are fat
+// pointers of the same LLVM type so the PHI is well-formed. Interops with a
+// top-level fn value in the other branch.
+void test_closure_selected_by_if() {
+    auto v = compileAndRun(
+        "fn dbl(x: i64) -> i64 { x + x }\n"
+        "fn main() -> i64 {\n"
+        "    let n = 10;\n"
+        "    let chosen = if 1 < 2 { dbl } else { |x| x + n };\n"
+        "    chosen(20)\n"
+        "}",
+        "main", "closure_selected_by_if");
+    expectEquals(v, 40, "closure_selected_by_if");
+}
+
+// A closure with a block body and a nested `let` that shadows nothing —
+// confirms block-scoped names aren't mistaken for captures.
+void test_closure_block_body() {
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "    let n = 3;\n"
+        "    let f = |x| { let y = x * n; y + 1 };\n"
+        "    f(4)\n"
+        "}",
+        "main", "closure_block_body");
+    expectEquals(v, 13, "closure_block_body");
+}
+
 } // namespace
 
 int main() {
@@ -870,7 +945,14 @@ int main() {
     // Phase 10a effect-carrying fn types (effects erased in lowering)
     test_effect_poly_higher_order_pure();
     test_concrete_effect_fn_type_param();
-    std::cout << "All codegen tests passed (57 cases) — Phase 10a fn-type "
-                 "effects\n";
+    // Phase 10b capturing closures (fat-pointer fn values)
+    test_closure_single_capture();
+    test_closure_multi_capture();
+    test_closure_passed_to_higher_order();
+    test_closure_multi_param_annotated();
+    test_closure_no_capture();
+    test_closure_selected_by_if();
+    test_closure_block_body();
+    std::cout << "All codegen tests passed (64 cases) — Phase 10b closures\n";
     return 0;
 }

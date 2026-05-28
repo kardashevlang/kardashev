@@ -57,6 +57,8 @@
 #include <utility>
 #include <vector>
 
+#include "kardashev/types.hpp" // Phase 10b: ClosureCapture carries a TypePtr
+
 namespace kardashev::ast {
 
 enum class BinOp {
@@ -252,6 +254,9 @@ struct BreakExpr : Expr {
 // Phase 9: `continue`. Jumps to the innermost enclosing loop's header.
 struct ContinueExpr : Expr {};
 
+// Phase 10b: ClosureExpr is declared below, after TypeRef (its param
+// annotations hold a TypeRef by value).
+
 // --- Statements ---
 
 struct LetStmt : Stmt {
@@ -315,6 +320,44 @@ struct TypeRef {
 struct Param {
     std::string name;
     TypeRef type;
+};
+
+// Phase 10b: a capturing closure `|x| x + n`, `|x, y| { ... }`, optionally
+// with param type annotations `|x: i64| ...`. The closure captures by
+// VALUE (copy/move, MVP — like Rust `move`) the free variables it
+// references from the enclosing local scope. It is a first-class value of
+// `Function` type, callable everywhere a fn value is (let-bound, passed to
+// higher-order fns, selected by `if`).
+//
+// Parsing fills `params` (names + optional annotations) and `body` (any
+// expression — typically a BlockExpr, but `|x| x + n` keeps a bare
+// BinaryExpr). The typechecker fills `captures` (the resolved free
+// variables, in a deterministic order); codegen reads them to lay out the
+// env struct and the generated top-level `__closure_<n>` function.
+struct ClosureParam {
+    std::string name;
+    TypeRef type;          // valid only when `hasAnnotation`
+    bool hasAnnotation = false;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
+// One captured free variable: its source name plus its resolved type
+// (filled by the typechecker). Codegen mirrors this order when building
+// the env struct and when loading captures in the closure prologue.
+struct ClosureCapture {
+    std::string name;
+    TypePtr type; // resolved at typecheck time
+};
+
+struct ClosureExpr : Expr {
+    std::vector<ClosureParam> params;
+    ExprPtr body;
+    // Filled by the typechecker. Stored on the node (rather than a side
+    // table) because codegen needs the ordered name+type list to build the
+    // env struct and load captures; `mutable` so the checker can populate
+    // it while walking an otherwise-const AST.
+    mutable std::vector<ClosureCapture> captures;
 };
 
 // Phase 4: a function's declared effect row. `labels` carries the

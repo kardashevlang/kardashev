@@ -890,6 +890,13 @@ private:
             return parseBlockExpr();
         }
 
+        // Phase 10b: a `|` (or `||`) in primary position begins a closure.
+        // There is no bitwise/logical-or operator, so a leading pipe is
+        // unambiguously the start of a closure's parameter list.
+        if (t.kind == TokenKind::Pipe || t.kind == TokenKind::PipePipe) {
+            return parseClosureExpr();
+        }
+
         errorHere(std::string("expected expression, got ") +
                   std::string(tokenKindName(t.kind)));
         // Synthesize a dummy node so callers don't have to null-check.
@@ -898,6 +905,52 @@ private:
         e->column = t.column;
         advance();
         return e;
+    }
+
+    // Phase 10b: `|p1, p2: T, ...| body` or `|| body`. Params may carry an
+    // optional `: Type` annotation. The body is a single expression — for
+    // `|x| x + n` it is the BinaryExpr; for `|x| { ... }` it is a BlockExpr.
+    // We restrict struct-literal parsing inside the body's leading position
+    // is unnecessary here because the body is a full expr; a `{` directly
+    // after the `|...|` is parsed as a block (parsePrimary sees LBrace).
+    ast::ExprPtr parseClosureExpr() {
+        auto cl = std::make_unique<ast::ClosureExpr>();
+        if (check(TokenKind::PipePipe)) {
+            // Zero-param closure `|| body`.
+            Token pipes = consume();
+            cl->line = pipes.line;
+            cl->column = pipes.column;
+        } else {
+            Token openPipe = expect(TokenKind::Pipe, "|");
+            cl->line = openPipe.line;
+            cl->column = openPipe.column;
+            if (!check(TokenKind::Pipe)) {
+                while (true) {
+                    Token nameTok =
+                        expect(TokenKind::Identifier, "closure parameter name");
+                    ast::ClosureParam p;
+                    p.name = nameTok.lexeme;
+                    p.line = nameTok.line;
+                    p.column = nameTok.column;
+                    if (accept(TokenKind::Colon)) {
+                        p.type = parseTypeRef();
+                        p.hasAnnotation = true;
+                    }
+                    cl->params.push_back(std::move(p));
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::Pipe)) break; // trailing comma
+                }
+            }
+            expect(TokenKind::Pipe, "|");
+        }
+        // The closure body is a full expression; struct literals inside it
+        // are fine even when the closure itself sits in a restricted
+        // position (e.g. an `if` condition), mirroring call-arg parsing.
+        bool prevRestrict = restrictStructLit_;
+        restrictStructLit_ = false;
+        cl->body = parseExpr();
+        restrictStructLit_ = prevRestrict;
+        return cl;
     }
 
     ast::ExprPtr parseIfExpr() {

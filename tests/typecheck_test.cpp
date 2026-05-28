@@ -1186,6 +1186,102 @@ void test_unknown_top_level_effect_label_errors() {
               "unknown_top_level_effect_label_errors");
 }
 
+// --- Phase 10b: capturing closures ---
+
+void test_closure_single_capture_ok() {
+    expectOk("fn main() -> i64 { let n = 5; let f = |x| x + n; f(10) }",
+             "closure_single_capture_ok");
+}
+
+void test_closure_multi_capture_ok() {
+    expectOk("fn main() -> i64 { let a = 3; let b = 4; let f = |x| x + a + b; "
+             "f(10) }",
+             "closure_multi_capture_ok");
+}
+
+void test_closure_records_captures_on_node() {
+    // The typechecker records the captured free variables (in order) on the
+    // ClosureExpr node so codegen can lay out the env struct.
+    auto pr = parse("fn main() -> i64 { let a = 1; let b = 2; "
+                    "let f = |x| x + a + b; f(0) }");
+    assert(pr.ok());
+    auto r = typecheck(pr.program);
+    if (!r.ok()) {
+        std::cerr << "[closure_records_captures_on_node] tc failed\n";
+        dump(r);
+        std::abort();
+    }
+    // Find the ClosureExpr in the AST (main's body: let a, let b, let f, tail).
+    const auto& mainFn = pr.program.functions.back();
+    const kardashev::ast::ClosureExpr* found = nullptr;
+    for (const auto& stmt : mainFn.body->stmts) {
+        if (auto* let =
+                dynamic_cast<const kardashev::ast::LetStmt*>(stmt.get())) {
+            if (auto* cl = dynamic_cast<const kardashev::ast::ClosureExpr*>(
+                    let->value.get())) {
+                found = cl;
+            }
+        }
+    }
+    assert(found != nullptr);
+    assert(found->captures.size() == 2);
+    assert(found->captures[0].name == "a");
+    assert(found->captures[1].name == "b");
+}
+
+void test_closure_no_capture_ok() {
+    expectOk("fn main() -> i64 { let f = |x| x + 1; f(41) }",
+             "closure_no_capture_ok");
+}
+
+void test_closure_higher_order_effect_poly_ok() {
+    // Passing a pure closure to an effect-polymorphic higher-order fn keeps
+    // the call pure.
+    expectOk("fn apply(f: fn(i64) -> i64 ! {e}) -> i64 ! {e} { f(10) }\n"
+             "fn main() -> i64 { let k = 7; apply(|x| x + k) }",
+             "closure_higher_order_effect_poly_ok");
+}
+
+void test_closure_io_effect_propagates_positive_ok() {
+    // A closure that calls `print` is `{io}`; calling it from an io-declaring
+    // context is accepted.
+    expectOk("fn main() -> i64 ! {io} { let n = 1; let p = |x| print(x + n); "
+             "p(5); 0 }",
+             "closure_io_effect_propagates_positive_ok");
+}
+
+void test_closure_io_effect_propagates_negative_errors() {
+    // The same io closure called from a PURE context must be rejected: the
+    // closure's `{io}` row flows to the indirect call site, which the pure
+    // `main` cannot absorb. (Ties Phase 10a effect inference to 10b.)
+    expectErr("fn main() -> i64 { let p = |x| print(x); p(5) }",
+              "closure_io_effect_propagates_negative_errors");
+}
+
+void test_closure_io_effect_via_higher_order_negative_errors() {
+    // An io closure passed to an effect-polymorphic `apply` makes that call
+    // io; a pure caller must be rejected (row polymorphism + closures).
+    expectErr("fn apply(f: fn(i64) -> i64 ! {e}) -> i64 ! {e} { f(10) }\n"
+              "fn main() -> i64 { apply(|x| print(x)) }",
+              "closure_io_effect_via_higher_order_negative_errors");
+}
+
+void test_closure_aggregate_capture_rejected() {
+    // MVP limitation: capturing a non-Copy aggregate (a struct value) by
+    // value is rejected with a clear error rather than miscompiled.
+    expectErr("struct P { x: i64 }\n"
+              "fn main() -> i64 { let p = P { x: 1 }; let f = |y| y + p.x; "
+              "f(2) }",
+              "closure_aggregate_capture_rejected");
+}
+
+void test_closure_arg_arity_mismatch_errors() {
+    // Calling a closure with the wrong number of args is a type error,
+    // routed through the same indirect-call arity check as fn values.
+    expectErr("fn main() -> i64 { let f = |x| x + 1; f(1, 2) }",
+              "closure_arg_arity_mismatch_errors");
+}
+
 // --- Phase 9: loops, ranges, assignment, mutability ---
 
 void test_while_basic_ok() {
@@ -1416,6 +1512,17 @@ int main() {
     test_higher_order_type_var_and_effect_var_together_ok();
     test_implicit_row_var_in_fn_type_ok();
     test_unknown_top_level_effect_label_errors();
+    // Phase 10b capturing closures
+    test_closure_single_capture_ok();
+    test_closure_multi_capture_ok();
+    test_closure_records_captures_on_node();
+    test_closure_no_capture_ok();
+    test_closure_higher_order_effect_poly_ok();
+    test_closure_io_effect_propagates_positive_ok();
+    test_closure_io_effect_propagates_negative_errors();
+    test_closure_io_effect_via_higher_order_negative_errors();
+    test_closure_aggregate_capture_rejected();
+    test_closure_arg_arity_mismatch_errors();
     // Phase 9 loops + ranges + assignment + mutability
     test_while_basic_ok();
     test_while_cond_must_be_bool();
@@ -1432,6 +1539,6 @@ int main() {
     test_range_endpoints_must_be_int();
     test_loop_io_effect_propagates();
     test_nested_loops_ok();
-    std::cout << "All typecheck tests passed (131 cases)\n";
+    std::cout << "All typecheck tests passed (142 cases)\n";
     return 0;
 }

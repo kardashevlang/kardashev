@@ -910,6 +910,63 @@ void test_fn_type_param_row_var_no_effects() {
     assert(fn.params[1].type.fnEffects.empty()); // pure fn type
 }
 
+// --- Phase 10b: closure parsing ---
+
+void test_closure_single_param() {
+    // `|x| x + n` parses to a ClosureExpr with one (unannotated) param and a
+    // BinaryExpr body.
+    auto r = parseWrapped("|x| x + 1");
+    auto* cl = dynamic_cast<const ast::ClosureExpr*>(tailExprOf(r));
+    assert(cl);
+    assert(cl->params.size() == 1);
+    assert(cl->params[0].name == "x");
+    assert(!cl->params[0].hasAnnotation);
+    assert(dynamic_cast<const ast::BinaryExpr*>(cl->body.get()));
+}
+
+void test_closure_multi_param_with_annotation() {
+    // `|x: i64, y| ...` — first param annotated, second inferred.
+    auto r = parseWrapped("|x: i64, y| x + y");
+    auto* cl = dynamic_cast<const ast::ClosureExpr*>(tailExprOf(r));
+    assert(cl);
+    assert(cl->params.size() == 2);
+    assert(cl->params[0].name == "x");
+    assert(cl->params[0].hasAnnotation);
+    assert(cl->params[0].type.name == "i64");
+    assert(cl->params[1].name == "y");
+    assert(!cl->params[1].hasAnnotation);
+}
+
+void test_closure_zero_param() {
+    // `|| 7` (the `||` token) is a zero-param closure.
+    auto r = parseWrapped("|| 7");
+    auto* cl = dynamic_cast<const ast::ClosureExpr*>(tailExprOf(r));
+    assert(cl);
+    assert(cl->params.empty());
+    assert(dynamic_cast<const ast::IntLitExpr*>(cl->body.get()));
+}
+
+void test_closure_block_body() {
+    // `|x| { ... }` keeps a BlockExpr body.
+    auto r = parseWrapped("|x| { let y = x; y }");
+    auto* cl = dynamic_cast<const ast::ClosureExpr*>(tailExprOf(r));
+    assert(cl);
+    assert(cl->params.size() == 1);
+    assert(dynamic_cast<const ast::BlockExpr*>(cl->body.get()));
+}
+
+void test_closure_as_call_argument() {
+    // A closure passed directly as a call argument parses (no parens needed).
+    auto r = parse("fn apply(f: fn(i64) -> i64) -> i64 { f(1) }\n"
+                   "fn main() -> i64 { apply(|x| x + 2) }");
+    assert(r.ok());
+    const auto& mainFn = r.program.functions.back();
+    auto* call = dynamic_cast<const ast::CallExpr*>(mainFn.body->tail.get());
+    assert(call && call->callee == "apply");
+    assert(call->args.size() == 1);
+    assert(dynamic_cast<const ast::ClosureExpr*>(call->args[0].get()));
+}
+
 void test_mod_decl_basic() {
     auto r = parse("mod util;\nfn main() -> i64 { 0 }");
     if (!r.ok()) {
@@ -1115,6 +1172,12 @@ int main() {
     // Phase 10a function types with effect rows
     test_fn_type_param_with_effect_row();
     test_fn_type_param_row_var_no_effects();
+    // Phase 10b closures
+    test_closure_single_param();
+    test_closure_multi_param_with_annotation();
+    test_closure_zero_param();
+    test_closure_block_body();
+    test_closure_as_call_argument();
     // Phase 7 mod
     test_mod_decl_basic();
     test_mod_multiple();
@@ -1130,6 +1193,6 @@ int main() {
     test_assign_stmt();
     test_field_assign_stmt();
     test_while_as_statement_then_tail();
-    std::cout << "All parser tests passed (69 cases)\n";
+    std::cout << "All parser tests passed (74 cases)\n";
     return 0;
 }

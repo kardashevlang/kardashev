@@ -222,6 +222,24 @@ private:
     // reuse them when specializing vec_* per T.
     llvm::Function* reallocFn_ = nullptr;
     llvm::Function* printfFn_ = nullptr;
+    llvm::Function* mallocFn_ = nullptr;
+
+    // Phase 10b: the uniform fat-pointer LLVM type for ALL first-class fn
+    // VALUES — `{ i8* fn, i8* env }`. `fn` points at a generated function
+    // whose first parameter is the env pointer (`ret(i8* env, params...)`);
+    // `env` points at a heap-allocated capture struct, or is null for a
+    // top-level fn used as a value. Direct calls to named globals do NOT use
+    // this type (they keep their natural signature); only fn-typed values
+    // (let-bound, params, if-selected, closures) do. This subsumes the
+    // Phase 4.3 bare-fn-pointer representation under one calling convention.
+    llvm::StructType* fnValTy_ = nullptr;
+
+    // Phase 10b: monotonically-increasing id for generated closure / thunk
+    // functions, so each gets a unique LLVM name.
+    unsigned nextClosureId_ = 0;
+    // Cache of generated `__fnval_<name>` thunks, keyed by the target
+    // global's name, so re-using a fn value many times emits one thunk.
+    std::unordered_map<std::string, llvm::Function*> fnvalThunks_;
 
     // Phase 6.0 built-in: emit a `print` function that wraps libc's
     // `printf` to write one i64 + newline. The typechecker registered a
@@ -258,10 +276,13 @@ private:
         auto* reallocFn = llvm::Function::Create(
             reallocTy, llvm::Function::ExternalLinkage, "realloc",
             module_.get());
-        (void)mallocFn; // realloc(NULL, n) == malloc(n), so we drive
-                         // growth through realloc alone
         reallocFn_ = reallocFn;
         printfFn_ = printfFn;
+        mallocFn_ = mallocFn; // Phase 10b: closure env allocation
+
+        // --- Phase 10b: fat-pointer type for fn VALUES: { i8* fn, i8* env }
+        fnValTy_ = llvm::StructType::create(
+            ctx, {i8PtrTy, i8PtrTy}, "kd.fnval");
 
         // --- Vec struct layout: { i8* data, i64 len, i64 cap } ---
         auto* vecTy = llvm::StructType::create(
@@ -613,13 +634,15 @@ private:
                 return llvm::Type::getInt64Ty(*ctx_);
             }
             case TypeKind::Function:
-                // Phase 10a: a function-typed value (e.g. a `fn(i64)->i64 !
-                // {e}` parameter) lowers to an opaque function pointer.
-                // Effects are erased here — they never affect the calling
-                // convention. The concrete FunctionType used at an indirect
-                // call site is rebuilt from the value's arg/ret types in
-                // emitCall, mirroring the Phase 4.3 fn-pointer path.
-                return llvm::PointerType::get(*ctx_, /*AS=*/0);
+                // Phase 10b: a function-typed VALUE (a let-bound fn, a
+                // `fn(i64)->i64 ! {e}` parameter, an if-selected fn, or a
+                // closure) lowers to the uniform fat pointer `{ i8* fn, i8*
+                // env }`. Effects are erased here — they never affect the
+                // calling convention. The generated callee's signature is
+                // `ret(i8* env, params...)`; emitCall rebuilds it from the
+                // value's arg/ret types at the indirect call site. This
+                // subsumes the Phase 4.3 bare-fn-pointer representation.
+                return fnValTy_;
             default:
                 errors_.push_back("codegen: unsupported type for codegen");
                 return llvm::Type::getInt64Ty(*ctx_);
@@ -1167,12 +1190,26 @@ private:
                 return builder_->CreateLoad(alloca->getAllocatedType(),
                                             alloca, id->name);
             }
-            // Phase 4.3: a bare fn name evaluated in expression
-            // position yields the LLVM Function* (already a pointer).
-            // That lets `let f = my_fn` capture a callable by value.
+            // Phase 10b: a bare fn name evaluated in expression position
+            // yields a fat-pointer fn VALUE `{ __fnval_<name>, null }`. The
+            // generated thunk adapts the global's natural signature to the
+            // env-calling convention, so this fn value is callable through
+            // the exact same indirect path as a closure. (This subsumes the
+            // Phase 4.3 raw-Function* representation.)
             if (auto fnIt = declaredFns_.find(id->name);
                 fnIt != declaredFns_.end()) {
-                return fnIt->second;
+                TypePtr fnTy = lookupExprType(*id);
+                if (fnTy) fnTy = resolve(fnTy);
+                if (!fnTy || fnTy->kind != TypeKind::Function) {
+                    errors_.push_back(
+                        "codegen: fn value '" + id->name +
+                        "' has no Function type at use site");
+                    return llvm::UndefValue::get(fnValTy_);
+                }
+                auto* thunk = getOrEmitFnvalThunk(fnIt->second, fnTy);
+                auto* i8PtrTy = llvm::PointerType::get(*ctx_, 0);
+                return makeFnVal(thunk,
+                                 llvm::ConstantPointerNull::get(i8PtrTy));
             }
             // Fall back to unit-variant constructor (e.g. `None`).
             auto vit = tc_.variantIndex.find(id->name);
@@ -1221,6 +1258,9 @@ private:
         }
         if (auto* ce = dynamic_cast<const ast::ContinueExpr*>(&e)) {
             return emitContinue(*ce);
+        }
+        if (auto* cl = dynamic_cast<const ast::ClosureExpr*>(&e)) {
+            return emitClosure(*cl);
         }
         if (auto* t = dynamic_cast<const ast::TryExpr*>(&e)) {
             return emitTry(*t);
@@ -1433,30 +1473,94 @@ private:
         return nullptr;
     }
 
+    // Phase 10b: the env-aware LLVM signature of a fn VALUE whose kardashev
+    // type is `fnTy` — `ret(i8* env, params...)`. Every generated callee
+    // (closure body or `__fnval_<name>` thunk) uses this shape, and every
+    // indirect call site rebuilds it to type the `call` instruction.
+    llvm::FunctionType* envCalleeType(const TypePtr& fnTy) {
+        auto* i8PtrTy = llvm::PointerType::get(*ctx_, 0);
+        std::vector<llvm::Type*> argTs;
+        argTs.reserve(fnTy->args.size() + 1);
+        argTs.push_back(i8PtrTy); // env
+        for (const auto& a : fnTy->args) argTs.push_back(mapKardashevType(a));
+        llvm::Type* retT = mapKardashevType(fnTy->ret);
+        return llvm::FunctionType::get(retT, argTs, /*isVarArg=*/false);
+    }
+
+    // Phase 10b: build a fat-pointer fn VALUE `{ fnPtr, envPtr }`. `fnPtr`
+    // and `envPtr` are both i8* (opaque). Returns the aggregate value.
+    llvm::Value* makeFnVal(llvm::Value* fnPtr, llvm::Value* envPtr) {
+        llvm::Value* agg = llvm::UndefValue::get(fnValTy_);
+        agg = builder_->CreateInsertValue(agg, fnPtr, {0}, "fnval.fn");
+        agg = builder_->CreateInsertValue(agg, envPtr, {1}, "fnval.env");
+        return agg;
+    }
+
+    // Phase 10b: get-or-create the `__fnval_<name>` thunk that adapts a
+    // top-level fn `target` (natural signature `ret(params...)`) to the
+    // env-calling convention `ret(i8* env, params...)`. The thunk ignores
+    // env and forwards the remaining args to `target`. This is what folds
+    // the Phase 4.3 "fn name as a value" path into the uniform fat pointer:
+    // `let f = add;` becomes `{ __fnval_add, null }`.
+    llvm::Function* getOrEmitFnvalThunk(llvm::Function* target,
+                                        const TypePtr& fnTy) {
+        std::string thunkName = "__fnval_" + target->getName().str();
+        auto it = fnvalThunks_.find(thunkName);
+        if (it != fnvalThunks_.end()) return it->second;
+
+        // Save the builder's insertion point — we emit the thunk as a
+        // sibling function, mirroring how async wrappers / vec ops are
+        // emitted mid-compilation.
+        auto* savedBB = builder_->GetInsertBlock();
+
+        llvm::FunctionType* thunkTy = envCalleeType(fnTy);
+        auto* thunk = llvm::Function::Create(
+            thunkTy, llvm::Function::InternalLinkage, thunkName,
+            module_.get());
+        auto* entry = llvm::BasicBlock::Create(*ctx_, "entry", thunk);
+        llvm::IRBuilder<> b(entry);
+        std::vector<llvm::Value*> fwd;
+        fwd.reserve(thunk->arg_size() - 1);
+        unsigned idx = 0;
+        for (auto& arg : thunk->args()) {
+            if (idx++ == 0) continue; // skip env
+            fwd.push_back(&arg);
+        }
+        auto* callee = llvm::cast<llvm::Function>(target);
+        llvm::Value* ret = b.CreateCall(callee->getFunctionType(), callee, fwd);
+        if (callee->getReturnType()->isVoidTy()) b.CreateRetVoid();
+        else b.CreateRet(ret);
+
+        if (savedBB) builder_->SetInsertPoint(savedBB);
+        fnvalThunks_[thunkName] = thunk;
+        return thunk;
+    }
+
     llvm::Value* emitCall(const ast::CallExpr& call) {
-        // Phase 4.3: indirect call through a let-bound fn-pointer. We
-        // try this BEFORE the direct/generic paths so a binding that
-        // shadows a top-level fn dispatches through the binding (matches
-        // the typechecker's order).
+        // Phase 10b: indirect call through a fn VALUE (fat pointer). Applies
+        // to let-bound fn values, fn-typed params, and if-selected fns. We
+        // try this BEFORE the direct/generic paths so a binding that shadows
+        // a top-level fn dispatches through the binding (matches the
+        // typechecker's order). We load the `{ fn, env }` pair and call
+        // `fn(env, args...)`.
         if (auto localIt = locals_.find(call.callee);
             localIt != locals_.end()) {
             auto tyIt = localTypes_.find(call.callee);
             if (tyIt != localTypes_.end()) {
                 TypePtr fnTy = resolve(tyIt->second);
                 if (fnTy->kind == TypeKind::Function) {
-                    std::vector<llvm::Type*> argTs;
-                    argTs.reserve(fnTy->args.size());
-                    for (const auto& a : fnTy->args) {
-                        argTs.push_back(mapKardashevType(a));
-                    }
-                    auto* retT = mapKardashevType(fnTy->ret);
-                    auto* llvmFnTy = llvm::FunctionType::get(
-                        retT, argTs, /*isVarArg=*/false);
-                    auto* fnPtr = builder_->CreateLoad(
+                    auto* llvmFnTy = envCalleeType(fnTy);
+                    // Load the fat pointer, extract fn + env.
+                    auto* fatVal = builder_->CreateLoad(
                         localIt->second->getAllocatedType(),
                         localIt->second, call.callee);
+                    auto* fnPtr = builder_->CreateExtractValue(
+                        fatVal, {0}, call.callee + ".fn");
+                    auto* envPtr = builder_->CreateExtractValue(
+                        fatVal, {1}, call.callee + ".env");
                     std::vector<llvm::Value*> args;
-                    args.reserve(call.args.size());
+                    args.reserve(call.args.size() + 1);
+                    args.push_back(envPtr);
                     for (const auto& a : call.args) {
                         args.push_back(emitExpr(*a));
                     }
@@ -2139,6 +2243,163 @@ private:
         }
         builder_->CreateBr(loopFrames_.back().continueBB);
         return nullptr;
+    }
+
+    // Phase 10b: lower a capturing closure to (1) a heap-allocated env
+    // struct populated by value from the captured locals, (2) a generated
+    // top-level `__closure_<n>(i8* env, params...)` function whose prologue
+    // reloads the captures, and (3) the fat-pointer value `{ __closure_<n>,
+    // env }`. The env is heap-allocated (via libc malloc) so a simple
+    // returned closure stays sound even if the defining frame pops — the
+    // captures are Copy scalars copied into the heap env, so there is no
+    // dangling reference. (Freeing the env / FnMut / by-ref capture are
+    // deferred; see the report.)
+    llvm::Value* emitClosure(const ast::ClosureExpr& cl) {
+        auto& ctx = *ctx_;
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+
+        // The closure's kardashev Function type (params + ret), resolved in
+        // the current instance so generic enclosing fns pin their type vars.
+        TypePtr fnTy = lookupExprType(cl); // applies resolveInInstance
+        if (!fnTy || resolve(fnTy)->kind != TypeKind::Function) {
+            errors_.push_back("codegen: closure has no Function type");
+            return llvm::UndefValue::get(fnValTy_);
+        }
+        fnTy = resolve(fnTy);
+
+        // Build the env struct type from the captures (in declaration order).
+        std::vector<llvm::Type*> capLlvmTys;
+        std::vector<TypePtr> capKdTys;
+        capLlvmTys.reserve(cl.captures.size());
+        capKdTys.reserve(cl.captures.size());
+        for (const auto& cap : cl.captures) {
+            TypePtr ct = resolveInInstance(cap.type);
+            capKdTys.push_back(ct);
+            capLlvmTys.push_back(mapKardashevType(ct));
+        }
+        std::string envName = "kd.closure_env." + std::to_string(nextClosureId_);
+        auto* envTy = llvm::StructType::create(ctx, capLlvmTys, envName);
+
+        // --- In the ENCLOSING fn: allocate + populate the env on the heap.
+        llvm::Value* envPtr;
+        if (cl.captures.empty()) {
+            // No captures => null env (like a top-level fn value). Avoids a
+            // pointless zero-byte malloc.
+            envPtr = llvm::ConstantPointerNull::get(i8PtrTy);
+        } else {
+            uint64_t envBytes =
+                module_->getDataLayout().getTypeAllocSize(envTy);
+            envPtr = builder_->CreateCall(
+                mallocFn_, {llvm::ConstantInt::get(i64Ty, envBytes)},
+                "closure_env");
+            for (unsigned i = 0; i < cl.captures.size(); ++i) {
+                // Load the captured local from the enclosing scope and copy
+                // it (by value) into the env slot.
+                const std::string& name = cl.captures[i].name;
+                auto lit = locals_.find(name);
+                if (lit == locals_.end()) {
+                    errors_.push_back(
+                        "codegen: closure capture '" + name +
+                        "' not a local in the enclosing scope");
+                    continue;
+                }
+                llvm::Value* loaded = builder_->CreateLoad(
+                    lit->second->getAllocatedType(), lit->second,
+                    "cap_" + name);
+                auto* slot = builder_->CreateStructGEP(
+                    envTy, envPtr, i, "cap_slot_" + name);
+                builder_->CreateStore(loaded, slot);
+            }
+        }
+
+        // --- Generate the closure body function as a sibling.
+        std::string fnName = "__closure_" + std::to_string(nextClosureId_);
+        ++nextClosureId_;
+        llvm::FunctionType* closureFnTy = envCalleeType(fnTy);
+        auto* closureFn = llvm::Function::Create(
+            closureFnTy, llvm::Function::InternalLinkage, fnName,
+            module_.get());
+        // Name args: arg0 = env, then params.
+        {
+            unsigned ai = 0;
+            for (auto& arg : closureFn->args()) {
+                if (ai == 0) arg.setName("env");
+                else if (ai - 1 < cl.params.size())
+                    arg.setName(cl.params[ai - 1].name);
+                ++ai;
+            }
+        }
+
+        // Save the full emission context — we are emitting a new function
+        // body mid-stream (same pattern as async wrappers, but here the
+        // companion is a complete fn with its own locals).
+        auto* savedFn = currentFn_;
+        auto* savedBB = builder_->GetInsertBlock();
+        auto savedLocals = std::move(locals_);
+        auto savedLocalTypes = std::move(localTypes_);
+        auto savedLoopFrames = std::move(loopFrames_);
+        TypePtr savedRetTy = currentFnReturnType_;
+
+        locals_.clear();
+        localTypes_.clear();
+        loopFrames_.clear();
+        currentFn_ = closureFn;
+        currentFnReturnType_ = resolveInInstance(fnTy->ret);
+
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", closureFn);
+        builder_->SetInsertPoint(entry);
+
+        // Prologue: reload captures from env into locals. We bitcast the
+        // i8* env arg to the env struct pointer (opaque pointers make this a
+        // no-op, but the GEPs use envTy).
+        llvm::Value* envArg = closureFn->getArg(0);
+        for (unsigned i = 0; i < cl.captures.size(); ++i) {
+            const std::string& name = cl.captures[i].name;
+            auto* slot = builder_->CreateStructGEP(
+                envTy, envArg, i, "cap_slot_" + name);
+            llvm::Value* val = builder_->CreateLoad(
+                capLlvmTys[i], slot, "cap_" + name);
+            auto* alloca =
+                builder_->CreateAlloca(capLlvmTys[i], nullptr, name);
+            builder_->CreateStore(val, alloca);
+            locals_[name] = alloca;
+            if (capKdTys[i] && resolve(capKdTys[i])->kind ==
+                                   TypeKind::Function) {
+                localTypes_[name] = capKdTys[i];
+            }
+        }
+        // Params: alloca + store, mirroring emitFunctionAs.
+        for (unsigned i = 0; i < cl.params.size(); ++i) {
+            auto* paramArg = closureFn->getArg(i + 1);
+            auto* alloca = builder_->CreateAlloca(
+                paramArg->getType(), nullptr, cl.params[i].name);
+            builder_->CreateStore(paramArg, alloca);
+            locals_[cl.params[i].name] = alloca;
+            TypePtr pt = resolveInInstance(fnTy->args[i]);
+            if (resolve(pt)->kind == TypeKind::Function) {
+                localTypes_[cl.params[i].name] = pt;
+            }
+        }
+
+        llvm::Value* bodyVal = emitExpr(*cl.body);
+        if (!currentBlockTerminated()) {
+            if (bodyVal && !closureFn->getReturnType()->isVoidTy()) {
+                builder_->CreateRet(bodyVal);
+            } else {
+                builder_->CreateRetVoid();
+            }
+        }
+
+        // Restore the enclosing context.
+        currentFn_ = savedFn;
+        locals_ = std::move(savedLocals);
+        localTypes_ = std::move(savedLocalTypes);
+        loopFrames_ = std::move(savedLoopFrames);
+        currentFnReturnType_ = savedRetTy;
+        if (savedBB) builder_->SetInsertPoint(savedBB);
+
+        return makeFnVal(closureFn, envPtr);
     }
 
     // Phase 9: `a..b` / `a..=b` as a first-class value — build the Range
