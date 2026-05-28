@@ -1,0 +1,9 @@
+load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary")
+
+# Phase 20a capstone: a reverse-Polish-notation calculator written in
+# kardashev, exercising Vec / HashMap / struct / trait dispatch / match /
+# Option / Result / loops. AOT-compiled via //compiler:kardc.
+kardashev_binary(
+    name = "rpn",
+    src = "main.kd",
+)

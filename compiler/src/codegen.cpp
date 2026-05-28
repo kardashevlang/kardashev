@@ -42,11 +42,13 @@ constexpr int kMonotonicClockId = 1; // <bits/time.h>: CLOCK_MONOTONIC on Linux
 class Codegen {
 public:
     explicit Codegen(const TypeCheckResult& tc, bool emitDebugInfo = false,
-                     const std::string& sourceFile = "<kardashev>")
+                     const std::string& sourceFile = "<kardashev>",
+                     OptLevel optLevel = OptLevel::O2)
         : tc_(tc),
           ctx_(std::make_unique<llvm::LLVMContext>()),
           module_(std::make_unique<llvm::Module>("kardashev", *ctx_)),
           builder_(std::make_unique<llvm::IRBuilder<>>(*ctx_)),
+          optLevel_(optLevel),
           emitDebugInfo_(emitDebugInfo) {
         if (emitDebugInfo_) initDebugInfo(sourceFile);
     }
@@ -178,12 +180,19 @@ public:
         if (llvm::verifyModule(*module_, &os)) {
             errors_.push_back("module verification failed: " + verifyErrs);
         } else {
-            // Phase 8.1: run LLVM's default O2 pipeline so the module
+            // Phase 8.1: run an LLVM optimization pipeline so the module
             // codegen hands off to JIT / AOT is release-quality (mem2reg
             // collapses our alloca-heavy bindings, inliner cleans up the
             // built-in `print` wrapper, instcombine + GVN + DCE handle
             // the rest). Skip optimizing if verification already failed
             // — opt passes would compound the diagnostic.
+            //
+            // Phase 20a: the level is now selectable via `-O0..-O3` (default
+            // O2, so this is unchanged when no flag is passed). At O0 we run
+            // LLVM's dedicated minimal O0 pipeline (buildPerModuleDefaultPipeline
+            // asserts on O0); the alloca-heavy bindings and the `print` /
+            // trivial-wrapper calls survive un-inlined, so O0 IR is materially
+            // larger / less optimized than O2 — which the smoke test asserts.
             llvm::PassBuilder pb;
             llvm::LoopAnalysisManager lam;
             llvm::FunctionAnalysisManager fam;
@@ -194,8 +203,17 @@ public:
             pb.registerFunctionAnalyses(fam);
             pb.registerLoopAnalyses(lam);
             pb.crossRegisterProxies(lam, fam, cam, mam);
-            auto mpm = pb.buildPerModuleDefaultPipeline(
-                llvm::OptimizationLevel::O2);
+            llvm::OptimizationLevel lvl;
+            switch (optLevel_) {
+                case OptLevel::O0: lvl = llvm::OptimizationLevel::O0; break;
+                case OptLevel::O1: lvl = llvm::OptimizationLevel::O1; break;
+                case OptLevel::O3: lvl = llvm::OptimizationLevel::O3; break;
+                case OptLevel::O2:
+                default:           lvl = llvm::OptimizationLevel::O2; break;
+            }
+            auto mpm = (optLevel_ == OptLevel::O0)
+                           ? pb.buildO0DefaultPipeline(lvl)
+                           : pb.buildPerModuleDefaultPipeline(lvl);
             mpm.run(*module_, mam);
         }
         return {std::move(ctx_), std::move(module_), std::move(errors_)};
@@ -207,6 +225,9 @@ private:
     std::unique_ptr<llvm::Module> module_;
     std::unique_ptr<llvm::IRBuilder<>> builder_;
     std::vector<std::string> errors_;
+
+    // Phase 20a: which LLVM optimization pipeline finish() runs (default O2).
+    OptLevel optLevel_ = OptLevel::O2;
 
     // --- Phase 14a: DWARF debug info (only populated when emitDebugInfo_) ---
     bool emitDebugInfo_ = false;
@@ -6695,8 +6716,9 @@ private:
 CodegenResult codegen(const ast::Program& program,
                        const TypeCheckResult& tc,
                        bool emitDebugInfo,
-                       const std::string& sourceFile) {
-    Codegen cg(tc, emitDebugInfo, sourceFile);
+                       const std::string& sourceFile,
+                       OptLevel optLevel) {
+    Codegen cg(tc, emitDebugInfo, sourceFile, optLevel);
     cg.run(program);
     return cg.finish();
 }

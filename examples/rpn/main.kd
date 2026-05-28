@@ -1,0 +1,151 @@
+// =====================================================================
+// RPN (reverse-Polish notation) calculator — a kardashev capstone.
+// =====================================================================
+//
+// Evaluates a handful of hardcoded RPN expressions with a stack machine
+// and prints each result, then returns the first result as the process
+// exit code (so the program is checkable via both stdout AND exit code).
+//
+// It is a genuine cross-section of the language + stdlib:
+//   * `Vec<Tok>`            — the token stream (Vec of a user struct).
+//   * `HashMap<i64, i64>`   — the evaluation stack (slot index -> value),
+//                             with a `top` cursor for push / pop.
+//   * `struct`              — `Tok` (a tagged token) + the operator structs.
+//   * `trait` + dispatch    — `Op::apply`, implemented by Add/Sub/Mul/Div.
+//   * `match`               — token-kind dispatch, op-code dispatch, and
+//                             unwrapping `Option` / `Result`.
+//   * `Option<i64>`         — `hashmap_get` returns `Some` / `None`.
+//   * `Result<i64, i64>`    — recoverable errors: `Err(1)` = divide by
+//                             zero, `Err(2)` = stack underflow / malformed.
+//   * loops + locals        — the `while` evaluation loop.
+//
+// Token encoding: a `Tok { kind, val }`. `kind == 0` is an operand whose
+// value is `val`; `kind == 1` is an operator whose op code is `val`
+// (0 = +, 1 = -, 2 = *, 3 = /).
+
+struct Tok { kind: i64, val: i64 }
+
+// A binary operator. Returns `Result` so division by zero is recoverable
+// rather than a crash.
+trait Op { fn apply(&self, a: i64, b: i64) -> Result<i64, i64>; }
+
+struct Add {}
+struct Sub {}
+struct Mul {}
+struct Div {}
+
+impl Op for Add { fn apply(&self, a: i64, b: i64) -> Result<i64, i64> { Ok(a + b) } }
+impl Op for Sub { fn apply(&self, a: i64, b: i64) -> Result<i64, i64> { Ok(a - b) } }
+impl Op for Mul { fn apply(&self, a: i64, b: i64) -> Result<i64, i64> { Ok(a * b) } }
+impl Op for Div {
+    fn apply(&self, a: i64, b: i64) -> Result<i64, i64> {
+        if b == 0 { Err(1) } else { Ok(a / b) }
+    }
+}
+
+// Dispatch op `code` through the `Op` trait and apply it to (a, b).
+fn run_op(code: i64, a: i64, b: i64) -> Result<i64, i64> {
+    match code {
+        0 => { let o = Add {}; o.apply(a, b) },
+        1 => { let o = Sub {}; o.apply(a, b) },
+        2 => { let o = Mul {}; o.apply(a, b) },
+        _ => { let o = Div {}; o.apply(a, b) },
+    }
+}
+
+// Evaluate an RPN token stream. The stack lives in a HashMap keyed by slot
+// index, with `top` as the next free slot. Returns `Ok(result)` for a
+// well-formed single-value expression, else `Err(code)`.
+fn eval(toks: &Vec<Tok>) -> Result<i64, i64> ! { alloc } {
+    let mut m = hashmap_new();
+    let mut top = 0;
+    let n = vec_len(toks);
+    let mut i = 0;
+    let mut err = 0;
+    while i < n {
+        let t = vec_get(toks, i);
+        if t.kind == 0 {
+            // Operand: push onto the stack.
+            hashmap_insert(&mut m, top, t.val);
+            top = top + 1;
+        } else {
+            // Operator: pop two, apply, push the result.
+            if top < 2 {
+                err = 2;          // underflow
+                i = n;            // bail out of the loop
+            } else {
+                top = top - 1;
+                let b = match hashmap_get(&m, top) { Some(v) => v, None => 0 };
+                top = top - 1;
+                let a = match hashmap_get(&m, top) { Some(v) => v, None => 0 };
+                match run_op(t.val, a, b) {
+                    Ok(r) => { hashmap_insert(&mut m, top, r); top = top + 1; },
+                    Err(e) => { err = e; i = n; },
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if err != 0 {
+        Err(err)
+    } else {
+        // A valid expression leaves exactly one value on the stack.
+        if top == 1 {
+            top = top - 1;
+            match hashmap_get(&m, top) { Some(v) => Ok(v), None => Err(2) }
+        } else {
+            Err(2)
+        }
+    }
+}
+
+// `vec_push` returns i64, so these thin builders do too (a unit return type
+// is intentionally avoided).
+fn push_num(toks: &mut Vec<Tok>, x: i64) -> i64 ! { alloc } {
+    vec_push(toks, Tok { kind: 0, val: x })
+}
+fn push_op(toks: &mut Vec<Tok>, code: i64) -> i64 ! { alloc } {
+    vec_push(toks, Tok { kind: 1, val: code })
+}
+
+// Print an evaluation result. Errors print as a negative code (-1 = divide
+// by zero, -2 = underflow) so every line is a single integer.
+fn report(r: Result<i64, i64>) -> i64 ! { io } {
+    match r {
+        Ok(v) => print(v),
+        Err(e) => print(0 - e),
+    }
+}
+
+fn main() -> i64 ! { alloc, io } {
+    // Expr 1:  3 4 + 5 *        => 35
+    let mut e1 = vec_new();
+    push_num(&mut e1, 3); push_num(&mut e1, 4); push_op(&mut e1, 0);
+    push_num(&mut e1, 5); push_op(&mut e1, 2);
+    report(eval(&e1));
+
+    // Expr 2:  10 2 8 * + 3 -   => 23
+    let mut e2 = vec_new();
+    push_num(&mut e2, 10); push_num(&mut e2, 2); push_num(&mut e2, 8);
+    push_op(&mut e2, 2); push_op(&mut e2, 0); push_num(&mut e2, 3);
+    push_op(&mut e2, 1);
+    report(eval(&e2));
+
+    // Expr 3:  100 5 /          => 20
+    let mut e3 = vec_new();
+    push_num(&mut e3, 100); push_num(&mut e3, 5); push_op(&mut e3, 3);
+    report(eval(&e3));
+
+    // Expr 4:  7 0 /            => divide by zero  -> -1
+    let mut e4 = vec_new();
+    push_num(&mut e4, 7); push_num(&mut e4, 0); push_op(&mut e4, 3);
+    report(eval(&e4));
+
+    // Expr 5:  1 +              => underflow       -> -2
+    let mut e5 = vec_new();
+    push_num(&mut e5, 1); push_op(&mut e5, 0);
+    report(eval(&e5));
+
+    // Process exit code = first expression's result (35).
+    match eval(&e1) { Ok(v) => v, Err(e) => 0 - e }
+}

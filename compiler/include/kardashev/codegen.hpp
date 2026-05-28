@@ -49,6 +49,16 @@ struct CodegenResult {
     bool ok() const { return errors.empty(); }
 };
 
+// Phase 20a: optimization level for the post-codegen LLVM pass pipeline.
+// O2 is the default (matches the historic hardcoded pipeline, so behavior is
+// unchanged when no `-O` flag is passed). O0 runs LLVM's minimal O0 pipeline
+// (no inlining / instcombine / GVN), leaving the alloca-heavy, wrapper-laden
+// IR largely as codegen emitted it. O1/O2/O3 select the matching
+// `llvm::OptimizationLevel` via buildPerModuleDefaultPipeline. The numeric
+// values are stable identifiers used in the incremental-cache key so objects
+// built at different levels never collide.
+enum class OptLevel : int { O0 = 0, O1 = 1, O2 = 2, O3 = 3 };
+
 // Generate an LLVM module from a parsed + type-checked program. The
 // returned `context` MUST outlive any use of `module` (move both into
 // a `ThreadSafeModule` together when handing to LLJIT).
@@ -60,9 +70,14 @@ struct CodegenResult {
 // Version" flags, and finalizes the DIBuilder. `sourceFile` names the source
 // for the DIFile (defaults to a placeholder when unknown). When the flag is
 // false the emitted module is byte-for-byte identical to the historic path.
+//
+// Phase 20a: `optLevel` selects the post-codegen LLVM optimization pipeline
+// (default O2 — byte-for-byte the historic behavior). It is appended last so
+// existing 2-/3-/4-argument callers (incl. the unit tests) are unaffected.
 CodegenResult codegen(const ast::Program& program,
                        const TypeCheckResult& tc,
                        bool emitDebugInfo = false,
-                       const std::string& sourceFile = "<kardashev>");
+                       const std::string& sourceFile = "<kardashev>",
+                       OptLevel optLevel = OptLevel::O2);
 
 } // namespace kardashev

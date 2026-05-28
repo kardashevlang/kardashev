@@ -274,7 +274,9 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
                                           const std::string& srcDir = ".",
                                           bool emitDebug = false,
                                           const std::string& sourceFile =
-                                              "<kardashev>") {
+                                              "<kardashev>",
+                                          kardashev::OptLevel optLevel =
+                                              kardashev::OptLevel::O2) {
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return std::nullopt;
     auto& program = *progOpt;
@@ -288,7 +290,8 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
         reportBorrowErrors(bcr);
         return std::nullopt;
     }
-    auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile);
+    auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile,
+                                  optLevel);
     if (!cgr.ok()) {
         for (const auto& msg : cgr.errors) {
             std::cerr << "codegen error: " << msg << '\n';
@@ -407,14 +410,16 @@ int runREPL() {
     return 0;
 }
 
-int runFile(const char* path, bool emitDebug = false) {
+int runFile(const char* path, bool emitDebug = false,
+            kardashev::OptLevel optLevel = kardashev::OptLevel::O2) {
     auto src = readFile(path);
     if (!src) {
         std::cerr << "kardc: cannot open file: " << path << '\n';
         return 1;
     }
     if (auto result =
-            compileAndRun(*src, "main", dirOf(path), emitDebug, path)) {
+            compileAndRun(*src, "main", dirOf(path), emitDebug, path,
+                          optLevel)) {
         std::cout << *result << '\n';
         return 0;
     }
@@ -560,7 +565,7 @@ bool linkObject(const std::string& objPath, const std::string& outExePath) {
 // Bump when the object-file format / codegen ABI changes in a way that
 // must invalidate every existing cache entry. Combined into the key so an
 // upgraded kardc never reuses a stale object.
-constexpr const char* kCacheFormatVersion = "kardashev-cache-v3";
+constexpr const char* kCacheFormatVersion = "kardashev-cache-v4";
 
 // FNV-1a 64-bit over a byte string. Small, dependency-free, and good
 // enough for a content-addressed local cache (no adversarial inputs).
@@ -607,12 +612,16 @@ void collectFullSource(const std::string& srcRaw, const std::string& parentDir,
 }
 
 // Compute the cache key for an AOT build of `srcRaw` (resolved against
-// `srcDir`) with the given flags.
+// `srcDir`) with the given flags. Phase 20a folds the optimization level into
+// the key so `-O0` and `-O2` objects (which differ in their bytes) never
+// collide in the content-addressed cache.
 std::string computeCacheKey(const std::string& srcRaw,
-                            const std::string& srcDir, bool emitDebug) {
+                            const std::string& srcDir, bool emitDebug,
+                            kardashev::OptLevel optLevel) {
     std::string material;
     material += kCacheFormatVersion;
     material += emitDebug ? "|g=1|" : "|g=0|";
+    material += "|O" + std::to_string(static_cast<int>(optLevel)) + "|";
     std::unordered_set<std::string> visited;
     collectFullSource(srcRaw, srcDir, visited, material);
     return hexKey(fnv1a(material, 1469598103934665603ULL /* FNV offset */));
@@ -657,7 +666,8 @@ bool copyFile(const std::string& from, const std::string& to) {
 // out of runAot so both the cache-miss path and the no-cache path share it.
 bool compileToObject(const std::string& srcRaw, const std::string& srcDir,
                      bool emitDebug, const std::string& sourceFile,
-                     const std::string& objPath) {
+                     const std::string& objPath,
+                     kardashev::OptLevel optLevel) {
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return false;
     auto& program = *progOpt;
@@ -671,7 +681,8 @@ bool compileToObject(const std::string& srcRaw, const std::string& srcDir,
         reportBorrowErrors(bcr);
         return false;
     }
-    auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile);
+    auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile,
+                                  optLevel);
     if (!cgr.ok()) {
         for (const auto& msg : cgr.errors) {
             std::cerr << "codegen error: " << msg << '\n';
@@ -687,7 +698,8 @@ bool compileToObject(const std::string& srcRaw, const std::string& srcDir,
 // is visible). Platform-independent way to inspect codegen — no external
 // dwarf tooling required. Returns a process exit code.
 int emitLlvmIr(const std::string& srcRaw, const std::string& srcDir,
-               bool emitDebug, const std::string& sourceFile) {
+               bool emitDebug, const std::string& sourceFile,
+               kardashev::OptLevel optLevel) {
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return 1;
     auto& program = *progOpt;
@@ -701,7 +713,8 @@ int emitLlvmIr(const std::string& srcRaw, const std::string& srcDir,
         reportBorrowErrors(bcr);
         return 1;
     }
-    auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile);
+    auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile,
+                                  optLevel);
     if (!cgr.ok()) {
         for (const auto& msg : cgr.errors) {
             std::cerr << "codegen error: " << msg << '\n';
@@ -720,7 +733,8 @@ int emitLlvmIr(const std::string& srcRaw, const std::string& srcDir,
 int runAot(const std::string& srcRaw, const std::string& outExePath,
             const std::string& srcDir = ".", bool emitDebug = false,
             const std::string& sourceFile = "<kardashev>",
-            bool useCache = true) {
+            bool useCache = true,
+            kardashev::OptLevel optLevel = kardashev::OptLevel::O2) {
     // Intermediate object next to the output exe; always cleaned up.
     std::string objPath = outExePath + ".o";
 
@@ -728,7 +742,7 @@ int runAot(const std::string& srcRaw, const std::string& outExePath,
     bool cacheUsable = useCache && ensureDir(dir);
 
     if (cacheUsable) {
-        std::string key = computeCacheKey(srcRaw, srcDir, emitDebug);
+        std::string key = computeCacheKey(srcRaw, srcDir, emitDebug, optLevel);
         std::string cachedObj = dir + "/" + key + ".o";
         if (llvm::sys::fs::exists(cachedObj)) {
             // HIT: reuse the cached object, skipping the entire pipeline.
@@ -738,7 +752,7 @@ int runAot(const std::string& srcRaw, const std::string& outExePath,
                 // compile rather than aborting the build.
                 std::cerr << "kardc: cache read failed; recompiling\n";
                 if (!compileToObject(srcRaw, srcDir, emitDebug, sourceFile,
-                                     objPath))
+                                     objPath, optLevel))
                     return 1;
             }
             bool linked = linkObject(objPath, outExePath);
@@ -747,7 +761,8 @@ int runAot(const std::string& srcRaw, const std::string& outExePath,
         }
         // MISS: compile, then deposit the object into the cache.
         std::cerr << "kardc: cache miss " << key << '\n';
-        if (!compileToObject(srcRaw, srcDir, emitDebug, sourceFile, objPath))
+        if (!compileToObject(srcRaw, srcDir, emitDebug, sourceFile, objPath,
+                             optLevel))
             return 1;
         // Populate the cache atomically-ish: write to a temp then rename so a
         // concurrent reader never sees a half-written object. Both steps are
@@ -768,11 +783,133 @@ int runAot(const std::string& srcRaw, const std::string& outExePath,
     }
 
     // No cache (disabled, or dir not usable): compile + link as before.
-    if (!compileToObject(srcRaw, srcDir, emitDebug, sourceFile, objPath))
+    if (!compileToObject(srcRaw, srcDir, emitDebug, sourceFile, objPath,
+                         optLevel))
         return 1;
     bool linked = linkObject(objPath, outExePath);
     std::remove(objPath.c_str());
     return linked ? 0 : 1;
+}
+
+// ====================================================================
+// Phase 20a: `kardc --test <file.kd>` — discover + run unit tests
+// ====================================================================
+//
+// Convention: a test is a `fn test_*() -> i64` (name begins with `test_`, no
+// params, no generic params). Returning 0 means PASS; any nonzero return means
+// FAIL (the exit-code model — a test can `return 1` or propagate a nonzero
+// assertion result). The file need NOT define `main()` (a test file may hold
+// only `test_*` fns), and the front-end already tolerates a missing `main`.
+//
+// We compile the whole program ONCE into a single JIT module, then look up and
+// call each discovered test by name (generalizing the REPL/file mode's
+// single-lookup machinery). Output mirrors common test runners:
+//
+//   running N tests
+//   test test_foo ... ok
+//   test test_bar ... FAILED (returned 3)
+//   test result: X passed, Y failed
+//
+// Returns a process exit code: 0 if every test passed, 1 if any failed (or on a
+// compile error / no tests found, which is treated as a failure to surface
+// mistakes rather than silently "succeed").
+
+// True if `fn` matches the test convention: name starts with `test_`, takes no
+// parameters, and is non-generic. (Return type is enforced to be i64 by the
+// typechecker via the call below; we additionally require a plain i64 return so
+// the JIT call through an i64(*)() pointer is well-defined.)
+bool isTestFn(const kardashev::ast::FnDecl& fn) {
+    if (fn.name.rfind("test_", 0) != 0) return false; // must start with test_
+    if (!fn.params.empty()) return false;
+    if (!fn.genericParams.empty()) return false;
+    // Return type must be i64 (no refs / type-args). The exit-code model.
+    if (fn.returnType.name != "i64") return false;
+    if (fn.returnType.isRef || !fn.returnType.typeArgs.empty()) return false;
+    return true;
+}
+
+int runTests(const std::string& srcRaw, const std::string& srcDir,
+             bool emitDebug, const std::string& sourceFile,
+             kardashev::OptLevel optLevel) {
+    auto progOpt = buildProgram(srcRaw, srcDir);
+    if (!progOpt) return 1;
+    auto& program = *progOpt;
+    auto tcr = kardashev::typecheck(program);
+    if (!tcr.ok()) {
+        reportTypeErrors(tcr);
+        return 1;
+    }
+    auto bcr = kardashev::borrow_check(program, tcr);
+    if (!bcr.ok()) {
+        reportBorrowErrors(bcr);
+        return 1;
+    }
+
+    // Discover test fns from the merged program. Prelude fns (option_map, …)
+    // don't start with `test_`, so they're naturally excluded.
+    std::vector<std::string> testNames;
+    for (const auto& fn : program.functions) {
+        if (isTestFn(fn)) testNames.push_back(fn.name);
+    }
+    if (testNames.empty()) {
+        std::cerr << "kardc: no `test_*() -> i64` functions found in "
+                  << sourceFile << '\n';
+        return 1;
+    }
+
+    auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile,
+                                  optLevel);
+    if (!cgr.ok()) {
+        for (const auto& msg : cgr.errors) {
+            std::cerr << "codegen error: " << msg << '\n';
+        }
+        return 1;
+    }
+
+    auto jitOrErr = llvm::orc::LLJITBuilder().create();
+    if (!jitOrErr) {
+        llvm::errs() << "LLJIT create failed: "
+                     << llvm::toString(jitOrErr.takeError()) << '\n';
+        return 1;
+    }
+    auto jit = std::move(*jitOrErr);
+    auto tsm = llvm::orc::ThreadSafeModule(std::move(cgr.module),
+                                           std::move(cgr.context));
+    if (auto err = jit->addIRModule(std::move(tsm))) {
+        llvm::errs() << "addIRModule failed: "
+                     << llvm::toString(std::move(err)) << '\n';
+        return 1;
+    }
+
+    std::cout << "running " << testNames.size() << " test"
+              << (testNames.size() == 1 ? "" : "s") << '\n';
+    using TestFn = std::int64_t (*)();
+    int passed = 0;
+    int failed = 0;
+    for (const auto& name : testNames) {
+        auto symOrErr = jit->lookup(name);
+        if (!symOrErr) {
+            // Should not happen (the fn typechecked + codegen'd), but treat a
+            // lookup failure as a hard failure rather than crashing.
+            std::cout << "test " << name << " ... FAILED (lookup error)\n";
+            llvm::consumeError(symOrErr.takeError());
+            ++failed;
+            continue;
+        }
+        auto fn = symOrErr->toPtr<TestFn>();
+        std::int64_t rc = fn();
+        if (rc == 0) {
+            std::cout << "test " << name << " ... ok\n";
+            ++passed;
+        } else {
+            std::cout << "test " << name << " ... FAILED (returned " << rc
+                      << ")\n";
+            ++failed;
+        }
+    }
+    std::cout << "test result: " << passed << " passed, " << failed
+              << " failed\n";
+    return failed == 0 ? 0 : 1;
 }
 
 } // namespace
@@ -795,6 +932,11 @@ int main(int argc, char** argv) {
     // Phase 14a: `--emit-llvm` prints textual LLVM IR (with debug metadata
     // when `-g` is also given) instead of JITing or emitting an object.
     bool emitIr = false;
+    // Phase 20a: `--test` discovers + JIT-runs `test_*() -> i64` fns.
+    bool testMode = false;
+    // Phase 20a: optimization level for the post-codegen LLVM pipeline.
+    // Default O2 — byte-for-byte the historic behavior when no `-O` is passed.
+    kardashev::OptLevel optLevel = kardashev::OptLevel::O2;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-o" && i + 1 < argc) {
@@ -805,10 +947,22 @@ int main(int argc, char** argv) {
             useCache = false;
         } else if (a == "--emit-llvm") {
             emitIr = true;
+        } else if (a == "--test") {
+            testMode = true;
+        } else if (a == "-O0") {
+            optLevel = kardashev::OptLevel::O0;
+        } else if (a == "-O1") {
+            optLevel = kardashev::OptLevel::O1;
+        } else if (a == "-O2") {
+            optLevel = kardashev::OptLevel::O2;
+        } else if (a == "-O3") {
+            optLevel = kardashev::OptLevel::O3;
         } else if (a == "-h" || a == "--help") {
             std::cout << "usage: kardc                     # interactive REPL\n"
                          "       kardc <file.kd>            # JIT-run main()\n"
                          "       kardc -o <out> <file.kd>   # AOT-compile to native exe\n"
+                         "       kardc --test <file.kd>     # discover + run test_* fns\n"
+                         "       kardc -O0|-O1|-O2|-O3 ...   # optimization level (default -O2)\n"
                          "       kardc -g ...               # emit DWARF debug info\n"
                          "       kardc --emit-llvm <file.kd> # print LLVM IR to stdout\n"
                          "       kardc --no-cache ...       # bypass the AOT compile cache\n";
@@ -825,6 +979,19 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (testMode) {
+        if (inputPath.empty()) {
+            std::cerr << "kardc: --test requires an input file\n";
+            return 2;
+        }
+        auto src = readFile(inputPath);
+        if (!src) {
+            std::cerr << "kardc: cannot open file: " << inputPath << '\n';
+            return 1;
+        }
+        return runTests(*src, dirOf(inputPath), emitDebug, inputPath,
+                        optLevel);
+    }
     if (emitIr) {
         if (inputPath.empty()) {
             std::cerr << "kardc: --emit-llvm requires an input file\n";
@@ -835,7 +1002,8 @@ int main(int argc, char** argv) {
             std::cerr << "kardc: cannot open file: " << inputPath << '\n';
             return 1;
         }
-        return emitLlvmIr(*src, dirOf(inputPath), emitDebug, inputPath);
+        return emitLlvmIr(*src, dirOf(inputPath), emitDebug, inputPath,
+                          optLevel);
     }
     if (!outPath.empty()) {
         if (inputPath.empty()) {
@@ -848,10 +1016,10 @@ int main(int argc, char** argv) {
             return 1;
         }
         return runAot(*src, outPath, dirOf(inputPath), emitDebug, inputPath,
-                      useCache);
+                      useCache, optLevel);
     }
     if (!inputPath.empty()) {
-        return runFile(inputPath.c_str(), emitDebug);
+        return runFile(inputPath.c_str(), emitDebug, optLevel);
     }
     return runREPL();
 }

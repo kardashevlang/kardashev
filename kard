@@ -6,6 +6,7 @@
 #   kard build <file.kd> -o <out>
 #                            # AOT-compile to a custom path
 #   kard run   <file.kd>     # JIT-run main()
+#   kard test  <file.kd>     # discover + run `test_*() -> i64` fns (0 = pass)
 #   kard fmt   <file.kd>     # print canonically-formatted source to stdout
 #   kard fmt --check <file.kd>
 #                            # exit non-zero if the file is not formatted (CI)
@@ -100,6 +101,14 @@ case "$cmd" in
             exit 2
         fi
         exec "$KARDC_BIN" "$@"
+        ;;
+    test)
+        if [[ $# -eq 0 ]]; then
+            echo "kard test: missing file" >&2
+            exit 2
+        fi
+        # Pass all args through so `-O0` etc. reach kardc alongside --test.
+        exec "$KARDC_BIN" --test "$@"
         ;;
     fmt)
         if [[ $# -eq 0 ]]; then

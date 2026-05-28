@@ -142,14 +142,30 @@ Four driver entry points:
 kardc                            # interactive REPL (JIT each expression)
 kardc <file.kd>                  # JIT-run main() and print result
 kardc -o <out> <file.kd>         # AOT-compile to a native executable
+kardc --test <file.kd>           # run every `test_*() -> i64` fn (0 = pass)
+kardc -O0|-O1|-O2|-O3 ...         # optimization level (default -O2)
 kard-lsp                         # Language Server Protocol over stdio
                                  #   (publishes diagnostics for every edit)
 ```
 
-Plus the thin `kard` shell wrapper (`kard build`, `kard run`, `kard
-repl`) and Bazel rules (`kardashev_library`, `kardashev_binary`) for
+The optimization flag selects the post-codegen LLVM pass pipeline: `-O0`
+runs LLVM's minimal O0 pipeline (no inlining; alloca-heavy IR kept), while
+`-O1/-O2/-O3` run the matching `buildPerModuleDefaultPipeline`. The default
+is `-O2` — byte-for-byte the historic behavior. The level is folded into the
+AOT compile-cache key, so `-O0` and `-O2` objects never collide.
+
+`kardc --test` discovers test functions by convention — `fn test_*() -> i64`
+(no params; `return 0` = pass, nonzero = fail) — compiles the file once,
+JIT-runs each test, prints a `running N tests … result: X passed, Y failed`
+summary, and exits nonzero if any test failed. A test file need not define
+`main()`.
+
+Plus the thin `kard` shell wrapper (`kard build`, `kard run`, `kard test`,
+`kard repl`) and Bazel rules (`kardashev_library`, `kardashev_binary`) for
 projects that want to compose kardashev targets into a larger Bazel
-monorepo.
+monorepo. A worked capstone — a reverse-Polish-notation calculator
+exercising `Vec`/`HashMap`/structs/trait dispatch/`match`/`Option`/`Result`
+— lives in `examples/rpn/`.
 
 The AOT path emits a native object via LLVM's `TargetMachine`,
 synthesizes a C-compatible `int main()` wrapper that returns the

@@ -154,6 +154,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 20a: opt-level flags (-O0..-O3) + the `kardc --test` runner + the RPN
+# capstone. The capstone program text is inlined in the script so the Bazel
+# sandbox needs no extra source data beyond kardc itself.
+sh_test(
+    name = "smoke_test_toolchain",
+    srcs = ["smoke_test_toolchain.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],
