@@ -352,14 +352,31 @@ private:
             fn->getArg(0)->setName("v");
             fn->getArg(1)->setName("i");
             auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* inBoundsBB = llvm::BasicBlock::Create(ctx, "in_bounds", fn);
+            auto* retZeroBB = llvm::BasicBlock::Create(ctx, "ret_zero", fn);
             llvm::IRBuilder<> b(entry);
             auto* dataPtr =
                 b.CreateStructGEP(vecTy, fn->getArg(0), 0, "data_ptr");
+            auto* lenPtr =
+                b.CreateStructGEP(vecTy, fn->getArg(0), 1, "len_ptr");
             auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
-            auto* elemPtr =
-                b.CreateGEP(i64Ty, data, fn->getArg(1), "elem_ptr");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* idx = fn->getArg(1);
+            auto* idxNonNegative = b.CreateICmpSGE(idx, zero, "idx_non_negative");
+            auto* idxInRange = b.CreateICmpSLT(idx, len, "idx_in_range");
+            auto* dataNonNull = b.CreateICmpNE(
+                data, llvm::ConstantPointerNull::get(i8PtrTy), "data_non_null");
+            auto* boundsOk = b.CreateAnd(idxNonNegative, idxInRange, "bounds_ok");
+            auto* canRead = b.CreateAnd(boundsOk, dataNonNull, "can_read");
+            b.CreateCondBr(canRead, inBoundsBB, retZeroBB);
+
+            b.SetInsertPoint(inBoundsBB);
+            auto* elemPtr = b.CreateGEP(i64Ty, data, idx, "elem_ptr");
             auto* val = b.CreateLoad(i64Ty, elemPtr, "val");
             b.CreateRet(val);
+
+            b.SetInsertPoint(retZeroBB);
+            b.CreateRet(zero);
             declaredFns_["vec_get"] = fn;
         }
 

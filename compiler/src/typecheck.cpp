@@ -1313,6 +1313,11 @@ private:
     }
 
     TypePtr checkStructLit(const ast::StructLitExpr& sl) {
+        if (sl.structName == "Vec") {
+            error("`Vec` is an opaque built-in type and cannot be constructed with a struct literal; use vec_new()", sl.line, sl.column);
+            for (const auto& f : sl.fields) checkExpr(*f.second);
+            return structSchemas_["Vec"].type;
+        }
         auto it = structSchemas_.find(sl.structName);
         if (it == structSchemas_.end()) {
             error("unknown struct: " + sl.structName, sl.line, sl.column);
