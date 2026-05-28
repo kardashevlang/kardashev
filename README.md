@@ -145,7 +145,9 @@ kardc -o <out> <file.kd>         # AOT-compile to a native executable
 kardc --test <file.kd>           # run every `test_*() -> i64` fn (0 = pass)
 kardc -O0|-O1|-O2|-O3 ...         # optimization level (default -O2)
 kard-lsp                         # Language Server Protocol over stdio
-                                 #   (publishes diagnostics for every edit)
+                                 #   (diagnostics, hover, completion,
+                                 #    go-to-definition, find-references, rename)
+kard build | kard run            # build/run a kard.toml project (no file arg)
 ```
 
 The optimization flag selects the post-codegen LLVM pass pipeline: `-O0`
@@ -166,6 +168,44 @@ projects that want to compose kardashev targets into a larger Bazel
 monorepo. A worked capstone — a reverse-Polish-notation calculator
 exercising `Vec`/`HashMap`/structs/trait dispatch/`match`/`Option`/`Result`
 — lives in `examples/rpn/`.
+
+### Package manifest (`kard.toml`) + local-path dependencies
+
+A project can carry a `kard.toml` at its root. `kard build` / `kard run`
+**with no file argument** read it, compile the declared entry point, and make
+each local-path dependency resolvable:
+
+```toml
+[package]
+name = "app"
+version = "0.1.0"
+entry = "src/main.kd"            # optional; defaults to src/main.kd
+
+[dependencies]
+mathlib = { path = "../mathlib" }   # inline-table form
+strutil = "../strutil"               # bare-string form (path)
+```
+
+```
+// src/main.kd
+mod mathlib;
+fn main() -> i64 { square(5) + cube(3) }   // square/cube come from mathlib
+```
+
+A local dependency's library `.kd` is located under its path (`<dep>.kd`,
+`src/lib.kd`, `lib.kd`, or `src/<dep>.kd`, or the path itself if it's a `.kd`
+file) and staged as a `mod`-resolvable sibling of the entry, so kardashev's
+existing intra-project flat-merge picks it up — then unstaged afterward (the
+source tree is left untouched). The manifest parser is a tiny hand-written
+reader in the `kard` wrapper (no TOML library dependency). A missing/malformed
+manifest, a missing entry, or an unresolvable dependency each fail with a
+clear message.
+
+**Deferred (documented, not stubbed):** resolving *third-party* dependencies
+via the Bazel module registry. Bazel can't run in this build environment, so a
+real registry integration isn't verifiable here and is intentionally left as
+future work — the `kard.toml` manifest + local-path resolution above is what's
+implemented and tested (`tests/smoke_test_manifest.sh`).
 
 The AOT path emits a native object via LLVM's `TargetMachine`,
 synthesizes a C-compatible `int main()` wrapper that returns the
@@ -231,7 +271,7 @@ can write idiomatic code (`if flag`, `else if`, `!done`) without contortions.
 | 17 | **Fully generic stdlib + closures**: de-`i64`-ify `Iterator`/`Future<T>`/`HashMap<K,V>`/adaptors; `FnMut` + capture-by-reference; calling a field-held fn value | `Iterator`'s element type, `Future`, `HashMap`, and `fold`/`map`/`filter` are all hardcoded to `i64` (the generic `Vec<T>` machinery already works, so the path is proven). Closures are `Fn`-only, can't capture by reference, and a struct-stored closure can't be invoked (`(s.f)(x)` doesn't parse) — which is why lazy iterator adaptors aren't possible yet. |
 | 18 | **Real async I/O + multitask executor**: an epoll/kqueue reactor, timer + I/O-readiness leaf futures, `spawn` + `join` | ✅ A process-global executor holds a growable queue of type-erased `Future` tasks and round-robins them: `spawn(f)` enqueues a task (returns an i64 handle), `block_on(f)`/`join(h)` drive the whole queue (so spawned tasks interleave) until the target completes. `sleep_ms(n)` is a real `CLOCK_MONOTONIC` timer leaf; when every task is Pending the reactor **sleeps** (`nanosleep`, or `epoll_wait` on Linux) until the nearest deadline instead of hot-spinning (3×100 ms sleeps finish in ~100 ms at ~0% CPU). Linux/epoll fd-readiness landed (`pipe_make`/`pipe_send`/`read_pipe` — an async reader suspends in `epoll_wait` and wakes on a write); macOS/kqueue fd-readiness is deferred (timers work there via `nanosleep`). |
 | 19 | **Threads + compile-time data-race freedom**: OS threads, `Send`/`Sync` marker traits enforced by the type system, channels, `Mutex`/atomics | The language is single-threaded today. Ownership + Drop (16) + the effect/trait machinery are an ideal substrate for statically rejecting data races — `Send`/`Sync` fall out naturally, the way `io`/`alloc` effects already do. |
-| 20 | **Production toolchain & ecosystem**: cross-project dependency resolution via the Bazel module registry (the v2 deferral), a package manifest, `kard test`, `-O0/-O2/-O3` opt-level flags, LSP rename/find-references — capped by building a real non-trivial program end to end | The one item v2 left deferred (third-party packages) lands here, plus the toolchain maturity that proves the stdlib is sufficient: the capstone is shipping a real CLI/tool written in kardashev. The jump from "a toolchain" to "an ecosystem". |
+| 20 | **Production toolchain & ecosystem**: cross-project dependency resolution via the Bazel module registry (the v2 deferral), a package manifest, `kard test`, `-O0/-O2/-O3` opt-level flags, LSP rename/find-references — capped by building a real non-trivial program end to end | ✅ (20a) `-O0..-O3` opt-level flags (folded into the AOT cache key), the `kardc --test` runner (`fn test_*() -> i64`, pass/fail counts + exit code), and the RPN-calculator capstone (`examples/rpn/`). ✅ (20b) `kard-lsp` adds **find-all-references** (resolves the symbol under the cursor to its definition site over the Phase 14b occurrence index, then returns every occurrence that resolves to it; honors `includeDeclaration`) and **rename** (a single-document `WorkspaceEdit` rewriting every occurrence + the declaration); a `kard.toml` **package manifest** + **local-path dependency** resolution drive `kard build`/`kard run` with no file argument. **Deferred (1 item, unchanged from v2):** third-party dependency resolution via the Bazel module registry — Bazel can't run in this build environment, so it isn't verifiable here and was intentionally not stubbed; intra-project + local-path deps (`mod foo;`, `kardashev_library`/`kardashev_binary`, and now `kard.toml` `[dependencies]`) are what ship. |
 
 Dependencies: 17 (generic `Future<T>`) unblocks 18; 16 (Drop) underpins 19's
 safe sharing; 15 and 20 are largely independent. Suggested order: **15 → 16 → 17

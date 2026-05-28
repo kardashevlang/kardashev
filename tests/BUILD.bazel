@@ -43,6 +43,25 @@ sh_test(
     data = ["//compiler:kard-lsp"],
 )
 
+# Phase 20b: LSP find-all-references + rename, driven over stdio JSON-RPC.
+sh_test(
+    name = "smoke_test_lsp_edit",
+    srcs = ["smoke_test_lsp_edit.sh"],
+    data = ["//compiler:kard-lsp"],
+)
+
+# Phase 20b: kard.toml package manifest + local-path dependency resolution.
+# Needs kardc (the compiler) plus the `kard` wrapper (which carries the
+# manifest logic); the fixture project is created in a mktemp -d at runtime.
+sh_test(
+    name = "smoke_test_manifest",
+    srcs = ["smoke_test_manifest.sh"],
+    data = [
+        "//:kard",
+        "//compiler:kardc",
+    ],
+)
+
 sh_test(
     name = "smoke_test_cache",
     srcs = ["smoke_test_cache.sh"],

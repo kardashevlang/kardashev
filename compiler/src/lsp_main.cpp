@@ -133,6 +133,21 @@ long long findIntFieldAfter(const std::string& json, const std::string& anchor,
     return findIntField(json.substr(pos), key);
 }
 
+// Find a boolean-valued field. Returns `dflt` if the key is missing or not a
+// recognizable true/false literal. Used for references' includeDeclaration.
+bool findBoolField(const std::string& json, const std::string& key,
+                   bool dflt) {
+    std::string needle = "\"" + key + "\"";
+    auto pos = json.find(needle);
+    if (pos == std::string::npos) return dflt;
+    pos += needle.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':' ||
+                                   json[pos] == '\t')) ++pos;
+    if (json.compare(pos, 4, "true") == 0) return true;
+    if (json.compare(pos, 5, "false") == 0) return false;
+    return dflt;
+}
+
 // Escape a string for JSON output (covers the chars LSP cares about).
 std::string jsonEscape(const std::string& s) {
     std::string out;
@@ -443,8 +458,11 @@ std::string renderTraitDecl(const ast::TraitDecl& t) {
 class IndexBuilder {
 public:
     IndexBuilder(const ast::Program& prog,
-                 const kardashev::TypeCheckResult& tc, DocIndex& out)
-        : prog_(prog), tc_(tc), out_(out) {}
+                 const kardashev::TypeCheckResult& tc, DocIndex& out,
+                 const std::string& src)
+        : prog_(prog), tc_(tc), out_(out) {
+        splitLines(src);
+    }
 
     void build() {
         collectGlobals();
@@ -454,27 +472,71 @@ public:
     }
 
 private:
+    // The AST records a decl's anchor at its KEYWORD token (`fn`/`let`/
+    // `struct`/…), not at the bound NAME. For go-to-definition that's fine
+    // (it lands on the right line), but references/rename must point a range
+    // at the name's exact columns — otherwise a rename would corrupt the
+    // keyword. We recover the name's precise 1-based column by scanning the
+    // stored source line for `name` as a whole word at/after the anchor
+    // column. Falls back to the anchor column if the line isn't available or
+    // the name isn't found (keeps behavior safe, never worse than before).
+    void splitLines(const std::string& src) {
+        std::string cur;
+        for (char c : src) {
+            if (c == '\n') { lines_.push_back(cur); cur.clear(); }
+            else if (c != '\r') cur.push_back(c);
+        }
+        lines_.push_back(cur);
+    }
+
+    static bool isIdentChar(char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+    }
+
+    // Resolve the precise 1-based column of `name` on 1-based `line`, searching
+    // at/after the 1-based `fromCol`. Returns `fromCol` unchanged on any miss.
+    std::size_t resolveNameColumn(std::size_t line, std::size_t fromCol,
+                                  const std::string& name) const {
+        if (name.empty() || line == 0 || line > lines_.size()) return fromCol;
+        const std::string& text = lines_[line - 1];
+        std::size_t start = fromCol > 0 ? fromCol - 1 : 0; // -> 0-based
+        if (start > text.size()) return fromCol;
+        std::size_t at = start;
+        while ((at = text.find(name, at)) != std::string::npos) {
+            bool leftOk = at == 0 || !isIdentChar(text[at - 1]);
+            std::size_t after = at + name.size();
+            bool rightOk = after >= text.size() || !isIdentChar(text[after]);
+            if (leftOk && rightOk) return at + 1; // -> 1-based
+            ++at;
+        }
+        return fromCol;
+    }
     void collectGlobals() {
         for (const auto& fn : prog_.functions) {
-            DefInfo d{fn.name, fn.line, fn.column, fn.name.size(),
+            std::size_t col = resolveNameColumn(fn.line, fn.column, fn.name);
+            DefInfo d{fn.name, fn.line, col, fn.name.size(),
                       renderFnSignature(fn, tc_)};
             out_.globals[fn.name] = d;
             out_.globalCompletions.push_back({fn.name, /*Function*/ 3, d.hover});
         }
         for (const auto& s : prog_.structs) {
-            DefInfo d{s.name, s.line, s.column, s.name.size(),
+            std::size_t col = resolveNameColumn(s.line, s.column, s.name);
+            DefInfo d{s.name, s.line, col, s.name.size(),
                       renderStructDecl(s)};
             out_.globals[s.name] = d;
             out_.globalCompletions.push_back({s.name, /*Struct*/ 22, d.hover});
         }
         for (const auto& e : prog_.enums) {
-            DefInfo d{e.name, e.line, e.column, e.name.size(),
+            std::size_t col = resolveNameColumn(e.line, e.column, e.name);
+            DefInfo d{e.name, e.line, col, e.name.size(),
                       renderEnumDecl(e)};
             out_.globals[e.name] = d;
             out_.globalCompletions.push_back({e.name, /*Enum*/ 13, d.hover});
             for (const auto& v : e.variants) {
                 if (out_.globals.find(v.name) == out_.globals.end()) {
-                    out_.globals[v.name] = DefInfo{v.name, v.line, v.column,
+                    std::size_t vcol =
+                        resolveNameColumn(v.line, v.column, v.name);
+                    out_.globals[v.name] = DefInfo{v.name, v.line, vcol,
                                                    v.name.size(),
                                                    e.name + "::" + v.name};
                 }
@@ -483,7 +545,8 @@ private:
             }
         }
         for (const auto& t : prog_.traits) {
-            DefInfo d{t.name, t.line, t.column, t.name.size(),
+            std::size_t col = resolveNameColumn(t.line, t.column, t.name);
+            DefInfo d{t.name, t.line, col, t.name.size(),
                       renderTraitDecl(t)};
             out_.globals[t.name] = d;
             out_.globalCompletions.push_back({t.name, /*Interface*/ 8, d.hover});
@@ -495,11 +558,13 @@ private:
         auto& locals = out_.localsByFn[&fn];
         locals.clear();
         // Seed params FIRST so a use anywhere in the body resolves to them.
-        // The parser doesn't store a per-param position, so we anchor the
-        // def at the fn-decl line/column (definition still lands in-file on
-        // the signature). Hover shows the declared type.
+        // The parser doesn't store a per-param position, so we anchor the def
+        // at the fn-decl line/column then scan forward for the param name's
+        // precise column on that line (so references/rename land on the param,
+        // not the `fn` keyword). Hover shows the declared type.
         for (const auto& p : fn.params) {
-            locals.push_back(DefInfo{p.name, fn.line, fn.column, p.name.size(),
+            std::size_t col = resolveNameColumn(fn.line, fn.column, p.name);
+            locals.push_back(DefInfo{p.name, fn.line, col, p.name.size(),
                                      p.name + ": " + renderTypeRef(p.type)});
         }
         if (fn.body) walkExpr(*fn.body);
@@ -507,8 +572,12 @@ private:
 
     void addLocal(const std::string& name, std::size_t line, std::size_t col,
                   const std::string& hover) {
+        // Anchor columns from a binding keyword (`let`/`for`) or binder token
+        // may precede the bound name; scan forward to the name's real column
+        // so references/rename target the identifier, not the keyword.
+        std::size_t ncol = resolveNameColumn(line, col, name);
         out_.localsByFn[curFn_].push_back(
-            DefInfo{name, line, col, name.size(), hover});
+            DefInfo{name, line, ncol, name.size(), hover});
     }
 
     // Inferred type of an expression, printable (empty if unknown).
@@ -721,6 +790,7 @@ private:
     const kardashev::TypeCheckResult& tc_;
     DocIndex& out_;
     const ast::FnDecl* curFn_ = nullptr;
+    std::vector<std::string> lines_; // source split for precise name columns
 };
 
 // Build the document index from raw source text. We keep the ParseResult and
@@ -733,7 +803,7 @@ void buildIndex(const std::string& src, DocIndex& out,
     // typecheck populates exprTypes / fnSchemas. Even on type errors it
     // records what it could resolve, enough for best-effort hover.
     tcKeep = kardashev::typecheck(prKeep.program);
-    IndexBuilder b(prKeep.program, tcKeep, out);
+    IndexBuilder b(prKeep.program, tcKeep, out, src);
     b.build();
 }
 
@@ -756,6 +826,174 @@ const std::vector<std::string>& keywords() {
         "break", "continue", "return", "async", "await", "impl", "trait",
         "struct", "enum", "dyn", "mod", "pub", "true", "false"};
     return kw;
+}
+
+// ====================================================================
+// Phase 20b: references / rename — symbol resolution over the occurrence index
+// ====================================================================
+//
+// A symbol's identity is its DEFINITION SITE: the (line,column) of the decl it
+// resolves to. Each Occurrence already carries that as (defLine, defCol) — the
+// Phase 14b index computed it via lookupDef (nearest-preceding local wins, else
+// a top-level decl). So "find all references to the symbol under the cursor"
+// reduces to: (1) find the symbol's canonical def site, then (2) collect every
+// occurrence that resolves to the same site.
+//
+// Note the declaration site itself is generally NOT in idx.occurrences — a
+// `let x = …` / parameter / `for x in …` binder is recorded only as a DefInfo
+// (via addLocal), never as an Occurrence. So we synthesize the declaration's
+// Location separately (and gate it on includeDeclaration / the rename always
+// rewriting it).
+
+// A resolved symbol identity: its definition coordinates (1-based) plus the
+// name + the def length (for the declaration range). `defLine == 0` means the
+// occurrence had no resolvable definition (a builtin / unresolved name); we
+// then fall back to identity-by-name-at-that-occurrence so a local rename still
+// does something sensible rather than nothing.
+struct SymbolKey {
+    bool valid = false;
+    std::string name;
+    std::size_t defLine = 0; // 0 = unresolved (builtin / unknown)
+    std::size_t defCol = 0;
+    std::size_t defLen = 0;
+};
+
+// Resolve the symbol under the 1-based cursor. Works whether the cursor is on a
+// USE (an occurrence with a def site) or directly on a DECLARATION (which isn't
+// an occurrence — we scan the occurrence list for any use whose def site spans
+// the cursor, then adopt that def site).
+SymbolKey symbolAt(const DocIndex& idx, std::size_t line, std::size_t col) {
+    SymbolKey key;
+    // Case 1: cursor is on an occurrence (a use, or a global-decl name that the
+    // walker also records as an occurrence — e.g. a struct name at a literal).
+    if (const Occurrence* o = occurrenceAt(idx, line, col)) {
+        key.valid = true;
+        key.name = o->name;
+        if (o->defLine != 0) {
+            key.defLine = o->defLine;
+            key.defCol = o->defCol;
+            key.defLen = o->defLen > 0 ? o->defLen : o->name.size();
+        } else {
+            // Unresolved: treat the occurrence position itself as the anchor so
+            // we can still group same-named occurrences with no def.
+            key.defLine = 0;
+            key.defCol = 0;
+            key.defLen = o->name.size();
+        }
+        return key;
+    }
+    // Case 2: cursor sits on a declaration name that is not itself an
+    // occurrence (a `let` / param / match-binder, or a top-level decl whose
+    // name token the walker didn't emit as an occurrence). Find an occurrence
+    // whose resolved DEF range contains the cursor and adopt its def site.
+    for (const auto& o : idx.occurrences) {
+        if (o.defLine != line) continue;
+        std::size_t dStart = o.defCol;
+        std::size_t dEnd = o.defCol + (o.defLen > 0 ? o.defLen : o.name.size());
+        if (col < dStart || col >= dEnd) continue;
+        key.valid = true;
+        key.name = o.name;
+        key.defLine = o.defLine;
+        key.defCol = o.defCol;
+        key.defLen = o.defLen > 0 ? o.defLen : o.name.size();
+        return key;
+    }
+    return key; // invalid
+}
+
+// Does occurrence `o` refer to the symbol identified by `key`?
+bool occurrenceMatches(const Occurrence& o, const SymbolKey& key) {
+    if (o.name != key.name) return false;
+    if (key.defLine != 0) {
+        // Resolved symbol: match by def site (this is what disambiguates two
+        // distinct locals that happen to share a name across functions).
+        return o.defLine == key.defLine && o.defCol == key.defCol;
+    }
+    // Unresolved symbol: best-effort match by name + also-unresolved.
+    return o.defLine == 0;
+}
+
+// Emit a single-line LSP Range [startCol0, endCol0) on `line0` (all 0-based).
+void appendRange(std::ostringstream& ss, std::size_t line0,
+                 std::size_t startCol0, std::size_t endCol0) {
+    ss << "{\"start\":{\"line\":" << line0 << ",\"character\":" << startCol0
+       << "},\"end\":{\"line\":" << line0 << ",\"character\":" << endCol0
+       << "}}";
+}
+
+// Collect the 1-based reference ranges for `key`: every occurrence that matches
+// it, plus (when includeDecl is set and the def site is known) the declaration
+// site itself. Returned as (line, startCol, endCol) triples, deduplicated, so a
+// declaration that is ALSO an occurrence isn't listed twice.
+struct RefRange {
+    std::size_t line;
+    std::size_t startCol;
+    std::size_t endCol;
+};
+
+std::vector<RefRange> collectReferences(const DocIndex& idx,
+                                        const SymbolKey& key,
+                                        bool includeDecl) {
+    std::vector<RefRange> ranges;
+    auto already = [&](std::size_t l, std::size_t s) {
+        for (const auto& r : ranges)
+            if (r.line == l && r.startCol == s) return true;
+        return false;
+    };
+    if (includeDecl && key.defLine != 0) {
+        std::size_t len = key.defLen > 0 ? key.defLen : key.name.size();
+        ranges.push_back({key.defLine, key.defCol, key.defCol + len});
+    }
+    for (const auto& o : idx.occurrences) {
+        if (!occurrenceMatches(o, key)) continue;
+        if (already(o.line, o.startCol)) continue;
+        ranges.push_back({o.line, o.startCol, o.endCol});
+    }
+    return ranges;
+}
+
+std::string buildReferencesResult(const DocIndex& idx, const std::string& uri,
+                                  std::size_t line, std::size_t col,
+                                  bool includeDecl) {
+    SymbolKey key = symbolAt(idx, line, col);
+    if (!key.valid) return "[]";
+    auto ranges = collectReferences(idx, key, includeDecl);
+    if (ranges.empty()) return "[]";
+    std::ostringstream ss;
+    ss << "[";
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        if (i > 0) ss << ',';
+        ss << "{\"uri\":\"" << jsonEscape(uri) << "\",\"range\":";
+        appendRange(ss, ranges[i].line - 1, ranges[i].startCol - 1,
+                    ranges[i].endCol - 1);
+        ss << "}";
+    }
+    ss << "]";
+    return ss.str();
+}
+
+// Rename is single-document scope (MVP): we return a WorkspaceEdit whose only
+// keyed URI is the active document. Every occurrence + the declaration site is
+// rewritten to `newName` (the declaration is ALWAYS included in a rename —
+// unlike references, where it's gated on includeDeclaration).
+std::string buildRenameResult(const DocIndex& idx, const std::string& uri,
+                              std::size_t line, std::size_t col,
+                              const std::string& newName) {
+    SymbolKey key = symbolAt(idx, line, col);
+    if (!key.valid) return "null";
+    auto ranges = collectReferences(idx, key, /*includeDecl=*/true);
+    if (ranges.empty()) return "null";
+    std::ostringstream ss;
+    ss << "{\"changes\":{\"" << jsonEscape(uri) << "\":[";
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        if (i > 0) ss << ',';
+        ss << "{\"range\":";
+        appendRange(ss, ranges[i].line - 1, ranges[i].startCol - 1,
+                    ranges[i].endCol - 1);
+        ss << ",\"newText\":\"" << jsonEscape(newName) << "\"}";
+    }
+    ss << "]}}";
+    return ss.str();
 }
 
 // --- Request handlers ---
@@ -849,11 +1087,13 @@ int main() {
                 "\"textDocumentSync\":1,"
                 "\"hoverProvider\":true,"
                 "\"definitionProvider\":true,"
+                "\"referencesProvider\":true,"
+                "\"renameProvider\":true,"
                 "\"completionProvider\":{\"triggerCharacters\":[\".\"]},"
                 "\"diagnosticProvider\":{\"interFileDependencies\":false,"
                                         "\"workspaceDiagnostics\":false}"
                 "},\"serverInfo\":{\"name\":\"kard-lsp\","
-                                  "\"version\":\"0.2\"}}");
+                                  "\"version\":\"0.3\"}}");
         } else if (method == "initialized") {
             // no-op
         } else if (method == "textDocument/didOpen" ||
@@ -874,8 +1114,10 @@ int main() {
             publishDiagnostics(uri, {});
         } else if (method == "textDocument/hover" ||
                    method == "textDocument/completion" ||
-                   method == "textDocument/definition") {
-            // All three share: params.textDocument.uri + params.position.
+                   method == "textDocument/definition" ||
+                   method == "textDocument/references" ||
+                   method == "textDocument/rename") {
+            // All five share: params.textDocument.uri + params.position.
             std::string uri = findStringField(msg, "uri");
             // LSP positions are 0-based; convert to the 1-based scheme our
             // index uses. Anchor the line/character search on "position".
@@ -900,8 +1142,27 @@ int main() {
                 sendResponse(id, buildHoverResult(idx, line1, col1));
             } else if (method == "textDocument/completion") {
                 sendResponse(id, buildCompletionResult(idx, pr.program, line1));
-            } else { // definition
+            } else if (method == "textDocument/definition") {
                 sendResponse(id, buildDefinitionResult(idx, uri, line1, col1));
+            } else if (method == "textDocument/references") {
+                // params.context.includeDeclaration controls whether the
+                // declaration site is part of the result (default true if the
+                // client omitted the context, which is lenient but harmless).
+                bool includeDecl =
+                    findBoolField(msg, "includeDeclaration", true);
+                sendResponse(id, buildReferencesResult(idx, uri, line1, col1,
+                                                       includeDecl));
+            } else { // textDocument/rename
+                // params.newName is a top-level string under params. The
+                // declaration is always rewritten (rename has no
+                // includeDeclaration knob).
+                std::string newName = findStringField(msg, "newName");
+                if (newName.empty()) {
+                    sendResponse(id, "null");
+                } else {
+                    sendResponse(id, buildRenameResult(idx, uri, line1, col1,
+                                                       newName));
+                }
             }
         } else if (method == "shutdown") {
             shutdownRequested = true;
