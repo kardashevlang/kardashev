@@ -285,6 +285,78 @@ public:
             fnSchemas_["poll_count"] = std::move(sch);
         }
 
+        // Phase 18 built-in: `sleep_ms(n: i64) -> Future<i64> ! { async }`.
+        // A real wall-clock timer leaf future: its poll computes a deadline
+        // `now + n ms` on the first poll, then returns Pending until the
+        // monotonic clock reaches it, then Ready(n). Like `yield_now` it
+        // carries the `async` effect (awaiting it suspends the enclosing fn),
+        // but unlike `yield_now` it genuinely waits on time and registers its
+        // deadline with the executor so the reactor can sleep instead of spin.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, futureI64Ty);
+            sch.declaredEffects.add("async");
+            fnSchemas_["sleep_ms"] = std::move(sch);
+        }
+        // Phase 18 built-in, generic: `spawn<T>(f: Future<T>) -> i64`.
+        // Registers `f` as a concurrent task with the process-global executor
+        // and returns an i64 task handle. Synchronous (no `async` effect): it
+        // only enqueues; the task makes progress when the executor is driven
+        // (by `block_on`/`join`). Codegen specializes per T so the handle's
+        // result slot is sized for T (read back by `join<T>`).
+        {
+            TypePtr spawnVar = makeFreshVar();
+            FnSchema sch;
+            sch.signature = makeFunction({makeFuture(spawnVar)}, makeInt());
+            sch.genericVars.push_back(spawnVar);
+            fnSchemas_["spawn"] = std::move(sch);
+        }
+        // Phase 18 built-in, generic: `join<T>(handle: i64) -> T`.
+        // Drives the executor until the task named by `handle` completes, then
+        // yields its result. Synchronous (it runs the executor, not suspends).
+        // T is inferred from the binding context; codegen reads the handle's
+        // result slot as T.
+        {
+            TypePtr joinVar = makeFreshVar();
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, joinVar);
+            sch.genericVars.push_back(joinVar);
+            fnSchemas_["join"] = std::move(sch);
+        }
+#if defined(__linux__)
+        // Phase 18 stretch (Linux/epoll ONLY): real fd-readiness primitives.
+        // Registered only on Linux — the codegen reactor is epoll-based and
+        // `#if`-guarded, and macOS (kqueue) support is documented as deferred,
+        // so on macOS these names simply don't exist (a program using them
+        // won't typecheck there, by design, rather than silently stubbing).
+        //
+        //   pipe_make() -> i64           : create an OS pipe; returns a handle
+        //                                  packing (write_fd << 32 | read_fd).
+        //   pipe_send(h: i64, b: i64)->i64: write one byte `b` to the pipe.
+        //   read_pipe(h: i64) -> Future<i64> ! { async } : a leaf future that
+        //                                  becomes Ready(byte) when the read
+        //                                  end is readable; the executor blocks
+        //                                  in epoll_wait until then.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["pipe_make"] = std::move(sch);
+        }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt(), makeInt()}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["pipe_send"] = std::move(sch);
+        }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, futureI64Ty);
+            sch.declaredEffects.add("async");
+            fnSchemas_["read_pipe"] = std::move(sch);
+        }
+#endif
+
         // Pass 1a: register every struct and enum decl. To allow free
         // cross-references (struct field of enum type, enum payload of
         // struct type), we do this in two phases:

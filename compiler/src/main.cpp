@@ -554,7 +554,7 @@ bool linkObject(const std::string& objPath, const std::string& outExePath) {
 // Bump when the object-file format / codegen ABI changes in a way that
 // must invalidate every existing cache entry. Combined into the key so an
 // upgraded kardc never reuses a stale object.
-constexpr const char* kCacheFormatVersion = "kardashev-cache-v1";
+constexpr const char* kCacheFormatVersion = "kardashev-cache-v2";
 
 // FNV-1a 64-bit over a byte string. Small, dependency-free, and good
 // enough for a content-addressed local cache (no adversarial inputs).

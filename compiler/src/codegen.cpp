@@ -27,6 +27,18 @@
 namespace kardashev {
 namespace {
 
+// Phase 18: the `clockid_t` integer constant for CLOCK_MONOTONIC, chosen at
+// COMPILE time for the host that will also run the emitted program (CI builds
+// and runs on the same OS: ubuntu glibc => 1, macOS/Darwin => 6). The emitted
+// IR passes this literal to clock_gettime; we can't reference the C macro from
+// raw IR so we hard-code its platform value. (CLOCK_MONOTONIC, not _REALTIME,
+// so wall-clock adjustments never make a timer fire early/late.)
+#if defined(__APPLE__)
+constexpr int kMonotonicClockId = 6; // <time.h>: CLOCK_MONOTONIC on Darwin
+#else
+constexpr int kMonotonicClockId = 1; // <bits/time.h>: CLOCK_MONOTONIC on Linux
+#endif
+
 class Codegen {
 public:
     explicit Codegen(const TypeCheckResult& tc, bool emitDebugInfo = false,
@@ -440,6 +452,46 @@ private:
     // Phase 17b: the HashMap bucket entry struct is now per-V (emitted lazily
     // by getOrEmitHashMapOp), so no single cached entry type lives here.
 
+    // --- Phase 18: real async I/O + multitask executor ---
+    // libc time/sleep externs the timer future + reactor depend on. Same
+    // linkage story as malloc/printf (host process for JIT, clang's libc for
+    // AOT). `clock_gettime(clockid_t, struct timespec*)` reads the monotonic
+    // clock; `nanosleep(const struct timespec*, struct timespec*)` sleeps the
+    // calling thread until the requested duration elapses (the reactor uses it
+    // to wait for the nearest deadline instead of hot-spinning).
+    llvm::Function* clockGettimeFn_ = nullptr;
+    llvm::Function* nanosleepFn_ = nullptr;
+    // `struct timespec { i64 tv_sec, i64 tv_nsec }` (LP64; matches glibc and
+    // macOS where both fields are 64-bit). Used to size the buffers passed to
+    // clock_gettime / nanosleep and to GEP their fields.
+    llvm::StructType* timespecTy_ = nullptr;
+    // The process-global executor singleton + the per-task entry struct. The
+    // executor holds a growable array of tasks (each a type-erased Future +
+    // its result Poll slot), the nearest pending timer deadline, and (Linux)
+    // the epoll fd. Built once in declareAsyncRuntime.
+    llvm::StructType* execTy_ = nullptr;
+    llvm::StructType* taskTy_ = nullptr;
+    llvm::GlobalVariable* execGlobal_ = nullptr;
+    llvm::Function* execEnsureFn_ = nullptr;   // __kd_exec_ensure
+    llvm::Function* execPushFn_ = nullptr;     // __kd_exec_push
+    llvm::Function* execStepFn_ = nullptr;     // __kd_exec_step
+    llvm::Function* execWaitFn_ = nullptr;     // __kd_exec_wait (reactor sleep)
+    llvm::Function* execDriveFn_ = nullptr;    // __kd_exec_drive_until
+    llvm::Function* execSlotFn_ = nullptr;     // __kd_exec_task_slot
+#if defined(__linux__)
+    // Phase 18 stretch (Linux): epoll-based fd-readiness reactor externs.
+    llvm::Function* epollCreate1Fn_ = nullptr;
+    llvm::Function* epollCtlFn_ = nullptr;
+    llvm::Function* epollWaitFn_ = nullptr;
+    llvm::Function* pipeFn_ = nullptr;
+    llvm::Function* readFn_ = nullptr;
+    llvm::Function* writeFn_ = nullptr;
+    llvm::Function* closeFn_ = nullptr;
+    llvm::Function* fcntlFn_ = nullptr;
+    llvm::StructType* epollEventTy_ = nullptr;
+    llvm::Function* readPipePollFn_ = nullptr; // __kd_readpipe_poll
+#endif
+
     // Phase 10b: the uniform fat-pointer LLVM type for ALL first-class fn
     // VALUES — `{ i8* fn, i8* env }`. `fn` points at a generated function
     // whose first parameter is the env pointer (`ret(i8* env, params...)`);
@@ -575,6 +627,78 @@ private:
         printfFn_ = printfFn;
         mallocFn_ = mallocFn; // Phase 10b: closure env allocation
         freeFn_ = freeFn;     // Phase 16: drop glue
+
+        // --- Phase 18: time / sleep externs for the timer future + reactor.
+        // `struct timespec { time_t tv_sec; long tv_nsec; }` — both 64-bit on
+        // the LP64 targets we build on (ubuntu glibc, macOS). We model it as
+        // `{ i64, i64 }`; clock_gettime/nanosleep take pointers to it.
+        timespecTy_ = llvm::StructType::create(ctx, {i64Ty, i64Ty},
+                                               "kd.timespec");
+        auto* tsPtrTy = i8PtrTy; // opaque ptr to timespec
+        // int clock_gettime(clockid_t clk_id, struct timespec* tp)
+        auto* clockGettimeTy = llvm::FunctionType::get(
+            i32Ty, {i32Ty, tsPtrTy}, /*isVarArg=*/false);
+        clockGettimeFn_ = llvm::Function::Create(
+            clockGettimeTy, llvm::Function::ExternalLinkage, "clock_gettime",
+            module_.get());
+        // int nanosleep(const struct timespec* req, struct timespec* rem)
+        auto* nanosleepTy = llvm::FunctionType::get(
+            i32Ty, {tsPtrTy, tsPtrTy}, /*isVarArg=*/false);
+        nanosleepFn_ = llvm::Function::Create(
+            nanosleepTy, llvm::Function::ExternalLinkage, "nanosleep",
+            module_.get());
+#if defined(__linux__)
+        // --- Phase 18 stretch (Linux only): epoll + pipe/read/write/close for
+        // the fd-readiness reactor. Guarded so the macOS build (kqueue, LLVM
+        // 21) never references these Linux-only symbols. `struct epoll_event`
+        // is `{ uint32_t events; epoll_data_t data; }` and is declared
+        // `__attribute__((packed))` on x86-64 Linux, so its size is 12 bytes
+        // (4 + 8) — we build a PACKED LLVM struct `<{ i32, i64 }>` to match the
+        // kernel ABI exactly (a non-packed { i32, i64 } would be 16 bytes and
+        // misalign the array epoll_wait writes into).
+        epollEventTy_ = llvm::StructType::create(ctx, "kd.epoll_event");
+        epollEventTy_->setBody({i32Ty, i64Ty}, /*isPacked=*/true);
+        auto* epollCreate1Ty =
+            llvm::FunctionType::get(i32Ty, {i32Ty}, /*isVarArg=*/false);
+        epollCreate1Fn_ = llvm::Function::Create(
+            epollCreate1Ty, llvm::Function::ExternalLinkage, "epoll_create1",
+            module_.get());
+        // int epoll_ctl(int epfd, int op, int fd, struct epoll_event* ev)
+        auto* epollCtlTy = llvm::FunctionType::get(
+            i32Ty, {i32Ty, i32Ty, i32Ty, i8PtrTy}, /*isVarArg=*/false);
+        epollCtlFn_ = llvm::Function::Create(
+            epollCtlTy, llvm::Function::ExternalLinkage, "epoll_ctl",
+            module_.get());
+        // int epoll_wait(int epfd, struct epoll_event* evs, int max, int timeout)
+        auto* epollWaitTy = llvm::FunctionType::get(
+            i32Ty, {i32Ty, i8PtrTy, i32Ty, i32Ty}, /*isVarArg=*/false);
+        epollWaitFn_ = llvm::Function::Create(
+            epollWaitTy, llvm::Function::ExternalLinkage, "epoll_wait",
+            module_.get());
+        // int pipe(int fds[2])
+        auto* pipeTy =
+            llvm::FunctionType::get(i32Ty, {i8PtrTy}, /*isVarArg=*/false);
+        pipeFn_ = llvm::Function::Create(
+            pipeTy, llvm::Function::ExternalLinkage, "pipe", module_.get());
+        // ssize_t read(int fd, void* buf, size_t n) / write(...) / close(fd)
+        auto* readTy = llvm::FunctionType::get(
+            i64Ty, {i32Ty, i8PtrTy, i64Ty}, /*isVarArg=*/false);
+        readFn_ = llvm::Function::Create(
+            readTy, llvm::Function::ExternalLinkage, "read", module_.get());
+        writeFn_ = llvm::Function::Create(
+            readTy, llvm::Function::ExternalLinkage, "write", module_.get());
+        auto* closeTy =
+            llvm::FunctionType::get(i32Ty, {i32Ty}, /*isVarArg=*/false);
+        closeFn_ = llvm::Function::Create(
+            closeTy, llvm::Function::ExternalLinkage, "close", module_.get());
+        // int fcntl(int fd, int cmd, ... /* int flag */) — used to flip the
+        // pipe's read end to O_NONBLOCK so read_pipe's poll can probe for data
+        // without ever blocking the whole reactor.
+        auto* fcntlTy = llvm::FunctionType::get(
+            i32Ty, {i32Ty, i32Ty}, /*isVarArg=*/true);
+        fcntlFn_ = llvm::Function::Create(
+            fcntlTy, llvm::Function::ExternalLinkage, "fcntl", module_.get());
+#endif
 
         // --- Phase 10b: fat-pointer type for fn VALUES: { i8* fn, i8* env }
         // Phase 17a: may already be created by ensureFnValTy() (run() builds
@@ -1302,7 +1426,6 @@ private:
     void declareAsyncRuntime() {
         auto& ctx = *ctx_;
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
-        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
         auto* futureTy = structTypes_["Future"];
 
         // The yield frame: { i64 count, i64 value }. `count` starts 0; the
@@ -1381,38 +1504,26 @@ private:
             declaredFns_["yield_now"] = fn;
         }
 
-        // i64 block_on__i64(Future f): the single-threaded executor for the
-        // i64 result type. Busy-poll f.poll(f.frame, &poll) until Ready, then
-        // return the value. Phase 17b makes `block_on` generic over the result
-        // type T: call sites route to a `block_on__<T>` specialization
-        // (getOrEmitBlockOn). We emit the i64 specialization eagerly here (the
-        // common case + back-compat) and register it under both the mangled
-        // name and the bare `block_on` alias.
+        // Phase 18: the process-global multitask executor (task queue +
+        // round-robin scheduler + timer/fd reactor) and the `sleep_ms` timer
+        // future. Must come before block_on/spawn/join, which drive it.
+        declareExecutor();
+        declareSleepMs();
+#if defined(__linux__)
+        // Phase 18 stretch (Linux/epoll): the fd-readiness primitives
+        // (pipe_make / pipe_send / read_pipe). macOS (kqueue) is deferred.
+        declareFdReactor();
+#endif
+
+        // i64 block_on__i64(Future f): the i64 specialization of the executor
+        // driver. Phase 18: instead of busy-polling f alone, it enqueues f as
+        // a task and drives the WHOLE executor (round-robin over f plus any
+        // spawned tasks, sleeping in the reactor when everyone is Pending)
+        // until f completes, then returns f's result. Registered under both
+        // the mangled name and the bare `block_on` alias for back-compat;
+        // getOrEmitBlockOn emits the same shape for other result types.
         {
-            auto* fnTy = llvm::FunctionType::get(i64Ty, {futureTy}, false);
-            auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "block_on__i64",
-                module_.get());
-            fn->getArg(0)->setName("f");
-            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
-            llvm::IRBuilder<> b(entry);
-            auto* fut = fn->getArg(0);
-            auto* pollPtr = b.CreateExtractValue(fut, {0}, "f.poll");
-            auto* framePtr = b.CreateExtractValue(fut, {1}, "f.frame");
-            auto* pollSlot = b.CreateAlloca(pollTy_, nullptr, "poll_slot");
-            auto* loopBB = llvm::BasicBlock::Create(ctx, "block_on.loop", fn);
-            auto* doneBB = llvm::BasicBlock::Create(ctx, "block_on.done", fn);
-            b.CreateBr(loopBB);
-            b.SetInsertPoint(loopBB);
-            // poll(frame, &poll_slot)
-            b.CreateCall(pollFnTy_, pollPtr, {framePtr, pollSlot});
-            auto* rdyP = b.CreateStructGEP(pollTy_, pollSlot, 0, "ready_ptr");
-            auto* rdy = b.CreateLoad(i1Ty, rdyP, "ready");
-            b.CreateCondBr(rdy, doneBB, loopBB);
-            b.SetInsertPoint(doneBB);
-            auto* valP = b.CreateStructGEP(pollTy_, pollSlot, 1, "val_ptr");
-            auto* val = b.CreateLoad(i64Ty, valP, "result");
-            b.CreateRet(val);
+            llvm::Function* fn = emitBlockOnBody("block_on__i64", makeInt());
             declaredFns_["block_on__i64"] = fn;
             declaredFns_["block_on"] = fn;
         }
@@ -1451,23 +1562,566 @@ private:
         return pt;
     }
 
-    // Phase 17b: lazily emit a per-result-type specialization of `block_on`.
+    // Phase 17b/18: lazily emit a per-result-type specialization of `block_on`.
     // Mangled `block_on__<T>` so emitCall's generic-callee branch routes to it
-    // (mirrors getOrEmitVecOp). The executor busy-polls the future until Ready
-    // then returns the value read as T from a `Poll<T>` slot. `block_on__i64`
-    // is the original i64 executor (emitted eagerly in declareAsyncRuntime and
-    // also registered under the bare `block_on` name for back-compat).
+    // (mirrors getOrEmitVecOp). Phase 18 drives the whole executor (not just
+    // this future) until it completes, so spawned tasks make progress and the
+    // reactor sleeps when everyone is Pending. `block_on__i64` is emitted
+    // eagerly in declareAsyncRuntime and aliased to the bare `block_on` name.
     llvm::Function* getOrEmitBlockOn(const TypePtr& T) {
         std::string mangled = "block_on__" + mangleType(T);
         auto it = declaredFns_.find(mangled);
         if (it != declaredFns_.end()) return it->second;
+        llvm::Function* fn = emitBlockOnBody(mangled, T);
+        declaredFns_[mangled] = fn;
+        return fn;
+    }
 
+    // ===================================================================
+    // Phase 18: real async I/O + multitask executor
+    // ===================================================================
+    //
+    // The runtime model upgrades the Phase 12 single-task busy-poll into a
+    // cooperative scheduler with a real timer/fd reactor:
+    //
+    //   * A process-global executor (`__kd_exec`) owns a growable array of
+    //     tasks. A task is a type-erased Future `{poll,frame}` plus a
+    //     heap `poll_slot` (a `Poll<T>` the SPAWNER sized — the executor only
+    //     ever reads field 0, the `ready` flag at offset 0, so it stays
+    //     T-agnostic; block_on/join read the value through their own Poll<T>).
+    //   * `spawn(f)` enqueues a task, returns an i64 handle (= task index).
+    //   * `block_on(f)` / `join(h)` enqueue (block_on) then DRIVE the whole
+    //     executor round-robin until the target task is done, returning its T.
+    //     Driving everyone is what makes spawned tasks interleave.
+    //   * The reactor: each round resets `has_dl`; a timer future that returns
+    //     Pending registers its deadline (min) via __kd_exec_set_deadline. If
+    //     a full round makes no task ready and a deadline is registered, the
+    //     executor sleeps (nanosleep, or epoll_wait on Linux when fds are
+    //     registered) until the nearest deadline rather than hot-spinning.
+
+    // Field indices into the global executor struct `__kd_exec`.
+    enum {
+        EXEC_TASKS = 0,   // i8* — malloc'd array of Task
+        EXEC_COUNT = 1,   // i64 — live task count
+        EXEC_CAP = 2,     // i64 — array capacity (in Tasks)
+        EXEC_DL_SEC = 3,  // i64 — nearest pending deadline, seconds
+        EXEC_DL_NSEC = 4, // i64 — nearest pending deadline, nanoseconds
+        EXEC_HAS_DL = 5,  // i64 — 1 iff a deadline was registered this round
+        EXEC_EPFD = 6,    // i32 — epoll fd (Linux), -1 if none
+        EXEC_NFDS = 7     // i32 — count of fds registered with epoll
+    };
+    // Field indices into a Task entry.
+    enum {
+        TASK_POLL = 0,  // i8* — the future's poll fn
+        TASK_FRAME = 1, // i8* — the future's heap frame
+        TASK_DONE = 2,  // i64 — 1 once Ready
+        TASK_SLOT = 3   // i8* — the spawner-sized Poll<T> result slot
+    };
+
+    // Build the executor types + global + scheduler/reactor functions. Called
+    // once from declareAsyncRuntime. All functions are InternalLinkage IR; no
+    // C++ runtime file is required (mirrors how yield_now/print are emitted).
+    void declareExecutor() {
         auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
         auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* voidTy = llvm::Type::getVoidTy(ctx);
+
+        taskTy_ = llvm::StructType::create(
+            ctx, {i8PtrTy, i8PtrTy, i64Ty, i8PtrTy}, "kd.task");
+        execTy_ = llvm::StructType::create(
+            ctx,
+            {i8PtrTy, i64Ty, i64Ty, i64Ty, i64Ty, i64Ty, i32Ty, i32Ty},
+            "kd.exec");
+        // The singleton, zero-initialized: count=cap=0, has_dl=0. epfd starts 0
+        // here and is set to -1 lazily by __kd_exec_ensure (0 is a valid fd, so
+        // we can't use it as the "no epoll yet" sentinel from the zeroinit).
+        execGlobal_ = new llvm::GlobalVariable(
+            *module_, execTy_, /*isConstant=*/false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantAggregateZero::get(execTy_), "__kd_exec");
+
+        auto* execPtrTy = i8PtrTy; // opaque ptr to __kd_exec / Task array
+
+        // ---- void __kd_exec_ensure(): lazily mark the executor initialized.
+        // Sets epfd to -1 the first time (cap is the init sentinel: while it's
+        // 0 we treat tasks as absent; epfd's -1 means "no epoll created yet").
+        {
+            auto* fnTy = llvm::FunctionType::get(voidTy, {}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::InternalLinkage, "__kd_exec_ensure",
+                module_.get());
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* initBB = llvm::BasicBlock::Create(ctx, "init", fn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "done", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* epfdP = b.CreateStructGEP(execTy_, execGlobal_, EXEC_EPFD,
+                                            "epfd_ptr");
+            auto* epfd = b.CreateLoad(i32Ty, epfdP, "epfd");
+            // epfd==0 means "never initialized" (the zeroinit value); set -1.
+            auto* uninit = b.CreateICmpEQ(
+                epfd, llvm::ConstantInt::get(i32Ty, 0), "uninit");
+            b.CreateCondBr(uninit, initBB, doneBB);
+            b.SetInsertPoint(initBB);
+            b.CreateStore(llvm::ConstantInt::get(i32Ty, -1), epfdP);
+            b.CreateBr(doneBB);
+            b.SetInsertPoint(doneBB);
+            b.CreateRetVoid();
+            execEnsureFn_ = fn;
+        }
+
+        // ---- i8* __kd_exec_task_slot(i64 idx): return a pointer to Task[idx].
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i8PtrTy, {i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::InternalLinkage, "__kd_exec_task_slot",
+                module_.get());
+            fn->getArg(0)->setName("idx");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* tasksP = b.CreateStructGEP(execTy_, execGlobal_, EXEC_TASKS,
+                                             "tasks_ptr");
+            auto* tasks = b.CreateLoad(i8PtrTy, tasksP, "tasks");
+            auto* slot = b.CreateGEP(taskTy_, tasks, {fn->getArg(0)},
+                                     "task_slot");
+            b.CreateRet(slot);
+            execSlotFn_ = fn;
+        }
+
+        // ---- i64 __kd_exec_push(i8* poll, i8* frame, i8* poll_slot):
+        // append a task; grow the array if needed; return its index (handle).
+        {
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {i8PtrTy, i8PtrTy, i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::InternalLinkage, "__kd_exec_push",
+                module_.get());
+            fn->getArg(0)->setName("poll");
+            fn->getArg(1)->setName("frame");
+            fn->getArg(2)->setName("slot");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* growBB = llvm::BasicBlock::Create(ctx, "grow", fn);
+            auto* storeBB = llvm::BasicBlock::Create(ctx, "store", fn);
+            llvm::IRBuilder<> b(entry);
+            b.CreateCall(execEnsureFn_, {});
+            auto* countP = b.CreateStructGEP(execTy_, execGlobal_, EXEC_COUNT,
+                                             "count_ptr");
+            auto* count = b.CreateLoad(i64Ty, countP, "count");
+            auto* capP = b.CreateStructGEP(execTy_, execGlobal_, EXEC_CAP,
+                                           "cap_ptr");
+            auto* cap = b.CreateLoad(i64Ty, capP, "cap");
+            auto* full = b.CreateICmpEQ(count, cap, "full");
+            b.CreateCondBr(full, growBB, storeBB);
+            // grow: newcap = cap==0 ? 4 : cap*2; realloc(tasks, newcap*sizeof).
+            b.SetInsertPoint(growBB);
+            auto* capZero = b.CreateICmpEQ(
+                cap, llvm::ConstantInt::get(i64Ty, 0), "cap_zero");
+            auto* dbl = b.CreateMul(cap, llvm::ConstantInt::get(i64Ty, 2),
+                                    "cap_dbl");
+            auto* newCap = b.CreateSelect(
+                capZero, llvm::ConstantInt::get(i64Ty, 4), dbl, "new_cap");
+            uint64_t taskSz =
+                module_->getDataLayout().getTypeAllocSize(taskTy_);
+            auto* bytes = b.CreateMul(
+                newCap, llvm::ConstantInt::get(i64Ty, taskSz), "new_bytes");
+            auto* tasksP = b.CreateStructGEP(execTy_, execGlobal_, EXEC_TASKS,
+                                             "tasks_ptr");
+            auto* oldTasks = b.CreateLoad(i8PtrTy, tasksP, "old_tasks");
+            auto* newTasks =
+                b.CreateCall(reallocFn_, {oldTasks, bytes}, "new_tasks");
+            b.CreateStore(newTasks, tasksP);
+            b.CreateStore(newCap, capP);
+            b.CreateBr(storeBB);
+            // store: Task[count] = { poll, frame, done=0, slot }; count++.
+            b.SetInsertPoint(storeBB);
+            auto* slot = b.CreateCall(execSlotFn_, {count}, "slot");
+            b.CreateStore(fn->getArg(0),
+                          b.CreateStructGEP(taskTy_, slot, TASK_POLL, "p"));
+            b.CreateStore(fn->getArg(1),
+                          b.CreateStructGEP(taskTy_, slot, TASK_FRAME, "f"));
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0),
+                          b.CreateStructGEP(taskTy_, slot, TASK_DONE, "d"));
+            b.CreateStore(fn->getArg(2),
+                          b.CreateStructGEP(taskTy_, slot, TASK_SLOT, "s"));
+            b.CreateStore(
+                b.CreateAdd(count, llvm::ConstantInt::get(i64Ty, 1)), countP);
+            b.CreateRet(count);
+            execPushFn_ = fn;
+        }
+
+        // ---- i64 __kd_exec_step(): poll every not-done task once
+        // (round-robin). Returns the number of tasks polled that returned
+        // Pending this round (0 => nothing left pending, so the driver can
+        // stop or doesn't need to sleep). Clears has_dl before the round so a
+        // timer that stays Pending re-registers the freshest deadline.
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::InternalLinkage, "__kd_exec_step",
+                module_.get());
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* loopBB = llvm::BasicBlock::Create(ctx, "loop", fn);
+            auto* bodyBB = llvm::BasicBlock::Create(ctx, "body", fn);
+            auto* pollBB = llvm::BasicBlock::Create(ctx, "poll", fn);
+            auto* readyBB = llvm::BasicBlock::Create(ctx, "ready", fn);
+            auto* pendBB = llvm::BasicBlock::Create(ctx, "pending", fn);
+            auto* contBB = llvm::BasicBlock::Create(ctx, "cont", fn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "done", fn);
+            llvm::IRBuilder<> b(entry);
+            // pending counter + reset has_dl.
+            auto* pendP = b.CreateAlloca(i64Ty, nullptr, "pending");
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0), pendP);
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0),
+                          b.CreateStructGEP(execTy_, execGlobal_, EXEC_HAS_DL,
+                                            "has_dl_ptr"));
+            auto* iP = b.CreateAlloca(i64Ty, nullptr, "i");
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0), iP);
+            b.CreateBr(loopBB);
+            b.SetInsertPoint(loopBB);
+            auto* i = b.CreateLoad(i64Ty, iP, "i");
+            auto* count = b.CreateLoad(
+                i64Ty,
+                b.CreateStructGEP(execTy_, execGlobal_, EXEC_COUNT, "cnt_ptr"),
+                "count");
+            auto* more = b.CreateICmpULT(i, count, "more");
+            b.CreateCondBr(more, bodyBB, doneBB);
+            // body: skip done tasks, else poll.
+            b.SetInsertPoint(bodyBB);
+            auto* slot = b.CreateCall(execSlotFn_, {i}, "slot");
+            auto* doneP = b.CreateStructGEP(taskTy_, slot, TASK_DONE, "done_p");
+            auto* done = b.CreateLoad(i64Ty, doneP, "done");
+            auto* isDone = b.CreateICmpNE(
+                done, llvm::ConstantInt::get(i64Ty, 0), "is_done");
+            b.CreateCondBr(isDone, contBB, pollBB);
+            // poll this task into its own poll_slot.
+            b.SetInsertPoint(pollBB);
+            auto* pollFn = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(taskTy_, slot, TASK_POLL, "pp"),
+                "poll");
+            auto* frame = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(taskTy_, slot, TASK_FRAME, "fp"),
+                "frame");
+            auto* pslot = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(taskTy_, slot, TASK_SLOT, "sp"),
+                "pslot");
+            b.CreateCall(pollFnTy_, pollFn, {frame, pslot});
+            // ready flag is field 0 of Poll<T> — offset 0 for every T.
+            auto* rdy = b.CreateLoad(
+                i1Ty, b.CreateStructGEP(pollTy_, pslot, 0, "rdy_p"), "rdy");
+            b.CreateCondBr(rdy, readyBB, pendBB);
+            // ready: mark the task done (drops it from future rotation).
+            // Re-fetch the slot: the poll may have spawned a new task and
+            // grown (realloc'd) the array, invalidating the pre-poll `slot`.
+            b.SetInsertPoint(readyBB);
+            auto* slot2 = b.CreateCall(execSlotFn_, {i}, "slot2");
+            b.CreateStore(
+                llvm::ConstantInt::get(i64Ty, 1),
+                b.CreateStructGEP(taskTy_, slot2, TASK_DONE, "done_p2"));
+            b.CreateBr(contBB);
+            // pending: count it (the driver uses this to decide to sleep/loop).
+            b.SetInsertPoint(pendBB);
+            auto* pend = b.CreateLoad(i64Ty, pendP, "pend");
+            b.CreateStore(
+                b.CreateAdd(pend, llvm::ConstantInt::get(i64Ty, 1)), pendP);
+            b.CreateBr(contBB);
+            b.SetInsertPoint(contBB);
+            b.CreateStore(
+                b.CreateAdd(i, llvm::ConstantInt::get(i64Ty, 1)), iP);
+            b.CreateBr(loopBB);
+            b.SetInsertPoint(doneBB);
+            b.CreateRet(b.CreateLoad(i64Ty, pendP, "pending_final"));
+            execStepFn_ = fn;
+        }
+
+        declareExecSetDeadline();
+        declareExecWait();
+        declareExecDrive(execPtrTy);
+    }
+
+    // ---- void __kd_exec_set_deadline(i64 sec, i64 nsec): register a timer
+    // deadline; keeps the EARLIEST of any deadlines registered this round so
+    // the reactor sleeps only until the nearest one.
+    void declareExecSetDeadline() {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* voidTy = llvm::Type::getVoidTy(ctx);
+        auto* fnTy = llvm::FunctionType::get(voidTy, {i64Ty, i64Ty}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::InternalLinkage, "__kd_exec_set_deadline",
+            module_.get());
+        fn->getArg(0)->setName("sec");
+        fn->getArg(1)->setName("nsec");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* setBB = llvm::BasicBlock::Create(ctx, "set", fn);
+        auto* cmpBB = llvm::BasicBlock::Create(ctx, "cmp", fn);
+        auto* doneBB = llvm::BasicBlock::Create(ctx, "done", fn);
+        llvm::IRBuilder<> b(entry);
+        auto* hasP = b.CreateStructGEP(execTy_, execGlobal_, EXEC_HAS_DL,
+                                       "has_dl_ptr");
+        auto* secP = b.CreateStructGEP(execTy_, execGlobal_, EXEC_DL_SEC,
+                                       "dl_sec_ptr");
+        auto* nsecP = b.CreateStructGEP(execTy_, execGlobal_, EXEC_DL_NSEC,
+                                        "dl_nsec_ptr");
+        auto* has = b.CreateLoad(i64Ty, hasP, "has");
+        auto* none = b.CreateICmpEQ(
+            has, llvm::ConstantInt::get(i64Ty, 0), "none_yet");
+        b.CreateCondBr(none, setBB, cmpBB);
+        b.SetInsertPoint(setBB);
+        b.CreateStore(llvm::ConstantInt::get(i64Ty, 1), hasP);
+        b.CreateStore(fn->getArg(0), secP);
+        b.CreateStore(fn->getArg(1), nsecP);
+        b.CreateBr(doneBB);
+        // cmp: keep min(existing, new) as nanoseconds-since-epoch comparison.
+        b.SetInsertPoint(cmpBB);
+        auto* curSec = b.CreateLoad(i64Ty, secP, "cur_sec");
+        auto* curNsec = b.CreateLoad(i64Ty, nsecP, "cur_nsec");
+        auto* newEarlierSec = b.CreateICmpSLT(fn->getArg(0), curSec, "ne_sec");
+        auto* eqSec = b.CreateICmpEQ(fn->getArg(0), curSec, "eq_sec");
+        auto* newEarlierNsec =
+            b.CreateICmpSLT(fn->getArg(1), curNsec, "ne_nsec");
+        auto* earlier = b.CreateOr(
+            newEarlierSec, b.CreateAnd(eqSec, newEarlierNsec), "earlier");
+        auto* updBB = llvm::BasicBlock::Create(ctx, "upd", fn);
+        b.CreateCondBr(earlier, updBB, doneBB);
+        b.SetInsertPoint(updBB);
+        b.CreateStore(fn->getArg(0), secP);
+        b.CreateStore(fn->getArg(1), nsecP);
+        b.CreateBr(doneBB);
+        b.SetInsertPoint(doneBB);
+        b.CreateRetVoid();
+        // not cached in a member; looked up by name where needed.
+        declaredFns_["__kd_exec_set_deadline"] = fn;
+    }
+
+    // ---- void __kd_exec_wait(): the reactor's "sleep, don't spin". Called by
+    // the driver only when a full round made NO task ready but at least one
+    // task is still pending on a timer (has_dl) and/or an fd (Linux epoll).
+    //   * timer only: nanosleep the remaining `deadline - now`.
+    //   * fds only (Linux): block in epoll_wait with timeout = -1 (forever)
+    //     until a registered fd is readable.
+    //   * timer + fds (Linux): epoll_wait with timeout = remaining ms (whoever
+    //     fires first wakes us).
+    //   * non-Linux with no timer: return immediately (defensive; the driver
+    //     only reaches here with has_dl set on macOS, since fds aren't a
+    //     thing there).
+    void declareExecWait() {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* voidTy = llvm::Type::getVoidTy(ctx);
+        auto* fnTy = llvm::FunctionType::get(voidTy, {}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::InternalLinkage, "__kd_exec_wait",
+            module_.get());
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* retBB = llvm::BasicBlock::Create(ctx, "ret", fn);
+        llvm::IRBuilder<> b(entry);
+        auto* hasDl = b.CreateLoad(
+            i64Ty,
+            b.CreateStructGEP(execTy_, execGlobal_, EXEC_HAS_DL, "hdp"),
+            "has_dl");
+        auto* haveDl = b.CreateICmpNE(
+            hasDl, llvm::ConstantInt::get(i64Ty, 0), "have_dl");
+
+        // Compute remaining = deadline - now (only meaningful when haveDl);
+        // also a "past" flag so an already-elapsed timer doesn't sleep.
+        auto* nowTs = b.CreateAlloca(timespecTy_, nullptr, "now_ts");
+        b.CreateCall(clockGettimeFn_,
+                     {llvm::ConstantInt::get(i32Ty, kMonotonicClockId), nowTs});
+        auto* nowSec = b.CreateLoad(
+            i64Ty, b.CreateStructGEP(timespecTy_, nowTs, 0, "now_sec_p"),
+            "now_sec");
+        auto* nowNsec = b.CreateLoad(
+            i64Ty, b.CreateStructGEP(timespecTy_, nowTs, 1, "now_nsec_p"),
+            "now_nsec");
+        auto* dlSec = b.CreateLoad(
+            i64Ty, b.CreateStructGEP(execTy_, execGlobal_, EXEC_DL_SEC, "dlsp"),
+            "dl_sec");
+        auto* dlNsec = b.CreateLoad(
+            i64Ty, b.CreateStructGEP(execTy_, execGlobal_, EXEC_DL_NSEC, "dlnp"),
+            "dl_nsec");
+        auto* rsec = b.CreateSub(dlSec, nowSec, "rsec");
+        auto* rnsec = b.CreateSub(dlNsec, nowNsec, "rnsec");
+        auto* neg = b.CreateICmpSLT(rnsec, llvm::ConstantInt::get(i64Ty, 0),
+                                    "nsec_neg");
+        auto* rnsecB = b.CreateSelect(
+            neg, b.CreateAdd(rnsec, llvm::ConstantInt::get(i64Ty, 1000000000)),
+            rnsec, "rnsec_b");
+        auto* rsecB = b.CreateSelect(
+            neg, b.CreateSub(rsec, llvm::ConstantInt::get(i64Ty, 1)), rsec,
+            "rsec_b");
+        auto* past = b.CreateICmpSLT(rsecB, llvm::ConstantInt::get(i64Ty, 0),
+                                     "past");
+        // timer-elapsed-already => return without sleeping (re-poll now).
+        auto* timerPast = b.CreateAnd(haveDl, past, "timer_past");
+#if defined(__linux__)
+        // Linux: branch on whether any fds are registered.
+        auto* nfds = b.CreateLoad(
+            i32Ty, b.CreateStructGEP(execTy_, execGlobal_, EXEC_NFDS, "nfdsp"),
+            "nfds");
+        auto* haveFds = b.CreateICmpSGT(
+            nfds, llvm::ConstantInt::get(i32Ty, 0), "have_fds");
+        auto* epollBB = llvm::BasicBlock::Create(ctx, "epoll", fn);
+        auto* nanoChkBB = llvm::BasicBlock::Create(ctx, "nano_chk", fn);
+        // If a timer already elapsed AND no fds, just return (re-poll). If fds
+        // exist we still want to drain readiness, so go to epoll even if the
+        // timer is past (epoll with timeout 0 = non-blocking poll).
+        auto* skip = b.CreateAnd(timerPast, b.CreateNot(haveFds), "skip");
+        auto* doWaitBB = llvm::BasicBlock::Create(ctx, "do_wait", fn);
+        b.CreateCondBr(skip, retBB, doWaitBB);
+        b.SetInsertPoint(doWaitBB);
+        b.CreateCondBr(haveFds, epollBB, nanoChkBB);
+        // epoll path: timeout = haveDl ? max(remaining_ms, 0) : -1 (forever).
+        b.SetInsertPoint(epollBB);
+        auto* epfd = b.CreateLoad(
+            i32Ty, b.CreateStructGEP(execTy_, execGlobal_, EXEC_EPFD, "epfdp2"),
+            "epfd");
+        auto* msSec = b.CreateMul(rsecB, llvm::ConstantInt::get(i64Ty, 1000),
+                                  "ms_sec");
+        auto* msNsec = b.CreateSDiv(
+            rnsecB, llvm::ConstantInt::get(i64Ty, 1000000), "ms_nsec");
+        auto* msTot = b.CreateAdd(msSec, msNsec, "ms_tot");
+        // clamp negative remaining to 0 (non-blocking drain).
+        auto* msClamped = b.CreateSelect(
+            b.CreateICmpSLT(msTot, llvm::ConstantInt::get(i64Ty, 0)),
+            llvm::ConstantInt::get(i64Ty, 0), msTot, "ms_clamped");
+        auto* msI32 = b.CreateTrunc(msClamped, i32Ty, "ms_i32");
+        auto* timeout = b.CreateSelect(
+            haveDl, msI32, llvm::ConstantInt::get(i32Ty, -1), "timeout");
+        auto* evbuf = b.CreateAlloca(
+            epollEventTy_, llvm::ConstantInt::get(i32Ty, 8), "evbuf");
+        b.CreateCall(epollWaitFn_,
+                     {epfd, evbuf, llvm::ConstantInt::get(i32Ty, 8), timeout});
+        b.CreateBr(retBB);
+        // nano_chk: no fds. Only nanosleep if we actually have a (future)
+        // deadline; otherwise return (defensive — driver shouldn't call us).
+        b.SetInsertPoint(nanoChkBB);
+        auto* doNano = b.CreateAnd(haveDl, b.CreateNot(past), "do_nano");
+        auto* nanoBB = llvm::BasicBlock::Create(ctx, "nano", fn);
+        b.CreateCondBr(doNano, nanoBB, retBB);
+        b.SetInsertPoint(nanoBB);
+        auto* req = b.CreateAlloca(timespecTy_, nullptr, "req");
+        b.CreateStore(rsecB, b.CreateStructGEP(timespecTy_, req, 0, "rqs"));
+        b.CreateStore(rnsecB, b.CreateStructGEP(timespecTy_, req, 1, "rqn"));
+        b.CreateCall(nanosleepFn_,
+                     {req, llvm::ConstantPointerNull::get(
+                               llvm::cast<llvm::PointerType>(i8PtrTy))});
+        b.CreateBr(retBB);
+#else
+        // Non-Linux (macOS): nanosleep the remaining duration when a future
+        // deadline exists. kqueue fd-readiness is documented as deferred, so
+        // there are never fds to wait on here.
+        auto* doNano = b.CreateAnd(haveDl, b.CreateNot(past), "do_nano");
+        auto* nanoBB = llvm::BasicBlock::Create(ctx, "nano", fn);
+        b.CreateCondBr(doNano, nanoBB, retBB);
+        b.SetInsertPoint(nanoBB);
+        auto* req = b.CreateAlloca(timespecTy_, nullptr, "req");
+        b.CreateStore(rsecB, b.CreateStructGEP(timespecTy_, req, 0, "rqs"));
+        b.CreateStore(rnsecB, b.CreateStructGEP(timespecTy_, req, 1, "rqn"));
+        b.CreateCall(nanosleepFn_,
+                     {req, llvm::ConstantPointerNull::get(
+                               llvm::cast<llvm::PointerType>(i8PtrTy))});
+        b.CreateBr(retBB);
+        (void)timerPast;
+#endif
+        b.SetInsertPoint(retBB);
+        b.CreateRetVoid();
+        execWaitFn_ = fn;
+    }
+
+    // ---- void __kd_exec_drive_until(i64 idx): the scheduler heart. Loop:
+    // step() the whole queue (round-robin one poll per live task); if the
+    // target task is done, stop; else if the round made no task ready and a
+    // timer deadline is registered, sleep in the reactor until it; else keep
+    // looping (busy — only when a non-timer leaf like yield_now is the only
+    // thing pending, preserving Phase 12 behavior). A task that returns Ready
+    // is removed from rotation (its `done` flag short-circuits future polls).
+    void declareExecDrive(llvm::Type* /*execPtrTy*/) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* voidTy = llvm::Type::getVoidTy(ctx);
+        auto* fnTy = llvm::FunctionType::get(voidTy, {i64Ty}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::InternalLinkage, "__kd_exec_drive_until",
+            module_.get());
+        fn->getArg(0)->setName("idx");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* loopBB = llvm::BasicBlock::Create(ctx, "loop", fn);
+        auto* chkBB = llvm::BasicBlock::Create(ctx, "check_target", fn);
+        auto* waitChkBB = llvm::BasicBlock::Create(ctx, "wait_check", fn);
+        auto* waitBB = llvm::BasicBlock::Create(ctx, "wait", fn);
+        auto* doneBB = llvm::BasicBlock::Create(ctx, "done", fn);
+        llvm::IRBuilder<> b(entry);
+        b.CreateCall(execEnsureFn_, {});
+        b.CreateBr(loopBB);
+        b.SetInsertPoint(loopBB);
+        auto* pending = b.CreateCall(execStepFn_, {}, "pending");
+        b.CreateBr(chkBB);
+        // target done? read Task[idx].done.
+        b.SetInsertPoint(chkBB);
+        auto* slot = b.CreateCall(execSlotFn_, {fn->getArg(0)}, "tslot");
+        auto* done = b.CreateLoad(
+            i64Ty, b.CreateStructGEP(taskTy_, slot, TASK_DONE, "tdone_p"),
+            "tdone");
+        auto* targetDone = b.CreateICmpNE(
+            done, llvm::ConstantInt::get(i64Ty, 0), "target_done");
+        b.CreateCondBr(targetDone, doneBB, waitChkBB);
+        // not done. If nothing is pending at all, also stop (defensive: target
+        // somehow not pending and not done — avoid an infinite spin).
+        b.SetInsertPoint(waitChkBB);
+        auto* nonePending = b.CreateICmpEQ(
+            pending, llvm::ConstantInt::get(i64Ty, 0), "none_pending");
+        auto* loop2BB = llvm::BasicBlock::Create(ctx, "decide_wait", fn);
+        b.CreateCondBr(nonePending, doneBB, loop2BB);
+        b.SetInsertPoint(loop2BB);
+        // Some task is pending. If a timer deadline is registered (or, on
+        // Linux, an fd is registered with epoll), sleep in the reactor until
+        // it fires (don't spin). Otherwise loop immediately (a yield_now-style
+        // leaf that's Pending-then-Ready needs an immediate re-poll — this
+        // preserves the Phase 12 busy-progress behavior for non-timer leaves).
+        auto* hasDl = b.CreateLoad(
+            i64Ty,
+            b.CreateStructGEP(execTy_, execGlobal_, EXEC_HAS_DL, "has_dl_p"),
+            "has_dl");
+        llvm::Value* shouldWait = b.CreateICmpNE(
+            hasDl, llvm::ConstantInt::get(i64Ty, 0), "has_dl_nz");
+#if defined(__linux__)
+        auto* nfds = b.CreateLoad(
+            llvm::Type::getInt32Ty(ctx),
+            b.CreateStructGEP(execTy_, execGlobal_, EXEC_NFDS, "nfds_p"),
+            "nfds");
+        auto* haveFds = b.CreateICmpSGT(
+            nfds, llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0),
+            "have_fds");
+        shouldWait = b.CreateOr(shouldWait, haveFds, "should_wait");
+#endif
+        b.CreateCondBr(shouldWait, waitBB, loopBB);
+        b.SetInsertPoint(waitBB);
+        b.CreateCall(execWaitFn_, {});
+        b.CreateBr(loopBB);
+        b.SetInsertPoint(doneBB);
+        b.CreateRetVoid();
+        execDriveFn_ = fn;
+    }
+
+    // Phase 18: emit a `block_on`/spawn-driven executor body for result type T.
+    // Shared by block_on__i64 (eager) and getOrEmitBlockOn (lazy per-T). Body:
+    //   slot = malloc(sizeof Poll<T>)
+    //   h = __kd_exec_push(f.poll, f.frame, slot)
+    //   __kd_exec_drive_until(h)
+    //   return ((Poll<T>*)slot)->value
+    llvm::Function* emitBlockOnBody(const std::string& mangled,
+                                    const TypePtr& T) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
         auto* futureTy = structTypes_["Future"];
         auto* pollT = pollTypeFor(T);
         auto* valTy = mapKardashevType(T);
-
         auto* fnTy = llvm::FunctionType::get(valTy, {futureTy}, false);
         auto* fn = llvm::Function::Create(
             fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
@@ -1477,22 +2131,458 @@ private:
         auto* fut = fn->getArg(0);
         auto* pollPtr = b.CreateExtractValue(fut, {0}, "f.poll");
         auto* framePtr = b.CreateExtractValue(fut, {1}, "f.frame");
-        auto* pollSlot = b.CreateAlloca(pollT, nullptr, "poll_slot");
-        auto* loopBB = llvm::BasicBlock::Create(ctx, "block_on.loop", fn);
-        auto* doneBB = llvm::BasicBlock::Create(ctx, "block_on.done", fn);
-        b.CreateBr(loopBB);
-        b.SetInsertPoint(loopBB);
-        b.CreateCall(pollFnTy_, pollPtr, {framePtr, pollSlot});
-        auto* rdyP = b.CreateStructGEP(pollT, pollSlot, 0, "ready_ptr");
-        auto* rdy = b.CreateLoad(i1Ty, rdyP, "ready");
-        b.CreateCondBr(rdy, doneBB, loopBB);
-        b.SetInsertPoint(doneBB);
-        auto* valP = b.CreateStructGEP(pollT, pollSlot, 1, "val_ptr");
+        uint64_t sz = module_->getDataLayout().getTypeAllocSize(pollT);
+        auto* slot = b.CreateCall(
+            mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "poll_slot");
+        auto* h = b.CreateCall(execPushFn_, {pollPtr, framePtr, slot}, "handle");
+        b.CreateCall(execDriveFn_, {h});
+        // result = Poll<T>.value from the task's slot.
+        auto* valP = b.CreateStructGEP(pollT, slot, 1, "val_ptr");
+        auto* val = b.CreateLoad(valTy, valP, "result");
+        (void)i8PtrTy;
+        b.CreateRet(val);
+        return fn;
+    }
+
+    // Phase 18: `sleep_ms(n: i64) -> Future<i64>` — a real wall-clock timer
+    // leaf future. Frame: { i64 armed, i64 dl_sec, i64 dl_nsec, i64 ms }.
+    // First poll computes deadline = now + ms (CLOCK_MONOTONIC) and arms;
+    // every poll compares now vs deadline: past => Ready(ms); else register
+    // the deadline with the executor and return Pending. Registering lets the
+    // reactor sleep until the nearest deadline rather than busy-spin.
+    void declareSleepMs() {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* futureTy = structTypes_["Future"];
+        // frame { armed, dl_sec, dl_nsec, ms }.
+        auto* frameTy = llvm::StructType::create(
+            ctx, {i64Ty, i64Ty, i64Ty, i64Ty}, "kd.sleep_frame");
+        auto* setDl = declaredFns_["__kd_exec_set_deadline"];
+
+        // void __kd_sleep_poll(i8* frame, kd.poll* out).
+        llvm::Function* pollFn;
+        {
+            pollFn = llvm::Function::Create(
+                pollFnTy_, llvm::Function::InternalLinkage, "__kd_sleep_poll",
+                module_.get());
+            pollFn->getArg(0)->setName("frame");
+            pollFn->getArg(1)->setName("out");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", pollFn);
+            auto* armBB = llvm::BasicBlock::Create(ctx, "arm", pollFn);
+            auto* chkBB = llvm::BasicBlock::Create(ctx, "check", pollFn);
+            auto* readyBB = llvm::BasicBlock::Create(ctx, "ready", pollFn);
+            auto* pendBB = llvm::BasicBlock::Create(ctx, "pending", pollFn);
+            llvm::IRBuilder<> b(entry);
+            // Observe the poll (shared global counter, like yield_now).
+            auto* pc = b.CreateLoad(i64Ty, kdPollCount_, "pc");
+            b.CreateStore(
+                b.CreateAdd(pc, llvm::ConstantInt::get(i64Ty, 1)),
+                kdPollCount_);
+            auto* frame = pollFn->getArg(0);
+            auto* armedP = b.CreateStructGEP(frameTy, frame, 0, "armed_p");
+            auto* dlSecP = b.CreateStructGEP(frameTy, frame, 1, "dlsec_p");
+            auto* dlNsecP = b.CreateStructGEP(frameTy, frame, 2, "dlnsec_p");
+            auto* msP = b.CreateStructGEP(frameTy, frame, 3, "ms_p");
+            auto* armed = b.CreateLoad(i64Ty, armedP, "armed");
+            auto* needArm = b.CreateICmpEQ(
+                armed, llvm::ConstantInt::get(i64Ty, 0), "need_arm");
+            b.CreateCondBr(needArm, armBB, chkBB);
+            // arm: deadline = now + ms.
+            b.SetInsertPoint(armBB);
+            auto* nowTs = b.CreateAlloca(timespecTy_, nullptr, "now_ts");
+            b.CreateCall(
+                clockGettimeFn_,
+                {llvm::ConstantInt::get(i32Ty, kMonotonicClockId), nowTs});
+            auto* nowSec = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(timespecTy_, nowTs, 0, "ns_p"),
+                "now_sec");
+            auto* nowNsec = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(timespecTy_, nowTs, 1, "nn_p"),
+                "now_nsec");
+            auto* ms = b.CreateLoad(i64Ty, msP, "ms");
+            // total_nsec = now_nsec + (ms % 1000)*1e6 ; sec = now_sec + ms/1000
+            auto* addSec = b.CreateSDiv(ms, llvm::ConstantInt::get(i64Ty, 1000),
+                                        "add_sec");
+            auto* remMs = b.CreateSRem(ms, llvm::ConstantInt::get(i64Ty, 1000),
+                                       "rem_ms");
+            auto* addNsec = b.CreateMul(
+                remMs, llvm::ConstantInt::get(i64Ty, 1000000), "add_nsec");
+            auto* sumNsec = b.CreateAdd(nowNsec, addNsec, "sum_nsec");
+            // carry if sumNsec >= 1e9.
+            auto* carry = b.CreateICmpSGE(
+                sumNsec, llvm::ConstantInt::get(i64Ty, 1000000000), "carry");
+            auto* nsecFinal = b.CreateSelect(
+                carry,
+                b.CreateSub(sumNsec, llvm::ConstantInt::get(i64Ty, 1000000000)),
+                sumNsec, "nsec_final");
+            auto* secCarry = b.CreateSelect(
+                carry, llvm::ConstantInt::get(i64Ty, 1),
+                llvm::ConstantInt::get(i64Ty, 0), "sec_carry");
+            auto* secFinal = b.CreateAdd(
+                b.CreateAdd(nowSec, addSec), secCarry, "sec_final");
+            b.CreateStore(secFinal, dlSecP);
+            b.CreateStore(nsecFinal, dlNsecP);
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 1), armedP);
+            b.CreateBr(chkBB);
+            // check: now >= deadline ?
+            b.SetInsertPoint(chkBB);
+            auto* nowTs2 = b.CreateAlloca(timespecTy_, nullptr, "now_ts2");
+            b.CreateCall(
+                clockGettimeFn_,
+                {llvm::ConstantInt::get(i32Ty, kMonotonicClockId), nowTs2});
+            auto* nSec = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(timespecTy_, nowTs2, 0, "ns2_p"),
+                "n_sec");
+            auto* nNsec = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(timespecTy_, nowTs2, 1, "nn2_p"),
+                "n_nsec");
+            auto* dSec = b.CreateLoad(i64Ty, dlSecP, "d_sec");
+            auto* dNsec = b.CreateLoad(i64Ty, dlNsecP, "d_nsec");
+            // reached = now_sec > d_sec || (now_sec==d_sec && now_nsec>=d_nsec)
+            auto* secGt = b.CreateICmpSGT(nSec, dSec, "sec_gt");
+            auto* secEq = b.CreateICmpEQ(nSec, dSec, "sec_eq");
+            auto* nsecGe = b.CreateICmpSGE(nNsec, dNsec, "nsec_ge");
+            auto* reached =
+                b.CreateOr(secGt, b.CreateAnd(secEq, nsecGe), "reached");
+            b.CreateCondBr(reached, readyBB, pendBB);
+            // ready: Ready(ms).
+            b.SetInsertPoint(readyBB);
+            auto* out = pollFn->getArg(1);
+            b.CreateStore(llvm::ConstantInt::getTrue(ctx),
+                          b.CreateStructGEP(pollTy_, out, 0, "rdy_p"));
+            auto* ms2 = b.CreateLoad(i64Ty, msP, "ms2");
+            b.CreateStore(ms2,
+                          b.CreateStructGEP(pollTy_, out, 1, "outval_p"));
+            b.CreateRetVoid();
+            // pending: register deadline with the executor, return Pending.
+            b.SetInsertPoint(pendBB);
+            b.CreateCall(setDl, {dSec, dNsec});
+            b.CreateStore(llvm::ConstantInt::getFalse(ctx),
+                          b.CreateStructGEP(pollTy_, out, 0, "rdy_p2"));
+            b.CreateRetVoid();
+        }
+
+        // Future sleep_ms(i64 ms): malloc the frame { armed=0, 0, 0, ms } and
+        // return Future { __kd_sleep_poll, frame }.
+        {
+            auto* fnTy = llvm::FunctionType::get(futureTy, {i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "sleep_ms",
+                module_.get());
+            fn->getArg(0)->setName("ms");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            uint64_t sz = module_->getDataLayout().getTypeAllocSize(frameTy);
+            auto* frame = b.CreateCall(
+                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "sleep_frame");
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0),
+                          b.CreateStructGEP(frameTy, frame, 0, "armed0"));
+            b.CreateStore(fn->getArg(0),
+                          b.CreateStructGEP(frameTy, frame, 3, "ms0"));
+            llvm::Value* futv = llvm::UndefValue::get(futureTy);
+            futv = b.CreateInsertValue(futv, pollFn, {0}, "fut.poll");
+            futv = b.CreateInsertValue(futv, frame, {1}, "fut.frame");
+            b.CreateRet(futv);
+            declaredFns_["sleep_ms"] = fn;
+            (void)i1Ty;
+            (void)i8PtrTy;
+        }
+    }
+
+    // Phase 18: `spawn<T>(f: Future<T>) -> i64` — register f as a concurrent
+    // task and return its handle. Per-T only so the result slot is sized for T
+    // (read back by join<T>). Mangled `spawn__<T>` so emitCall routes here.
+    llvm::Function* getOrEmitSpawn(const TypePtr& T) {
+        std::string mangled = "spawn__" + mangleType(T);
+        auto it = declaredFns_.find(mangled);
+        if (it != declaredFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* futureTy = structTypes_["Future"];
+        auto* pollT = pollTypeFor(T);
+        auto* fnTy = llvm::FunctionType::get(i64Ty, {futureTy}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        fn->getArg(0)->setName("f");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        llvm::IRBuilder<> b(entry);
+        auto* fut = fn->getArg(0);
+        auto* pollPtr = b.CreateExtractValue(fut, {0}, "f.poll");
+        auto* framePtr = b.CreateExtractValue(fut, {1}, "f.frame");
+        uint64_t sz = module_->getDataLayout().getTypeAllocSize(pollT);
+        auto* slot = b.CreateCall(
+            mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "poll_slot");
+        auto* h = b.CreateCall(execPushFn_, {pollPtr, framePtr, slot}, "handle");
+        b.CreateRet(h);
+        declaredFns_[mangled] = fn;
+        return fn;
+    }
+
+    // Phase 18: `join<T>(handle: i64) -> T` — drive the executor until the
+    // handle's task completes, then return its result read as T from the
+    // task's poll_slot. Per-T so the value is read at its natural width.
+    llvm::Function* getOrEmitJoin(const TypePtr& T) {
+        std::string mangled = "join__" + mangleType(T);
+        auto it = declaredFns_.find(mangled);
+        if (it != declaredFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* pollT = pollTypeFor(T);
+        auto* valTy = mapKardashevType(T);
+        auto* fnTy = llvm::FunctionType::get(valTy, {i64Ty}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        fn->getArg(0)->setName("handle");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        llvm::IRBuilder<> b(entry);
+        auto* h = fn->getArg(0);
+        b.CreateCall(execDriveFn_, {h});
+        auto* slot = b.CreateCall(execSlotFn_, {h}, "tslot");
+        auto* pslot = b.CreateLoad(
+            i8PtrTy, b.CreateStructGEP(taskTy_, slot, TASK_SLOT, "sp"),
+            "pslot");
+        auto* valP = b.CreateStructGEP(pollT, pslot, 1, "val_ptr");
         auto* val = b.CreateLoad(valTy, valP, "result");
         b.CreateRet(val);
         declaredFns_[mangled] = fn;
         return fn;
     }
+
+#if defined(__linux__)
+    // Phase 18 stretch (Linux/epoll): the fd-readiness primitives. A pipe
+    // handle packs `(write_fd << 32) | read_fd`; the read end is set
+    // O_NONBLOCK so `read_pipe`'s poll can probe without blocking. `read_pipe`
+    // is a leaf future whose frame is { i64 fd, i64 registered }: first poll
+    // registers the fd with the executor's epoll set (EPOLLIN) and returns
+    // Pending; the reactor then blocks in epoll_wait (see __kd_exec_wait)
+    // until the fd is readable, after which a re-poll's non-blocking read
+    // succeeds and the future reports Ready(byte). EOF reports Ready(0).
+    void declareFdReactor() {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* futureTy = structTypes_["Future"];
+
+        // i64 pipe_make(): pipe(fds); set fds[0] nonblocking; pack hi/lo.
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "pipe_make",
+                module_.get());
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            b.CreateCall(execEnsureFn_, {}); // ensure executor exists
+            // ensure the epoll fd exists (lazily create on first pipe).
+            ensureEpoll(b);
+            auto* fds = b.CreateAlloca(i32Ty, llvm::ConstantInt::get(i32Ty, 2),
+                                       "fds");
+            b.CreateCall(pipeFn_, {fds});
+            auto* rfdP = b.CreateGEP(i32Ty, fds,
+                                     {llvm::ConstantInt::get(i32Ty, 0)}, "rfdp");
+            auto* rfd = b.CreateLoad(i32Ty, rfdP, "rfd");
+            auto* wfdP = b.CreateGEP(i32Ty, fds,
+                                     {llvm::ConstantInt::get(i32Ty, 1)}, "wfdp");
+            auto* wfd = b.CreateLoad(i32Ty, wfdP, "wfd");
+            // fcntl(rfd, F_SETFL, O_NONBLOCK). F_SETFL=4, O_NONBLOCK=04000.
+            b.CreateCall(fcntlFn_,
+                         {rfd, llvm::ConstantInt::get(i32Ty, 4 /*F_SETFL*/),
+                          llvm::ConstantInt::get(i32Ty, 04000 /*O_NONBLOCK*/)});
+            // handle = (wfd << 32) | (rfd & 0xffffffff).
+            auto* rfd64 = b.CreateZExt(rfd, i64Ty, "rfd64");
+            auto* wfd64 = b.CreateZExt(wfd, i64Ty, "wfd64");
+            auto* hi = b.CreateShl(wfd64, llvm::ConstantInt::get(i64Ty, 32),
+                                   "hi");
+            auto* handle = b.CreateOr(hi, rfd64, "handle");
+            b.CreateRet(handle);
+            declaredFns_["pipe_make"] = fn;
+        }
+
+        // i64 pipe_send(i64 handle, i64 byte): write one byte to the write end.
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i64Ty, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "pipe_send",
+                module_.get());
+            fn->getArg(0)->setName("handle");
+            fn->getArg(1)->setName("byte");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* wfd64 = b.CreateLShr(
+                fn->getArg(0), llvm::ConstantInt::get(i64Ty, 32), "wfd64");
+            auto* wfd = b.CreateTrunc(wfd64, i32Ty, "wfd");
+            auto* buf = b.CreateAlloca(i8Ty, nullptr, "buf");
+            b.CreateStore(b.CreateTrunc(fn->getArg(1), i8Ty, "b8"), buf);
+            auto* n = b.CreateCall(
+                writeFn_, {wfd, buf, llvm::ConstantInt::get(i64Ty, 1)}, "n");
+            b.CreateRet(n);
+            declaredFns_["pipe_send"] = fn;
+        }
+
+        // read_pipe's frame { i64 rfd, i64 registered }.
+        auto* frameTy = llvm::StructType::create(ctx, {i64Ty, i64Ty},
+                                                 "kd.readpipe_frame");
+
+        // void __kd_readpipe_poll(i8* frame, kd.poll* out).
+        {
+            auto* fn = llvm::Function::Create(
+                pollFnTy_, llvm::Function::InternalLinkage,
+                "__kd_readpipe_poll", module_.get());
+            fn->getArg(0)->setName("frame");
+            fn->getArg(1)->setName("out");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* gotBB = llvm::BasicBlock::Create(ctx, "got", fn);
+            auto* pendBB = llvm::BasicBlock::Create(ctx, "pending", fn);
+            auto* regBB = llvm::BasicBlock::Create(ctx, "register", fn);
+            auto* afterRegBB = llvm::BasicBlock::Create(ctx, "after_reg", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* pc = b.CreateLoad(i64Ty, kdPollCount_, "pc");
+            b.CreateStore(
+                b.CreateAdd(pc, llvm::ConstantInt::get(i64Ty, 1)),
+                kdPollCount_);
+            auto* frame = fn->getArg(0);
+            auto* fdP = b.CreateStructGEP(frameTy, frame, 0, "fd_p");
+            auto* fd64 = b.CreateLoad(i64Ty, fdP, "fd64");
+            auto* fd = b.CreateTrunc(fd64, i32Ty, "fd");
+            // Try a non-blocking read of 1 byte.
+            auto* buf = b.CreateAlloca(i8Ty, nullptr, "buf");
+            auto* n = b.CreateCall(
+                readFn_, {fd, buf, llvm::ConstantInt::get(i64Ty, 1)}, "n");
+            // n >= 1 => Ready(byte); n == 0 => EOF Ready(0); n < 0 => would
+            // block => Pending (register with epoll first time).
+            auto* got = b.CreateICmpSGE(
+                n, llvm::ConstantInt::get(i64Ty, 1), "got_byte");
+            b.CreateCondBr(got, gotBB, pendBB);
+            // got: Ready(byte) and deregister the fd from epoll.
+            b.SetInsertPoint(gotBB);
+            auto* byte = b.CreateZExt(b.CreateLoad(i8Ty, buf, "byte8"), i64Ty,
+                                      "byte");
+            deregisterFd(b, fd);
+            auto* out = fn->getArg(1);
+            b.CreateStore(llvm::ConstantInt::getTrue(ctx),
+                          b.CreateStructGEP(pollTy_, out, 0, "rdy_p"));
+            b.CreateStore(byte,
+                          b.CreateStructGEP(pollTy_, out, 1, "outval_p"));
+            b.CreateRetVoid();
+            // pending: register the fd with epoll if not yet, then Pending.
+            b.SetInsertPoint(pendBB);
+            auto* regP = b.CreateStructGEP(frameTy, frame, 1, "reg_p");
+            auto* reg = b.CreateLoad(i64Ty, regP, "reg");
+            auto* notReg = b.CreateICmpEQ(
+                reg, llvm::ConstantInt::get(i64Ty, 0), "not_reg");
+            b.CreateCondBr(notReg, regBB, afterRegBB);
+            b.SetInsertPoint(regBB);
+            registerFd(b, fd);
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 1), regP);
+            b.CreateBr(afterRegBB);
+            b.SetInsertPoint(afterRegBB);
+            b.CreateStore(llvm::ConstantInt::getFalse(ctx),
+                          b.CreateStructGEP(pollTy_, fn->getArg(1), 0, "rdy_p2"));
+            b.CreateRetVoid();
+            readPipePollFn_ = fn;
+        }
+
+        // Future read_pipe(i64 handle): frame { rfd = handle & 0xffffffff,
+        // registered = 0 }, future { __kd_readpipe_poll, frame }.
+        {
+            auto* fnTy = llvm::FunctionType::get(futureTy, {i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "read_pipe",
+                module_.get());
+            fn->getArg(0)->setName("handle");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            uint64_t sz = module_->getDataLayout().getTypeAllocSize(frameTy);
+            auto* frame = b.CreateCall(
+                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "rp_frame");
+            auto* rfd = b.CreateAnd(
+                fn->getArg(0), llvm::ConstantInt::get(i64Ty, 0xffffffff),
+                "rfd");
+            b.CreateStore(rfd, b.CreateStructGEP(frameTy, frame, 0, "fd0"));
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0),
+                          b.CreateStructGEP(frameTy, frame, 1, "reg0"));
+            llvm::Value* futv = llvm::UndefValue::get(futureTy);
+            futv = b.CreateInsertValue(futv, readPipePollFn_, {0}, "fut.poll");
+            futv = b.CreateInsertValue(futv, frame, {1}, "fut.frame");
+            b.CreateRet(futv);
+            declaredFns_["read_pipe"] = fn;
+            (void)i1Ty;
+            (void)i8PtrTy;
+        }
+    }
+
+    // Lazily create the executor's epoll instance (epoll_create1(0)) if epfd is
+    // still -1, storing the new fd back into the executor global. Emitted into
+    // the IRBuilder's current block.
+    void ensureEpoll(llvm::IRBuilder<>& b) {
+        auto& ctx = *ctx_;
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* epfdP = b.CreateStructGEP(execTy_, execGlobal_, EXEC_EPFD,
+                                        "epfd_p");
+        auto* epfd = b.CreateLoad(i32Ty, epfdP, "epfd");
+        auto* needCreate = b.CreateICmpSLT(
+            epfd, llvm::ConstantInt::get(i32Ty, 0), "need_epoll");
+        auto* fn = b.GetInsertBlock()->getParent();
+        auto* createBB = llvm::BasicBlock::Create(ctx, "mk_epoll", fn);
+        auto* contBB = llvm::BasicBlock::Create(ctx, "ep_cont", fn);
+        b.CreateCondBr(needCreate, createBB, contBB);
+        b.SetInsertPoint(createBB);
+        auto* newFd = b.CreateCall(
+            epollCreate1Fn_, {llvm::ConstantInt::get(i32Ty, 0)}, "new_epfd");
+        b.CreateStore(newFd, epfdP);
+        b.CreateBr(contBB);
+        b.SetInsertPoint(contBB);
+    }
+
+    // epoll_ctl(epfd, EPOLL_CTL_ADD=1, fd, &ev{ EPOLLIN, fd }); nfds++.
+    void registerFd(llvm::IRBuilder<>& b, llvm::Value* fd) {
+        auto& ctx = *ctx_;
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* epfd = b.CreateLoad(
+            i32Ty, b.CreateStructGEP(execTy_, execGlobal_, EXEC_EPFD, "epp"),
+            "epfd");
+        auto* ev = b.CreateAlloca(epollEventTy_, nullptr, "ev");
+        // EPOLLIN = 0x001.
+        b.CreateStore(llvm::ConstantInt::get(i32Ty, 0x001),
+                      b.CreateStructGEP(epollEventTy_, ev, 0, "ev_events"));
+        b.CreateStore(b.CreateZExt(fd, i64Ty, "fd64"),
+                      b.CreateStructGEP(epollEventTy_, ev, 1, "ev_data"));
+        b.CreateCall(epollCtlFn_,
+                     {epfd, llvm::ConstantInt::get(i32Ty, 1 /*ADD*/), fd, ev});
+        auto* nfdsP =
+            b.CreateStructGEP(execTy_, execGlobal_, EXEC_NFDS, "nfds_p");
+        auto* nfds = b.CreateLoad(i32Ty, nfdsP, "nfds");
+        b.CreateStore(b.CreateAdd(nfds, llvm::ConstantInt::get(i32Ty, 1)),
+                      nfdsP);
+    }
+
+    // epoll_ctl(epfd, EPOLL_CTL_DEL=2, fd, null); nfds--.
+    void deregisterFd(llvm::IRBuilder<>& b, llvm::Value* fd) {
+        auto& ctx = *ctx_;
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* epfd = b.CreateLoad(
+            i32Ty, b.CreateStructGEP(execTy_, execGlobal_, EXEC_EPFD, "epp"),
+            "epfd");
+        b.CreateCall(epollCtlFn_,
+                     {epfd, llvm::ConstantInt::get(i32Ty, 2 /*DEL*/), fd,
+                      llvm::ConstantPointerNull::get(
+                          llvm::cast<llvm::PointerType>(i8PtrTy))});
+        auto* nfdsP =
+            b.CreateStructGEP(execTy_, execGlobal_, EXEC_NFDS, "nfds_p");
+        auto* nfds = b.CreateLoad(i32Ty, nfdsP, "nfds");
+        b.CreateStore(b.CreateSub(nfds, llvm::ConstantInt::get(i32Ty, 1)),
+                      nfdsP);
+    }
+#endif // __linux__
 
     // Phase 5.z: lazily emit a per-element-type specialization of one of
     // the four `vec_*` built-ins. Mangled name = `<op>__<T_mangle>`,
@@ -4071,6 +5161,30 @@ private:
                 args.reserve(call.args.size());
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
                 return builder_->CreateCall(fn, args, "call_block_on");
+            }
+            // Phase 18: `spawn<T>(Future<T>) -> i64` and `join<T>(i64) -> T`
+            // — generic executor built-ins with no AST body; synthesize per T.
+            if (call.callee == "spawn" && !concreteTypeArgs.empty()) {
+                llvm::Function* fn = getOrEmitSpawn(concreteTypeArgs[0]);
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_spawn");
+            }
+            if (call.callee == "join" && !concreteTypeArgs.empty()) {
+                // `join<T>`'s T appears only in return position, so when the
+                // result is discarded (e.g. `join(h);` purely to drive a task
+                // to completion) inference can leave it an unsolved Var. The
+                // executor stores results uniformly, so an unconstrained join
+                // just reads an i64-shaped slot — default the Var to i64 so it
+                // codegens (the value is unused anyway).
+                TypePtr jt = resolve(concreteTypeArgs[0]);
+                if (jt->kind == TypeKind::Var) jt = makeInt();
+                llvm::Function* fn = getOrEmitJoin(jt);
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_join");
             }
             // Phase 17b: `hashmap_*<V>` are generic built-ins with no AST body
             // — synthesize a per-value-type specialization (key fixed i64).
