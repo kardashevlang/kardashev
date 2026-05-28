@@ -1720,6 +1720,90 @@ void test_async_sync_fn_awaiting_errors() {
         "async_sync_fn_awaiting_errors");
 }
 
+// --- Phase 17b: generic Future<T> / HashMap<i64, V> ---
+
+// `block_on` on a bool-returning async fn yields `bool`, usable in an if cond.
+void test_async_block_on_bool_result() {
+    expectOk(
+        "async fn ab() -> bool { let x = yield_now(1).await; x == 1 }\n"
+        "fn main() -> i64 { if block_on(ab()) { 1 } else { 0 } }",
+        "async_block_on_bool_result");
+}
+
+// `block_on` of a bool-returning async fn returns bool, NOT i64 — using it
+// where an i64 is required is a type error (proves T threads through).
+void test_async_block_on_bool_not_int_errors() {
+    expectErr(
+        "async fn ab() -> bool { let x = yield_now(1).await; x == 1 }\n"
+        "fn main() -> i64 { block_on(ab()) + 1 }",
+        "async_block_on_bool_not_int_errors");
+}
+
+// `.await` of a bool-returning async fn yields bool inside the awaiter.
+void test_async_await_bool_result() {
+    expectOk(
+        "async fn ab() -> bool { let x = yield_now(1).await; x == 1 }\n"
+        "async fn outer() -> i64 { if ab().await { 1 } else { 0 } }",
+        "async_await_bool_result");
+}
+
+// `block_on` of a struct-returning async fn returns that struct; fields read.
+void test_async_block_on_struct_result() {
+    expectOk(
+        "struct P { x: i64, y: i64 }\n"
+        "async fn mk() -> P { let a = yield_now(1).await; P { x: a, y: a } }\n"
+        "fn main() -> i64 { let p = block_on(mk()); p.x + p.y }",
+        "async_block_on_struct_result");
+}
+
+// HashMap value type is generic: a bool value inserts and `get` returns
+// `Option<bool>` (matched as a bool).
+void test_hashmap_bool_value_ok() {
+    expectOk(
+        "enum Option<T> { Some(T), None }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "    let m = hashmap_new();\n"
+        "    hashmap_insert(&mut m, 1, true);\n"
+        "    match hashmap_get(&m, 1) { Some(v) => if v { 1 } else { 0 }, None => 0 }\n"
+        "}",
+        "hashmap_bool_value_ok");
+}
+
+// A struct value round-trips through HashMap<i64, P>.
+void test_hashmap_struct_value_ok() {
+    expectOk(
+        "enum Option<T> { Some(T), None }\n"
+        "struct P { x: i64, y: i64 }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "    let m = hashmap_new();\n"
+        "    hashmap_insert(&mut m, 1, P { x: 2, y: 3 });\n"
+        "    match hashmap_get(&m, 1) { Some(p) => p.x + p.y, None => 0 }\n"
+        "}",
+        "hashmap_struct_value_ok");
+}
+
+// Inserting a value of a type inconsistent with an earlier insert is a type
+// error (the map's V is pinned by the first insert).
+void test_hashmap_value_type_consistency_errors() {
+    expectErr(
+        "enum Option<T> { Some(T), None }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "    let m = hashmap_new();\n"
+        "    hashmap_insert(&mut m, 1, true);\n"
+        "    hashmap_insert(&mut m, 2, 5);\n" // 5 is i64, not bool
+        "    0\n"
+        "}",
+        "hashmap_value_type_consistency_errors");
+}
+
+// The two-arg `HashMap<i64, V>` surface annotation requires an i64 key.
+void test_hashmap_non_i64_key_errors() {
+    expectErr(
+        "fn f() -> HashMap<bool, i64> ! { alloc } { hashmap_new() }\n"
+        "fn main() -> i64 { 0 }",
+        "hashmap_non_i64_key_errors");
+}
+
 // --- Phase 15: bool literals, unary ops, else-if, inherent impls ---
 
 void test_bool_literal_typechecks_as_bool() {
@@ -2004,6 +2088,15 @@ int main() {
     test_async_await_non_future_errors();
     test_async_call_returns_future_not_int();
     test_async_sync_fn_awaiting_errors();
+    // Phase 17b generic Future<T> / HashMap<i64,V>
+    test_async_block_on_bool_result();
+    test_async_block_on_bool_not_int_errors();
+    test_async_await_bool_result();
+    test_async_block_on_struct_result();
+    test_hashmap_bool_value_ok();
+    test_hashmap_struct_value_ok();
+    test_hashmap_value_type_consistency_errors();
+    test_hashmap_non_i64_key_errors();
     // Phase 13a Iterator trait + method-receiver autoref + adaptors
     test_mut_self_repeated_calls_typecheck_ok();
     test_for_over_custom_iterator_ok();
@@ -2025,6 +2118,6 @@ int main() {
     test_inherent_and_trait_method_coexist();
     test_inherent_unknown_method_errors();
     test_duplicate_method_across_impls_errors();
-    std::cout << "All typecheck tests passed (184 cases)\n";
+    std::cout << "All typecheck tests passed (192 cases)\n";
     return 0;
 }

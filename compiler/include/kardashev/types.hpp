@@ -136,6 +136,11 @@ TypePtr makeBox(TypePtr inner);
 // Phase 13b: a slice `&[T]` — modeled as the built-in single-layout struct
 // `Slice` with `typeArgs[0]` = element type.
 TypePtr makeSlice(TypePtr elem);
+// Phase 17b: a `Future<T>` — the built-in poll/frame pair carrying its result
+// type in `typeArgs[0]`. Codegen lowers every Future to one `{ i8* poll, i8*
+// frame }` layout; the result type only affects the per-T `Poll<T>` and the
+// per-T `block_on`/`.await` value handling (sized via DataLayout, like Vec).
+TypePtr makeFuture(TypePtr result);
 
 // Follow the union-find link chain to the representative. Performs
 // path compression as a side effect.

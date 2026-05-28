@@ -1364,6 +1364,85 @@ void test_hashmap_rehash_all_retrievable() {
     expectEquals(v, 0, "hashmap_rehash");
 }
 
+// --- Phase 17b: generic Future<T> (result type follows the async fn's
+// declared return type) ---
+
+// An async fn returning `bool` (true): block_on recovers the bool. Encoded as
+// 1 so the i64-returning `main` can carry it.
+void test_async_returns_bool_true() {
+    auto v = compileAndRun(
+        "async fn ab() -> bool { let x = yield_now(1).await; x == 1 }\n"
+        "fn main() -> i64 { if block_on(ab()) { 1 } else { 0 } }",
+        "main", "async_returns_bool_true");
+    expectEquals(v, 1, "async_returns_bool_true");
+}
+
+// An async fn returning `bool` (false): block_on recovers false.
+void test_async_returns_bool_false() {
+    auto v = compileAndRun(
+        "async fn ab() -> bool { let x = yield_now(2).await; x == 1 }\n"
+        "fn main() -> i64 { if block_on(ab()) { 1 } else { 0 } }",
+        "main", "async_returns_bool_false");
+    expectEquals(v, 0, "async_returns_bool_false");
+}
+
+// An async fn returning a struct built from two awaited values; the first
+// (`a`) is live across the second suspension, so it must be frame-promoted
+// even though it is only read inside the struct literal. block_on returns the
+// struct; read its fields.
+void test_async_returns_struct() {
+    auto v = compileAndRun(
+        "struct P { x: i64, y: i64 }\n"
+        "async fn mk() -> P {\n"
+        "    let a = yield_now(10).await;\n"
+        "    let b = yield_now(20).await;\n"
+        "    P { x: a, y: b }\n"
+        "}\n"
+        "fn main() -> i64 { let p = block_on(mk()); p.x * 100 + p.y }",
+        "main", "async_returns_struct");
+    expectEquals(v, 1020, "async_returns_struct");
+}
+
+// --- Phase 17b: generic HashMap<i64, V> (value type follows the inserts) ---
+
+// HashMap<i64, bool>: insert (1->true),(2->false); get returns Some(bool) /
+// None. Encode the three lookups so the i64 main can assert all at once.
+void test_hashmap_bool_value() {
+    auto v = compileAndRun(
+        "enum Option<T> { Some(T), None }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "    let m = hashmap_new();\n"
+        "    hashmap_insert(&mut m, 1, true);\n"
+        "    hashmap_insert(&mut m, 2, false);\n"
+        "    let a = match hashmap_get(&m, 1) { Some(v) => if v { 1 } else { 0 }, None => 0 - 1 };\n"
+        "    let b = match hashmap_get(&m, 2) { Some(v) => if v { 1 } else { 0 }, None => 0 - 1 };\n"
+        "    let c = match hashmap_get(&m, 9) { Some(v) => if v { 1 } else { 0 }, None => 0 - 1 };\n"
+        // a=1 (Some true), b=0 (Some false), c=-1 (None) => 1*100 + 0*10 - (-1)... encode:
+        "    a * 100 + b * 10 - c\n" // 100 + 0 - (-1) = 101
+        "}",
+        "main", "hashmap_bool_value");
+    expectEquals(v, 101, "hashmap_bool_value");
+}
+
+// HashMap<i64, P> for a struct P{x,y}: insert + overwrite + get back a struct;
+// read its fields. Also confirms a miss returns None.
+void test_hashmap_struct_value() {
+    auto v = compileAndRun(
+        "enum Option<T> { Some(T), None }\n"
+        "struct P { x: i64, y: i64 }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "    let m = hashmap_new();\n"
+        "    hashmap_insert(&mut m, 5, P { x: 50, y: 51 });\n"
+        "    hashmap_insert(&mut m, 5, P { x: 500, y: 501 });\n" // overwrite
+        "    let hit = match hashmap_get(&m, 5) { Some(p) => p.x + p.y, None => 0 - 1 };\n"
+        "    let miss = match hashmap_get(&m, 9) { Some(p) => p.x, None => 0 - 1 };\n"
+        // hit = 500 + 501 = 1001; miss = -1; len = 1 => 1001 - (-1) + 1 = 1003
+        "    hit - miss + hashmap_len(&m)\n"
+        "}",
+        "main", "hashmap_struct_value");
+    expectEquals(v, 1003, "hashmap_struct_value");
+}
+
 void test_slice_of_vec_len_and_get() {
     // Slice [1,4) of {10,20,30,40,50}: len 3, sum 20+30+40 == 90.
     auto v = compileAndRun(
@@ -1816,6 +1895,10 @@ int main() {
     test_async_single_await();
     test_async_zero_await_chain();
     test_async_param_survives_suspension();
+    // Phase 17b generic Future<T>: result type follows the async fn's return
+    test_async_returns_bool_true();
+    test_async_returns_bool_false();
+    test_async_returns_struct();
     // Phase 13a method-receiver autoref + Iterator trait + adaptors
     test_mut_self_persists_across_calls();
     test_shared_self_multiple_calls();
@@ -1828,6 +1911,9 @@ int main() {
     test_string_push_grows_past_initial_cap();
     test_hashmap_insert_get_overwrite();
     test_hashmap_rehash_all_retrievable();
+    // Phase 17b generic HashMap<i64,V>: value type follows the inserts
+    test_hashmap_bool_value();
+    test_hashmap_struct_value();
     test_slice_of_vec_len_and_get();
     test_slice_len_direct();
     // Phase 15: bool literals, unary ops, else-if, inherent impls
@@ -1855,9 +1941,10 @@ int main() {
     test_drop_user_impl_emits_call();
     test_drop_emits_free_for_vec();
     test_no_drop_glue_for_scalars();
-    std::cout << "All codegen tests passed (117 cases) — Phase 16 Drop/RAII: "
+    std::cout << "All codegen tests passed (122 cases) — Phase 16 Drop/RAII: "
                  "reverse-order scope drops, move semantics, conditional-move "
                  "drop flags, Vec/Box free, scalar codegen unchanged; Phase "
-                 "17a fn-value field calls + FnMut captures\n";
+                 "17a fn-value field calls + FnMut captures; Phase 17b generic "
+                 "Future<T> (bool/struct) + HashMap<i64,V> (bool/struct)\n";
     return 0;
 }

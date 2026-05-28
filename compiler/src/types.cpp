@@ -102,6 +102,18 @@ TypePtr makeSlice(TypePtr elem) {
     return t;
 }
 
+TypePtr makeFuture(TypePtr result) {
+    // Phase 17b: a `Future<T>` is the built-in single-layout struct `Future`
+    // carrying its result type in `typeArgs[0]`. Codegen lowers every Future
+    // to one `{ i8* poll, i8* frame }` layout regardless of T (the result is
+    // surfaced separately per await/block_on site, like Vec's element).
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Struct;
+    t->structName = "Future";
+    t->typeArgs = {std::move(result)};
+    return t;
+}
+
 TypePtr resolve(const TypePtr& t) {
     if (t->kind != TypeKind::Var || !t->link) return t;
     TypePtr rep = resolve(t->link);

@@ -437,7 +437,8 @@ private:
     llvm::Function* mallocFn_ = nullptr;
     llvm::Function* memcpyFn_ = nullptr; // Phase 13b: String/HashMap copies
     llvm::Function* memsetFn_ = nullptr; // Phase 13b: HashMap bucket zeroing
-    llvm::StructType* hmEntryTy_ = nullptr; // Phase 13b: HashMap bucket entry
+    // Phase 17b: the HashMap bucket entry struct is now per-V (emitted lazily
+    // by getOrEmitHashMapOp), so no single cached entry type lives here.
 
     // Phase 10b: the uniform fat-pointer LLVM type for ALL first-class fn
     // VALUES — `{ i8* fn, i8* env }`. `fn` points at a generated function
@@ -468,7 +469,13 @@ private:
     // --- Phase 12 real async runtime ---
     // Poll = { i1 ready, i64 value }; the poll-fn type void(i8* frame,
     // kd.poll* out); the global poll counter; and the leaf yield poll fn.
+    // `pollTy_` is the canonical `Poll<i64>` used by `yield_now`; Phase 17b
+    // adds `pollTypeFor(T)` for arbitrary result types (sized via DataLayout),
+    // cached in `pollTypes_` keyed by the mangled T. The poll-fn TYPE stays
+    // uniform `void(ptr, ptr)` — the out-param is opaque, so each future
+    // writes its own `Poll<T>` shape into a slot its caller allocated.
     llvm::StructType* pollTy_ = nullptr;
+    std::unordered_map<std::string, llvm::StructType*> pollTypes_;
     llvm::FunctionType* pollFnTy_ = nullptr;
     llvm::GlobalVariable* kdPollCount_ = nullptr;
     llvm::Function* yieldPollFn_ = nullptr;       // __kd_yield_poll
@@ -488,6 +495,11 @@ private:
     llvm::StructType* asyncFrameTy_ = nullptr;
     llvm::Value* asyncFramePtr_ = nullptr;
     llvm::Value* asyncPollOut_ = nullptr;
+    // Phase 17b: the `Poll<T>` layout of the async fn currently being lowered,
+    // T = its declared result type. The poll fn writes Ready/Pending + value
+    // into `*asyncPollOut_` through THIS shape (its block_on/await caller
+    // allocated a matching slot).
+    llvm::StructType* asyncPollTy_ = nullptr;
     llvm::SwitchInst* asyncSwitch_ = nullptr;
     std::unordered_map<std::string, unsigned> asyncFrameIndex_;
     std::vector<std::string> asyncPromotedLocals_; // spill/reload order
@@ -886,62 +898,81 @@ private:
         declareAsyncRuntime();
     }
 
-    // Phase 13b: build the concrete `Option<i64>` Kardashev TypePtr by
-    // instantiating the prelude's generic `Option<T>` enum schema with T=i64.
-    // hashmap_get returns this; we go through the schema (rather than hand-
-    // rolling enumVariants) so the variant order / payload slots match what
-    // pattern matching and emitCtorCall expect for `Some`/`None`.
-    TypePtr optionI64Type() {
+    // Phase 13b / 17b: HashMap<i64, V> open-addressing runtime.
+    //
+    // Layout (struct %HashMap): { i8* buckets, i64 len, i64 cap } — V-agnostic
+    // (a single layout, like Vec). `buckets` is a malloc'd flat array of `cap`
+    // entries; Phase 17b makes the entry per-V: { i64 state, i64 key, V value }
+    // (sized via DataLayout) where state 0 = empty, 1 = occupied. Collisions
+    // resolve by linear probing (slot, slot+1, ... mod cap). On insert, when
+    // (len+1)*2 >= cap the table doubles and every occupied entry is
+    // re-inserted (rehashed) into the new buffer. The key stays i64 (no Hash
+    // trait yet).
+    //
+    // Only the V-agnostic `%HashMap` struct is declared eagerly here; the
+    // per-V bucket-entry struct + the five ops are emitted lazily by
+    // getOrEmitHashMapOp (mirrors getOrEmitVecOp).
+    void declareHashMapRuntime() {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        // %HashMap = { i8* buckets, i64 len, i64 cap }
+        auto* hmTy = llvm::StructType::create(
+            ctx, {i8PtrTy, i64Ty, i64Ty}, "HashMap");
+        structTypes_["HashMap"] = hmTy;
+    }
+
+    // Phase 17b: build the concrete `Option<V>` Kardashev TypePtr by
+    // instantiating the prelude's generic `Option<T>` enum schema with T=V.
+    // hashmap_get<V> returns this; going through the schema keeps the variant
+    // order / payload slots matching what pattern matching / emitCtorCall
+    // expect for `Some`/`None`.
+    TypePtr optionType(const TypePtr& V) {
         auto eit = tc_.enums.find("Option");
         if (eit == tc_.enums.end()) return nullptr;
         const EnumSchema& schema = eit->second;
         if (schema.genericVars.empty()) return schema.type;
         std::unordered_map<int, TypePtr> subst;
-        subst[schema.genericVars[0]->varId] = makeInt();
+        subst[schema.genericVars[0]->varId] = V;
         TypePtr inst = instantiate(schema.type, subst);
-        inst->typeArgs = {makeInt()};
+        inst->typeArgs = {V};
         return inst;
     }
 
-    // Phase 13b: HashMap<i64,i64> open-addressing runtime.
-    //
-    // Layout (struct %HashMap): { i8* buckets, i64 len, i64 cap }. `buckets`
-    // is a malloc'd flat array of `cap` entries; each entry is
-    // { i64 state, i64 key, i64 value } (24 bytes) where state 0 = empty,
-    // 1 = occupied. Collisions resolve by linear probing (slot, slot+1, ...
-    // mod cap). On insert, when (len+1)*2 >= cap the table doubles and every
-    // occupied entry is re-inserted (rehashed) into the new buffer.
-    //
-    // The bucket entry LLVM struct + the raw-insert helper are emitted once
-    // and cached; the four public builtins (hashmap_new / _insert / _get /
-    // _len) call into them.
-    void declareHashMapRuntime() {
+    // Phase 17b: lazily emit a per-value-type specialization of the HashMap
+    // runtime. On first call for a given V we emit all five mangled fns
+    // (`__hm_raw_insert__<V>`, `hashmap_new__<V>`, `hashmap_insert__<V>`,
+    // `hashmap_get__<V>`, `hashmap_len__<V>`) over a per-V bucket entry
+    // `{ i64 state, i64 key, V value }`, then return the one named by `op`.
+    // Mirrors getOrEmitVecOp; the `%HashMap` struct itself stays single-layout.
+    llvm::Function* getOrEmitHashMapOp(const std::string& op, const TypePtr& V) {
+        std::string vMangle = mangleType(V);
+        std::string want = op + "__" + vMangle;
+        if (auto it = declaredFns_.find(want); it != declaredFns_.end())
+            return it->second;
+
         auto& ctx = *ctx_;
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
         auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
         auto* zero = llvm::ConstantInt::get(i64Ty, 0);
         auto* one = llvm::ConstantInt::get(i64Ty, 1);
-
-        // %HashMap = { i8* buckets, i64 len, i64 cap }
-        auto* hmTy = llvm::StructType::create(
-            ctx, {i8PtrTy, i64Ty, i64Ty}, "HashMap");
-        structTypes_["HashMap"] = hmTy;
-        // entry = { i64 state, i64 key, i64 value }
+        auto* hmTy = structTypes_["HashMap"];
+        auto* valTy = mapKardashevType(V);
+        // entry = { i64 state, i64 key, V value }
         auto* entryTy = llvm::StructType::create(
-            ctx, {i64Ty, i64Ty, i64Ty}, "kd.hm_entry");
-        hmEntryTy_ = entryTy;
+            ctx, {i64Ty, i64Ty, valTy}, "kd.hm_entry." + vMangle);
 
-        // __hm_raw_insert(buckets: i8*, cap: i64, k: i64, v: i64) -> i64.
+        // __hm_raw_insert__<V>(buckets: i8*, cap: i64, k: i64, v: V) -> i64.
         // Linear-probe from k % cap; if it finds the key, overwrite value and
         // return 0 (no new slot); if it finds an empty slot, write
         // {1,k,v} and return 1 (caller bumps len). Assumes cap > 0 and at
         // least one empty slot exists (guaranteed by the load-factor grow).
         {
             auto* fnTy = llvm::FunctionType::get(
-                i64Ty, {i8PtrTy, i64Ty, i64Ty, i64Ty}, false);
+                i64Ty, {i8PtrTy, i64Ty, i64Ty, valTy}, false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "__hm_raw_insert",
-                module_.get());
+                fnTy, llvm::Function::ExternalLinkage,
+                "__hm_raw_insert__" + vMangle, module_.get());
             fn->getArg(0)->setName("buckets");
             fn->getArg(1)->setName("cap");
             fn->getArg(2)->setName("k");
@@ -1001,16 +1032,16 @@ private:
             auto* wrapped = b.CreateURem(inc, cap, "wrap");
             b.CreateStore(wrapped, idxSlot);
             b.CreateBr(loopBB);
-            declaredFns_["__hm_raw_insert"] = fn;
+            declaredFns_["__hm_raw_insert__" + vMangle] = fn;
             (void)notEmptyBB;
         }
 
-        // hashmap_new() -> HashMap : empty {null,0,0}.
+        // hashmap_new__<V>() -> HashMap : empty {null,0,0} (V-agnostic value).
         {
             auto* fnTy = llvm::FunctionType::get(hmTy, {}, false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "hashmap_new",
-                module_.get());
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashmap_new__" + vMangle, module_.get());
             auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
             llvm::IRBuilder<> b(entry);
             llvm::Value* m = llvm::UndefValue::get(hmTy);
@@ -1019,23 +1050,23 @@ private:
             m = b.CreateInsertValue(m, zero, {1}, "len");
             m = b.CreateInsertValue(m, zero, {2}, "cap");
             b.CreateRet(m);
-            declaredFns_["hashmap_new"] = fn;
+            declaredFns_["hashmap_new__" + vMangle] = fn;
         }
 
-        // hashmap_insert(m: &mut HashMap, k, v) -> i64. Ensures capacity
-        // (grow + rehash when (len+1)*2 >= cap), then raw-inserts the pair
-        // and bumps len if it occupied a fresh slot.
+        // hashmap_insert__<V>(m: &mut HashMap, k: i64, v: V) -> i64. Ensures
+        // capacity (grow + rehash when (len+1)*2 >= cap), then raw-inserts the
+        // pair and bumps len if it occupied a fresh slot.
         {
             auto dl = module_->getDataLayout();
             uint64_t entryBytes = dl.getTypeAllocSize(entryTy);
             auto* entryBytesK = llvm::ConstantInt::get(i64Ty, entryBytes);
-            auto* rawInsert = declaredFns_["__hm_raw_insert"];
+            auto* rawInsert = declaredFns_["__hm_raw_insert__" + vMangle];
 
             auto* fnTy = llvm::FunctionType::get(
-                i64Ty, {i8PtrTy, i64Ty, i64Ty}, false);
+                i64Ty, {i8PtrTy, i64Ty, valTy}, false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "hashmap_insert",
-                module_.get());
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashmap_insert__" + vMangle, module_.get());
             fn->getArg(0)->setName("m");
             fn->getArg(1)->setName("k");
             fn->getArg(2)->setName("v");
@@ -1104,7 +1135,7 @@ private:
             auto* okeyP = b.CreateStructGEP(entryTy, oeptr, 1, "okeyP");
             auto* okey = b.CreateLoad(i64Ty, okeyP, "okey");
             auto* ovalP = b.CreateStructGEP(entryTy, oeptr, 2, "ovalP");
-            auto* oval = b.CreateLoad(i64Ty, ovalP, "oval");
+            auto* oval = b.CreateLoad(valTy, ovalP, "oval");
             b.CreateCall(rawInsert, {newBuf, newCap, okey, oval}, "");
             b.CreateBr(rehashStep);
 
@@ -1128,22 +1159,22 @@ private:
             auto* newLen = b.CreateAdd(curLen, added, "newLen");
             b.CreateStore(newLen, lenP);
             b.CreateRet(zero);
-            declaredFns_["hashmap_insert"] = fn;
+            declaredFns_["hashmap_insert__" + vMangle] = fn;
         }
 
-        // hashmap_get(m: &HashMap, k) -> Option<i64> : linear-probe; Some(v)
-        // if found, None if an empty slot is hit first (or cap==0). The probe
-        // index lives in an alloca (`idxSlot`); `entry` seeds it (or returns
-        // None for an empty map), `probe` reloads it each iteration, `step`
-        // advances it and branches back.
+        // hashmap_get__<V>(m: &HashMap, k: i64) -> Option<V> : linear-probe;
+        // Some(v) if found, None if an empty slot is hit first (or cap==0). The
+        // probe index lives in an alloca (`idxSlot`); `entry` seeds it (or
+        // returns None for an empty map), `probe` reloads it each iteration,
+        // `step` advances it and branches back.
         {
-            TypePtr optTy = optionI64Type();
+            TypePtr optTy = optionType(V);
             if (!optTy) {
                 // No `Option` in scope (a self-contained unit-test fixture
                 // with no prelude). The typechecker likewise skipped
                 // registering `hashmap_get`, so a program here can't call it
                 // — skip emitting it silently rather than erroring out.
-                return;
+                return nullptr;
             }
             mapKardashevType(optTy); // declare LLVM struct + payload slots
             const std::string optMangled =
@@ -1157,8 +1188,8 @@ private:
             auto* fnTy = llvm::FunctionType::get(
                 optLlvm, {i8PtrTy, i64Ty}, false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "hashmap_get",
-                module_.get());
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashmap_get__" + vMangle, module_.get());
             fn->getArg(0)->setName("m");
             fn->getArg(1)->setName("k");
             auto* mPtr = fn->getArg(0);
@@ -1215,7 +1246,7 @@ private:
 
             b.SetInsertPoint(hitBB);
             auto* valP = b.CreateStructGEP(entryTy, eptr, 2, "valP");
-            auto* val = b.CreateLoad(i64Ty, valP, "val");
+            auto* val = b.CreateLoad(valTy, valP, "val");
             llvm::Value* someAgg = llvm::UndefValue::get(optLlvm);
             someAgg = b.CreateInsertValue(
                 someAgg, llvm::ConstantInt::get(i32Ty, someIdx), {0}, "some");
@@ -1227,22 +1258,27 @@ private:
             auto* wrapped = b.CreateURem(inc, cap, "wrap");
             b.CreateStore(wrapped, idxSlot);
             b.CreateBr(loopBB);
-            declaredFns_["hashmap_get"] = fn;
+            declaredFns_["hashmap_get__" + vMangle] = fn;
         }
 
-        // hashmap_len(m: &HashMap) -> i64
+        // hashmap_len__<V>(m: &HashMap) -> i64 (value-agnostic, but emitted
+        // per-V so the interception routes uniformly).
         {
             auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "hashmap_len",
-                module_.get());
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashmap_len__" + vMangle, module_.get());
             fn->getArg(0)->setName("m");
             auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
             llvm::IRBuilder<> b(entry);
             auto* lenP = b.CreateStructGEP(hmTy, fn->getArg(0), 1, "lenP");
             b.CreateRet(b.CreateLoad(i64Ty, lenP, "len"));
-            declaredFns_["hashmap_len"] = fn;
+            declaredFns_["hashmap_len__" + vMangle] = fn;
         }
+
+        // All five are now emitted for this V; return the requested one.
+        auto it = declaredFns_.find(want);
+        return it != declaredFns_.end() ? it->second : nullptr;
     }
 
     // memset extern (used to zero a freshly malloc'd HashMap bucket array).
@@ -1345,12 +1381,17 @@ private:
             declaredFns_["yield_now"] = fn;
         }
 
-        // i64 block_on(Future f): the single-threaded executor. Busy-poll
-        // f.poll(f.frame, &poll) until Ready, then return the value.
+        // i64 block_on__i64(Future f): the single-threaded executor for the
+        // i64 result type. Busy-poll f.poll(f.frame, &poll) until Ready, then
+        // return the value. Phase 17b makes `block_on` generic over the result
+        // type T: call sites route to a `block_on__<T>` specialization
+        // (getOrEmitBlockOn). We emit the i64 specialization eagerly here (the
+        // common case + back-compat) and register it under both the mangled
+        // name and the bare `block_on` alias.
         {
             auto* fnTy = llvm::FunctionType::get(i64Ty, {futureTy}, false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "block_on",
+                fnTy, llvm::Function::ExternalLinkage, "block_on__i64",
                 module_.get());
             fn->getArg(0)->setName("f");
             auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
@@ -1372,6 +1413,7 @@ private:
             auto* valP = b.CreateStructGEP(pollTy_, pollSlot, 1, "val_ptr");
             auto* val = b.CreateLoad(i64Ty, valP, "result");
             b.CreateRet(val);
+            declaredFns_["block_on__i64"] = fn;
             declaredFns_["block_on"] = fn;
         }
 
@@ -1386,6 +1428,70 @@ private:
             b.CreateRet(b.CreateLoad(i64Ty, kdPollCount_, "pc"));
             declaredFns_["poll_count"] = fn;
         }
+    }
+
+    // Phase 17b: the per-result-type `Poll<T> = { i1 ready, T value }`. Built
+    // lazily and cached by mangled T. `Poll<i64>` aliases the canonical
+    // `pollTy_`. Used to size + GEP the value slot at every block_on / await /
+    // async-fn-finish site for a future whose result is T.
+    llvm::StructType* pollTypeFor(const TypePtr& T) {
+        std::string m = mangleType(T);
+        // i64 and unit both use the canonical `Poll<i64>` value slot: i64 is
+        // the common case, and a unit-bodied async fn reports Ready(0) into an
+        // i64 slot (void can't be a struct field). Everything else gets a
+        // dedicated `{ i1, T }` shape sized via DataLayout at use sites.
+        if (m == "i64" || m == "unit") return pollTy_;
+        auto it = pollTypes_.find(m);
+        if (it != pollTypes_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* valTy = mapKardashevType(T);
+        auto* pt = llvm::StructType::create(ctx, {i1Ty, valTy}, "kd.poll." + m);
+        pollTypes_[m] = pt;
+        return pt;
+    }
+
+    // Phase 17b: lazily emit a per-result-type specialization of `block_on`.
+    // Mangled `block_on__<T>` so emitCall's generic-callee branch routes to it
+    // (mirrors getOrEmitVecOp). The executor busy-polls the future until Ready
+    // then returns the value read as T from a `Poll<T>` slot. `block_on__i64`
+    // is the original i64 executor (emitted eagerly in declareAsyncRuntime and
+    // also registered under the bare `block_on` name for back-compat).
+    llvm::Function* getOrEmitBlockOn(const TypePtr& T) {
+        std::string mangled = "block_on__" + mangleType(T);
+        auto it = declaredFns_.find(mangled);
+        if (it != declaredFns_.end()) return it->second;
+
+        auto& ctx = *ctx_;
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* futureTy = structTypes_["Future"];
+        auto* pollT = pollTypeFor(T);
+        auto* valTy = mapKardashevType(T);
+
+        auto* fnTy = llvm::FunctionType::get(valTy, {futureTy}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        fn->getArg(0)->setName("f");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        llvm::IRBuilder<> b(entry);
+        auto* fut = fn->getArg(0);
+        auto* pollPtr = b.CreateExtractValue(fut, {0}, "f.poll");
+        auto* framePtr = b.CreateExtractValue(fut, {1}, "f.frame");
+        auto* pollSlot = b.CreateAlloca(pollT, nullptr, "poll_slot");
+        auto* loopBB = llvm::BasicBlock::Create(ctx, "block_on.loop", fn);
+        auto* doneBB = llvm::BasicBlock::Create(ctx, "block_on.done", fn);
+        b.CreateBr(loopBB);
+        b.SetInsertPoint(loopBB);
+        b.CreateCall(pollFnTy_, pollPtr, {framePtr, pollSlot});
+        auto* rdyP = b.CreateStructGEP(pollT, pollSlot, 0, "ready_ptr");
+        auto* rdy = b.CreateLoad(i1Ty, rdyP, "ready");
+        b.CreateCondBr(rdy, doneBB, loopBB);
+        b.SetInsertPoint(doneBB);
+        auto* valP = b.CreateStructGEP(pollT, pollSlot, 1, "val_ptr");
+        auto* val = b.CreateLoad(valTy, valP, "result");
+        b.CreateRet(val);
+        declaredFns_[mangled] = fn;
+        return fn;
     }
 
     // Phase 5.z: lazily emit a per-element-type specialization of one of
@@ -1644,15 +1750,19 @@ private:
                 return llvm::PointerType::get(*ctx_, /*AS=*/0);
             }
             case TypeKind::Struct: {
-                // Built-in single-layout generics: `Vec<T>` and `String`
-                // always lower to the one hand-built `%Vec` / `%String`
-                // struct (`getOrEmitVecOp` keeps a single `{i8*,i64,i64}`
-                // layout and computes the element size separately), so
-                // `Vec<i64>` must NOT get a distinct `%Vec__i64` instance —
-                // that would mismatch the value `vec_new()` produces (e.g.
-                // when a fn returns `Vec<i64>`).
+                // Built-in single-layout generics: `Vec<T>`, `String`,
+                // `Slice`, `HashMap<V>` and `Future<T>` always lower to one
+                // hand-built struct regardless of their type arg(s). Vec keeps
+                // a single `{i8*,i64,i64}` layout (element size computed
+                // separately); HashMap is `{i8*,i64,i64}` (per-V bucket entry
+                // sized separately); Future is `{i8* poll, i8* frame}` (the
+                // result T only affects the per-T Poll/await/block_on, never
+                // the Future value itself). So `Vec<i64>` / `Future<bool>` /
+                // `HashMap<P>` must NOT get a distinct `%T__arg` instance —
+                // that would mismatch the value the constructor produces.
                 if (r->structName == "Vec" || r->structName == "String" ||
-                    r->structName == "Slice") {
+                    r->structName == "Slice" || r->structName == "HashMap" ||
+                    r->structName == "Future") {
                     auto bit = structTypes_.find(r->structName);
                     if (bit != structTypes_.end()) return bit->second;
                 }
@@ -2180,8 +2290,55 @@ private:
             for (const auto& a : call->args) collectAsyncLocalTypes(*a, out, seen);
             return;
         }
-        // Other expression kinds bind no locals reachable in the MVP async
-        // surface; their sub-expressions can't introduce `let`s.
+        // Phase 17b: descend into the remaining composite expressions so a
+        // `let` nested inside any of them (e.g. a struct-field block, a match
+        // arm) is still discovered and given a frame slot. Mirrors the wider
+        // set asyncLivenessWalk now traverses.
+        if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
+            for (const auto& f : sl->fields)
+                collectAsyncLocalTypes(*f.second, out, seen);
+            return;
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
+            collectAsyncLocalTypes(*fe->object, out, seen);
+            return;
+        }
+        if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
+            collectAsyncLocalTypes(*re->operand, out, seen);
+            return;
+        }
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            collectAsyncLocalTypes(*ue->operand, out, seen);
+            return;
+        }
+        if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
+            collectAsyncLocalTypes(*mc->receiver, out, seen);
+            for (const auto& a : mc->args) collectAsyncLocalTypes(*a, out, seen);
+            return;
+        }
+        if (auto* me = dynamic_cast<const ast::MatchExpr*>(&e)) {
+            collectAsyncLocalTypes(*me->scrutinee, out, seen);
+            for (const auto& arm : me->arms)
+                collectAsyncLocalTypes(*arm.body, out, seen);
+            return;
+        }
+        if (auto* se = dynamic_cast<const ast::SliceExpr*>(&e)) {
+            collectAsyncLocalTypes(*se->operand, out, seen);
+            collectAsyncLocalTypes(*se->start, out, seen);
+            collectAsyncLocalTypes(*se->end, out, seen);
+            return;
+        }
+        if (auto* range = dynamic_cast<const ast::RangeExpr*>(&e)) {
+            collectAsyncLocalTypes(*range->start, out, seen);
+            collectAsyncLocalTypes(*range->end, out, seen);
+            return;
+        }
+        if (auto* bn = dynamic_cast<const ast::BoxNewExpr*>(&e)) {
+            collectAsyncLocalTypes(*bn->value, out, seen);
+            return;
+        }
+        // Remaining kinds (literals, idents, closures) bind no locals reachable
+        // in the async surface; their sub-expressions can't introduce `let`s.
     }
 
     // Phase 12: compute the set of locals (params + `let` bindings) that are
@@ -2239,6 +2396,47 @@ private:
         }
         if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
             asyncLivenessWalk(*re->operand, boundAt, awaitCounter, promoted);
+            return;
+        }
+        // Phase 17b: a struct literal `P { x: a, y: b }` reads each field
+        // expression — so a local used only inside one (and bound before an
+        // await it crosses) must still be promoted (e.g. an async fn returning
+        // a struct built from awaited values). This traversal was missing,
+        // which left such locals on a non-dominating alloca.
+        if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
+            for (const auto& f : sl->fields)
+                asyncLivenessWalk(*f.second, boundAt, awaitCounter, promoted);
+            return;
+        }
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            asyncLivenessWalk(*ue->operand, boundAt, awaitCounter, promoted);
+            return;
+        }
+        if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
+            asyncLivenessWalk(*mc->receiver, boundAt, awaitCounter, promoted);
+            for (const auto& a : mc->args)
+                asyncLivenessWalk(*a, boundAt, awaitCounter, promoted);
+            return;
+        }
+        if (auto* me = dynamic_cast<const ast::MatchExpr*>(&e)) {
+            asyncLivenessWalk(*me->scrutinee, boundAt, awaitCounter, promoted);
+            for (const auto& arm : me->arms)
+                asyncLivenessWalk(*arm.body, boundAt, awaitCounter, promoted);
+            return;
+        }
+        if (auto* se = dynamic_cast<const ast::SliceExpr*>(&e)) {
+            asyncLivenessWalk(*se->operand, boundAt, awaitCounter, promoted);
+            asyncLivenessWalk(*se->start, boundAt, awaitCounter, promoted);
+            asyncLivenessWalk(*se->end, boundAt, awaitCounter, promoted);
+            return;
+        }
+        if (auto* range = dynamic_cast<const ast::RangeExpr*>(&e)) {
+            asyncLivenessWalk(*range->start, boundAt, awaitCounter, promoted);
+            asyncLivenessWalk(*range->end, boundAt, awaitCounter, promoted);
+            return;
+        }
+        if (auto* bn = dynamic_cast<const ast::BoxNewExpr*>(&e)) {
+            asyncLivenessWalk(*bn->value, boundAt, awaitCounter, promoted);
             return;
         }
         if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
@@ -2395,6 +2593,7 @@ private:
         auto savedFrameTy = asyncFrameTy_;
         auto savedFramePtr = asyncFramePtr_;
         auto savedPollOut = asyncPollOut_;
+        auto savedPollTy = asyncPollTy_;
         auto savedSwitch = asyncSwitch_;
         auto savedFrameIndex = std::move(asyncFrameIndex_);
         auto savedPromoted = std::move(asyncPromotedLocals_);
@@ -2411,6 +2610,10 @@ private:
         asyncFrameTy_ = frameTy;
         asyncFramePtr_ = pollFn->getArg(0);
         asyncPollOut_ = pollFn->getArg(1);
+        // Phase 17b: this async fn's result type drives the Poll<T> shape its
+        // poll fn writes through. currentFnReturnType_ is the INNER type T
+        // (the body's value type), not Future<T>.
+        asyncPollTy_ = pollTypeFor(currentFnReturnType_);
         asyncFrameIndex_ = std::move(frameIndex);
         asyncPromotedLocals_ = std::move(promotedOrder);
         asyncStateIdx_ = stateIdx;
@@ -2468,6 +2671,7 @@ private:
         asyncFrameTy_ = savedFrameTy;
         asyncFramePtr_ = savedFramePtr;
         asyncPollOut_ = savedPollOut;
+        asyncPollTy_ = savedPollTy;
         asyncSwitch_ = savedSwitch;
         asyncFrameIndex_ = std::move(savedFrameIndex);
         asyncPromotedLocals_ = std::move(savedPromoted);
@@ -2503,16 +2707,23 @@ private:
 
     // Finish the current async fn: write Ready(value) into the Poll out-param
     // and return from the poll function. `value` may be null for a unit body
-    // (we report Ready(0) — only `-> i64` async fns exist in the MVP).
+    // (we report Ready(0) into the i64-shaped Poll). Phase 17b: the out-param
+    // is shaped as `asyncPollTy_` = Poll<T> for this fn's result type T, so a
+    // bool / struct result is stored at its natural width.
     void finishAsyncReady(llvm::Value* value) {
         auto& ctx = *ctx_;
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
-        if (!value) value = llvm::ConstantInt::get(i64Ty, 0);
+        llvm::StructType* pollT = asyncPollTy_ ? asyncPollTy_ : pollTy_;
+        if (!value) {
+            // Unit body: report Ready(0) into the i64 slot (pollTypeFor(unit)
+            // aliases pollTy_, so pollT's value field is i64 here).
+            value = llvm::ConstantInt::get(i64Ty, 0);
+        }
         auto* rdyP =
-            builder_->CreateStructGEP(pollTy_, asyncPollOut_, 0, "ready_ptr");
+            builder_->CreateStructGEP(pollT, asyncPollOut_, 0, "ready_ptr");
         builder_->CreateStore(llvm::ConstantInt::getTrue(ctx), rdyP);
         auto* valP =
-            builder_->CreateStructGEP(pollTy_, asyncPollOut_, 1, "out_val_ptr");
+            builder_->CreateStructGEP(pollT, asyncPollOut_, 1, "out_val_ptr");
         builder_->CreateStore(value, valP);
         builder_->CreateRetVoid();
     }
@@ -2547,6 +2758,21 @@ private:
         auto* i1Ty = llvm::Type::getInt1Ty(ctx);
         auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
         auto* futureTy = structTypes_["Future"];
+
+        // Phase 17b: the awaited sub-future's result type. Its operand types as
+        // `Future<subT>`; we poll it through a `Poll<subT>` slot and read the
+        // ready value as subT. Defensive fallback to i64 if the type is
+        // missing (ill-typed input codegen shouldn't reach) or typeArgs-less.
+        TypePtr subResultTy = makeInt();
+        if (TypePtr opTy = lookupExprType(*ae.operand)) {
+            TypePtr ro = resolveInInstance(opTy);
+            if (ro->kind == TypeKind::Struct && ro->structName == "Future" &&
+                !ro->typeArgs.empty()) {
+                subResultTy = ro->typeArgs[0];
+            }
+        }
+        auto* subPollTy = pollTypeFor(subResultTy);
+        auto* subValTy = mapKardashevType(subResultTy);
 
         int state = asyncNextState_++;
 
@@ -2587,24 +2813,30 @@ private:
         auto* fut = builder_->CreateLoad(futureTy, subfutSlot, "subfut");
         auto* subPoll = builder_->CreateExtractValue(fut, {0}, "subfut.poll");
         auto* subFrame = builder_->CreateExtractValue(fut, {1}, "subfut.frame");
-        auto* pollSlot = builder_->CreateAlloca(pollTy_, nullptr, "subpoll");
+        auto* pollSlot = builder_->CreateAlloca(subPollTy, nullptr, "subpoll");
         builder_->CreateCall(pollFnTy_, subPoll, {subFrame, pollSlot});
-        auto* rdyP = builder_->CreateStructGEP(pollTy_, pollSlot, 0, "ready_ptr");
+        auto* rdyP = builder_->CreateStructGEP(subPollTy, pollSlot, 0, "ready_ptr");
         auto* rdy = builder_->CreateLoad(i1Ty, rdyP, "ready");
         builder_->CreateCondBr(rdy, readyBB, pendingBB);
 
-        // PENDING: propagate Pending to our caller and return (suspend).
+        // PENDING: propagate Pending to our caller and return (suspend). Only
+        // the `ready` flag (field 0) is written; the value is undefined while
+        // Pending. Use this fn's own Poll<T> shape for the out-param GEP.
         builder_->SetInsertPoint(pendingBB);
+        llvm::StructType* outPollTy = asyncPollTy_ ? asyncPollTy_ : pollTy_;
         auto* outRdyP =
-            builder_->CreateStructGEP(pollTy_, asyncPollOut_, 0, "out_ready_ptr");
+            builder_->CreateStructGEP(outPollTy, asyncPollOut_, 0,
+                                      "out_ready_ptr");
         builder_->CreateStore(llvm::ConstantInt::getFalse(ctx), outRdyP);
         builder_->CreateRetVoid();
 
-        // READY: extract the value and continue with it as the await result.
+        // READY: extract the value (as the sub-future's result type) and
+        // continue with it as the await result.
         builder_->SetInsertPoint(readyBB);
-        auto* valP = builder_->CreateStructGEP(pollTy_, pollSlot, 1, "val_ptr");
+        auto* valP = builder_->CreateStructGEP(subPollTy, pollSlot, 1, "val_ptr");
         (void)i8PtrTy;
-        return builder_->CreateLoad(i64Ty, valP, "await_result");
+        (void)i64Ty;
+        return builder_->CreateLoad(subValTy, valP, "await_result");
     }
 
     // ===================================================================
@@ -3830,6 +4062,36 @@ private:
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
                 return builder_->CreateCall(fn, args, "call_" + call.callee);
             }
+            // Phase 17b: `block_on<T>` is a generic built-in with no AST body
+            // — synthesize a per-result-type executor (mirrors vec_*). T is
+            // the call-site type arg (the future's result type).
+            if (call.callee == "block_on" && !concreteTypeArgs.empty()) {
+                llvm::Function* fn = getOrEmitBlockOn(concreteTypeArgs[0]);
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_block_on");
+            }
+            // Phase 17b: `hashmap_*<V>` are generic built-ins with no AST body
+            // — synthesize a per-value-type specialization (key fixed i64).
+            if ((call.callee == "hashmap_new" ||
+                 call.callee == "hashmap_insert" ||
+                 call.callee == "hashmap_get" ||
+                 call.callee == "hashmap_len") &&
+                !concreteTypeArgs.empty()) {
+                llvm::Function* fn =
+                    getOrEmitHashMapOp(call.callee, concreteTypeArgs[0]);
+                if (!fn) {
+                    errors_.push_back(
+                        "codegen: cannot specialize " + call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
+            }
             const std::string mangled =
                 mangleInstance(call.callee, concreteTypeArgs);
             auto fnIt = declaredFns_.find(mangled);
@@ -5004,6 +5266,13 @@ private:
 
         builder_->SetInsertPoint(mergeBB);
         if (!thenTerm && !elseTerm) {
+            // A unit-valued if where both branches end in a statement with no
+            // tail (e.g. `if c { print(1); } else { print(0); }` used as a
+            // statement) produces no SSA value — there is nothing to phi.
+            // Guard so we don't deref a null branch value (would crash). Only
+            // build the merge PHI when both branches actually yield a value;
+            // the value-producing path is unchanged.
+            if (!thenV || !elseV) return nullptr;
             auto* phi = builder_->CreatePHI(thenV->getType(), 2, "ifval");
             phi->addIncoming(thenV, thenEndBB);
             phi->addIncoming(elseV, elseEndBB);

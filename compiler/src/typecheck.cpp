@@ -55,18 +55,25 @@ public:
         }
         TypePtr stringTy = structSchemas_["String"].type;
 
-        // Phase 12 built-in: `Future` — a poll-function/frame pair. Codegen
-        // lays it out as { i8* poll, i8* frame } where `poll(frame, &Poll)`
-        // advances the future and reports Ready(value) / Pending via the
-        // out-param. (MVP only handles `Future` of `i64`; richer wrapped
-        // types wait for generic Future<T>.) The struct stays nameable but
-        // opaque to user dot-access.
+        // Phase 12 built-in, Phase 17b generic: `Future<T>` — a
+        // poll-function/frame pair. Codegen lays it out as { i8* poll, i8*
+        // frame } where `poll(frame, &Poll<T>)` advances the future and
+        // reports Ready(value) / Pending via the out-param. The result type T
+        // is carried in `typeArgs[0]`; an `async fn -> T` produces
+        // `Future<T>`, `.await` unwraps to T, and `block_on` returns T. The
+        // struct stays nameable but opaque to user dot-access. Registered as a
+        // generic schema (one type param) so `resolveTypeRef` can materialize
+        // a concrete `Future<T>` and codegen treats it like Vec (single
+        // layout, T surfaced per use site).
+        TypePtr futureGenericVar = makeFreshVar();
         {
             StructSchema sch;
-            sch.type = makeStruct("Future", {});
+            sch.type = makeFuture(futureGenericVar);
+            sch.genericVars.push_back(futureGenericVar);
             structSchemas_["Future"] = std::move(sch);
         }
-        TypePtr futureTy = structSchemas_["Future"].type;
+        // A `Future<i64>` instance used by the i64-leaf builtins below.
+        TypePtr futureI64Ty = makeFuture(makeInt());
 
         // Phase 9 built-in: `Range` — the iterable produced by `a..b` and
         // `a..=b`. Fields: current `start`, `end` bound, and `inclusive`
@@ -179,39 +186,49 @@ public:
             fnSchemas_["vec_len"] = std::move(sch);
         }
 
-        // Phase 13b built-in: `HashMap<i64, i64>` — an open-addressing map
-        // (MVP: i64 keys + i64 values). The struct is nameable but its
-        // fields are opaque to user dot-access (codegen lays it out as
-        // { i8* buckets, i64 len, i64 cap }). hashmap_get returns Option<i64>
-        // and is registered after the prelude's Option enum is resolved
-        // (see below, post pass-1).
+        // Phase 13b / 17b built-in: `HashMap<i64, V>` — an open-addressing
+        // map. The KEY stays `i64` (no Hash trait yet); the VALUE V is
+        // generic, inferred at the first insert (like `Vec<T>` via vec_push).
+        // Internally we carry only V in `typeArgs[0]` (the key is implicitly
+        // i64). The struct is nameable but its fields are opaque to user
+        // dot-access (codegen lays it out as { i8* buckets, i64 len, i64 cap }
+        // with a per-V `{ i64 state, i64 key, V value }` bucket entry).
+        // hashmap_get returns `Option<V>`; it's registered after the prelude's
+        // Option enum is resolved (see below, post pass-1).
+        TypePtr hmGenericVar = makeFreshVar();
+        TypePtr hashMapInst = makeStruct("HashMap", {});
+        hashMapInst->typeArgs = {hmGenericVar};
         {
             StructSchema sch;
-            sch.type = makeStruct("HashMap", {});
+            sch.type = hashMapInst;
+            sch.genericVars.push_back(hmGenericVar);
             structSchemas_["HashMap"] = std::move(sch);
         }
-        TypePtr hashMapTy = structSchemas_["HashMap"].type;
-        // hashmap_new() -> HashMap ! { alloc }
+        // hashmap_new<V>() -> HashMap<V> ! { alloc }
         {
             FnSchema sch;
-            sch.signature = makeFunction({}, hashMapTy);
+            sch.signature = makeFunction({}, hashMapInst);
+            sch.genericVars.push_back(hmGenericVar);
             sch.declaredEffects.add("alloc");
             fnSchemas_["hashmap_new"] = std::move(sch);
         }
-        // hashmap_insert(m: &mut HashMap, k: i64, v: i64) -> i64 ! { alloc }
+        // hashmap_insert<V>(m: &mut HashMap<V>, k: i64, v: V) -> i64 ! { alloc }
         {
             FnSchema sch;
             sch.signature = makeFunction(
-                {makeRef(hashMapTy, /*isMut=*/true), makeInt(), makeInt()},
+                {makeRef(hashMapInst, /*isMut=*/true), makeInt(),
+                 hmGenericVar},
                 makeInt());
+            sch.genericVars.push_back(hmGenericVar);
             sch.declaredEffects.add("alloc");
             fnSchemas_["hashmap_insert"] = std::move(sch);
         }
-        // hashmap_len(m: &HashMap) -> i64
+        // hashmap_len<V>(m: &HashMap<V>) -> i64
         {
             FnSchema sch;
             sch.signature = makeFunction(
-                {makeRef(hashMapTy, /*isMut=*/false)}, makeInt());
+                {makeRef(hashMapInst, /*isMut=*/false)}, makeInt());
+            sch.genericVars.push_back(hmGenericVar);
             fnSchemas_["hashmap_len"] = std::move(sch);
         }
 
@@ -233,26 +250,30 @@ public:
             fnSchemas_["slice_get"] = std::move(sch);
         }
 
-        // Phase 12 built-in: `yield_now(v: i64) -> Future ! { async }`. The
-        // leaf suspending primitive. Its Future returns Pending on the first
-        // poll and Ready(v) on the second, so awaiting it genuinely suspends
-        // the enclosing async fn exactly once. Carries the `async` effect so
-        // any fn that awaits it must declare `async` (which `async fn`s do
-        // implicitly).
+        // Phase 12 built-in: `yield_now(v: i64) -> Future<i64> ! { async }`.
+        // The leaf suspending primitive (stays monomorphic i64). Its Future
+        // returns Pending on the first poll and Ready(v) on the second, so
+        // awaiting it genuinely suspends the enclosing async fn exactly once.
+        // Carries the `async` effect so any fn that awaits it must declare
+        // `async` (which `async fn`s do implicitly).
         {
             FnSchema sch;
-            sch.signature = makeFunction({makeInt()}, futureTy);
+            sch.signature = makeFunction({makeInt()}, futureI64Ty);
             sch.declaredEffects.add("async");
             fnSchemas_["yield_now"] = std::move(sch);
         }
-        // Phase 12 built-in: `block_on(f: Future) -> i64`. The single-threaded
-        // executor: busy-polls `f` until it reports Ready, returning the
-        // value. Used by `main` (and any synchronous fn) to run async code to
-        // completion. block_on itself is synchronous (no `async` effect): it
-        // drives the future rather than suspending on it.
+        // Phase 12 built-in, Phase 17b generic: `block_on<T>(f: Future<T>)
+        // -> T`. The single-threaded executor: busy-polls `f` until it
+        // reports Ready, returning the value. T is inferred from the awaited
+        // future (e.g. `block_on(ab())` where `ab -> bool` yields a bool).
+        // Codegen lazily specializes the executor per T (DataLayout-sized
+        // Poll<T>), mirroring vec_*. block_on itself is synchronous (no
+        // `async` effect): it drives the future rather than suspending on it.
         {
+            TypePtr blockOnVar = makeFreshVar();
             FnSchema sch;
-            sch.signature = makeFunction({futureTy}, makeInt());
+            sch.signature = makeFunction({makeFuture(blockOnVar)}, blockOnVar);
+            sch.genericVars.push_back(blockOnVar);
             fnSchemas_["block_on"] = std::move(sch);
         }
         // Phase 12 built-in: `poll_count() -> i64`. Reads the global poll
@@ -371,24 +392,29 @@ public:
             currentGenericEnv_ = nullptr;
         }
 
-        // Phase 13b: now that the prelude's generic `Option<T>` enum is fully
-        // resolved, register `hashmap_get(m: &HashMap, k: i64) -> Option<i64>`.
-        // We build the concrete Option<i64> return type via resolveTypeRef so
-        // it carries the variants + typeArgs the call-site `match` unifies
-        // against. Only registered when `Option` is in scope (always true via
-        // the prelude, but guarded so a hand-rolled program lacking Option
-        // doesn't crash here — it simply won't get hashmap_get).
+        // Phase 13b / 17b: now that the prelude's generic `Option<T>` enum is
+        // fully resolved, register `hashmap_get<V>(m: &HashMap<V>, k: i64)
+        // -> Option<V>`. We instantiate Option with the SAME schema Var V the
+        // HashMap is generic over, so a single call-site unification pins V
+        // (from the map) and flows it into the returned `Option<V>` the
+        // call-site `match` destructures. Only registered when `Option` is in
+        // scope (always true via the prelude, but guarded so a hand-rolled
+        // program lacking Option doesn't crash here).
         if (enumSchemas_.count("Option") && structSchemas_.count("HashMap")) {
-            ast::TypeRef optRef;
-            optRef.name = "Option";
-            ast::TypeRef i64Ref;
-            i64Ref.name = "i64";
-            optRef.typeArgs.push_back(i64Ref);
-            TypePtr optI64 = resolveTypeRef(optRef);
-            TypePtr hashMapTy = structSchemas_["HashMap"].type;
+            const EnumSchema& optSchema = enumSchemas_["Option"];
+            TypePtr optV;
+            if (!optSchema.genericVars.empty()) {
+                std::unordered_map<int, TypePtr> subst;
+                subst[optSchema.genericVars[0]->varId] = hmGenericVar;
+                optV = instantiate(optSchema.type, subst);
+                optV->typeArgs = {hmGenericVar};
+            } else {
+                optV = optSchema.type;
+            }
             FnSchema sch;
             sch.signature = makeFunction(
-                {makeRef(hashMapTy, /*isMut=*/false), makeInt()}, optI64);
+                {makeRef(hashMapInst, /*isMut=*/false), makeInt()}, optV);
+            sch.genericVars.push_back(hmGenericVar);
             fnSchemas_["hashmap_get"] = std::move(sch);
         }
 
@@ -607,18 +633,15 @@ public:
             schema.declaredEffects = buildEffectSet(fn.effects,
                                                        fn.genericParams,
                                                        fn.name, &rowVarNames);
-            // Phase 6.1: `async fn` wraps the declared return type in
-            // the built-in `Future` struct. The body still emits the
-            // inner type (which we stash on the schema for codegen);
-            // callers see Future and must `.await` to unwrap.
+            // Phase 6.1 / 17b: `async fn -> T` wraps the declared return type
+            // in `Future<T>`. The body still emits the inner type T (which we
+            // stash on the schema for codegen); callers see `Future<T>` and
+            // must `.await` (or `block_on`) to unwrap, recovering T.
             if (fn.isAsync) {
                 schema.declaredEffects.add("async");
                 schema.isAsync = true;
                 schema.asyncInnerType = schema.signature->ret;
-                auto futIt = structSchemas_.find("Future");
-                if (futIt != structSchemas_.end()) {
-                    schema.signature->ret = futIt->second.type;
-                }
+                schema.signature->ret = makeFuture(schema.signature->ret);
             }
             schema.isPub = fn.isPub;
             fnSchemas_[fn.name] = std::move(schema);
@@ -1484,6 +1507,18 @@ private:
         std::vector<TypePtr> argTypes;
         argTypes.reserve(tr.typeArgs.size());
         for (const auto& a : tr.typeArgs) argTypes.push_back(resolveTypeRef(a));
+        // Phase 17b: `HashMap<i64, V>` surface form. The key is fixed to i64
+        // (no Hash trait yet), so internally we store only V; accept the
+        // two-arg spelling, validate the key is i64, and drop it to the
+        // one-arg `HashMap<V>` representation the schema/codegen use.
+        if (tr.name == "HashMap" && argTypes.size() == 2) {
+            if (resolve(argTypes[0])->kind != TypeKind::Int) {
+                error("HashMap key type must be i64 (no Hash trait yet), got " +
+                          typeToString(argTypes[0]),
+                      tr.line, tr.column);
+            }
+            argTypes = {argTypes[1]};
+        }
         if (auto sit = structSchemas_.find(tr.name);
             sit != structSchemas_.end()) {
             if (sit->second.genericVars.size() != argTypes.size()) {
@@ -1768,13 +1803,12 @@ private:
             return checkSlice(*se);
         }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
-            // Phase 12: `expr.await` requires its operand to be a `Future`
-            // (the poll/frame pair async fns and `yield_now` produce). Phase
-            // 12 MVP only supports `Future` of `i64`, so await is hard-coded
-            // to yield i64; generic Future<T> arrives alongside generic
-            // Vec<T>. `.await` is only legal inside an `async fn`: it suspends
-            // the enclosing future by returning Pending to the caller, which
-            // only exists if the enclosing fn IS a future.
+            // Phase 12 / 17b: `expr.await` requires its operand to be a
+            // `Future<T>` (the poll/frame pair async fns and `yield_now`
+            // produce) and yields `T` — the future's result type, read from
+            // `typeArgs[0]`. `.await` is only legal inside an `async fn`: it
+            // suspends the enclosing future by returning Pending to the
+            // caller, which only exists if the enclosing fn IS a future.
             TypePtr opTy = checkExpr(*ae->operand);
             TypePtr r = resolve(opTy);
             if (r->kind != TypeKind::Struct || r->structName != "Future") {
@@ -1787,6 +1821,10 @@ private:
                 error("`.await` is only allowed inside an `async fn`",
                       ae->line, ae->column);
             }
+            // The result type is the future's T. Fall back to i64 if a bare
+            // (typeArgs-less) Future leaks through (defensive — all Future
+            // values now carry their result type).
+            if (!r->typeArgs.empty()) return r->typeArgs[0];
             return makeInt();
         }
         error("unknown expression kind", e.line, e.column);
