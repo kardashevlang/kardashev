@@ -39,6 +39,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
@@ -458,8 +459,13 @@ int runAot(const std::string& srcRaw, const std::string& outExePath,
     // and Bazel's LLVM-detection step already pulled it in for the
     // build. -fuse-ld is left to clang's default so it picks the right
     // linker per platform (lld on Linux if installed, ld64 on macOS).
-    std::string cmd = "clang \"" + objPath + "\" -o \"" + outExePath + "\"";
-    int rc = std::system(cmd.c_str());
+    llvm::SmallVector<llvm::StringRef, 8> argv;
+    argv.push_back("clang");
+    argv.push_back(objPath);
+    argv.push_back("-o");
+    argv.push_back(outExePath);
+    std::string errMsg;
+    int rc = llvm::sys::ExecuteAndWait("clang", argv, std::nullopt, {}, 0, 0, &errMsg);
     // Always try to clean up the intermediate object so the working
     // tree stays tidy even when linking fails.
     std::remove(objPath.c_str());
