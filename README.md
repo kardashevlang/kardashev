@@ -158,7 +158,11 @@ shells out to `clang` for linking. Programs compile through lexer →
 parser → HM typechecker → NLL borrow-checker → effect inference →
 LLVM IR → LLVM O2 pipeline → ORC v2 JIT (or AOT).
 
-## Roadmap
+## Roadmap v1 — shipped
+
+Phases 0–8 are implemented and green on CI (ubuntu + macOS). This is the
+self-hosting-compiler MVP: the language compiles, type-checks, borrow-checks,
+JITs, and AOT-links real programs.
 
 | Phase | Goal | Status |
 |-------|------|--------|
@@ -171,6 +175,29 @@ LLVM IR → LLVM O2 pipeline → ORC v2 JIT (or AOT).
 | 6 | `async` / `await` + state-machine transform + basic executor | ✅ `async fn` returns the built-in `Future`. Codegen splits each async fn into `__async_body_<n>` + a Future-wrapping shim; `.await` lowers to a poll loop that branches on `READY`, ready to plug a real scheduler under the existing `pending` block once blocking primitives exist. |
 | 7 | Module system + complete `rules_kardashev` + `kard` CLI | ✅ `mod foo;` resolves siblings recursively; `pub` enforced on path-qualified references; `foo::bar` path syntax parses; `kard` shell wrapper + Bazel `kardashev_library` / `kardashev_binary` rules ship. |
 | 8 | Optimization passes + LSP + docs site | ✅ LLVM O2 PassBuilder pipeline runs on every emitted module; `kard-lsp` speaks the LSP protocol over stdio and publishes diagnostics; `docs/` carries the language reference, effects system notes, stdlib catalog, and compiler-architecture deep dive. |
+
+## Roadmap v2 — from MVP to a language you'd actually write programs in
+
+v1 proves the pipeline end to end, but to keep programs small it leans on
+recursion + `match` for control flow, top-level `fn`s for higher-order code,
+and static dispatch everywhere. v2 closes those gaps. The **north star** is to
+make the headline `map` example at the top of this README compile end to end —
+an effect-polymorphic higher-order function — because that exercises closures,
+effect-carrying function types, and iteration all at once, which is precisely
+what the language's thesis ("effects are part of the type") demands.
+
+| Phase | Goal | What's missing today / why it's next |
+|-------|------|--------------------------------------|
+| 9 | **Iteration**: `while`, `loop`/`break`/`continue`, `for x in it`, and an `Iterator` trait | The `for` keyword is currently *only* `impl Trait for Type`; there are no loop forms at all, so every repetition is hand-rolled recursion. This is the biggest day-to-day ergonomics gap and a prerequisite for stdlib combinators. |
+| 10 | **Closures + effect-carrying function types** | Phase 4.3 gives first-class *top-level* `fn` values, but `types.hpp`'s `Function` kind carries only `args`/`ret` — no effect row. So `fn(T) -> U ! {e}` row-polymorphism through values isn't real yet, and there are no capturing closures (`\|x\| x + n`). This phase lowers closures to env-struct + fn-ptr pairs and threads effect rows through function types so `e` genuinely propagates. **This is the capstone of the language's signature feature.** |
+| 11 | **Trait objects + dynamic dispatch**: `dyn Trait`, vtables, `Box<dyn Trait>` | Traits today are static-only (monomorphized). Heterogeneous collections and plugin-style APIs need runtime dispatch via a vtable layout. |
+| 12 | **Real async runtime**: blocking primitives (timer/IO-readiness) + single-threaded executor + multi-state state-machine transform | Phase 6.2 scaffolded a poll loop with a `pending` block that's never taken because bodies run eagerly. This phase adds genuine suspension points and a scheduler that drives futures to completion, finally exercising that `pending` path. |
+| 13 | **Growable stdlib**: mutable `String` (`push_str`), `HashMap<K,V>`, `&[T]` slices, iterator adaptors (`map`/`filter`/`fold`), `Option`/`Result` combinators | `String` is immutable/literal-backed and there's no associative container. Builds directly on the iterators (9) and closures (10) landed above. |
+| 14 | **Tooling + ecosystem**: `kard fmt`, richer LSP (completion/hover/go-to-def), incremental build cache, dependency resolution via the Bazel module registry, DWARF debug info | The LSP only publishes diagnostics today; there's no formatter, no debug info, and no story for third-party packages. This is the jump from "a compiler" to "a toolchain". |
+
+Dependencies: 13 needs 9 + 10; 12 extends 6; 9, 11, 14 are independent and can
+land in parallel. Suggested order: **9 → 10 → 13**, with **11 / 12 / 14** slotted
+in opportunistically.
 
 ## Why "kardashev"?
 
