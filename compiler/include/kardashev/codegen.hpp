@@ -52,7 +52,17 @@ struct CodegenResult {
 // Generate an LLVM module from a parsed + type-checked program. The
 // returned `context` MUST outlive any use of `module` (move both into
 // a `ThreadSafeModule` together when handing to LLJIT).
+//
+// Phase 14a: when `emitDebugInfo` is true, codegen additionally emits DWARF
+// debug info (a DICompileUnit, a DISubprogram per kardashev function, line/
+// column DILocations on instructions, and DILocalVariable + dbg.declare for
+// parameters / locals), sets the module's "Debug Info Version" + "Dwarf
+// Version" flags, and finalizes the DIBuilder. `sourceFile` names the source
+// for the DIFile (defaults to a placeholder when unknown). When the flag is
+// false the emitted module is byte-for-byte identical to the historic path.
 CodegenResult codegen(const ast::Program& program,
-                       const TypeCheckResult& tc);
+                       const TypeCheckResult& tc,
+                       bool emitDebugInfo = false,
+                       const std::string& sourceFile = "<kardashev>");
 
 } // namespace kardashev

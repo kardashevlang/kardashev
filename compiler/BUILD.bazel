@@ -87,6 +87,18 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "ast_print",
+    srcs = ["src/ast_print.cpp"],
+    hdrs = ["include/kardashev/ast_print.hpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":ast",
+        ":types",
+    ],
+)
+
 cc_binary(
     name = "kardc",
     srcs = ["src/main.cpp"],
@@ -108,5 +120,15 @@ cc_binary(
         ":borrow_check",
         ":parser",
         ":typecheck",
+    ],
+)
+
+cc_binary(
+    name = "kardfmt",
+    srcs = ["src/fmt_main.cpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":ast_print",
+        ":parser",
     ],
 )

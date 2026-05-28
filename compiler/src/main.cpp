@@ -271,7 +271,10 @@ std::optional<kardashev::ast::Program> buildProgram(
 
 std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
                                           const std::string& entry,
-                                          const std::string& srcDir = ".") {
+                                          const std::string& srcDir = ".",
+                                          bool emitDebug = false,
+                                          const std::string& sourceFile =
+                                              "<kardashev>") {
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return std::nullopt;
     auto& program = *progOpt;
@@ -285,7 +288,7 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
         reportBorrowErrors(bcr);
         return std::nullopt;
     }
-    auto cgr = kardashev::codegen(program, tcr);
+    auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile);
     if (!cgr.ok()) {
         for (const auto& msg : cgr.errors) {
             std::cerr << "codegen error: " << msg << '\n';
@@ -386,13 +389,14 @@ int runREPL() {
     return 0;
 }
 
-int runFile(const char* path) {
+int runFile(const char* path, bool emitDebug = false) {
     auto src = readFile(path);
     if (!src) {
         std::cerr << "kardc: cannot open file: " << path << '\n';
         return 1;
     }
-    if (auto result = compileAndRun(*src, "main", dirOf(path))) {
+    if (auto result =
+            compileAndRun(*src, "main", dirOf(path), emitDebug, path)) {
         std::cout << *result << '\n';
         return 0;
     }
@@ -490,7 +494,8 @@ bool emitObject(llvm::Module& module, const std::string& outObjPath) {
 // linker our CI / Bazel build already depends on, so AOT mode adds no
 // new system requirement beyond what JIT mode needed.
 int runAot(const std::string& srcRaw, const std::string& outExePath,
-            const std::string& srcDir = ".") {
+            const std::string& srcDir = ".", bool emitDebug = false,
+            const std::string& sourceFile = "<kardashev>") {
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return 1;
     auto& program = *progOpt;
@@ -504,7 +509,7 @@ int runAot(const std::string& srcRaw, const std::string& outExePath,
         reportBorrowErrors(bcr);
         return 1;
     }
-    auto cgr = kardashev::codegen(program, tcr);
+    auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile);
     if (!cgr.ok()) {
         for (const auto& msg : cgr.errors) {
             std::cerr << "codegen error: " << msg << '\n';
@@ -544,14 +549,21 @@ int main(int argc, char** argv) {
     // we keep the historic positional `<file.kd>` (JIT) or REPL behaviour.
     std::string outPath;
     std::string inputPath;
+    // Phase 14a: `-g` emits DWARF debug info (compile unit + per-fn
+    // subprograms + line tables). Off by default so the historic codegen
+    // path is byte-for-byte unchanged.
+    bool emitDebug = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-o" && i + 1 < argc) {
             outPath = argv[++i];
+        } else if (a == "-g") {
+            emitDebug = true;
         } else if (a == "-h" || a == "--help") {
             std::cout << "usage: kardc                     # interactive REPL\n"
                          "       kardc <file.kd>            # JIT-run main()\n"
-                         "       kardc -o <out> <file.kd>   # AOT-compile to native exe\n";
+                         "       kardc -o <out> <file.kd>   # AOT-compile to native exe\n"
+                         "       kardc -g ...               # emit DWARF debug info\n";
             return 0;
         } else if (!a.empty() && a[0] == '-') {
             std::cerr << "kardc: unknown option `" << a << "`\n";
@@ -575,10 +587,10 @@ int main(int argc, char** argv) {
             std::cerr << "kardc: cannot open file: " << inputPath << '\n';
             return 1;
         }
-        return runAot(*src, outPath, dirOf(inputPath));
+        return runAot(*src, outPath, dirOf(inputPath), emitDebug, inputPath);
     }
     if (!inputPath.empty()) {
-        return runFile(inputPath.c_str());
+        return runFile(inputPath.c_str(), emitDebug);
     }
     return runREPL();
 }

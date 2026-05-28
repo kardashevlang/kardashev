@@ -10,10 +10,13 @@
 
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DIBuilder.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
@@ -26,11 +29,15 @@ namespace {
 
 class Codegen {
 public:
-    explicit Codegen(const TypeCheckResult& tc)
+    explicit Codegen(const TypeCheckResult& tc, bool emitDebugInfo = false,
+                     const std::string& sourceFile = "<kardashev>")
         : tc_(tc),
           ctx_(std::make_unique<llvm::LLVMContext>()),
           module_(std::make_unique<llvm::Module>("kardashev", *ctx_)),
-          builder_(std::make_unique<llvm::IRBuilder<>>(*ctx_)) {}
+          builder_(std::make_unique<llvm::IRBuilder<>>(*ctx_)),
+          emitDebugInfo_(emitDebugInfo) {
+        if (emitDebugInfo_) initDebugInfo(sourceFile);
+    }
 
     void run(const ast::Program& program) {
         for (const auto& fn : program.functions) {
@@ -118,6 +125,16 @@ public:
     }
 
     CodegenResult finish() {
+        // Phase 14a: finalize DWARF before verification. The module flags tell
+        // LLVM the metadata is debug-info v3 and to emit DWARF v4; finalize()
+        // resolves the DIBuilder's temporary nodes. Order matters: the
+        // verifier rejects debug intrinsics whose CU isn't finalized / flagged.
+        if (emitDebugInfo_ && dib_) {
+            module_->addModuleFlag(llvm::Module::Warning, "Debug Info Version",
+                                   llvm::DEBUG_METADATA_VERSION);
+            module_->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
+            dib_->finalize();
+        }
         std::string verifyErrs;
         llvm::raw_string_ostream os(verifyErrs);
         if (llvm::verifyModule(*module_, &os)) {
@@ -152,6 +169,117 @@ private:
     std::unique_ptr<llvm::Module> module_;
     std::unique_ptr<llvm::IRBuilder<>> builder_;
     std::vector<std::string> errors_;
+
+    // --- Phase 14a: DWARF debug info (only populated when emitDebugInfo_) ---
+    bool emitDebugInfo_ = false;
+    std::unique_ptr<llvm::DIBuilder> dib_;
+    llvm::DICompileUnit* diCU_ = nullptr;
+    llvm::DIFile* diFile_ = nullptr;
+    // The DISubprogram scope for the function currently being emitted, and a
+    // reusable i64 debug type (every kardashev value lowers through i64-shaped
+    // integers / pointers for line-table purposes; we describe params/locals
+    // with a single signed-64 base type, which is enough for DW_AT_type to be
+    // present and well-formed).
+    llvm::DISubprogram* diCurrentSP_ = nullptr;
+    llvm::DIType* diI64_ = nullptr;
+
+    // Set up the compile unit + file. Called once from the constructor.
+    void initDebugInfo(const std::string& sourceFile) {
+        dib_ = std::make_unique<llvm::DIBuilder>(*module_);
+        // Split the path into directory + filename for DIFile.
+        std::string dir = ".";
+        std::string file = sourceFile;
+        auto slash = sourceFile.find_last_of('/');
+        if (slash != std::string::npos) {
+            dir = sourceFile.substr(0, slash);
+            file = sourceFile.substr(slash + 1);
+        }
+        diFile_ = dib_->createFile(file, dir);
+        diCU_ = dib_->createCompileUnit(
+            llvm::dwarf::DW_LANG_C,  // closest stock language tag; kardashev
+                                      // has no dedicated DWARF language code.
+            diFile_, "kardc (kardashev)",
+            /*isOptimized=*/false, /*Flags=*/"", /*RV=*/0);
+        // A single signed 64-bit base type for params / locals.
+        diI64_ = dib_->createBasicType("i64", 64, llvm::dwarf::DW_ATE_signed);
+    }
+
+    // Build a DISubroutineType for a function from its kardashev signature.
+    // For line-table + scope purposes the element types only need to be
+    // present and well-formed, so we describe everything as i64 (return type
+    // is element 0). Null entries are not used.
+    llvm::DISubroutineType* makeDISubroutineType(std::size_t numParams) {
+        std::vector<llvm::Metadata*> elts;
+        elts.reserve(numParams + 1);
+        elts.push_back(diI64_); // return type
+        for (std::size_t i = 0; i < numParams; ++i) elts.push_back(diI64_);
+        return dib_->createSubroutineType(
+            dib_->getOrCreateTypeArray(elts));
+    }
+
+    // Make a DILocation for an AST node's 1-based line/column, scoped to the
+    // current subprogram. Returns a DebugLoc that SetCurrentDebugLocation can
+    // consume. No-op-safe: returns an empty DebugLoc when debug is off or no
+    // subprogram scope is active.
+    llvm::DebugLoc debugLocFor(std::size_t line, std::size_t column) {
+        if (!emitDebugInfo_ || !diCurrentSP_) return llvm::DebugLoc();
+        unsigned l = line ? static_cast<unsigned>(line) : 1;
+        unsigned c = column ? static_cast<unsigned>(column) : 1;
+        return llvm::DILocation::get(*ctx_, l, c, diCurrentSP_);
+    }
+
+    // Create + attach a DISubprogram for `fn` to the current LLVM function,
+    // and make it the active scope. No-op when debug is off.
+    void beginDebugSubprogram(const ast::FnDecl& fn) {
+        diCurrentSP_ = nullptr;
+        if (!emitDebugInfo_) return;
+        unsigned line = fn.line ? static_cast<unsigned>(fn.line) : 1;
+        auto* spType = makeDISubroutineType(fn.params.size());
+        llvm::DISubprogram::DISPFlags spFlags =
+            llvm::DISubprogram::SPFlagDefinition;
+        llvm::DINode::DIFlags flags = llvm::DINode::FlagPrototyped;
+        auto* sp = dib_->createFunction(
+            diFile_, currentFn_->getName(), currentFn_->getName(), diFile_,
+            line, spType, line, flags, spFlags);
+        currentFn_->setSubprogram(sp);
+        diCurrentSP_ = sp;
+    }
+
+    // Finalize per-function debug emission and clear the active scope so any
+    // module-level instructions emitted afterwards carry no stale location.
+    void endDebugSubprogram() {
+        if (!emitDebugInfo_ || !diCurrentSP_) return;
+        dib_->finalizeSubprogram(diCurrentSP_);
+        builder_->SetCurrentDebugLocation(llvm::DebugLoc());
+        diCurrentSP_ = nullptr;
+    }
+
+    // Emit a DILocalVariable + dbg.declare for parameter #argNo (bonus).
+    void declareDebugParam(const ast::FnDecl& fn, unsigned argNo,
+                           const std::string& name, llvm::Value* alloca) {
+        if (!emitDebugInfo_ || !diCurrentSP_) return;
+        unsigned line = fn.line ? static_cast<unsigned>(fn.line) : 1;
+        auto* lv = dib_->createParameterVariable(
+            diCurrentSP_, name, argNo + 1, diFile_, line, diI64_,
+            /*AlwaysPreserve=*/true);
+        dib_->insertDeclare(
+            alloca, lv, dib_->createExpression(),
+            llvm::DILocation::get(*ctx_, line, 1, diCurrentSP_),
+            builder_->GetInsertBlock());
+    }
+
+    // Emit a DILocalVariable + dbg.declare for a `let` binding (bonus).
+    void declareDebugLocal(const std::string& name, std::size_t line,
+                           std::size_t column, llvm::Value* alloca) {
+        if (!emitDebugInfo_ || !diCurrentSP_) return;
+        unsigned l = line ? static_cast<unsigned>(line) : 1;
+        unsigned c = column ? static_cast<unsigned>(column) : 1;
+        auto* lv = dib_->createAutoVariable(diCurrentSP_, name, diFile_, l,
+                                            diI64_, /*AlwaysPreserve=*/true);
+        dib_->insertDeclare(alloca, lv, dib_->createExpression(),
+                            llvm::DILocation::get(*ctx_, l, c, diCurrentSP_),
+                            builder_->GetInsertBlock());
+    }
 
     // Module-wide: mangled name -> LLVM Function declaration. Monomorphic
     // fns are keyed by their source name; generic-instance fns are keyed by
@@ -1827,6 +1955,10 @@ private:
         currentFnReturnType_ = astTypeRefToConcrete(fn.returnType);
         locals_.clear();
         localTypes_.clear();
+        // Phase 14a: attach a DISubprogram for this function (line-table
+        // scope + DWARF entry). Done before body emission so DILocations can
+        // reference it. No-op when debug is off.
+        beginDebugSubprogram(fn);
         auto* entry =
             llvm::BasicBlock::Create(*ctx_, "entry", currentFn_);
         builder_->SetInsertPoint(entry);
@@ -1839,6 +1971,8 @@ private:
             auto* alloca = builder_->CreateAlloca(arg.getType(), nullptr, name);
             builder_->CreateStore(&arg, alloca);
             locals_[name] = alloca;
+            // Phase 14a: describe the parameter to the debugger (bonus).
+            declareDebugParam(fn, i, name, alloca);
             // Phase 10a: record fn-typed params' Kardashev type so an
             // indirect call `f(args)` through the parameter can rebuild the
             // concrete LLVM FunctionType (same machinery as let-bound fn
@@ -1864,6 +1998,7 @@ private:
                 builder_->CreateRetVoid();
             }
         }
+        endDebugSubprogram();
     }
 
     // Collect every `let`-bound local in an async fn body (source order, first
@@ -2389,6 +2524,12 @@ private:
             }
             builder_->CreateStore(v, alloca);
             locals_[let->name] = alloca;
+            // Phase 14a: describe the local to the debugger (bonus). Skip in
+            // async fns, where locals live in a promoted frame slot rather
+            // than a plain entry-block alloca.
+            if (!inAsyncFn_) {
+                declareDebugLocal(let->name, let->line, let->column, alloca);
+            }
             // Phase 4.3: remember the kardashev type so emitCall can
             // do indirect dispatch through fn-pointer locals.
             auto tyIt = tc_.exprTypes.find(let->value.get());
@@ -2498,6 +2639,23 @@ private:
     }
 
     llvm::Value* emitExpr(const ast::Expr& e) {
+        // Phase 14a: attach this node's source position to every instruction
+        // the raw emit produces, building the DWARF line table. Set before
+        // emit (so child instructions inherit it) and restore the parent's
+        // location after, so sibling expressions get their own line. No-op
+        // when debug is off (debugLocFor returns an empty DebugLoc, but we
+        // guard the set/restore to avoid disturbing the historic path).
+        if (emitDebugInfo_ && diCurrentSP_) {
+            llvm::DebugLoc saved = builder_->getCurrentDebugLocation();
+            builder_->SetCurrentDebugLocation(debugLocFor(e.line, e.column));
+            llvm::Value* v = emitExprWithCoercion(e);
+            builder_->SetCurrentDebugLocation(saved);
+            return v;
+        }
+        return emitExprWithCoercion(e);
+    }
+
+    llvm::Value* emitExprWithCoercion(const ast::Expr& e) {
         llvm::Value* v = emitExprRaw(e);
         // Phase 11: apply a recorded `&T`->`&dyn` / `Box<T>`->`Box<dyn>`
         // coercion at the producing expression, so it fires uniformly at
@@ -4120,8 +4278,10 @@ private:
 } // namespace
 
 CodegenResult codegen(const ast::Program& program,
-                       const TypeCheckResult& tc) {
-    Codegen cg(tc);
+                       const TypeCheckResult& tc,
+                       bool emitDebugInfo,
+                       const std::string& sourceFile) {
+    Codegen cg(tc, emitDebugInfo, sourceFile);
     cg.run(program);
     return cg.finish();
 }
