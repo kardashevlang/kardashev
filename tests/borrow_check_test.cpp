@@ -570,6 +570,36 @@ void test_break_value_walked_ok() {
              "break_value_walked_ok");
 }
 
+// --- Phase 16: Drop trait parses + move analysis still governs droppable
+// types (the borrow checker, unchanged, is what tells codegen a value is or
+// isn't still owned at scope exit). A type with `impl Drop` is just a Move
+// type to the checker.
+
+void test_drop_impl_type_use_after_move_errors() {
+    // `let b = a;` moves the (droppable) Noisy; using `a` after is an error.
+    expectErr("trait Drop { fn drop(&mut self); }\n"
+              "struct Noisy { id: i64 }\n"
+              "impl Drop for Noisy { fn drop(&mut self) { let x = self.id; } }\n"
+              "fn use_it(n: Noisy) -> i64 { 0 }\n"
+              "fn main() -> i64 {\n"
+              "  let a = Noisy { id: 1 };\n"
+              "  let b = a;\n"
+              "  use_it(a)\n"
+              "}",
+              "drop_impl_type_use_after_move_errors");
+}
+
+void test_drop_impl_move_into_fn_ok() {
+    // Moving a droppable value into a fn exactly once is fine (the callee
+    // becomes the owner; codegen drops it there).
+    expectOk("trait Drop { fn drop(&mut self); }\n"
+             "struct Noisy { id: i64 }\n"
+             "impl Drop for Noisy { fn drop(&mut self) { let x = self.id; } }\n"
+             "fn sink(n: Noisy) -> i64 { 0 }\n"
+             "fn main() -> i64 { let a = Noisy { id: 1 }; sink(a) }",
+             "drop_impl_move_into_fn_ok");
+}
+
 } // namespace
 
 int main() {
@@ -616,9 +646,12 @@ int main() {
     test_for_loop_body_ok();
     test_move_inside_loop_body_detected();
     test_break_value_walked_ok();
-    std::cout << "All borrow_check tests passed (41 cases) — Phase 2.4c "
+    // Phase 16: Drop trait + move analysis
+    test_drop_impl_type_use_after_move_errors();
+    test_drop_impl_move_into_fn_ok();
+    std::cout << "All borrow_check tests passed (43 cases) — Phase 2.4c "
                  "NLL + mutable references; Phase 9 loops; Phase 13a "
                  "method-receiver autoref; Phase 15 inherent &mut self + "
-                 "unary operands\n";
+                 "unary operands; Phase 16 Drop-typed move tracking\n";
     return 0;
 }

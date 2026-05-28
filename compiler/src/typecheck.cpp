@@ -1451,6 +1451,14 @@ private:
                 error("i64 takes no type arguments", tr.line, tr.column);
             return makeInt();
         }
+        // Phase 16: `unit` is the type of a function with no `-> T` return
+        // annotation (the parser synthesizes a "unit" TypeRef there). Maps to
+        // the unit type — codegen lowers it to `void`.
+        if (tr.name == "unit") {
+            if (!tr.typeArgs.empty())
+                error("unit takes no type arguments", tr.line, tr.column);
+            return makeUnit();
+        }
         if (tr.name == "bool") {
             if (!tr.typeArgs.empty())
                 error("bool takes no type arguments", tr.line, tr.column);

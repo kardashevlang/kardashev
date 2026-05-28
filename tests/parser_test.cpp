@@ -1314,6 +1314,43 @@ void test_pub_inherent_impl() {
     assert(r.program.impls[0].isInherent());
 }
 
+// Phase 16: the return type is optional — omitting `-> T` means `unit`. This
+// is the surface the `Drop` trait method uses (`fn drop(&mut self);`).
+void test_optional_return_type_fn() {
+    auto r = parse("fn noop() { let x = 1; }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors)
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message << '\n';
+        std::abort();
+    }
+    assert(r.program.functions.size() == 1);
+    assert(r.program.functions[0].returnType.name == "unit");
+}
+
+void test_optional_return_type_drop_trait() {
+    // The exact spec spelling: `trait Drop { fn drop(&mut self); }` plus an
+    // `impl Drop for T` whose method also omits the return type.
+    auto r = parse(
+        "trait Drop { fn drop(&mut self); }\n"
+        "struct N { id: i64 }\n"
+        "impl Drop for N { fn drop(&mut self) { let x = self.id; } }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors)
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message << '\n';
+        std::abort();
+    }
+    assert(r.program.traits.size() == 1);
+    assert(r.program.traits[0].name == "Drop");
+    assert(r.program.traits[0].methods.size() == 1);
+    assert(r.program.traits[0].methods[0].name == "drop");
+    assert(r.program.traits[0].methods[0].returnType.name == "unit");
+    assert(r.program.impls.size() == 1);
+    assert(r.program.impls[0].traitName == "Drop");
+    assert(r.program.impls[0].methods[0].returnType.name == "unit");
+}
+
 } // namespace
 
 int main() {
@@ -1419,6 +1456,9 @@ int main() {
     test_trait_impl_still_has_trait_name();
     test_pub_struct_enum_trait();
     test_pub_inherent_impl();
-    std::cout << "All parser tests passed (91 cases)\n";
+    // Phase 16: optional return type (the Drop-method surface)
+    test_optional_return_type_fn();
+    test_optional_return_type_drop_trait();
+    std::cout << "All parser tests passed (93 cases)\n";
     return 0;
 }

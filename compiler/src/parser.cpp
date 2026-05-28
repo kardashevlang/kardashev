@@ -174,11 +174,24 @@ private:
             }
         }
         expect(TokenKind::RParen, ")");
-        expect(TokenKind::Arrow, "->");
-        decl.returnType = parseTypeRef();
+        decl.returnType = parseOptionalReturnType();
         decl.effects = parseOptionalEffectRow();
         decl.body = parseBlockExpr();
         return decl;
+    }
+
+    // Phase 16: the return type is optional. `-> T` names an explicit return
+    // type; omitting it (e.g. `fn drop(&mut self) { ... }`) means the function
+    // returns `unit` — the natural spelling the `Drop` trait method uses. A
+    // TypeRef with name "unit" resolves to the unit type in the typechecker.
+    ast::TypeRef parseOptionalReturnType() {
+        if (accept(TokenKind::Arrow)) return parseTypeRef();
+        const Token& t = peek();
+        ast::TypeRef tr;
+        tr.name = "unit";
+        tr.line = t.line;
+        tr.column = t.column;
+        return tr;
     }
 
     // Phase 4: parse an optional `! { e1, e2, ... }` effect row. Returns
@@ -447,8 +460,7 @@ private:
             }
         }
         expect(TokenKind::RParen, ")");
-        expect(TokenKind::Arrow, "->");
-        sig.returnType = parseTypeRef();
+        sig.returnType = parseOptionalReturnType();
         sig.effects = parseOptionalEffectRow();
         expect(TokenKind::Semi, ";");
         return sig;
@@ -575,8 +587,7 @@ private:
             }
         }
         expect(TokenKind::RParen, ")");
-        expect(TokenKind::Arrow, "->");
-        decl.returnType = parseTypeRef();
+        decl.returnType = parseOptionalReturnType();
         decl.effects = parseOptionalEffectRow();
         decl.body = parseBlockExpr();
         return decl;

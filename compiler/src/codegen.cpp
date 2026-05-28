@@ -66,6 +66,19 @@ public:
                 implMethodMangle_[&fn] = mangled;
                 implMethodSelf_[&fn] = selfTy;
             }
+            // Phase 16: record `impl Drop for T` so drop glue can invoke the
+            // user destructor when a value of type T goes out of scope. Keyed
+            // by the implementing type's base name (e.g. "Noisy"); the value
+            // is the mangled LLVM name of its `drop(&mut self)` method.
+            if (impl.traitName == "Drop") {
+                for (const auto& fn : impl.methods) {
+                    if (fn.name == "drop") {
+                        dropImpls_[impl.forType.name] =
+                            implMethodMangle(impl.traitName, impl.forType,
+                                             "drop");
+                    }
+                }
+            }
         }
         declareAllStructs();
         declareAllEnums();
@@ -335,6 +348,38 @@ private:
 
     // Per-fn locals: variable name -> alloca pointer.
     std::unordered_map<std::string, llvm::AllocaInst*> locals_;
+
+    // --- Phase 16: deterministic Drop (RAII) ---
+    // implementing-type base name -> mangled LLVM name of its `drop(&mut self)`
+    // method. Populated in run() from `impl Drop for T` blocks.
+    std::unordered_map<std::string, std::string> dropImpls_;
+    // libc `free` extern (declared in declareBuiltins alongside malloc/realloc).
+    llvm::Function* freeFn_ = nullptr;
+    // Memoized droppability per mangled type name (Vec/String/HashMap/Box,
+    // any type with an `impl Drop`, or any aggregate transitively owning one).
+    std::unordered_map<std::string, bool> droppableCache_;
+    // One tracked owning local pending drop at scope exit. `flag` is an i1
+    // alloca (in the fn entry block) that is true while the value is still
+    // owned by this binding and false once it has been moved away; the drop at
+    // scope exit is guarded by it (the runtime "drop flag", giving correct
+    // at-most-once semantics across conditional moves). `storage` is the
+    // binding's alloca (a pointer to the value); `type` is its resolved
+    // Kardashev type.
+    struct DropLocal {
+        std::string name;
+        llvm::AllocaInst* storage = nullptr;
+        llvm::AllocaInst* flag = nullptr;
+        TypePtr type;
+    };
+    // Lexical scope stack of droppable locals, innermost last. Each entry is
+    // the declaration-ordered list of owning locals in that scope; scope exit
+    // drops them in REVERSE order (Rust semantics). A function body opens the
+    // outermost scope (params live there); every BlockExpr opens a nested one.
+    std::vector<std::vector<DropLocal>> dropScopes_;
+    // Parallel to loopFrames_: the dropScopes_ depth at the point each loop was
+    // entered, so `break`/`continue` can drop exactly the scopes opened inside
+    // the loop body (indices >= this depth) without touching outer scopes.
+    std::vector<std::size_t> loopDropDepth_;
     // Phase 9: loop-target stack, innermost last. `continueBB` is the
     // block a `continue` branches to (loop header for `while`/`loop`, the
     // step block for `for`); `breakBB` is the post-loop block a `break`
@@ -473,10 +518,19 @@ private:
         auto* memcpyFn = llvm::Function::Create(
             memcpyTy, llvm::Function::ExternalLinkage, "memcpy",
             module_.get());
+        // Phase 16: `void free(void*)` — frees a heap buffer. Compiler-inserted
+        // drop glue calls this when a Vec/String/HashMap/Box (or an aggregate
+        // owning one) goes out of scope. Same linkage story as malloc.
+        auto* freeTy = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(ctx), {i8PtrTy}, /*isVarArg=*/false);
+        auto* freeFn = llvm::Function::Create(
+            freeTy, llvm::Function::ExternalLinkage, "free", module_.get());
+
         reallocFn_ = reallocFn;
         memcpyFn_ = memcpyFn;
         printfFn_ = printfFn;
         mallocFn_ = mallocFn; // Phase 10b: closure env allocation
+        freeFn_ = freeFn;     // Phase 16: drop glue
 
         // --- Phase 10b: fat-pointer type for fn VALUES: { i8* fn, i8* env }
         fnValTy_ = llvm::StructType::create(
@@ -1655,6 +1709,9 @@ private:
         }
         if (tr.name == "i64") return makeInt();
         if (tr.name == "bool") return makeBool();
+        // Phase 16: a fn with no `-> T` annotation returns unit (parser
+        // synthesizes a "unit" TypeRef). Mirrors typecheck's resolveTypeRef.
+        if (tr.name == "unit") return makeUnit();
         std::vector<TypePtr> resolvedArgs;
         resolvedArgs.reserve(tr.typeArgs.size());
         for (const auto& a : tr.typeArgs) {
@@ -1958,6 +2015,11 @@ private:
         currentFnReturnType_ = astTypeRefToConcrete(fn.returnType);
         locals_.clear();
         localTypes_.clear();
+        // Phase 16: reset Drop scope state and open the function-body scope
+        // (params live here; the body block opens a nested scope inside).
+        dropScopes_.clear();
+        loopDropDepth_.clear();
+        pushDropScope();
         // Phase 14a: attach a DISubprogram for this function (line-table
         // scope + DWARF entry). Done before body emission so DILocations can
         // reference it. No-op when debug is off.
@@ -1984,13 +2046,26 @@ private:
             if (resolve(paramTy)->kind == TypeKind::Function) {
                 localTypes_[name] = paramTy;
             }
+            // Phase 16: a by-value param owns its argument and is dropped at
+            // function exit unless moved/returned. (`&self`/`&mut self` and
+            // other reference params are borrows — not owning — so isDroppable
+            // is false for them.)
+            registerDroppableLocal(name, alloca, paramTy);
             ++i;
         }
 
         llvm::Value* bodyVal = emitBlock(*fn.body);
 
         // If we fell through to the end of the body without a terminator,
-        // emit a `ret` using the body's tail value.
+        // emit a `ret` using the body's tail value. Phase 16: drop the
+        // function-body scope (the params) first — but if the body's tail is
+        // the returned value (a bare droppable binding), it has moved out, so
+        // its flag was already cleared by emitBlock's tail handling.
+        if (!currentBlockTerminated()) {
+            if (fn.body->tail) clearDropFlagIfMoved(*fn.body->tail);
+            emitScopeDrops(dropScopes_.back());
+        }
+        dropScopes_.pop_back();
         if (!currentBlockTerminated()) {
             if (bodyVal) {
                 builder_->CreateRet(bodyVal);
@@ -2498,7 +2573,379 @@ private:
         return builder_->CreateLoad(i64Ty, valP, "await_result");
     }
 
+    // ===================================================================
+    // Phase 16: deterministic Drop (RAII)
+    // ===================================================================
+
+    // Allocate a stack slot in the CURRENT function's entry block. Drop-flag
+    // and scratch allocas MUST live in the entry block (not inline in a loop
+    // body) so they're created once per call rather than once per iteration —
+    // otherwise a loop that drops a fresh value each turn would grow the stack
+    // unboundedly. (LLVM's mem2reg promotes these away post-opt, but we keep
+    // the IR correct pre-opt too, and the unit tests assert on flag behavior.)
+    llvm::AllocaInst* entryAlloca(llvm::Type* ty, const std::string& name) {
+        llvm::BasicBlock& entry = currentFn_->getEntryBlock();
+        llvm::IRBuilder<> eb(&entry, entry.getFirstInsertionPt());
+        return eb.CreateAlloca(ty, nullptr, name);
+    }
+
+    // Is a value of type `t` something whose scope-exit needs drop glue?
+    // True for the heap-owning built-ins (Vec/String/HashMap/Box), any type
+    // with a user `impl Drop`, and any struct/enum that transitively owns one.
+    // `seen` guards against cyclic type definitions.
+    bool isDroppable(const TypePtr& t) {
+        std::unordered_set<std::string> seen;
+        return isDroppableImpl(t, seen);
+    }
+    bool isDroppableImpl(const TypePtr& t,
+                         std::unordered_set<std::string>& seen) {
+        if (!t) return false;
+        TypePtr r = resolveInInstance(t);
+        switch (r->kind) {
+        case TypeKind::Box:
+            return true; // always owns a heap allocation
+        case TypeKind::Struct: {
+            // Heap-owning built-ins.
+            if (r->structName == "Vec" || r->structName == "String" ||
+                r->structName == "HashMap")
+                return true;
+            // Slice / Range / fn-value / future structs own no heap (Slice is
+            // a borrow; Range/Future are plain scalars in the MVP).
+            if (r->structName == "Slice" || r->structName == "Range" ||
+                r->structName == "Future")
+                return false;
+            std::string key = mangleStructInstance(r->structName, r->typeArgs);
+            if (!seen.insert("S:" + key).second) return false;
+            if (dropImpls_.count(r->structName)) return true;
+            for (const auto& [_n, fty] : r->structFields) {
+                if (isDroppableImpl(fty, seen)) return true;
+            }
+            return false;
+        }
+        case TypeKind::Enum: {
+            std::string key = mangleStructInstance(r->enumName, r->typeArgs);
+            if (!seen.insert("E:" + key).second) return false;
+            if (dropImpls_.count(r->enumName)) return true;
+            for (const auto& v : r->enumVariants) {
+                for (const auto& pt : v.payloadTypes) {
+                    if (isDroppableImpl(pt, seen)) return true;
+                }
+            }
+            return false;
+        }
+        // Scalars, references, fn values, dyn objects: never owning.
+        default:
+            return false;
+        }
+    }
+
+    // Emit the full drop of a value whose storage lives at `valuePtr` (a
+    // pointer to a value of type `t`): run the user `Drop::drop` (if any), then
+    // recurse into fields / payloads / heap buffers, freeing as we go. This is
+    // the order Rust uses: user destructor first, then field drops, then the
+    // value's own backing storage. UNCONDITIONAL — callers gate it on a drop
+    // flag (or static knowledge that the value is still owned).
+    void emitDropGlue(llvm::Value* valuePtr, const TypePtr& t) {
+        TypePtr r = resolveInInstance(t);
+        auto& ctx = *ctx_;
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+
+        if (r->kind == TypeKind::Box) {
+            // Box<T>: storage holds a heap pointer to T. Drop the boxed value
+            // (through the loaded pointer), then free the box itself. A
+            // Box<dyn Trait> is a fat pointer we don't statically know how to
+            // drop the pointee of — free only the data slot.
+            llvm::Value* boxPtr =
+                builder_->CreateLoad(i8PtrTy, valuePtr, "box.ptr");
+            TypePtr inner = resolveInInstance(r->refInner);
+            if (inner->kind != TypeKind::Dyn && isDroppable(inner)) {
+                // boxPtr points directly at the boxed T.
+                emitDropGlue(boxPtr, inner);
+            }
+            builder_->CreateCall(freeFn_, {boxPtr});
+            return;
+        }
+
+        if (r->kind == TypeKind::Struct) {
+            // User destructor first (if this concrete type has `impl Drop`).
+            emitUserDrop(valuePtr, r);
+            llvm::Type* llvmTy = mapKardashevType(r);
+            if (r->structName == "Vec" || r->structName == "String") {
+                // { i8* data, i64 len, i64 cap }. `cap == 0` is the "not
+                // heap-owned" marker: an empty Vec (data == null) or a
+                // borrowed String literal (data points at a read-only global).
+                // Freeing in that case would be a no-op (null) or, worse, undo
+                // a non-malloc pointer, so we guard the free on `cap != 0`.
+                // When the buffer IS heap-owned and the element type is itself
+                // droppable, drop each live element before freeing.
+                if (r->structName == "Vec" && !r->typeArgs.empty() &&
+                    isDroppable(r->typeArgs[0])) {
+                    emitDropVecElements(valuePtr, r->typeArgs[0]);
+                }
+                emitFreeBufferIfOwned(valuePtr, llvmTy);
+                return;
+            }
+            if (r->structName == "HashMap") {
+                // { i8* buckets, i64 len, i64 cap }. MVP keys/values are i64
+                // (non-droppable), so just free the bucket array (guarded on
+                // cap != 0, i.e. an actually-allocated table).
+                emitFreeBufferIfOwned(valuePtr, llvmTy);
+                return;
+            }
+            // Plain user struct: recurse into each droppable field in
+            // declaration order (after the user destructor above).
+            for (unsigned i = 0; i < r->structFields.size(); ++i) {
+                const TypePtr& fty = r->structFields[i].second;
+                if (!isDroppable(fty)) continue;
+                auto* fldP = builder_->CreateStructGEP(
+                    llvmTy, valuePtr, i, "drop.fld");
+                emitDropGlue(fldP, fty);
+            }
+            return;
+        }
+
+        if (r->kind == TypeKind::Enum) {
+            emitUserDrop(valuePtr, r);
+            emitDropEnum(valuePtr, r);
+            return;
+        }
+        // Scalars / refs / fn values: nothing to free.
+    }
+
+    // Invoke a user `impl Drop for T`'s `drop(&mut self)` on the value at
+    // `valuePtr`, if this concrete type has one. The method's LLVM signature
+    // takes the self pointer directly (it's a `&mut self` method).
+    void emitUserDrop(llvm::Value* valuePtr, const TypePtr& r) {
+        const std::string& name =
+            r->kind == TypeKind::Struct ? r->structName : r->enumName;
+        auto it = dropImpls_.find(name);
+        if (it == dropImpls_.end()) return;
+        auto fit = declaredFns_.find(it->second);
+        if (fit == declaredFns_.end()) return; // not emitted (shouldn't happen)
+        builder_->CreateCall(fit->second, {valuePtr});
+    }
+
+    // Free the heap buffer (field 0) of a `{ data, len, cap }` value (Vec /
+    // String / HashMap) only when `cap != 0` — the marker that the buffer is
+    // genuinely heap-owned (cap == 0 is an empty/borrowed value whose `data`
+    // is null or a read-only global, which must NOT be passed to free).
+    void emitFreeBufferIfOwned(llvm::Value* valuePtr, llvm::Type* llvmTy) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* capP = builder_->CreateStructGEP(llvmTy, valuePtr, 2, "buf.cap.p");
+        auto* cap = builder_->CreateLoad(i64Ty, capP, "buf.cap");
+        auto* owned = builder_->CreateICmpNE(
+            cap, llvm::ConstantInt::get(i64Ty, 0), "buf.owned");
+        auto* freeBB = llvm::BasicBlock::Create(ctx, "buf.free", currentFn_);
+        auto* afterBB =
+            llvm::BasicBlock::Create(ctx, "buf.free.after", currentFn_);
+        builder_->CreateCondBr(owned, freeBB, afterBB);
+        builder_->SetInsertPoint(freeBB);
+        auto* dataP = builder_->CreateStructGEP(llvmTy, valuePtr, 0, "buf.ptr.p");
+        auto* data = builder_->CreateLoad(i8PtrTy, dataP, "buf.ptr");
+        builder_->CreateCall(freeFn_, {data});
+        builder_->CreateBr(afterBB);
+        builder_->SetInsertPoint(afterBB);
+    }
+
+    // Drop each live element of a Vec<T> whose element type T is droppable.
+    // Loads len, loops i in [0,len), GEPs element i, drops it. `data` may be
+    // null only when len==0, so the loop body never dereferences null.
+    void emitDropVecElements(llvm::Value* vecPtr, const TypePtr& elemTy) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* vecTy = structTypes_["Vec"];
+        llvm::Type* elemLlvm = mapKardashevType(elemTy);
+        auto* lenP = builder_->CreateStructGEP(vecTy, vecPtr, 1, "vec.len.p");
+        auto* len = builder_->CreateLoad(i64Ty, lenP, "vec.len");
+        auto* dataP = builder_->CreateStructGEP(vecTy, vecPtr, 0, "vec.data.p");
+        auto* data = builder_->CreateLoad(i8PtrTy, dataP, "vec.data");
+        auto* iSlot = entryAlloca(i64Ty, "drop.i");
+        builder_->CreateStore(llvm::ConstantInt::get(i64Ty, 0), iSlot);
+        auto* hdr = llvm::BasicBlock::Create(ctx, "drop.elem.hdr", currentFn_);
+        auto* body = llvm::BasicBlock::Create(ctx, "drop.elem.body", currentFn_);
+        auto* done = llvm::BasicBlock::Create(ctx, "drop.elem.done", currentFn_);
+        builder_->CreateBr(hdr);
+        builder_->SetInsertPoint(hdr);
+        auto* i = builder_->CreateLoad(i64Ty, iSlot, "i");
+        auto* cmp = builder_->CreateICmpSLT(i, len, "more");
+        builder_->CreateCondBr(cmp, body, done);
+        builder_->SetInsertPoint(body);
+        auto* elemPtr = builder_->CreateGEP(elemLlvm, data, i, "elem.ptr");
+        emitDropGlue(elemPtr, elemTy);
+        auto* iNext = builder_->CreateAdd(
+            i, llvm::ConstantInt::get(i64Ty, 1), "i.next");
+        builder_->CreateStore(iNext, iSlot);
+        builder_->CreateBr(hdr);
+        builder_->SetInsertPoint(done);
+    }
+
+    // Drop an enum value: switch on the tag and drop the active variant's
+    // droppable payload slots. Variants with no droppable payload share the
+    // no-op default. The enum's own storage is inline (no heap), so there's
+    // nothing to free beyond the payloads.
+    void emitDropEnum(llvm::Value* enumPtr, const TypePtr& r) {
+        // Collect variants that actually own something droppable.
+        std::vector<unsigned> dropVariants;
+        for (unsigned vi = 0; vi < r->enumVariants.size(); ++vi) {
+            for (const auto& pt : r->enumVariants[vi].payloadTypes) {
+                if (isDroppable(pt)) { dropVariants.push_back(vi); break; }
+            }
+        }
+        if (dropVariants.empty()) return; // nothing to do
+        auto& ctx = *ctx_;
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        llvm::Type* llvmTy = mapKardashevType(r);
+        std::string mangled = mangleStructInstance(r->enumName, r->typeArgs);
+        const auto& slots = enumPayloadIndices_[mangled];
+        auto* tagP = builder_->CreateStructGEP(llvmTy, enumPtr, 0, "drop.tag.p");
+        auto* tag = builder_->CreateLoad(i32Ty, tagP, "drop.tag");
+        auto* contBB = llvm::BasicBlock::Create(ctx, "drop.enum.cont",
+                                                currentFn_);
+        auto* sw = builder_->CreateSwitch(tag, contBB, dropVariants.size());
+        for (unsigned vi : dropVariants) {
+            auto* caseBB = llvm::BasicBlock::Create(
+                ctx, "drop.enum.v" + std::to_string(vi), currentFn_);
+            sw->addCase(llvm::ConstantInt::get(i32Ty, vi), caseBB);
+            builder_->SetInsertPoint(caseBB);
+            const auto& vty = r->enumVariants[vi].payloadTypes;
+            for (unsigned pi = 0; pi < vty.size(); ++pi) {
+                if (!isDroppable(vty[pi])) continue;
+                auto* pp = builder_->CreateStructGEP(
+                    llvmTy, enumPtr, slots[vi][pi], "drop.pld");
+                emitDropGlue(pp, vty[pi]);
+            }
+            builder_->CreateBr(contBB);
+        }
+        builder_->SetInsertPoint(contBB);
+    }
+
+    // --- scope bookkeeping ---
+
+    void pushDropScope() { dropScopes_.push_back({}); }
+
+    // Register `name` (just `let`-bound or a by-value param) as an owning local
+    // in the innermost scope, with a drop flag initialized to `live`. No-op for
+    // non-droppable types and inside async fns (whose frame-promoted locals
+    // outlive the poll fn and would risk a double-free — async values leak, a
+    // documented MVP limitation).
+    void registerDroppableLocal(const std::string& name,
+                                llvm::AllocaInst* storage, const TypePtr& ty) {
+        if (inAsyncFn_) return;
+        if (dropScopes_.empty()) return;
+        if (!ty || !isDroppable(ty)) return;
+        auto* flag = entryAlloca(llvm::Type::getInt1Ty(*ctx_),
+                                 name + ".droplive");
+        // Set live at the point of binding (re-runs each loop iteration for a
+        // local declared inside a loop body, which is exactly what we want:
+        // the previous iteration's value was already dropped at block exit).
+        builder_->CreateStore(llvm::ConstantInt::getTrue(*ctx_), flag);
+        dropScopes_.back().push_back({name, storage, flag,
+                                      resolveInInstance(ty)});
+    }
+
+    // Emit drops for one scope's locals in reverse declaration order, each
+    // guarded by its drop flag. After dropping, the flag is cleared so a value
+    // can never be dropped twice (defensive — each storage is dropped on one
+    // path). Does NOT pop the scope vector; callers manage the stack.
+    void emitScopeDrops(const std::vector<DropLocal>& scope) {
+        if (currentBlockTerminated()) return;
+        auto& ctx = *ctx_;
+        for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
+            const DropLocal& d = *it;
+            auto* live = builder_->CreateLoad(
+                llvm::Type::getInt1Ty(ctx), d.flag, d.name + ".live");
+            auto* dropBB = llvm::BasicBlock::Create(
+                ctx, "drop." + d.name, currentFn_);
+            auto* afterBB = llvm::BasicBlock::Create(
+                ctx, "drop." + d.name + ".after", currentFn_);
+            builder_->CreateCondBr(live, dropBB, afterBB);
+            builder_->SetInsertPoint(dropBB);
+            builder_->CreateStore(llvm::ConstantInt::getFalse(ctx), d.flag);
+            emitDropGlue(d.storage, d.type);
+            if (!currentBlockTerminated()) builder_->CreateBr(afterBB);
+            builder_->SetInsertPoint(afterBB);
+        }
+    }
+
+    // Pop the innermost scope and drop its locals (normal block fall-through).
+    void popDropScopeWithDrops() {
+        if (dropScopes_.empty()) return;
+        emitScopeDrops(dropScopes_.back());
+        dropScopes_.pop_back();
+    }
+
+    // A `return` exits every enclosing scope of the function: drop them all,
+    // innermost first, in reverse declaration order within each. Does NOT pop
+    // the scope vectors — the normal structural pop still happens as emission
+    // unwinds, but those pops see a terminated block and emit nothing.
+    void emitReturnDrops() {
+        for (auto sit = dropScopes_.rbegin(); sit != dropScopes_.rend(); ++sit) {
+            emitScopeDrops(*sit);
+            if (currentBlockTerminated()) break;
+        }
+    }
+
+    // `break`/`continue` exits the scopes opened INSIDE the current loop body
+    // (everything at depth >= the loop's recorded entry depth), innermost
+    // first. Outer scopes survive (the loop's enclosing scope keeps living).
+    void emitLoopExitDrops() {
+        if (loopDropDepth_.empty()) return;
+        std::size_t floor = loopDropDepth_.back();
+        for (std::size_t i = dropScopes_.size(); i-- > floor;) {
+            emitScopeDrops(dropScopes_[i]);
+            if (currentBlockTerminated()) break;
+        }
+    }
+
+    // Mark a droppable local as moved-out (clear its drop flag) when an
+    // IdentExpr naming it appears in a consuming position. Mirrors the borrow
+    // checker's "whole use": the new owner (callee, field, returned value, ...)
+    // becomes responsible, so the current scope must not also drop it. Searches
+    // all live scopes (a value declared in an outer block can be moved from an
+    // inner one). Walks innermost-out so shadowing resolves to the nearest.
+    void clearDropFlagIfMoved(const ast::Expr& e) {
+        if (inAsyncFn_) return;
+        const auto* id = dynamic_cast<const ast::IdentExpr*>(&e);
+        if (!id) return;
+        for (auto sit = dropScopes_.rbegin(); sit != dropScopes_.rend(); ++sit) {
+            for (auto it = sit->rbegin(); it != sit->rend(); ++it) {
+                if (it->name == id->name) {
+                    builder_->CreateStore(
+                        llvm::ConstantInt::getFalse(*ctx_), it->flag);
+                    return;
+                }
+            }
+        }
+    }
+
+    // Emit an expression that is being CONSUMED by value into the surrounding
+    // context (call/ctor arg, struct-lit field, `let` RHS, returned value,
+    // match scrutinee, by-value method receiver, `Box::new` operand, break
+    // value, `?` operand). If it's a bare droppable binding, that binding has
+    // been moved away, so clear its drop flag.
+    llvm::Value* emitConsume(const ast::Expr& e) {
+        llvm::Value* v = emitExpr(e);
+        clearDropFlagIfMoved(e);
+        return v;
+    }
+
     llvm::Value* emitBlock(const ast::BlockExpr& block) {
+        // Phase 16: a block opens a lexical scope; its `let`-bound owning
+        // locals are dropped (reverse order) when control leaves the block.
+        pushDropScope();
+        llvm::Value* v = emitBlockInner(block);
+        // The tail value, when it is a bare droppable binding, is moved OUT of
+        // the block to the enclosing context (it's the block's value) — so it
+        // must survive this scope's drops.
+        if (block.tail) clearDropFlagIfMoved(*block.tail);
+        popDropScopeWithDrops();
+        return v;
+    }
+
+    llvm::Value* emitBlockInner(const ast::BlockExpr& block) {
         for (const auto& stmt : block.stmts) {
             emitStmt(*stmt);
             if (currentBlockTerminated()) {
@@ -2511,7 +2958,11 @@ private:
 
     void emitStmt(const ast::Stmt& s) {
         if (auto* let = dynamic_cast<const ast::LetStmt*>(&s)) {
+            // Phase 16: the RHS is a consuming context — if it's a bare
+            // droppable binding, ownership moves into the new binding, so the
+            // source's drop flag is cleared (after the value bits are read).
             llvm::Value* v = emitExpr(*let->value);
+            clearDropFlagIfMoved(*let->value);
             // Phase 12: if this local is frame-promoted (live across an await),
             // its single stack slot was already alloca'd in the poll fn's entry
             // block (so the resume path's reload and the let's store target the
@@ -2539,18 +2990,29 @@ private:
             if (tyIt != tc_.exprTypes.end()) {
                 localTypes_[let->name] = tyIt->second;
             }
+            // Phase 16: track this binding for scope-exit drop if it owns a
+            // droppable value.
+            registerDroppableLocal(let->name, alloca, lookupExprType(*let->value));
             return;
         }
         if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(&s)) {
             llvm::Value* v = ret->value ? emitExpr(*ret->value) : nullptr;
+            // Phase 16: a returned bare binding is moved OUT to the caller, so
+            // clear its drop flag before running this fn's scope-exit drops —
+            // the caller now owns it. Then drop every still-live local in all
+            // enclosing scopes (innermost first) before the actual `ret`.
+            if (ret->value) clearDropFlagIfMoved(*ret->value);
             if (inAsyncFn_) {
                 // Phase 12: `return x` from an async fn finishes the future
                 // with Ready(x) (the poll fn itself returns void).
                 finishAsyncReady(v);
-            } else if (v) {
-                builder_->CreateRet(v);
             } else {
-                builder_->CreateRetVoid();
+                emitReturnDrops();
+                if (v) {
+                    builder_->CreateRet(v);
+                } else {
+                    builder_->CreateRetVoid();
+                }
             }
             return;
         }
@@ -2577,7 +3039,55 @@ private:
             return;
         }
         llvm::Value* v = emitExpr(*as.value);
+        // Phase 16: the RHS moves into the place (clear its source flag); and
+        // when the target is a still-live droppable binding, its OLD value is
+        // overwritten, so drop it first (guarded by its flag), then store the
+        // new value and keep the binding live. This frees, e.g., the previous
+        // buffer when a `let mut v: Vec` is reassigned — without it the old
+        // allocation would leak.
+        clearDropFlagIfMoved(*as.value);
+        if (auto* id = dynamic_cast<const ast::IdentExpr*>(as.target.get())) {
+            DropLocal* d = findDropLocal(id->name);
+            if (d) {
+                emitDropLocalGuarded(*d);
+                builder_->CreateStore(v, slot);
+                builder_->CreateStore(llvm::ConstantInt::getTrue(*ctx_),
+                                      d->flag);
+                return;
+            }
+        }
         builder_->CreateStore(v, slot);
+    }
+
+    // Find the tracked owning local named `name` in any live scope (innermost
+    // first), or null. Used by assignment-overwrite drops.
+    DropLocal* findDropLocal(const std::string& name) {
+        for (auto sit = dropScopes_.rbegin(); sit != dropScopes_.rend(); ++sit) {
+            for (auto it = sit->rbegin(); it != sit->rend(); ++it) {
+                if (it->name == name) return &*it;
+            }
+        }
+        return nullptr;
+    }
+
+    // Drop a single tracked local if its flag is live (then leave the flag
+    // cleared on the dropped path). Reuses the conditional pattern of
+    // emitScopeDrops for one local.
+    void emitDropLocalGuarded(DropLocal& d) {
+        if (currentBlockTerminated()) return;
+        auto& ctx = *ctx_;
+        auto* live = builder_->CreateLoad(
+            llvm::Type::getInt1Ty(ctx), d.flag, d.name + ".live");
+        auto* dropBB =
+            llvm::BasicBlock::Create(ctx, "drop." + d.name + ".re", currentFn_);
+        auto* afterBB = llvm::BasicBlock::Create(
+            ctx, "drop." + d.name + ".re.after", currentFn_);
+        builder_->CreateCondBr(live, dropBB, afterBB);
+        builder_->SetInsertPoint(dropBB);
+        builder_->CreateStore(llvm::ConstantInt::getFalse(ctx), d.flag);
+        emitDropGlue(d.storage, d.type);
+        if (!currentBlockTerminated()) builder_->CreateBr(afterBB);
+        builder_->SetInsertPoint(afterBB);
     }
 
     // Compute an address (pointer) for an assignable place. Returns null
@@ -2842,7 +3352,8 @@ private:
         std::unordered_map<std::string, llvm::Value*> values;
         values.reserve(sl.fields.size());
         for (const auto& [name, expr] : sl.fields) {
-            values[name] = emitExpr(*expr);
+            // Phase 16: a field initializer consumes its value into the struct.
+            values[name] = emitConsume(*expr);
         }
 
         const auto& fields = instTy->structFields;
@@ -2975,6 +3486,7 @@ private:
     // and is exactly what a `&dyn`/`Box<dyn>` coercion uses as the data slot.
     llvm::Value* emitBoxNew(const ast::BoxNewExpr& bn) {
         llvm::Value* inner = emitExpr(*bn.value);
+        clearDropFlagIfMoved(*bn.value); // Phase 16: value moves into the box
         TypePtr innerTy = lookupExprType(*bn.value);
         llvm::Type* llvmInner =
             innerTy ? mapKardashevType(innerTy) : inner->getType();
@@ -3209,7 +3721,7 @@ private:
                     args.reserve(call.args.size() + 1);
                     args.push_back(envPtr);
                     for (const auto& a : call.args) {
-                        args.push_back(emitExpr(*a));
+                        args.push_back(emitConsume(*a)); // Phase 16: by-value move
                     }
                     return builder_->CreateCall(
                         llvmFnTy, fnPtr, args, "indir_" + call.callee);
@@ -3252,7 +3764,7 @@ private:
                 }
                 std::vector<llvm::Value*> args;
                 args.reserve(call.args.size());
-                for (const auto& a : call.args) args.push_back(emitExpr(*a));
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
                 return builder_->CreateCall(fn, args, "call_" + call.callee);
             }
             const std::string mangled =
@@ -3281,7 +3793,7 @@ private:
             std::vector<llvm::Value*> args;
             args.reserve(call.args.size());
             for (const auto& a : call.args) {
-                args.push_back(emitExpr(*a));
+                args.push_back(emitConsume(*a));
             }
             return builder_->CreateCall(fn, args, "call_" + call.callee);
         }
@@ -3292,7 +3804,7 @@ private:
             std::vector<llvm::Value*> args;
             args.reserve(call.args.size());
             for (const auto& a : call.args) {
-                args.push_back(emitExpr(*a));
+                args.push_back(emitConsume(*a));
             }
             return builder_->CreateCall(fn, args, "call_" + call.callee);
         }
@@ -3361,7 +3873,8 @@ private:
             {0}, "ctor_" + enumName);
         for (unsigned i = 0; i < call.args.size() && i < payloadSlots.size();
              ++i) {
-            llvm::Value* v = emitExpr(*call.args[i]);
+            // Phase 16: a constructor argument is moved into the payload.
+            llvm::Value* v = emitConsume(*call.args[i]);
             agg = builder_->CreateInsertValue(agg, v, {payloadSlots[i]},
                                               "pld");
         }
@@ -3505,6 +4018,9 @@ private:
     // construct the right enum struct layout for the propagated error.
     llvm::Value* emitTry(const ast::TryExpr& te) {
         llvm::Value* opVal = emitExpr(*te.operand);
+        // Phase 16: `?` consumes (destructures) its operand — a bare binding is
+        // moved here, so it must not also be dropped by the enclosing scope.
+        clearDropFlagIfMoved(*te.operand);
         TypePtr opTy = lookupExprType(*te.operand);
         if (!opTy || opTy->kind != TypeKind::Enum) {
             errors_.push_back("codegen: `?` operand has no enum type");
@@ -3563,7 +4079,10 @@ private:
                 propAgg, errVal,
                 {enumPayloadIndices_[retMangled][retErrIdx][0]},
                 "errpld");
-            builder_->CreateRet(propAgg);
+            // Phase 16: the `?` early-return path must drop the function's
+            // still-live locals (the new owner is the caller, via the Err).
+            emitReturnDrops();
+            if (!currentBlockTerminated()) builder_->CreateRet(propAgg);
         }
 
         // Ok path: unwrap to Ok's payload, continue.
@@ -3697,8 +4216,17 @@ private:
                                              "deref" + std::to_string(d));
             }
         }
+        // Phase 16: a by-value `self` consumes the receiver (moves it into the
+        // method, which drops it at its own exit); a `&self`/`&mut self` borrow
+        // does not. Clear the receiver binding's drop flag in the by-value case.
+        if (!selfByRef) clearDropFlagIfMoved(*mc.receiver);
         args.push_back(recv);
-        for (const auto& a : mc.args) args.push_back(emitExpr(*a));
+        // Method arguments are moved into the method by value.
+        for (const auto& a : mc.args) {
+            llvm::Value* av = emitExpr(*a);
+            clearDropFlagIfMoved(*a);
+            args.push_back(av);
+        }
         return builder_->CreateCall(fn, args, "mcall_" + mc.methodName);
     }
 
@@ -3752,6 +4280,11 @@ private:
 
     llvm::Value* emitMatch(const ast::MatchExpr& me) {
         llvm::Value* scrutinee = emitExpr(*me.scrutinee);
+        // Phase 16: matching consumes (destructures) the scrutinee — a bare
+        // binding is moved into the match, so the enclosing scope must not drop
+        // it. (Payload bindings introduced by patterns are not yet tracked for
+        // drop; matching on droppable-payload enums is a documented limitation.)
+        clearDropFlagIfMoved(*me.scrutinee);
         auto* mergeBB = llvm::BasicBlock::Create(*ctx_, "matchmerge",
                                                   currentFn_);
         std::vector<std::pair<llvm::BasicBlock*, llvm::Value*>> incoming;
@@ -3802,7 +4335,9 @@ private:
 
         builder_->SetInsertPoint(bodyBB);
         loopFrames_.push_back({headerBB, exitBB, nullptr});
+        loopDropDepth_.push_back(dropScopes_.size()); // Phase 16
         emitExpr(*we.body);
+        loopDropDepth_.pop_back();
         loopFrames_.pop_back();
         if (!currentBlockTerminated()) builder_->CreateBr(headerBB);
 
@@ -3845,7 +4380,9 @@ private:
         builder_->CreateBr(bodyBB);
         builder_->SetInsertPoint(bodyBB);
         loopFrames_.push_back({bodyBB, exitBB, valSlot, /*sawBreak=*/false});
+        loopDropDepth_.push_back(dropScopes_.size()); // Phase 16
         emitExpr(*le.body);
+        loopDropDepth_.pop_back();
         bool sawBreak = loopFrames_.back().sawBreak;
         loopFrames_.pop_back();
         if (!currentBlockTerminated()) builder_->CreateBr(bodyBB);
@@ -3949,7 +4486,9 @@ private:
             locals_[vp->name] = vAlloca;
         }
         loopFrames_.push_back({stepBB, exitBB, nullptr});
+        loopDropDepth_.push_back(dropScopes_.size()); // Phase 16
         emitExpr(*fe.body);
+        loopDropDepth_.pop_back();
         loopFrames_.pop_back();
         if (!currentBlockTerminated()) builder_->CreateBr(stepBB);
 
@@ -4030,7 +4569,9 @@ private:
         }
         // continue -> header (re-calls next()); break -> exit.
         loopFrames_.push_back({headerBB, exitBB, nullptr});
+        loopDropDepth_.push_back(dropScopes_.size()); // Phase 16
         emitExpr(*fe.body);
+        loopDropDepth_.pop_back();
         loopFrames_.pop_back();
         if (!currentBlockTerminated()) builder_->CreateBr(headerBB);
 
@@ -4055,11 +4596,15 @@ private:
         frame.sawBreak = true;
         if (be.value) {
             llvm::Value* v = emitExpr(*be.value);
+            clearDropFlagIfMoved(*be.value); // Phase 16: break value moves out
             if (frame.breakValueAlloca) {
                 builder_->CreateStore(v, frame.breakValueAlloca);
             }
         }
-        builder_->CreateBr(frame.breakBB);
+        // Phase 16: leaving the loop drops the locals of every scope opened
+        // inside the loop body before branching to the exit.
+        emitLoopExitDrops();
+        if (!currentBlockTerminated()) builder_->CreateBr(frame.breakBB);
         return nullptr;
     }
 
@@ -4070,7 +4615,12 @@ private:
             errors_.push_back("codegen: `continue` outside loop");
             return nullptr;
         }
-        builder_->CreateBr(loopFrames_.back().continueBB);
+        // Phase 16: `continue` also leaves the loop-body scopes (this
+        // iteration's locals are dropped before jumping to the loop header /
+        // step block).
+        emitLoopExitDrops();
+        if (!currentBlockTerminated())
+            builder_->CreateBr(loopFrames_.back().continueBB);
         return nullptr;
     }
 
@@ -4139,6 +4689,15 @@ private:
                 auto* slot = builder_->CreateStructGEP(
                     envTy, envPtr, i, "cap_slot_" + name);
                 builder_->CreateStore(loaded, slot);
+                // Phase 16: a `move`-style capture takes the value by value
+                // into the heap env. If the captured local is droppable, treat
+                // the capture as a move so the enclosing scope does not also
+                // free it (which would dangle the env's copy). The env itself
+                // is not freed today — a documented leak, but never a UAF or
+                // double-free.
+                ast::IdentExpr capId;
+                capId.name = name;
+                clearDropFlagIfMoved(capId);
             }
         }
 
@@ -4169,19 +4728,30 @@ private:
         auto savedLocalTypes = std::move(localTypes_);
         auto savedLoopFrames = std::move(loopFrames_);
         TypePtr savedRetTy = currentFnReturnType_;
+        // Phase 16: the closure body is a sibling function with its own Drop
+        // scope stack; save + reset (mirrors locals_/loopFrames_).
+        auto savedDropScopes = std::move(dropScopes_);
+        auto savedLoopDropDepth = std::move(loopDropDepth_);
 
         locals_.clear();
         localTypes_.clear();
         loopFrames_.clear();
+        dropScopes_.clear();
+        loopDropDepth_.clear();
         currentFn_ = closureFn;
         currentFnReturnType_ = resolveInInstance(fnTy->ret);
 
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", closureFn);
         builder_->SetInsertPoint(entry);
+        // Phase 16: open the closure-body function scope (its by-value params
+        // are dropped at its exit, just like a top-level fn's).
+        pushDropScope();
 
         // Prologue: reload captures from env into locals. We bitcast the
         // i8* env arg to the env struct pointer (opaque pointers make this a
-        // no-op, but the GEPs use envTy).
+        // no-op, but the GEPs use envTy). Captures are by-value copies living
+        // in the (leaked) env; we do NOT drop them in the closure body, so
+        // they aren't registered as owning locals.
         llvm::Value* envArg = closureFn->getArg(0);
         for (unsigned i = 0; i < cl.captures.size(); ++i) {
             const std::string& name = cl.captures[i].name;
@@ -4209,9 +4779,21 @@ private:
             if (resolve(pt)->kind == TypeKind::Function) {
                 localTypes_[cl.params[i].name] = pt;
             }
+            registerDroppableLocal(cl.params[i].name, alloca, pt);
         }
 
         llvm::Value* bodyVal = emitExpr(*cl.body);
+        // Drop the closure body scope (params) on fall-through; clear the flag
+        // of a moved-out tail value first.
+        if (!currentBlockTerminated()) {
+            if (auto* be = dynamic_cast<const ast::BlockExpr*>(cl.body.get())) {
+                if (be->tail) clearDropFlagIfMoved(*be->tail);
+            } else {
+                clearDropFlagIfMoved(*cl.body);
+            }
+            emitScopeDrops(dropScopes_.back());
+        }
+        dropScopes_.pop_back();
         if (!currentBlockTerminated()) {
             if (bodyVal && !closureFn->getReturnType()->isVoidTy()) {
                 builder_->CreateRet(bodyVal);
@@ -4226,6 +4808,8 @@ private:
         localTypes_ = std::move(savedLocalTypes);
         loopFrames_ = std::move(savedLoopFrames);
         currentFnReturnType_ = savedRetTy;
+        dropScopes_ = std::move(savedDropScopes);
+        loopDropDepth_ = std::move(savedLoopDropDepth);
         if (savedBB) builder_->SetInsertPoint(savedBB);
 
         return makeFnVal(closureFn, envPtr);
