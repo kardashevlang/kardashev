@@ -667,6 +667,9 @@ private:
                        std::unique_ptr<pattern_match::DecisionTree>>
         matchTrees_;
     std::vector<TypeError> errors_;
+    // Phase 13a: monotonic counter for fresh `for`-loop iterator slot names
+    // (`__for_it_N`) when desugaring `for x in <Iterator>`.
+    int forSlotCounter_ = 0;
     std::vector<Scope> scopes_;
     // Phase 9: parallel to scopes_; names of `let mut` (reassignable)
     // bindings in each scope. A name absent here is immutable.
@@ -877,6 +880,12 @@ private:
         }
         if (auto* fe = dynamic_cast<const ast::ForExpr*>(&e)) {
             collectEffects(*fe->iter, out);
+            // Phase 13a: a desugared `for` drives `__it.next()` each
+            // iteration; union the resolved `next` impl's declared effects
+            // (so an iterator whose `next` performs `io` makes the loop `io`).
+            if (fe->iteratorDesugar && fe->nextCall) {
+                collectEffects(*fe->nextCall, out);
+            }
             collectEffects(*fe->body, out);
             return;
         }
@@ -1649,6 +1658,34 @@ private:
         return unify(actual, expected);
     }
 
+    // Phase 13a: classify how a method takes `self` from its first-arg type,
+    // so the borrow checker can autoref the receiver place. A `&mut Self` slot
+    // is ByMutRef, a `&Self` slot is ByRef, anything else (`Self`) ByValue.
+    ResolvedMethod::SelfKind selfKindFromSlot(const TypePtr& slot) {
+        if (!slot) return ResolvedMethod::SelfKind::ByValue;
+        TypePtr s = resolve(slot);
+        if (s->kind == TypeKind::Ref) {
+            return s->refIsMut ? ResolvedMethod::SelfKind::ByMutRef
+                               : ResolvedMethod::SelfKind::ByRef;
+        }
+        return ResolvedMethod::SelfKind::ByValue;
+    }
+
+    // Phase 13a: classify the self kind directly from a parsed method
+    // signature's first param (used for trait-driven dispatch — dyn and
+    // bounded-generic — where we have the MethodSig rather than a resolved
+    // self slot). The parser lowers `&self`/`&mut self` to a `self: Self`
+    // param with isRef / refIsMut set on the TypeRef.
+    ResolvedMethod::SelfKind selfKindFromSig(const ast::MethodSig& sig) {
+        if (sig.params.empty()) return ResolvedMethod::SelfKind::ByValue;
+        const ast::TypeRef& t = sig.params[0].type;
+        if (t.isRef) {
+            return t.refIsMut ? ResolvedMethod::SelfKind::ByMutRef
+                              : ResolvedMethod::SelfKind::ByRef;
+        }
+        return ResolvedMethod::SelfKind::ByValue;
+    }
+
     // Phase 11: unify a receiver against an impl method's `self` slot,
     // tolerating one level of ref difference (autoref / autoderef). A `&self`
     // method's self slot is `&Concrete`; a by-value `self` method's is
@@ -1868,6 +1905,9 @@ private:
         res.methodName = mc.methodName;
         res.concreteTypeName = typeName;
         res.receiverTypeArgs = r->typeArgs;
+        res.selfKind = instSig->args.empty()
+                           ? ResolvedMethod::SelfKind::ByValue
+                           : selfKindFromSlot(instSig->args[0]);
         methodResolutions_[&mc] = std::move(res);
         return instSig->ret;
     }
@@ -1921,6 +1961,7 @@ private:
         res.methodName = mc.methodName;
         res.concreteTypeName = concreteTypeName;
         res.boundedVarId = boundedVarId;
+        res.selfKind = selfKindFromSig(sig);
         methodResolutions_[&mc] = std::move(res);
         return retTy;
     }
@@ -1996,6 +2037,7 @@ private:
         res.traitName = traitName;
         res.methodName = mc.methodName;
         res.dynMethodSlot = slot;
+        res.selfKind = selfKindFromSig(*sig);
         methodResolutions_[&mc] = std::move(res);
         return retTy;
     }
@@ -2766,21 +2808,107 @@ private:
         return makeFreshVar();
     }
 
-    // Phase 9: `for <pat> in <range> { body }`. Range endpoints must be
-    // i64; the pattern binds the (i64) element. Body is unit; the whole
-    // expression is unit. Conceptually desugars through Iterator::next.
+    // Phase 9 / 13a: `for <pat> in <iter> { body }`.
+    //
+    //   - Fast path (Phase 9): when `<iter>` is the built-in `Range` (whether
+    //     a literal `a..b` or a Range value), the pattern binds the i64
+    //     element and codegen lowers the loop directly with an induction var.
+    //   - General path (Phase 13a): when `<iter>` is any other type that
+    //     impls `Iterator` (`fn next(&mut self) -> Option<i64>`), we desugar
+    //     to `{ let mut __it = <iter>; loop { match __it.next() { Some(x) =>
+    //     body, None => break } } }`. We synthesize the `__it.next()`
+    //     MethodCallExpr on the ForExpr so typecheck (here) records its
+    //     resolution and codegen reuses the same node.
+    //
+    // Body is unit; the whole expression is unit either way.
     TypePtr checkFor(const ast::ForExpr& fe) {
         TypePtr iterT = checkExpr(*fe.iter);
         TypePtr ir = resolve(iterT);
-        if (ir->kind != TypeKind::Struct || ir->structName != "Range") {
-            error("for-loop iterable must be a range (a..b), got " +
-                      typeToString(iterT),
-                  fe.iter->line, fe.iter->column);
+
+        // Element type bound to the loop pattern. Ranges yield i64; an
+        // Iterator yields its `next()` Option payload (i64 in the MVP).
+        TypePtr elemTy = makeInt();
+        bool isRange = (ir->kind == TypeKind::Struct &&
+                        ir->structName == "Range");
+
+        if (!isRange) {
+            // General Iterator path. The iterable's type must impl Iterator.
+            std::string typeName = concreteTypeName(ir);
+            bool hasNext = false;
+            if (!typeName.empty()) {
+                auto tIt = methodImplLookup_.find(typeName);
+                if (tIt != methodImplLookup_.end()) {
+                    auto mIt = tIt->second.find("next");
+                    if (mIt != tIt->second.end() &&
+                        mIt->second.first == "Iterator") {
+                        hasNext = true;
+                    }
+                }
+            }
+            if (!hasNext) {
+                error("for-loop iterable must be a range (a..b) or a type that "
+                      "impls Iterator, got " + typeToString(iterT),
+                      fe.iter->line, fe.iter->column);
+                // Bind pattern to i64 and check the body so we still surface
+                // body errors, then bail out as a unit.
+                pushScope();
+                Scope bindings;
+                checkPattern(*fe.pattern, makeInt(), bindings);
+                for (auto& kv : bindings) scopes_.back()[kv.first] = kv.second;
+                loopStack_.push_back(LoopCtx{false, nullptr, false});
+                checkExpr(*fe.body);
+                loopStack_.pop_back();
+                popScope();
+                return makeUnit();
+            }
+            // Set up the desugar: a fresh iterator slot + a synthetic
+            // `__it.next()` call whose receiver names that slot. We register
+            // the slot name as a binding (type = the iterator) so resolving
+            // the receiver finds it.
+            fe.iteratorDesugar = true;
+            fe.iterSlotName = "__for_it_" + std::to_string(forSlotCounter_++);
+            auto recv = std::make_unique<ast::IdentExpr>();
+            recv->name = fe.iterSlotName;
+            recv->line = fe.iter->line;
+            recv->column = fe.iter->column;
+            auto nextCall = std::make_shared<ast::MethodCallExpr>();
+            nextCall->methodName = "next";
+            nextCall->line = fe.iter->line;
+            nextCall->column = fe.iter->column;
+            nextCall->receiver = std::move(recv);
+            fe.nextCall = nextCall;
+
+            // Resolve `__it.next()` against the iterator type. Bind the slot
+            // name in a scope first so checkMethodCall's receiver resolves.
+            pushScope();
+            scopes_.back()[fe.iterSlotName] = iterT;
+            // Record the receiver IdentExpr's type for codegen place-emission.
+            exprTypes_[fe.nextCall->receiver.get()] = iterT;
+            TypePtr nextRet = checkMethodCall(*fe.nextCall);
+            exprTypes_[fe.nextCall.get()] = nextRet;
+            popScope();
+
+            // next() must return Option<i64>; the element is its Some payload.
+            TypePtr nr = resolve(nextRet);
+            if (nr->kind == TypeKind::Enum && nr->enumName == "Option" &&
+                !nr->enumVariants.empty()) {
+                for (const auto& v : nr->enumVariants) {
+                    if (v.name == "Some" && !v.payloadTypes.empty()) {
+                        elemTy = v.payloadTypes[0];
+                        break;
+                    }
+                }
+            } else {
+                error("Iterator::next must return Option<i64>, got " +
+                          typeToString(nextRet),
+                      fe.iter->line, fe.iter->column);
+            }
         }
-        // Range elements are i64. Bind the pattern in a fresh scope.
+
+        // Bind the loop pattern (to the element type) in a fresh scope.
         pushScope();
         Scope bindings;
-        checkPattern(*fe.pattern, makeInt(), bindings);
+        checkPattern(*fe.pattern, elemTy, bindings);
         for (auto& kv : bindings) scopes_.back()[kv.first] = kv.second;
         loopStack_.push_back(LoopCtx{/*isValueLoop=*/false, nullptr, false});
         TypePtr bodyT = checkExpr(*fe.body);

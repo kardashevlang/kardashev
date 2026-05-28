@@ -77,6 +77,29 @@ std::string applyPrelude(const std::string& userSrc) {
     if (userSrc.find("enum Result") == std::string::npos) {
         prelude += "enum Result<T, E> { Ok(T), Err(E) }\n";
     }
+    // Phase 13a: the `Iterator` trait + its impl for the built-in `Range`.
+    // Element type is i64 (the accepted MVP). Adding `impl Iterator for
+    // Range` lets `for x in <range>` route through `next()` and lets ranges
+    // feed the iterator adaptors (fold/map/filter). `for` over literal
+    // ranges keeps its Phase 9 fast path in codegen, so this impl is only
+    // exercised when a Range is used as a generic `Iterator`.
+    if (userSrc.find("trait Iterator") == std::string::npos) {
+        prelude +=
+            "trait Iterator { fn next(&mut self) -> Option<i64>; }\n"
+            "impl Iterator for Range {\n"
+            "    fn next(&mut self) -> Option<i64> {\n"
+            "        if self.inclusive != 0 {\n"
+            "            if self.start > self.end { None }\n"
+            "            else { let v = self.start;"
+            " self.start = self.start + 1; Some(v) }\n"
+            "        } else {\n"
+            "            if self.start >= self.end { None }\n"
+            "            else { let v = self.start;"
+            " self.start = self.start + 1; Some(v) }\n"
+            "        }\n"
+            "    }\n"
+            "}\n";
+    }
     return prelude + userSrc;
 }
 

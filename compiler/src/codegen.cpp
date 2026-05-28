@@ -842,6 +842,17 @@ private:
                 return llvm::PointerType::get(*ctx_, /*AS=*/0);
             }
             case TypeKind::Struct: {
+                // Built-in single-layout generics: `Vec<T>` and `String`
+                // always lower to the one hand-built `%Vec` / `%String`
+                // struct (`getOrEmitVecOp` keeps a single `{i8*,i64,i64}`
+                // layout and computes the element size separately), so
+                // `Vec<i64>` must NOT get a distinct `%Vec__i64` instance —
+                // that would mismatch the value `vec_new()` produces (e.g.
+                // when a fn returns `Vec<i64>`).
+                if (r->structName == "Vec" || r->structName == "String") {
+                    auto bit = structTypes_.find(r->structName);
+                    if (bit != structTypes_.end()) return bit->second;
+                }
                 // Generic instance (typeArgs non-empty): lazily declare a
                 // dedicated LLVM struct per (name, typeArgs) tuple so
                 // different instantiations get distinct layouts.
@@ -3031,6 +3042,14 @@ private:
     //   step:   i = i + 1; -> header   (continue target = step)
     //   exit:   (break target)
     llvm::Value* emitFor(const ast::ForExpr& fe) {
+        // Phase 13a: general `for` over an arbitrary Iterator. The
+        // typechecker marked this loop and synthesized a `__it.next()` call;
+        // lower to `{ let mut __it = <iter>; loop { match __it.next() {
+        // Some(x) => body, None => break } } }`. Ranges (iteratorDesugar ==
+        // false) keep the Phase 9 direct induction-variable lowering below.
+        if (fe.iteratorDesugar && fe.nextCall) {
+            return emitForIterator(fe);
+        }
         auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
         // Evaluate the range bounds. We optimize the common case where the
         // iterable is written directly as `a..b`; otherwise read the Range
@@ -3109,6 +3128,85 @@ private:
         builder_->CreateBr(headerBB);
 
         builder_->SetInsertPoint(exitBB);
+        return nullptr; // unit
+    }
+
+    // Phase 13a: lower a `for x in <iter>` over an arbitrary Iterator to the
+    // Iterator::next desugar. The iterator value is spilled into a stack slot
+    // so the synthetic `__it.next()` call (a `&mut self` method) can mutate it
+    // in place across iterations (the receiver IdentExpr resolves to this
+    // alloca via `locals_`). Each iteration: call next(), test the returned
+    // Option's tag; Some -> bind payload to the loop var + run body + loop,
+    // None -> exit.
+    llvm::Value* emitForIterator(const ast::ForExpr& fe) {
+        auto* i32Ty = llvm::Type::getInt32Ty(*ctx_);
+
+        // Spill the iterator into an addressable slot and register the
+        // synthetic slot name so the next() receiver resolves to it.
+        TypePtr iterTy = lookupExprType(*fe.iter);
+        llvm::Value* iterVal = emitExpr(*fe.iter);
+        llvm::Type* iterLlvm = iterVal->getType();
+        auto* iterSlot =
+            builder_->CreateAlloca(iterLlvm, nullptr, fe.iterSlotName);
+        builder_->CreateStore(iterVal, iterSlot);
+        llvm::AllocaInst* savedLocal = nullptr;
+        bool hadLocal = locals_.count(fe.iterSlotName) > 0;
+        if (hadLocal) savedLocal = locals_[fe.iterSlotName];
+        locals_[fe.iterSlotName] = iterSlot;
+
+        // Option<i64> layout for the next() result.
+        TypePtr optTy = lookupExprType(*fe.nextCall);
+        if (!optTy || resolveInInstance(optTy)->kind != TypeKind::Enum) {
+            errors_.push_back("codegen: for-Iterator next() has no Option type");
+            return nullptr;
+        }
+        optTy = resolveInInstance(optTy);
+        mapKardashevType(optTy); // ensure LLVM struct + payload indices exist
+        const std::string optMangled =
+            mangleStructInstance(optTy->enumName, optTy->typeArgs);
+        unsigned someIdx = variantIndexInEnum(optTy, "Some");
+        const auto& optPayloadSlots = enumPayloadIndices_[optMangled];
+
+        auto* headerBB =
+            llvm::BasicBlock::Create(*ctx_, "foriter.header", currentFn_);
+        auto* bodyBB =
+            llvm::BasicBlock::Create(*ctx_, "foriter.body", currentFn_);
+        auto* exitBB =
+            llvm::BasicBlock::Create(*ctx_, "foriter.exit", currentFn_);
+
+        builder_->CreateBr(headerBB);
+        builder_->SetInsertPoint(headerBB);
+        // Drive the iterator: __it.next() (the &mut self call mutates the
+        // slot in place).
+        llvm::Value* optVal = emitMethodCall(*fe.nextCall);
+        llvm::Value* tag =
+            builder_->CreateExtractValue(optVal, {0}, "foriter.tag");
+        llvm::Value* isSome = builder_->CreateICmpEQ(
+            tag, llvm::ConstantInt::get(i32Ty, someIdx), "foriter.issome");
+        builder_->CreateCondBr(isSome, bodyBB, exitBB);
+
+        builder_->SetInsertPoint(bodyBB);
+        // Bind the loop variable to Some's payload.
+        if (auto* vp = dynamic_cast<const ast::VarPat*>(fe.pattern.get())) {
+            llvm::Value* payload = builder_->CreateExtractValue(
+                optVal, {optPayloadSlots[someIdx][0]}, "foriter.elem");
+            auto* vAlloca = builder_->CreateAlloca(
+                payload->getType(), nullptr, vp->name);
+            builder_->CreateStore(payload, vAlloca);
+            locals_[vp->name] = vAlloca;
+        }
+        // continue -> header (re-calls next()); break -> exit.
+        loopFrames_.push_back({headerBB, exitBB, nullptr});
+        emitExpr(*fe.body);
+        loopFrames_.pop_back();
+        if (!currentBlockTerminated()) builder_->CreateBr(headerBB);
+
+        builder_->SetInsertPoint(exitBB);
+        // Restore any prior binding of the slot name (defensive; the name is
+        // freshly generated per loop so collisions shouldn't occur).
+        if (hadLocal) locals_[fe.iterSlotName] = savedLocal;
+        else locals_.erase(fe.iterSlotName);
+        (void)iterTy;
         return nullptr; // unit
     }
 

@@ -191,6 +191,66 @@ void test_method_call_once_ok() {
              "method_call_once_ok");
 }
 
+// --- Phase 13a: method-receiver autoref. A `&mut self` / `&self` call
+// borrows the receiver instead of moving it, so the SECOND call no longer
+// trips a use-after-move (THE foundation bug). A by-value `self` call keeps
+// today's move semantics. ---
+
+void test_mut_self_repeated_calls_ok() {
+    // Before the fix, the 2nd `c.inc()` reported `c` moved at the 1st.
+    expectOk("trait Inc { fn inc(&mut self) -> i64; }\n"
+             "struct Counter { n: i64 }\n"
+             "impl Inc for Counter {\n"
+             "    fn inc(&mut self) -> i64 { self.n = self.n + 1; self.n }\n"
+             "}\n"
+             "fn main() -> i64 {\n"
+             "    let mut c = Counter { n: 0 };\n"
+             "    c.inc(); c.inc(); c.inc()\n"
+             "}",
+             "mut_self_repeated_calls_ok");
+}
+
+void test_shared_self_repeated_calls_ok() {
+    expectOk("trait Get { fn get(&self) -> i64; }\n"
+             "struct P { x: i64 }\n"
+             "impl Get for P { fn get(&self) -> i64 { self.x } }\n"
+             "fn main() -> i64 {\n"
+             "    let p = P { x: 7 };\n"
+             "    p.get() + p.get() + p.get()\n"
+             "}",
+             "shared_self_repeated_calls_ok");
+}
+
+void test_mut_self_on_nested_field_receiver_ok() {
+    // `w.c.inc()` twice: the receiver is a field-rooted place; each call's
+    // autoref &mut borrow of the root `w` must expire at end-of-statement so
+    // the second call doesn't see the first's borrow still live.
+    expectOk("trait Inc { fn inc(&mut self) -> i64; }\n"
+             "struct Counter { n: i64 }\n"
+             "impl Inc for Counter {\n"
+             "    fn inc(&mut self) -> i64 { self.n = self.n + 1; self.n }\n"
+             "}\n"
+             "struct Wrap { c: Counter }\n"
+             "fn main() -> i64 {\n"
+             "    let mut w = Wrap { c: Counter { n: 0 } };\n"
+             "    w.c.inc(); w.c.inc()\n"
+             "}",
+             "mut_self_on_nested_field_receiver_ok");
+}
+
+void test_by_value_self_double_use_errors() {
+    // By-value `self` still moves the receiver, so the 2nd call is an error.
+    expectErr("trait Take { fn take(self) -> i64; }\n"
+              "struct B { x: i64 }\n"
+              "impl Take for B { fn take(self) -> i64 { self.x } }\n"
+              "fn main() -> i64 {\n"
+              "    let b = B { x: 5 };\n"
+              "    b.take();\n"
+              "    b.take()\n"
+              "}",
+              "by_value_self_double_use_errors");
+}
+
 // --- Phase 2.4a: Generics — body checked once, conservative. ---
 
 void test_generic_fn_body_move_uses_owned_arg_ok() {
@@ -498,6 +558,11 @@ int main() {
     test_match_then_use_errors();
     test_method_call_consumes_self_then_use_errors();
     test_method_call_once_ok();
+    // Phase 13a method-receiver autoref
+    test_mut_self_repeated_calls_ok();
+    test_shared_self_repeated_calls_ok();
+    test_mut_self_on_nested_field_receiver_ok();
+    test_by_value_self_double_use_errors();
     test_generic_fn_body_move_uses_owned_arg_ok();
     test_generic_fn_body_use_after_move_errors();
     test_if_both_branches_use_ok();
@@ -522,7 +587,8 @@ int main() {
     test_for_loop_body_ok();
     test_move_inside_loop_body_detected();
     test_break_value_walked_ok();
-    std::cout << "All borrow_check tests passed (35 cases) — Phase 2.4c "
-                 "NLL + mutable references; Phase 9 loops\n";
+    std::cout << "All borrow_check tests passed (39 cases) — Phase 2.4c "
+                 "NLL + mutable references; Phase 9 loops; Phase 13a "
+                 "method-receiver autoref\n";
     return 0;
 }

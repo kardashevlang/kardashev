@@ -367,7 +367,7 @@ private:
         }
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
             lastInSubtree = std::max(lastInSubtree,
-                                       consume(*mc->receiver, expectExpire));
+                                       consumeReceiver(*mc));
             for (const auto& a : mc->args) {
                 lastInSubtree = std::max(lastInSubtree,
                                            consume(*a, expectExpire));
@@ -480,6 +480,108 @@ private:
             return lastInSubtree;
         }
         return lastInSubtree;
+    }
+
+    // Phase 13a: borrow-check a method-call receiver. The method's `self`
+    // convention (recorded by the typechecker as ResolvedMethod::selfKind)
+    // decides whether the receiver is moved (`self`), shared-borrowed
+    // (`&self`), or mutably borrowed (`&mut self`). Before this, every
+    // receiver was unconditionally moved, so `c.inc(); c.inc();` on a
+    // `&mut self` method wrongly reported `c` as used-after-move.
+    //
+    // The position walk MUST match `consume(*mc.receiver)` exactly (pass 1's
+    // prePass walked the receiver the same way), so we tick `pos_` identically
+    // and only change the binding *effect* (borrow vs move). For an autoref
+    // borrow we synthesize a transient loan (like `&recv` / `&mut recv`) that
+    // expires at end of statement, leaving the binding owned + usable again.
+    int consumeReceiver(const ast::MethodCallExpr& mc) {
+        ResolvedMethod::SelfKind sk = ResolvedMethod::SelfKind::ByValue;
+        auto it = tc_.methodResolutions.find(&mc);
+        if (it != tc_.methodResolutions.end()) sk = it->second.selfKind;
+
+        if (sk == ResolvedMethod::SelfKind::ByValue) {
+            // Unchanged: by-value `self` moves the receiver.
+            return consume(*mc.receiver, /*expectExpire=*/-1);
+        }
+
+        const bool isMut = (sk == ResolvedMethod::SelfKind::ByMutRef);
+
+        // Receiver is a bare binding: `recv.method()`. Autoref-borrow it.
+        if (auto* id = dynamic_cast<const ast::IdentExpr*>(mc.receiver.get())) {
+            int myPos = pos_++; // mirrors consume(IdentExpr)'s single tick
+            borrowBindingAt(*id, isMut, myPos);
+            return myPos;
+        }
+        // Receiver is a place rooted at a binding: `recv.field.method()`.
+        // consume()'s FieldExpr arm reads the root and ticks twice (the
+        // FieldExpr node + the inner ident); reproduce that, but layer a
+        // borrow of the root binding on top of the read so a `&mut self`
+        // call can't coexist with another live borrow of the same root.
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(mc.receiver.get())) {
+            if (auto* ido =
+                    dynamic_cast<const ast::IdentExpr*>(fe->object.get())) {
+                int myPos = pos_++;        // FieldExpr node
+                checkRead(*ido);           // moved-value diagnostic on root
+                int innerPos = pos_++;     // inner IdentExpr tick
+                // Expire the loan at the deepest position we visited and
+                // return that, so the enclosing statement's
+                // retireExpiredLoans (called with the statement's last pos)
+                // covers it — otherwise a 2nd `w.c.method()` on the same root
+                // would wrongly see the 1st call's borrow still live.
+                borrowBindingAt(*ido, isMut, innerPos);
+                (void)myPos;
+                return innerPos;
+            }
+        }
+        // Any other receiver shape (a temporary produced by a nested call,
+        // an `if`, etc.) has no named binding to borrow from; fall back to
+        // the normal walk so positions stay in sync. The temporary is
+        // produced and consumed within the statement.
+        return consume(*mc.receiver, /*expectExpire=*/-1);
+    }
+
+    // Apply an autoref borrow to a binding referenced at `atPos`, with the
+    // same conflict checks as `&x` / `&mut x` (handleRefExpr) and a loan that
+    // expires at statement end. No-op if the name isn't a tracked binding.
+    void borrowBindingAt(const ast::IdentExpr& id, bool isMut, int atPos) {
+        Binding* b = lookupBinding(id.name);
+        if (!b) return;
+        if (b->state == OwnState::Moved) {
+            error("borrow of moved value `" + id.name + "` (moved at " +
+                      std::to_string(b->moveLine) + ":" +
+                      std::to_string(b->moveCol) + ")",
+                  id.line, id.column);
+            return;
+        }
+        if (isMut) {
+            if (b->sharedLoans > 0) {
+                error("cannot borrow `" + id.name +
+                          "` mutably while shared borrows are active",
+                      id.line, id.column);
+            } else if (b->mutLoanActive) {
+                error("cannot borrow `" + id.name +
+                          "` mutably more than once at a time",
+                      id.line, id.column);
+            } else {
+                b->mutLoanActive = true;
+            }
+        } else {
+            if (b->mutLoanActive) {
+                error("cannot borrow `" + id.name +
+                          "` immutably while a mutable borrow is active",
+                      id.line, id.column);
+            } else {
+                ++b->sharedLoans;
+            }
+        }
+        Loan loan;
+        loan.borrowedDeclPos = b->declPos;
+        loan.borrowerDeclPos = -1;       // transient (statement-scoped)
+        loan.isMut = isMut;
+        loan.expirePos = atPos;          // retired at end of statement
+        loan.line = id.line;
+        loan.column = id.column;
+        activeLoans_.push_back(loan);
     }
 
     int consumeBlock(const ast::BlockExpr& block) {

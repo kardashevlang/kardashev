@@ -242,10 +242,26 @@ struct RangeExpr : Expr {
 // None => break } }`); codegen lowers integer ranges directly (the impl
 // method ABI passes `&mut self` by value, so a literal method-driven
 // desugar can't advance the iterator). The whole expression is unit.
+struct MethodCallExpr; // fwd (defined below)
+
 struct ForExpr : Expr {
     PatternPtr pattern; // the loop variable binding (a VarPat for ranges)
-    ExprPtr iter;       // a RangeExpr
+    ExprPtr iter;       // a RangeExpr (fast path) or any `Iterator` impl
     ExprPtr body;       // a BlockExpr
+    // Phase 13a: general `for` over an arbitrary `Iterator`. When `iter` is
+    // not a literal range / Range value but a type that impls `Iterator`, the
+    // typechecker sets `iteratorDesugar` and fills the two synthetic nodes
+    // below so the loop lowers to `{ let mut __it = <iter>; loop { match
+    // __it.next() { Some(x) => body, None => break } } }`. `iterSlotName` is
+    // the fresh binding that holds the iterator; `nextCall` is the
+    // `__it.next()` method call (its receiver is an IdentExpr naming
+    // `iterSlotName`). Ranges keep the Phase 9 direct lowering (these stay
+    // unset). Held by shared_ptr / unique_ptr so the AST node owns them.
+    // `mutable` so the typechecker can populate them while walking an
+    // otherwise-const AST (mirrors ClosureExpr::captures).
+    mutable bool iteratorDesugar = false;
+    mutable std::string iterSlotName;
+    mutable std::shared_ptr<MethodCallExpr> nextCall; // null unless desugar
 };
 
 // Phase 9: `break` / `break <value>`. Exits the innermost enclosing loop.

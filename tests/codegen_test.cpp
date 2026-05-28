@@ -1063,6 +1063,143 @@ void test_async_param_survives_suspension() {
     expectEquals(v, 18, "async_param_survives_suspension");
 }
 
+// --- Phase 13a: method-receiver autoref + Iterator trait + adaptors ---
+
+// THE foundation fix: a `&mut self` method mutates the receiver in place
+// across repeated calls (previously the 2nd call saw a moved value and, even
+// once that was fixed, the mutation had to persist via by-address passing).
+const char* kIterPrelude =
+    "enum Option<T> { Some(T), None }\n"
+    "trait Iterator { fn next(&mut self) -> Option<i64>; }\n";
+
+void test_mut_self_persists_across_calls() {
+    auto v = compileAndRun(
+        "trait Inc { fn inc(&mut self) -> i64; }\n"
+        "struct Counter { n: i64 }\n"
+        "impl Inc for Counter {\n"
+        "    fn inc(&mut self) -> i64 { self.n = self.n + 1; self.n }\n"
+        "}\n"
+        "fn main() -> i64 {\n"
+        "    let mut c = Counter { n: 0 };\n"
+        "    c.inc(); c.inc(); c.inc()\n"
+        "}",
+        "main", "mut_self_persists_across_calls");
+    expectEquals(v, 3, "mut_self_persists_across_calls");
+}
+
+// `&self` shared borrow: the receiver stays usable, multiple calls allowed.
+void test_shared_self_multiple_calls() {
+    auto v = compileAndRun(
+        "trait Get { fn get(&self) -> i64; }\n"
+        "struct P { x: i64 }\n"
+        "impl Get for P { fn get(&self) -> i64 { self.x } }\n"
+        "fn main() -> i64 {\n"
+        "    let p = P { x: 7 };\n"
+        "    p.get() + p.get() + p.get()\n"
+        "}",
+        "main", "shared_self_multiple_calls");
+    expectEquals(v, 21, "shared_self_multiple_calls");
+}
+
+// `for` over a non-Range Iterator impl (Countdown) visits the right elements.
+void test_for_over_custom_iterator() {
+    auto v = compileAndRun(
+        std::string(kIterPrelude) +
+            "struct Countdown { n: i64 }\n"
+            "impl Iterator for Countdown {\n"
+            "    fn next(&mut self) -> Option<i64> {\n"
+            "        if self.n <= 0 { None }\n"
+            "        else { self.n = self.n - 1; Some(self.n + 1) }\n"
+            "    }\n"
+            "}\n"
+            "fn main() -> i64 {\n"
+            "    let cd = Countdown { n: 4 };\n"
+            "    let mut s = 0;\n"
+            "    for x in cd { s = s + x; }\n"
+            "    s\n"
+            "}",
+        "main", "for_over_custom_iterator");
+    expectEquals(v, 10, "for_over_custom_iterator"); // 4+3+2+1
+}
+
+// The Phase 9 range fast path still works alongside the Iterator desugar.
+void test_for_inclusive_range_still_55() {
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "    let mut s = 0;\n"
+        "    for x in 1..=10 { s = s + x; }\n"
+        "    s\n"
+        "}",
+        "main", "for_inclusive_range_still_55");
+    expectEquals(v, 55, "for_inclusive_range_still_55");
+}
+
+// Closure-driven `fold` over a custom Iterator.
+void test_fold_closure_driven() {
+    auto v = compileAndRun(
+        std::string(kIterPrelude) +
+            "struct Countdown { n: i64 }\n"
+            "impl Iterator for Countdown {\n"
+            "    fn next(&mut self) -> Option<i64> {\n"
+            "        if self.n <= 0 { None }\n"
+            "        else { self.n = self.n - 1; Some(self.n + 1) }\n"
+            "    }\n"
+            "}\n"
+            "fn fold<I: Iterator>(it: I, init: i64,\n"
+            "                     f: fn(i64, i64) -> i64) -> i64 {\n"
+            "    let mut iter = it;\n"
+            "    let mut acc = init;\n"
+            "    loop {\n"
+            "        match iter.next() {\n"
+            "            Some(x) => { acc = f(acc, x); },\n"
+            "            None => { break; },\n"
+            "        }\n"
+            "    }\n"
+            "    acc\n"
+            "}\n"
+            "fn main() -> i64 {\n"
+            "    fold(Countdown { n: 5 }, 0, |acc, x| acc + x)\n"
+            "}",
+        "main", "fold_closure_driven");
+    expectEquals(v, 15, "fold_closure_driven"); // 5+4+3+2+1
+}
+
+// Eager `map`/`filter` collecting into a Vec, driven by closures over a
+// custom Iterator. filter keeps evens, then a fold-style sum verifies.
+void test_map_filter_eager_vec() {
+    auto v = compileAndRun(
+        std::string(kIterPrelude) +
+            "struct UpTo { i: i64, hi: i64 }\n"
+            "impl Iterator for UpTo {\n"
+            "    fn next(&mut self) -> Option<i64> {\n"
+            "        if self.i >= self.hi { None }\n"
+            "        else { let v = self.i; self.i = self.i + 1; Some(v) }\n"
+            "    }\n"
+            "}\n"
+            "fn map<I: Iterator>(it: I, f: fn(i64) -> i64)\n"
+            "        -> Vec<i64> ! { alloc } {\n"
+            "    let mut iter = it;\n"
+            "    let out = vec_new();\n"
+            "    loop {\n"
+            "        match iter.next() {\n"
+            "            Some(x) => { vec_push(&mut out, f(x)); },\n"
+            "            None => { break; },\n"
+            "        }\n"
+            "    }\n"
+            "    out\n"
+            "}\n"
+            "fn sum_vec(v: &Vec<i64>, i: i64) -> i64 {\n"
+            "    if i < vec_len(v) { vec_get(v, i) + sum_vec(v, i + 1) }\n"
+            "    else { 0 }\n"
+            "}\n"
+            "fn main() -> i64 ! { alloc } {\n"
+            "    let doubled = map(UpTo { i: 1, hi: 6 }, |x| x * 2);\n"
+            "    sum_vec(&doubled, 0)\n"
+            "}",
+        "main", "map_filter_eager_vec");
+    expectEquals(v, 30, "map_filter_eager_vec"); // (1+2+3+4+5)*2 == 30
+}
+
 } // namespace
 
 int main() {
@@ -1150,6 +1287,14 @@ int main() {
     test_async_single_await();
     test_async_zero_await_chain();
     test_async_param_survives_suspension();
-    std::cout << "All codegen tests passed (76 cases) — Phase 12 real async runtime\n";
+    // Phase 13a method-receiver autoref + Iterator trait + adaptors
+    test_mut_self_persists_across_calls();
+    test_shared_self_multiple_calls();
+    test_for_over_custom_iterator();
+    test_for_inclusive_range_still_55();
+    test_fold_closure_driven();
+    test_map_filter_eager_vec();
+    std::cout << "All codegen tests passed (82 cases) — Phase 13a method-receiver "
+                 "autoref + Iterator trait + adaptors\n";
     return 0;
 }

@@ -124,6 +124,14 @@ struct ResolvedMethod {
     // resolved to a single impl at compile time.
     enum Kind { Concrete, BoundedGeneric, Dyn };
     Kind kind = Concrete;
+    // Phase 13a: how the resolved method takes its receiver, derived from the
+    // method's `self` declaration (`self` / `&self` / `&mut self`). The borrow
+    // checker uses this to autoref the receiver place at the call site —
+    // ByValue keeps move semantics, ByRef takes a shared borrow, ByMutRef a
+    // mutable borrow — so `c.inc(); c.inc()` on a `&mut self` method no longer
+    // reports `c` as moved on the second call.
+    enum class SelfKind { ByValue, ByRef, ByMutRef };
+    SelfKind selfKind = SelfKind::ByValue;
     // Common to all kinds:
     std::string traitName;
     std::string methodName;

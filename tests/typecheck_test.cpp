@@ -1437,6 +1437,104 @@ void test_loop_io_effect_propagates() {
         "io", "loop_io_effect_propagates");
 }
 
+// --- Phase 13a: Iterator trait + method-receiver autoref + adaptors ---
+
+// A `&mut self` method can be called repeatedly on a mut binding without a
+// move error surfacing as a type/borrow problem (typecheck accepts it; the
+// borrow checker's autoref is exercised separately).
+void test_mut_self_repeated_calls_typecheck_ok() {
+    expectOk(
+        "trait Inc { fn inc(&mut self) -> i64; }\n"
+        "struct Counter { n: i64 }\n"
+        "impl Inc for Counter {\n"
+        "    fn inc(&mut self) -> i64 { self.n = self.n + 1; self.n }\n"
+        "}\n"
+        "fn f() -> i64 { let mut c = Counter { n: 0 };"
+        " c.inc(); c.inc(); c.inc() }",
+        "mut_self_repeated_calls_typecheck_ok");
+}
+
+// `for` over a type implementing Iterator type-checks; the loop var binds the
+// Option payload (i64).
+void test_for_over_custom_iterator_ok() {
+    expectOk(
+        "enum Option<T> { Some(T), None }\n"
+        "trait Iterator { fn next(&mut self) -> Option<i64>; }\n"
+        "struct Countdown { n: i64 }\n"
+        "impl Iterator for Countdown {\n"
+        "    fn next(&mut self) -> Option<i64> {\n"
+        "        if self.n <= 0 { None }\n"
+        "        else { self.n = self.n - 1; Some(self.n + 1) }\n"
+        "    }\n"
+        "}\n"
+        "fn f() -> i64 { let cd = Countdown { n: 3 }; let mut s = 0;"
+        " for x in cd { s = s + x; } s }",
+        "for_over_custom_iterator_ok");
+}
+
+// `for` over a type that does NOT impl Iterator (and isn't a Range) is
+// rejected with a clear diagnostic.
+void test_for_over_non_iterator_errors() {
+    expectErrContains(
+        "struct NotIter { n: i64 }\n"
+        "fn f() -> i64 { let x = NotIter { n: 1 };"
+        " for y in x { } 0 }",
+        "impls Iterator", "for_over_non_iterator_errors");
+}
+
+// Effect composition: a `fold` generic over an effect-row var, called with an
+// `io` closure inside an `io` fn, type-checks (the closure's io flows to the
+// call site through the row var).
+void test_fold_io_closure_positive() {
+    expectOk(
+        "enum Option<T> { Some(T), None }\n"
+        "trait Iterator { fn next(&mut self) -> Option<i64>; }\n"
+        "struct Countdown { n: i64 }\n"
+        "impl Iterator for Countdown {\n"
+        "    fn next(&mut self) -> Option<i64> {\n"
+        "        if self.n <= 0 { None }\n"
+        "        else { self.n = self.n - 1; Some(self.n + 1) }\n"
+        "    }\n"
+        "}\n"
+        "fn fold<I: Iterator, e>(it: I, init: i64,"
+        " f: fn(i64, i64) -> i64 ! {e}) -> i64 ! {e} {\n"
+        "    let mut iter = it; let mut acc = init;\n"
+        "    loop { match iter.next() {"
+        " Some(x) => { acc = f(acc, x); }, None => { break; }, } }\n"
+        "    acc\n"
+        "}\n"
+        "fn main() -> i64 ! { io } {\n"
+        "    fold(Countdown { n: 3 }, 0, |acc, x| { print(x); acc + x })\n"
+        "}",
+        "fold_io_closure_positive");
+}
+
+// Negative: the same fold + io closure in a PURE fn must be rejected — the io
+// effect leaks to the call site and the fn doesn't declare it.
+void test_fold_io_closure_negative() {
+    expectErrContains(
+        "enum Option<T> { Some(T), None }\n"
+        "trait Iterator { fn next(&mut self) -> Option<i64>; }\n"
+        "struct Countdown { n: i64 }\n"
+        "impl Iterator for Countdown {\n"
+        "    fn next(&mut self) -> Option<i64> {\n"
+        "        if self.n <= 0 { None }\n"
+        "        else { self.n = self.n - 1; Some(self.n + 1) }\n"
+        "    }\n"
+        "}\n"
+        "fn fold<I: Iterator, e>(it: I, init: i64,"
+        " f: fn(i64, i64) -> i64 ! {e}) -> i64 ! {e} {\n"
+        "    let mut iter = it; let mut acc = init;\n"
+        "    loop { match iter.next() {"
+        " Some(x) => { acc = f(acc, x); }, None => { break; }, } }\n"
+        "    acc\n"
+        "}\n"
+        "fn main() -> i64 {\n"
+        "    fold(Countdown { n: 3 }, 0, |acc, x| { print(x); acc + x })\n"
+        "}",
+        "io", "fold_io_closure_negative");
+}
+
 void test_nested_loops_ok() {
     expectOk(
         "fn f() -> i64 {\n"
@@ -1686,6 +1784,12 @@ int main() {
     test_async_await_non_future_errors();
     test_async_call_returns_future_not_int();
     test_async_sync_fn_awaiting_errors();
-    std::cout << "All typecheck tests passed (155 cases)\n";
+    // Phase 13a Iterator trait + method-receiver autoref + adaptors
+    test_mut_self_repeated_calls_typecheck_ok();
+    test_for_over_custom_iterator_ok();
+    test_for_over_non_iterator_errors();
+    test_fold_io_closure_positive();
+    test_fold_io_closure_negative();
+    std::cout << "All typecheck tests passed (160 cases)\n";
     return 0;
 }
