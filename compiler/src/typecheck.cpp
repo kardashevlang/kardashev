@@ -2574,6 +2574,16 @@ private:
             for (const auto& f : sl.fields) checkExpr(*f.second);
             return freshInstantiateStruct(it->second);
         }
+        // PR#24: `Vec` is likewise an opaque built-in (heap {data,len,cap});
+        // a forged `Vec { ... }` literal could desync the buffer/length and
+        // drive out-of-bounds access. Use vec_new().
+        if (sl.structName == "Vec") {
+            error("cannot construct built-in opaque struct 'Vec' with a "
+                  "struct literal; use vec_new()",
+                  sl.line, sl.column);
+            for (const auto& f : sl.fields) checkExpr(*f.second);
+            return freshInstantiateStruct(it->second);
+        }
         // For generic structs, build a fresh instantiation so field-type
         // unification with each literal expr leaves the instance's
         // typeArgs in a fully-solved state.

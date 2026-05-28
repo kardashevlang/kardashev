@@ -3038,14 +3038,35 @@ private:
             fn->getArg(0)->setName("v");
             fn->getArg(1)->setName("i");
             auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            // PR#24: bounds-check before dereferencing. Reject a negative or
+            // >= len index, or a null buffer (empty Vec), returning a
+            // type-correct zero instead of an out-of-bounds load. The element
+            // GEP keeps the generic `elemLlvmTy` stride (do NOT hardcode i64).
+            auto* inBoundsBB = llvm::BasicBlock::Create(ctx, "in_bounds", fn);
+            auto* retZeroBB = llvm::BasicBlock::Create(ctx, "ret_zero", fn);
             llvm::IRBuilder<> b(entry);
+            auto* zero64 = llvm::ConstantInt::get(i64Ty, 0);
             auto* dataPtr =
                 b.CreateStructGEP(vecTy, fn->getArg(0), 0, "data_ptr");
+            auto* lenPtr =
+                b.CreateStructGEP(vecTy, fn->getArg(0), 1, "len_ptr");
             auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
-            auto* elemPtr =
-                b.CreateGEP(elemLlvmTy, data, fn->getArg(1), "elem_ptr");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* idx = fn->getArg(1);
+            auto* idxNonNeg = b.CreateICmpSGE(idx, zero64, "idx_non_negative");
+            auto* idxInRange = b.CreateICmpSLT(idx, len, "idx_in_range");
+            auto* dataNonNull = b.CreateICmpNE(
+                data, llvm::Constant::getNullValue(i8PtrTy), "data_non_null");
+            auto* canRead = b.CreateAnd(
+                b.CreateAnd(idxNonNeg, idxInRange, "bounds_ok"), dataNonNull,
+                "can_read");
+            b.CreateCondBr(canRead, inBoundsBB, retZeroBB);
+            b.SetInsertPoint(inBoundsBB);
+            auto* elemPtr = b.CreateGEP(elemLlvmTy, data, idx, "elem_ptr");
             auto* val = b.CreateLoad(elemLlvmTy, elemPtr, "val");
             b.CreateRet(val);
+            b.SetInsertPoint(retZeroBB);
+            b.CreateRet(llvm::Constant::getNullValue(elemLlvmTy));
             declaredFns_[mangled] = fn;
             return fn;
         }

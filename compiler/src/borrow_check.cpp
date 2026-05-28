@@ -690,13 +690,18 @@ private:
                 // *named* borrow whose lifetime ties to `r`. RefExprs
                 // nested inside the RHS (e.g. `read(&p)`) are temporary
                 // borrows that expire at end-of-statement.
-                const bool rhsIsRef =
+                // PR#15: a slice `let s = &v[a..b];` is likewise a named
+                // borrow of `v` — tie the loan to `s` so mutating `v` while
+                // `s` is live (a stale-slice read) is rejected.
+                const bool rhsStartsNamedBorrow =
                     dynamic_cast<const ast::RefExpr*>(let->value.get()) !=
-                    nullptr;
+                        nullptr ||
+                    dynamic_cast<const ast::SliceExpr*>(let->value.get()) !=
+                        nullptr;
                 int rhsEnd = consume(*let->value, /*expectExpire=*/-1);
                 int borrowerDp = pos_++;
                 scopes_.back()[let->name] = borrowerDp;
-                if (rhsIsRef) attachLoanToBorrower(borrowerDp);
+                if (rhsStartsNamedBorrow) attachLoanToBorrower(borrowerDp);
                 retireExpiredLoans(rhsEnd);
                 last = std::max(last, rhsEnd);
                 continue;
