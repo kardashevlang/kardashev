@@ -148,11 +148,19 @@ EOF
 check_jit_aot "nested_const_fn" "$TMP/nested.kd" 6
 
 # --- Error cases: must be CLEAR compile errors (rc != 0), no crash/hang ----
+# Portable timeout wrapper: GNU `timeout` (Linux) or `gtimeout` (macOS via
+# coreutils); if neither exists, run without it — the const evaluator is
+# step/depth-bounded internally, so the wrapper is only belt-and-suspenders
+# against a regression. (macOS runners have no `timeout`, which previously
+# made every expect_error case fail with "command not found".)
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout 20"
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout 20"; fi
 expect_error() {
     local label="$1" src="$2" needle="$3"
     set +e
     local out rc
-    out=$(timeout 20 "$KARDC" "$src" 2>&1)
+    out=$($TIMEOUT_BIN "$KARDC" "$src" 2>&1)
     rc=$?
     set -e
     if [[ "$rc" -eq 124 ]]; then
