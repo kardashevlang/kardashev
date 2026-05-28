@@ -226,6 +226,13 @@ void test_typeref_unknown_struct_name() {
         "typeref_unknown_struct_name");
 }
 
+void test_returning_reference_is_rejected() {
+    expectErr(
+        "struct P { x: i64 }\n"
+        "fn leak() -> &P { let p = P { x: 1 }; &p }",
+        "returning_reference_is_rejected");
+}
+
 // ---- Phase 2.2: enums + minimal pattern matching ----
 
 void test_enum_decl_empty() {
@@ -1031,6 +1038,7 @@ int main() {
     test_field_access_on_non_struct();
     test_field_access_missing_field();
     test_typeref_unknown_struct_name();
+    test_returning_reference_is_rejected();
     // Phase 2.2
     test_enum_decl_empty();
     test_enum_decl_unit_variants();
@@ -1106,6 +1114,6 @@ int main() {
     test_try_outside_fn_with_result_errors();
     test_try_on_non_result_enum_errors();
     test_try_err_payload_mismatch_errors();
-    std::cout << "All typecheck tests passed (95 cases)\n";
+    std::cout << "All typecheck tests passed (96 cases)\n";
     return 0;
 }

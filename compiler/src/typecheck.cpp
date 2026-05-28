@@ -699,6 +699,11 @@ private:
             scopes_.back()[p.name] = resolveTypeRef(p.type);
         }
         currentReturnType_ = resolveTypeRef(fn.returnType);
+        if (resolve(currentReturnType_)->kind == TypeKind::Ref) {
+            error("function '" + fn.name +
+                      "' cannot return a reference in Phase 2.4b",
+                  fn.returnType.line, fn.returnType.column);
+        }
 
         TypePtr bodyType = checkBlock(*fn.body);
         // If the block has a tail expression, it must match the declared
