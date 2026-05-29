@@ -504,6 +504,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 55 (v9): hashmap_entries -> Vec<(K,V)> (deep-cloned tuples), so a map is
+# rankable/printable without manual key lookups. JIT + AOT + constant-memory.
+sh_test(
+    name = "smoke_test_phase55",
+    srcs = ["smoke_test_phase55.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

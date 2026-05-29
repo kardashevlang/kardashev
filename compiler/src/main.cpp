@@ -600,6 +600,28 @@ std::string applyPrelude(const std::string& userSrc) {
             "    acc\n"
             "}\n";
     }
+    // Phase 55 (v9): enumerate a HashMap's entries as a Vec of (key, value)
+    // tuples (each deep-cloned, so the Vec owns them), so a map can be ranked /
+    // printed without manual key lookups. Bucket-order; the caller sorts (e.g.
+    // via a derived-Ord wrapper). Guarded.
+    if (userSrc.find("fn hashmap_entries") == std::string::npos) {
+        prelude +=
+            "fn hashmap_entries<K: Hash + Eq + Clone, V: Clone>"
+            "(m: &HashMap<K, V>) -> Vec<(K, V)> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let ks = hashmap_keys(m);\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(&ks) {\n"
+            "        let kref = vec_get_ref(&ks, i);\n"
+            "        match hashmap_get_ref(m, kref.clone()) {\n"
+            "            Some(vref) => { vec_push(&mut out, (kref.clone(), vref.clone())); },\n"
+            "            None => {},\n"
+            "        }\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
     if (userSrc.find("fn option_unwrap_or") == std::string::npos) {
         prelude +=
             "fn option_unwrap_or(o: Option<i64>, default: i64) -> i64 {\n"
