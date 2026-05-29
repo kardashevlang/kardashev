@@ -253,6 +253,7 @@ std::vector<Token> lex(std::string_view source) {
         case '}': push1(TokenKind::RBrace, startCol); continue;
         case '[': push1(TokenKind::LBracket, startCol); continue;
         case ']': push1(TokenKind::RBracket, startCol); continue;
+        case '#': push1(TokenKind::Pound, startCol); continue; // Phase 42 attrs
         case ',': push1(TokenKind::Comma, startCol); continue;
         case ';': push1(TokenKind::Semi, startCol); continue;
         case ':': push1(TokenKind::Colon, startCol); continue;
@@ -324,6 +325,7 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::LBrace: return "LBrace";
     case TokenKind::RBrace: return "RBrace";
     case TokenKind::LBracket: return "LBracket";
+    case TokenKind::Pound: return "Pound";
     case TokenKind::RBracket: return "RBracket";
     case TokenKind::Comma: return "Comma";
     case TokenKind::Semi: return "Semi";

@@ -401,6 +401,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 42: #[derive(Clone, Eq, Display)] — synthesized field/payload-wise impls
+# on structs + enums (incl. recursive + generic), via re-parsed impl source.
+sh_test(
+    name = "smoke_test_phase42",
+    srcs = ["smoke_test_phase42.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

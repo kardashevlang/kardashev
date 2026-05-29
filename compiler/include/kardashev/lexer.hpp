@@ -89,6 +89,7 @@ enum class TokenKind {
     LBrace,
     RBrace,
     LBracket, // Phase 13b: `[` (slice types `&[T]` + slice exprs `&v[a..b]`)
+    Pound,    // Phase 42: `#` — attribute lead-in for `#[derive(...)]`
     RBracket, // Phase 13b: `]`
     Comma,
     Semi,

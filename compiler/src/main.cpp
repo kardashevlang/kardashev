@@ -303,6 +303,172 @@ std::string applyPrelude(const std::string& userSrc) {
     return prelude + userSrc;
 }
 
+// Phase 42: synthesize `impl` SOURCE for each `#[derive(...)]` on a struct/enum
+// (field-/payload-wise Clone, Eq, Display), then re-parse + append. Reuses the
+// real impl machinery (incl. generic impls, Phase 40) instead of hand-building
+// AST. A generic type's params each gain the derived trait as a bound.
+std::string deriveImplSource(const kardashev::ast::Program& prog) {
+    auto header = [](const std::vector<kardashev::ast::TypeParam>& ps,
+                     const char* bound) -> std::string {
+        if (ps.empty()) return "";
+        std::string s = "<";
+        for (std::size_t i = 0; i < ps.size(); ++i) {
+            if (i) s += ", ";
+            s += ps[i].name;
+            s += ": ";
+            s += bound;
+        }
+        return s + ">";
+    };
+    auto tyName = [](const std::string& name,
+                     const std::vector<kardashev::ast::TypeParam>& ps) -> std::string {
+        if (ps.empty()) return name;
+        std::string s = name + "<";
+        for (std::size_t i = 0; i < ps.size(); ++i) {
+            if (i) s += ", ";
+            s += ps[i].name;
+        }
+        return s + ">";
+    };
+    std::string out;
+    for (const auto& s : prog.structs) {
+        const std::string TN = tyName(s.name, s.genericParams);
+        for (const auto& d : s.derives) {
+            if (d == "Clone") {
+                out += "impl" + header(s.genericParams, "Clone") + " Clone for " +
+                       TN + " { fn clone(&self) -> " + TN + " ! { alloc } { " +
+                       s.name + " {";
+                for (std::size_t i = 0; i < s.fields.size(); ++i)
+                    out += (i ? "," : "") + (" " + s.fields[i].name + ": self." +
+                                             s.fields[i].name + ".clone()");
+                out += " } } }\n";
+            } else if (d == "Eq") {
+                out += "impl" + header(s.genericParams, "Eq") + " Eq for " + TN +
+                       " { fn eq(&self, other: &" + TN + ") -> bool { ";
+                if (s.fields.empty()) out += "true";
+                for (std::size_t i = 0; i < s.fields.size(); ++i)
+                    out += (i ? " && " : "") + ("self." + s.fields[i].name +
+                                                ".eq(&other." +
+                                                s.fields[i].name + ")");
+                out += " } }\n";
+            } else if (d == "Display") {
+                out += "impl" + header(s.genericParams, "Display") +
+                       " Display for " + TN +
+                       " { fn to_string(&self) -> String ! { alloc } { let mut "
+                       "out = \"" + s.name + " { \";";
+                for (std::size_t i = 0; i < s.fields.size(); ++i) {
+                    if (i)
+                        out += " string_push_str(&mut out, \", \");";
+                    out += " string_push_str(&mut out, \"" + s.fields[i].name +
+                           ": \"); string_push_str(&mut out, self." +
+                           s.fields[i].name + ".to_string());";
+                }
+                out += " string_push_str(&mut out, \" }\"); out } }\n";
+            }
+        }
+    }
+    for (const auto& e : prog.enums) {
+        const std::string TN = tyName(e.name, e.genericParams);
+        const bool multi = e.variants.size() > 1;
+        for (const auto& d : e.derives) {
+            if (d == "Clone") {
+                out += "impl" + header(e.genericParams, "Clone") + " Clone for " +
+                       TN + " { fn clone(&self) -> " + TN +
+                       " ! { alloc } { match self {";
+                for (std::size_t v = 0; v < e.variants.size(); ++v) {
+                    const auto& var = e.variants[v];
+                    out += " " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("x" + std::to_string(i));
+                        out += ")";
+                    }
+                    out += " => " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") +
+                                   ("x" + std::to_string(i) + ".clone()");
+                        out += ")";
+                    }
+                    out += ",";
+                }
+                out += " } } }\n";
+            } else if (d == "Eq") {
+                out += "impl" + header(e.genericParams, "Eq") + " Eq for " + TN +
+                       " { fn eq(&self, other: &" + TN +
+                       ") -> bool { match self {";
+                for (const auto& var : e.variants) {
+                    out += " " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("a" + std::to_string(i));
+                        out += ")";
+                    }
+                    out += " => match other { " + var.name;
+                    std::string body;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i) {
+                            out += (i ? ", " : "") + ("b" + std::to_string(i));
+                            body += (i ? " && " : "") +
+                                    ("a" + std::to_string(i) + ".eq(b" +
+                                     std::to_string(i) + ")");
+                        }
+                        out += ")";
+                    } else {
+                        body = "true";
+                    }
+                    out += " => " + body + ",";
+                    if (multi) out += " _ => false,";
+                    out += " },";
+                }
+                out += " } } }\n";
+            } else if (d == "Display") {
+                out += "impl" + header(e.genericParams, "Display") +
+                       " Display for " + TN +
+                       " { fn to_string(&self) -> String ! { alloc } { match "
+                       "self {";
+                for (const auto& var : e.variants) {
+                    out += " " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("x" + std::to_string(i));
+                        out += ")";
+                    }
+                    if (var.payloadTypes.empty()) {
+                        out += " => \"" + var.name + "\",";
+                    } else {
+                        out += " => { let mut out = \"" + var.name + "(\";";
+                        for (std::size_t i = 0; i < var.payloadTypes.size();
+                             ++i) {
+                            if (i)
+                                out += " string_push_str(&mut out, \", \");";
+                            out += " string_push_str(&mut out, x" +
+                                   std::to_string(i) + ".to_string());";
+                        }
+                        out += " string_push_str(&mut out, \")\"); out },";
+                    }
+                }
+                out += " } } }\n";
+            }
+        }
+    }
+    return out;
+}
+
+// Generate + parse the derive impls and append them to the program.
+void expandDerives(kardashev::ast::Program& prog) {
+    std::string gen = deriveImplSource(prog);
+    if (gen.empty()) return;
+    auto pr = kardashev::parse(gen);
+    for (auto& impl : pr.program.impls)
+        prog.impls.push_back(std::move(impl));
+}
+
 // Phase 7.1: resolve `mod foo;` directives by reading sibling `.kd`
 // files and merging their declarations into the caller's program. The
 // merge is FLAT — module contents become part of the top-level program
@@ -447,6 +613,7 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return std::nullopt;
     auto& program = *progOpt;
+    expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     // PR#26 (ABI safety): the JIT calls `entry` through an i64()-typed
     // function pointer, so reject any entry whose signature doesn't match —
     // a non-empty parameter list or a non-integer return would corrupt the
@@ -878,6 +1045,7 @@ bool compileToObject(const std::string& srcRaw, const std::string& srcDir,
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return false;
     auto& program = *progOpt;
+    expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr);
@@ -910,6 +1078,7 @@ int emitLlvmIr(const std::string& srcRaw, const std::string& srcDir,
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return 1;
     auto& program = *progOpt;
+    expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr);
@@ -1041,6 +1210,7 @@ int runTests(const std::string& srcRaw, const std::string& srcDir,
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return 1;
     auto& program = *progOpt;
+    expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr);

@@ -639,6 +639,7 @@ struct StructDecl {
     std::string name;
     std::vector<TypeParam> genericParams; // empty = monomorphic struct
     std::vector<Param> fields;
+    std::vector<std::string> derives; // Phase 42: `#[derive(Clone, Eq, ...)]`
     bool isPub = false; // Phase 15: `pub struct` — parsed + stored.
     std::size_t line = 1;
     std::size_t column = 1;
@@ -655,6 +656,7 @@ struct EnumDecl {
     std::string name;
     std::vector<TypeParam> genericParams; // empty = monomorphic enum
     std::vector<EnumVariant> variants;
+    std::vector<std::string> derives; // Phase 42: `#[derive(Clone, Eq, ...)]`
     bool isPub = false; // Phase 15: `pub enum` — parsed + stored.
     std::size_t line = 1;
     std::size_t column = 1;
