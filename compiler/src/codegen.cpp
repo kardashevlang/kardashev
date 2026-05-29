@@ -2444,7 +2444,14 @@ private:
 
             b.SetInsertPoint(hitBB);
             auto* valP = b.CreateStructGEP(entryTy, eptr, 2, "valP");
-            auto* val = b.CreateLoad(valTy, valP, "val");
+            // hashmap_get returns Option<V> BY VALUE while the entry STAYS in
+            // the map, so the returned value must be an independent deep CLONE
+            // — a bitwise load would alias the map's heap buffer and, now that
+            // the map drops its values (Phase 33 interior drop), double-free.
+            // For a Copy V (i64/bool/struct-of-Copy) the clone is a plain copy,
+            // so the common case is unchanged. (get_ref returns a borrow and
+            // needs no clone.)
+            auto* val = b.CreateCall(getOrEmitCloneFn(V), {valP}, "val");
             llvm::Value* someAgg = llvm::UndefValue::get(optLlvm);
             someAgg = b.CreateInsertValue(
                 someAgg, llvm::ConstantInt::get(i32Ty, someIdx), {0}, "some");
@@ -5154,7 +5161,11 @@ private:
             llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
             auto* data = b.CreateExtractValue(fn->getArg(0), {0}, "data");
             auto* ep = b.CreateGEP(elemLlvmTy, data, fn->getArg(1), "elem_ptr");
-            b.CreateRet(b.CreateLoad(elemLlvmTy, ep, "val"));
+            // A slice only BORROWS its backing, so a by-value element must be a
+            // deep CLONE — a bitwise load would alias storage owned elsewhere
+            // (the source Vec/array) and double-free. Copy T is unchanged;
+            // slice_get_ref returns a borrow and needs no clone.
+            b.CreateRet(b.CreateCall(getOrEmitCloneFn(T), {ep}, "val"));
             declaredFns_[mangled] = fn;
             return fn;
         }
@@ -5294,7 +5305,12 @@ private:
             b.CreateCondBr(canRead, inBoundsBB, retZeroBB);
             b.SetInsertPoint(inBoundsBB);
             auto* elemPtr = b.CreateGEP(elemLlvmTy, data, idx, "elem_ptr");
-            auto* val = b.CreateLoad(elemLlvmTy, elemPtr, "val");
+            // vec_get returns the element BY VALUE while it STAYS in the vec, so
+            // the result must be an independent deep CLONE — a bitwise load
+            // would alias the vec's heap buffer and double-free once the vec
+            // drops its elements. Copy T clones to the same bits (common case
+            // unchanged); vec_get_ref returns a borrow and needs no clone.
+            auto* val = b.CreateCall(getOrEmitCloneFn(T), {elemPtr}, "val");
             b.CreateRet(val);
             b.SetInsertPoint(retZeroBB);
             b.CreateRet(llvm::Constant::getNullValue(elemLlvmTy));

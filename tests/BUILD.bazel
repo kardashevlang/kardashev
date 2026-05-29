@@ -512,6 +512,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Pre-merge review fixes: a soundness regression guard locking in the 5 memory-
+# safety / type-soundness blocker fixes + the dyn/generic effect attribution.
+sh_test(
+    name = "smoke_test_soundness",
+    srcs = ["smoke_test_soundness.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
