@@ -1253,6 +1253,176 @@ private:
             declaredFns_["print_string"] = fn;
         }
 
+        // --- Phase 27: str_eq(a: &String, b: &String) -> bool ---
+        // Lengths must match; an empty/empty pair is equal without touching
+        // the (possibly null) data pointers; otherwise memcmp the bytes.
+        {
+            auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+            auto* fnTy =
+                llvm::FunctionType::get(i1Ty, {i8PtrTy, i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "str_eq", module_.get());
+            fn->getArg(0)->setName("a");
+            fn->getArg(1)->setName("b");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* cmpBB = llvm::BasicBlock::Create(ctx, "cmp", fn);
+            auto* memBB = llvm::BasicBlock::Create(ctx, "memcmp", fn);
+            auto* trueBB = llvm::BasicBlock::Create(ctx, "eq_true", fn);
+            auto* falseBB = llvm::BasicBlock::Create(ctx, "eq_false", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* aLenP = b.CreateStructGEP(strTy, fn->getArg(0), 1, "a_len_p");
+            auto* bLenP = b.CreateStructGEP(strTy, fn->getArg(1), 1, "b_len_p");
+            auto* aLen = b.CreateLoad(i64Ty, aLenP, "a_len");
+            auto* bLen = b.CreateLoad(i64Ty, bLenP, "b_len");
+            b.CreateCondBr(b.CreateICmpEQ(aLen, bLen, "len_eq"), cmpBB, falseBB);
+            b.SetInsertPoint(cmpBB);
+            b.CreateCondBr(b.CreateICmpEQ(aLen, zeroI64, "empty"), trueBB,
+                           memBB);
+            b.SetInsertPoint(memBB);
+            auto* memcmpTy = llvm::FunctionType::get(
+                i32Ty, {i8PtrTy, i8PtrTy, i64Ty}, false);
+            auto memcmpFn = module_->getOrInsertFunction("memcmp", memcmpTy);
+            auto* aDataP = b.CreateStructGEP(strTy, fn->getArg(0), 0, "a_data_p");
+            auto* bDataP = b.CreateStructGEP(strTy, fn->getArg(1), 0, "b_data_p");
+            auto* aData = b.CreateLoad(i8PtrTy, aDataP, "a_data");
+            auto* bData = b.CreateLoad(i8PtrTy, bDataP, "b_data");
+            auto* r = b.CreateCall(memcmpFn, {aData, bData, aLen}, "memcmp_r");
+            b.CreateRet(
+                b.CreateICmpEQ(r, llvm::ConstantInt::get(i32Ty, 0), "bytes_eq"));
+            b.SetInsertPoint(trueBB);
+            b.CreateRet(llvm::ConstantInt::getTrue(ctx));
+            b.SetInsertPoint(falseBB);
+            b.CreateRet(llvm::ConstantInt::getFalse(ctx));
+            declaredFns_["str_eq"] = fn;
+        }
+
+        // --- Phase 27: str_substring(s: &String, start, len) -> String ---
+        // Clamp start into [0, sLen] and len into [0, sLen-start], then malloc
+        // a fresh heap buffer of the clamped length and memcpy the slice. An
+        // empty result returns {null, 0, 0} (no allocation), like string_new.
+        {
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            auto* fnTy = llvm::FunctionType::get(
+                strTy, {i8PtrTy, i64Ty, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "str_substring",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("start");
+            fn->getArg(2)->setName("len");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* allocBB = llvm::BasicBlock::Create(ctx, "alloc", fn);
+            auto* emptyBB = llvm::BasicBlock::Create(ctx, "empty", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* sDataP = b.CreateStructGEP(strTy, fn->getArg(0), 0, "s_data_p");
+            auto* sLenP = b.CreateStructGEP(strTy, fn->getArg(0), 1, "s_len_p");
+            auto* sData = b.CreateLoad(i8PtrTy, sDataP, "s_data");
+            auto* sLen = b.CreateLoad(i64Ty, sLenP, "s_len");
+            auto* start = fn->getArg(1);
+            auto* len = fn->getArg(2);
+            auto* s0 = b.CreateSelect(
+                b.CreateICmpSLT(start, zeroI64, "start_neg"), zeroI64, start,
+                "s0");
+            auto* cs = b.CreateSelect(
+                b.CreateICmpSGT(s0, sLen, "start_big"), sLen, s0, "cs");
+            auto* maxLen = b.CreateSub(sLen, cs, "max_len");
+            auto* l0 = b.CreateSelect(
+                b.CreateICmpSLT(len, zeroI64, "len_neg"), zeroI64, len, "l0");
+            auto* cl = b.CreateSelect(
+                b.CreateICmpSGT(l0, maxLen, "len_big"), maxLen, l0, "cl");
+            b.CreateCondBr(b.CreateICmpSGT(cl, zeroI64, "has_bytes"), allocBB,
+                           emptyBB);
+            b.SetInsertPoint(allocBB);
+            auto* buf = b.CreateCall(mallocFn_, {cl}, "sub_buf");
+            auto* src = b.CreateGEP(i8Ty, sData, cs, "src");
+            b.CreateCall(memcpyFn_, {buf, src, cl}, "sub_copy");
+            llvm::Value* v = llvm::UndefValue::get(strTy);
+            v = b.CreateInsertValue(v, buf, {0}, "sub_data");
+            v = b.CreateInsertValue(v, cl, {1}, "sub_len");
+            v = b.CreateInsertValue(v, cl, {2}, "sub_cap");
+            b.CreateRet(v);
+            b.SetInsertPoint(emptyBB);
+            llvm::Value* e = llvm::UndefValue::get(strTy);
+            e = b.CreateInsertValue(
+                e, llvm::ConstantPointerNull::get(i8PtrTy), {0}, "e_data");
+            e = b.CreateInsertValue(e, zeroI64, {1}, "e_len");
+            e = b.CreateInsertValue(e, zeroI64, {2}, "e_cap");
+            b.CreateRet(e);
+            declaredFns_["str_substring"] = fn;
+        }
+
+        // --- Phase 27: int_to_string(n: i64) -> String ---
+        // snprintf the decimal form of n into a fresh 24-byte heap buffer (an
+        // i64 is at most 20 digits + sign + NUL = 22 < 24). The returned String
+        // is heap-owned (cap = 24), so a later string_push_str reallocs it.
+        {
+            auto* fnTy = llvm::FunctionType::get(strTy, {i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "int_to_string",
+                module_.get());
+            fn->getArg(0)->setName("n");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* cap = llvm::ConstantInt::get(i64Ty, 24);
+            auto* buf = b.CreateCall(mallocFn_, {cap}, "its_buf");
+            auto* snprintfTy = llvm::FunctionType::get(
+                i32Ty, {i8PtrTy, i64Ty, i8PtrTy}, /*isVarArg=*/true);
+            auto snprintfFn =
+                module_->getOrInsertFunction("snprintf", snprintfTy);
+            auto* fmt = b.CreateGlobalString("%lld", "kd_itos_fmt", 0,
+                                             module_.get());
+            auto* written = b.CreateCall(
+                snprintfFn, {buf, cap, fmt, fn->getArg(0)}, "its_written");
+            auto* len = b.CreateSExt(written, i64Ty, "its_len");
+            llvm::Value* v = llvm::UndefValue::get(strTy);
+            v = b.CreateInsertValue(v, buf, {0}, "its_data");
+            v = b.CreateInsertValue(v, len, {1}, "its_len_f");
+            v = b.CreateInsertValue(v, cap, {2}, "its_cap");
+            b.CreateRet(v);
+            declaredFns_["int_to_string"] = fn;
+        }
+
+        // --- Phase 27: print_no_nl(s: &String) -> i64 (no trailing newline) ---
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "print_no_nl",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* dataPtr = b.CreateStructGEP(strTy, fn->getArg(0), 0, "data_p");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* lenPtr = b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_p");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* lenI32 = b.CreateTrunc(len, i32Ty, "len_i32");
+            auto* fmt = b.CreateGlobalString("%.*s", "kd_print_nonl_fmt", 0,
+                                             module_.get());
+            b.CreateCall(printfFn, {fmt, lenI32, data});
+            b.CreateRet(zeroI64);
+            declaredFns_["print_no_nl"] = fn;
+        }
+
+        // --- Phase 27: println(s: &String) -> i64 (newline-terminated) ---
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "println", module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* dataPtr = b.CreateStructGEP(strTy, fn->getArg(0), 0, "data_p");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* lenPtr = b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_p");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* lenI32 = b.CreateTrunc(len, i32Ty, "len_i32");
+            auto* fmt = b.CreateGlobalString("%.*s\n", "kd_println_fmt", 0,
+                                             module_.get());
+            b.CreateCall(printfFn, {fmt, lenI32, data});
+            b.CreateRet(zeroI64);
+            declaredFns_["println"] = fn;
+        }
+
         // --- Phase 13b: slice read ops. A slice value is the {ptr,len} fat
         // pointer produced by `&v[a..b]` (emitSlice). Both ops take the slice
         // BY VALUE (a 16-byte aggregate). MVP element = i64; slice_get uses an

@@ -256,6 +256,16 @@ sh_test(
     ],
 )
 
+# Phase 27 string toolkit: str_eq (byte-exact, incl. empty/length-mismatch),
+# str_substring (start/len clamped into bounds), int_to_string (signed decimal),
+# print_no_nl (no trailing newline) + println, and a heap-owned-growth check
+# (string_push_str onto an int_to_string result); through JIT + AOT.
+sh_test(
+    name = "smoke_test_strings",
+    srcs = ["smoke_test_strings.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

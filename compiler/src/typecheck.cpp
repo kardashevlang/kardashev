@@ -156,6 +156,66 @@ public:
             fnSchemas_["print_string"] = std::move(sch);
         }
 
+        // --- Phase 27: string toolkit ---
+        // The pre-existing string ops were print_str / str_len / str_char_at
+        // (Phase 26) and the heap string_* family (Phase 13b). This group adds
+        // the comparison, slicing, integer-formatting, and no-newline output a
+        // self-written parser/serializer needs. Note print_str/print_string
+        // already force a trailing newline; the genuinely new output capability
+        // here is print_no_nl (compose a line piece by piece), with println as
+        // the conventional newline-terminated name.
+
+        // str_eq(a: &String, b: &String) -> bool — byte-exact equality (length
+        // then memcmp). Pure: only reads borrowed memory.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false),
+                 makeRef(stringTy, /*isMut=*/false)},
+                makeBool());
+            fnSchemas_["str_eq"] = std::move(sch);
+        }
+        // str_substring(s: &String, start: i64, len: i64) -> String ! { alloc }
+        // A fresh heap-owned String holding the clamped byte range
+        // [start, start+len). start and len are clamped into bounds, so an
+        // out-of-range request yields a shorter (possibly empty) string rather
+        // than reading past the buffer.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false), makeInt(), makeInt()},
+                stringTy);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["str_substring"] = std::move(sch);
+        }
+        // int_to_string(n: i64) -> String ! { alloc } — decimal formatting of
+        // an i64 into a fresh heap String (snprintf "%lld").
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, stringTy);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["int_to_string"] = std::move(sch);
+        }
+        // print_no_nl(s: &String) -> i64 ! { io } — writes s with NO trailing
+        // newline (print_str / print_string / println all force one), so
+        // output can be composed piece by piece on a single line.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false)}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["print_no_nl"] = std::move(sch);
+        }
+        // println(s: &String) -> i64 ! { io } — the conventional name for a
+        // newline-terminated string print (same behavior as print_str).
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false)}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["println"] = std::move(sch);
+        }
+
         // Phase 5.z: vec_* are generic over T. Each call site infers T
         // from arg types; codegen lazily specializes the runtime per T.
         TypePtr vecFnGenericVar = makeFreshVar();
