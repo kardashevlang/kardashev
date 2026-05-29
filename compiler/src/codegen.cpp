@@ -734,6 +734,7 @@ private:
     llvm::Function* execEnsureFn_ = nullptr;   // __kd_exec_ensure
     llvm::Function* execPushFn_ = nullptr;     // __kd_exec_push
     llvm::Function* execStepFn_ = nullptr;     // __kd_exec_step
+    llvm::Function* execReapFn_ = nullptr;     // __kd_exec_reap_if_idle (P43)
     llvm::Function* execWaitFn_ = nullptr;     // __kd_exec_wait (reactor sleep)
     llvm::Function* execDriveFn_ = nullptr;    // __kd_exec_drive_until
     llvm::Function* execSlotFn_ = nullptr;     // __kd_exec_task_slot
@@ -1259,6 +1260,68 @@ private:
             v = b.CreateInsertValue(v, zeroI64, {2}, "cap");
             b.CreateRet(v);
             declaredFns_["string_new"] = fn;
+        }
+
+        // Phase 43: str_push_byte(s: &mut String, b: i64) -> i64 — append the
+        // low 8 bits of `b`, growing s's buffer (same policy as string_push_str:
+        // realloc a heap buffer, malloc+copy a borrowed literal).
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i8PtrTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "str_push_byte",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("b");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* growBB = llvm::BasicBlock::Create(ctx, "grow", fn);
+            auto* freshBB = llvm::BasicBlock::Create(ctx, "fresh", fn);
+            auto* reuseBB = llvm::BasicBlock::Create(ctx, "reuse", fn);
+            auto* writeBB = llvm::BasicBlock::Create(ctx, "write", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* sPtr = fn->getArg(0);
+            auto* sDataP = b.CreateStructGEP(strTy, sPtr, 0, "s_data_p");
+            auto* sLenP = b.CreateStructGEP(strTy, sPtr, 1, "s_len_p");
+            auto* sCapP = b.CreateStructGEP(strTy, sPtr, 2, "s_cap_p");
+            auto* sLen = b.CreateLoad(i64Ty, sLenP, "s_len");
+            auto* sCap = b.CreateLoad(i64Ty, sCapP, "s_cap");
+            auto* sData = b.CreateLoad(i8PtrTy, sDataP, "s_data");
+            auto* newLen = b.CreateAdd(sLen, llvm::ConstantInt::get(i64Ty, 1),
+                                       "new_len");
+            b.CreateCondBr(b.CreateICmpULT(sCap, newLen, "need_grow"), growBB,
+                           writeBB);
+            b.SetInsertPoint(growBB);
+            auto* eight = llvm::ConstantInt::get(i64Ty, 8);
+            auto* doubled =
+                b.CreateMul(sCap, llvm::ConstantInt::get(i64Ty, 2), "dbl");
+            auto* atLeast8 = b.CreateSelect(
+                b.CreateICmpULT(doubled, eight, "lt8"), eight, doubled, "a8");
+            auto* newCap = b.CreateSelect(
+                b.CreateICmpULT(atLeast8, newLen, "ltnew"), newLen, atLeast8,
+                "new_cap");
+            b.CreateCondBr(b.CreateICmpNE(sCap, zeroI64, "was_heap"), reuseBB,
+                           freshBB);
+            b.SetInsertPoint(reuseBB);
+            b.CreateStore(b.CreateCall(reallocFn_, {sData, newCap}, "re"),
+                          sDataP);
+            b.CreateStore(newCap, sCapP);
+            b.CreateBr(writeBB);
+            b.SetInsertPoint(freshBB);
+            auto* nb = b.CreateCall(mallocFn_, {newCap}, "fresh_buf");
+            b.CreateCall(memcpyFn_, {nb, sData, sLen});
+            b.CreateStore(nb, sDataP);
+            b.CreateStore(newCap, sCapP);
+            b.CreateBr(writeBB);
+            b.SetInsertPoint(writeBB);
+            auto* curData = b.CreateLoad(i8PtrTy, sDataP, "cur_data");
+            auto* dst = b.CreateGEP(llvm::Type::getInt8Ty(ctx), curData, sLen,
+                                    "dst");
+            b.CreateStore(b.CreateTrunc(fn->getArg(1),
+                                        llvm::Type::getInt8Ty(ctx), "b8"),
+                          dst);
+            b.CreateStore(newLen, sLenP);
+            b.CreateRet(zeroI64);
+            declaredFns_["str_push_byte"] = fn;
         }
 
         // string_push_str(s: &mut String, other: String) -> i64 : append
@@ -4142,6 +4205,79 @@ private:
             execStepFn_ = fn;
         }
 
+        // ---- void __kd_exec_reap_if_idle() (Phase 43): if NO task is still
+        // live (all done), free every task's heap frame + poll slot and reset
+        // the task count to 0. Only acting when nothing is live makes this
+        // safe — no live task's frame is freed, and no surviving index is
+        // invalidated. block_on calls it after its target completes, so a
+        // block_on-in-a-loop reclaims each completed future's frame (constant
+        // memory) without disturbing the spawn/join handle space.
+        {
+            auto* fnTy = llvm::FunctionType::get(voidTy, {}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::InternalLinkage,
+                "__kd_exec_reap_if_idle", module_.get());
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* scan = llvm::BasicBlock::Create(ctx, "scan", fn);
+            auto* scanBody = llvm::BasicBlock::Create(ctx, "scan.body", fn);
+            auto* scanNext = llvm::BasicBlock::Create(ctx, "scan.next", fn);
+            auto* freeLoop = llvm::BasicBlock::Create(ctx, "free", fn);
+            auto* freeBody = llvm::BasicBlock::Create(ctx, "free.body", fn);
+            auto* bail = llvm::BasicBlock::Create(ctx, "bail", fn);
+            auto* doneReap = llvm::BasicBlock::Create(ctx, "done.reap", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+            auto* one = llvm::ConstantInt::get(i64Ty, 1);
+            auto* cntP =
+                b.CreateStructGEP(execTy_, execGlobal_, EXEC_COUNT, "cntP");
+            auto* count = b.CreateLoad(i64Ty, cntP, "count");
+            auto* iP = b.CreateAlloca(i64Ty, nullptr, "i");
+            b.CreateStore(zero, iP);
+            b.CreateBr(scan);
+            // scan: if any task has done==0, a future is still live -> bail.
+            b.SetInsertPoint(scan);
+            auto* i1 = b.CreateLoad(i64Ty, iP, "i1");
+            b.CreateCondBr(b.CreateICmpULT(i1, count, "more1"), scanBody,
+                           freeLoop);
+            b.SetInsertPoint(scanBody);
+            auto* s1 = b.CreateCall(execSlotFn_, {i1}, "s1");
+            auto* d1 = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(taskTy_, s1, TASK_DONE, "d1p"), "d1");
+            // done==0 -> a future is live -> bail WITHOUT reaping; else scan on.
+            b.CreateCondBr(b.CreateICmpEQ(d1, zero, "is_live"), bail, scanNext);
+            b.SetInsertPoint(scanNext);
+            b.CreateStore(b.CreateAdd(i1, one, "i1n"), iP);
+            b.CreateBr(scan);
+            // free: all tasks done -> free each frame + poll slot.
+            b.SetInsertPoint(freeLoop);
+            b.CreateStore(zero, iP); // reuse i for the free pass
+            b.CreateBr(freeBody);
+            b.SetInsertPoint(freeBody);
+            auto* i2 = b.CreateLoad(i64Ty, iP, "i2");
+            auto* freeOne = llvm::BasicBlock::Create(ctx, "free.one", fn);
+            b.CreateCondBr(b.CreateICmpULT(i2, count, "more2"), freeOne,
+                           doneReap);
+            b.SetInsertPoint(freeOne);
+            auto* s2 = b.CreateCall(execSlotFn_, {i2}, "s2");
+            auto* fr = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(taskTy_, s2, TASK_FRAME, "frp"),
+                "fr");
+            b.CreateCall(freeFn_, {fr});
+            auto* sl = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(taskTy_, s2, TASK_SLOT, "slp"), "sl");
+            b.CreateCall(freeFn_, {sl});
+            b.CreateStore(b.CreateAdd(i2, one, "i2n"), iP);
+            b.CreateBr(freeBody);
+            // reaped everything -> the executor is empty again.
+            b.SetInsertPoint(doneReap);
+            b.CreateStore(zero, cntP);
+            b.CreateRetVoid();
+            // a live task remained -> leave the executor untouched.
+            b.SetInsertPoint(bail);
+            b.CreateRetVoid();
+            execReapFn_ = fn;
+        }
+
         declareExecSetDeadline();
         declareExecWait();
         declareExecDrive(execPtrTy);
@@ -4443,9 +4579,15 @@ private:
         auto* typeTag = llvm::ConstantInt::get(i64Ty, std::hash<std::string>{}(mangleType(T)));
         auto* h = b.CreateCall(execPushFn_, {pollPtr, framePtr, slot, typeTag}, "handle");
         b.CreateCall(execDriveFn_, {h});
-        // result = Poll<T>.value from the task's slot.
+        // result = Poll<T>.value from the task's slot — read it BEFORE reaping
+        // (the reap may free the slot). `val` is a value copy; any heap it owns
+        // (e.g. a returned String's buffer) lives outside the frame/slot.
         auto* valP = b.CreateStructGEP(pollT, slot, 1, "val_ptr");
         auto* val = b.CreateLoad(valTy, valP, "result");
+        // Phase 43: reclaim this completed future's frame + poll slot (and any
+        // other now-done tasks) when the executor is idle — constant memory
+        // across a block_on loop. Safe: only acts when nothing is live.
+        if (execReapFn_) b.CreateCall(execReapFn_, {});
         (void)i8PtrTy;
         b.CreateRet(val);
         return fn;
@@ -6764,8 +6906,12 @@ private:
         builder_->CreateRetVoid();
 
         // READY: extract the value (as the sub-future's result type) and
-        // continue with it as the await result.
+        // continue with it as the await result. Phase 43: the sub-future is
+        // complete and never polled again, so free its heap frame here (the
+        // value lives in `pollSlot`, a local — not in subFrame; a null frame
+        // makes the free a safe no-op). Closes the awaited-frame leak.
         builder_->SetInsertPoint(readyBB);
+        builder_->CreateCall(freeFn_, {subFrame});
         auto* valP = builder_->CreateStructGEP(subPollTy, pollSlot, 1, "val_ptr");
         (void)i8PtrTy;
         (void)i64Ty;

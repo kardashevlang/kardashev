@@ -202,6 +202,73 @@ std::string applyPrelude(const std::string& userSrc) {
             "    }\n"
             "}\n";
     }
+    // Phase 43: runtime string escape decode/encode for JSON-style strings,
+    // written in kardashev over str_push_byte / str_char_at. `\\uXXXX` decodes
+    // the Latin-1 subset (cp < 256); higher code points become '?' (documented).
+    // Guarded so a user-defined `str_unescape` suppresses the whole block.
+    if (userSrc.find("fn str_unescape") == std::string::npos) {
+        prelude +=
+            "fn __kd_hex_alpha(c: i64) -> i64 {\n"
+            "    if c >= 97 { if c <= 102 { c - 87 } else { 0 } }\n"
+            "    else { if c >= 65 { if c <= 70 { c - 55 } else { 0 } } else { 0 } }\n"
+            "}\n"
+            "fn __kd_hex_digit(c: i64) -> i64 {\n"
+            "    if c >= 48 { if c <= 57 { c - 48 } else { __kd_hex_alpha(c) } }\n"
+            "    else { __kd_hex_alpha(c) }\n"
+            "}\n"
+            "fn str_unescape(s: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let n = str_len(s);\n"
+            "    let mut i = 0;\n"
+            "    while i < n {\n"
+            "        let c = str_char_at(s, i);\n"
+            "        if c == 92 {\n"
+            "            i = i + 1;\n"
+            "            if i < n {\n"
+            "                let d = str_char_at(s, i);\n"
+            "                if d == 110 { str_push_byte(&mut out, 10); }\n"
+            "                else if d == 116 { str_push_byte(&mut out, 9); }\n"
+            "                else if d == 114 { str_push_byte(&mut out, 13); }\n"
+            "                else if d == 34 { str_push_byte(&mut out, 34); }\n"
+            "                else if d == 92 { str_push_byte(&mut out, 92); }\n"
+            "                else if d == 47 { str_push_byte(&mut out, 47); }\n"
+            "                else if d == 117 {\n"
+            "                    let h0 = __kd_hex_digit(str_char_at(s, i + 1));\n"
+            "                    let h1 = __kd_hex_digit(str_char_at(s, i + 2));\n"
+            "                    let h2 = __kd_hex_digit(str_char_at(s, i + 3));\n"
+            "                    let h3 = __kd_hex_digit(str_char_at(s, i + 4));\n"
+            "                    let cp = ((h0 * 16 + h1) * 16 + h2) * 16 + h3;\n"
+            "                    i = i + 4;\n"
+            "                    if cp < 256 { str_push_byte(&mut out, cp); }\n"
+            "                    else { str_push_byte(&mut out, 63); }\n"
+            "                }\n"
+            "                else { str_push_byte(&mut out, d); }\n"
+            "                i = i + 1;\n"
+            "            } else {}\n"
+            "        } else {\n"
+            "            str_push_byte(&mut out, c);\n"
+            "            i = i + 1;\n"
+            "        }\n"
+            "    }\n"
+            "    out\n"
+            "}\n"
+            "fn str_escape(s: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let n = str_len(s);\n"
+            "    let mut i = 0;\n"
+            "    while i < n {\n"
+            "        let c = str_char_at(s, i);\n"
+            "        if c == 10 { str_push_byte(&mut out, 92); str_push_byte(&mut out, 110); }\n"
+            "        else if c == 9 { str_push_byte(&mut out, 92); str_push_byte(&mut out, 116); }\n"
+            "        else if c == 13 { str_push_byte(&mut out, 92); str_push_byte(&mut out, 114); }\n"
+            "        else if c == 34 { str_push_byte(&mut out, 92); str_push_byte(&mut out, 34); }\n"
+            "        else if c == 92 { str_push_byte(&mut out, 92); str_push_byte(&mut out, 92); }\n"
+            "        else { str_push_byte(&mut out, c); }\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
     // Phase 30: file I/O + CLI args. The low-level builtins (fs_read_into /
     // fs_write_raw / fs_exists / arg_count / arg_get) return a status category
     // (0=ok, 1=not-found, 2=permission, 4=other); these wrappers present the

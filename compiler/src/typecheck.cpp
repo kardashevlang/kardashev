@@ -160,6 +160,16 @@ public:
             sch.declaredEffects.add("alloc");
             fnSchemas_["string_push_str"] = std::move(sch);
         }
+        // Phase 43: str_push_byte(s: &mut String, b: i64) -> i64 ! { alloc } —
+        // append one byte (low 8 bits of b) to a String, growing as needed.
+        // The low-level builder the str_escape / str_unescape prelude fns use.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/true), makeInt()}, makeInt());
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["str_push_byte"] = std::move(sch);
+        }
         // string_len(s: &String) -> i64
         {
             FnSchema sch;
@@ -208,6 +218,9 @@ public:
             sch.declaredEffects.add("alloc");
             fnSchemas_["str_substring"] = std::move(sch);
         }
+        // Phase 43: str_unescape / str_escape are kardashev PRELUDE functions
+        // (defined over str_push_byte), not builtins — so they are NOT
+        // registered here (that would collide with the prelude `fn`).
         // int_to_string(n: i64) -> String ! { alloc } — decimal formatting of
         // an i64 into a fresh heap String (snprintf "%lld").
         {
