@@ -286,6 +286,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 30: file I/O over Result<_, IoError> (write -> exists -> read+compare
+# round-trip, missing-file -> IoNotFound) and CLI args (args / arg_count /
+# arg_get, with the AOT argv-capture). Through JIT + AOT.
+sh_test(
+    name = "smoke_test_io",
+    srcs = ["smoke_test_io.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

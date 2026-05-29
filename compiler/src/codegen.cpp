@@ -1501,6 +1501,248 @@ private:
             declaredFns_["hash_string"] = fn;
         }
 
+        // --- Phase 30: file I/O + CLI args runtime ---
+        // Low-level builtins returning a status category (0=ok, 1=not-found,
+        // 2=permission-denied, 4=other) classified PORTABLY via access() — no
+        // libc errno symbol is referenced, so the same IR links on Linux and
+        // macOS. The prelude wraps these in Result<_, IoError> / Vec<String>.
+        // Emitted ONLY when the program references one of these builtins (this
+        // runtime calls libc free/fopen), so I/O-free programs — and the
+        // codegen unit tests asserting "no @free for scalars" — stay clean.
+        if (tc_.usesFileIo) {
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            auto* nullPtr = llvm::ConstantPointerNull::get(i8PtrTy);
+            auto accessFn = module_->getOrInsertFunction(
+                "access",
+                llvm::FunctionType::get(i32Ty, {i8PtrTy, i32Ty}, false));
+            auto fopenFn = module_->getOrInsertFunction(
+                "fopen",
+                llvm::FunctionType::get(i8PtrTy, {i8PtrTy, i8PtrTy}, false));
+            auto fseekFn = module_->getOrInsertFunction(
+                "fseek",
+                llvm::FunctionType::get(i32Ty, {i8PtrTy, i64Ty, i32Ty}, false));
+            auto ftellFn = module_->getOrInsertFunction(
+                "ftell", llvm::FunctionType::get(i64Ty, {i8PtrTy}, false));
+            auto freadFn = module_->getOrInsertFunction(
+                "fread", llvm::FunctionType::get(
+                             i64Ty, {i8PtrTy, i64Ty, i64Ty, i8PtrTy}, false));
+            auto fwriteFn = module_->getOrInsertFunction(
+                "fwrite", llvm::FunctionType::get(
+                              i64Ty, {i8PtrTy, i64Ty, i64Ty, i8PtrTy}, false));
+            auto fcloseFn = module_->getOrInsertFunction(
+                "fclose", llvm::FunctionType::get(i32Ty, {i8PtrTy}, false));
+            auto strlenFn = module_->getOrInsertFunction(
+                "strlen", llvm::FunctionType::get(i64Ty, {i8PtrTy}, false));
+            auto* i32_0 = llvm::ConstantInt::get(i32Ty, 0); // F_OK / SEEK_SET
+            auto* i32_2 = llvm::ConstantInt::get(i32Ty, 2); // W_OK / SEEK_END
+            auto* i32_4 = llvm::ConstantInt::get(i32Ty, 4); // R_OK
+            auto* one64 = llvm::ConstantInt::get(i64Ty, 1);
+
+            // argv capture: stored by the AOT C-main wrapper, which runs
+            // AFTER the O2 pipeline — so these MUST be ExternalLinkage, else
+            // the optimizer (seeing no in-module store yet) would constant-fold
+            // an internal global to its 0/null initializer. JIT never runs the
+            // wrapper, so the loads observe the 0/null defaults => zero args.
+            auto* argcG = new llvm::GlobalVariable(
+                *module_, i64Ty, false, llvm::GlobalValue::ExternalLinkage,
+                zeroI64, "__kd_argc");
+            auto* argvG = new llvm::GlobalVariable(
+                *module_, i8PtrTy, false, llvm::GlobalValue::ExternalLinkage,
+                nullPtr, "__kd_argv");
+
+            // __kd_cstr(&String) -> i8* : a malloc'd NUL-terminated copy of the
+            // string bytes (kardashev Strings carry no terminator). Caller frees.
+            llvm::Function* cstrFn;
+            {
+                auto* ft = llvm::FunctionType::get(i8PtrTy, {i8PtrTy}, false);
+                cstrFn = llvm::Function::Create(
+                    ft, llvm::Function::InternalLinkage, "__kd_cstr",
+                    module_.get());
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", cstrFn);
+                llvm::IRBuilder<> b(e);
+                auto* s = cstrFn->getArg(0);
+                auto* data = b.CreateLoad(
+                    i8PtrTy, b.CreateStructGEP(strTy, s, 0, "dp"), "data");
+                auto* len = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(strTy, s, 1, "lp"), "len");
+                auto* buf = b.CreateCall(
+                    mallocFn_, {b.CreateAdd(len, one64, "len1")}, "cbuf");
+                b.CreateCall(memcpyFn_, {buf, data, len});
+                b.CreateStore(llvm::ConstantInt::get(i8Ty, 0),
+                              b.CreateGEP(i8Ty, buf, len, "nulp"));
+                b.CreateRet(buf);
+            }
+
+            // arg_count() -> i64
+            {
+                auto* ft = llvm::FunctionType::get(i64Ty, {}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "arg_count",
+                    module_.get());
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                llvm::IRBuilder<> b(e);
+                b.CreateRet(b.CreateLoad(i64Ty, argcG, "argc"));
+                declaredFns_["arg_count"] = fn;
+            }
+
+            // arg_get(i: i64) -> String (borrowed view of argv[i], cap 0)
+            {
+                auto* ft = llvm::FunctionType::get(strTy, {i64Ty}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "arg_get",
+                    module_.get());
+                fn->getArg(0)->setName("i");
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* okBB = llvm::BasicBlock::Create(ctx, "inrange", fn);
+                auto* emptyBB = llvm::BasicBlock::Create(ctx, "empty", fn);
+                llvm::IRBuilder<> b(e);
+                auto* i = fn->getArg(0);
+                auto* argc = b.CreateLoad(i64Ty, argcG, "argc");
+                auto* inr = b.CreateAnd(b.CreateICmpSGE(i, zeroI64, "ge0"),
+                                        b.CreateICmpSLT(i, argc, "lt"), "inr");
+                b.CreateCondBr(inr, okBB, emptyBB);
+                b.SetInsertPoint(okBB);
+                auto* argv = b.CreateLoad(i8PtrTy, argvG, "argv");
+                auto* cstr = b.CreateLoad(
+                    i8PtrTy, b.CreateGEP(i8PtrTy, argv, i, "slotp"), "cstr");
+                auto* len = b.CreateCall(strlenFn, {cstr}, "len");
+                llvm::Value* v = llvm::UndefValue::get(strTy);
+                v = b.CreateInsertValue(v, cstr, {0}, "d");
+                v = b.CreateInsertValue(v, len, {1}, "l");
+                v = b.CreateInsertValue(v, zeroI64, {2}, "c");
+                b.CreateRet(v);
+                b.SetInsertPoint(emptyBB);
+                llvm::Value* e2 = llvm::UndefValue::get(strTy);
+                e2 = b.CreateInsertValue(e2, nullPtr, {0}, "d");
+                e2 = b.CreateInsertValue(e2, zeroI64, {1}, "l");
+                e2 = b.CreateInsertValue(e2, zeroI64, {2}, "c");
+                b.CreateRet(e2);
+                declaredFns_["arg_get"] = fn;
+            }
+
+            // fs_exists(&String) -> bool : access(path, F_OK) == 0
+            {
+                auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+                auto* ft = llvm::FunctionType::get(i1Ty, {i8PtrTy}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "fs_exists",
+                    module_.get());
+                fn->getArg(0)->setName("path");
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                llvm::IRBuilder<> b(e);
+                auto* cp = b.CreateCall(cstrFn, {fn->getArg(0)}, "cp");
+                auto* r = b.CreateCall(accessFn, {cp, i32_0}, "acc");
+                b.CreateCall(freeFn_, {cp});
+                b.CreateRet(b.CreateICmpEQ(r, i32_0, "exists"));
+                declaredFns_["fs_exists"] = fn;
+            }
+
+            // fs_read_into(path: &String, out: &mut String) -> i64
+            {
+                auto* ft =
+                    llvm::FunctionType::get(i64Ty, {i8PtrTy, i8PtrTy}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "fs_read_into",
+                    module_.get());
+                fn->getArg(0)->setName("path");
+                fn->getArg(1)->setName("out");
+                auto* path = fn->getArg(0);
+                auto* out = fn->getArg(1);
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* okBB = llvm::BasicBlock::Create(ctx, "opened", fn);
+                auto* errBB = llvm::BasicBlock::Create(ctx, "openerr", fn);
+                auto* hasBB = llvm::BasicBlock::Create(ctx, "hasbytes", fn);
+                auto* emptyBB = llvm::BasicBlock::Create(ctx, "emptyfile", fn);
+                llvm::IRBuilder<> b(e);
+                auto* cp = b.CreateCall(cstrFn, {path}, "cp");
+                auto* rb =
+                    b.CreateGlobalString("rb", "kd_mode_rb", 0, module_.get());
+                auto* f = b.CreateCall(fopenFn, {cp, rb}, "f");
+                b.CreateCall(freeFn_, {cp});
+                b.CreateCondBr(b.CreateICmpNE(f, nullPtr, "opened"), okBB,
+                               errBB);
+                b.SetInsertPoint(errBB);
+                auto* cp2 = b.CreateCall(cstrFn, {path}, "cp2");
+                auto* ex = b.CreateCall(accessFn, {cp2, i32_0}, "ex"); // F_OK
+                auto* rd = b.CreateCall(accessFn, {cp2, i32_4}, "rd"); // R_OK
+                b.CreateCall(freeFn_, {cp2});
+                auto* cat = b.CreateSelect(
+                    b.CreateICmpNE(ex, i32_0, "noexist"),
+                    llvm::ConstantInt::get(i64Ty, 1),
+                    b.CreateSelect(b.CreateICmpNE(rd, i32_0, "noread"),
+                                   llvm::ConstantInt::get(i64Ty, 2),
+                                   llvm::ConstantInt::get(i64Ty, 4), "c2"),
+                    "cat");
+                b.CreateRet(cat);
+                b.SetInsertPoint(okBB);
+                b.CreateCall(fseekFn, {f, zeroI64, i32_2}); // SEEK_END
+                auto* size = b.CreateCall(ftellFn, {f}, "size");
+                b.CreateCall(fseekFn, {f, zeroI64, i32_0}); // SEEK_SET
+                b.CreateCondBr(b.CreateICmpSGT(size, zeroI64, "has"), hasBB,
+                               emptyBB);
+                b.SetInsertPoint(hasBB);
+                auto* buf = b.CreateCall(mallocFn_, {size}, "buf");
+                b.CreateCall(freadFn, {buf, one64, size, f});
+                b.CreateCall(fcloseFn, {f});
+                b.CreateStore(buf, b.CreateStructGEP(strTy, out, 0, "od"));
+                b.CreateStore(size, b.CreateStructGEP(strTy, out, 1, "ol"));
+                b.CreateStore(size, b.CreateStructGEP(strTy, out, 2, "oc"));
+                b.CreateRet(zeroI64);
+                b.SetInsertPoint(emptyBB);
+                b.CreateCall(fcloseFn, {f});
+                b.CreateStore(nullPtr, b.CreateStructGEP(strTy, out, 0, "od2"));
+                b.CreateStore(zeroI64, b.CreateStructGEP(strTy, out, 1, "ol2"));
+                b.CreateStore(zeroI64, b.CreateStructGEP(strTy, out, 2, "oc2"));
+                b.CreateRet(zeroI64);
+                declaredFns_["fs_read_into"] = fn;
+            }
+
+            // fs_write_raw(path: &String, contents: &String) -> i64
+            {
+                auto* ft =
+                    llvm::FunctionType::get(i64Ty, {i8PtrTy, i8PtrTy}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "fs_write_raw",
+                    module_.get());
+                fn->getArg(0)->setName("path");
+                fn->getArg(1)->setName("contents");
+                auto* path = fn->getArg(0);
+                auto* contents = fn->getArg(1);
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* okBB = llvm::BasicBlock::Create(ctx, "opened", fn);
+                auto* errBB = llvm::BasicBlock::Create(ctx, "openerr", fn);
+                llvm::IRBuilder<> b(e);
+                auto* cp = b.CreateCall(cstrFn, {path}, "cp");
+                auto* wb =
+                    b.CreateGlobalString("wb", "kd_mode_wb", 0, module_.get());
+                auto* f = b.CreateCall(fopenFn, {cp, wb}, "f");
+                b.CreateCall(freeFn_, {cp});
+                b.CreateCondBr(b.CreateICmpNE(f, nullPtr, "opened"), okBB,
+                               errBB);
+                b.SetInsertPoint(errBB);
+                auto* cp2 = b.CreateCall(cstrFn, {path}, "cp2");
+                auto* ex = b.CreateCall(accessFn, {cp2, i32_0}, "ex");
+                auto* wr = b.CreateCall(accessFn, {cp2, i32_2}, "wr"); // W_OK
+                b.CreateCall(freeFn_, {cp2});
+                auto* perm = b.CreateAnd(b.CreateICmpEQ(ex, i32_0, "exists"),
+                                         b.CreateICmpNE(wr, i32_0, "nowrite"),
+                                         "perm");
+                b.CreateRet(b.CreateSelect(
+                    perm, llvm::ConstantInt::get(i64Ty, 2),
+                    llvm::ConstantInt::get(i64Ty, 4), "cat"));
+                b.SetInsertPoint(okBB);
+                auto* data = b.CreateLoad(
+                    i8PtrTy, b.CreateStructGEP(strTy, contents, 0, "cd"),
+                    "data");
+                auto* len = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(strTy, contents, 1, "cl"), "len");
+                b.CreateCall(fwriteFn, {data, one64, len, f});
+                b.CreateCall(fcloseFn, {f});
+                b.CreateRet(zeroI64);
+                declaredFns_["fs_write_raw"] = fn;
+            }
+        }
+
         // --- Phase 13b: slice read ops. A slice value is the {ptr,len} fat
         // pointer produced by `&v[a..b]` (emitSlice). Both ops take the slice
         // BY VALUE (a 16-byte aggregate). MVP element = i64; slice_get uses an

@@ -130,6 +130,64 @@ std::string applyPrelude(const std::string& userSrc) {
             " { fn eq(&self, other: &String) -> bool"
             " { str_eq(self, other) } }\n";
     }
+    // Phase 30: file I/O + CLI args. The low-level builtins (fs_read_into /
+    // fs_write_raw / fs_exists / arg_count / arg_get) return a status category
+    // (0=ok, 1=not-found, 2=permission, 4=other); these wrappers present the
+    // idiomatic `Result<_, IoError>` and `Vec<String>`. Variant names are
+    // `Io`-prefixed so the always-injected enum can't clash with a user's own
+    // `NotFound` etc. Guarded per-name so a user redefinition wins.
+    // These are added LAZILY — only when the user source mentions the name —
+    // so an I/O-free program carries none of the file-I/O machinery (and the
+    // codegen, which emits the libc-referencing runtime on demand, stays
+    // clean). A mention can't be missed: to call `fs_read_to_string` the name
+    // must appear in the source. Each is also guarded against a user
+    // redefinition.
+    const bool wantsIo = userSrc.find("fs_read_to_string") != std::string::npos ||
+                         userSrc.find("fs_write") != std::string::npos ||
+                         userSrc.find("fs_exists") != std::string::npos ||
+                         userSrc.find("IoError") != std::string::npos;
+    if (wantsIo && userSrc.find("enum IoError") == std::string::npos) {
+        prelude +=
+            "enum IoError { IoNotFound, IoPermissionDenied, IoOther }\n";
+    }
+    if (wantsIo && userSrc.find("fn io_error_cat") == std::string::npos) {
+        prelude +=
+            "fn io_error_cat(c: i64) -> IoError {\n"
+            "    if c == 1 { IoNotFound }\n"
+            "    else if c == 2 { IoPermissionDenied }\n"
+            "    else { IoOther }\n"
+            "}\n";
+    }
+    if (userSrc.find("fs_read_to_string") != std::string::npos &&
+        userSrc.find("fn fs_read_to_string") == std::string::npos) {
+        prelude +=
+            "fn fs_read_to_string(path: &String)"
+            " -> Result<String, IoError> ! { io, alloc } {\n"
+            "    let mut s = string_new();\n"
+            "    let c = fs_read_into(path, &mut s);\n"
+            "    if c == 0 { Ok(s) } else { Err(io_error_cat(c)) }\n"
+            "}\n";
+    }
+    if (userSrc.find("fs_write") != std::string::npos &&
+        userSrc.find("fn fs_write(") == std::string::npos) {
+        prelude +=
+            "fn fs_write(path: &String, contents: &String)"
+            " -> Result<i64, IoError> ! { io } {\n"
+            "    let c = fs_write_raw(path, contents);\n"
+            "    if c == 0 { Ok(0) } else { Err(io_error_cat(c)) }\n"
+            "}\n";
+    }
+    if (userSrc.find("args") != std::string::npos &&
+        userSrc.find("fn args(") == std::string::npos) {
+        prelude +=
+            "fn args() -> Vec<String> ! { alloc } {\n"
+            "    let mut v = vec_new();\n"
+            "    let n = arg_count();\n"
+            "    let mut i = 0;\n"
+            "    while i < n { vec_push(&mut v, arg_get(i)); i = i + 1; }\n"
+            "    v\n"
+            "}\n";
+    }
     // Phase 13b: Option / Result combinators as effect-row-polymorphic
     // prelude functions. They lower like any other generic kardashev fn —
     // closures + `! {e}` rows mean a combinator's call-site inherits its
@@ -497,11 +555,21 @@ void addCMainWrapper(llvm::Module& mod) {
 
     auto& ctx = mod.getContext();
     auto* i32Ty = llvm::Type::getInt32Ty(ctx);
-    auto* mainTy = llvm::FunctionType::get(i32Ty, {}, /*isVarArg=*/false);
+    auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+    auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+    // Phase 30: take (int argc, char** argv) so the `arg_count` / `arg_get`
+    // builtins can see the CLI args (their `__kd_argc` / `__kd_argv` globals
+    // default to 0/null, which is what the JIT — with no real argv — uses).
+    auto* mainTy =
+        llvm::FunctionType::get(i32Ty, {i32Ty, i8PtrTy}, /*isVarArg=*/false);
     auto* cmain = llvm::Function::Create(
         mainTy, llvm::Function::ExternalLinkage, "main", &mod);
     auto* entry = llvm::BasicBlock::Create(ctx, "entry", cmain);
     llvm::IRBuilder<> b(entry);
+    if (auto* argcG = mod.getNamedGlobal("__kd_argc"))
+        b.CreateStore(b.CreateZExt(cmain->getArg(0), i64Ty), argcG);
+    if (auto* argvG = mod.getNamedGlobal("__kd_argv"))
+        b.CreateStore(cmain->getArg(1), argvG);
     auto* result = b.CreateCall(userMain, {}, "kdresult");
     // The user's `main` is usually `-> i64`, but Phase 15 allows `-> bool`
     // (an i1). Adapt to the i32 exit code by integer width: truncate a wider

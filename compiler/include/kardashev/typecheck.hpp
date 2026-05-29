@@ -266,6 +266,10 @@ struct TypeCheckResult {
     std::unordered_map<const ast::MatchArm*,
                        std::unordered_map<std::string, TypePtr>>
         matchBindingTypes;
+    // Phase 30: true iff the program references a file-I/O / CLI-args builtin.
+    // Codegen emits that runtime (which calls libc free/fopen) only when set,
+    // so I/O-free programs stay free of it.
+    bool usesFileIo = false;
     bool ok() const { return errors.empty(); }
 
     // Special members declared out-of-line so the implicit dtor / move ops

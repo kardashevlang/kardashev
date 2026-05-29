@@ -246,6 +246,55 @@ public:
             fnSchemas_["hash_string"] = std::move(sch);
         }
 
+        // --- Phase 30: file I/O + CLI args support builtins ---
+        // The prelude wraps these in Result<_, IoError> (fs_read_to_string /
+        // fs_write) and Vec<String> (args). Status convention: 0 = ok, 1 =
+        // not-found, 2 = permission-denied, 4 = other (classified portably via
+        // access(), so no libc errno symbol is referenced).
+        // fs_read_into(path: &String, out: &mut String) -> i64 ! { io, alloc }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false),
+                 makeRef(stringTy, /*isMut=*/true)},
+                makeInt());
+            sch.declaredEffects.add("io");
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["fs_read_into"] = std::move(sch);
+        }
+        // fs_write_raw(path: &String, contents: &String) -> i64 ! { io }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false),
+                 makeRef(stringTy, /*isMut=*/false)},
+                makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["fs_write_raw"] = std::move(sch);
+        }
+        // fs_exists(path: &String) -> bool ! { io }
+        {
+            FnSchema sch;
+            sch.signature =
+                makeFunction({makeRef(stringTy, /*isMut=*/false)}, makeBool());
+            sch.declaredEffects.add("io");
+            fnSchemas_["fs_exists"] = std::move(sch);
+        }
+        // arg_count() -> i64 — number of process CLI args (argv[0] included).
+        // Pure: it reads process state set at startup, no syscall.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({}, makeInt());
+            fnSchemas_["arg_count"] = std::move(sch);
+        }
+        // arg_get(i: i64) -> String — a borrowed view of argv[i] (cap 0, not
+        // freed on drop); an out-of-range index yields the empty string.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, stringTy);
+            fnSchemas_["arg_get"] = std::move(sch);
+        }
+
         // Phase 5.z: vec_* are generic over T. Each call site infers T
         // from arg types; codegen lazily specializes the runtime per T.
         TypePtr vecFnGenericVar = makeFreshVar();
@@ -1363,6 +1412,7 @@ public:
         result.variantIndex = std::move(variantIndex_);
         result.matchTrees = std::move(matchTrees_);
         result.matchBindingTypes = std::move(matchBindingTypes_);
+        result.usesFileIo = usesFileIo_;
         result.fnSchemas = std::move(fnSchemas_);
         result.callInstantiations = std::move(callInstantiations_);
         result.methodResolutions = std::move(methodResolutions_);
@@ -1520,6 +1570,9 @@ private:
     std::unordered_map<const ast::MatchArm*,
                        std::unordered_map<std::string, TypePtr>>
         matchBindingTypes_;
+    // Phase 30: set when the program calls a file-I/O / CLI-args builtin, so
+    // codegen emits that (libc-referencing) runtime only on demand.
+    bool usesFileIo_ = false;
     std::vector<TypeError> errors_;
     // Phase 13a: monotonic counter for fresh `for`-loop iterator slot names
     // (`__for_it_N`) when desugaring `for x in <Iterator>`.
@@ -4618,6 +4671,15 @@ private:
     }
 
     TypePtr checkCall(const ast::CallExpr& call) {
+        // Phase 30: note any use of a file-I/O / CLI-args builtin so codegen
+        // emits that runtime (which references libc free/fopen) ONLY for
+        // programs that actually touch it — keeping I/O-free programs (and the
+        // codegen unit tests) free of that machinery.
+        if (call.callee == "fs_read_into" || call.callee == "fs_write_raw" ||
+            call.callee == "fs_exists" || call.callee == "arg_count" ||
+            call.callee == "arg_get") {
+            usesFileIo_ = true;
+        }
         // Phase 4.3: first-class fn values. If the call's callee name
         // resolves to a local binding with a Function type, this is an
         // indirect call through a fn pointer. We type-check the arg
