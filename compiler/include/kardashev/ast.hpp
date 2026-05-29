@@ -724,6 +724,12 @@ struct TraitDecl {
 // them with a fixed sentinel trait token so the existing static-dispatch
 // path applies unchanged.
 struct ImplDecl {
+    // Phase 40: the impl's OWN generic params, e.g. the `T: Clone` in
+    // `impl<T: Clone> Display for Pair<T>`. Distinct from traitTypeArgs (the
+    // concrete args supplied to a parameterized trait). Each is in scope while
+    // resolving forType + every method's signature/body, and behaves like an
+    // extra generic param on each method, inferred from the receiver at a call.
+    std::vector<TypeParam> genericParams;
     std::string traitName; // empty => inherent impl (Phase 15)
     // Phase 21a: the concrete type arguments this impl supplies to a
     // parameterized trait, e.g. the `i64` in `impl Iterator<i64> for Range`.

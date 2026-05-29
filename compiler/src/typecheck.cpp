@@ -1032,7 +1032,14 @@ public:
                           impl.line, impl.column);
                 }
             }
+            // Phase 40: resolve forType with the impl's generic params in
+            // scope so `impl<T> .. for Pair<T>` yields Pair<Var> (typeName
+            // "Pair") instead of erroring on unknown `T`.
+            GenericEnv implEnv0 = implParamEnv(impl);
+            const GenericEnv* savedEnv0 = currentGenericEnv_;
+            currentGenericEnv_ = &implEnv0;
             TypePtr forTy = resolveTypeRef(impl.forType);
+            currentGenericEnv_ = savedEnv0;
             TypePtr rfor = resolve(forTy);
             std::string typeName;
             if (rfor->kind == TypeKind::Struct) typeName = rfor->structName;
@@ -1386,6 +1393,19 @@ public:
                 std::vector<std::string> genBounds;
                 std::vector<std::vector<std::string>> genExtraBounds;
                 std::vector<const ast::TypeParam*> genBoundParam;
+                // Phase 40: the IMPL's own generic params come FIRST in the
+                // method's effective generic vars (the convention checkImplMethod
+                // + codegen rely on), so `impl<T: Clone> .. for Pair<T>` makes
+                // each method generic over T, with T's bound in force in the
+                // body and T inferred from the receiver at a call.
+                for (const auto& gp : impl.genericParams) {
+                    TypePtr v = makeFreshVar();
+                    genEnv[gp.name] = v;
+                    genVars.push_back(v);
+                    genBounds.push_back(gp.bound);
+                    genExtraBounds.push_back(gp.extraBounds);
+                    genBoundParam.push_back(&gp);
+                }
                 for (const auto& gp : fn.genericParams) {
                     TypePtr v = makeFreshVar();
                     genEnv[gp.name] = v;
@@ -1396,7 +1416,10 @@ public:
                 }
                 // Bind Self to the impl's forType while resolving params /
                 // return. This lets the impl write `self: Self -> i64`
-                // and have it land as `self: ConcreteType -> i64`.
+                // and have it land as `self: ConcreteType -> i64`. genEnv
+                // already holds the impl's generic params (Phase 40), so
+                // `Pair<T>` resolves T to its Var — set it active first.
+                currentGenericEnv_ = &genEnv;
                 TypePtr selfTy = resolveTypeRef(impl.forType);
                 genEnv["Self"] = selfTy;
                 // Phase 21a: bind the trait's generic params to this impl's
@@ -1468,9 +1491,16 @@ public:
             checkFunction(fn);
         }
         // Pass 2 (impl methods): same, with Self bound to the impl's
-        // forType.
+        // forType. (Phase 40: checkImplMethod recomputes selfTy from its own
+        // env so a generic impl's `Self` uses the schema's impl-param Vars;
+        // this `selfTy` is the concrete/non-generic fallback. Resolve it with
+        // the impl params in scope so `Pair<T>` doesn't error here.)
         for (const auto& impl : program.impls) {
+            GenericEnv implEnv2 = implParamEnv(impl);
+            const GenericEnv* savedEnv2 = currentGenericEnv_;
+            currentGenericEnv_ = &implEnv2;
             TypePtr selfTy = resolveTypeRef(impl.forType);
+            currentGenericEnv_ = savedEnv2;
             for (const auto& fn : impl.methods) {
                 checkImplMethod(fn, impl, selfTy);
             }
@@ -2069,6 +2099,17 @@ private:
     // trait-args are resolved in that same env. No-op for inherent /
     // non-generic-trait impls (their traitTypeArgs are empty). Trait-param
     // names never clash with `Self` (validated at trait registration).
+    // Phase 40: a generic env mapping the impl's own generic params to fresh
+    // Vars, so `resolveTypeRef(impl.forType)` (e.g. `Pair<T>`) resolves T
+    // instead of erroring on an unknown type. Used where we only need the
+    // forType's NAME / shape (registration, pass-2 selfTy).
+    GenericEnv implParamEnv(const ast::ImplDecl& impl) {
+        GenericEnv env;
+        for (const auto& gp : impl.genericParams)
+            env[gp.name] = makeFreshVar();
+        return env;
+    }
+
     void bindTraitParamsForImpl(const ast::ImplDecl& impl, GenericEnv& env) {
         if (impl.traitName.empty()) return;
         auto pit = traitGenericParams_.find(impl.traitName);
@@ -2101,12 +2142,27 @@ private:
         if (sit == fnSchemas_.end()) return;
         const FnSchema& schema = sit->second;
         GenericEnv genEnv;
-        for (std::size_t i = 0;
-             i < fn.genericParams.size() && i < schema.genericVars.size();
-             ++i) {
-            genEnv[fn.genericParams[i].name] = schema.genericVars[i];
+        // Phase 40: schema.genericVars is [impl params] ++ [fn params] (the
+        // sig-resolution order) — bind both positionally so an impl param `T`
+        // (with its bound) is in scope in the method body.
+        std::size_t gvi = 0;
+        for (const auto& gp : impl.genericParams) {
+            if (gvi < schema.genericVars.size())
+                genEnv[gp.name] = schema.genericVars[gvi++];
         }
-        genEnv["Self"] = selfTy;
+        for (const auto& gp : fn.genericParams) {
+            if (gvi < schema.genericVars.size())
+                genEnv[gp.name] = schema.genericVars[gvi++];
+        }
+        // Phase 40: for a generic impl, recompute Self from THIS env so it uses
+        // the schema's impl-param Vars (the passed selfTy was resolved with
+        // throwaway Vars). For a non-generic impl this is identical to selfTy.
+        TypePtr selfTyLocal = selfTy;
+        if (!impl.genericParams.empty()) {
+            currentGenericEnv_ = &genEnv;
+            selfTyLocal = resolveTypeRef(impl.forType);
+        }
+        genEnv["Self"] = selfTyLocal;
         // Phase 21a: bind the trait's generic params to this impl's concrete
         // trait-args (matches the schema-registration env), so a method body
         // referencing `T` checks against the impl's element type.

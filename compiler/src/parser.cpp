@@ -886,6 +886,10 @@ private:
         ast::ImplDecl decl;
         decl.line = implTok.line;
         decl.column = implTok.column;
+        // Phase 40: the impl's own generic params, `impl<T: Bound> ...`. The
+        // `<` here is unambiguous (it directly follows `impl`). These are in
+        // scope for forType + every method.
+        decl.genericParams = parseOptionalGenericParams();
         // Three forms:
         //   impl Trait for Type { ... }        -- trait impl (since Phase 3.3)
         //   impl Trait<Args...> for Type { ... } -- generic trait impl (21a)
@@ -924,6 +928,8 @@ private:
             tr.typeArgs = std::move(leadingArgs);
             decl.forType = std::move(tr);
         }
+        // Phase 40: a `where` clause adds bounds onto the impl's generic params.
+        parseOptionalWhereClause(decl.genericParams);
         expect(TokenKind::LBrace, "{");
         while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;

@@ -118,14 +118,21 @@ public:
         // (resolved through astTypeRefToConcrete) so emit / declare
         // passes can bind `Self`.
         for (const auto& impl : program.impls) {
-            TypePtr selfTy = astTypeRefToConcrete(impl.forType);
+            // Phase 40: a generic impl's forType (`Pair<T>`) can't be resolved
+            // to a concrete Self up front — T is bound per call. Such methods
+            // are monomorphized on demand (genericImplOf_), so Self is set
+            // per-instance in setInstanceContext, not here.
+            const bool genericImpl = !impl.genericParams.empty();
+            TypePtr selfTy = genericImpl ? nullptr
+                                         : astTypeRefToConcrete(impl.forType);
             for (const auto& fn : impl.methods) {
                 std::string mangled = implMethodMangle(impl.traitName,
                                                         impl.forType,
                                                         fn.name);
                 fnAst_[mangled] = &fn;
                 implMethodMangle_[&fn] = mangled;
-                implMethodSelf_[&fn] = selfTy;
+                if (genericImpl) genericImplOf_[&fn] = &impl;
+                else implMethodSelf_[&fn] = selfTy;
             }
             // Phase 16: record `impl Drop for T` so drop glue can invoke the
             // user destructor when a value of type T goes out of scope. Keyed
@@ -181,7 +188,8 @@ public:
         }
         for (const auto& impl : program.impls) {
             for (const auto& fn : impl.methods) {
-                if (fn.genericParams.empty()) {
+                // Phase 40: generic-impl methods are monomorphized on demand.
+                if (fn.genericParams.empty() && !genericImplOf_.count(&fn)) {
                     declareMonoFnAs(fn, implMethodMangle_[&fn]);
                 }
             }
@@ -200,7 +208,7 @@ public:
         }
         for (const auto& impl : program.impls) {
             for (const auto& fn : impl.methods) {
-                if (fn.genericParams.empty()) {
+                if (fn.genericParams.empty() && !genericImplOf_.count(&fn)) {
                     emitFunctionAs(fn, implMethodMangle_[&fn], {});
                 }
             }
@@ -582,6 +590,11 @@ private:
     // signature / body resolution so `self: Self` and any other Self
     // mentions map to the impl's forType.
     std::unordered_map<const ast::FnDecl*, TypePtr> implMethodSelf_;
+
+    // Phase 40: methods of a GENERIC impl (`impl<T> .. for Pair<T>`). Maps the
+    // method's AST to its impl, so the method is monomorphized per concrete T
+    // (like a generic fn) instead of emitted once with `T` unbound.
+    std::unordered_map<const ast::FnDecl*, const ast::ImplDecl*> genericImplOf_;
 
     // Active during emission of a generic fn instance. Maps the source's
     // generic-param name (`T`) to the concrete TypePtr for this instance,
@@ -5915,6 +5928,34 @@ private:
                             const std::vector<TypePtr>& typeArgs) {
         currentInstanceTypeMap_.clear();
         currentSchemaVarSubst_.clear();
+        // Phase 40: a method of a GENERIC impl. typeArgs are the impl's own
+        // generic params (= the receiver's type args). Bind them by name +
+        // their schema Vars (the schema, keyed by the mangled base, lists the
+        // impl params FIRST), then compute Self = forType<typeArgs>.
+        auto gimplIt = genericImplOf_.find(&fn);
+        if (gimplIt != genericImplOf_.end()) {
+            const ast::ImplDecl* impl = gimplIt->second;
+            auto baseIt = implMethodMangle_.find(&fn);
+            const FnSchema* sch =
+                baseIt != implMethodMangle_.end()
+                    ? (tc_.fnSchemas.count(baseIt->second)
+                           ? &tc_.fnSchemas.at(baseIt->second)
+                           : nullptr)
+                    : nullptr;
+            for (std::size_t i = 0;
+                 i < impl->genericParams.size() && i < typeArgs.size(); ++i) {
+                currentInstanceTypeMap_[impl->genericParams[i].name] =
+                    typeArgs[i];
+                if (sch && i < sch->genericVars.size()) {
+                    TypePtr gv = resolve(sch->genericVars[i]);
+                    if (gv->kind == TypeKind::Var)
+                        currentSchemaVarSubst_[gv->varId] = typeArgs[i];
+                }
+            }
+            // Self = the impl's forType with the params now bound.
+            currentInstanceTypeMap_["Self"] = astTypeRefToConcrete(impl->forType);
+            return;
+        }
         auto schemaIt = tc_.fnSchemas.find(fn.name);
         for (std::size_t i = 0;
              i < fn.genericParams.size() && i < typeArgs.size(); ++i) {
@@ -6014,7 +6055,13 @@ private:
 
     void emitFunction(const ast::FnDecl& fn,
                       const std::vector<TypePtr>& typeArgs) {
-        emitFunctionAs(fn, fn.name, typeArgs);
+        // Phase 40: an impl method emits under its mangled base, so a queued
+        // generic-impl-method instance mangles as base + typeArgs (not the
+        // bare method name). mangleInstance(base, {}) == base, so non-generic
+        // impl methods are unaffected.
+        auto it = implMethodMangle_.find(&fn);
+        emitFunctionAs(fn, it != implMethodMangle_.end() ? it->second : fn.name,
+                       typeArgs);
     }
 
     void emitFunctionAs(const ast::FnDecl& fn, const std::string& baseName,
@@ -9075,8 +9122,30 @@ private:
         // Function declared in `run()`.
         ast::TypeRef forTyRef;
         forTyRef.name = targetTypeName;
-        const std::string mangled =
+        std::string mangled =
             implMethodMangle(res.traitName, forTyRef, res.methodName);
+        // The base (un-instantiated) mangling keys the FnSchema (self-kind etc.)
+        // even after `mangled` is swapped to a generic instance below.
+        const std::string schemaKey = mangled;
+        // Phase 40: a method of a GENERIC impl is monomorphized per the impl's
+        // type args — which, for `impl<T..> .. for C<T..>`, are exactly the
+        // receiver's type args. Mangle/declare/queue the instance like a
+        // generic fn call, then call that instance.
+        const ast::FnDecl* methodAst =
+            fnAst_.count(mangled) ? fnAst_[mangled] : nullptr;
+        if (methodAst && genericImplOf_.count(methodAst)) {
+            std::vector<TypePtr> implArgs;
+            implArgs.reserve(res.receiverTypeArgs.size());
+            for (const auto& a : res.receiverTypeArgs)
+                implArgs.push_back(resolveInInstance(a));
+            std::string instMangled = mangleInstance(mangled, implArgs);
+            if (!declaredFns_.count(instMangled)) {
+                declareInstance(*methodAst, implArgs, instMangled);
+                if (!emittedInstances_.count(instMangled))
+                    pendingInstances_.push_back({mangled, implArgs});
+            }
+            mangled = std::move(instMangled);
+        }
         auto fnIt = declaredFns_.find(mangled);
         if (fnIt == declaredFns_.end()) {
             errors_.push_back("codegen: impl method not declared: " +
@@ -9090,7 +9159,8 @@ private:
         // (`&self`, Phase 11) or by value (`self`), so we pass the receiver
         // accordingly. The FnSchema's first arg type is the source of truth.
         bool selfByRef = false;
-        if (auto sIt = tc_.fnSchemas.find(mangled); sIt != tc_.fnSchemas.end()) {
+        if (auto sIt = tc_.fnSchemas.find(schemaKey);
+            sIt != tc_.fnSchemas.end()) {
             const TypePtr& sig = sIt->second.signature;
             if (!sig->args.empty() &&
                 resolve(sig->args[0])->kind == TypeKind::Ref) {
