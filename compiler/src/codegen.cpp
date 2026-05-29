@@ -8698,6 +8698,47 @@ private:
     }
 
     llvm::Value* emitCall(const ast::CallExpr& call) {
+        // Phase 52: a GENERIC static call `T::method()` — resolve the bound Var
+        // to the concrete type at THIS monomorphization, then call that type's
+        // impl method (`__impl_<trait>_for_<concrete>__<method>`).
+        if (auto git = tc_.staticCallGeneric.find(&call);
+            git != tc_.staticCallGeneric.end()) {
+            const auto& sg = git->second;
+            std::string tn;
+            auto sit = currentSchemaVarSubst_.find(sg.boundedVarId);
+            if (sit != currentSchemaVarSubst_.end()) {
+                TypePtr c = resolveInInstance(sit->second);
+                if (c->kind == TypeKind::Struct) tn = c->structName;
+                else if (c->kind == TypeKind::Enum) tn = c->enumName;
+                else if (c->kind == TypeKind::Int) tn = "i64";
+                else if (c->kind == TypeKind::Float) tn = "f64";
+                else if (c->kind == TypeKind::Bool) tn = "bool";
+                else if (c->kind == TypeKind::Box) tn = "Box";
+            }
+            if (tn.empty()) {
+                errors_.push_back("codegen: generic static call " +
+                                  sg.traitName + "::" + sg.methodName +
+                                  " has no concrete type at instance");
+                return llvm::ConstantInt::get(
+                    llvm::Type::getInt64Ty(*ctx_), 0);
+            }
+            std::string mangled =
+                "__impl_" + sg.traitName + "_for_" + tn + "__" + sg.methodName;
+            auto fit = declaredFns_.find(mangled);
+            if (fit == declaredFns_.end()) {
+                errors_.push_back("codegen: generic static method body not "
+                                  "emitted: " + mangled);
+                return llvm::ConstantInt::get(
+                    llvm::Type::getInt64Ty(*ctx_), 0);
+            }
+            llvm::Function* fn = fit->second;
+            std::vector<llvm::Value*> args;
+            args.reserve(call.args.size());
+            for (const auto& a : call.args) args.push_back(emitConsume(*a));
+            return builder_->CreateCall(
+                fn, args,
+                fn->getReturnType()->isVoidTy() ? "" : "call_gstatic");
+        }
         // Phase 48: a qualified static call `Type::method(args)` resolved by the
         // typechecker to a concrete impl method (an associated / no-self trait
         // method like `P::default()`). Emit a direct call to the mangled impl

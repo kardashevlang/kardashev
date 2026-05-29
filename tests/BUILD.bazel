@@ -477,6 +477,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 52 (v9): generic associated functions — a static trait method on a
+# bounded type param `T::method()` (e.g. `T::default()` for `<T: Default>`),
+# monomorphized per instance. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase52",
+    srcs = ["smoke_test_phase52.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

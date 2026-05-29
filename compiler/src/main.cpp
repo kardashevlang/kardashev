@@ -694,8 +694,11 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
             } else if (d == "Default" && s.genericParams.empty()) {
                 // Phase 48: field-wise default. Leaf/container fields inline
                 // their default; a concrete nested user type uses its own
-                // Type::default() (a static call). Non-generic structs only —
-                // a generic field would need a generic static call (deferred).
+                // Type::default() static call. Non-generic structs only: a
+                // generic struct's `Pair::default()` would need a generic-TYPE
+                // static call (type args inferred from context + the static impl
+                // method monomorphized) — deferred. The Phase-52 bounded
+                // `T::default()` form (a generic PARAM) does work.
                 out += "impl Default for " + TN +
                        " { fn default() -> " + TN + " ! { alloc } { " + s.name +
                        " {";

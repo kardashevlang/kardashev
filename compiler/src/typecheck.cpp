@@ -1622,6 +1622,7 @@ public:
         result.fnSchemas = std::move(fnSchemas_);
         result.callInstantiations = std::move(callInstantiations_);
         result.staticCallMangled = std::move(staticCallMangled_);
+        result.staticCallGeneric = std::move(staticCallGeneric_);
         result.methodResolutions = std::move(methodResolutions_);
         result.dynCoercions = std::move(dynCoercions_);
         result.dynVtablesNeeded = std::move(dynVtablesNeeded_);
@@ -1773,6 +1774,9 @@ private:
         methodResolutions_;
     // Phase 48: qualified static call `Type::method()` -> mangled impl method.
     std::unordered_map<const ast::CallExpr*, std::string> staticCallMangled_;
+    // Phase 52: generic static call `T::method()` -> (trait, method, varId).
+    std::unordered_map<const ast::CallExpr*, TypeCheckResult::StaticGenericCall>
+        staticCallGeneric_;
     // Phase 11: per-Expr `&T`->`&dyn`/`Box<T>`->`Box<dyn>` coercions and the
     // set of (trait,type) vtables those coercions require.
     std::unordered_map<const ast::Expr*, DynCoercion> dynCoercions_;
@@ -5131,6 +5135,71 @@ private:
                             exprEffects_[&call] = sch.declaredEffects;
                             staticCallMangled_[&call] = mangIt->second;
                             return resolve(instSig->ret);
+                        }
+                    }
+                }
+            }
+            // Phase 52: a GENERIC static call `T::method()` — T a bounded type
+            // param whose bound trait declares a static (no-self) method. The
+            // concrete impl is chosen at monomorphization; here we resolve the
+            // return type (Self -> T) and record (trait, method, varId).
+            if (tIt == methodImplLookup_.end() && currentGenericEnv_) {
+                auto git = currentGenericEnv_->find(call.pathQualifier);
+                if (git != currentGenericEnv_->end()) {
+                    TypePtr tv = resolve(git->second);
+                    auto bit = tv->kind == TypeKind::Var
+                                   ? currentVarAllBounds_.find(tv->varId)
+                                   : currentVarAllBounds_.end();
+                    if (tv->kind == TypeKind::Var &&
+                        bit != currentVarAllBounds_.end()) {
+                        for (const auto& traitName : bit->second) {
+                            auto trIt = traits_.find(traitName);
+                            if (trIt == traits_.end()) continue;
+                            const ast::MethodSig* sig = nullptr;
+                            for (const auto& m : trIt->second)
+                                if (m.name == call.callee &&
+                                    (m.params.empty() ||
+                                     m.params[0].name != "self")) {
+                                    sig = &m;
+                                    break;
+                                }
+                            if (!sig) continue;
+                            // Resolve param/return with Self -> T (keep the
+                            // surrounding generic env so other names resolve).
+                            GenericEnv selfEnv = *currentGenericEnv_;
+                            selfEnv["Self"] = tv;
+                            const GenericEnv* saved = currentGenericEnv_;
+                            currentGenericEnv_ = &selfEnv;
+                            std::vector<TypePtr> paramTypes;
+                            for (const auto& p : sig->params)
+                                paramTypes.push_back(resolveTypeRef(p.type));
+                            TypePtr retTy = resolveTypeRef(sig->returnType);
+                            currentGenericEnv_ = saved;
+                            if (paramTypes.size() != call.args.size()) {
+                                error("static method '" + call.pathQualifier +
+                                          "::" + call.callee + "' expects " +
+                                          std::to_string(paramTypes.size()) +
+                                          " arg(s), got " +
+                                          std::to_string(call.args.size()),
+                                      call.line, call.column);
+                            }
+                            const std::size_t n = std::min(paramTypes.size(),
+                                                           call.args.size());
+                            for (std::size_t i = 0; i < n; ++i) {
+                                TypePtr at = checkExpr(*call.args[i]);
+                                if (!coerceOrUnify(*call.args[i], at,
+                                                   paramTypes[i]))
+                                    error("argument " + std::to_string(i + 1) +
+                                              " to '" + call.pathQualifier +
+                                              "::" + call.callee + "'",
+                                          call.args[i]->line,
+                                          call.args[i]->column);
+                            }
+                            exprEffects_[&call] = buildEffectSet(
+                                sig->effects, {}, call.callee, nullptr);
+                            staticCallGeneric_[&call] = {traitName, call.callee,
+                                                         tv->varId};
+                            return resolve(retTy);
                         }
                     }
                 }
