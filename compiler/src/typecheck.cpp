@@ -1329,9 +1329,14 @@ public:
             // Phase 21b: expose each bounded param's trait to `resolveTypeRef`
             // so a `C::Item` projection in this signature resolves C's bound.
             currentVarBound_.clear();
+            currentVarAllBounds_.clear();
             for (std::size_t i = 0; i < genVars.size(); ++i) {
-                if (i < genBounds.size() && !genBounds[i].empty())
-                    currentVarBound_[genVars[i]->varId] = genBounds[i];
+                recordVarBounds(genVars[i]->varId,
+                                i < genBounds.size() ? genBounds[i]
+                                                     : std::string{},
+                                i < genExtraBounds.size()
+                                    ? genExtraBounds[i]
+                                    : std::vector<std::string>{});
             }
 
             std::vector<TypePtr> argTypes;
@@ -1344,6 +1349,7 @@ public:
             currentGenericEnv_ = nullptr;
             currentEffectRowVarNames_ = nullptr;
             currentVarBound_.clear();
+            currentVarAllBounds_.clear();
 
             FnSchema schema;
             schema.signature = makeFunction(std::move(argTypes), ret);
@@ -1480,6 +1486,19 @@ public:
                         resolved.push_back(resolveTypeRef(a));
                     genBoundArgs[i] = std::move(resolved);
                 }
+                // Phase 45: expose the method's generic bounds (impl + fn
+                // params) so a `HashMap<K,V>` param/return with `K: Hash + Eq`
+                // passes keyIsHashable while the schema's signature resolves.
+                currentVarBound_.clear();
+                currentVarAllBounds_.clear();
+                for (std::size_t i = 0; i < genVars.size(); ++i) {
+                    recordVarBounds(genVars[i]->varId,
+                                    i < genBounds.size() ? genBounds[i]
+                                                         : std::string{},
+                                    i < genExtraBounds.size()
+                                        ? genExtraBounds[i]
+                                        : std::vector<std::string>{});
+                }
                 std::vector<TypePtr> argTypes;
                 for (const auto& p : fn.params) {
                     argTypes.push_back(resolveTypeRef(p.type));
@@ -1487,6 +1506,8 @@ public:
                 TypePtr ret = resolveTypeRef(fn.returnType);
                 currentGenericEnv_ = nullptr;
                 currentEffectRowVarNames_ = nullptr;
+                currentVarBound_.clear();
+                currentVarAllBounds_.clear();
                 FnSchema sch;
                 sch.signature = makeFunction(std::move(argTypes), ret);
                 sch.genericVars = std::move(genVars);
@@ -1656,6 +1677,24 @@ private:
     // signature resolves. Persisted long-term in `assocProjections_` for the
     // projection Vars that survive into bodies / codegen.
     std::unordered_map<int, std::string> currentVarBound_;
+    // Phase 45: the FULL set of trait bounds on each generic Var in scope
+    // (primary `.bound` + every `.extraBound`). currentVarBound_ keeps only the
+    // primary for `C::Item` projection; container-op gates like keyIsHashable
+    // need the whole set so a `K: Hash + Eq` param satisfies HashMap's key
+    // requirement from inside a generic body. Cleared/populated in lockstep
+    // with currentVarBound_.
+    std::unordered_map<int, std::unordered_set<std::string>> currentVarAllBounds_;
+    // Register every bound of a generic Var (primary + extras) into the two
+    // bound maps. Safe to call with an empty primary (extras still recorded).
+    void recordVarBounds(int varId, const std::string& primary,
+                         const std::vector<std::string>& extras) {
+        if (!primary.empty()) {
+            currentVarBound_[varId] = primary;
+            currentVarAllBounds_[varId].insert(primary);
+        }
+        for (const auto& e : extras)
+            if (!e.empty()) currentVarAllBounds_[varId].insert(e);
+    }
     // Phase 21b: placeholder-Var id -> how to resolve that `C::Item` projection
     // at codegen. Survives into the TypeCheckResult.
     std::unordered_map<int, AssocProjection> assocProjections_;
@@ -2204,6 +2243,23 @@ private:
         currentGenericEnv_ = &genEnv;
         currentEffectRowVarNames_ = &rowVarNames;
         currentFnIsAsync_ = fn.isAsync;
+        // Phase 45: expose every generic param's bounds (impl params, then fn
+        // params — the same order they were bound into genEnv above) so the
+        // method body's container ops can see a `K: Hash + Eq` promise. This is
+        // why a generic-impl method may build/query a `HashMap<K,V>`.
+        currentVarBound_.clear();
+        currentVarAllBounds_.clear();
+        {
+            auto expose = [&](const ast::TypeParam& gp) {
+                auto git = genEnv.find(gp.name);
+                if (git == genEnv.end()) return;
+                TypePtr v = resolve(git->second);
+                if (v->kind == TypeKind::Var)
+                    recordVarBounds(v->varId, gp.bound, gp.extraBounds);
+            };
+            for (const auto& gp : impl.genericParams) expose(gp);
+            for (const auto& gp : fn.genericParams) expose(gp);
+        }
         pushScope();
         for (const auto& p : fn.params) {
             scopes_.back()[p.name] = resolveTypeRef(p.type);
@@ -2243,6 +2299,8 @@ private:
         currentGenericEnv_ = nullptr;
         currentEffectRowVarNames_ = nullptr;
         currentEffectRowVarById_.clear();
+        currentVarBound_.clear();
+        currentVarAllBounds_.clear();
     }
 
     // Allocate a schema shell: an opaque Type (Struct or Enum kind, empty
@@ -2567,6 +2625,16 @@ private:
         if (ty->kind == TypeKind::Int) return true;
         if (ty->kind == TypeKind::Struct && ty->structName == "String")
             return true;
+        // Phase 45: a still-generic key Var is hashable iff the body's bounds
+        // promise it — `K: Hash + Eq`. This lets a generic fn/impl body build
+        // and query a `HashMap<K,V>`; the concrete K (which DOES impl Hash+Eq,
+        // checked at the call site against the bound) is substituted at
+        // monomorphization, so codegen always sees a real hashable type.
+        if (ty->kind == TypeKind::Var) {
+            auto bit = currentVarAllBounds_.find(ty->varId);
+            return bit != currentVarAllBounds_.end() &&
+                   bit->second.count("Hash") && bit->second.count("Eq");
+        }
         std::string name;
         if (ty->kind == TypeKind::Struct) name = ty->structName;
         else if (ty->kind == TypeKind::Enum) name = ty->enumName;
@@ -2932,14 +3000,14 @@ private:
         // Phase 21b: expose bounded params' traits so a `C::Item` projection in
         // the body / return type resolves C's bound (mirrors Pass 1b).
         currentVarBound_.clear();
+        currentVarAllBounds_.clear();
         for (std::size_t i = 0;
              i < fn.genericParams.size() && i < schema.genericVars.size();
              ++i) {
-            if (!fn.genericParams[i].bound.empty()) {
-                TypePtr v = resolve(schema.genericVars[i]);
-                if (v->kind == TypeKind::Var)
-                    currentVarBound_[v->varId] = fn.genericParams[i].bound;
-            }
+            TypePtr v = resolve(schema.genericVars[i]);
+            if (v->kind == TypeKind::Var)
+                recordVarBounds(v->varId, fn.genericParams[i].bound,
+                                fn.genericParams[i].extraBounds);
         }
 
         pushScope();
@@ -2987,6 +3055,7 @@ private:
         currentEffectRowVarNames_ = nullptr;
         currentEffectRowVarById_.clear();
         currentVarBound_.clear();
+        currentVarAllBounds_.clear();
     }
 
     // --- Phase 25: the compile-time evaluator -------------------------------

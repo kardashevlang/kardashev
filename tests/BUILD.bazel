@@ -418,6 +418,16 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 45 (v8): a bounded `K: Hash + Eq` type param satisfies HashMap's key
+# requirement from inside a generic fn / generic-impl method body (the
+# key-hashable gate accepts a bounded Var, not just concrete i64/String). JIT +
+# AOT, plus a negative test that an unbounded key param is rejected.
+sh_test(
+    name = "smoke_test_phase45",
+    srcs = ["smoke_test_phase45.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],
