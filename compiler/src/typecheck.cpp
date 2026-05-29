@@ -474,18 +474,34 @@ public:
         // the fat pointer produced by `&v[a..b]`; the two ops mirror Vec's
         // read API. The slice value is passed by value (it's a small {ptr,len}
         // aggregate). Constructing a slice doesn't allocate, so no `alloc`.
-        TypePtr sliceI64Ty = makeSlice(makeInt());
-        // slice_len(s: &[i64]) -> i64
+        // Phase 37: the slice read API is now generic over the element type T
+        // (was i64-only). The slice value carries its element type, so codegen
+        // strides by `sizeof(T)`. slice_len ignores T (reads the len field);
+        // slice_get copies element i (T must be Copy at the call site for a
+        // value read); slice_get_ref borrows it (&T) for non-Copy elements.
+        TypePtr sliceFnVar = makeFreshVar();
+        TypePtr sliceFnInst = makeSlice(sliceFnVar);
+        // slice_len<T>(s: &[T]) -> i64
         {
             FnSchema sch;
-            sch.signature = makeFunction({sliceI64Ty}, makeInt());
+            sch.signature = makeFunction({sliceFnInst}, makeInt());
+            sch.genericVars.push_back(sliceFnVar);
             fnSchemas_["slice_len"] = std::move(sch);
         }
-        // slice_get(s: &[i64], i: i64) -> i64
+        // slice_get<T>(s: &[T], i: i64) -> T
         {
             FnSchema sch;
-            sch.signature = makeFunction({sliceI64Ty, makeInt()}, makeInt());
+            sch.signature = makeFunction({sliceFnInst, makeInt()}, sliceFnVar);
+            sch.genericVars.push_back(sliceFnVar);
             fnSchemas_["slice_get"] = std::move(sch);
+        }
+        // slice_get_ref<T>(s: &[T], i: i64) -> &T — a borrow into the slice.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({sliceFnInst, makeInt()},
+                                         makeRef(sliceFnVar, /*isMut=*/false));
+            sch.genericVars.push_back(sliceFnVar);
+            fnSchemas_["slice_get_ref"] = std::move(sch);
         }
 
         // Phase 12 built-in: `yield_now(v: i64) -> Future<i64> ! { async }`.

@@ -357,6 +357,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 37: the Display/to_string trait (+ built-in impls) + de-i64'd generic
+# iteration (for-loop binds the iterator's real next() payload) + generic
+# `&[T]` slice reads (slice_len / slice_get / slice_get_ref over any T).
+sh_test(
+    name = "smoke_test_phase37",
+    srcs = ["smoke_test_phase37.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

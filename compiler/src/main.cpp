@@ -130,6 +130,28 @@ std::string applyPrelude(const std::string& userSrc) {
             " { fn eq(&self, other: &String) -> bool"
             " { str_eq(self, other) } }\n";
     }
+    // Phase 37: the `Display` trait — `to_string(&self) -> String` — with
+    // built-in impls for the scalar/heap primitives, so a generic can be
+    // bounded `<T: Display>` and uniformly format i64 / bool / String, and a
+    // user type formats by hand-writing `impl Display for T`. Static dispatch
+    // only (a `dyn Display` needs the still-open generic-`dyn Trait<T>` work).
+    // The impls forward to existing builtins: i64 -> int_to_string, String ->
+    // a deep clone (so the result is owned), bool -> a literal. Method bodies
+    // are codegen'd only on use, so declaring these costs unused programs
+    // nothing. Guarded so a user-defined `Display` wins.
+    if (userSrc.find("trait Display") == std::string::npos) {
+        prelude +=
+            "trait Display { fn to_string(&self) -> String; }\n"
+            "impl Display for i64"
+            " { fn to_string(&self) -> String ! { alloc }"
+            " { int_to_string(*self) } }\n"
+            "impl Display for String"
+            " { fn to_string(&self) -> String ! { alloc }"
+            " { clone(self) } }\n"
+            "impl Display for bool"
+            " { fn to_string(&self) -> String"
+            " { if *self { \"true\" } else { \"false\" } } }\n";
+    }
     // Phase 30: file I/O + CLI args. The low-level builtins (fs_read_into /
     // fs_write_raw / fs_exists / arg_count / arg_get) return a status category
     // (0=ok, 1=not-found, 2=permission, 4=other); these wrappers present the

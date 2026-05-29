@@ -1821,42 +1821,11 @@ private:
             }
         }
 
-        // --- Phase 13b: slice read ops. A slice value is the {ptr,len} fat
-        // pointer produced by `&v[a..b]` (emitSlice). Both ops take the slice
-        // BY VALUE (a 16-byte aggregate). MVP element = i64; slice_get uses an
-        // i64 element stride. ---
-        {
-            // slice_len(s: Slice) -> i64
-            auto* fnTy = llvm::FunctionType::get(i64Ty, {sliceTy}, false);
-            auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "slice_len",
-                module_.get());
-            fn->getArg(0)->setName("s");
-            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
-            llvm::IRBuilder<> b(entry);
-            auto* len = b.CreateExtractValue(fn->getArg(0), {1}, "len");
-            b.CreateRet(len);
-            declaredFns_["slice_len"] = fn;
-        }
-        {
-            // slice_get(s: Slice, i: i64) -> i64 : load element i (i64 stride).
-            auto* i64ElemTy = llvm::Type::getInt64Ty(ctx);
-            auto* fnTy = llvm::FunctionType::get(
-                i64Ty, {sliceTy, i64Ty}, false);
-            auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "slice_get",
-                module_.get());
-            fn->getArg(0)->setName("s");
-            fn->getArg(1)->setName("i");
-            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
-            llvm::IRBuilder<> b(entry);
-            auto* data = b.CreateExtractValue(fn->getArg(0), {0}, "data");
-            auto* elemPtr =
-                b.CreateGEP(i64ElemTy, data, fn->getArg(1), "elem_ptr");
-            auto* val = b.CreateLoad(i64ElemTy, elemPtr, "val");
-            b.CreateRet(val);
-            declaredFns_["slice_get"] = fn;
-        }
+        // Phase 13b / 37: slice read ops (slice_len / slice_get / slice_get_ref)
+        // are now GENERIC over the element type and synthesized per-T in
+        // getOrEmitSliceOp (mirroring getOrEmitVecOp), dispatched from emitCall.
+        // A slice value is the {ptr,len} fat pointer from `&v[a..b]`; the
+        // element stride is sizeof(T).
 
         // --- Phase 13b: HashMap<i64,i64> runtime (open addressing) ---
         declareHashMapRuntime();
@@ -4838,6 +4807,58 @@ private:
     // matching the codegen generic-instance naming scheme so emitCall's
     // existing generic-callee branch can find it in declaredFns_ after
     // we register it here. Returns the LLVM Function.
+    // Phase 37: per-element-type slice read ops. A slice value is the {ptr,len}
+    // fat pointer (passed BY VALUE); the element stride is sizeof(T). slice_get
+    // copies element i; slice_get_ref returns a borrow (&T) into the slice.
+    llvm::Function* getOrEmitSliceOp(const std::string& op, const TypePtr& T) {
+        std::string mangled = op + "__" + mangleType(T);
+        auto it = declaredFns_.find(mangled);
+        if (it != declaredFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* sliceTy = structTypes_["Slice"];
+        llvm::Type* elemLlvmTy = mapKardashevType(T);
+        if (op == "slice_len") {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {sliceTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("s");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            b.CreateRet(b.CreateExtractValue(fn->getArg(0), {1}, "len"));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "slice_get") {
+            auto* fnTy =
+                llvm::FunctionType::get(elemLlvmTy, {sliceTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("i");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* data = b.CreateExtractValue(fn->getArg(0), {0}, "data");
+            auto* ep = b.CreateGEP(elemLlvmTy, data, fn->getArg(1), "elem_ptr");
+            b.CreateRet(b.CreateLoad(elemLlvmTy, ep, "val"));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "slice_get_ref") {
+            auto* fnTy =
+                llvm::FunctionType::get(i8PtrTy, {sliceTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("i");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* data = b.CreateExtractValue(fn->getArg(0), {0}, "data");
+            b.CreateRet(b.CreateGEP(elemLlvmTy, data, fn->getArg(1), "elem_ptr"));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        return nullptr;
+    }
+
     llvm::Function* getOrEmitVecOp(const std::string& op, const TypePtr& T) {
         std::string mangled = op + "__" + mangleType(T);
         auto it = declaredFns_.find(mangled);
@@ -8338,6 +8359,23 @@ private:
                 llvm::Function* fn = getOrEmitCloneFn(concreteTypeArgs[0]);
                 llvm::Value* srcPtr = emitConsume(*call.args[0]);
                 return builder_->CreateCall(fn, {srcPtr}, "call_clone");
+            }
+            // Phase 37: `slice_*<T>` over the element type T (stride sizeof(T)).
+            if ((call.callee == "slice_len" || call.callee == "slice_get" ||
+                 call.callee == "slice_get_ref") &&
+                !concreteTypeArgs.empty()) {
+                llvm::Function* fn =
+                    getOrEmitSliceOp(call.callee, concreteTypeArgs[0]);
+                if (!fn) {
+                    errors_.push_back("codegen: cannot specialize " +
+                                      call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
             }
             // Phase 17b: `block_on<T>` is a generic built-in with no AST body
             // — synthesize a per-result-type executor (mirrors vec_*). T is
