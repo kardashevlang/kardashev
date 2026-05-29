@@ -340,6 +340,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 35: sound recursive heap enums (cycle-guarded layout + a recursive drop
+# function) + the `clone` deep-copy intrinsic (String/Vec/HashMap/Box/user
+# structs+enums, recursive types via a per-type clone fn). JIT + AOT.
+sh_test(
+    name = "smoke_test_clone",
+    srcs = ["smoke_test_clone.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

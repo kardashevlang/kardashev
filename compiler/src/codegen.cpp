@@ -23,6 +23,12 @@
 #include "llvm/Passes/OptimizationLevel.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/raw_ostream.h"
+// Phase 35: the optimizer must see the real target datalayout (set below in
+// run()) so struct/aggregate GEP folding matches the backend's field offsets.
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/TargetParser/Host.h"
 
 namespace kardashev {
 namespace {
@@ -344,6 +350,37 @@ public:
                                    llvm::DEBUG_METADATA_VERSION);
             module_->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
             dib_->finalize();
+        }
+        // Phase 35: pin the module to the HOST target's datalayout BEFORE the
+        // optimization pipeline runs. Without it the optimizer folds struct /
+        // aggregate GEPs (StructGEP -> a raw byte offset) against LLVM's
+        // default layout, whose field offsets can differ from the backend's
+        // real layout for a multi-field aggregate (e.g. an enum laid out as
+        // {i32 tag, i64, %Vec}). The backend then stores the aggregate at the
+        // real offsets while the optimizer-folded load reads the wrong byte
+        // offset — a silent miscompile at -O1+ that only surfaces when such a
+        // value is read through a pointer (the keystone recursive-enum read).
+        // Idempotent target init; the AOT/JIT paths set this again later.
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+        {
+            std::string tripleStr = llvm::sys::getDefaultTargetTriple();
+            std::string tErr;
+            if (const llvm::Target* tgt =
+                    llvm::TargetRegistry::lookupTarget(tripleStr, tErr)) {
+                llvm::TargetOptions topts;
+#if LLVM_VERSION_MAJOR >= 21
+                llvm::Triple triple(tripleStr);
+                module_->setTargetTriple(triple);
+                auto* tm = tgt->createTargetMachine(triple, "generic", "",
+                                                    topts, llvm::Reloc::PIC_);
+#else
+                module_->setTargetTriple(tripleStr);
+                auto* tm = tgt->createTargetMachine(tripleStr, "generic", "",
+                                                    topts, llvm::Reloc::PIC_);
+#endif
+                if (tm) module_->setDataLayout(tm->createDataLayout());
+            }
         }
         std::string verifyErrs;
         llvm::raw_string_ostream os(verifyErrs);
@@ -750,6 +787,17 @@ private:
     // Cache of per-type drop thunks `void __kd_drop_<mangled>(i8*)` that wrap
     // emitDropGlue, so a cleanup entry can name a uniform `void(i8*)` drop fn.
     std::unordered_map<std::string, llvm::Function*> dropThunks_;
+
+    // Phase 35: named struct/enum nodes currently on the resolveInInstance
+    // stack. A self-recursive type (`enum Json { JArr(Vec<Json>) }`) forms a
+    // pointer cycle in its payload graph; re-entering a node already here is
+    // the back-edge, where we stop expanding to terminate.
+    std::unordered_set<const Type*> resolvingInInstance_;
+
+    // Phase 35: per-type deep-clone functions `T __kd_clone_<mangled>(i8* src)`
+    // backing the `clone` intrinsic. Cached (and registered BEFORE the body is
+    // emitted) so a self-recursive type clones via a run-time recursive call.
+    std::unordered_map<std::string, llvm::Function*> cloneFns_;
 
     // Phase 10b: the uniform fat-pointer LLVM type for ALL first-class fn
     // VALUES — `{ i8* fn, i8* env }`. `fn` points at a generated function
@@ -3310,17 +3358,383 @@ private:
         // Save + restore the builder's insert point and currentFn_ — drop glue
         // creates basic blocks against currentFn_, which must be THIS thunk
         // while we lower the glue, then restored for the caller.
+        // Cache the thunk BEFORE lowering its body: a self-recursive type's
+        // body drops a nested value of the same type, which routes back through
+        // emitDropGlue -> getOrEmitDropThunk; finding the (still-being-emitted)
+        // thunk here turns that into a recursive CALL rather than re-emitting
+        // the body forever.
+        dropThunks_[key] = fn;
         auto* savedFn = currentFn_;
         auto savedIP = builder_->saveIP();
         currentFn_ = fn;
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
         builder_->SetInsertPoint(entry);
-        emitDropGlue(fn->getArg(0), r);
+        // Inline the drop logic directly (NOT via the dispatcher): the thunk IS
+        // the recursive function, so its top level must do the real work; only
+        // nested same-type sub-drops loop back through the dispatcher.
+        emitDropGlueInline(fn->getArg(0), r);
         if (!currentBlockTerminated()) builder_->CreateRetVoid();
         currentFn_ = savedFn;
         builder_->restoreIP(savedIP);
-        dropThunks_[key] = fn;
         return fn;
+    }
+
+    // Phase 35: deep-clone DISPATCHER. A self-recursive type clones via a CALL
+    // to its per-type clone function (so recursion happens at run time over the
+    // real tree); every other type is cloned inline. All sub-element clone
+    // sites route through here. Returns the cloned value (an SSA value of the
+    // type's lowered LLVM type). `src` points to the source value's storage.
+    llvm::Value* emitCloneValue(llvm::Value* src, const TypePtr& t) {
+        TypePtr r = resolveInInstance(t);
+        if (typeIsSelfRecursive(r)) {
+            return builder_->CreateCall(getOrEmitCloneFn(r), {src}, "clone.rec");
+        }
+        return emitCloneBody(src, r);
+    }
+
+    // The per-type clone function `T __kd_clone_<mangled>(i8* src)`. Cached
+    // before the body is lowered, so a nested same-type clone (routed through
+    // emitCloneValue) becomes a recursive call rather than re-emitting forever.
+    llvm::Function* getOrEmitCloneFn(const TypePtr& t) {
+        TypePtr r = resolveInInstance(t);
+        std::string key = mangleType(r);
+        auto it = cloneFns_.find(key);
+        if (it != cloneFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Type* retTy = mapKardashevType(r);
+        auto* fn = llvm::Function::Create(
+            llvm::FunctionType::get(retTy, {i8PtrTy}, false),
+            llvm::Function::InternalLinkage, "__kd_clone_" + key,
+            module_.get());
+        fn->getArg(0)->setName("src");
+        cloneFns_[key] = fn; // cache BEFORE body — recursion safe
+        auto* savedFn = currentFn_;
+        auto savedIP = builder_->saveIP();
+        currentFn_ = fn;
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        builder_->SetInsertPoint(entry);
+        // Inline the clone logic directly (the function IS the recursion point;
+        // only nested same-type clones loop back through emitCloneValue).
+        llvm::Value* cloned = emitCloneBody(fn->getArg(0), r);
+        if (!currentBlockTerminated()) builder_->CreateRet(cloned);
+        currentFn_ = savedFn;
+        builder_->restoreIP(savedIP);
+        return fn;
+    }
+
+    // Produce a deep copy of the value at `src` (type `r`), as an SSA value.
+    // Heap owners (String/Vec/HashMap/HashSet/Box) re-allocate their backing
+    // storage and deep-clone their contents; scalars bit-copy; user
+    // structs/enums clone field-/payload-wise. Sub-clones go through
+    // emitCloneValue so a nested self-recursive type recurses via its fn.
+    llvm::Value* emitCloneBody(llvm::Value* src, const TypePtr& t) {
+        TypePtr r = resolveInInstance(t);
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto& dl = module_->getDataLayout();
+        switch (r->kind) {
+        case TypeKind::Int:
+        case TypeKind::Bool:
+        case TypeKind::Unit:
+        case TypeKind::Ref:
+        case TypeKind::Dyn: {
+            // Scalars / borrows / trait objects: a bit-copy is the clone. (A
+            // reference clones to the same borrow — it owns nothing.)
+            llvm::Type* ty = mapKardashevType(r);
+            return builder_->CreateLoad(ty, src, "clone.scalar");
+        }
+        case TypeKind::Function:
+            errors_.push_back(
+                "codegen: clone of a function/closure value is not supported "
+                "(its captured env would be shared, then double-freed)");
+            return llvm::UndefValue::get(mapKardashevType(r));
+        case TypeKind::Box: {
+            TypePtr inner = resolveInInstance(r->refInner);
+            if (inner->kind == TypeKind::Dyn) // Box<dyn>: fat ptr, bit-copy
+                return builder_->CreateLoad(dynPtrTy_, src, "clone.boxdyn");
+            llvm::Type* innerTy = mapKardashevType(inner);
+            auto* heap = builder_->CreateLoad(i8PtrTy, src, "box.src");
+            auto* sz = llvm::ConstantInt::get(i64Ty, dl.getTypeAllocSize(innerTy));
+            auto* nbuf = builder_->CreateCall(mallocFn_, {sz}, "box.new");
+            llvm::Value* clonedInner = emitCloneValue(heap, inner);
+            builder_->CreateStore(clonedInner, nbuf);
+            return nbuf;
+        }
+        case TypeKind::Struct: {
+            // Built-in heap containers.
+            if (r->structName == "String")
+                return cloneStringValue(src);
+            if (r->structName == "Vec")
+                return cloneVecValue(src, r->typeArgs.empty() ? makeInt()
+                                                              : r->typeArgs[0]);
+            if (r->structName == "HashMap") {
+                TypePtr K = r->typeArgs.size() > 0 ? r->typeArgs[0] : makeInt();
+                TypePtr V = r->typeArgs.size() > 1 ? r->typeArgs[1] : makeInt();
+                return cloneMapValue(src, K, V);
+            }
+            if (r->structName == "HashSet") {
+                TypePtr K = r->typeArgs.empty() ? makeInt() : r->typeArgs[0];
+                return cloneMapValue(src, K, makeInt()); // V = i64 dummy
+            }
+            if (r->structName == "Slice" || r->structName == "Range" ||
+                r->structName == "Future")
+                return builder_->CreateLoad(mapKardashevType(r), src,
+                                            "clone.opaque");
+            // User struct: clone each field.
+            llvm::Type* st = mapKardashevType(r);
+            llvm::Value* agg = llvm::UndefValue::get(st);
+            for (unsigned i = 0; i < r->structFields.size(); ++i) {
+                auto* fp = builder_->CreateStructGEP(st, src, i, "fld.p");
+                llvm::Value* cv = emitCloneValue(fp, r->structFields[i].second);
+                agg = builder_->CreateInsertValue(agg, cv, {i}, "fld.clone");
+            }
+            return agg;
+        }
+        case TypeKind::Enum: {
+            llvm::Type* st = mapKardashevType(r);
+            std::string mangled =
+                mangleStructInstance(r->enumName, r->typeArgs);
+            const auto& slots = enumPayloadIndices_[mangled];
+            auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+            auto* tag = builder_->CreateLoad(
+                i32Ty, builder_->CreateStructGEP(st, src, 0, "tag.p"),
+                "clone.tag");
+            auto* resultSlot = entryAlloca(st, "clone.result");
+            auto* cont =
+                llvm::BasicBlock::Create(ctx, "clone.enum.cont", currentFn_);
+            auto* dflt =
+                llvm::BasicBlock::Create(ctx, "clone.enum.dflt", currentFn_);
+            auto* sw =
+                builder_->CreateSwitch(tag, dflt, r->enumVariants.size());
+            for (unsigned vi = 0; vi < r->enumVariants.size(); ++vi) {
+                auto* caseBB = llvm::BasicBlock::Create(
+                    ctx, "clone.enum.v" + std::to_string(vi), currentFn_);
+                sw->addCase(llvm::ConstantInt::get(i32Ty, vi), caseBB);
+                builder_->SetInsertPoint(caseBB);
+                llvm::Value* agg = llvm::UndefValue::get(st);
+                agg = builder_->CreateInsertValue(
+                    agg, llvm::ConstantInt::get(i32Ty, vi), {0}, "ctag");
+                const auto& vty = r->enumVariants[vi].payloadTypes;
+                for (unsigned pi = 0; pi < vty.size(); ++pi) {
+                    auto* pp = builder_->CreateStructGEP(st, src, slots[vi][pi],
+                                                         "pld.p");
+                    llvm::Value* cv = emitCloneValue(pp, vty[pi]);
+                    agg = builder_->CreateInsertValue(agg, cv, {slots[vi][pi]},
+                                                      "pld.clone");
+                }
+                builder_->CreateStore(agg, resultSlot);
+                builder_->CreateBr(cont);
+            }
+            builder_->SetInsertPoint(dflt);
+            builder_->CreateUnreachable(); // tag always in [0, nVariants)
+            builder_->SetInsertPoint(cont);
+            return builder_->CreateLoad(st, resultSlot, "clone.enum");
+        }
+        case TypeKind::Array: {
+            // Phase 22 arrays are Copy-element only — a value bit-copy clones.
+            return builder_->CreateLoad(mapKardashevType(r), src, "clone.arr");
+        }
+        case TypeKind::Tuple: {
+            llvm::Type* st = mapKardashevType(r);
+            llvm::Value* agg = llvm::UndefValue::get(st);
+            for (unsigned i = 0; i < r->tupleElems.size(); ++i) {
+                auto* ep = builder_->CreateStructGEP(st, src, i, "tup.p");
+                llvm::Value* cv = emitCloneValue(ep, r->tupleElems[i]);
+                agg = builder_->CreateInsertValue(agg, cv, {i}, "tup.clone");
+            }
+            return agg;
+        }
+        default:
+            return builder_->CreateLoad(mapKardashevType(r), src, "clone.bits");
+        }
+    }
+
+    // Deep-copy a String value (`{i8* data, i64 len, i64 cap}`): a fresh
+    // `len`-byte buffer with the same contents (empty -> null buffer).
+    llvm::Value* cloneStringValue(llvm::Value* src) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* strTy = structTypes_["String"];
+        auto* len = builder_->CreateLoad(
+            i64Ty, builder_->CreateStructGEP(strTy, src, 1, "s.len.p"), "s.len");
+        auto* data = builder_->CreateLoad(
+            i8PtrTy, builder_->CreateStructGEP(strTy, src, 0, "s.dat.p"),
+            "s.data");
+        auto* nonEmpty =
+            builder_->CreateICmpSGT(len, llvm::ConstantInt::get(i64Ty, 0),
+                                    "s.nonempty");
+        auto* allocBB = llvm::BasicBlock::Create(ctx, "s.clone.alloc", currentFn_);
+        auto* doneBB = llvm::BasicBlock::Create(ctx, "s.clone.done", currentFn_);
+        auto* fromBB = builder_->GetInsertBlock();
+        builder_->CreateCondBr(nonEmpty, allocBB, doneBB);
+        builder_->SetInsertPoint(allocBB);
+        auto* nbuf = builder_->CreateCall(mallocFn_, {len}, "s.newbuf");
+        builder_->CreateMemCpy(nbuf, llvm::MaybeAlign(1), data,
+                               llvm::MaybeAlign(1), len);
+        builder_->CreateBr(doneBB);
+        builder_->SetInsertPoint(doneBB);
+        auto* bufPhi = builder_->CreatePHI(i8PtrTy, 2, "s.buf");
+        bufPhi->addIncoming(nbuf, allocBB);
+        bufPhi->addIncoming(llvm::ConstantPointerNull::get(i8PtrTy), fromBB);
+        llvm::Value* agg = llvm::UndefValue::get(strTy);
+        agg = builder_->CreateInsertValue(agg, bufPhi, {0}, "s.d");
+        agg = builder_->CreateInsertValue(agg, len, {1}, "s.l");
+        agg = builder_->CreateInsertValue(agg, len, {2}, "s.c"); // cap = len
+        return agg;
+    }
+
+    // Deep-copy a Vec value: a fresh `len`-element buffer, each element
+    // deep-cloned (so element-owned heap is not shared). cap = len.
+    llvm::Value* cloneVecValue(llvm::Value* src, const TypePtr& elemTy) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto& dl = module_->getDataLayout();
+        auto* vecTy = structTypes_["Vec"];
+        llvm::Type* elemLlvm = mapKardashevType(elemTy);
+        auto* elemSz = llvm::ConstantInt::get(i64Ty, dl.getTypeAllocSize(elemLlvm));
+        auto* len = builder_->CreateLoad(
+            i64Ty, builder_->CreateStructGEP(vecTy, src, 1, "v.len.p"), "v.len");
+        auto* data = builder_->CreateLoad(
+            i8PtrTy, builder_->CreateStructGEP(vecTy, src, 0, "v.dat.p"),
+            "v.data");
+        auto* nonEmpty = builder_->CreateICmpSGT(
+            len, llvm::ConstantInt::get(i64Ty, 0), "v.nonempty");
+        auto* allocBB = llvm::BasicBlock::Create(ctx, "v.clone.alloc", currentFn_);
+        auto* afterBB = llvm::BasicBlock::Create(ctx, "v.clone.after", currentFn_);
+        auto* fromBB = builder_->GetInsertBlock();
+        builder_->CreateCondBr(nonEmpty, allocBB, afterBB);
+        builder_->SetInsertPoint(allocBB);
+        auto* nbytes = builder_->CreateMul(len, elemSz, "v.bytes");
+        auto* nbuf = builder_->CreateCall(mallocFn_, {nbytes}, "v.newbuf");
+        // clone loop
+        auto* iSlot = entryAlloca(i64Ty, "v.i");
+        builder_->CreateStore(llvm::ConstantInt::get(i64Ty, 0), iSlot);
+        auto* hdr = llvm::BasicBlock::Create(ctx, "v.clone.hdr", currentFn_);
+        auto* body = llvm::BasicBlock::Create(ctx, "v.clone.body", currentFn_);
+        builder_->CreateBr(hdr);
+        builder_->SetInsertPoint(hdr);
+        auto* i = builder_->CreateLoad(i64Ty, iSlot, "i");
+        builder_->CreateCondBr(builder_->CreateICmpSLT(i, len, "more"), body,
+                               afterBB);
+        builder_->SetInsertPoint(body);
+        auto* sElem = builder_->CreateGEP(elemLlvm, data, i, "v.s.elem");
+        llvm::Value* cv = emitCloneValue(sElem, elemTy);
+        builder_->CreateStore(cv, builder_->CreateGEP(elemLlvm, nbuf, i,
+                                                      "v.d.elem"));
+        builder_->CreateStore(
+            builder_->CreateAdd(i, llvm::ConstantInt::get(i64Ty, 1), "i.n"),
+            iSlot);
+        builder_->CreateBr(hdr);
+        builder_->SetInsertPoint(afterBB);
+        auto* bufPhi = builder_->CreatePHI(i8PtrTy, 2, "v.buf");
+        bufPhi->addIncoming(llvm::ConstantPointerNull::get(i8PtrTy), fromBB);
+        bufPhi->addIncoming(nbuf, hdr); // loop exits to afterBB from hdr
+        llvm::Value* agg = llvm::UndefValue::get(vecTy);
+        agg = builder_->CreateInsertValue(agg, bufPhi, {0}, "v.d");
+        agg = builder_->CreateInsertValue(agg, len, {1}, "v.l");
+        agg = builder_->CreateInsertValue(agg, len, {2}, "v.c");
+        return agg;
+    }
+
+    // Deep-copy a HashMap/HashSet value. Bulk-copy the bucket array (carries
+    // states + empty slots), then deep-clone the key (and value) of every
+    // OCCUPIED bucket so element-owned heap is not shared. HashSet passes a
+    // dummy i64 value type. cap/len preserved.
+    llvm::Value* cloneMapValue(llvm::Value* src, const TypePtr& K,
+                               const TypePtr& V) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* one = llvm::ConstantInt::get(i64Ty, 1);
+        auto& dl = module_->getDataLayout();
+        auto* hmTy = structTypes_["HashMap"];
+        auto* entryTy = llvm::StructType::get(
+            ctx, {i64Ty, mapKardashevType(K), mapKardashevType(V)});
+        auto* entrySz =
+            llvm::ConstantInt::get(i64Ty, dl.getTypeAllocSize(entryTy));
+        auto* buckets = builder_->CreateLoad(
+            i8PtrTy, builder_->CreateStructGEP(hmTy, src, 0, "m.b.p"),
+            "m.buckets");
+        auto* len = builder_->CreateLoad(
+            i64Ty, builder_->CreateStructGEP(hmTy, src, 1, "m.l.p"), "m.len");
+        auto* cap = builder_->CreateLoad(
+            i64Ty, builder_->CreateStructGEP(hmTy, src, 2, "m.c.p"), "m.cap");
+        auto* nonEmpty =
+            builder_->CreateICmpSGT(cap, llvm::ConstantInt::get(i64Ty, 0),
+                                    "m.has.cap");
+        auto* allocBB = llvm::BasicBlock::Create(ctx, "m.clone.alloc", currentFn_);
+        auto* afterBB = llvm::BasicBlock::Create(ctx, "m.clone.after", currentFn_);
+        auto* fromBB = builder_->GetInsertBlock();
+        builder_->CreateCondBr(nonEmpty, allocBB, afterBB);
+        builder_->SetInsertPoint(allocBB);
+        auto* nbytes = builder_->CreateMul(cap, entrySz, "m.bytes");
+        auto* nbuf = builder_->CreateCall(mallocFn_, {nbytes}, "m.newbuf");
+        builder_->CreateMemCpy(nbuf, llvm::MaybeAlign(8), buckets,
+                               llvm::MaybeAlign(8), nbytes);
+        // deep-clone the K/V of occupied buckets, overwriting the shallow copy.
+        bool deepK = isDroppable(K), deepV = isDroppable(V);
+        if (deepK || deepV) {
+            auto* jSlot = entryAlloca(i64Ty, "m.j");
+            builder_->CreateStore(llvm::ConstantInt::get(i64Ty, 0), jSlot);
+            auto* hdr = llvm::BasicBlock::Create(ctx, "m.clone.hdr", currentFn_);
+            auto* body = llvm::BasicBlock::Create(ctx, "m.clone.body", currentFn_);
+            auto* occ = llvm::BasicBlock::Create(ctx, "m.clone.occ", currentFn_);
+            auto* step = llvm::BasicBlock::Create(ctx, "m.clone.step", currentFn_);
+            builder_->CreateBr(hdr);
+            builder_->SetInsertPoint(hdr);
+            auto* j = builder_->CreateLoad(i64Ty, jSlot, "j");
+            builder_->CreateCondBr(builder_->CreateICmpSLT(j, cap, "more"), body,
+                                   afterBB);
+            builder_->SetInsertPoint(body);
+            auto* sEntry = builder_->CreateGEP(entryTy, buckets, j, "s.entry");
+            auto* dEntry = builder_->CreateGEP(entryTy, nbuf, j, "d.entry");
+            auto* state = builder_->CreateLoad(
+                i64Ty, builder_->CreateStructGEP(entryTy, sEntry, 0, "st.p"),
+                "state");
+            builder_->CreateCondBr(builder_->CreateICmpEQ(state, one, "occ?"),
+                                   occ, step);
+            builder_->SetInsertPoint(occ);
+            if (deepK) {
+                llvm::Value* ck = emitCloneValue(
+                    builder_->CreateStructGEP(entryTy, sEntry, 1, "sk.p"), K);
+                builder_->CreateStore(
+                    ck, builder_->CreateStructGEP(entryTy, dEntry, 1, "dk.p"));
+            }
+            if (deepV) {
+                llvm::Value* cvv = emitCloneValue(
+                    builder_->CreateStructGEP(entryTy, sEntry, 2, "sv.p"), V);
+                builder_->CreateStore(
+                    cvv, builder_->CreateStructGEP(entryTy, dEntry, 2, "dv.p"));
+            }
+            builder_->CreateBr(step);
+            builder_->SetInsertPoint(step);
+            builder_->CreateStore(builder_->CreateAdd(j, one, "j.n"), jSlot);
+            builder_->CreateBr(hdr);
+            builder_->SetInsertPoint(afterBB);
+            auto* bufPhi = builder_->CreatePHI(i8PtrTy, 2, "m.buf");
+            bufPhi->addIncoming(llvm::ConstantPointerNull::get(i8PtrTy), fromBB);
+            bufPhi->addIncoming(nbuf, hdr);
+            return buildMapAgg(hmTy, bufPhi, len, cap);
+        }
+        builder_->CreateBr(afterBB);
+        builder_->SetInsertPoint(afterBB);
+        auto* bufPhi = builder_->CreatePHI(i8PtrTy, 2, "m.buf");
+        bufPhi->addIncoming(llvm::ConstantPointerNull::get(i8PtrTy), fromBB);
+        bufPhi->addIncoming(nbuf, allocBB);
+        return buildMapAgg(hmTy, bufPhi, len, cap);
+    }
+
+    llvm::Value* buildMapAgg(llvm::Type* hmTy, llvm::Value* buf,
+                             llvm::Value* len, llvm::Value* cap) {
+        llvm::Value* agg = llvm::UndefValue::get(hmTy);
+        agg = builder_->CreateInsertValue(agg, buf, {0}, "m.b");
+        agg = builder_->CreateInsertValue(agg, len, {1}, "m.l");
+        agg = builder_->CreateInsertValue(agg, cap, {2}, "m.c");
+        return agg;
     }
 
     // Phase 17b: the per-result-type `Poll<T> = { i1 ready, T value }`. Built
@@ -5195,6 +5609,23 @@ private:
     // partially-resolved Vars from `tc_.exprTypes`.
     TypePtr resolveInInstance(const TypePtr& t) {
         TypePtr r = resolve(t);
+        // Phase 35: cycle guard for self-recursive named types. Re-entering a
+        // struct/enum node already on the resolution stack means we hit the
+        // back-edge of a recursive type — return it unchanged to terminate.
+        // Var substitution on this subtree (if any) was applied the first time
+        // the node was visited; the cyclic child is the node itself and needs
+        // no further rewrite. Without this the eager rebuild below recurses
+        // forever and overflows the compiler's stack.
+        bool guard = (r->kind == TypeKind::Struct || r->kind == TypeKind::Enum);
+        if (guard) {
+            if (!resolvingInInstance_.insert(r.get()).second) return r;
+        }
+        TypePtr out = resolveInInstanceImpl(r);
+        if (guard) resolvingInInstance_.erase(r.get());
+        return out;
+    }
+
+    TypePtr resolveInInstanceImpl(const TypePtr& r) {
         switch (r->kind) {
         case TypeKind::Var: {
             if (auto it = currentSchemaVarSubst_.find(r->varId);
@@ -6208,13 +6639,109 @@ private:
         }
     }
 
+    // Phase 35: does dropping a value of type `t` transitively require dropping
+    // another value of the SAME named type? (e.g. `enum Json { JArr(Vec<Json>),
+    // JObj(HashMap<String,Json>) }` — a Json owns a Vec/HashMap whose elements
+    // are themselves Json.) Such a type's drop glue must be emitted ONCE as a
+    // callable function that recurses at RUN time over the actual tree, instead
+    // of inlined — inlining would recurse forever at COMPILE time.
+    bool dropTypeMentions(const TypePtr& t, const std::string& target,
+                          std::unordered_set<std::string>& seen) {
+        if (!t) return false;
+        TypePtr r = resolveInInstance(t);
+        switch (r->kind) {
+        case TypeKind::Box:
+            return dropTypeMentions(r->refInner, target, seen);
+        case TypeKind::Array:
+            return dropTypeMentions(r->arrayElem, target, seen);
+        case TypeKind::Tuple:
+            for (const auto& e : r->tupleElems)
+                if (dropTypeMentions(e, target, seen)) return true;
+            return false;
+        case TypeKind::Struct: {
+            // Heap containers own their element / key / value types (typeArgs).
+            if (r->structName == "Vec" || r->structName == "HashMap" ||
+                r->structName == "HashSet") {
+                for (const auto& a : r->typeArgs)
+                    if (dropTypeMentions(a, target, seen)) return true;
+                return false;
+            }
+            if (r->structName == "String" || r->structName == "Slice" ||
+                r->structName == "Range" || r->structName == "Future")
+                return false; // leaf owners — no nested user types
+            if (r->structName == target) return true;
+            if (!seen.insert("S:" + r->structName).second) return false;
+            for (const auto& [_n, fty] : r->structFields)
+                if (dropTypeMentions(fty, target, seen)) return true;
+            return false;
+        }
+        case TypeKind::Enum: {
+            if (r->enumName == target) return true;
+            if (!seen.insert("E:" + r->enumName).second) return false;
+            for (const auto& v : r->enumVariants)
+                for (const auto& pt : v.payloadTypes)
+                    if (dropTypeMentions(pt, target, seen)) return true;
+            return false;
+        }
+        // Ref is a borrow — it owns nothing, so it never makes a type's drop
+        // recursive (and following it could loop on a `&Self` field).
+        default:
+            return false;
+        }
+    }
+
+    bool typeIsSelfRecursive(const TypePtr& t) {
+        TypePtr r = resolveInInstance(t);
+        std::string name;
+        if (r->kind == TypeKind::Struct) {
+            if (r->structName == "Vec" || r->structName == "String" ||
+                r->structName == "HashMap" || r->structName == "HashSet" ||
+                r->structName == "Slice" || r->structName == "Range" ||
+                r->structName == "Future")
+                return false;
+            name = r->structName;
+        } else if (r->kind == TypeKind::Enum) {
+            name = r->enumName;
+        } else {
+            return false;
+        }
+        if (name.empty()) return false;
+        // Walk the IMMEDIATE children for a re-occurrence of `name` (the root's
+        // own match is trivial, so we start one level down).
+        std::unordered_set<std::string> seen;
+        if (r->kind == TypeKind::Struct) {
+            for (const auto& [_n, fty] : r->structFields)
+                if (dropTypeMentions(fty, name, seen)) return true;
+        } else {
+            for (const auto& v : r->enumVariants)
+                for (const auto& pt : v.payloadTypes)
+                    if (dropTypeMentions(pt, name, seen)) return true;
+        }
+        return false;
+    }
+
+    // Phase 35: the drop DISPATCHER. A self-recursive type is dropped by
+    // CALLING its per-type drop thunk (so recursion happens at run time over
+    // the real tree); every other type is dropped inline as before. All
+    // scope-exit / sub-field drop sites route through here.
+    void emitDropGlue(llvm::Value* valuePtr, const TypePtr& t) {
+        if (typeIsSelfRecursive(t)) {
+            llvm::Function* thunk = getOrEmitDropThunk(t);
+            builder_->CreateCall(thunk, {valuePtr});
+            return;
+        }
+        emitDropGlueInline(valuePtr, t);
+    }
+
     // Emit the full drop of a value whose storage lives at `valuePtr` (a
     // pointer to a value of type `t`): run the user `Drop::drop` (if any), then
     // recurse into fields / payloads / heap buffers, freeing as we go. This is
     // the order Rust uses: user destructor first, then field drops, then the
     // value's own backing storage. UNCONDITIONAL — callers gate it on a drop
-    // flag (or static knowledge that the value is still owned).
-    void emitDropGlue(llvm::Value* valuePtr, const TypePtr& t) {
+    // flag (or static knowledge that the value is still owned). Sub-drops call
+    // the dispatcher (`emitDropGlue`), so a nested self-recursive type recurses
+    // through its thunk rather than expanding here forever.
+    void emitDropGlueInline(llvm::Value* valuePtr, const TypePtr& t) {
         TypePtr r = resolveInInstance(t);
         auto& ctx = *ctx_;
         auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
@@ -7759,6 +8286,14 @@ private:
                 args.reserve(call.args.size());
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
                 return builder_->CreateCall(fn, args, "call_" + call.callee);
+            }
+            // Phase 35: `clone<T>(&T) -> T` deep-copies via a per-type clone fn.
+            // The argument is a `&T` borrow, so emitConsume yields the pointer
+            // to the source value (no move of the borrowed-from local).
+            if (call.callee == "clone" && !concreteTypeArgs.empty()) {
+                llvm::Function* fn = getOrEmitCloneFn(concreteTypeArgs[0]);
+                llvm::Value* srcPtr = emitConsume(*call.args[0]);
+                return builder_->CreateCall(fn, {srcPtr}, "call_clone");
             }
             // Phase 17b: `block_on<T>` is a generic built-in with no AST body
             // — synthesize a per-result-type executor (mirrors vec_*). T is

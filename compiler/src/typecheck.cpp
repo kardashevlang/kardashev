@@ -346,6 +346,25 @@ public:
             sch.genericVars.push_back(vecFnGenericVar);
             fnSchemas_["vec_len"] = std::move(sch);
         }
+        // Phase 35: clone<T>(x: &T) -> T ! { alloc } — a DEEP copy. The result
+        // owns freshly-allocated heap storage (String buffer, Vec/HashMap
+        // backing array, Box payload — recursively), so the clone and the
+        // original can each be dropped exactly once with no shared storage.
+        // The built-in deep-clone covers scalars, String, Vec, HashMap/HashSet,
+        // Box, and user structs/enums INCLUDING self-recursive types (cloned by
+        // a per-type clone function that recurses at run time). It subsumes the
+        // roadmap's "Clone trait + hand-written user impls": generic `impl<T>`
+        // blocks are deferred (Phase 21), so an intrinsic is the sound path and
+        // is strictly more capable (no per-type boilerplate).
+        {
+            FnSchema sch;
+            TypePtr cloneVar = makeFreshVar();
+            sch.signature =
+                makeFunction({makeRef(cloneVar, /*isMut=*/false)}, cloneVar);
+            sch.genericVars.push_back(cloneVar);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["clone"] = std::move(sch);
+        }
 
         // Phase 13b / 17b built-in: `HashMap<i64, V>` — an open-addressing
         // map. The KEY stays `i64` (no Hash trait yet); the VALUE V is
