@@ -2775,23 +2775,27 @@ private:
                       tr.line, tr.column);
                 return makeInt();
             }
-            // Phase 21a: generic trait objects (`dyn Iterator<T>`) are NOT
-            // supported this phase — monomorphization keeps generic-trait
-            // method calls static. Reject with a clear message rather than
-            // emitting an unsound vtable. Non-generic `dyn Trait` is unchanged.
+            // Phase 49: a parameterized trait object `dyn Trait<Args>` (e.g.
+            // `dyn Producer<i64>`). The trait's concrete args are carried on the
+            // Dyn type (in `typeArgs`); checkDynMethodCall binds the trait's
+            // params to them so a method returning the trait param resolves to
+            // the concrete type. The vtable thunk forwards to the impl method's
+            // already-concrete signature, so codegen needs nothing extra.
             auto pit = traitGenericParams_.find(tr.name);
-            if (pit != traitGenericParams_.end() && !pit->second.empty()) {
-                error("`dyn " + tr.name + "` is not supported: trait '" +
-                          tr.name +
-                          "' has generic type parameters (generic trait "
-                          "objects aren't supported; use a generic param with "
-                          "a trait bound like `<I: " + tr.name + "<...>>` "
-                          "instead)",
+            std::size_t want =
+                pit != traitGenericParams_.end() ? pit->second.size() : 0;
+            if (tr.typeArgs.size() != want) {
+                error("`dyn " + tr.name + "` expects " +
+                          std::to_string(want) + " trait type arg(s), got " +
+                          std::to_string(tr.typeArgs.size()),
                       tr.line, tr.column);
                 return makeInt();
             }
             checkObjectSafe(tr.name, tr.line, tr.column);
-            return makeDyn(tr.name);
+            TypePtr d = makeDyn(tr.name);
+            for (const auto& a : tr.typeArgs)
+                d->typeArgs.push_back(resolveTypeRef(a));
+            return d;
         }
         // Phase 11: `Box<T>` — the built-in heap-owned pointer. Built-in,
         // single type arg; the inner T may itself be `dyn Trait` (a heap
@@ -3788,16 +3792,16 @@ private:
         // through the object's vtable at runtime instead of resolving to a
         // single impl. We type-check args against the *trait's* method
         // signature (Self = the receiver's trait-object type).
-        if (r->kind == TypeKind::Ref || r->kind == TypeKind::Box) {
-            TypePtr inner = resolve(r->refInner);
-            if (inner->kind == TypeKind::Dyn) {
-                return checkDynMethodCall(mc, inner->dynTraitName, recvT);
-            }
-        }
-        // A bare `dyn Trait` value can't reach here normally (it's unsized),
-        // but guard defensively.
-        if (r->kind == TypeKind::Dyn) {
-            return checkDynMethodCall(mc, r->dynTraitName, recvT);
+        // Peel ANY number of pointer layers to find a `dyn` underneath:
+        // `&dyn`, `Box<dyn>`, AND `&Box<dyn>` (the shape returned by
+        // vec_get_ref over a `Vec<Box<dyn Trait>>`). Codegen's dyn dispatch
+        // already loads the fat pointer through an arbitrary pointer receiver.
+        {
+            TypePtr p = r;
+            while (p->kind == TypeKind::Ref || p->kind == TypeKind::Box)
+                p = resolve(p->refInner);
+            if (p->kind == TypeKind::Dyn)
+                return checkDynMethodCall(mc, p->dynTraitName, recvT);
         }
 
         // Phase 2.4b auto-deref: if the receiver is `&T` (or `&mut T`),
@@ -4096,6 +4100,22 @@ private:
         // and any `&self`/`self` receiver is irrelevant to the args.
         GenericEnv selfEnv;
         selfEnv["Self"] = dynRecvTy;
+        // Phase 49: bind the trait's generic params to the trait object's
+        // concrete args (`dyn Producer<i64>` => T -> i64), so a method whose
+        // signature names a trait param resolves to the concrete type. The
+        // args live on the Dyn type (its `typeArgs`); peel the receiver's
+        // pointer layers to reach it.
+        {
+            TypePtr p = resolve(dynRecvTy);
+            while (p->kind == TypeKind::Ref || p->kind == TypeKind::Box)
+                p = resolve(p->refInner);
+            auto pit = traitGenericParams_.find(traitName);
+            if (p->kind == TypeKind::Dyn && pit != traitGenericParams_.end()) {
+                for (std::size_t i = 0;
+                     i < pit->second.size() && i < p->typeArgs.size(); ++i)
+                    selfEnv[pit->second[i]] = p->typeArgs[i];
+            }
+        }
         const GenericEnv* savedEnv = currentGenericEnv_;
         currentGenericEnv_ = &selfEnv;
         std::vector<TypePtr> paramTypes;

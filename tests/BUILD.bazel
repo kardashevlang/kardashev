@@ -457,6 +457,16 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 49 (v8): generic trait objects — a `dyn Trait<Arg>` carries the trait's
+# concrete arg (bound when resolving method sigs), and dispatch works through
+# the `&Box<dyn>` that vec_get_ref returns, so a heterogeneous Vec<Box<dyn ...>>
+# is iterated with dynamic dispatch. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase49",
+    srcs = ["smoke_test_phase49.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],
