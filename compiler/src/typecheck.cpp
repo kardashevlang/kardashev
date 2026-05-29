@@ -229,6 +229,15 @@ public:
             sch.declaredEffects.add("alloc");
             fnSchemas_["int_to_string"] = std::move(sch);
         }
+        // Phase 44: f64_to_string(x: f64) -> String ! { alloc } — format an f64
+        // into a fresh heap String (snprintf "%g"). The dual of int_to_string,
+        // used to serialize JSON numbers.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeFloat()}, stringTy);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["f64_to_string"] = std::move(sch);
+        }
         // print_no_nl(s: &String) -> i64 ! { io } — writes s with NO trailing
         // newline (print_str / print_string / println all force one), so
         // output can be composed piece by piece on a single line.
@@ -1058,6 +1067,7 @@ public:
             if (rfor->kind == TypeKind::Struct) typeName = rfor->structName;
             else if (rfor->kind == TypeKind::Enum) typeName = rfor->enumName;
             else if (rfor->kind == TypeKind::Int) typeName = "i64";
+            else if (rfor->kind == TypeKind::Float) typeName = "f64";  // Phase 44
             else if (rfor->kind == TypeKind::Bool) typeName = "bool";
             else {
                 error("impl for unsupported type " + typeToString(forTy),
@@ -2413,6 +2423,7 @@ private:
         if (rb->kind == TypeKind::Struct) typeName = rb->structName;
         else if (rb->kind == TypeKind::Enum) typeName = rb->enumName;
         else if (rb->kind == TypeKind::Int) typeName = "i64";
+        else if (rb->kind == TypeKind::Float) typeName = "f64";  // Phase 44
         else if (rb->kind == TypeKind::Bool) typeName = "bool";
         else {
             error("associated type projection on unsupported base type " +
@@ -3615,6 +3626,7 @@ private:
         if (r->kind == TypeKind::Struct) return r->structName;
         if (r->kind == TypeKind::Enum) return r->enumName;
         if (r->kind == TypeKind::Int) return "i64";
+        else if (r->kind == TypeKind::Float) return "f64";  // Phase 44
         if (r->kind == TypeKind::Bool) return "bool";
         return {};
     }
@@ -3751,6 +3763,7 @@ private:
         if (r->kind == TypeKind::Struct) typeName = r->structName;
         else if (r->kind == TypeKind::Enum) typeName = r->enumName;
         else if (r->kind == TypeKind::Int) typeName = "i64";
+        else if (r->kind == TypeKind::Float) typeName = "f64";  // Phase 44
         else if (r->kind == TypeKind::Bool) typeName = "bool";
         else {
             error("method call on unsupported receiver type " +
@@ -5043,6 +5056,7 @@ private:
                 else if (concrete->kind == TypeKind::Enum)
                     typeName = concrete->enumName;
                 else if (concrete->kind == TypeKind::Int) typeName = "i64";
+                else if (concrete->kind == TypeKind::Float) typeName = "f64";  // Phase 44
                 else if (concrete->kind == TypeKind::Bool) typeName = "bool";
                 else continue; // still a Var / unsupported — leave unbound
                 auto tyIt = implAssocTypes_.find(typeName);

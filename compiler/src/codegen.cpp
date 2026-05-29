@@ -1590,6 +1590,37 @@ private:
             declaredFns_["int_to_string"] = fn;
         }
 
+        // Phase 44: f64_to_string(x: f64) -> String — snprintf "%g" into a
+        // fresh 32-byte heap String (the dual of int_to_string; %g gives a
+        // compact round-trippable form).
+        {
+            auto* dblTy = llvm::Type::getDoubleTy(ctx);
+            auto* fnTy = llvm::FunctionType::get(strTy, {dblTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "f64_to_string",
+                module_.get());
+            fn->getArg(0)->setName("x");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* cap = llvm::ConstantInt::get(i64Ty, 32);
+            auto* buf = b.CreateCall(mallocFn_, {cap}, "fts_buf");
+            auto* snprintfTy = llvm::FunctionType::get(
+                i32Ty, {i8PtrTy, i64Ty, i8PtrTy}, /*isVarArg=*/true);
+            auto snprintfFn =
+                module_->getOrInsertFunction("snprintf", snprintfTy);
+            auto* fmt =
+                b.CreateGlobalString("%g", "kd_ftos_fmt", 0, module_.get());
+            auto* written = b.CreateCall(
+                snprintfFn, {buf, cap, fmt, fn->getArg(0)}, "fts_written");
+            auto* len = b.CreateSExt(written, i64Ty, "fts_len");
+            llvm::Value* v = llvm::UndefValue::get(strTy);
+            v = b.CreateInsertValue(v, buf, {0}, "fts_data");
+            v = b.CreateInsertValue(v, len, {1}, "fts_len_f");
+            v = b.CreateInsertValue(v, cap, {2}, "fts_cap");
+            b.CreateRet(v);
+            declaredFns_["f64_to_string"] = fn;
+        }
+
         // --- Phase 27: print_no_nl(s: &String) -> i64 (no trailing newline) ---
         {
             auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
@@ -2019,6 +2050,7 @@ private:
         if (k->kind == TypeKind::Struct) return k->structName;
         if (k->kind == TypeKind::Enum) return k->enumName;
         if (k->kind == TypeKind::Int) return "i64";
+        else if (k->kind == TypeKind::Float) return "f64";  // Phase 44
         if (k->kind == TypeKind::Bool) return "bool";
         return "";
     }
@@ -5552,6 +5584,7 @@ private:
         if (rb->kind == TypeKind::Struct) typeName = rb->structName;
         else if (rb->kind == TypeKind::Enum) typeName = rb->enumName;
         else if (rb->kind == TypeKind::Int) typeName = "i64";
+        else if (rb->kind == TypeKind::Float) typeName = "f64";  // Phase 44
         else if (rb->kind == TypeKind::Bool) typeName = "bool";
         else {
             errors_.push_back("codegen: associated type projection '" +
@@ -5646,6 +5679,7 @@ private:
             return it->second;
         }
         if (tr.name == "i64") return makeInt();
+        if (tr.name == "f64") return makeFloat(); // Phase 39/44
         if (tr.name == "bool") return makeBool();
         // Phase 16: a fn with no `-> T` annotation returns unit (parser
         // synthesizes a "unit" TypeRef). Mirrors typecheck's resolveTypeRef.
@@ -5965,6 +5999,7 @@ private:
                     else if (base->kind == TypeKind::Enum)
                         typeName = base->enumName;
                     else if (base->kind == TypeKind::Int) typeName = "i64";
+                    else if (base->kind == TypeKind::Float) typeName = "f64";  // Phase 44
                     else if (base->kind == TypeKind::Bool) typeName = "bool";
                     if (!typeName.empty()) {
                         auto tyIt = tc_.implAssocTypes.find(typeName);

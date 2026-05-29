@@ -128,7 +128,16 @@ std::string applyPrelude(const std::string& userSrc) {
             " { fn eq(&self, other: &i64) -> bool { int_eq(self, other) } }\n"
             "impl Eq for String"
             " { fn eq(&self, other: &String) -> bool"
-            " { str_eq(self, other) } }\n";
+            " { str_eq(self, other) } }\n"
+            // Phase 44: bool / f64 Eq (scalars). (A generic HashMap Eq trait
+            // impl is deferred for the same reason as HashMap Clone above; a
+            // hand-written order-independent compare is straightforward where
+            // needed.)
+            "impl Eq for bool"
+            " { fn eq(&self, other: &bool) -> bool"
+            " { if *self { *other } else { !*other } } }\n"
+            "impl Eq for f64"
+            " { fn eq(&self, other: &f64) -> bool { *self == *other } }\n";
     }
     // Phase 37: the `Display` trait — `to_string(&self) -> String` — with
     // built-in impls for the scalar/heap primitives, so a generic can be
@@ -179,7 +188,14 @@ std::string applyPrelude(const std::string& userSrc) {
             "        }\n"
             "        out\n"
             "    }\n"
-            "}\n";
+            "}\n"
+            // Phase 44: f64 Clone (scalar). (A generic HashMap Clone trait impl
+            // is NOT shipped: a generic `impl<K, V> .. for HashMap<K,V>` body
+            // can't yet satisfy the HashMap-op K: Hash+Eq requirement from a
+            // bounded type param — deferred. The `clone(&x)` intrinsic already
+            // deep-clones a HashMap structurally, so map cloning works via it.)
+            "impl Clone for f64"
+            " { fn clone(&self) -> f64 ! { alloc } { *self } }\n";
     }
     // Phase 41: a generic `impl<T: Eq> Eq for Vec<T>` (the `Eq` trait + its
     // i64/String impls are injected below) — element-wise deep equality, the
