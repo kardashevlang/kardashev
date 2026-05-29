@@ -1136,19 +1136,22 @@ private:
 
     static int binPrec(TokenKind k) {
         switch (k) {
+        case TokenKind::AmpAmp: // Phase 33: `&&` binds loosest (below comparisons)
+            return 1;
         case TokenKind::EqEq:
         case TokenKind::NotEq:
         case TokenKind::Lt:
         case TokenKind::Le:
         case TokenKind::Gt:
         case TokenKind::Ge:
-            return 1;
+            return 2;
         case TokenKind::Plus:
         case TokenKind::Minus:
-            return 2;
+            return 3;
         case TokenKind::Star:
         case TokenKind::Slash:
-            return 3;
+        case TokenKind::Percent: // Phase 33: `%` at the multiplicative tier
+            return 4;
         default:
             return 0; // not a binop
         }
@@ -1160,6 +1163,8 @@ private:
         case TokenKind::Minus: return ast::BinOp::Sub;
         case TokenKind::Star: return ast::BinOp::Mul;
         case TokenKind::Slash: return ast::BinOp::Div;
+        case TokenKind::Percent: return ast::BinOp::Mod;
+        case TokenKind::AmpAmp: return ast::BinOp::And;
         case TokenKind::Lt: return ast::BinOp::Lt;
         case TokenKind::Le: return ast::BinOp::Le;
         case TokenKind::Gt: return ast::BinOp::Gt;
@@ -1218,14 +1223,19 @@ private:
     // and the closure `|` are still handled by parsePrimary, so `-&x` and
     // `&-x` both flow through correctly.
     ast::ExprPtr parseUnary() {
-        if (check(TokenKind::Minus) || check(TokenKind::Bang)) {
+        // Phase 34: a leading `*` is the deref operator (an infix `*` is
+        // multiplication, handled in the precedence parser — position
+        // disambiguates, the standard prefix/infix split).
+        if (check(TokenKind::Minus) || check(TokenKind::Bang) ||
+            check(TokenKind::Star)) {
             Token opTok = consume();
             auto operand = parseUnary();
             auto ue = std::make_unique<ast::UnaryExpr>();
             ue->line = opTok.line;
             ue->column = opTok.column;
-            ue->op = opTok.kind == TokenKind::Minus ? ast::UnaryOp::Neg
-                                                     : ast::UnaryOp::Not;
+            ue->op = opTok.kind == TokenKind::Minus  ? ast::UnaryOp::Neg
+                     : opTok.kind == TokenKind::Bang ? ast::UnaryOp::Not
+                                                     : ast::UnaryOp::Deref;
             ue->operand = std::move(operand);
             return ue;
         }
@@ -1814,6 +1824,27 @@ private:
             auto p = std::make_unique<ast::WildPat>();
             p->line = tok.line;
             p->column = tok.column;
+            return p;
+        }
+        // Phase 36: parenthesized / tuple pattern. `(p)` is just grouping;
+        // `(p0, p1, ...)` (and the empty `()`) is a tuple destructure.
+        if (t.kind == TokenKind::LParen) {
+            Token tok = consume();
+            std::vector<ast::PatternPtr> elems;
+            if (!check(TokenKind::RParen)) {
+                while (true) {
+                    elems.push_back(parsePattern());
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::RParen)) break; // trailing comma
+                }
+            }
+            expect(TokenKind::RParen, ")");
+            // A single element with no comma is a grouped pattern, not a tuple.
+            if (elems.size() == 1) return std::move(elems[0]);
+            auto p = std::make_unique<ast::TuplePat>();
+            p->line = tok.line;
+            p->column = tok.column;
+            p->elements = std::move(elems);
             return p;
         }
         if (t.kind == TokenKind::Identifier) {

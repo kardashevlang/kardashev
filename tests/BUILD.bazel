@@ -303,7 +303,6 @@ sh_test(
     srcs = ["smoke_test_capstones.sh"],
     data = [
         "//compiler:kardc",
-        "//examples/json:main.kd",
         "//examples/kdlex:main.kd",
     ],
 )
@@ -320,6 +319,61 @@ sh_test(
         "//docs:effects.md",
         "//docs:language-reference.md",
         "//docs:stdlib.md",
+    ],
+)
+
+# Phase 33: the `%` / `&&` operators (incl. short-circuit) and HashMap/HashSet
+# interior drop + rehash-buffer reclaim (constant-memory probe). JIT + AOT.
+sh_test(
+    name = "smoke_test_phase33",
+    srcs = ["smoke_test_phase33.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 34: read-without-move — vec_get_ref / hashmap_get_ref (Option<&V>) /
+# the `*r` deref operator / match-through-&Enum (binding payloads as borrows),
+# with a constant-memory by-reference traversal loop. JIT + AOT.
+sh_test(
+    name = "smoke_test_refread",
+    srcs = ["smoke_test_refread.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 35: sound recursive heap enums (cycle-guarded layout + a recursive drop
+# function) + the `clone` deep-copy intrinsic (String/Vec/HashMap/Box/user
+# structs+enums, recursive types via a per-type clone fn). JIT + AOT.
+sh_test(
+    name = "smoke_test_clone",
+    srcs = ["smoke_test_clone.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 36: enum-typed struct fields (mutual struct/enum layout) + non-Copy
+# tuple elements (drop) + tuple `match` patterns + Result error propagation.
+sh_test(
+    name = "smoke_test_phase36",
+    srcs = ["smoke_test_phase36.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 37: the Display/to_string trait (+ built-in impls) + de-i64'd generic
+# iteration (for-loop binds the iterator's real next() payload) + generic
+# `&[T]` slice reads (slice_len / slice_get / slice_get_ref over any T).
+sh_test(
+    name = "smoke_test_phase37",
+    srcs = ["smoke_test_phase37.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 38 capstone: the full nested-JSON example — parse + serialize, round-trip
+# by deep-equality, leak-free under a constant-memory loop. Builds the SHIPPED
+# example source (//examples/json:main.kd) so the test doubles as a build check.
+sh_test(
+    name = "smoke_test_json",
+    srcs = ["smoke_test_json.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/json:main.kd",
     ],
 )
 

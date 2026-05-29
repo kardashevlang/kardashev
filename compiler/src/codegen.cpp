@@ -23,6 +23,12 @@
 #include "llvm/Passes/OptimizationLevel.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/raw_ostream.h"
+// Phase 35: the optimizer must see the real target datalayout (set below in
+// run()) so struct/aggregate GEP folding matches the backend's field offsets.
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/TargetParser/Host.h"
 
 namespace kardashev {
 namespace {
@@ -53,7 +59,37 @@ public:
         if (emitDebugInfo_) initDebugInfo(sourceFile);
     }
 
+    // Phase 34 fix: the canonical built-in container struct TYPES must exist
+    // BEFORE any user struct/enum that references them (String / Vec<T> /
+    // HashMap / ... as a field or variant payload) is laid out — otherwise the
+    // user layout creates its own `%String` which `declareBuiltins` then
+    // shadows with a second `%String.0`, and an enum-with-String-payload ctor
+    // gets an InsertValue type mismatch. Create them once here, idempotently;
+    // declareBuiltins / declareHashMapRuntime reuse these entries.
+    void ensureCoreStructTypes() {
+        if (structTypes_.count("String")) return;
+        auto& ctx = *ctx_;
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        structTypes_["Vec"] =
+            llvm::StructType::create(ctx, {i8PtrTy, i64Ty, i64Ty}, "Vec");
+        structTypes_["String"] =
+            llvm::StructType::create(ctx, {i8PtrTy, i64Ty, i64Ty}, "String");
+        structTypes_["Slice"] =
+            llvm::StructType::create(ctx, {i8PtrTy, i64Ty}, "Slice");
+        structTypes_["Future"] =
+            llvm::StructType::create(ctx, {i8PtrTy, i8PtrTy}, "Future");
+        auto* hm =
+            llvm::StructType::create(ctx, {i8PtrTy, i64Ty, i64Ty}, "HashMap");
+        structTypes_["HashMap"] = hm;
+        structTypes_["HashSet"] = hm; // HashSet shares the HashMap layout
+    }
+
     void run(const ast::Program& program) {
+        // Phase 34: register the built-in container struct layouts first (see
+        // ensureCoreStructTypes) so user types referencing them get the
+        // canonical instances.
+        ensureCoreStructTypes();
         // Phase 23: decide up front whether this program can panic. A program
         // that never panics gets ZERO panic-runtime / cleanup-stack machinery
         // (byte-identical IR to pre-Phase-23). "Can panic" = it calls
@@ -115,8 +151,13 @@ public:
         // existing lazy `Option<i64>` instantiation order the HashMap
         // built-ins depend on.
         ensureFnValTy();
+        // Phase 36: declare ALL struct + enum names (opaque) before filling any
+        // body, so a struct field of enum type (and vice-versa) resolves no
+        // matter the declaration order.
         declareAllStructs();
         declareAllEnums();
+        fillAllStructBodies();
+        fillAllEnumBodies();
         declareBuiltins();
         // Phase 24: declare every user `extern "C" fn` as an LLVM external
         // function with the C-ABI-mapped signature. The LLVM symbol name is
@@ -314,6 +355,37 @@ public:
                                    llvm::DEBUG_METADATA_VERSION);
             module_->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
             dib_->finalize();
+        }
+        // Phase 35: pin the module to the HOST target's datalayout BEFORE the
+        // optimization pipeline runs. Without it the optimizer folds struct /
+        // aggregate GEPs (StructGEP -> a raw byte offset) against LLVM's
+        // default layout, whose field offsets can differ from the backend's
+        // real layout for a multi-field aggregate (e.g. an enum laid out as
+        // {i32 tag, i64, %Vec}). The backend then stores the aggregate at the
+        // real offsets while the optimizer-folded load reads the wrong byte
+        // offset — a silent miscompile at -O1+ that only surfaces when such a
+        // value is read through a pointer (the keystone recursive-enum read).
+        // Idempotent target init; the AOT/JIT paths set this again later.
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+        {
+            std::string tripleStr = llvm::sys::getDefaultTargetTriple();
+            std::string tErr;
+            if (const llvm::Target* tgt =
+                    llvm::TargetRegistry::lookupTarget(tripleStr, tErr)) {
+                llvm::TargetOptions topts;
+#if LLVM_VERSION_MAJOR >= 21
+                llvm::Triple triple(tripleStr);
+                module_->setTargetTriple(triple);
+                auto* tm = tgt->createTargetMachine(triple, "generic", "",
+                                                    topts, llvm::Reloc::PIC_);
+#else
+                module_->setTargetTriple(tripleStr);
+                auto* tm = tgt->createTargetMachine(tripleStr, "generic", "",
+                                                    topts, llvm::Reloc::PIC_);
+#endif
+                if (tm) module_->setDataLayout(tm->createDataLayout());
+            }
         }
         std::string verifyErrs;
         llvm::raw_string_ostream os(verifyErrs);
@@ -721,6 +793,17 @@ private:
     // emitDropGlue, so a cleanup entry can name a uniform `void(i8*)` drop fn.
     std::unordered_map<std::string, llvm::Function*> dropThunks_;
 
+    // Phase 35: named struct/enum nodes currently on the resolveInInstance
+    // stack. A self-recursive type (`enum Json { JArr(Vec<Json>) }`) forms a
+    // pointer cycle in its payload graph; re-entering a node already here is
+    // the back-edge, where we stop expanding to terminate.
+    std::unordered_set<const Type*> resolvingInInstance_;
+
+    // Phase 35: per-type deep-clone functions `T __kd_clone_<mangled>(i8* src)`
+    // backing the `clone` intrinsic. Cached (and registered BEFORE the body is
+    // emitted) so a self-recursive type clones via a run-time recursive call.
+    std::unordered_map<std::string, llvm::Function*> cloneFns_;
+
     // Phase 10b: the uniform fat-pointer LLVM type for ALL first-class fn
     // VALUES — `{ i8* fn, i8* env }`. `fn` points at a generated function
     // whose first parameter is the env pointer (`ret(i8* env, params...)`);
@@ -948,9 +1031,9 @@ private:
             ctx, {i8PtrTy, i8PtrTy}, "kd.dynptr");
 
         // --- Vec struct layout: { i8* data, i64 len, i64 cap } ---
-        auto* vecTy = llvm::StructType::create(
-            ctx, {i8PtrTy, i64Ty, i64Ty}, "Vec");
-        structTypes_["Vec"] = vecTy;
+        // Created once in ensureCoreStructTypes (so user types referencing Vec
+        // get this exact instance); reuse it here.
+        auto* vecTy = structTypes_["Vec"];
 
         // --- String struct layout: { i8* data, i64 len, i64 cap }.
         // Phase 13b made String growable (mirroring Vec's {ptr,len,cap}).
@@ -961,16 +1044,13 @@ private:
         // it copies the literal's bytes in on first append so the original
         // global is never mutated. `print_str` / `str_len` only read
         // data+len, so they work uniformly over literals and grown strings.
-        auto* strTy = llvm::StructType::create(
-            ctx, {i8PtrTy, i64Ty, i64Ty}, "String");
-        structTypes_["String"] = strTy;
+        auto* strTy = structTypes_["String"]; // see ensureCoreStructTypes
 
         // --- Phase 13b: slice fat pointer { i8* ptr, i64 len }. Like Vec /
         // String, every `&[T]` lowers to this single layout regardless of T
         // (the element stride is computed separately at slice_get sites).
-        auto* sliceTy = llvm::StructType::create(
-            ctx, {i8PtrTy, i64Ty}, "Slice");
-        structTypes_["Slice"] = sliceTy;
+        auto* sliceTy = structTypes_["Slice"]; // see ensureCoreStructTypes
+        (void)sliceTy;
 
         // --- Phase 12 real async runtime ---
         // Poll = { i1 ready, i64 value }: the result of polling a future.
@@ -982,9 +1062,7 @@ private:
         // the future's heap-allocated state (a counter for yield_now, or the
         // async-fn state-machine frame). Replaces the Phase 6 fake
         // {state,result} pair — futures are now genuinely pollable/resumable.
-        auto* futureTy = llvm::StructType::create(
-            ctx, {i8PtrTy, i8PtrTy}, "Future");
-        structTypes_["Future"] = futureTy;
+        auto* futureTy = structTypes_["Future"]; // see ensureCoreStructTypes
         // The poll-function type shared by every future: void(i8*, kd.poll*).
         pollFnTy_ = llvm::FunctionType::get(
             llvm::Type::getVoidTy(ctx), {i8PtrTy, llvm::PointerType::get(ctx, 0)},
@@ -1212,6 +1290,19 @@ private:
             auto* dst = b.CreateGEP(i8Ty, curData, sLen, "dst");
             b.CreateCall(memcpyFn_, {dst, oData, oLen}, "append");
             b.CreateStore(newLen, sLenP);
+            // Phase 38: `other` is MOVED in (consumed by value) — free its heap
+            // buffer now that its bytes are copied, else every pushed owned
+            // String (e.g. a serializer's sub-result) leaks. A cap==0 literal
+            // view owns nothing, so the free is guarded on cap != 0.
+            auto* oCap = b.CreateExtractValue(oVal, {2}, "o_cap");
+            auto* oHeap = b.CreateICmpNE(oCap, zeroI64, "o_heap");
+            auto* ofreeBB = llvm::BasicBlock::Create(ctx, "ofree", fn);
+            auto* odoneBB = llvm::BasicBlock::Create(ctx, "odone", fn);
+            b.CreateCondBr(oHeap, ofreeBB, odoneBB);
+            b.SetInsertPoint(ofreeBB);
+            b.CreateCall(freeFn_, {oData});
+            b.CreateBr(odoneBB);
+            b.SetInsertPoint(odoneBB);
             b.CreateRet(zeroI64);
             declaredFns_["string_push_str"] = fn;
         }
@@ -1743,42 +1834,11 @@ private:
             }
         }
 
-        // --- Phase 13b: slice read ops. A slice value is the {ptr,len} fat
-        // pointer produced by `&v[a..b]` (emitSlice). Both ops take the slice
-        // BY VALUE (a 16-byte aggregate). MVP element = i64; slice_get uses an
-        // i64 element stride. ---
-        {
-            // slice_len(s: Slice) -> i64
-            auto* fnTy = llvm::FunctionType::get(i64Ty, {sliceTy}, false);
-            auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "slice_len",
-                module_.get());
-            fn->getArg(0)->setName("s");
-            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
-            llvm::IRBuilder<> b(entry);
-            auto* len = b.CreateExtractValue(fn->getArg(0), {1}, "len");
-            b.CreateRet(len);
-            declaredFns_["slice_len"] = fn;
-        }
-        {
-            // slice_get(s: Slice, i: i64) -> i64 : load element i (i64 stride).
-            auto* i64ElemTy = llvm::Type::getInt64Ty(ctx);
-            auto* fnTy = llvm::FunctionType::get(
-                i64Ty, {sliceTy, i64Ty}, false);
-            auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "slice_get",
-                module_.get());
-            fn->getArg(0)->setName("s");
-            fn->getArg(1)->setName("i");
-            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
-            llvm::IRBuilder<> b(entry);
-            auto* data = b.CreateExtractValue(fn->getArg(0), {0}, "data");
-            auto* elemPtr =
-                b.CreateGEP(i64ElemTy, data, fn->getArg(1), "elem_ptr");
-            auto* val = b.CreateLoad(i64ElemTy, elemPtr, "val");
-            b.CreateRet(val);
-            declaredFns_["slice_get"] = fn;
-        }
+        // Phase 13b / 37: slice read ops (slice_len / slice_get / slice_get_ref)
+        // are now GENERIC over the element type and synthesized per-T in
+        // getOrEmitSliceOp (mirroring getOrEmitVecOp), dispatched from emitCall.
+        // A slice value is the {ptr,len} fat pointer from `&v[a..b]`; the
+        // element stride is sizeof(T).
 
         // --- Phase 13b: HashMap<i64,i64> runtime (open addressing) ---
         declareHashMapRuntime();
@@ -1805,19 +1865,9 @@ private:
     // per-V bucket-entry struct + the five ops are emitted lazily by
     // getOrEmitHashMapOp (mirrors getOrEmitVecOp).
     void declareHashMapRuntime() {
-        auto& ctx = *ctx_;
-        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
-        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
-        // %HashMap = { i8* buckets, i64 len, i64 cap }
-        auto* hmTy = llvm::StructType::create(
-            ctx, {i8PtrTy, i64Ty, i64Ty}, "HashMap");
-        structTypes_["HashMap"] = hmTy;
-        // Phase 28: HashSet IS a HashMap-with-a-dummy-value at runtime, so it
-        // shares the identical LLVM type (the two stay nominally distinct only
-        // in the kardashev type system, which drives dispatch via the callee
-        // name). Sharing the LLVM type keeps `hashset_new` returning the same
-        // struct the underlying `hashmap_new` produces.
-        structTypes_["HashSet"] = hmTy;
+        // %HashMap = { i8* buckets, i64 len, i64 cap } — created once in
+        // ensureCoreStructTypes (HashSet shares it); reuse here.
+        (void)structTypes_["HashMap"];
     }
 
     // Phase 17b: build the concrete `Option<V>` Kardashev TypePtr by
@@ -1932,6 +1982,15 @@ private:
                 return b.CreateICmpEQ(cur, kVal, "keyEq");
             }
             return b.CreateCall(eqFn, {kSlot, keyPtr}, "keyEq");
+        };
+        // Phase 38: a lookup op (get / get_ref / contains) receives its key BY
+        // VALUE but does NOT store it — so it must DROP that key before every
+        // return, else a heap key (e.g. a String) leaks once per lookup. i64
+        // keys own nothing (no kSlot); the drop thunk frees a String / runs a
+        // user Drop. Call this immediately before each CreateRet in those ops.
+        auto dropConsumedKey = [&](llvm::IRBuilder<>& bb, llvm::Value* kSlot) {
+            if (!keyIsInt && kSlot)
+                bb.CreateCall(getOrEmitDropThunk(K), {kSlot});
         };
 
         // __hm_raw_insert__<V>(buckets: i8*, cap: i64, k: i64, v: V) -> i64.
@@ -2119,6 +2178,12 @@ private:
             b.SetInsertPoint(rehashDone);
             b.CreateStore(newBuf, bucketsP);
             b.CreateStore(newCap, capP);
+            // Phase 33: reclaim the OLD bucket buffer now that every entry has
+            // migrated into newBuf. oldBuf is null on the first grow (cap was
+            // 0) and a malloc'd buffer otherwise — free() handles both. (The
+            // entries themselves moved by value, so their interior heap is now
+            // owned by newBuf; only the array shell is freed here.)
+            b.CreateCall(freeFn_, {oldBuf});
             b.CreateBr(doInsertBB);
 
             // doinsert: raw-insert into current buffer; bump len if new.
@@ -2211,6 +2276,7 @@ private:
             b.CreateCondBr(isEmpty, noneBB, checkBB);
 
             b.SetInsertPoint(noneBB);
+            dropConsumedKey(b, kSlot);
             b.CreateRet(buildNone(b));
 
             b.SetInsertPoint(checkBB);
@@ -2225,6 +2291,7 @@ private:
             someAgg = b.CreateInsertValue(
                 someAgg, llvm::ConstantInt::get(i32Ty, someIdx), {0}, "some");
             someAgg = b.CreateInsertValue(someAgg, val, {someSlot}, "someV");
+            dropConsumedKey(b, kSlot);
             b.CreateRet(someAgg);
 
             b.SetInsertPoint(stepBB);
@@ -2233,6 +2300,92 @@ private:
             b.CreateStore(wrapped, idxSlot);
             b.CreateBr(loopBB);
             declaredFns_["hashmap_get__" + vMangle] = fn;
+        }
+
+        // Phase 34: hashmap_get_ref__<K,V>(m, k) -> Option<&V> — identical
+        // probe to hashmap_get, but the `Some` payload is a BORROW (the value
+        // slot pointer) rather than a copy (read-without-move for maps).
+        {
+            TypePtr optTy = optionType(makeRef(V, /*isMut=*/false));
+            if (optTy) {
+                mapKardashevType(optTy);
+                const std::string optMangled =
+                    mangleStructInstance(optTy->enumName, optTy->typeArgs);
+                auto* optLlvm = enumTypes_[optMangled];
+                unsigned someIdx = variantIndexInEnum(optTy, "Some");
+                unsigned noneIdx = variantIndexInEnum(optTy, "None");
+                unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+                auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+                auto* fnTy =
+                    llvm::FunctionType::get(optLlvm, {i8PtrTy, keyTy}, false);
+                auto* fn = llvm::Function::Create(
+                    fnTy, llvm::Function::ExternalLinkage,
+                    "hashmap_get_ref__" + vMangle, module_.get());
+                fn->getArg(0)->setName("m");
+                fn->getArg(1)->setName("k");
+                auto* mPtr = fn->getArg(0);
+                auto* k = fn->getArg(1);
+                auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* loopBB = llvm::BasicBlock::Create(ctx, "probe", fn);
+                auto* checkBB = llvm::BasicBlock::Create(ctx, "check", fn);
+                auto* noneBB = llvm::BasicBlock::Create(ctx, "none", fn);
+                auto* hitBB = llvm::BasicBlock::Create(ctx, "hit", fn);
+                auto* stepBB = llvm::BasicBlock::Create(ctx, "step", fn);
+                auto buildNone = [&](llvm::IRBuilder<>& bb) {
+                    llvm::Value* agg = llvm::UndefValue::get(optLlvm);
+                    return bb.CreateInsertValue(
+                        agg, llvm::ConstantInt::get(i32Ty, noneIdx), {0},
+                        "none");
+                };
+                llvm::IRBuilder<> b(entry);
+                auto* idxSlot = b.CreateAlloca(i64Ty, nullptr, "idx");
+                llvm::Value* kSlot = nullptr;
+                if (!keyIsInt) {
+                    kSlot = b.CreateAlloca(keyTy, nullptr, "kslot");
+                    b.CreateStore(k, kSlot);
+                }
+                auto* cap = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(hmTy, mPtr, 2, "capP"), "cap");
+                auto* buckets = b.CreateLoad(
+                    i8PtrTy, b.CreateStructGEP(hmTy, mPtr, 0, "bucketsP"),
+                    "buckets");
+                auto* nonZeroBB = llvm::BasicBlock::Create(ctx, "nonzero", fn);
+                b.CreateCondBr(b.CreateICmpEQ(cap, zero, "capZero"), noneBB,
+                               nonZeroBB);
+                b.SetInsertPoint(nonZeroBB);
+                b.CreateStore(emitStart(b, k, kSlot, cap), idxSlot);
+                b.CreateBr(loopBB);
+                b.SetInsertPoint(loopBB);
+                auto* idx = b.CreateLoad(i64Ty, idxSlot, "i");
+                auto* eptr = b.CreateGEP(entryTy, buckets, idx, "eptr");
+                auto* state = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(entryTy, eptr, 0, "stateP"),
+                    "state");
+                b.CreateCondBr(b.CreateICmpEQ(state, zero, "isEmpty"), noneBB,
+                               checkBB);
+                b.SetInsertPoint(noneBB);
+                dropConsumedKey(b, kSlot);
+                b.CreateRet(buildNone(b));
+                b.SetInsertPoint(checkBB);
+                auto* keyP = b.CreateStructGEP(entryTy, eptr, 1, "keyP");
+                b.CreateCondBr(emitEq(b, k, kSlot, keyP), hitBB, stepBB);
+                b.SetInsertPoint(hitBB);
+                auto* valP = b.CreateStructGEP(entryTy, eptr, 2, "valP");
+                llvm::Value* someAgg = llvm::UndefValue::get(optLlvm);
+                someAgg = b.CreateInsertValue(
+                    someAgg, llvm::ConstantInt::get(i32Ty, someIdx), {0},
+                    "some");
+                someAgg = b.CreateInsertValue(someAgg, valP, {someSlot},
+                                              "someRef"); // the BORROW
+                dropConsumedKey(b, kSlot);
+                b.CreateRet(someAgg);
+                b.SetInsertPoint(stepBB);
+                b.CreateStore(b.CreateURem(b.CreateAdd(idx, one, "inc"), cap,
+                                           "wrap"),
+                              idxSlot);
+                b.CreateBr(loopBB);
+                declaredFns_["hashmap_get_ref__" + vMangle] = fn;
+            }
         }
 
         // hashmap_len__<V>(m: &HashMap) -> i64 (value-agnostic, but emitted
@@ -2250,7 +2403,59 @@ private:
             declaredFns_["hashmap_len__" + vMangle] = fn;
         }
 
-        // All five are now emitted for this V; return the requested one.
+        // Phase 38: hashmap_keys__<K,V>(m: &HashMap) -> Vec<K> — a fresh Vec of
+        // the live keys, each DEEP-CLONED (so the Vec owns them independently of
+        // the map; dropping the Vec frees its copies, the map keeps its own).
+        // Bucket-order (unordered); the only way to enumerate a map's entries.
+        {
+            auto* vecTy = structTypes_["Vec"];
+            auto* fnTy = llvm::FunctionType::get(vecTy, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashmap_keys__" + vMangle, module_.get());
+            fn->getArg(0)->setName("m");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            llvm::Function* vecNew = getOrEmitVecOp("vec_new", K);
+            llvm::Function* vecPush = getOrEmitVecOp("vec_push", K);
+            llvm::Function* keyClone = getOrEmitCloneFn(K);
+            auto* resSlot = b.CreateAlloca(vecTy, nullptr, "keys");
+            b.CreateStore(b.CreateCall(vecNew, {}, "kv"), resSlot);
+            auto* buckets = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(hmTy, fn->getArg(0), 0, "bP"),
+                "buckets");
+            auto* cap = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(hmTy, fn->getArg(0), 2, "cP"), "cap");
+            auto* jSlot = b.CreateAlloca(i64Ty, nullptr, "j");
+            b.CreateStore(zero, jSlot);
+            auto* hdr = llvm::BasicBlock::Create(ctx, "k.hdr", fn);
+            auto* body = llvm::BasicBlock::Create(ctx, "k.body", fn);
+            auto* occ = llvm::BasicBlock::Create(ctx, "k.occ", fn);
+            auto* step = llvm::BasicBlock::Create(ctx, "k.step", fn);
+            auto* done = llvm::BasicBlock::Create(ctx, "k.done", fn);
+            b.CreateBr(hdr);
+            b.SetInsertPoint(hdr);
+            auto* j = b.CreateLoad(i64Ty, jSlot, "j");
+            b.CreateCondBr(b.CreateICmpSLT(j, cap, "more"), body, done);
+            b.SetInsertPoint(body);
+            auto* eptr = b.CreateGEP(entryTy, buckets, j, "eptr");
+            auto* state = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(entryTy, eptr, 0, "stP"), "state");
+            b.CreateCondBr(b.CreateICmpEQ(state, one, "isocc"), occ, step);
+            b.SetInsertPoint(occ);
+            auto* keyPtr = b.CreateStructGEP(entryTy, eptr, 1, "kP");
+            auto* ck = b.CreateCall(keyClone, {keyPtr}, "ck");
+            b.CreateCall(vecPush, {resSlot, ck});
+            b.CreateBr(step);
+            b.SetInsertPoint(step);
+            b.CreateStore(b.CreateAdd(j, one, "jn"), jSlot);
+            b.CreateBr(hdr);
+            b.SetInsertPoint(done);
+            b.CreateRet(b.CreateLoad(vecTy, resSlot, "keysv"));
+            declaredFns_["hashmap_keys__" + vMangle] = fn;
+        }
+
+        // All ops are now emitted for this (K,V); return the requested one.
         auto it = declaredFns_.find(want);
         return it != declaredFns_.end() ? it->second : nullptr;
     }
@@ -3205,17 +3410,383 @@ private:
         // Save + restore the builder's insert point and currentFn_ — drop glue
         // creates basic blocks against currentFn_, which must be THIS thunk
         // while we lower the glue, then restored for the caller.
+        // Cache the thunk BEFORE lowering its body: a self-recursive type's
+        // body drops a nested value of the same type, which routes back through
+        // emitDropGlue -> getOrEmitDropThunk; finding the (still-being-emitted)
+        // thunk here turns that into a recursive CALL rather than re-emitting
+        // the body forever.
+        dropThunks_[key] = fn;
         auto* savedFn = currentFn_;
         auto savedIP = builder_->saveIP();
         currentFn_ = fn;
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
         builder_->SetInsertPoint(entry);
-        emitDropGlue(fn->getArg(0), r);
+        // Inline the drop logic directly (NOT via the dispatcher): the thunk IS
+        // the recursive function, so its top level must do the real work; only
+        // nested same-type sub-drops loop back through the dispatcher.
+        emitDropGlueInline(fn->getArg(0), r);
         if (!currentBlockTerminated()) builder_->CreateRetVoid();
         currentFn_ = savedFn;
         builder_->restoreIP(savedIP);
-        dropThunks_[key] = fn;
         return fn;
+    }
+
+    // Phase 35: deep-clone DISPATCHER. A self-recursive type clones via a CALL
+    // to its per-type clone function (so recursion happens at run time over the
+    // real tree); every other type is cloned inline. All sub-element clone
+    // sites route through here. Returns the cloned value (an SSA value of the
+    // type's lowered LLVM type). `src` points to the source value's storage.
+    llvm::Value* emitCloneValue(llvm::Value* src, const TypePtr& t) {
+        TypePtr r = resolveInInstance(t);
+        if (typeIsSelfRecursive(r)) {
+            return builder_->CreateCall(getOrEmitCloneFn(r), {src}, "clone.rec");
+        }
+        return emitCloneBody(src, r);
+    }
+
+    // The per-type clone function `T __kd_clone_<mangled>(i8* src)`. Cached
+    // before the body is lowered, so a nested same-type clone (routed through
+    // emitCloneValue) becomes a recursive call rather than re-emitting forever.
+    llvm::Function* getOrEmitCloneFn(const TypePtr& t) {
+        TypePtr r = resolveInInstance(t);
+        std::string key = mangleType(r);
+        auto it = cloneFns_.find(key);
+        if (it != cloneFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        llvm::Type* retTy = mapKardashevType(r);
+        auto* fn = llvm::Function::Create(
+            llvm::FunctionType::get(retTy, {i8PtrTy}, false),
+            llvm::Function::InternalLinkage, "__kd_clone_" + key,
+            module_.get());
+        fn->getArg(0)->setName("src");
+        cloneFns_[key] = fn; // cache BEFORE body — recursion safe
+        auto* savedFn = currentFn_;
+        auto savedIP = builder_->saveIP();
+        currentFn_ = fn;
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        builder_->SetInsertPoint(entry);
+        // Inline the clone logic directly (the function IS the recursion point;
+        // only nested same-type clones loop back through emitCloneValue).
+        llvm::Value* cloned = emitCloneBody(fn->getArg(0), r);
+        if (!currentBlockTerminated()) builder_->CreateRet(cloned);
+        currentFn_ = savedFn;
+        builder_->restoreIP(savedIP);
+        return fn;
+    }
+
+    // Produce a deep copy of the value at `src` (type `r`), as an SSA value.
+    // Heap owners (String/Vec/HashMap/HashSet/Box) re-allocate their backing
+    // storage and deep-clone their contents; scalars bit-copy; user
+    // structs/enums clone field-/payload-wise. Sub-clones go through
+    // emitCloneValue so a nested self-recursive type recurses via its fn.
+    llvm::Value* emitCloneBody(llvm::Value* src, const TypePtr& t) {
+        TypePtr r = resolveInInstance(t);
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto& dl = module_->getDataLayout();
+        switch (r->kind) {
+        case TypeKind::Int:
+        case TypeKind::Bool:
+        case TypeKind::Unit:
+        case TypeKind::Ref:
+        case TypeKind::Dyn: {
+            // Scalars / borrows / trait objects: a bit-copy is the clone. (A
+            // reference clones to the same borrow — it owns nothing.)
+            llvm::Type* ty = mapKardashevType(r);
+            return builder_->CreateLoad(ty, src, "clone.scalar");
+        }
+        case TypeKind::Function:
+            errors_.push_back(
+                "codegen: clone of a function/closure value is not supported "
+                "(its captured env would be shared, then double-freed)");
+            return llvm::UndefValue::get(mapKardashevType(r));
+        case TypeKind::Box: {
+            TypePtr inner = resolveInInstance(r->refInner);
+            if (inner->kind == TypeKind::Dyn) // Box<dyn>: fat ptr, bit-copy
+                return builder_->CreateLoad(dynPtrTy_, src, "clone.boxdyn");
+            llvm::Type* innerTy = mapKardashevType(inner);
+            auto* heap = builder_->CreateLoad(i8PtrTy, src, "box.src");
+            auto* sz = llvm::ConstantInt::get(i64Ty, dl.getTypeAllocSize(innerTy));
+            auto* nbuf = builder_->CreateCall(mallocFn_, {sz}, "box.new");
+            llvm::Value* clonedInner = emitCloneValue(heap, inner);
+            builder_->CreateStore(clonedInner, nbuf);
+            return nbuf;
+        }
+        case TypeKind::Struct: {
+            // Built-in heap containers.
+            if (r->structName == "String")
+                return cloneStringValue(src);
+            if (r->structName == "Vec")
+                return cloneVecValue(src, r->typeArgs.empty() ? makeInt()
+                                                              : r->typeArgs[0]);
+            if (r->structName == "HashMap") {
+                TypePtr K = r->typeArgs.size() > 0 ? r->typeArgs[0] : makeInt();
+                TypePtr V = r->typeArgs.size() > 1 ? r->typeArgs[1] : makeInt();
+                return cloneMapValue(src, K, V);
+            }
+            if (r->structName == "HashSet") {
+                TypePtr K = r->typeArgs.empty() ? makeInt() : r->typeArgs[0];
+                return cloneMapValue(src, K, makeInt()); // V = i64 dummy
+            }
+            if (r->structName == "Slice" || r->structName == "Range" ||
+                r->structName == "Future")
+                return builder_->CreateLoad(mapKardashevType(r), src,
+                                            "clone.opaque");
+            // User struct: clone each field.
+            llvm::Type* st = mapKardashevType(r);
+            llvm::Value* agg = llvm::UndefValue::get(st);
+            for (unsigned i = 0; i < r->structFields.size(); ++i) {
+                auto* fp = builder_->CreateStructGEP(st, src, i, "fld.p");
+                llvm::Value* cv = emitCloneValue(fp, r->structFields[i].second);
+                agg = builder_->CreateInsertValue(agg, cv, {i}, "fld.clone");
+            }
+            return agg;
+        }
+        case TypeKind::Enum: {
+            llvm::Type* st = mapKardashevType(r);
+            std::string mangled =
+                mangleStructInstance(r->enumName, r->typeArgs);
+            const auto& slots = enumPayloadIndices_[mangled];
+            auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+            auto* tag = builder_->CreateLoad(
+                i32Ty, builder_->CreateStructGEP(st, src, 0, "tag.p"),
+                "clone.tag");
+            auto* resultSlot = entryAlloca(st, "clone.result");
+            auto* cont =
+                llvm::BasicBlock::Create(ctx, "clone.enum.cont", currentFn_);
+            auto* dflt =
+                llvm::BasicBlock::Create(ctx, "clone.enum.dflt", currentFn_);
+            auto* sw =
+                builder_->CreateSwitch(tag, dflt, r->enumVariants.size());
+            for (unsigned vi = 0; vi < r->enumVariants.size(); ++vi) {
+                auto* caseBB = llvm::BasicBlock::Create(
+                    ctx, "clone.enum.v" + std::to_string(vi), currentFn_);
+                sw->addCase(llvm::ConstantInt::get(i32Ty, vi), caseBB);
+                builder_->SetInsertPoint(caseBB);
+                llvm::Value* agg = llvm::UndefValue::get(st);
+                agg = builder_->CreateInsertValue(
+                    agg, llvm::ConstantInt::get(i32Ty, vi), {0}, "ctag");
+                const auto& vty = r->enumVariants[vi].payloadTypes;
+                for (unsigned pi = 0; pi < vty.size(); ++pi) {
+                    auto* pp = builder_->CreateStructGEP(st, src, slots[vi][pi],
+                                                         "pld.p");
+                    llvm::Value* cv = emitCloneValue(pp, vty[pi]);
+                    agg = builder_->CreateInsertValue(agg, cv, {slots[vi][pi]},
+                                                      "pld.clone");
+                }
+                builder_->CreateStore(agg, resultSlot);
+                builder_->CreateBr(cont);
+            }
+            builder_->SetInsertPoint(dflt);
+            builder_->CreateUnreachable(); // tag always in [0, nVariants)
+            builder_->SetInsertPoint(cont);
+            return builder_->CreateLoad(st, resultSlot, "clone.enum");
+        }
+        case TypeKind::Array: {
+            // Phase 22 arrays are Copy-element only — a value bit-copy clones.
+            return builder_->CreateLoad(mapKardashevType(r), src, "clone.arr");
+        }
+        case TypeKind::Tuple: {
+            llvm::Type* st = mapKardashevType(r);
+            llvm::Value* agg = llvm::UndefValue::get(st);
+            for (unsigned i = 0; i < r->tupleElems.size(); ++i) {
+                auto* ep = builder_->CreateStructGEP(st, src, i, "tup.p");
+                llvm::Value* cv = emitCloneValue(ep, r->tupleElems[i]);
+                agg = builder_->CreateInsertValue(agg, cv, {i}, "tup.clone");
+            }
+            return agg;
+        }
+        default:
+            return builder_->CreateLoad(mapKardashevType(r), src, "clone.bits");
+        }
+    }
+
+    // Deep-copy a String value (`{i8* data, i64 len, i64 cap}`): a fresh
+    // `len`-byte buffer with the same contents (empty -> null buffer).
+    llvm::Value* cloneStringValue(llvm::Value* src) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* strTy = structTypes_["String"];
+        auto* len = builder_->CreateLoad(
+            i64Ty, builder_->CreateStructGEP(strTy, src, 1, "s.len.p"), "s.len");
+        auto* data = builder_->CreateLoad(
+            i8PtrTy, builder_->CreateStructGEP(strTy, src, 0, "s.dat.p"),
+            "s.data");
+        auto* nonEmpty =
+            builder_->CreateICmpSGT(len, llvm::ConstantInt::get(i64Ty, 0),
+                                    "s.nonempty");
+        auto* allocBB = llvm::BasicBlock::Create(ctx, "s.clone.alloc", currentFn_);
+        auto* doneBB = llvm::BasicBlock::Create(ctx, "s.clone.done", currentFn_);
+        auto* fromBB = builder_->GetInsertBlock();
+        builder_->CreateCondBr(nonEmpty, allocBB, doneBB);
+        builder_->SetInsertPoint(allocBB);
+        auto* nbuf = builder_->CreateCall(mallocFn_, {len}, "s.newbuf");
+        builder_->CreateMemCpy(nbuf, llvm::MaybeAlign(1), data,
+                               llvm::MaybeAlign(1), len);
+        builder_->CreateBr(doneBB);
+        builder_->SetInsertPoint(doneBB);
+        auto* bufPhi = builder_->CreatePHI(i8PtrTy, 2, "s.buf");
+        bufPhi->addIncoming(nbuf, allocBB);
+        bufPhi->addIncoming(llvm::ConstantPointerNull::get(i8PtrTy), fromBB);
+        llvm::Value* agg = llvm::UndefValue::get(strTy);
+        agg = builder_->CreateInsertValue(agg, bufPhi, {0}, "s.d");
+        agg = builder_->CreateInsertValue(agg, len, {1}, "s.l");
+        agg = builder_->CreateInsertValue(agg, len, {2}, "s.c"); // cap = len
+        return agg;
+    }
+
+    // Deep-copy a Vec value: a fresh `len`-element buffer, each element
+    // deep-cloned (so element-owned heap is not shared). cap = len.
+    llvm::Value* cloneVecValue(llvm::Value* src, const TypePtr& elemTy) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto& dl = module_->getDataLayout();
+        auto* vecTy = structTypes_["Vec"];
+        llvm::Type* elemLlvm = mapKardashevType(elemTy);
+        auto* elemSz = llvm::ConstantInt::get(i64Ty, dl.getTypeAllocSize(elemLlvm));
+        auto* len = builder_->CreateLoad(
+            i64Ty, builder_->CreateStructGEP(vecTy, src, 1, "v.len.p"), "v.len");
+        auto* data = builder_->CreateLoad(
+            i8PtrTy, builder_->CreateStructGEP(vecTy, src, 0, "v.dat.p"),
+            "v.data");
+        auto* nonEmpty = builder_->CreateICmpSGT(
+            len, llvm::ConstantInt::get(i64Ty, 0), "v.nonempty");
+        auto* allocBB = llvm::BasicBlock::Create(ctx, "v.clone.alloc", currentFn_);
+        auto* afterBB = llvm::BasicBlock::Create(ctx, "v.clone.after", currentFn_);
+        auto* fromBB = builder_->GetInsertBlock();
+        builder_->CreateCondBr(nonEmpty, allocBB, afterBB);
+        builder_->SetInsertPoint(allocBB);
+        auto* nbytes = builder_->CreateMul(len, elemSz, "v.bytes");
+        auto* nbuf = builder_->CreateCall(mallocFn_, {nbytes}, "v.newbuf");
+        // clone loop
+        auto* iSlot = entryAlloca(i64Ty, "v.i");
+        builder_->CreateStore(llvm::ConstantInt::get(i64Ty, 0), iSlot);
+        auto* hdr = llvm::BasicBlock::Create(ctx, "v.clone.hdr", currentFn_);
+        auto* body = llvm::BasicBlock::Create(ctx, "v.clone.body", currentFn_);
+        builder_->CreateBr(hdr);
+        builder_->SetInsertPoint(hdr);
+        auto* i = builder_->CreateLoad(i64Ty, iSlot, "i");
+        builder_->CreateCondBr(builder_->CreateICmpSLT(i, len, "more"), body,
+                               afterBB);
+        builder_->SetInsertPoint(body);
+        auto* sElem = builder_->CreateGEP(elemLlvm, data, i, "v.s.elem");
+        llvm::Value* cv = emitCloneValue(sElem, elemTy);
+        builder_->CreateStore(cv, builder_->CreateGEP(elemLlvm, nbuf, i,
+                                                      "v.d.elem"));
+        builder_->CreateStore(
+            builder_->CreateAdd(i, llvm::ConstantInt::get(i64Ty, 1), "i.n"),
+            iSlot);
+        builder_->CreateBr(hdr);
+        builder_->SetInsertPoint(afterBB);
+        auto* bufPhi = builder_->CreatePHI(i8PtrTy, 2, "v.buf");
+        bufPhi->addIncoming(llvm::ConstantPointerNull::get(i8PtrTy), fromBB);
+        bufPhi->addIncoming(nbuf, hdr); // loop exits to afterBB from hdr
+        llvm::Value* agg = llvm::UndefValue::get(vecTy);
+        agg = builder_->CreateInsertValue(agg, bufPhi, {0}, "v.d");
+        agg = builder_->CreateInsertValue(agg, len, {1}, "v.l");
+        agg = builder_->CreateInsertValue(agg, len, {2}, "v.c");
+        return agg;
+    }
+
+    // Deep-copy a HashMap/HashSet value. Bulk-copy the bucket array (carries
+    // states + empty slots), then deep-clone the key (and value) of every
+    // OCCUPIED bucket so element-owned heap is not shared. HashSet passes a
+    // dummy i64 value type. cap/len preserved.
+    llvm::Value* cloneMapValue(llvm::Value* src, const TypePtr& K,
+                               const TypePtr& V) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* one = llvm::ConstantInt::get(i64Ty, 1);
+        auto& dl = module_->getDataLayout();
+        auto* hmTy = structTypes_["HashMap"];
+        auto* entryTy = llvm::StructType::get(
+            ctx, {i64Ty, mapKardashevType(K), mapKardashevType(V)});
+        auto* entrySz =
+            llvm::ConstantInt::get(i64Ty, dl.getTypeAllocSize(entryTy));
+        auto* buckets = builder_->CreateLoad(
+            i8PtrTy, builder_->CreateStructGEP(hmTy, src, 0, "m.b.p"),
+            "m.buckets");
+        auto* len = builder_->CreateLoad(
+            i64Ty, builder_->CreateStructGEP(hmTy, src, 1, "m.l.p"), "m.len");
+        auto* cap = builder_->CreateLoad(
+            i64Ty, builder_->CreateStructGEP(hmTy, src, 2, "m.c.p"), "m.cap");
+        auto* nonEmpty =
+            builder_->CreateICmpSGT(cap, llvm::ConstantInt::get(i64Ty, 0),
+                                    "m.has.cap");
+        auto* allocBB = llvm::BasicBlock::Create(ctx, "m.clone.alloc", currentFn_);
+        auto* afterBB = llvm::BasicBlock::Create(ctx, "m.clone.after", currentFn_);
+        auto* fromBB = builder_->GetInsertBlock();
+        builder_->CreateCondBr(nonEmpty, allocBB, afterBB);
+        builder_->SetInsertPoint(allocBB);
+        auto* nbytes = builder_->CreateMul(cap, entrySz, "m.bytes");
+        auto* nbuf = builder_->CreateCall(mallocFn_, {nbytes}, "m.newbuf");
+        builder_->CreateMemCpy(nbuf, llvm::MaybeAlign(8), buckets,
+                               llvm::MaybeAlign(8), nbytes);
+        // deep-clone the K/V of occupied buckets, overwriting the shallow copy.
+        bool deepK = isDroppable(K), deepV = isDroppable(V);
+        if (deepK || deepV) {
+            auto* jSlot = entryAlloca(i64Ty, "m.j");
+            builder_->CreateStore(llvm::ConstantInt::get(i64Ty, 0), jSlot);
+            auto* hdr = llvm::BasicBlock::Create(ctx, "m.clone.hdr", currentFn_);
+            auto* body = llvm::BasicBlock::Create(ctx, "m.clone.body", currentFn_);
+            auto* occ = llvm::BasicBlock::Create(ctx, "m.clone.occ", currentFn_);
+            auto* step = llvm::BasicBlock::Create(ctx, "m.clone.step", currentFn_);
+            builder_->CreateBr(hdr);
+            builder_->SetInsertPoint(hdr);
+            auto* j = builder_->CreateLoad(i64Ty, jSlot, "j");
+            builder_->CreateCondBr(builder_->CreateICmpSLT(j, cap, "more"), body,
+                                   afterBB);
+            builder_->SetInsertPoint(body);
+            auto* sEntry = builder_->CreateGEP(entryTy, buckets, j, "s.entry");
+            auto* dEntry = builder_->CreateGEP(entryTy, nbuf, j, "d.entry");
+            auto* state = builder_->CreateLoad(
+                i64Ty, builder_->CreateStructGEP(entryTy, sEntry, 0, "st.p"),
+                "state");
+            builder_->CreateCondBr(builder_->CreateICmpEQ(state, one, "occ?"),
+                                   occ, step);
+            builder_->SetInsertPoint(occ);
+            if (deepK) {
+                llvm::Value* ck = emitCloneValue(
+                    builder_->CreateStructGEP(entryTy, sEntry, 1, "sk.p"), K);
+                builder_->CreateStore(
+                    ck, builder_->CreateStructGEP(entryTy, dEntry, 1, "dk.p"));
+            }
+            if (deepV) {
+                llvm::Value* cvv = emitCloneValue(
+                    builder_->CreateStructGEP(entryTy, sEntry, 2, "sv.p"), V);
+                builder_->CreateStore(
+                    cvv, builder_->CreateStructGEP(entryTy, dEntry, 2, "dv.p"));
+            }
+            builder_->CreateBr(step);
+            builder_->SetInsertPoint(step);
+            builder_->CreateStore(builder_->CreateAdd(j, one, "j.n"), jSlot);
+            builder_->CreateBr(hdr);
+            builder_->SetInsertPoint(afterBB);
+            auto* bufPhi = builder_->CreatePHI(i8PtrTy, 2, "m.buf");
+            bufPhi->addIncoming(llvm::ConstantPointerNull::get(i8PtrTy), fromBB);
+            bufPhi->addIncoming(nbuf, hdr);
+            return buildMapAgg(hmTy, bufPhi, len, cap);
+        }
+        builder_->CreateBr(afterBB);
+        builder_->SetInsertPoint(afterBB);
+        auto* bufPhi = builder_->CreatePHI(i8PtrTy, 2, "m.buf");
+        bufPhi->addIncoming(llvm::ConstantPointerNull::get(i8PtrTy), fromBB);
+        bufPhi->addIncoming(nbuf, allocBB);
+        return buildMapAgg(hmTy, bufPhi, len, cap);
+    }
+
+    llvm::Value* buildMapAgg(llvm::Type* hmTy, llvm::Value* buf,
+                             llvm::Value* len, llvm::Value* cap) {
+        llvm::Value* agg = llvm::UndefValue::get(hmTy);
+        agg = builder_->CreateInsertValue(agg, buf, {0}, "m.b");
+        agg = builder_->CreateInsertValue(agg, len, {1}, "m.l");
+        agg = builder_->CreateInsertValue(agg, cap, {2}, "m.c");
+        return agg;
     }
 
     // Phase 17b: the per-result-type `Poll<T> = { i1 ready, T value }`. Built
@@ -4314,6 +4885,58 @@ private:
     // matching the codegen generic-instance naming scheme so emitCall's
     // existing generic-callee branch can find it in declaredFns_ after
     // we register it here. Returns the LLVM Function.
+    // Phase 37: per-element-type slice read ops. A slice value is the {ptr,len}
+    // fat pointer (passed BY VALUE); the element stride is sizeof(T). slice_get
+    // copies element i; slice_get_ref returns a borrow (&T) into the slice.
+    llvm::Function* getOrEmitSliceOp(const std::string& op, const TypePtr& T) {
+        std::string mangled = op + "__" + mangleType(T);
+        auto it = declaredFns_.find(mangled);
+        if (it != declaredFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* sliceTy = structTypes_["Slice"];
+        llvm::Type* elemLlvmTy = mapKardashevType(T);
+        if (op == "slice_len") {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {sliceTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("s");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            b.CreateRet(b.CreateExtractValue(fn->getArg(0), {1}, "len"));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "slice_get") {
+            auto* fnTy =
+                llvm::FunctionType::get(elemLlvmTy, {sliceTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("i");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* data = b.CreateExtractValue(fn->getArg(0), {0}, "data");
+            auto* ep = b.CreateGEP(elemLlvmTy, data, fn->getArg(1), "elem_ptr");
+            b.CreateRet(b.CreateLoad(elemLlvmTy, ep, "val"));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "slice_get_ref") {
+            auto* fnTy =
+                llvm::FunctionType::get(i8PtrTy, {sliceTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("i");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* data = b.CreateExtractValue(fn->getArg(0), {0}, "data");
+            b.CreateRet(b.CreateGEP(elemLlvmTy, data, fn->getArg(1), "elem_ptr"));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        return nullptr;
+    }
+
     llvm::Function* getOrEmitVecOp(const std::string& op, const TypePtr& T) {
         std::string mangled = op + "__" + mangleType(T);
         auto it = declaredFns_.find(mangled);
@@ -4441,6 +5064,43 @@ private:
             declaredFns_[mangled] = fn;
             return fn;
         }
+        if (op == "vec_get_ref") {
+            // Phase 34: like vec_get, but returns a BORROW (&T) into the
+            // buffer rather than a by-value copy — the read-without-move
+            // primitive. Same bounds guard; an out-of-range index yields a
+            // null `&T` (callers index within `vec_len`, like vec_get).
+            auto* fnTy =
+                llvm::FunctionType::get(i8PtrTy, {vecPtrTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("v");
+            fn->getArg(1)->setName("i");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* inBoundsBB = llvm::BasicBlock::Create(ctx, "in_bounds", fn);
+            auto* oobBB = llvm::BasicBlock::Create(ctx, "oob", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* zero64 = llvm::ConstantInt::get(i64Ty, 0);
+            auto* data = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(vecTy, fn->getArg(0), 0, "data_ptr"),
+                "data");
+            auto* len = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(vecTy, fn->getArg(0), 1, "len_ptr"),
+                "len");
+            auto* idx = fn->getArg(1);
+            auto* canRead = b.CreateAnd(
+                b.CreateAnd(b.CreateICmpSGE(idx, zero64, "nn"),
+                            b.CreateICmpSLT(idx, len, "ir"), "bounds_ok"),
+                b.CreateICmpNE(data, llvm::Constant::getNullValue(i8PtrTy),
+                               "data_nn"),
+                "can_read");
+            b.CreateCondBr(canRead, inBoundsBB, oobBB);
+            b.SetInsertPoint(inBoundsBB);
+            b.CreateRet(b.CreateGEP(elemLlvmTy, data, idx, "elem_ptr"));
+            b.SetInsertPoint(oobBB);
+            b.CreateRet(llvm::Constant::getNullValue(i8PtrTy));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
         if (op == "vec_len") {
             auto* fnTy = llvm::FunctionType::get(i64Ty, {vecPtrTy}, false);
             auto* fn = llvm::Function::Create(
@@ -4459,13 +5119,30 @@ private:
         return nullptr;
     }
 
+    // Phase 36: struct and enum layout is split into a NAME pass (opaque
+    // StructTypes) and a BODY pass. run() declares ALL names (structs + enums)
+    // before filling ANY body, so a struct field of enum type — or an enum
+    // payload of struct type — resolves regardless of declaration order
+    // (structs and enums are mutually recursive). Filling bodies eagerly in one
+    // function would hit an as-yet-undeclared sibling ("unresolved enum").
     void declareAllStructs() {
         for (const auto& [name, schema] : tc_.structs) {
             if (!schema.genericVars.empty()) continue;
+            // Phase 34: a built-in container (e.g. String) already has its real
+            // LLVM layout from ensureCoreStructTypes; do NOT re-create it here
+            // from its (intentionally fieldless / opaque) schema, which would
+            // overwrite the real `{ptr,len,cap}` body with an empty struct.
+            if (structTypes_.count(name)) continue;
             structTypes_[name] = llvm::StructType::create(*ctx_, name);
         }
+    }
+
+    void fillAllStructBodies() {
         for (const auto& [name, schema] : tc_.structs) {
             if (!schema.genericVars.empty()) continue;
+            if (name == "String" || name == "Vec" || name == "HashMap" ||
+                name == "HashSet" || name == "Future" || name == "Slice")
+                continue; // body owned by ensureCoreStructTypes / declareBuiltins
             std::vector<llvm::Type*> elems;
             elems.reserve(schema.type->structFields.size());
             for (const auto& [_fname, fty] : schema.type->structFields) {
@@ -4480,6 +5157,9 @@ private:
             if (!schema.genericVars.empty()) continue;
             enumTypes_[name] = llvm::StructType::create(*ctx_, name);
         }
+    }
+
+    void fillAllEnumBodies() {
         for (const auto& [name, schema] : tc_.enums) {
             if (!schema.genericVars.empty()) continue;
             buildEnumBody(name, schema.type);
@@ -5045,6 +5725,23 @@ private:
     // partially-resolved Vars from `tc_.exprTypes`.
     TypePtr resolveInInstance(const TypePtr& t) {
         TypePtr r = resolve(t);
+        // Phase 35: cycle guard for self-recursive named types. Re-entering a
+        // struct/enum node already on the resolution stack means we hit the
+        // back-edge of a recursive type — return it unchanged to terminate.
+        // Var substitution on this subtree (if any) was applied the first time
+        // the node was visited; the cyclic child is the node itself and needs
+        // no further rewrite. Without this the eager rebuild below recurses
+        // forever and overflows the compiler's stack.
+        bool guard = (r->kind == TypeKind::Struct || r->kind == TypeKind::Enum);
+        if (guard) {
+            if (!resolvingInInstance_.insert(r.get()).second) return r;
+        }
+        TypePtr out = resolveInInstanceImpl(r);
+        if (guard) resolvingInInstance_.erase(r.get());
+        return out;
+    }
+
+    TypePtr resolveInInstanceImpl(const TypePtr& r) {
         switch (r->kind) {
         case TypeKind::Var: {
             if (auto it = currentSchemaVarSubst_.find(r->varId);
@@ -6052,10 +6749,110 @@ private:
         // reclaims everything a closure owns.
         case TypeKind::Function:
             return true;
-        // Scalars, references, dyn objects: never owning.
+        // Phase 36: a tuple owns its elements, so it is droppable iff any
+        // element is. (Arrays stay Copy-only -> never droppable.)
+        case TypeKind::Tuple:
+            for (const auto& el : r->tupleElems)
+                if (isDroppableImpl(el, seen)) return true;
+            return false;
+        // Scalars, references, dyn objects, arrays: never owning.
         default:
             return false;
         }
+    }
+
+    // Phase 35: does dropping a value of type `t` transitively require dropping
+    // another value of the SAME named type? (e.g. `enum Json { JArr(Vec<Json>),
+    // JObj(HashMap<String,Json>) }` — a Json owns a Vec/HashMap whose elements
+    // are themselves Json.) Such a type's drop glue must be emitted ONCE as a
+    // callable function that recurses at RUN time over the actual tree, instead
+    // of inlined — inlining would recurse forever at COMPILE time.
+    bool dropTypeMentions(const TypePtr& t, const std::string& target,
+                          std::unordered_set<std::string>& seen) {
+        if (!t) return false;
+        TypePtr r = resolveInInstance(t);
+        switch (r->kind) {
+        case TypeKind::Box:
+            return dropTypeMentions(r->refInner, target, seen);
+        case TypeKind::Array:
+            return dropTypeMentions(r->arrayElem, target, seen);
+        case TypeKind::Tuple:
+            for (const auto& e : r->tupleElems)
+                if (dropTypeMentions(e, target, seen)) return true;
+            return false;
+        case TypeKind::Struct: {
+            // Heap containers own their element / key / value types (typeArgs).
+            if (r->structName == "Vec" || r->structName == "HashMap" ||
+                r->structName == "HashSet") {
+                for (const auto& a : r->typeArgs)
+                    if (dropTypeMentions(a, target, seen)) return true;
+                return false;
+            }
+            if (r->structName == "String" || r->structName == "Slice" ||
+                r->structName == "Range" || r->structName == "Future")
+                return false; // leaf owners — no nested user types
+            if (r->structName == target) return true;
+            if (!seen.insert("S:" + r->structName).second) return false;
+            for (const auto& [_n, fty] : r->structFields)
+                if (dropTypeMentions(fty, target, seen)) return true;
+            return false;
+        }
+        case TypeKind::Enum: {
+            if (r->enumName == target) return true;
+            if (!seen.insert("E:" + r->enumName).second) return false;
+            for (const auto& v : r->enumVariants)
+                for (const auto& pt : v.payloadTypes)
+                    if (dropTypeMentions(pt, target, seen)) return true;
+            return false;
+        }
+        // Ref is a borrow — it owns nothing, so it never makes a type's drop
+        // recursive (and following it could loop on a `&Self` field).
+        default:
+            return false;
+        }
+    }
+
+    bool typeIsSelfRecursive(const TypePtr& t) {
+        TypePtr r = resolveInInstance(t);
+        std::string name;
+        if (r->kind == TypeKind::Struct) {
+            if (r->structName == "Vec" || r->structName == "String" ||
+                r->structName == "HashMap" || r->structName == "HashSet" ||
+                r->structName == "Slice" || r->structName == "Range" ||
+                r->structName == "Future")
+                return false;
+            name = r->structName;
+        } else if (r->kind == TypeKind::Enum) {
+            name = r->enumName;
+        } else {
+            return false;
+        }
+        if (name.empty()) return false;
+        // Walk the IMMEDIATE children for a re-occurrence of `name` (the root's
+        // own match is trivial, so we start one level down).
+        std::unordered_set<std::string> seen;
+        if (r->kind == TypeKind::Struct) {
+            for (const auto& [_n, fty] : r->structFields)
+                if (dropTypeMentions(fty, name, seen)) return true;
+        } else {
+            for (const auto& v : r->enumVariants)
+                for (const auto& pt : v.payloadTypes)
+                    if (dropTypeMentions(pt, name, seen)) return true;
+        }
+        return false;
+    }
+
+    // Phase 35: the drop DISPATCHER. A self-recursive type is dropped by
+    // CALLING its per-type drop thunk (so recursion happens at run time over
+    // the real tree); every other type is dropped inline as before. All
+    // scope-exit / sub-field drop sites route through here.
+    void emitDropGlue(llvm::Value* valuePtr, const TypePtr& t) {
+        if (typeIsSelfRecursive(t)) {
+            llvm::Function* thunk = getOrEmitDropThunk(t);
+            builder_->CreateCall(thunk, {valuePtr});
+            return;
+        }
+        emitDropGlueInline(valuePtr, t);
     }
 
     // Emit the full drop of a value whose storage lives at `valuePtr` (a
@@ -6063,8 +6860,10 @@ private:
     // recurse into fields / payloads / heap buffers, freeing as we go. This is
     // the order Rust uses: user destructor first, then field drops, then the
     // value's own backing storage. UNCONDITIONAL — callers gate it on a drop
-    // flag (or static knowledge that the value is still owned).
-    void emitDropGlue(llvm::Value* valuePtr, const TypePtr& t) {
+    // flag (or static knowledge that the value is still owned). Sub-drops call
+    // the dispatcher (`emitDropGlue`), so a nested self-recursive type recurses
+    // through its thunk rather than expanding here forever.
+    void emitDropGlueInline(llvm::Value* valuePtr, const TypePtr& t) {
         TypePtr r = resolveInInstance(t);
         auto& ctx = *ctx_;
         auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
@@ -6127,11 +6926,17 @@ private:
                 return;
             }
             if (r->structName == "HashMap" || r->structName == "HashSet") {
-                // { i8* buckets, i64 len, i64 cap }. Free the bucket array
-                // (guarded on cap != 0). Phase 28: droppable keys/values stored
-                // inside the table are NOT yet individually dropped — a
-                // documented leak (no UAF), in the same class as a droppable
-                // Vec element; interior drop is deferred to Phase 29.
+                // { i8* buckets, i64 len, i64 cap }. Phase 33: drop the live
+                // interior keys/values first, then free the bucket array
+                // (guarded on cap != 0). HashMap carries [K, V] in typeArgs;
+                // HashSet carries [T] and uses a HashMap<T, i64> layout, whose
+                // dummy i64 value is non-droppable.
+                TypePtr kTy = !r->typeArgs.empty() ? r->typeArgs[0] : nullptr;
+                TypePtr vTy = (r->structName == "HashMap" &&
+                               r->typeArgs.size() > 1)
+                                  ? r->typeArgs[1]
+                                  : makeInt();
+                if (kTy) emitDropMapEntries(valuePtr, kTy, vTy);
                 emitFreeBufferIfOwned(valuePtr, llvmTy);
                 return;
             }
@@ -6150,6 +6955,19 @@ private:
         if (r->kind == TypeKind::Enum) {
             emitUserDrop(valuePtr, r);
             emitDropEnum(valuePtr, r);
+            return;
+        }
+
+        // Phase 36: a tuple owns its elements — drop each droppable one in
+        // declaration order. The tuple's own storage is inline (no heap).
+        if (r->kind == TypeKind::Tuple) {
+            llvm::Type* llvmTy = mapKardashevType(r);
+            for (unsigned i = 0; i < r->tupleElems.size(); ++i) {
+                if (!isDroppable(r->tupleElems[i])) continue;
+                auto* ep = builder_->CreateStructGEP(llvmTy, valuePtr, i,
+                                                     "drop.tup");
+                emitDropGlue(ep, r->tupleElems[i]);
+            }
             return;
         }
         // Scalars / refs / fn values: nothing to free.
@@ -6221,6 +7039,59 @@ private:
         auto* iNext = builder_->CreateAdd(
             i, llvm::ConstantInt::get(i64Ty, 1), "i.next");
         builder_->CreateStore(iNext, iSlot);
+        builder_->CreateBr(hdr);
+        builder_->SetInsertPoint(done);
+    }
+
+    // Phase 33: drop the live keys/values of a HashMap/HashSet before its
+    // bucket array is freed. Walks [0, cap), and for each OCCUPIED bucket
+    // (state == 1) drops the key (and, for a HashMap, the value). The bucket
+    // entry layout is { i64 state, K key, V value } (HashSet uses a dummy i64
+    // V); an anonymous struct of the same element types matches that layout.
+    void emitDropMapEntries(llvm::Value* mapPtr, const TypePtr& K,
+                            const TypePtr& V) {
+        bool dropK = isDroppable(K);
+        bool dropV = isDroppable(V);
+        if (!dropK && !dropV) return; // nothing droppable inside
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* one = llvm::ConstantInt::get(i64Ty, 1);
+        auto* hmTy = structTypes_["HashMap"]; // {buckets,len,cap}; HashSet shares it
+        auto* entryTy = llvm::StructType::get(
+            ctx, {i64Ty, mapKardashevType(K), mapKardashevType(V)});
+        auto* buckets = builder_->CreateLoad(
+            i8PtrTy, builder_->CreateStructGEP(hmTy, mapPtr, 0, "hm.b.p"),
+            "hm.buckets");
+        auto* cap = builder_->CreateLoad(
+            i64Ty, builder_->CreateStructGEP(hmTy, mapPtr, 2, "hm.c.p"),
+            "hm.cap");
+        auto* jSlot = entryAlloca(i64Ty, "hmdrop.j");
+        builder_->CreateStore(llvm::ConstantInt::get(i64Ty, 0), jSlot);
+        auto* hdr = llvm::BasicBlock::Create(ctx, "hmdrop.hdr", currentFn_);
+        auto* body = llvm::BasicBlock::Create(ctx, "hmdrop.body", currentFn_);
+        auto* occ = llvm::BasicBlock::Create(ctx, "hmdrop.occ", currentFn_);
+        auto* step = llvm::BasicBlock::Create(ctx, "hmdrop.step", currentFn_);
+        auto* done = llvm::BasicBlock::Create(ctx, "hmdrop.done", currentFn_);
+        builder_->CreateBr(hdr);
+        builder_->SetInsertPoint(hdr);
+        auto* j = builder_->CreateLoad(i64Ty, jSlot, "j");
+        builder_->CreateCondBr(builder_->CreateICmpSLT(j, cap, "more"), body,
+                               done);
+        builder_->SetInsertPoint(body);
+        auto* eptr = builder_->CreateGEP(entryTy, buckets, j, "eptr");
+        auto* state = builder_->CreateLoad(
+            i64Ty, builder_->CreateStructGEP(entryTy, eptr, 0, "st.p"), "state");
+        builder_->CreateCondBr(builder_->CreateICmpEQ(state, one, "occupied"),
+                               occ, step);
+        builder_->SetInsertPoint(occ);
+        if (dropK)
+            emitDropGlue(builder_->CreateStructGEP(entryTy, eptr, 1, "k.p"), K);
+        if (dropV)
+            emitDropGlue(builder_->CreateStructGEP(entryTy, eptr, 2, "v.p"), V);
+        builder_->CreateBr(step); // CreateBr uses the post-drop insert point
+        builder_->SetInsertPoint(step);
+        builder_->CreateStore(builder_->CreateAdd(j, one, "j.next"), jSlot);
         builder_->CreateBr(hdr);
         builder_->SetInsertPoint(done);
     }
@@ -6447,8 +7318,8 @@ private:
                     llvm::Value* elt = builder_->CreateExtractValue(
                         tup, {static_cast<unsigned>(i)},
                         "destr." + let->tupleNames[i]);
-                    auto* alloca = builder_->CreateAlloca(
-                        elt->getType(), nullptr, let->tupleNames[i]);
+                    auto* alloca = entryAlloca(elt->getType(),
+                                               let->tupleNames[i]); // hoisted
                     builder_->CreateStore(elt, alloca);
                     locals_[let->tupleNames[i]] = alloca;
                     if (tupTy && tupTy->kind == TypeKind::Tuple &&
@@ -6473,8 +7344,12 @@ private:
                 if (existing != locals_.end()) alloca = existing->second;
             }
             if (!alloca) {
-                alloca = builder_->CreateAlloca(v->getType(), nullptr,
-                                                let->name);
+                // Phase 34 fix: hoist the binding's storage to the function
+                // entry block. A `let` inside a loop must NOT alloca per
+                // iteration — an address-taken (un-promotable) binding, e.g. a
+                // droppable enum/struct whose drop reads it, would otherwise
+                // accumulate one stack slot per iteration and overflow.
+                alloca = entryAlloca(v->getType(), let->name);
             }
             builder_->CreateStore(v, alloca);
             locals_[let->name] = alloca;
@@ -7005,8 +7880,16 @@ private:
     llvm::Value* emitRef(const ast::RefExpr& re) {
         auto* id = dynamic_cast<const ast::IdentExpr*>(re.operand.get());
         if (!id) {
+            // Phase 36: `&place` for a field / tuple-field / index access — the
+            // address of the place IS the borrow (a pointer into the
+            // aggregate's storage), mirroring vec_get_ref / match-by-reference.
+            // Enables reading a struct's enum-typed field by reference:
+            // `match &h.t { ... }`.
+            if (llvm::Value* addr = emitPlaceAddr(*re.operand))
+                return addr;
             errors_.push_back(
-                "codegen: `&` operand must be a binding (Phase 2.4b)");
+                "codegen: `&` operand must be a binding or a field/index/"
+                "tuple-field place");
             return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
         }
         // Phase 17a: `&x` / `&mut x` of a by-ref capture is the env pointer —
@@ -7241,11 +8124,42 @@ private:
             return builder_->CreateNeg(v, "neg");
         case ast::UnaryOp::Not:
             return builder_->CreateNot(v, "not");
+        case ast::UnaryOp::Deref: {
+            // Phase 34: `*r` — `v` is the pointer (a `&T`/Box value); load the
+            // pointee, whose type the typechecker recorded for this expr.
+            TypePtr resTy = lookupExprType(un);
+            llvm::Type* llvmTy =
+                resTy ? mapKardashevType(resTy)
+                      : llvm::Type::getInt64Ty(*ctx_);
+            return builder_->CreateLoad(llvmTy, v, "deref");
+        }
         }
         return v; // unreachable
     }
 
     llvm::Value* emitBinary(const ast::BinaryExpr& bin) {
+        // Phase 33: `&&` short-circuits — evaluate rhs only when lhs is true.
+        // `a && b` == `lhs ? rhs : false`, via a branch + phi (mirrors how the
+        // eager path below would evaluate both, but skips rhs when lhs fails).
+        if (bin.op == ast::BinOp::And) {
+            auto& ctx = *ctx_;
+            auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+            llvm::Value* L = emitExpr(*bin.lhs);
+            auto* entryBB = builder_->GetInsertBlock();
+            auto* fn = entryBB->getParent();
+            auto* rhsBB = llvm::BasicBlock::Create(ctx, "and.rhs", fn);
+            auto* contBB = llvm::BasicBlock::Create(ctx, "and.cont", fn);
+            builder_->CreateCondBr(L, rhsBB, contBB);
+            builder_->SetInsertPoint(rhsBB);
+            llvm::Value* R = emitExpr(*bin.rhs);
+            auto* rhsEnd = builder_->GetInsertBlock(); // rhs may have added blocks
+            builder_->CreateBr(contBB);
+            builder_->SetInsertPoint(contBB);
+            auto* phi = builder_->CreatePHI(i1Ty, 2, "and");
+            phi->addIncoming(llvm::ConstantInt::getFalse(ctx), entryBB);
+            phi->addIncoming(R, rhsEnd);
+            return phi;
+        }
         llvm::Value* L = emitExpr(*bin.lhs);
         llvm::Value* R = emitExpr(*bin.rhs);
         switch (bin.op) {
@@ -7253,12 +8167,14 @@ private:
         case ast::BinOp::Sub: return builder_->CreateSub(L, R, "sub");
         case ast::BinOp::Mul: return builder_->CreateMul(L, R, "mul");
         case ast::BinOp::Div: return builder_->CreateSDiv(L, R, "div");
+        case ast::BinOp::Mod: return builder_->CreateSRem(L, R, "mod");
         case ast::BinOp::Lt:  return builder_->CreateICmpSLT(L, R, "lt");
         case ast::BinOp::Le:  return builder_->CreateICmpSLE(L, R, "le");
         case ast::BinOp::Gt:  return builder_->CreateICmpSGT(L, R, "gt");
         case ast::BinOp::Ge:  return builder_->CreateICmpSGE(L, R, "ge");
         case ast::BinOp::Eq:  return builder_->CreateICmpEQ(L, R, "eq");
         case ast::BinOp::NotEq: return builder_->CreateICmpNE(L, R, "ne");
+        case ast::BinOp::And: return nullptr; // handled above
         }
         return nullptr;
     }
@@ -7498,13 +8414,39 @@ private:
             // Phase 5.z: vec_* built-ins are generic but have no AST
             // body — synthesize their specialization directly.
             if ((call.callee == "vec_new" || call.callee == "vec_push" ||
-                 call.callee == "vec_get" || call.callee == "vec_len") &&
+                 call.callee == "vec_get" || call.callee == "vec_get_ref" ||
+                 call.callee == "vec_len") &&
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
                     getOrEmitVecOp(call.callee, concreteTypeArgs[0]);
                 if (!fn) {
                     errors_.push_back(
                         "codegen: cannot specialize " + call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
+            }
+            // Phase 35: `clone<T>(&T) -> T` deep-copies via a per-type clone fn.
+            // The argument is a `&T` borrow, so emitConsume yields the pointer
+            // to the source value (no move of the borrowed-from local).
+            if (call.callee == "clone" && !concreteTypeArgs.empty()) {
+                llvm::Function* fn = getOrEmitCloneFn(concreteTypeArgs[0]);
+                llvm::Value* srcPtr = emitConsume(*call.args[0]);
+                return builder_->CreateCall(fn, {srcPtr}, "call_clone");
+            }
+            // Phase 37: `slice_*<T>` over the element type T (stride sizeof(T)).
+            if ((call.callee == "slice_len" || call.callee == "slice_get" ||
+                 call.callee == "slice_get_ref") &&
+                !concreteTypeArgs.empty()) {
+                llvm::Function* fn =
+                    getOrEmitSliceOp(call.callee, concreteTypeArgs[0]);
+                if (!fn) {
+                    errors_.push_back("codegen: cannot specialize " +
+                                      call.callee);
                     return llvm::ConstantInt::get(
                         llvm::Type::getInt64Ty(*ctx_), 0);
                 }
@@ -7553,6 +8495,8 @@ private:
             if ((call.callee == "hashmap_new" ||
                  call.callee == "hashmap_insert" ||
                  call.callee == "hashmap_get" ||
+                 call.callee == "hashmap_get_ref" ||
+                 call.callee == "hashmap_keys" ||
                  call.callee == "hashmap_len") &&
                 concreteTypeArgs.size() >= 2) {
                 llvm::Function* fn = getOrEmitHashMapOp(
@@ -7760,7 +8704,9 @@ private:
             llvm::Value* scrutinee,
             llvm::BasicBlock* mergeBB,
             std::vector<std::pair<llvm::BasicBlock*, llvm::Value*>>& incoming,
-            const ast::MatchExpr& me) {
+            const ast::MatchExpr& me,
+            bool refMatch = false, llvm::Value* origPtr = nullptr,
+            llvm::Type* enumLlvmTy = nullptr) {
         using DT = pattern_match::DecisionTree;
         switch (dt.kind) {
             case DT::Fail: {
@@ -7777,9 +8723,32 @@ private:
                     dt.armIndex < me.arms.size() ? &me.arms[dt.armIndex]
                                                  : nullptr;
                 for (const auto& [name, path] : dt.bindings) {
-                    llvm::Value* sub = walkOccurrence(scrutinee, path);
-                    auto* alloca = builder_->CreateAlloca(sub->getType(),
-                                                          nullptr, name);
+                    // Phase 34: in a by-reference match, a payload binding is a
+                    // BORROW — a pointer GEP'd into the original scrutinee
+                    // (origPtr), not a by-value copy out of the loaded
+                    // aggregate. path [] binds the whole &Enum; [slot] a
+                    // payload field. (Deeper nesting through a ref would need a
+                    // GEP-chain with intermediate types — not supported yet.)
+                    llvm::Value* sub;
+                    if (refMatch) {
+                        if (path.empty()) {
+                            sub = origPtr;
+                        } else if (path.size() == 1) {
+                            sub = builder_->CreateStructGEP(enumLlvmTy, origPtr,
+                                                            path[0],
+                                                            name + ".ref");
+                        } else {
+                            errors_.push_back(
+                                "codegen: nested pattern through a reference "
+                                "is not yet supported");
+                            sub = origPtr;
+                        }
+                    } else {
+                        sub = walkOccurrence(scrutinee, path);
+                    }
+                    // Hoisted to entry (Phase 34 fix): a match inside a loop
+                    // must not alloca per iteration.
+                    auto* alloca = entryAlloca(sub->getType(), name);
                     builder_->CreateStore(sub, alloca);
                     locals_[name] = alloca;
                     if (arm) {
@@ -7854,7 +8823,8 @@ private:
                     builder_->SetInsertPoint(hitBB);
                     if (c.child) {
                         emitDecisionTree(*c.child, scrutinee, mergeBB,
-                                         incoming, me);
+                                         incoming, me, refMatch, origPtr,
+                                         enumLlvmTy);
                     } else {
                         builder_->CreateUnreachable();
                     }
@@ -7866,7 +8836,8 @@ private:
                 // default).
                 if (dt.defaultCase) {
                     emitDecisionTree(*dt.defaultCase, scrutinee, mergeBB,
-                                     incoming, me);
+                                     incoming, me, refMatch, origPtr,
+                                     enumLlvmTy);
                 } else {
                     builder_->CreateUnreachable();
                 }
@@ -8112,7 +9083,12 @@ private:
             clearDropFlagIfMoved(*a);
             args.push_back(av);
         }
-        return builder_->CreateCall(fn, args, "mcall_" + mc.methodName);
+        // A void-returning method (a unit `&mut self` mutator like `skip_ws`)
+        // must NOT name its call — LLVM rejects a name on a void value.
+        std::string nm = fn->getReturnType()->isVoidTy()
+                             ? std::string()
+                             : ("mcall_" + mc.methodName);
+        return builder_->CreateCall(fn, args, nm);
     }
 
     // Phase 11: lower a dynamic-dispatch method call through a trait object's
@@ -8164,12 +9140,37 @@ private:
     }
 
     llvm::Value* emitMatch(const ast::MatchExpr& me) {
-        llvm::Value* scrutinee = emitExpr(*me.scrutinee);
-        // Phase 16: matching consumes (destructures) the scrutinee — a bare
-        // binding is moved into the match, so the enclosing scope must not drop
-        // it. (Payload bindings introduced by patterns are not yet tracked for
-        // drop; matching on droppable-payload enums is a documented limitation.)
-        clearDropFlagIfMoved(*me.scrutinee);
+        // Phase 34: match-through-reference — if the scrutinee is `&Enum`, the
+        // decision tree was built against the pointee enum; we load the enum
+        // value ONCE for the discriminant reads (the tag is Copy), but bind
+        // payloads as borrows GEP'd into the original pointer (origPtr) so
+        // nothing is moved/copied out (see emitDecisionTree's Leaf).
+        bool refMatch = false;
+        llvm::Type* enumLlvmTy = nullptr;
+        if (TypePtr sty = lookupExprType(*me.scrutinee)) {
+            TypePtr r = resolve(sty);
+            if (r->kind == TypeKind::Ref) {
+                TypePtr inner = resolveInInstance(r->refInner);
+                if (inner->kind == TypeKind::Enum) {
+                    refMatch = true;
+                    enumLlvmTy = mapKardashevType(inner);
+                }
+            }
+        }
+        llvm::Value* scrutinee;
+        llvm::Value* origPtr = nullptr;
+        if (refMatch) {
+            origPtr = emitExpr(*me.scrutinee); // the &Enum pointer (a borrow)
+            scrutinee =
+                builder_->CreateLoad(enumLlvmTy, origPtr, "refmatch.val");
+            // `&x` borrows x — it is NOT moved, so no drop-flag clearing.
+        } else {
+            scrutinee = emitExpr(*me.scrutinee);
+            // Phase 16: a by-value match consumes (destructures) the scrutinee
+            // — a bare binding is moved in, so the enclosing scope must not
+            // drop it.
+            clearDropFlagIfMoved(*me.scrutinee);
+        }
         auto* mergeBB = llvm::BasicBlock::Create(*ctx_, "matchmerge",
                                                   currentFn_);
         std::vector<std::pair<llvm::BasicBlock*, llvm::Value*>> incoming;
@@ -8181,7 +9182,8 @@ private:
             builder_->SetInsertPoint(mergeBB);
             return llvm::UndefValue::get(llvm::Type::getInt64Ty(*ctx_));
         }
-        emitDecisionTree(*it->second, scrutinee, mergeBB, incoming, me);
+        emitDecisionTree(*it->second, scrutinee, mergeBB, incoming, me,
+                         refMatch, origPtr, enumLlvmTy);
 
         builder_->SetInsertPoint(mergeBB);
         if (incoming.empty()) {
@@ -8595,9 +9597,11 @@ private:
                 // Phase 16: a `move`-style capture takes the value by value
                 // into the heap env. If the captured local is droppable, treat
                 // the capture as a move so the enclosing scope does not also
-                // free it (which would dangle the env's copy). The env itself
-                // is not freed today — a documented leak, but never a UAF or
-                // double-free.
+                // free it (which would dangle the env's copy). The env buffer
+                // itself IS freed at scope exit since Phase 29 (a fn-value is
+                // droppable; its drop glue frees the env — see emitDropGlue's
+                // Function arm); captures are Copy scalars (PR#18), so freeing
+                // the buffer reclaims everything the closure owns.
                 ast::IdentExpr capId;
                 capId.name = name;
                 clearDropFlagIfMoved(capId);
@@ -8654,9 +9658,10 @@ private:
 
         // Prologue: reload captures from env into locals. We bitcast the
         // i8* env arg to the env struct pointer (opaque pointers make this a
-        // no-op, but the GEPs use envTy). Captures are by-value copies living
-        // in the (leaked) env; we do NOT drop them in the closure body, so
-        // they aren't registered as owning locals.
+        // no-op, but the GEPs use envTy). Captures are by-value Copy scalars
+        // living in the heap env (freed at scope exit since Phase 29); we do
+        // NOT drop them per-capture in the closure body — freeing the env
+        // buffer reclaims them — so they aren't registered as owning locals.
         llvm::Value* envArg = closureFn->getArg(0);
         for (unsigned i = 0; i < cl.captures.size(); ++i) {
             const std::string& name = cl.captures[i].name;

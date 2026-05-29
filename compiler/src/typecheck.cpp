@@ -328,6 +328,16 @@ public:
             sch.genericVars.push_back(vecFnGenericVar);
             fnSchemas_["vec_get"] = std::move(sch);
         }
+        // Phase 34: vec_get_ref<T>(v: &Vec<T>, i: i64) -> &T — a BORROW into
+        // the buffer (read without moving/copying the element out).
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecFnInst, /*isMut=*/false), makeInt()},
+                makeRef(vecFnGenericVar, /*isMut=*/false));
+            sch.genericVars.push_back(vecFnGenericVar);
+            fnSchemas_["vec_get_ref"] = std::move(sch);
+        }
         // vec_len<T>(v: &Vec<T>) -> i64
         {
             FnSchema sch;
@@ -335,6 +345,25 @@ public:
                 {makeRef(vecFnInst, /*isMut=*/false)}, makeInt());
             sch.genericVars.push_back(vecFnGenericVar);
             fnSchemas_["vec_len"] = std::move(sch);
+        }
+        // Phase 35: clone<T>(x: &T) -> T ! { alloc } — a DEEP copy. The result
+        // owns freshly-allocated heap storage (String buffer, Vec/HashMap
+        // backing array, Box payload — recursively), so the clone and the
+        // original can each be dropped exactly once with no shared storage.
+        // The built-in deep-clone covers scalars, String, Vec, HashMap/HashSet,
+        // Box, and user structs/enums INCLUDING self-recursive types (cloned by
+        // a per-type clone function that recurses at run time). It subsumes the
+        // roadmap's "Clone trait + hand-written user impls": generic `impl<T>`
+        // blocks are deferred (Phase 21), so an intrinsic is the sound path and
+        // is strictly more capable (no per-type boilerplate).
+        {
+            FnSchema sch;
+            TypePtr cloneVar = makeFreshVar();
+            sch.signature =
+                makeFunction({makeRef(cloneVar, /*isMut=*/false)}, cloneVar);
+            sch.genericVars.push_back(cloneVar);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["clone"] = std::move(sch);
         }
 
         // Phase 13b / 17b built-in: `HashMap<i64, V>` — an open-addressing
@@ -393,6 +422,21 @@ public:
             sch.genericVars.push_back(hmValVar);
             fnSchemas_["hashmap_len"] = std::move(sch);
         }
+        // Phase 38: hashmap_keys<K,V>(m: &HashMap<K,V>) -> Vec<K> ! { alloc } —
+        // a freshly-allocated Vec of the live keys (each deep-cloned, so the
+        // Vec owns them). Bucket-order. The way to enumerate a map's entries
+        // (e.g. to serialize a JSON object).
+        {
+            FnSchema sch;
+            TypePtr vecOfKey = makeStruct("Vec", {});
+            vecOfKey->typeArgs = {hmKeyVar};
+            sch.signature = makeFunction(
+                {makeRef(hashMapInst, /*isMut=*/false)}, vecOfKey);
+            sch.genericVars.push_back(hmKeyVar);
+            sch.genericVars.push_back(hmValVar);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["hashmap_keys"] = std::move(sch);
+        }
 
         // Phase 28: `HashSet<T>` — a set over a hashable element T. Codegen
         // reuses the HashMap table machinery with a dummy i64 value, so T must
@@ -445,18 +489,34 @@ public:
         // the fat pointer produced by `&v[a..b]`; the two ops mirror Vec's
         // read API. The slice value is passed by value (it's a small {ptr,len}
         // aggregate). Constructing a slice doesn't allocate, so no `alloc`.
-        TypePtr sliceI64Ty = makeSlice(makeInt());
-        // slice_len(s: &[i64]) -> i64
+        // Phase 37: the slice read API is now generic over the element type T
+        // (was i64-only). The slice value carries its element type, so codegen
+        // strides by `sizeof(T)`. slice_len ignores T (reads the len field);
+        // slice_get copies element i (T must be Copy at the call site for a
+        // value read); slice_get_ref borrows it (&T) for non-Copy elements.
+        TypePtr sliceFnVar = makeFreshVar();
+        TypePtr sliceFnInst = makeSlice(sliceFnVar);
+        // slice_len<T>(s: &[T]) -> i64
         {
             FnSchema sch;
-            sch.signature = makeFunction({sliceI64Ty}, makeInt());
+            sch.signature = makeFunction({sliceFnInst}, makeInt());
+            sch.genericVars.push_back(sliceFnVar);
             fnSchemas_["slice_len"] = std::move(sch);
         }
-        // slice_get(s: &[i64], i: i64) -> i64
+        // slice_get<T>(s: &[T], i: i64) -> T
         {
             FnSchema sch;
-            sch.signature = makeFunction({sliceI64Ty, makeInt()}, makeInt());
+            sch.signature = makeFunction({sliceFnInst, makeInt()}, sliceFnVar);
+            sch.genericVars.push_back(sliceFnVar);
             fnSchemas_["slice_get"] = std::move(sch);
+        }
+        // slice_get_ref<T>(s: &[T], i: i64) -> &T — a borrow into the slice.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({sliceFnInst, makeInt()},
+                                         makeRef(sliceFnVar, /*isMut=*/false));
+            sch.genericVars.push_back(sliceFnVar);
+            fnSchemas_["slice_get_ref"] = std::move(sch);
         }
 
         // Phase 12 built-in: `yield_now(v: i64) -> Future<i64> ! { async }`.
@@ -824,6 +884,22 @@ public:
             sch.genericVars.push_back(hmKeyVar);
             sch.genericVars.push_back(hmValVar);
             fnSchemas_["hashmap_get"] = std::move(sch);
+
+            // Phase 34: hashmap_get_ref<K,V>(m: &HashMap<K,V>, k: K)
+            // -> Option<&V> — a borrow into the value slot (read-without-move).
+            if (!optSchema.genericVars.empty()) {
+                TypePtr refV = makeRef(hmValVar, /*isMut=*/false);
+                std::unordered_map<int, TypePtr> subst;
+                subst[optSchema.genericVars[0]->varId] = refV;
+                TypePtr optRefV = instantiate(optSchema.type, subst);
+                optRefV->typeArgs = {refV};
+                FnSchema rsch;
+                rsch.signature = makeFunction(
+                    {makeRef(hashMapInst, /*isMut=*/false), hmKeyVar}, optRefV);
+                rsch.genericVars.push_back(hmKeyVar);
+                rsch.genericVars.push_back(hmValVar);
+                fnSchemas_["hashmap_get_ref"] = std::move(rsch);
+            }
         }
 
         // Pass 1c: register trait declarations. Each trait gets a global
@@ -2938,6 +3014,8 @@ private:
             return {true, (l.i == r.i) ? 1 : 0};
         case Op::NotEq:
             return {true, (l.i != r.i) ? 1 : 0};
+        case Op::And: // Phase 33: bool && bool (both operands treated as 0/1)
+            return {true, (l.i != 0 && r.i != 0) ? 1 : 0};
         case Op::Lt:
         case Op::Le:
         case Op::Gt:
@@ -2956,7 +3034,8 @@ private:
         case Op::Add:
         case Op::Sub:
         case Op::Mul:
-        case Op::Div: {
+        case Op::Div:
+        case Op::Mod: {
             if (l.isBool || r.isBool)
                 constFail("arithmetic requires i64 operands in a const expr",
                           bin);
@@ -2967,6 +3046,11 @@ private:
                 of = __builtin_sub_overflow(l.i, r.i, &out);
             else if (bin.op == Op::Mul)
                 of = __builtin_mul_overflow(l.i, r.i, &out);
+            else if (bin.op == Op::Mod) {
+                if (r.i == 0) constFail("modulo by zero in const expr", bin);
+                // i64::MIN % -1 is 0 (and would overflow in two's complement).
+                out = (l.i == INT64_MIN && r.i == -1) ? 0 : (l.i % r.i);
+            }
             else { // Div
                 if (r.i == 0) constFail("division by zero in const expr", bin);
                 // i64::MIN / -1 overflows.
@@ -3979,6 +4063,21 @@ private:
     TypePtr checkBinary(const ast::BinaryExpr& bin) {
         TypePtr lhs = checkExpr(*bin.lhs);
         TypePtr rhs = checkExpr(*bin.rhs);
+        // Phase 33: `&&` is the only boolean binary op — both operands and the
+        // result are bool (short-circuit; codegen only evaluates rhs if lhs).
+        if (bin.op == ast::BinOp::And) {
+            if (!unify(lhs, makeBool())) {
+                error("logical `&&` expects bool on lhs, got " +
+                          typeToString(lhs),
+                      bin.lhs->line, bin.lhs->column);
+            }
+            if (!unify(rhs, makeBool())) {
+                error("logical `&&` expects bool on rhs, got " +
+                          typeToString(rhs),
+                      bin.rhs->line, bin.rhs->column);
+            }
+            return makeBool();
+        }
         const bool isComparison = (bin.op == ast::BinOp::Lt) ||
                                   (bin.op == ast::BinOp::Le) ||
                                   (bin.op == ast::BinOp::Gt) ||
@@ -4275,6 +4374,11 @@ private:
         }
         if (auto* cp = dynamic_cast<const ast::CtorPat*>(&pat)) {
             for (const auto& sp : cp->subpatterns)
+                collectPatternBindings(*sp, bound, added);
+            return;
+        }
+        if (auto* tp = dynamic_cast<const ast::TuplePat*>(&pat)) {
+            for (const auto& sp : tp->elements)
                 collectPatternBindings(*sp, bound, added);
             return;
         }
@@ -5007,6 +5111,16 @@ private:
                       un.operand->line, un.operand->column);
             }
             return makeBool();
+        case ast::UnaryOp::Deref: {
+            // Phase 34: `*r` reads the pointee of a `&T` / `&mut T` / Box<T>.
+            TypePtr r = resolve(operand);
+            if (r->kind == TypeKind::Ref) return resolve(r->refInner);
+            if (r->kind == TypeKind::Box) return resolve(r->refInner);
+            error("unary `*` requires a reference or Box operand, got " +
+                      typeToString(operand),
+                  un.operand->line, un.operand->column);
+            return makeInt();
+        }
         }
         return makeInt(); // unreachable
     }
@@ -5325,21 +5439,22 @@ private:
         return objTy->arrayElem;
     }
 
-    // Phase 22: tuple literal `(a, b, ...)`. The empty `()` is unit; otherwise
-    // the type is the tuple of the element types.
+    // Phase 22 / 36: tuple literal `(a, b, ...)`. The empty `()` is unit;
+    // otherwise the type is the tuple of the element types. Phase 36 lifts the
+    // Copy-only restriction: a tuple may now hold non-Copy (heap-owning)
+    // elements like `(String, i64)` or `(Json, i64)`. Such a tuple is itself
+    // droppable (codegen drops each droppable element) and is move-tracked as a
+    // whole by the borrow checker — moving the tuple moves its elements; tuple
+    // field READS of a non-Copy element are rejected by the borrow checker
+    // unless the element is Copy (no partial move-out via `.0` in this MVP —
+    // destructure with a tuple pattern instead). Arrays stay Copy-only (their
+    // dynamic index makes element-granular move tracking unsound here).
     TypePtr checkTupleLit(const ast::TupleLitExpr& tl) {
         if (tl.elements.empty()) return makeUnit(); // 0-tuple == unit
         std::vector<TypePtr> elems;
         elems.reserve(tl.elements.size());
         for (const auto& el : tl.elements) {
-            TypePtr et = checkExpr(*el);
-            if (!isCopyAggregateElem(et)) {
-                error("tuple elements must be Copy types (i64, bool, or nested "
-                      "arrays/tuples of those) in this version, got " +
-                          typeToString(et),
-                      el->line, el->column);
-            }
-            elems.push_back(et);
+            elems.push_back(checkExpr(*el));
         }
         return makeTuple(std::move(elems));
     }
@@ -5489,6 +5604,23 @@ private:
 
     TypePtr checkMatch(const ast::MatchExpr& me) {
         TypePtr scrutT = checkExpr(*me.scrutinee);
+        // Phase 34: match-through-reference. When the scrutinee is `&Enum`
+        // (one layer of `&`/`&mut`), match the pointee enum and bind every
+        // payload as a borrow `&T` — so a recursive heap value can be
+        // traversed without moving/copying it out (codegen reads through the
+        // pointer; the scrutinee `&x` borrows x rather than consuming it).
+        TypePtr patExpected = scrutT;
+        bool refMatch = false;
+        {
+            TypePtr rs = resolve(scrutT);
+            if (rs->kind == TypeKind::Ref) {
+                TypePtr inner = resolve(rs->refInner);
+                if (inner->kind == TypeKind::Enum) {
+                    refMatch = true;
+                    patExpected = inner;
+                }
+            }
+        }
         if (me.arms.empty()) {
             error("match expression must have at least one arm",
                   me.line, me.column);
@@ -5511,7 +5643,7 @@ private:
             // recorded inline; we still process the body so secondary
             // type errors surface.
             Scope bindings;
-            checkPattern(*arm.pattern, scrutT, bindings);
+            checkPattern(*arm.pattern, patExpected, bindings, refMatch);
             for (auto& kv : bindings) {
                 scopes_.back()[kv.first] = kv.second;
                 // Phase 29: record the binding's type so codegen can drop a
@@ -5536,7 +5668,7 @@ private:
         enumsForPm.reserve(enumSchemas_.size());
         for (const auto& [n, s] : enumSchemas_) enumsForPm[n] = s.type;
         if (auto w = pattern_match::checkExhaustiveness(
-                scrutT, me.arms, enumsForPm, variantIndex_)) {
+                patExpected, me.arms, enumsForPm, variantIndex_)) {
             error("non-exhaustive match: missing pattern `" + w->text + "`",
                   me.line, me.column);
         }
@@ -5544,7 +5676,7 @@ private:
         if (armsClean) {
             // Redundancy: report each arm unreachable given the arms before it.
             auto redundant = pattern_match::findRedundantArms(
-                scrutT, me.arms, enumsForPm, variantIndex_);
+                patExpected, me.arms, enumsForPm, variantIndex_);
             for (unsigned idx : redundant) {
                 if (idx >= me.arms.size()) continue;
                 const auto& arm = me.arms[idx];
@@ -5556,7 +5688,7 @@ private:
             // (even when non-exhaustive — the tree bottoms out at Fail
             // nodes), as long as arm patterns were well-typed.
             matchTrees_[&me] = pattern_match::compileDecisionTree(
-                scrutT, me.arms, enumsForPm, variantIndex_);
+                patExpected, me.arms, enumsForPm, variantIndex_);
         }
         return unified;
     }
@@ -5569,8 +5701,12 @@ private:
     // as a unit-CtorPat (matches the variant, no binding). Names that
     // collide with non-unit variants are likely a forgotten parenthesis
     // and are flagged as an arity error rather than silently binding.
+    // Phase 34: `refMatch` is true when the scrutinee is `&Enum` (a
+    // match-through-reference). Then a bound name binds a BORROW `&T` of the
+    // matched location rather than an owned/copied `T`, so traversing a
+    // recursive heap value never moves/double-frees it.
     void checkPattern(const ast::Pattern& pat, const TypePtr& expected,
-                      Scope& bindings) {
+                      Scope& bindings, bool refMatch = false) {
         if (dynamic_cast<const ast::LitIntPat*>(&pat)) {
             if (!unify(expected, makeInt())) {
                 error("integer pattern requires i64, scrutinee is " +
@@ -5607,7 +5743,9 @@ private:
                       pat.line, pat.column);
                 return;
             }
-            bindings[vp->name] = expected;
+            // Phase 34: in a match-through-reference, bind a borrow `&T`.
+            bindings[vp->name] =
+                refMatch ? makeRef(expected, /*isMut=*/false) : expected;
             return;
         }
         if (auto* cp = dynamic_cast<const ast::CtorPat*>(&pat)) {
@@ -5618,7 +5756,7 @@ private:
                 // Still walk subpatterns so nested errors / bindings surface
                 // against fresh vars.
                 for (const auto& sp : cp->subpatterns) {
-                    checkPattern(*sp, makeFreshVar(), bindings);
+                    checkPattern(*sp, makeFreshVar(), bindings, refMatch);
                 }
                 return;
             }
@@ -5640,12 +5778,46 @@ private:
                 std::min(cp->subpatterns.size(), variant.payloadTypes.size());
             for (std::size_t i = 0; i < n; ++i) {
                 checkPattern(*cp->subpatterns[i], variant.payloadTypes[i],
-                             bindings);
+                             bindings, refMatch);
             }
             // Walk any extras against fresh vars to surface their bindings/errors.
             for (std::size_t i = n; i < cp->subpatterns.size(); ++i) {
-                checkPattern(*cp->subpatterns[i], makeFreshVar(), bindings);
+                checkPattern(*cp->subpatterns[i], makeFreshVar(), bindings,
+                             refMatch);
             }
+            return;
+        }
+        // Phase 36: a tuple destructure `(p0, p1, ...)` — the scrutinee must be
+        // a tuple of matching arity; bind each element sub-pattern to its type.
+        if (auto* tp = dynamic_cast<const ast::TuplePat*>(&pat)) {
+            TypePtr exp = resolve(expected);
+            if (exp->kind != TypeKind::Tuple) {
+                std::vector<TypePtr> fresh;
+                fresh.reserve(tp->elements.size());
+                for (std::size_t i = 0; i < tp->elements.size(); ++i)
+                    fresh.push_back(makeFreshVar());
+                if (!unify(expected, makeTuple(fresh))) {
+                    error("tuple pattern, but scrutinee is " +
+                              typeToString(expected),
+                          pat.line, pat.column);
+                    for (const auto& sp : tp->elements)
+                        checkPattern(*sp, makeFreshVar(), bindings, refMatch);
+                    return;
+                }
+                exp = resolve(expected);
+            }
+            if (exp->tupleElems.size() != tp->elements.size()) {
+                error("tuple pattern has " +
+                          std::to_string(tp->elements.size()) +
+                          " element(s), scrutinee tuple has " +
+                          std::to_string(exp->tupleElems.size()),
+                      pat.line, pat.column);
+            }
+            const std::size_t n =
+                std::min(tp->elements.size(), exp->tupleElems.size());
+            for (std::size_t i = 0; i < n; ++i)
+                checkPattern(*tp->elements[i], exp->tupleElems[i], bindings,
+                             refMatch);
             return;
         }
         error("unknown pattern kind", pat.line, pat.column);

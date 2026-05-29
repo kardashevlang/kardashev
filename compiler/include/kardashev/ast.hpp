@@ -63,16 +63,19 @@ namespace kardashev::ast {
 
 enum class BinOp {
     Add, Sub, Mul, Div,
+    Mod,          // Phase 33: `%` integer modulo
     Lt, Le, Gt, Ge,
     Eq, NotEq,
+    And,          // Phase 33: `&&` short-circuit logical-and (bool -> bool)
 };
 
 // Phase 15: prefix unary operators. `Neg` is integer negation (`-x`,
 // i64 -> i64); `Not` is logical not (`!x`, bool -> bool). Both bind
 // tighter than every binary operator.
 enum class UnaryOp {
-    Neg, // -x
-    Not, // !x
+    Neg,   // -x
+    Not,   // !x
+    Deref, // *r — Phase 34: read the pointee of a `&T` / `Box<T>` (yields T)
 };
 
 // Base expression. Polymorphic by design — use `dynamic_cast<...*>` in
@@ -122,6 +125,13 @@ struct VarPat : Pattern {
 struct CtorPat : Pattern {
     std::string ctorName;
     std::vector<PatternPtr> subpatterns;
+};
+
+// Phase 36: a tuple destructuring pattern `(p0, p1, ...)`. Irrefutable (a
+// tuple has exactly one shape); binds each sub-pattern to the corresponding
+// element. Modeled in the match compiler as a single-constructor type.
+struct TuplePat : Pattern {
+    std::vector<PatternPtr> elements;
 };
 
 // --- Expressions ---

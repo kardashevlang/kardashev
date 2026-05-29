@@ -195,9 +195,17 @@ std::vector<Token> lex(std::string_view source) {
             push2(TokenKind::PipePipe, startCol);
             continue;
         }
+        // Phase 33: `&&` short-circuit logical-and, matched before single `&`
+        // so the longer match wins. (There is no `||` logical-or — `||` is
+        // the zero-param-closure token above.)
+        if (c == '&' && n == '&') {
+            push2(TokenKind::AmpAmp, startCol);
+            continue;
+        }
 
         // Single-char tokens.
         switch (c) {
+        case '%': push1(TokenKind::Percent, startCol); continue; // Phase 33
         case '+': push1(TokenKind::Plus, startCol); continue;
         case '-': push1(TokenKind::Minus, startCol); continue;
         case '*': push1(TokenKind::Star, startCol); continue;
@@ -263,6 +271,8 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::Minus: return "Minus";
     case TokenKind::Star: return "Star";
     case TokenKind::Slash: return "Slash";
+    case TokenKind::Percent: return "Percent";
+    case TokenKind::AmpAmp: return "AmpAmp";
     case TokenKind::Lt: return "Lt";
     case TokenKind::Le: return "Le";
     case TokenKind::Gt: return "Gt";
