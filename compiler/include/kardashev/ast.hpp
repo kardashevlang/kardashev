@@ -288,10 +288,10 @@ struct TupleFieldExpr : Expr {
     std::size_t index = 0;
 };
 
-// Phase 6 (stub): `expr.await` postfix. Today this is a no-op at both
-// typecheck and codegen (the operand's type / value flow through
-// unchanged); once a state-machine transform lands this becomes the
-// suspend point of the enclosing async fn.
+// `expr.await` postfix: the suspend point of the enclosing async fn. It
+// unwraps a `Future<T>` to its `T`; codegen (Phase 12) lowers it to a poll
+// loop over the sub-future's heap frame that genuinely returns Pending and
+// resumes (the Phase 18 executor drives it). Typecheck unwraps Future<T> -> T.
 struct AwaitExpr : Expr {
     ExprPtr operand;
 };
@@ -586,8 +586,9 @@ struct FnDecl {
     std::vector<Param> params;
     TypeRef returnType;
     EffectRow effects; // Phase 4: declared effect row; empty = pure
-    bool isAsync = false; // Phase 6 (stub): `async fn` desugars to a fn
-                            // that implicitly carries the `async` effect.
+    bool isAsync = false; // `async fn` returns a Future and implicitly
+                            // carries the `async` effect; codegen (Phase 12)
+                            // splits it into a resumable poll fn over a frame.
     bool isPub = false;   // Phase 7.3b: visible across module boundaries
                             // when referenced via path syntax.
     // Phase 25: `const fn` — a function that MAY be evaluated at compile time.

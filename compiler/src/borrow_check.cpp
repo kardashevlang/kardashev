@@ -282,8 +282,8 @@ private:
             return;
         }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
-            // Phase 6 (stub): `.await` consumes its operand. Walk to
-            // keep lastUsePos accurate.
+            // `.await` consumes its operand (a Future). Walk to keep
+            // lastUsePos accurate.
             prePass(*ae->operand);
             return;
         }
@@ -553,7 +553,7 @@ private:
             return handleRefExpr(*re, expectExpire);
         }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
-            // Phase 6 (stub): `.await` consumes its operand.
+            // `.await` consumes its operand (a Future).
             return std::max(lastInSubtree,
                             consume(*ae->operand, expectExpire));
         }

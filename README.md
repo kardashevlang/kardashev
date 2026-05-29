@@ -298,39 +298,40 @@ Iterator stdlib; 22's arrays fed 25's const-generic lengths; 23 built on v3's Dr
 24's FFI + 26's capstone pair up), each verified — clean build + direct behavior
 checks — and CI-green on ubuntu + macOS before the next built on it.
 
-## Roadmap v5 — planned
+## Roadmap v5 — shipped
 
 v4 proved kardashev can compile a real program written *in itself* (`examples/calc/`).
-v5's **north star** is to make that no longer a demo: compile two genuinely non-trivial
-tools written in kardashev — a **JSON parser** (`examples/json/`) and a **kardashev-subset
-lexer/parser** (`examples/kdlex/`) — as green capstones, standing on a deeper stdlib, a
-leak-free memory model, and accurate docs. The **theme** is to close, one verifiable
-dependency layer at a time, the stdlib/collection/soundness gaps that today block writing
-real programs in the language. *This section is the plan — these phases are not yet
-implemented.* As in v1–v4, each phase will ship fully green (`Makefile.local` + a new smoke
-test, CI on ubuntu + macOS) before the next builds on it, and anything unverifiable in this
-build environment stays documented-deferred, never stubbed.
+v5's **north star** made that no longer a demo: two genuinely non-trivial tools written in
+kardashev — a **JSON parser** (`examples/json/`) and a **kardashev-subset lexer**
+(`examples/kdlex/`) — compile and run green, standing on a deeper stdlib, a tighter memory
+model, and accurate docs. Phases 27–32 are implemented and green on the full suite (6 unit
+suites + 46 smoke tests, JIT + AOT, ubuntu + macOS). As in v1–v4, each phase shipped fully
+green before the next built on it, and everything unverifiable in this build environment is
+documented-deferred, never stubbed.
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| 27 | **String toolkit** | 🎯 planned. Today's only string ops are `print_str` / `str_len` / `str_char_at` and an `i64`-only `print`; add `str_eq`, `str_substring` (byte slice), `int_to_string`, and `println(&str)` so a self-written tool can compare, format, and emit text. Verified by a JIT+AOT smoke test. |
-| 28 | **`Hash` trait + generic map/set keys** | 🎯 planned. `HashMap` keys are pinned to `i64` today (the typechecker rejects any other key — "no Hash trait yet"). Land a `Hash` trait and generalize to `HashMap<K, V>` for `K: Hash + Eq` — which first needs multiple-bounds-per-param (`T: A + B`, not yet in the grammar) — plus `HashSet<T>`. Verified at `i64` + `String` keys, JIT+AOT. |
-| 29 | **Plug the documented Drop leaks** | 🎯 planned. Closure-env structs, async-frame contents, and enum/`match`-payload bindings are not dropped yet (the documented Phase-16 leak — no UAF, but they leak). Run Drop glue through all three so a loop that captures, awaits, or destructures droppable values runs in **constant memory**, extending the Phase-16 guarantee. Verified with a constant-RSS loop test (à la Phase 16/23). *(Dynamic array-index OOB already panics as of Phase 23 — not part of this phase.)* |
-| 30 | **File I/O + CLI args** | 🎯 planned. `fs_read_to_string` / `fs_write` / `fs_exists` returning `Result<_, IoError>` (carrying the `io` effect, lowered through the Phase-24 `extern "C"` path) and `args()` for argv. Verified here on Linux; macOS readiness rides CI. |
-| 31 | **Capstone: a JSON parser + a kd-subset parser, written in kardashev** | 🎯 planned. `examples/json/` (string → AST → value) and `examples/kdlex/` (a kardashev-subset lexer/parser) consuming the Phase 27–30 stdlib, with fixture-driven smoke tests. **The north star** — a real SUBSET self-parse exercising the stdlib end to end, no new language features. |
-| 32 | **Docs + source-comment truth pass** | 🎯 planned. `docs/` still describes the language at roughly Phase 7 / v2, and several source comments label now-fully-working async code as "Phase 6 (stub)". Rewrite `docs/` through v5 and purge the stale markers; a doc-lint check guards against regression. |
+| 27 | **String toolkit** | ✅ `str_eq` (byte-exact, pure), `str_substring` (a fresh heap slice, start/len **clamped** into bounds), `int_to_string` (`snprintf "%lld"`), and `print_no_nl` — the genuinely new output op, since `print_str` / `print_string` / the new `println` all force a trailing newline. Verified JIT + AOT (`smoke_test_strings`). |
+| 28 | **`Hash` trait + generic map/set keys** | ✅ Multiple trait bounds (`T: A + B`, inline + via `where`); a prelude `Hash` + `Eq` trait with built-in i64/String impls; **generic `HashMap<K, V>`** (the bucket entry now stores `K` — i64 keys keep the historic inline identity-hash+icmp; String keys hash via FNV-1a + compare via `str_eq`; **user key types** dispatch through their `impl Hash`/`impl Eq`); and `HashSet<T>`. A non-hashable key is a clear error. Verified at i64/String/user-struct keys (`smoke_test_hash`). |
+| 29 | **Plug the documented Drop leaks** | ✅ The closure-env and `match`-payload-binding leaks are closed: a fn-value is droppable (its heap capture env is freed), and a droppable enum payload bound in a `match` arm drops at arm exit unless moved out. Verified with 2 M-iteration constant-memory loops (~1.5 MB RSS) for both, plus a no-UAF check that a moved-out payload survives (`smoke_test_dropleaks`). *(Dynamic array-index OOB already panics since Phase 23.)* **Documented-deferred:** async-frame interior free — freeing a completed `Future`'s heap frame needs reworking the executor task lifecycle (read-after-free risk on the poll slot) and async is off the v5 capstone path, so it stays a known leak rather than a risky half-fix. |
+| 30 | **File I/O + CLI args** | ✅ `fs_read_to_string` → `Result<String, IoError>`, `fs_write` → `Result<i64, IoError>`, `fs_exists` → `bool`, and `args()` → `Vec<String>` (`arg_count`/`arg_get`). Errors are classified **portably** via `access()` probes (no libc `errno` symbol, so the IR links on Linux + macOS); the AOT `int main(argc, argv)` wrapper captures argv (JIT sees none); the runtime is emitted only when a program uses it. Verified JIT + AOT (`smoke_test_io`). |
+| 31 | **Capstones, written in kardashev** | ✅ `examples/json/` parses a JSON object into a `HashMap<String, i64>` (the headline Phase-28 map), and `examples/kdlex/` lexes a kardashev subset into a `Vec<Tok>` and counts `fn` decls + checks brace balance — both compiled by `kardc`, JIT + AOT (`smoke_test_capstones`). **The north star.** *(Subset, documented: the JSON parser targets a numeric-config object — top-level, integer values — the sound shape that exercises the String-keyed map end to end; nested/string/bool values are out of scope.)* |
+| 32 | **Docs + source-comment truth pass** | ✅ `docs/` (language reference, effects, stdlib, architecture) rewritten from the Phase-7/v2 era to v5; the stale "Phase 6 (stub)" comments that labelled now-fully-working async code are purged; a `doc-lint` smoke test (`smoke_test_doclint`) guards against the markers and the worst stale claims regressing. |
 
 **Documented-deferred (carried forward unchanged, never stubbed):** third-party dependency
 resolution via the Bazel module registry (Bazel can't run in this build environment;
-`mod foo;` + `kard.toml` local-path deps are what ship) and macOS/kqueue async fd-readiness
-(Linux/`epoll` only here; timers work cross-platform, and CI covers macOS).
+`mod foo;` + `kard.toml` local-path deps are what ship); macOS/kqueue async fd-readiness
+(Linux/`epoll` only here; timers work cross-platform, and CI covers macOS); and the new v5
+deferral above — async-frame interior free (the `Future` heap frame is reclaimed by neither
+`block_on` nor the executor yet, so a long-running async workload leaks frames; a bounded
+one-shot does not).
 
-Plan lands in order **27 → 28 → 29 → 30 → 31 → 32** — a deliberate dependency arc: 27's
-strings feed 28's string-key hashing and 31's AST dumps; 28's `Hash` trait must precede
-generic keys; 29 plugs the Drop leaks once 27–28 introduce new droppable values that make
-them load-bearing; 30's `Result<String, IoError>` drops cleanly on the error path *because*
-29 closed that hole; 31 integrates 27–30 into the self-written capstones; 32 documents the
-result last. Each ships green before the next, exactly as v1–v4 did.
+Landed in order **27 → 28 → 29 → 30 → 31 → 32** along the planned dependency arc: 27's
+strings fed 28's string-key hashing and 31's tokenizers; 28's `Hash` trait preceded the
+generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load-bearing;
+30's `Result<String, IoError>` drops cleanly on the error path *because* 29 closed that
+hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
+Each shipped green before the next, exactly as v1–v4 did.
 
 ## Why "kardashev"?
 

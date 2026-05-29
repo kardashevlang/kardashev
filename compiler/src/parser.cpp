@@ -261,10 +261,11 @@ private:
     }
 
     ast::FnDecl parseFnDecl() {
-        // Phase 6 (stub): `async fn` optional prefix marks the fn body
-        // for state-machine transform. Today the transform is a no-op
-        // but the typechecker implicitly adds `async` to the effect row.
-        // `async` stays as an Identifier (not a keyword) so it can also
+        // `async fn` optional prefix marks the fn for the Phase-12
+        // state-machine transform (codegen splits it into a resumable poll fn
+        // over a heap frame); the typechecker implicitly adds `async` to the
+        // effect row. `async` stays as an Identifier (not a keyword) so it can
+        // also
         // appear in effect-row labels like `! { async }`; we detect it
         // by lexeme here.
         bool isAsync = false;
@@ -1236,7 +1237,8 @@ private:
         while (true) {
             if (check(TokenKind::Dot)) {
                 Token dotTok = consume();
-                // Phase 6 (stub): `.await` is a postfix operator. We
+                // `.await` is a postfix operator (the suspend point of an
+                // async fn; lowered to a real poll loop in Phase 12). We
                 // recognise `await` by lexeme (it stays an Identifier
                 // so the same word can appear as an effect label).
                 // Distinguish from a field literally named `await` by

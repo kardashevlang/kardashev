@@ -308,6 +308,21 @@ sh_test(
     ],
 )
 
+# Phase 32: doc-lint truth-pass guard — asserts the rewritten docs/ don't
+# regress to stale v1-era claims and still document the v5 stdlib. (The
+# source-comment "(stub)" check runs in the Makefile build, where the tree is
+# available; here it greps the doc data.)
+sh_test(
+    name = "smoke_test_doclint",
+    srcs = ["smoke_test_doclint.sh"],
+    data = [
+        "//docs:architecture.md",
+        "//docs:effects.md",
+        "//docs:language-reference.md",
+        "//docs:stdlib.md",
+    ],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],
