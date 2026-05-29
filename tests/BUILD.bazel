@@ -295,6 +295,19 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 31: the two v5 capstones written in kardashev — a JSON object parser
+# (HashMap<String, i64>) and a kardashev-subset lexer (Vec<Tok> + keyword
+# classification). Builds the SHIPPED example sources, JIT + AOT.
+sh_test(
+    name = "smoke_test_capstones",
+    srcs = ["smoke_test_capstones.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/json:main.kd",
+        "//examples/kdlex:main.kd",
+    ],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],
