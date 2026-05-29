@@ -63,8 +63,10 @@ namespace kardashev::ast {
 
 enum class BinOp {
     Add, Sub, Mul, Div,
+    Mod,          // Phase 33: `%` integer modulo
     Lt, Le, Gt, Ge,
     Eq, NotEq,
+    And,          // Phase 33: `&&` short-circuit logical-and (bool -> bool)
 };
 
 // Phase 15: prefix unary operators. `Neg` is integer negation (`-x`,

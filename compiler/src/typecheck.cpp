@@ -2938,6 +2938,8 @@ private:
             return {true, (l.i == r.i) ? 1 : 0};
         case Op::NotEq:
             return {true, (l.i != r.i) ? 1 : 0};
+        case Op::And: // Phase 33: bool && bool (both operands treated as 0/1)
+            return {true, (l.i != 0 && r.i != 0) ? 1 : 0};
         case Op::Lt:
         case Op::Le:
         case Op::Gt:
@@ -2956,7 +2958,8 @@ private:
         case Op::Add:
         case Op::Sub:
         case Op::Mul:
-        case Op::Div: {
+        case Op::Div:
+        case Op::Mod: {
             if (l.isBool || r.isBool)
                 constFail("arithmetic requires i64 operands in a const expr",
                           bin);
@@ -2967,6 +2970,11 @@ private:
                 of = __builtin_sub_overflow(l.i, r.i, &out);
             else if (bin.op == Op::Mul)
                 of = __builtin_mul_overflow(l.i, r.i, &out);
+            else if (bin.op == Op::Mod) {
+                if (r.i == 0) constFail("modulo by zero in const expr", bin);
+                // i64::MIN % -1 is 0 (and would overflow in two's complement).
+                out = (l.i == INT64_MIN && r.i == -1) ? 0 : (l.i % r.i);
+            }
             else { // Div
                 if (r.i == 0) constFail("division by zero in const expr", bin);
                 // i64::MIN / -1 overflows.
@@ -3979,6 +3987,21 @@ private:
     TypePtr checkBinary(const ast::BinaryExpr& bin) {
         TypePtr lhs = checkExpr(*bin.lhs);
         TypePtr rhs = checkExpr(*bin.rhs);
+        // Phase 33: `&&` is the only boolean binary op — both operands and the
+        // result are bool (short-circuit; codegen only evaluates rhs if lhs).
+        if (bin.op == ast::BinOp::And) {
+            if (!unify(lhs, makeBool())) {
+                error("logical `&&` expects bool on lhs, got " +
+                          typeToString(lhs),
+                      bin.lhs->line, bin.lhs->column);
+            }
+            if (!unify(rhs, makeBool())) {
+                error("logical `&&` expects bool on rhs, got " +
+                          typeToString(rhs),
+                      bin.rhs->line, bin.rhs->column);
+            }
+            return makeBool();
+        }
         const bool isComparison = (bin.op == ast::BinOp::Lt) ||
                                   (bin.op == ast::BinOp::Le) ||
                                   (bin.op == ast::BinOp::Gt) ||

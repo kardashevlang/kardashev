@@ -2119,6 +2119,12 @@ private:
             b.SetInsertPoint(rehashDone);
             b.CreateStore(newBuf, bucketsP);
             b.CreateStore(newCap, capP);
+            // Phase 33: reclaim the OLD bucket buffer now that every entry has
+            // migrated into newBuf. oldBuf is null on the first grow (cap was
+            // 0) and a malloc'd buffer otherwise — free() handles both. (The
+            // entries themselves moved by value, so their interior heap is now
+            // owned by newBuf; only the array shell is freed here.)
+            b.CreateCall(freeFn_, {oldBuf});
             b.CreateBr(doInsertBB);
 
             // doinsert: raw-insert into current buffer; bump len if new.
@@ -6127,11 +6133,17 @@ private:
                 return;
             }
             if (r->structName == "HashMap" || r->structName == "HashSet") {
-                // { i8* buckets, i64 len, i64 cap }. Free the bucket array
-                // (guarded on cap != 0). Phase 28: droppable keys/values stored
-                // inside the table are NOT yet individually dropped — a
-                // documented leak (no UAF), in the same class as a droppable
-                // Vec element; interior drop is deferred to Phase 29.
+                // { i8* buckets, i64 len, i64 cap }. Phase 33: drop the live
+                // interior keys/values first, then free the bucket array
+                // (guarded on cap != 0). HashMap carries [K, V] in typeArgs;
+                // HashSet carries [T] and uses a HashMap<T, i64> layout, whose
+                // dummy i64 value is non-droppable.
+                TypePtr kTy = !r->typeArgs.empty() ? r->typeArgs[0] : nullptr;
+                TypePtr vTy = (r->structName == "HashMap" &&
+                               r->typeArgs.size() > 1)
+                                  ? r->typeArgs[1]
+                                  : makeInt();
+                if (kTy) emitDropMapEntries(valuePtr, kTy, vTy);
                 emitFreeBufferIfOwned(valuePtr, llvmTy);
                 return;
             }
@@ -6221,6 +6233,59 @@ private:
         auto* iNext = builder_->CreateAdd(
             i, llvm::ConstantInt::get(i64Ty, 1), "i.next");
         builder_->CreateStore(iNext, iSlot);
+        builder_->CreateBr(hdr);
+        builder_->SetInsertPoint(done);
+    }
+
+    // Phase 33: drop the live keys/values of a HashMap/HashSet before its
+    // bucket array is freed. Walks [0, cap), and for each OCCUPIED bucket
+    // (state == 1) drops the key (and, for a HashMap, the value). The bucket
+    // entry layout is { i64 state, K key, V value } (HashSet uses a dummy i64
+    // V); an anonymous struct of the same element types matches that layout.
+    void emitDropMapEntries(llvm::Value* mapPtr, const TypePtr& K,
+                            const TypePtr& V) {
+        bool dropK = isDroppable(K);
+        bool dropV = isDroppable(V);
+        if (!dropK && !dropV) return; // nothing droppable inside
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* one = llvm::ConstantInt::get(i64Ty, 1);
+        auto* hmTy = structTypes_["HashMap"]; // {buckets,len,cap}; HashSet shares it
+        auto* entryTy = llvm::StructType::get(
+            ctx, {i64Ty, mapKardashevType(K), mapKardashevType(V)});
+        auto* buckets = builder_->CreateLoad(
+            i8PtrTy, builder_->CreateStructGEP(hmTy, mapPtr, 0, "hm.b.p"),
+            "hm.buckets");
+        auto* cap = builder_->CreateLoad(
+            i64Ty, builder_->CreateStructGEP(hmTy, mapPtr, 2, "hm.c.p"),
+            "hm.cap");
+        auto* jSlot = entryAlloca(i64Ty, "hmdrop.j");
+        builder_->CreateStore(llvm::ConstantInt::get(i64Ty, 0), jSlot);
+        auto* hdr = llvm::BasicBlock::Create(ctx, "hmdrop.hdr", currentFn_);
+        auto* body = llvm::BasicBlock::Create(ctx, "hmdrop.body", currentFn_);
+        auto* occ = llvm::BasicBlock::Create(ctx, "hmdrop.occ", currentFn_);
+        auto* step = llvm::BasicBlock::Create(ctx, "hmdrop.step", currentFn_);
+        auto* done = llvm::BasicBlock::Create(ctx, "hmdrop.done", currentFn_);
+        builder_->CreateBr(hdr);
+        builder_->SetInsertPoint(hdr);
+        auto* j = builder_->CreateLoad(i64Ty, jSlot, "j");
+        builder_->CreateCondBr(builder_->CreateICmpSLT(j, cap, "more"), body,
+                               done);
+        builder_->SetInsertPoint(body);
+        auto* eptr = builder_->CreateGEP(entryTy, buckets, j, "eptr");
+        auto* state = builder_->CreateLoad(
+            i64Ty, builder_->CreateStructGEP(entryTy, eptr, 0, "st.p"), "state");
+        builder_->CreateCondBr(builder_->CreateICmpEQ(state, one, "occupied"),
+                               occ, step);
+        builder_->SetInsertPoint(occ);
+        if (dropK)
+            emitDropGlue(builder_->CreateStructGEP(entryTy, eptr, 1, "k.p"), K);
+        if (dropV)
+            emitDropGlue(builder_->CreateStructGEP(entryTy, eptr, 2, "v.p"), V);
+        builder_->CreateBr(step); // CreateBr uses the post-drop insert point
+        builder_->SetInsertPoint(step);
+        builder_->CreateStore(builder_->CreateAdd(j, one, "j.next"), jSlot);
         builder_->CreateBr(hdr);
         builder_->SetInsertPoint(done);
     }
@@ -7246,6 +7311,28 @@ private:
     }
 
     llvm::Value* emitBinary(const ast::BinaryExpr& bin) {
+        // Phase 33: `&&` short-circuits — evaluate rhs only when lhs is true.
+        // `a && b` == `lhs ? rhs : false`, via a branch + phi (mirrors how the
+        // eager path below would evaluate both, but skips rhs when lhs fails).
+        if (bin.op == ast::BinOp::And) {
+            auto& ctx = *ctx_;
+            auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+            llvm::Value* L = emitExpr(*bin.lhs);
+            auto* entryBB = builder_->GetInsertBlock();
+            auto* fn = entryBB->getParent();
+            auto* rhsBB = llvm::BasicBlock::Create(ctx, "and.rhs", fn);
+            auto* contBB = llvm::BasicBlock::Create(ctx, "and.cont", fn);
+            builder_->CreateCondBr(L, rhsBB, contBB);
+            builder_->SetInsertPoint(rhsBB);
+            llvm::Value* R = emitExpr(*bin.rhs);
+            auto* rhsEnd = builder_->GetInsertBlock(); // rhs may have added blocks
+            builder_->CreateBr(contBB);
+            builder_->SetInsertPoint(contBB);
+            auto* phi = builder_->CreatePHI(i1Ty, 2, "and");
+            phi->addIncoming(llvm::ConstantInt::getFalse(ctx), entryBB);
+            phi->addIncoming(R, rhsEnd);
+            return phi;
+        }
         llvm::Value* L = emitExpr(*bin.lhs);
         llvm::Value* R = emitExpr(*bin.rhs);
         switch (bin.op) {
@@ -7253,12 +7340,14 @@ private:
         case ast::BinOp::Sub: return builder_->CreateSub(L, R, "sub");
         case ast::BinOp::Mul: return builder_->CreateMul(L, R, "mul");
         case ast::BinOp::Div: return builder_->CreateSDiv(L, R, "div");
+        case ast::BinOp::Mod: return builder_->CreateSRem(L, R, "mod");
         case ast::BinOp::Lt:  return builder_->CreateICmpSLT(L, R, "lt");
         case ast::BinOp::Le:  return builder_->CreateICmpSLE(L, R, "le");
         case ast::BinOp::Gt:  return builder_->CreateICmpSGT(L, R, "gt");
         case ast::BinOp::Ge:  return builder_->CreateICmpSGE(L, R, "ge");
         case ast::BinOp::Eq:  return builder_->CreateICmpEQ(L, R, "eq");
         case ast::BinOp::NotEq: return builder_->CreateICmpNE(L, R, "ne");
+        case ast::BinOp::And: return nullptr; // handled above
         }
         return nullptr;
     }

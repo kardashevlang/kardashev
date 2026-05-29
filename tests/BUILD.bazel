@@ -323,6 +323,14 @@ sh_test(
     ],
 )
 
+# Phase 33: the `%` / `&&` operators (incl. short-circuit) and HashMap/HashSet
+# interior drop + rehash-buffer reclaim (constant-memory probe). JIT + AOT.
+sh_test(
+    name = "smoke_test_phase33",
+    srcs = ["smoke_test_phase33.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

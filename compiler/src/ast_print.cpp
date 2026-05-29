@@ -432,19 +432,22 @@ private:
     //   comparisons = 1, additive = 2, multiplicative = 3.
     static int binOpPrec(BinOp op) {
         switch (op) {
+        case BinOp::And:   // Phase 33: `&&` binds loosest
+            return 1;
         case BinOp::Lt:
         case BinOp::Le:
         case BinOp::Gt:
         case BinOp::Ge:
         case BinOp::Eq:
         case BinOp::NotEq:
-            return 1;
+            return 2;
         case BinOp::Add:
         case BinOp::Sub:
-            return 2;
+            return 3;
         case BinOp::Mul:
         case BinOp::Div:
-            return 3;
+        case BinOp::Mod:
+            return 4;
         }
         return 1;
     }
@@ -455,12 +458,14 @@ private:
         case BinOp::Sub: return "-";
         case BinOp::Mul: return "*";
         case BinOp::Div: return "/";
+        case BinOp::Mod: return "%";
         case BinOp::Lt: return "<";
         case BinOp::Le: return "<=";
         case BinOp::Gt: return ">";
         case BinOp::Ge: return ">=";
         case BinOp::Eq: return "==";
         case BinOp::NotEq: return "!=";
+        case BinOp::And: return "&&";
         }
         return "+";
     }

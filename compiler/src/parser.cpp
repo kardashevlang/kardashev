@@ -1136,19 +1136,22 @@ private:
 
     static int binPrec(TokenKind k) {
         switch (k) {
+        case TokenKind::AmpAmp: // Phase 33: `&&` binds loosest (below comparisons)
+            return 1;
         case TokenKind::EqEq:
         case TokenKind::NotEq:
         case TokenKind::Lt:
         case TokenKind::Le:
         case TokenKind::Gt:
         case TokenKind::Ge:
-            return 1;
+            return 2;
         case TokenKind::Plus:
         case TokenKind::Minus:
-            return 2;
+            return 3;
         case TokenKind::Star:
         case TokenKind::Slash:
-            return 3;
+        case TokenKind::Percent: // Phase 33: `%` at the multiplicative tier
+            return 4;
         default:
             return 0; // not a binop
         }
@@ -1160,6 +1163,8 @@ private:
         case TokenKind::Minus: return ast::BinOp::Sub;
         case TokenKind::Star: return ast::BinOp::Mul;
         case TokenKind::Slash: return ast::BinOp::Div;
+        case TokenKind::Percent: return ast::BinOp::Mod;
+        case TokenKind::AmpAmp: return ast::BinOp::And;
         case TokenKind::Lt: return ast::BinOp::Lt;
         case TokenKind::Le: return ast::BinOp::Le;
         case TokenKind::Gt: return ast::BinOp::Gt;

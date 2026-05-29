@@ -61,6 +61,8 @@ enum class TokenKind {
     Minus,
     Star,
     Slash,
+    Percent,  // % — Phase 33 integer modulo
+    AmpAmp,   // && — Phase 33 short-circuit logical-and
     Lt,
     Le,
     Gt,
