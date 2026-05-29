@@ -1456,6 +1456,22 @@ private:
             return e;
         }
 
+        // Phase 39: f64 literal.
+        if (t.kind == TokenKind::Float) {
+            Token tok = consume();
+            auto e = std::make_unique<ast::FloatLitExpr>();
+            e->line = tok.line;
+            e->column = tok.column;
+            e->lexeme = tok.lexeme;
+            try {
+                e->value = std::stod(tok.lexeme);
+            } catch (const std::exception&) {
+                errorHere("float literal out of range: " + tok.lexeme);
+                e->value = 0.0;
+            }
+            return e;
+        }
+
         if (t.kind == TokenKind::StringLit) {
             Token tok = consume();
             auto e = std::make_unique<ast::StringLitExpr>();

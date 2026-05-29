@@ -377,6 +377,14 @@ sh_test(
     ],
 )
 
+# Phase 39: f64 floating-point — literals, arithmetic/comparison, conversions
+# (to_f64 / float_to_int), Vec<f64>, print_f64. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase39",
+    srcs = ["smoke_test_phase39.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

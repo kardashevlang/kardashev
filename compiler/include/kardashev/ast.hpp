@@ -144,6 +144,13 @@ struct IntLitExpr : Expr {
     std::int64_t value = 0;
 };
 
+// Phase 39: an `f64` floating-point literal (e.g. `1.5`, `-2.0`, `3e8`). The
+// lexeme is kept verbatim; codegen parses it to a `double` ConstantFP.
+struct FloatLitExpr : Expr {
+    std::string lexeme;
+    double value = 0.0;
+};
+
 // Phase 15: `true` / `false` boolean literal. Codegen lowers to an i1
 // constant (1/0); typechecks to `bool`. Mirrors IntLitExpr.
 struct BoolLitExpr : Expr {

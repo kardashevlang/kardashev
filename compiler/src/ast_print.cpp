@@ -507,6 +507,11 @@ private:
             out_ += std::to_string(lit->value);
             return;
         }
+        // Phase 39: f64 literal — emit the original lexeme verbatim.
+        if (auto* fl = dynamic_cast<const FloatLitExpr*>(&e)) {
+            out_ += fl->lexeme;
+            return;
+        }
         // Phase 15: boolean literal.
         if (auto* bl = dynamic_cast<const BoolLitExpr*>(&e)) {
             out_ += bl->value ? "true" : "false";

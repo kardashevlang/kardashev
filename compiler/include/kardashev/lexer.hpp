@@ -22,6 +22,7 @@ namespace kardashev {
 enum class TokenKind {
     // Literals & identifiers
     Integer,
+    Float, // Phase 39: f64 literal — DIGIT+ ('.' DIGIT+)? ([eE][+-]?DIGIT+)?
     StringLit, // Phase 5.y: "..." string literal
     Identifier,
 

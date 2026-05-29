@@ -25,6 +25,26 @@ public:
             sch.declaredEffects.add("io");
             fnSchemas_["print"] = std::move(sch);
         }
+        // Phase 39: f64 conversions + printing.
+        // to_f64(n: i64) -> f64        (signed widen, SIToFP)
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, makeFloat());
+            fnSchemas_["to_f64"] = std::move(sch);
+        }
+        // float_to_int(x: f64) -> i64  (truncation toward zero, FPToSI)
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeFloat()}, makeInt());
+            fnSchemas_["float_to_int"] = std::move(sch);
+        }
+        // print_f64(x: f64) -> i64 ! { io }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeFloat()}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["print_f64"] = std::move(sch);
+        }
 
         // Phase 5.z built-in: `Vec<T>` — a growable buffer with one
         // type parameter. typeArgs at use sites tell codegen which
@@ -1773,6 +1793,7 @@ private:
     // unknown callees (the typechecker already errored on them) we skip.
     void collectEffects(const ast::Expr& e, EffectSet& out) {
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) return;
+        if (dynamic_cast<const ast::FloatLitExpr*>(&e)) return;
         if (dynamic_cast<const ast::BoolLitExpr*>(&e)) return;
         if (dynamic_cast<const ast::StringLitExpr*>(&e)) return;
         if (dynamic_cast<const ast::IdentExpr*>(&e)) return;
@@ -2645,6 +2666,11 @@ private:
                 error("i64 takes no type arguments", tr.line, tr.column);
             return makeInt();
         }
+        if (tr.name == "f64") {
+            if (!tr.typeArgs.empty())
+                error("f64 takes no type arguments", tr.line, tr.column);
+            return makeFloat();
+        }
         // Phase 16: `unit` is the type of a function with no `-> T` return
         // annotation (the parser synthesizes a "unit" TypeRef there). Maps to
         // the unit type — codegen lowers it to `void`.
@@ -3213,6 +3239,9 @@ private:
     TypePtr computeExprType(const ast::Expr& e) {
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) {
             return makeInt();
+        }
+        if (dynamic_cast<const ast::FloatLitExpr*>(&e)) {
+            return makeFloat();
         }
         if (dynamic_cast<const ast::BoolLitExpr*>(&e)) {
             return makeBool();
@@ -4085,6 +4114,27 @@ private:
                                   (bin.op == ast::BinOp::Eq) ||
                                   (bin.op == ast::BinOp::NotEq);
         const char* what = isComparison ? "comparison" : "arithmetic";
+        // Phase 39: f64 arithmetic / comparison. If a side is already f64, both
+        // sides must be f64 — there is NO implicit i64<->f64 coercion (use
+        // to_f64 / float_to_int). `%` is integer-only.
+        if (resolve(lhs)->kind == TypeKind::Float ||
+            resolve(rhs)->kind == TypeKind::Float) {
+            if (bin.op == ast::BinOp::Mod) {
+                error("`%` (modulo) is not defined for f64", bin.line,
+                      bin.column);
+            }
+            if (!unify(lhs, makeFloat())) {
+                error(std::string(what) + " op expects f64 on lhs, got " +
+                          typeToString(lhs),
+                      bin.lhs->line, bin.lhs->column);
+            }
+            if (!unify(rhs, makeFloat())) {
+                error(std::string(what) + " op expects f64 on rhs, got " +
+                          typeToString(rhs),
+                      bin.rhs->line, bin.rhs->column);
+            }
+            return isComparison ? makeBool() : makeFloat();
+        }
         if (!unify(lhs, makeInt())) {
             error(std::string(what) + " op expects i64 on lhs, got " +
                       typeToString(lhs),
@@ -5098,8 +5148,10 @@ private:
         TypePtr operand = checkExpr(*un.operand);
         switch (un.op) {
         case ast::UnaryOp::Neg:
+            // Phase 39: `-x` negates an i64 OR an f64.
+            if (resolve(operand)->kind == TypeKind::Float) return makeFloat();
             if (!unify(operand, makeInt())) {
-                error("unary `-` requires an i64 operand, got " +
+                error("unary `-` requires an i64 or f64 operand, got " +
                           typeToString(operand),
                       un.operand->line, un.operand->column);
             }
@@ -5364,6 +5416,7 @@ private:
         TypePtr r = resolve(t);
         switch (r->kind) {
         case TypeKind::Int:
+        case TypeKind::Float: // Phase 39: f64 is Copy
         case TypeKind::Bool:
         case TypeKind::Unit:
             return true;

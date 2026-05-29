@@ -1096,6 +1096,47 @@ private:
             declaredFns_["print"] = printFn;
         }
 
+        // Phase 39: f64 conversions + print. Trivial casts + a %g print.
+        {
+            auto* dblTy = llvm::Type::getDoubleTy(ctx);
+            // to_f64(i64) -> f64 (SIToFP)
+            {
+                auto* fnTy = llvm::FunctionType::get(dblTy, {i64Ty}, false);
+                auto* fn = llvm::Function::Create(
+                    fnTy, llvm::Function::ExternalLinkage, "to_f64",
+                    module_.get());
+                fn->getArg(0)->setName("n");
+                llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+                b.CreateRet(b.CreateSIToFP(fn->getArg(0), dblTy, "f"));
+                declaredFns_["to_f64"] = fn;
+            }
+            // float_to_int(f64) -> i64 (FPToSI — truncates toward zero)
+            {
+                auto* fnTy = llvm::FunctionType::get(i64Ty, {dblTy}, false);
+                auto* fn = llvm::Function::Create(
+                    fnTy, llvm::Function::ExternalLinkage, "float_to_int",
+                    module_.get());
+                fn->getArg(0)->setName("x");
+                llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+                b.CreateRet(b.CreateFPToSI(fn->getArg(0), i64Ty, "i"));
+                declaredFns_["float_to_int"] = fn;
+            }
+            // print_f64(f64) -> i64 ! { io } : printf("%g\n", x)
+            {
+                auto* fnTy = llvm::FunctionType::get(i64Ty, {dblTy}, false);
+                auto* fn = llvm::Function::Create(
+                    fnTy, llvm::Function::ExternalLinkage, "print_f64",
+                    module_.get());
+                fn->getArg(0)->setName("x");
+                llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+                auto* fmt = b.CreateGlobalString("%g\n", "kd_printf_fmt", 0,
+                                                 module_.get());
+                b.CreateCall(printfFn, {fmt, fn->getArg(0)});
+                b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+                declaredFns_["print_f64"] = fn;
+            }
+        }
+
         // Phase 5.z: vec_* are now generic over T; their bodies are
         // emitted lazily per-T via `getOrEmitVecOp` when a call site
         // demands them. Nothing eager to emit here for vec_*.
@@ -5237,6 +5278,7 @@ private:
         TypePtr r = resolveInInstance(t);
         switch (r->kind) {
             case TypeKind::Int:  return llvm::Type::getInt64Ty(*ctx_);
+            case TypeKind::Float: return llvm::Type::getDoubleTy(*ctx_);
             case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
             case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
             case TypeKind::Ref: {
@@ -5524,6 +5566,7 @@ private:
         TypePtr r = resolve(astTypeRefToConcrete(tr));
         switch (r->kind) {
             case TypeKind::Int:  return llvm::Type::getInt64Ty(*ctx_);
+            case TypeKind::Float: return llvm::Type::getDoubleTy(*ctx_);
             case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
             case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
             case TypeKind::Ref:
@@ -5682,6 +5725,7 @@ private:
         };
         switch (r->kind) {
         case TypeKind::Int:    return "i64";
+        case TypeKind::Float:  return "f64";
         case TypeKind::Bool:   return "bool";
         case TypeKind::Unit:   return "unit";
         case TypeKind::Struct: return r->structName + mangleTypeArgs(r->typeArgs);
@@ -7613,6 +7657,11 @@ private:
                 llvm::Type::getInt64Ty(*ctx_),
                 static_cast<uint64_t>(lit->value), /*isSigned=*/true);
         }
+        // Phase 39: f64 literal -> double ConstantFP.
+        if (auto* fl = dynamic_cast<const ast::FloatLitExpr*>(&e)) {
+            return llvm::ConstantFP::get(llvm::Type::getDoubleTy(*ctx_),
+                                         fl->value);
+        }
         // Phase 15: boolean literal -> i1 constant (1/0).
         if (auto* bl = dynamic_cast<const ast::BoolLitExpr*>(&e)) {
             return llvm::ConstantInt::get(llvm::Type::getInt1Ty(*ctx_),
@@ -8121,7 +8170,9 @@ private:
         llvm::Value* v = emitExpr(*un.operand);
         switch (un.op) {
         case ast::UnaryOp::Neg:
-            return builder_->CreateNeg(v, "neg");
+            // Phase 39: `-x` on an f64 negates with FNeg.
+            return v->getType()->isDoubleTy() ? builder_->CreateFNeg(v, "fneg")
+                                              : builder_->CreateNeg(v, "neg");
         case ast::UnaryOp::Not:
             return builder_->CreateNot(v, "not");
         case ast::UnaryOp::Deref: {
@@ -8162,6 +8213,24 @@ private:
         }
         llvm::Value* L = emitExpr(*bin.lhs);
         llvm::Value* R = emitExpr(*bin.rhs);
+        // Phase 39: f64 operands use floating-point ops (ordered comparisons —
+        // a NaN compares false). `%` never reaches here for f64 (typecheck).
+        if (L->getType()->isDoubleTy()) {
+            switch (bin.op) {
+            case ast::BinOp::Add: return builder_->CreateFAdd(L, R, "fadd");
+            case ast::BinOp::Sub: return builder_->CreateFSub(L, R, "fsub");
+            case ast::BinOp::Mul: return builder_->CreateFMul(L, R, "fmul");
+            case ast::BinOp::Div: return builder_->CreateFDiv(L, R, "fdiv");
+            case ast::BinOp::Lt:  return builder_->CreateFCmpOLT(L, R, "flt");
+            case ast::BinOp::Le:  return builder_->CreateFCmpOLE(L, R, "fle");
+            case ast::BinOp::Gt:  return builder_->CreateFCmpOGT(L, R, "fgt");
+            case ast::BinOp::Ge:  return builder_->CreateFCmpOGE(L, R, "fge");
+            case ast::BinOp::Eq:  return builder_->CreateFCmpOEQ(L, R, "feq");
+            case ast::BinOp::NotEq: return builder_->CreateFCmpUNE(L, R, "fne");
+            case ast::BinOp::Mod:
+            case ast::BinOp::And: return nullptr; // not valid for f64
+            }
+        }
         switch (bin.op) {
         case ast::BinOp::Add: return builder_->CreateAdd(L, R, "add");
         case ast::BinOp::Sub: return builder_->CreateSub(L, R, "sub");
