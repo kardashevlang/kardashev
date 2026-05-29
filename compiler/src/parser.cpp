@@ -261,10 +261,11 @@ private:
     }
 
     ast::FnDecl parseFnDecl() {
-        // Phase 6 (stub): `async fn` optional prefix marks the fn body
-        // for state-machine transform. Today the transform is a no-op
-        // but the typechecker implicitly adds `async` to the effect row.
-        // `async` stays as an Identifier (not a keyword) so it can also
+        // `async fn` optional prefix marks the fn for the Phase-12
+        // state-machine transform (codegen splits it into a resumable poll fn
+        // over a heap frame); the typechecker implicitly adds `async` to the
+        // effect row. `async` stays as an Identifier (not a keyword) so it can
+        // also
         // appear in effect-row labels like `! { async }`; we detect it
         // by lexeme here.
         bool isAsync = false;
@@ -677,6 +678,25 @@ private:
             }
             expect(TokenKind::Gt, ">");
         }
+        // Phase 28: additional bounds `T: A + B + C`. Each extra bound is a
+        // trait name; an optional `<...>` arg list is accepted and discarded
+        // (extra bounds dispatch by trait name — the practical multi-bound
+        // case, Hash + Eq, is non-generic).
+        while (accept(TokenKind::Plus)) {
+            Token extraTok = expect(TokenKind::Identifier,
+                                    "trait name after '+'");
+            tp.extraBounds.push_back(extraTok.lexeme);
+            if (accept(TokenKind::Lt)) {
+                if (!check(TokenKind::Gt)) {
+                    while (true) {
+                        parseTypeRef(); // discard a parameterized extra bound
+                        if (!accept(TokenKind::Comma)) break;
+                        if (check(TokenKind::Gt)) break; // trailing ,
+                    }
+                }
+                expect(TokenKind::Gt, ">");
+            }
+        }
     }
 
     // Helper for fn/struct/enum decls: parse optional `<T1, T2: Bound>`
@@ -739,12 +759,14 @@ private:
                 ast::TypeParam scratch;
                 parseTraitBoundInto(scratch);
             } else if (!target->bound.empty()) {
-                errorAt(std::string("generic parameter '") + nameTok.lexeme +
-                            "' already has a trait bound (only one bound per "
-                            "parameter is supported)",
-                        nameTok.line, nameTok.column);
-                ast::TypeParam scratch;
-                parseTraitBoundInto(scratch);
+                // Phase 28: a second `where` constraint on the same param
+                // accumulates as an extra bound, so `where T: A, T: B` is
+                // equivalent to the inline `T: A + B`.
+                ast::TypeParam tmp;
+                parseTraitBoundInto(tmp);
+                target->extraBounds.push_back(tmp.bound);
+                for (const auto& eb : tmp.extraBounds)
+                    target->extraBounds.push_back(eb);
             } else {
                 parseTraitBoundInto(*target);
             }
@@ -1215,7 +1237,8 @@ private:
         while (true) {
             if (check(TokenKind::Dot)) {
                 Token dotTok = consume();
-                // Phase 6 (stub): `.await` is a postfix operator. We
+                // `.await` is a postfix operator (the suspend point of an
+                // async fn; lowered to a real poll loop in Phase 12). We
                 // recognise `await` by lexeme (it stays an Identifier
                 // so the same word can appear as an effect label).
                 // Distinguish from a field literally named `await` by

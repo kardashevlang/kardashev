@@ -256,6 +256,73 @@ sh_test(
     ],
 )
 
+# Phase 27 string toolkit: str_eq (byte-exact, incl. empty/length-mismatch),
+# str_substring (start/len clamped into bounds), int_to_string (signed decimal),
+# print_no_nl (no trailing newline) + println, and a heap-owned-growth check
+# (string_push_str onto an int_to_string result); through JIT + AOT.
+sh_test(
+    name = "smoke_test_strings",
+    srcs = ["smoke_test_strings.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 28: the Hash + Eq traits, multiple trait bounds (T: A + B), a generic
+# HashMap<K,V> (i64 / String / user-type keys via their Hash+Eq impls), and
+# HashSet<T>; through JIT + AOT, with the non-hashable-key and unknown-bound
+# rejections.
+sh_test(
+    name = "smoke_test_hash",
+    srcs = ["smoke_test_hash.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 29: the documented closure-env and match-payload Drop leaks are
+# plugged — a loop creating + dropping capturing closures, and one matching +
+# dropping heap Strings, both run in constant memory; a payload binding moved
+# out of its arm survives (no UAF). Through JIT + AOT.
+sh_test(
+    name = "smoke_test_dropleaks",
+    srcs = ["smoke_test_dropleaks.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 30: file I/O over Result<_, IoError> (write -> exists -> read+compare
+# round-trip, missing-file -> IoNotFound) and CLI args (args / arg_count /
+# arg_get, with the AOT argv-capture). Through JIT + AOT.
+sh_test(
+    name = "smoke_test_io",
+    srcs = ["smoke_test_io.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 31: the two v5 capstones written in kardashev — a JSON object parser
+# (HashMap<String, i64>) and a kardashev-subset lexer (Vec<Tok> + keyword
+# classification). Builds the SHIPPED example sources, JIT + AOT.
+sh_test(
+    name = "smoke_test_capstones",
+    srcs = ["smoke_test_capstones.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/json:main.kd",
+        "//examples/kdlex:main.kd",
+    ],
+)
+
+# Phase 32: doc-lint truth-pass guard — asserts the rewritten docs/ don't
+# regress to stale v1-era claims and still document the v5 stdlib. (The
+# source-comment "(stub)" check runs in the Makefile build, where the tree is
+# available; here it greps the doc data.)
+sh_test(
+    name = "smoke_test_doclint",
+    srcs = ["smoke_test_doclint.sh"],
+    data = [
+        "//docs:architecture.md",
+        "//docs:effects.md",
+        "//docs:language-reference.md",
+        "//docs:stdlib.md",
+    ],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

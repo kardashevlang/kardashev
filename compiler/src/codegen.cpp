@@ -1253,6 +1253,496 @@ private:
             declaredFns_["print_string"] = fn;
         }
 
+        // --- Phase 27: str_eq(a: &String, b: &String) -> bool ---
+        // Lengths must match; an empty/empty pair is equal without touching
+        // the (possibly null) data pointers; otherwise memcmp the bytes.
+        {
+            auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+            auto* fnTy =
+                llvm::FunctionType::get(i1Ty, {i8PtrTy, i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "str_eq", module_.get());
+            fn->getArg(0)->setName("a");
+            fn->getArg(1)->setName("b");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* cmpBB = llvm::BasicBlock::Create(ctx, "cmp", fn);
+            auto* memBB = llvm::BasicBlock::Create(ctx, "memcmp", fn);
+            auto* trueBB = llvm::BasicBlock::Create(ctx, "eq_true", fn);
+            auto* falseBB = llvm::BasicBlock::Create(ctx, "eq_false", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* aLenP = b.CreateStructGEP(strTy, fn->getArg(0), 1, "a_len_p");
+            auto* bLenP = b.CreateStructGEP(strTy, fn->getArg(1), 1, "b_len_p");
+            auto* aLen = b.CreateLoad(i64Ty, aLenP, "a_len");
+            auto* bLen = b.CreateLoad(i64Ty, bLenP, "b_len");
+            b.CreateCondBr(b.CreateICmpEQ(aLen, bLen, "len_eq"), cmpBB, falseBB);
+            b.SetInsertPoint(cmpBB);
+            b.CreateCondBr(b.CreateICmpEQ(aLen, zeroI64, "empty"), trueBB,
+                           memBB);
+            b.SetInsertPoint(memBB);
+            auto* memcmpTy = llvm::FunctionType::get(
+                i32Ty, {i8PtrTy, i8PtrTy, i64Ty}, false);
+            auto memcmpFn = module_->getOrInsertFunction("memcmp", memcmpTy);
+            auto* aDataP = b.CreateStructGEP(strTy, fn->getArg(0), 0, "a_data_p");
+            auto* bDataP = b.CreateStructGEP(strTy, fn->getArg(1), 0, "b_data_p");
+            auto* aData = b.CreateLoad(i8PtrTy, aDataP, "a_data");
+            auto* bData = b.CreateLoad(i8PtrTy, bDataP, "b_data");
+            auto* r = b.CreateCall(memcmpFn, {aData, bData, aLen}, "memcmp_r");
+            b.CreateRet(
+                b.CreateICmpEQ(r, llvm::ConstantInt::get(i32Ty, 0), "bytes_eq"));
+            b.SetInsertPoint(trueBB);
+            b.CreateRet(llvm::ConstantInt::getTrue(ctx));
+            b.SetInsertPoint(falseBB);
+            b.CreateRet(llvm::ConstantInt::getFalse(ctx));
+            declaredFns_["str_eq"] = fn;
+        }
+
+        // --- Phase 27: str_substring(s: &String, start, len) -> String ---
+        // Clamp start into [0, sLen] and len into [0, sLen-start], then malloc
+        // a fresh heap buffer of the clamped length and memcpy the slice. An
+        // empty result returns {null, 0, 0} (no allocation), like string_new.
+        {
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            auto* fnTy = llvm::FunctionType::get(
+                strTy, {i8PtrTy, i64Ty, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "str_substring",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("start");
+            fn->getArg(2)->setName("len");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* allocBB = llvm::BasicBlock::Create(ctx, "alloc", fn);
+            auto* emptyBB = llvm::BasicBlock::Create(ctx, "empty", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* sDataP = b.CreateStructGEP(strTy, fn->getArg(0), 0, "s_data_p");
+            auto* sLenP = b.CreateStructGEP(strTy, fn->getArg(0), 1, "s_len_p");
+            auto* sData = b.CreateLoad(i8PtrTy, sDataP, "s_data");
+            auto* sLen = b.CreateLoad(i64Ty, sLenP, "s_len");
+            auto* start = fn->getArg(1);
+            auto* len = fn->getArg(2);
+            auto* s0 = b.CreateSelect(
+                b.CreateICmpSLT(start, zeroI64, "start_neg"), zeroI64, start,
+                "s0");
+            auto* cs = b.CreateSelect(
+                b.CreateICmpSGT(s0, sLen, "start_big"), sLen, s0, "cs");
+            auto* maxLen = b.CreateSub(sLen, cs, "max_len");
+            auto* l0 = b.CreateSelect(
+                b.CreateICmpSLT(len, zeroI64, "len_neg"), zeroI64, len, "l0");
+            auto* cl = b.CreateSelect(
+                b.CreateICmpSGT(l0, maxLen, "len_big"), maxLen, l0, "cl");
+            b.CreateCondBr(b.CreateICmpSGT(cl, zeroI64, "has_bytes"), allocBB,
+                           emptyBB);
+            b.SetInsertPoint(allocBB);
+            auto* buf = b.CreateCall(mallocFn_, {cl}, "sub_buf");
+            auto* src = b.CreateGEP(i8Ty, sData, cs, "src");
+            b.CreateCall(memcpyFn_, {buf, src, cl}, "sub_copy");
+            llvm::Value* v = llvm::UndefValue::get(strTy);
+            v = b.CreateInsertValue(v, buf, {0}, "sub_data");
+            v = b.CreateInsertValue(v, cl, {1}, "sub_len");
+            v = b.CreateInsertValue(v, cl, {2}, "sub_cap");
+            b.CreateRet(v);
+            b.SetInsertPoint(emptyBB);
+            llvm::Value* e = llvm::UndefValue::get(strTy);
+            e = b.CreateInsertValue(
+                e, llvm::ConstantPointerNull::get(i8PtrTy), {0}, "e_data");
+            e = b.CreateInsertValue(e, zeroI64, {1}, "e_len");
+            e = b.CreateInsertValue(e, zeroI64, {2}, "e_cap");
+            b.CreateRet(e);
+            declaredFns_["str_substring"] = fn;
+        }
+
+        // --- Phase 27: int_to_string(n: i64) -> String ---
+        // snprintf the decimal form of n into a fresh 24-byte heap buffer (an
+        // i64 is at most 20 digits + sign + NUL = 22 < 24). The returned String
+        // is heap-owned (cap = 24), so a later string_push_str reallocs it.
+        {
+            auto* fnTy = llvm::FunctionType::get(strTy, {i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "int_to_string",
+                module_.get());
+            fn->getArg(0)->setName("n");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* cap = llvm::ConstantInt::get(i64Ty, 24);
+            auto* buf = b.CreateCall(mallocFn_, {cap}, "its_buf");
+            auto* snprintfTy = llvm::FunctionType::get(
+                i32Ty, {i8PtrTy, i64Ty, i8PtrTy}, /*isVarArg=*/true);
+            auto snprintfFn =
+                module_->getOrInsertFunction("snprintf", snprintfTy);
+            auto* fmt = b.CreateGlobalString("%lld", "kd_itos_fmt", 0,
+                                             module_.get());
+            auto* written = b.CreateCall(
+                snprintfFn, {buf, cap, fmt, fn->getArg(0)}, "its_written");
+            auto* len = b.CreateSExt(written, i64Ty, "its_len");
+            llvm::Value* v = llvm::UndefValue::get(strTy);
+            v = b.CreateInsertValue(v, buf, {0}, "its_data");
+            v = b.CreateInsertValue(v, len, {1}, "its_len_f");
+            v = b.CreateInsertValue(v, cap, {2}, "its_cap");
+            b.CreateRet(v);
+            declaredFns_["int_to_string"] = fn;
+        }
+
+        // --- Phase 27: print_no_nl(s: &String) -> i64 (no trailing newline) ---
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "print_no_nl",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* dataPtr = b.CreateStructGEP(strTy, fn->getArg(0), 0, "data_p");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* lenPtr = b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_p");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* lenI32 = b.CreateTrunc(len, i32Ty, "len_i32");
+            auto* fmt = b.CreateGlobalString("%.*s", "kd_print_nonl_fmt", 0,
+                                             module_.get());
+            b.CreateCall(printfFn, {fmt, lenI32, data});
+            b.CreateRet(zeroI64);
+            declaredFns_["print_no_nl"] = fn;
+        }
+
+        // --- Phase 27: println(s: &String) -> i64 (newline-terminated) ---
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "println", module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* dataPtr = b.CreateStructGEP(strTy, fn->getArg(0), 0, "data_p");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* lenPtr = b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_p");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* lenI32 = b.CreateTrunc(len, i32Ty, "len_i32");
+            auto* fmt = b.CreateGlobalString("%.*s\n", "kd_println_fmt", 0,
+                                             module_.get());
+            b.CreateCall(printfFn, {fmt, lenI32, data});
+            b.CreateRet(zeroI64);
+            declaredFns_["println"] = fn;
+        }
+
+        // --- Phase 28: hash_i64(s: &i64) -> i64 (identity hash) ---
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "hash_i64",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            b.CreateRet(b.CreateLoad(i64Ty, fn->getArg(0), "v"));
+            declaredFns_["hash_i64"] = fn;
+        }
+
+        // --- Phase 28: int_eq(a: &i64, b: &i64) -> bool ---
+        {
+            auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+            auto* fnTy =
+                llvm::FunctionType::get(i1Ty, {i8PtrTy, i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "int_eq", module_.get());
+            fn->getArg(0)->setName("a");
+            fn->getArg(1)->setName("b");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* av = b.CreateLoad(i64Ty, fn->getArg(0), "av");
+            auto* bv = b.CreateLoad(i64Ty, fn->getArg(1), "bv");
+            b.CreateRet(b.CreateICmpEQ(av, bv, "int_eq"));
+            declaredFns_["int_eq"] = fn;
+        }
+
+        // --- Phase 28: hash_string(s: &String) -> i64 (FNV-1a) ---
+        // h = 0xcbf29ce484222325; for each byte: h = (h ^ byte) * 0x100000001b3.
+        // The multiply wraps mod 2^64 (fine for hashing); the result is used as
+        // a signed i64 bucket index after the container's (h%cap+cap)%cap.
+        {
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "hash_string",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* condBB = llvm::BasicBlock::Create(ctx, "cond", fn);
+            auto* bodyBB = llvm::BasicBlock::Create(ctx, "body", fn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "done", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* hSlot = b.CreateAlloca(i64Ty, nullptr, "h");
+            auto* iSlot = b.CreateAlloca(i64Ty, nullptr, "i");
+            b.CreateStore(
+                llvm::ConstantInt::get(i64Ty, 1469598103934665603ULL), hSlot);
+            b.CreateStore(zeroI64, iSlot);
+            auto* dataPtr = b.CreateStructGEP(strTy, fn->getArg(0), 0, "data_p");
+            auto* lenPtr = b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_p");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            b.CreateBr(condBB);
+            b.SetInsertPoint(condBB);
+            auto* i = b.CreateLoad(i64Ty, iSlot, "i_cur");
+            b.CreateCondBr(b.CreateICmpSLT(i, len, "more"), bodyBB, doneBB);
+            b.SetInsertPoint(bodyBB);
+            auto* bytePtr = b.CreateGEP(i8Ty, data, i, "byte_p");
+            auto* byte = b.CreateZExt(b.CreateLoad(i8Ty, bytePtr, "byte"), i64Ty,
+                                      "byte64");
+            auto* h = b.CreateLoad(i64Ty, hSlot, "h_cur");
+            auto* mixed =
+                b.CreateMul(b.CreateXor(h, byte, "hxor"),
+                            llvm::ConstantInt::get(i64Ty, 1099511628211ULL),
+                            "hmul");
+            b.CreateStore(mixed, hSlot);
+            b.CreateStore(b.CreateAdd(i, llvm::ConstantInt::get(i64Ty, 1),
+                                      "i_next"),
+                          iSlot);
+            b.CreateBr(condBB);
+            b.SetInsertPoint(doneBB);
+            b.CreateRet(b.CreateLoad(i64Ty, hSlot, "h_final"));
+            declaredFns_["hash_string"] = fn;
+        }
+
+        // --- Phase 30: file I/O + CLI args runtime ---
+        // Low-level builtins returning a status category (0=ok, 1=not-found,
+        // 2=permission-denied, 4=other) classified PORTABLY via access() — no
+        // libc errno symbol is referenced, so the same IR links on Linux and
+        // macOS. The prelude wraps these in Result<_, IoError> / Vec<String>.
+        // Emitted ONLY when the program references one of these builtins (this
+        // runtime calls libc free/fopen), so I/O-free programs — and the
+        // codegen unit tests asserting "no @free for scalars" — stay clean.
+        if (tc_.usesFileIo) {
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            auto* nullPtr = llvm::ConstantPointerNull::get(i8PtrTy);
+            auto accessFn = module_->getOrInsertFunction(
+                "access",
+                llvm::FunctionType::get(i32Ty, {i8PtrTy, i32Ty}, false));
+            auto fopenFn = module_->getOrInsertFunction(
+                "fopen",
+                llvm::FunctionType::get(i8PtrTy, {i8PtrTy, i8PtrTy}, false));
+            auto fseekFn = module_->getOrInsertFunction(
+                "fseek",
+                llvm::FunctionType::get(i32Ty, {i8PtrTy, i64Ty, i32Ty}, false));
+            auto ftellFn = module_->getOrInsertFunction(
+                "ftell", llvm::FunctionType::get(i64Ty, {i8PtrTy}, false));
+            auto freadFn = module_->getOrInsertFunction(
+                "fread", llvm::FunctionType::get(
+                             i64Ty, {i8PtrTy, i64Ty, i64Ty, i8PtrTy}, false));
+            auto fwriteFn = module_->getOrInsertFunction(
+                "fwrite", llvm::FunctionType::get(
+                              i64Ty, {i8PtrTy, i64Ty, i64Ty, i8PtrTy}, false));
+            auto fcloseFn = module_->getOrInsertFunction(
+                "fclose", llvm::FunctionType::get(i32Ty, {i8PtrTy}, false));
+            auto strlenFn = module_->getOrInsertFunction(
+                "strlen", llvm::FunctionType::get(i64Ty, {i8PtrTy}, false));
+            auto* i32_0 = llvm::ConstantInt::get(i32Ty, 0); // F_OK / SEEK_SET
+            auto* i32_2 = llvm::ConstantInt::get(i32Ty, 2); // W_OK / SEEK_END
+            auto* i32_4 = llvm::ConstantInt::get(i32Ty, 4); // R_OK
+            auto* one64 = llvm::ConstantInt::get(i64Ty, 1);
+
+            // argv capture: stored by the AOT C-main wrapper, which runs
+            // AFTER the O2 pipeline — so these MUST be ExternalLinkage, else
+            // the optimizer (seeing no in-module store yet) would constant-fold
+            // an internal global to its 0/null initializer. JIT never runs the
+            // wrapper, so the loads observe the 0/null defaults => zero args.
+            auto* argcG = new llvm::GlobalVariable(
+                *module_, i64Ty, false, llvm::GlobalValue::ExternalLinkage,
+                zeroI64, "__kd_argc");
+            auto* argvG = new llvm::GlobalVariable(
+                *module_, i8PtrTy, false, llvm::GlobalValue::ExternalLinkage,
+                nullPtr, "__kd_argv");
+
+            // __kd_cstr(&String) -> i8* : a malloc'd NUL-terminated copy of the
+            // string bytes (kardashev Strings carry no terminator). Caller frees.
+            llvm::Function* cstrFn;
+            {
+                auto* ft = llvm::FunctionType::get(i8PtrTy, {i8PtrTy}, false);
+                cstrFn = llvm::Function::Create(
+                    ft, llvm::Function::InternalLinkage, "__kd_cstr",
+                    module_.get());
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", cstrFn);
+                llvm::IRBuilder<> b(e);
+                auto* s = cstrFn->getArg(0);
+                auto* data = b.CreateLoad(
+                    i8PtrTy, b.CreateStructGEP(strTy, s, 0, "dp"), "data");
+                auto* len = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(strTy, s, 1, "lp"), "len");
+                auto* buf = b.CreateCall(
+                    mallocFn_, {b.CreateAdd(len, one64, "len1")}, "cbuf");
+                b.CreateCall(memcpyFn_, {buf, data, len});
+                b.CreateStore(llvm::ConstantInt::get(i8Ty, 0),
+                              b.CreateGEP(i8Ty, buf, len, "nulp"));
+                b.CreateRet(buf);
+            }
+
+            // arg_count() -> i64
+            {
+                auto* ft = llvm::FunctionType::get(i64Ty, {}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "arg_count",
+                    module_.get());
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                llvm::IRBuilder<> b(e);
+                b.CreateRet(b.CreateLoad(i64Ty, argcG, "argc"));
+                declaredFns_["arg_count"] = fn;
+            }
+
+            // arg_get(i: i64) -> String (borrowed view of argv[i], cap 0)
+            {
+                auto* ft = llvm::FunctionType::get(strTy, {i64Ty}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "arg_get",
+                    module_.get());
+                fn->getArg(0)->setName("i");
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* okBB = llvm::BasicBlock::Create(ctx, "inrange", fn);
+                auto* emptyBB = llvm::BasicBlock::Create(ctx, "empty", fn);
+                llvm::IRBuilder<> b(e);
+                auto* i = fn->getArg(0);
+                auto* argc = b.CreateLoad(i64Ty, argcG, "argc");
+                auto* inr = b.CreateAnd(b.CreateICmpSGE(i, zeroI64, "ge0"),
+                                        b.CreateICmpSLT(i, argc, "lt"), "inr");
+                b.CreateCondBr(inr, okBB, emptyBB);
+                b.SetInsertPoint(okBB);
+                auto* argv = b.CreateLoad(i8PtrTy, argvG, "argv");
+                auto* cstr = b.CreateLoad(
+                    i8PtrTy, b.CreateGEP(i8PtrTy, argv, i, "slotp"), "cstr");
+                auto* len = b.CreateCall(strlenFn, {cstr}, "len");
+                llvm::Value* v = llvm::UndefValue::get(strTy);
+                v = b.CreateInsertValue(v, cstr, {0}, "d");
+                v = b.CreateInsertValue(v, len, {1}, "l");
+                v = b.CreateInsertValue(v, zeroI64, {2}, "c");
+                b.CreateRet(v);
+                b.SetInsertPoint(emptyBB);
+                llvm::Value* e2 = llvm::UndefValue::get(strTy);
+                e2 = b.CreateInsertValue(e2, nullPtr, {0}, "d");
+                e2 = b.CreateInsertValue(e2, zeroI64, {1}, "l");
+                e2 = b.CreateInsertValue(e2, zeroI64, {2}, "c");
+                b.CreateRet(e2);
+                declaredFns_["arg_get"] = fn;
+            }
+
+            // fs_exists(&String) -> bool : access(path, F_OK) == 0
+            {
+                auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+                auto* ft = llvm::FunctionType::get(i1Ty, {i8PtrTy}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "fs_exists",
+                    module_.get());
+                fn->getArg(0)->setName("path");
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                llvm::IRBuilder<> b(e);
+                auto* cp = b.CreateCall(cstrFn, {fn->getArg(0)}, "cp");
+                auto* r = b.CreateCall(accessFn, {cp, i32_0}, "acc");
+                b.CreateCall(freeFn_, {cp});
+                b.CreateRet(b.CreateICmpEQ(r, i32_0, "exists"));
+                declaredFns_["fs_exists"] = fn;
+            }
+
+            // fs_read_into(path: &String, out: &mut String) -> i64
+            {
+                auto* ft =
+                    llvm::FunctionType::get(i64Ty, {i8PtrTy, i8PtrTy}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "fs_read_into",
+                    module_.get());
+                fn->getArg(0)->setName("path");
+                fn->getArg(1)->setName("out");
+                auto* path = fn->getArg(0);
+                auto* out = fn->getArg(1);
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* okBB = llvm::BasicBlock::Create(ctx, "opened", fn);
+                auto* errBB = llvm::BasicBlock::Create(ctx, "openerr", fn);
+                auto* hasBB = llvm::BasicBlock::Create(ctx, "hasbytes", fn);
+                auto* emptyBB = llvm::BasicBlock::Create(ctx, "emptyfile", fn);
+                llvm::IRBuilder<> b(e);
+                auto* cp = b.CreateCall(cstrFn, {path}, "cp");
+                auto* rb =
+                    b.CreateGlobalString("rb", "kd_mode_rb", 0, module_.get());
+                auto* f = b.CreateCall(fopenFn, {cp, rb}, "f");
+                b.CreateCall(freeFn_, {cp});
+                b.CreateCondBr(b.CreateICmpNE(f, nullPtr, "opened"), okBB,
+                               errBB);
+                b.SetInsertPoint(errBB);
+                auto* cp2 = b.CreateCall(cstrFn, {path}, "cp2");
+                auto* ex = b.CreateCall(accessFn, {cp2, i32_0}, "ex"); // F_OK
+                auto* rd = b.CreateCall(accessFn, {cp2, i32_4}, "rd"); // R_OK
+                b.CreateCall(freeFn_, {cp2});
+                auto* cat = b.CreateSelect(
+                    b.CreateICmpNE(ex, i32_0, "noexist"),
+                    llvm::ConstantInt::get(i64Ty, 1),
+                    b.CreateSelect(b.CreateICmpNE(rd, i32_0, "noread"),
+                                   llvm::ConstantInt::get(i64Ty, 2),
+                                   llvm::ConstantInt::get(i64Ty, 4), "c2"),
+                    "cat");
+                b.CreateRet(cat);
+                b.SetInsertPoint(okBB);
+                b.CreateCall(fseekFn, {f, zeroI64, i32_2}); // SEEK_END
+                auto* size = b.CreateCall(ftellFn, {f}, "size");
+                b.CreateCall(fseekFn, {f, zeroI64, i32_0}); // SEEK_SET
+                b.CreateCondBr(b.CreateICmpSGT(size, zeroI64, "has"), hasBB,
+                               emptyBB);
+                b.SetInsertPoint(hasBB);
+                auto* buf = b.CreateCall(mallocFn_, {size}, "buf");
+                b.CreateCall(freadFn, {buf, one64, size, f});
+                b.CreateCall(fcloseFn, {f});
+                b.CreateStore(buf, b.CreateStructGEP(strTy, out, 0, "od"));
+                b.CreateStore(size, b.CreateStructGEP(strTy, out, 1, "ol"));
+                b.CreateStore(size, b.CreateStructGEP(strTy, out, 2, "oc"));
+                b.CreateRet(zeroI64);
+                b.SetInsertPoint(emptyBB);
+                b.CreateCall(fcloseFn, {f});
+                b.CreateStore(nullPtr, b.CreateStructGEP(strTy, out, 0, "od2"));
+                b.CreateStore(zeroI64, b.CreateStructGEP(strTy, out, 1, "ol2"));
+                b.CreateStore(zeroI64, b.CreateStructGEP(strTy, out, 2, "oc2"));
+                b.CreateRet(zeroI64);
+                declaredFns_["fs_read_into"] = fn;
+            }
+
+            // fs_write_raw(path: &String, contents: &String) -> i64
+            {
+                auto* ft =
+                    llvm::FunctionType::get(i64Ty, {i8PtrTy, i8PtrTy}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "fs_write_raw",
+                    module_.get());
+                fn->getArg(0)->setName("path");
+                fn->getArg(1)->setName("contents");
+                auto* path = fn->getArg(0);
+                auto* contents = fn->getArg(1);
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* okBB = llvm::BasicBlock::Create(ctx, "opened", fn);
+                auto* errBB = llvm::BasicBlock::Create(ctx, "openerr", fn);
+                llvm::IRBuilder<> b(e);
+                auto* cp = b.CreateCall(cstrFn, {path}, "cp");
+                auto* wb =
+                    b.CreateGlobalString("wb", "kd_mode_wb", 0, module_.get());
+                auto* f = b.CreateCall(fopenFn, {cp, wb}, "f");
+                b.CreateCall(freeFn_, {cp});
+                b.CreateCondBr(b.CreateICmpNE(f, nullPtr, "opened"), okBB,
+                               errBB);
+                b.SetInsertPoint(errBB);
+                auto* cp2 = b.CreateCall(cstrFn, {path}, "cp2");
+                auto* ex = b.CreateCall(accessFn, {cp2, i32_0}, "ex");
+                auto* wr = b.CreateCall(accessFn, {cp2, i32_2}, "wr"); // W_OK
+                b.CreateCall(freeFn_, {cp2});
+                auto* perm = b.CreateAnd(b.CreateICmpEQ(ex, i32_0, "exists"),
+                                         b.CreateICmpNE(wr, i32_0, "nowrite"),
+                                         "perm");
+                b.CreateRet(b.CreateSelect(
+                    perm, llvm::ConstantInt::get(i64Ty, 2),
+                    llvm::ConstantInt::get(i64Ty, 4), "cat"));
+                b.SetInsertPoint(okBB);
+                auto* data = b.CreateLoad(
+                    i8PtrTy, b.CreateStructGEP(strTy, contents, 0, "cd"),
+                    "data");
+                auto* len = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(strTy, contents, 1, "cl"), "len");
+                b.CreateCall(fwriteFn, {data, one64, len, f});
+                b.CreateCall(fcloseFn, {f});
+                b.CreateRet(zeroI64);
+                declaredFns_["fs_write_raw"] = fn;
+            }
+        }
+
         // --- Phase 13b: slice read ops. A slice value is the {ptr,len} fat
         // pointer produced by `&v[a..b]` (emitSlice). Both ops take the slice
         // BY VALUE (a 16-byte aggregate). MVP element = i64; slice_get uses an
@@ -1322,6 +1812,12 @@ private:
         auto* hmTy = llvm::StructType::create(
             ctx, {i8PtrTy, i64Ty, i64Ty}, "HashMap");
         structTypes_["HashMap"] = hmTy;
+        // Phase 28: HashSet IS a HashMap-with-a-dummy-value at runtime, so it
+        // shares the identical LLVM type (the two stay nominally distinct only
+        // in the kardashev type system, which drives dispatch via the callee
+        // name). Sharing the LLVM type keeps `hashset_new` returning the same
+        // struct the underlying `hashmap_new` produces.
+        structTypes_["HashSet"] = hmTy;
     }
 
     // Phase 17b: build the concrete `Option<V>` Kardashev TypePtr by
@@ -1347,8 +1843,46 @@ private:
     // `hashmap_get__<V>`, `hashmap_len__<V>`) over a per-V bucket entry
     // `{ i64 state, i64 key, V value }`, then return the one named by `op`.
     // Mirrors getOrEmitVecOp; the `%HashMap` struct itself stays single-layout.
-    llvm::Function* getOrEmitHashMapOp(const std::string& op, const TypePtr& V) {
-        std::string vMangle = mangleType(V);
+    // Phase 28: the AST-style type name of a HashMap key, matching
+    // implMethodMangle's forType.name, so a user key type's Hash/Eq impl can be
+    // found. i64/String are special-cased by the caller, so this is only
+    // consulted for user key types.
+    std::string keyTypeName(const TypePtr& K) {
+        TypePtr k = resolve(K);
+        if (k->kind == TypeKind::Struct) return k->structName;
+        if (k->kind == TypeKind::Enum) return k->enumName;
+        if (k->kind == TypeKind::Int) return "i64";
+        if (k->kind == TypeKind::Bool) return "bool";
+        return "";
+    }
+    // hash(&K) -> i64 for a non-i64 key: the hash_string builtin for String,
+    // else the user's `impl Hash for K` method. Null if none is available.
+    llvm::Function* keyHashFn(const TypePtr& K) {
+        TypePtr k = resolve(K);
+        if (k->kind == TypeKind::Struct && k->structName == "String")
+            return declaredFns_.count("hash_string") ? declaredFns_["hash_string"]
+                                                      : nullptr;
+        auto it =
+            declaredFns_.find("__impl_Hash_for_" + keyTypeName(K) + "__hash");
+        return it != declaredFns_.end() ? it->second : nullptr;
+    }
+    // eq(&K, &K) -> bool for a non-i64 key: the str_eq builtin for String, else
+    // the user's `impl Eq for K` method. Null if none is available.
+    llvm::Function* keyEqFn(const TypePtr& K) {
+        TypePtr k = resolve(K);
+        if (k->kind == TypeKind::Struct && k->structName == "String")
+            return declaredFns_.count("str_eq") ? declaredFns_["str_eq"]
+                                                : nullptr;
+        auto it = declaredFns_.find("__impl_Eq_for_" + keyTypeName(K) + "__eq");
+        return it != declaredFns_.end() ? it->second : nullptr;
+    }
+
+    llvm::Function* getOrEmitHashMapOp(const std::string& op, const TypePtr& K,
+                                       const TypePtr& V) {
+        // The per-specialization suffix now covers BOTH key and value, so all
+        // the `"...__" + vMangle` symbol names + the bucket-entry struct pick
+        // up K automatically (K=i64 keeps the historic `{state,i64,V}` layout).
+        std::string vMangle = mangleType(K) + "_" + mangleType(V);
         std::string want = op + "__" + vMangle;
         if (auto it = declaredFns_.find(want); it != declaredFns_.end())
             return it->second;
@@ -1359,10 +1893,46 @@ private:
         auto* zero = llvm::ConstantInt::get(i64Ty, 0);
         auto* one = llvm::ConstantInt::get(i64Ty, 1);
         auto* hmTy = structTypes_["HashMap"];
+        auto* keyTy = mapKardashevType(K);
         auto* valTy = mapKardashevType(V);
-        // entry = { i64 state, i64 key, V value }
+        // Phase 28: i64 keys probe/compare inline (identity hash + icmp), byte
+        // -identical to the historic i64-only HashMap. Any other key hashes via
+        // hash(&K)->i64 and compares via eq(&K,&K)->bool (String builtins or a
+        // user Hash/Eq impl).
+        bool keyIsInt = resolve(K)->kind == TypeKind::Int;
+        llvm::Function* hashFn = keyIsInt ? nullptr : keyHashFn(K);
+        llvm::Function* eqFn = keyIsInt ? nullptr : keyEqFn(K);
+        if (!keyIsInt && (!hashFn || !eqFn)) {
+            errors_.push_back(
+                "codegen: HashMap key type '" + keyTypeName(K) +
+                "' lacks a Hash/Eq impl");
+            return nullptr;
+        }
+        // entry = { i64 state, K key, V value }
         auto* entryTy = llvm::StructType::create(
-            ctx, {i64Ty, i64Ty, valTy}, "kd.hm_entry." + vMangle);
+            ctx, {i64Ty, keyTy, valTy}, "kd.hm_entry." + vMangle);
+
+        // Probe-start index ((hash(k) % cap) + cap) % cap. `kSlot` (an alloca
+        // holding the key) is only read when K is not i64.
+        auto emitStart = [&](llvm::IRBuilder<>& b, llvm::Value* kVal,
+                             llvm::Value* kSlot,
+                             llvm::Value* cap) -> llvm::Value* {
+            llvm::Value* h =
+                keyIsInt ? kVal : b.CreateCall(hashFn, {kSlot}, "kh");
+            auto* rem = b.CreateSRem(h, cap, "rem");
+            auto* plus = b.CreateAdd(rem, cap, "plus");
+            return b.CreateURem(plus, cap, "start");
+        };
+        // i1: does the stored key at `keyPtr` equal the probe key?
+        auto emitEq = [&](llvm::IRBuilder<>& b, llvm::Value* kVal,
+                          llvm::Value* kSlot,
+                          llvm::Value* keyPtr) -> llvm::Value* {
+            if (keyIsInt) {
+                auto* cur = b.CreateLoad(i64Ty, keyPtr, "curKey");
+                return b.CreateICmpEQ(cur, kVal, "keyEq");
+            }
+            return b.CreateCall(eqFn, {kSlot, keyPtr}, "keyEq");
+        };
 
         // __hm_raw_insert__<V>(buckets: i8*, cap: i64, k: i64, v: V) -> i64.
         // Linear-probe from k % cap; if it finds the key, overwrite value and
@@ -1371,7 +1941,7 @@ private:
         // least one empty slot exists (guaranteed by the load-factor grow).
         {
             auto* fnTy = llvm::FunctionType::get(
-                i64Ty, {i8PtrTy, i64Ty, i64Ty, valTy}, false);
+                i64Ty, {i8PtrTy, i64Ty, keyTy, valTy}, false);
             auto* fn = llvm::Function::Create(
                 fnTy, llvm::Function::ExternalLinkage,
                 "__hm_raw_insert__" + vMangle, module_.get());
@@ -1391,13 +1961,14 @@ private:
             auto* hitBB = llvm::BasicBlock::Create(ctx, "hit", fn);
             auto* nextBB = llvm::BasicBlock::Create(ctx, "next", fn);
             llvm::IRBuilder<> b(entry);
+            // Spill the key once (for non-i64 Hash/Eq calls); reused in probe.
+            llvm::Value* kSlot = nullptr;
+            if (!keyIsInt) {
+                kSlot = b.CreateAlloca(keyTy, nullptr, "kslot");
+                b.CreateStore(k, kSlot);
+            }
             auto* idxSlot = b.CreateAlloca(i64Ty, nullptr, "idx");
-            // start = ((k % cap) + cap) % cap  — urem keeps it in range for
-            // non-negative; for negative keys the extra +cap,%cap normalizes.
-            auto* rem = b.CreateSRem(k, cap, "rem");
-            auto* plus = b.CreateAdd(rem, cap, "plus");
-            auto* start = b.CreateURem(plus, cap, "start");
-            b.CreateStore(start, idxSlot);
+            b.CreateStore(emitStart(b, k, kSlot, cap), idxSlot);
             b.CreateBr(loopBB);
 
             b.SetInsertPoint(loopBB);
@@ -1418,8 +1989,7 @@ private:
 
             b.SetInsertPoint(checkBB);
             auto* keyP2 = b.CreateStructGEP(entryTy, eptr, 1, "keyP2");
-            auto* curKey = b.CreateLoad(i64Ty, keyP2, "curKey");
-            auto* keyEq = b.CreateICmpEQ(curKey, k, "keyEq");
+            auto* keyEq = emitEq(b, k, kSlot, keyP2);
             b.CreateCondBr(keyEq, hitBB, notEmptyBB);
 
             b.SetInsertPoint(hitBB);
@@ -1465,7 +2035,7 @@ private:
             auto* rawInsert = declaredFns_["__hm_raw_insert__" + vMangle];
 
             auto* fnTy = llvm::FunctionType::get(
-                i64Ty, {i8PtrTy, i64Ty, valTy}, false);
+                i64Ty, {i8PtrTy, keyTy, valTy}, false);
             auto* fn = llvm::Function::Create(
                 fnTy, llvm::Function::ExternalLinkage,
                 "hashmap_insert__" + vMangle, module_.get());
@@ -1535,7 +2105,7 @@ private:
 
             b.SetInsertPoint(rehashOcc);
             auto* okeyP = b.CreateStructGEP(entryTy, oeptr, 1, "okeyP");
-            auto* okey = b.CreateLoad(i64Ty, okeyP, "okey");
+            auto* okey = b.CreateLoad(keyTy, okeyP, "okey");
             auto* ovalP = b.CreateStructGEP(entryTy, oeptr, 2, "ovalP");
             auto* oval = b.CreateLoad(valTy, ovalP, "oval");
             b.CreateCall(rawInsert, {newBuf, newCap, okey, oval}, "");
@@ -1588,7 +2158,7 @@ private:
             auto* i32Ty = llvm::Type::getInt32Ty(ctx);
 
             auto* fnTy = llvm::FunctionType::get(
-                optLlvm, {i8PtrTy, i64Ty}, false);
+                optLlvm, {i8PtrTy, keyTy}, false);
             auto* fn = llvm::Function::Create(
                 fnTy, llvm::Function::ExternalLinkage,
                 "hashmap_get__" + vMangle, module_.get());
@@ -1613,20 +2183,23 @@ private:
 
             llvm::IRBuilder<> b(entry);
             auto* idxSlot = b.CreateAlloca(i64Ty, nullptr, "idx");
+            // Spill the key once for non-i64 Hash/Eq calls (reused in probe).
+            llvm::Value* kSlot = nullptr;
+            if (!keyIsInt) {
+                kSlot = b.CreateAlloca(keyTy, nullptr, "kslot");
+                b.CreateStore(k, kSlot);
+            }
             auto* bucketsP = b.CreateStructGEP(hmTy, mPtr, 0, "bucketsP");
             auto* capP = b.CreateStructGEP(hmTy, mPtr, 2, "capP");
             auto* cap = b.CreateLoad(i64Ty, capP, "cap");
             auto* buckets = b.CreateLoad(i8PtrTy, bucketsP, "buckets");
             auto* capZero = b.CreateICmpEQ(cap, zero, "capZero");
-            // Seed idxSlot = ((k % cap)+cap)%cap, but guard the modulo: when
-            // cap==0 we'd divide by zero, so branch to None first.
+            // Seed idxSlot = ((hash(k) % cap)+cap)%cap, but guard the modulo:
+            // when cap==0 we'd divide by zero, so branch to None first.
             auto* nonZeroBB = llvm::BasicBlock::Create(ctx, "nonzero", fn);
             b.CreateCondBr(capZero, noneBB, nonZeroBB);
             b.SetInsertPoint(nonZeroBB);
-            auto* rem = b.CreateSRem(k, cap, "rem");
-            auto* plus = b.CreateAdd(rem, cap, "plus");
-            auto* start = b.CreateURem(plus, cap, "start");
-            b.CreateStore(start, idxSlot);
+            b.CreateStore(emitStart(b, k, kSlot, cap), idxSlot);
             b.CreateBr(loopBB);
 
             b.SetInsertPoint(loopBB);
@@ -1642,8 +2215,7 @@ private:
 
             b.SetInsertPoint(checkBB);
             auto* keyP = b.CreateStructGEP(entryTy, eptr, 1, "keyP");
-            auto* curKey = b.CreateLoad(i64Ty, keyP, "curKey");
-            auto* keyEq = b.CreateICmpEQ(curKey, k, "keyEq");
+            auto* keyEq = emitEq(b, k, kSlot, keyP);
             b.CreateCondBr(keyEq, hitBB, stepBB);
 
             b.SetInsertPoint(hitBB);
@@ -1679,6 +2251,95 @@ private:
         }
 
         // All five are now emitted for this V; return the requested one.
+        auto it = declaredFns_.find(want);
+        return it != declaredFns_.end() ? it->second : nullptr;
+    }
+
+    // Phase 28: HashSet<T> ops, layered on the generic HashMap<T, i64> table
+    // (a dummy i64 value). Emits new/insert/contains/len on first use for
+    // element type T and returns the requested one. %HashSet has the same
+    // layout as %HashMap, so a &HashSet pointer flows straight to the map ops.
+    llvm::Function* getOrEmitHashSetOp(const std::string& op, const TypePtr& T) {
+        std::string suffix = mangleType(T);
+        std::string want = op + "__set_" + suffix;
+        if (auto it = declaredFns_.find(want); it != declaredFns_.end())
+            return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* hsTy = structTypes_["HashSet"];
+        auto* elemTy = mapKardashevType(T);
+        TypePtr i64T = makeInt();
+        llvm::Function* mapNew = getOrEmitHashMapOp("hashmap_new", T, i64T);
+        llvm::Function* mapInsert =
+            getOrEmitHashMapOp("hashmap_insert", T, i64T);
+        llvm::Function* mapGet = getOrEmitHashMapOp("hashmap_get", T, i64T);
+        llvm::Function* mapLen = getOrEmitHashMapOp("hashmap_len", T, i64T);
+        if (!mapNew || !mapInsert || !mapGet || !mapLen) return nullptr;
+
+        // hashset_new() -> HashSet
+        {
+            auto* fnTy = llvm::FunctionType::get(hsTy, {}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashset_new__set_" + suffix, module_.get());
+            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(e);
+            b.CreateRet(b.CreateCall(mapNew, {}, "m"));
+            declaredFns_["hashset_new__set_" + suffix] = fn;
+        }
+        // hashset_insert(s, k) -> i64 : insert k with a dummy value 1.
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i8PtrTy, elemTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashset_insert__set_" + suffix, module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("k");
+            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(e);
+            b.CreateCall(mapInsert,
+                         {fn->getArg(0), fn->getArg(1),
+                          llvm::ConstantInt::get(i64Ty, 1)},
+                         "ins");
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_["hashset_insert__set_" + suffix] = fn;
+        }
+        // hashset_len(s) -> i64
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashset_len__set_" + suffix, module_.get());
+            fn->getArg(0)->setName("s");
+            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(e);
+            b.CreateRet(b.CreateCall(mapLen, {fn->getArg(0)}, "len"));
+            declaredFns_["hashset_len__set_" + suffix] = fn;
+        }
+        // hashset_contains(s, k) -> bool : get(k) is Some?
+        {
+            TypePtr optTy = optionType(i64T);
+            unsigned someIdx = variantIndexInEnum(optTy, "Some");
+            auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+            auto* fnTy =
+                llvm::FunctionType::get(i1Ty, {i8PtrTy, elemTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashset_contains__set_" + suffix, module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("k");
+            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(e);
+            auto* opt =
+                b.CreateCall(mapGet, {fn->getArg(0), fn->getArg(1)}, "opt");
+            auto* disc = b.CreateExtractValue(opt, {0}, "disc");
+            b.CreateRet(b.CreateICmpEQ(
+                disc, llvm::ConstantInt::get(i32Ty, someIdx), "found"));
+            declaredFns_["hashset_contains__set_" + suffix] = fn;
+        }
         auto it = declaredFns_.find(want);
         return it != declaredFns_.end() ? it->second : nullptr;
     }
@@ -3937,7 +4598,7 @@ private:
                 // that would mismatch the value the constructor produces.
                 if (r->structName == "Vec" || r->structName == "String" ||
                     r->structName == "Slice" || r->structName == "HashMap" ||
-                    r->structName == "Future") {
+                    r->structName == "HashSet" || r->structName == "Future") {
                     auto bit = structTypes_.find(r->structName);
                     if (bit != structTypes_.end()) return bit->second;
                 }
@@ -5357,7 +6018,7 @@ private:
         case TypeKind::Struct: {
             // Heap-owning built-ins.
             if (r->structName == "Vec" || r->structName == "String" ||
-                r->structName == "HashMap")
+                r->structName == "HashMap" || r->structName == "HashSet")
                 return true;
             // Slice / Range / fn-value / future structs own no heap (Slice is
             // a borrow; Range/Future are plain scalars in the MVP).
@@ -5383,7 +6044,15 @@ private:
             }
             return false;
         }
-        // Scalars, references, fn values, dyn objects: never owning.
+        // Phase 29: a fn-value owns its heap capture env when it is a
+        // capturing closure (a top-level fn / no-capture closure carries a
+        // null env). Treat all fn-values as droppable so the env is freed at
+        // scope exit; a null-env free is a guarded no-op. Captures are
+        // restricted to Copy scalars (PR#18), so freeing the env buffer
+        // reclaims everything a closure owns.
+        case TypeKind::Function:
+            return true;
+        // Scalars, references, dyn objects: never owning.
         default:
             return false;
         }
@@ -5416,6 +6085,28 @@ private:
             return;
         }
 
+        if (r->kind == TypeKind::Function) {
+            // Phase 29: free a closure's heap capture env. The fn-value is the
+            // fat pointer { i8* fn, i8* env } stored at valuePtr; a top-level
+            // fn / no-capture closure has a null env (the free is then a
+            // guarded no-op). Captures are Copy scalars (PR#18), so freeing the
+            // env buffer reclaims everything the closure owns — no per-capture
+            // recursion needed.
+            auto* fatVal = builder_->CreateLoad(fnValTy_, valuePtr, "fn.val");
+            auto* envPtr = builder_->CreateExtractValue(fatVal, {1}, "fn.env");
+            auto* curFn = builder_->GetInsertBlock()->getParent();
+            auto* freeBB = llvm::BasicBlock::Create(ctx, "env.free", curFn);
+            auto* contBB = llvm::BasicBlock::Create(ctx, "env.cont", curFn);
+            auto* notNull = builder_->CreateICmpNE(
+                envPtr, llvm::ConstantPointerNull::get(i8PtrTy), "env.nn");
+            builder_->CreateCondBr(notNull, freeBB, contBB);
+            builder_->SetInsertPoint(freeBB);
+            builder_->CreateCall(freeFn_, {envPtr});
+            builder_->CreateBr(contBB);
+            builder_->SetInsertPoint(contBB);
+            return;
+        }
+
         if (r->kind == TypeKind::Struct) {
             // User destructor first (if this concrete type has `impl Drop`).
             emitUserDrop(valuePtr, r);
@@ -5435,10 +6126,12 @@ private:
                 emitFreeBufferIfOwned(valuePtr, llvmTy);
                 return;
             }
-            if (r->structName == "HashMap") {
-                // { i8* buckets, i64 len, i64 cap }. MVP keys/values are i64
-                // (non-droppable), so just free the bucket array (guarded on
-                // cap != 0, i.e. an actually-allocated table).
+            if (r->structName == "HashMap" || r->structName == "HashSet") {
+                // { i8* buckets, i64 len, i64 cap }. Free the bucket array
+                // (guarded on cap != 0). Phase 28: droppable keys/values stored
+                // inside the table are NOT yet individually dropped — a
+                // documented leak (no UAF), in the same class as a droppable
+                // Vec element; interior drop is deferred to Phase 29.
                 emitFreeBufferIfOwned(valuePtr, llvmTy);
                 return;
             }
@@ -6854,15 +7547,35 @@ private:
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
                 return builder_->CreateCall(fn, args, "call_join");
             }
-            // Phase 17b: `hashmap_*<V>` are generic built-ins with no AST body
-            // — synthesize a per-value-type specialization (key fixed i64).
+            // Phase 17b/28: `hashmap_*<K,V>` are generic built-ins with no AST
+            // body — synthesize a per-(key,value) specialization. typeArgs are
+            // [K, V] (matching the schema's genericVars order).
             if ((call.callee == "hashmap_new" ||
                  call.callee == "hashmap_insert" ||
                  call.callee == "hashmap_get" ||
                  call.callee == "hashmap_len") &&
+                concreteTypeArgs.size() >= 2) {
+                llvm::Function* fn = getOrEmitHashMapOp(
+                    call.callee, concreteTypeArgs[0], concreteTypeArgs[1]);
+                if (!fn) {
+                    errors_.push_back(
+                        "codegen: cannot specialize " + call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
+            }
+            // Phase 28: `hashset_*<T>` over the HashMap-backed set table.
+            if ((call.callee == "hashset_new" ||
+                 call.callee == "hashset_insert" ||
+                 call.callee == "hashset_contains" ||
+                 call.callee == "hashset_len") &&
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
-                    getOrEmitHashMapOp(call.callee, concreteTypeArgs[0]);
+                    getOrEmitHashSetOp(call.callee, concreteTypeArgs[0]);
                 if (!fn) {
                     errors_.push_back(
                         "codegen: cannot specialize " + call.callee);
@@ -7056,23 +7769,48 @@ private:
             }
             case DT::Leaf: {
                 auto savedLocals = locals_;
+                // Phase 29: an arm is a lexical scope. Open a drop scope so a
+                // droppable payload binding (e.g. `s` in `Some(s)`, s: String)
+                // is dropped at arm exit unless the arm moves it out.
+                pushDropScope();
+                const ast::MatchArm* arm =
+                    dt.armIndex < me.arms.size() ? &me.arms[dt.armIndex]
+                                                 : nullptr;
                 for (const auto& [name, path] : dt.bindings) {
                     llvm::Value* sub = walkOccurrence(scrutinee, path);
                     auto* alloca = builder_->CreateAlloca(sub->getType(),
                                                           nullptr, name);
                     builder_->CreateStore(sub, alloca);
                     locals_[name] = alloca;
+                    if (arm) {
+                        auto ait = tc_.matchBindingTypes.find(arm);
+                        if (ait != tc_.matchBindingTypes.end()) {
+                            auto tit = ait->second.find(name);
+                            if (tit != ait->second.end())
+                                registerDroppableLocal(name, alloca,
+                                                       tit->second);
+                        }
+                    }
                 }
                 if (dt.armIndex < me.arms.size()) {
                     llvm::Value* bodyVal = emitExpr(*me.arms[dt.armIndex].body);
-                    auto* bodyEnd = builder_->GetInsertBlock();
-                    if (!bodyEnd->getTerminator()) {
+                    if (!builder_->GetInsertBlock()->getTerminator()) {
+                        // The arm's value is moved OUT as the match result if
+                        // it is a bare droppable binding — clear its flag so
+                        // the scope drop below skips it.
+                        clearDropFlagIfMoved(*me.arms[dt.armIndex].body);
+                        emitScopeDrops(dropScopes_.back());
+                        // The block that actually reaches merge is the one
+                        // AFTER the drops (drop glue may add blocks).
+                        auto* predBB = builder_->GetInsertBlock();
                         builder_->CreateBr(mergeBB);
-                        if (bodyVal) incoming.push_back({bodyEnd, bodyVal});
+                        if (bodyVal) incoming.push_back({predBB, bodyVal});
                     }
+                    dropScopes_.pop_back();
                 } else {
                     errors_.push_back("codegen: leaf armIndex out of range");
                     builder_->CreateUnreachable();
+                    dropScopes_.pop_back();
                 }
                 locals_ = savedLocals;
                 return;
