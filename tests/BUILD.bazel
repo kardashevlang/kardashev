@@ -266,6 +266,16 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 28: the Hash + Eq traits, multiple trait bounds (T: A + B), a generic
+# HashMap<K,V> (i64 / String / user-type keys via their Hash+Eq impls), and
+# HashSet<T>; through JIT + AOT, with the non-hashable-key and unknown-bound
+# rejections.
+sh_test(
+    name = "smoke_test_hash",
+    srcs = ["smoke_test_hash.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

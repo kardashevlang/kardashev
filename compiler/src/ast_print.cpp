@@ -173,6 +173,8 @@ private:
                     }
                     s += ">";
                 }
+                // Phase 28: additional bounds `T: A + B`.
+                for (const auto& eb : gps[i].extraBounds) s += " + " + eb;
             }
         }
         s += ">";

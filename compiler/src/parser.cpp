@@ -677,6 +677,25 @@ private:
             }
             expect(TokenKind::Gt, ">");
         }
+        // Phase 28: additional bounds `T: A + B + C`. Each extra bound is a
+        // trait name; an optional `<...>` arg list is accepted and discarded
+        // (extra bounds dispatch by trait name — the practical multi-bound
+        // case, Hash + Eq, is non-generic).
+        while (accept(TokenKind::Plus)) {
+            Token extraTok = expect(TokenKind::Identifier,
+                                    "trait name after '+'");
+            tp.extraBounds.push_back(extraTok.lexeme);
+            if (accept(TokenKind::Lt)) {
+                if (!check(TokenKind::Gt)) {
+                    while (true) {
+                        parseTypeRef(); // discard a parameterized extra bound
+                        if (!accept(TokenKind::Comma)) break;
+                        if (check(TokenKind::Gt)) break; // trailing ,
+                    }
+                }
+                expect(TokenKind::Gt, ">");
+            }
+        }
     }
 
     // Helper for fn/struct/enum decls: parse optional `<T1, T2: Bound>`
@@ -739,12 +758,14 @@ private:
                 ast::TypeParam scratch;
                 parseTraitBoundInto(scratch);
             } else if (!target->bound.empty()) {
-                errorAt(std::string("generic parameter '") + nameTok.lexeme +
-                            "' already has a trait bound (only one bound per "
-                            "parameter is supported)",
-                        nameTok.line, nameTok.column);
-                ast::TypeParam scratch;
-                parseTraitBoundInto(scratch);
+                // Phase 28: a second `where` constraint on the same param
+                // accumulates as an extra bound, so `where T: A, T: B` is
+                // equivalent to the inline `T: A + B`.
+                ast::TypeParam tmp;
+                parseTraitBoundInto(tmp);
+                target->extraBounds.push_back(tmp.bound);
+                for (const auto& eb : tmp.extraBounds)
+                    target->extraBounds.push_back(eb);
             } else {
                 parseTraitBoundInto(*target);
             }

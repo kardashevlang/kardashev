@@ -216,6 +216,36 @@ public:
             fnSchemas_["println"] = std::move(sch);
         }
 
+        // --- Phase 28: Hash / Eq support builtins ---
+        // These back the prelude `impl Hash/Eq for i64` and `for String`
+        // (so user code can call `k.hash()` / `a.eq(&b)` and bound generics on
+        // `Hash`/`Eq`); `hash_string` is also called directly by the generic
+        // HashMap/HashSet container for String keys. All pure.
+        // hash_i64(s: &i64) -> i64 — identity hash (matches the historic
+        // i64-keyed HashMap probing).
+        {
+            FnSchema sch;
+            sch.signature =
+                makeFunction({makeRef(makeInt(), /*isMut=*/false)}, makeInt());
+            fnSchemas_["hash_i64"] = std::move(sch);
+        }
+        // int_eq(a: &i64, b: &i64) -> bool
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(makeInt(), /*isMut=*/false),
+                 makeRef(makeInt(), /*isMut=*/false)},
+                makeBool());
+            fnSchemas_["int_eq"] = std::move(sch);
+        }
+        // hash_string(s: &String) -> i64 — FNV-1a over the byte contents.
+        {
+            FnSchema sch;
+            sch.signature =
+                makeFunction({makeRef(stringTy, /*isMut=*/false)}, makeInt());
+            fnSchemas_["hash_string"] = std::move(sch);
+        }
+
         // Phase 5.z: vec_* are generic over T. Each call site infers T
         // from arg types; codegen lazily specializes the runtime per T.
         TypePtr vecFnGenericVar = makeFreshVar();
@@ -267,41 +297,99 @@ public:
         // with a per-V `{ i64 state, i64 key, V value }` bucket entry).
         // hashmap_get returns `Option<V>`; it's registered after the prelude's
         // Option enum is resolved (see below, post pass-1).
-        TypePtr hmGenericVar = makeFreshVar();
+        // Phase 28: HashMap is now generic over BOTH the key K and value V
+        // (`typeArgs = {K, V}`). Codegen stores the key by value in a per-(K,V)
+        // bucket entry `{ i64 state, K key, V value }` and hashes/compares K via
+        // its Hash/Eq impls (i64 + String built in; user types pluggable). K is
+        // required to be a hashable type (see the HashMap key-bound check in
+        // resolveTypeRef). hashmap_get returns `Option<V>` (registered after the
+        // prelude Option enum resolves, below).
+        TypePtr hmKeyVar = makeFreshVar();
+        TypePtr hmValVar = makeFreshVar();
         TypePtr hashMapInst = makeStruct("HashMap", {});
-        hashMapInst->typeArgs = {hmGenericVar};
+        hashMapInst->typeArgs = {hmKeyVar, hmValVar};
         {
             StructSchema sch;
             sch.type = hashMapInst;
-            sch.genericVars.push_back(hmGenericVar);
+            sch.genericVars.push_back(hmKeyVar);
+            sch.genericVars.push_back(hmValVar);
             structSchemas_["HashMap"] = std::move(sch);
         }
-        // hashmap_new<V>() -> HashMap<V> ! { alloc }
+        // hashmap_new<K,V>() -> HashMap<K,V> ! { alloc }
         {
             FnSchema sch;
             sch.signature = makeFunction({}, hashMapInst);
-            sch.genericVars.push_back(hmGenericVar);
+            sch.genericVars.push_back(hmKeyVar);
+            sch.genericVars.push_back(hmValVar);
             sch.declaredEffects.add("alloc");
             fnSchemas_["hashmap_new"] = std::move(sch);
         }
-        // hashmap_insert<V>(m: &mut HashMap<V>, k: i64, v: V) -> i64 ! { alloc }
+        // hashmap_insert<K,V>(m: &mut HashMap<K,V>, k: K, v: V) -> i64 ! {alloc}
         {
             FnSchema sch;
             sch.signature = makeFunction(
-                {makeRef(hashMapInst, /*isMut=*/true), makeInt(),
-                 hmGenericVar},
+                {makeRef(hashMapInst, /*isMut=*/true), hmKeyVar, hmValVar},
                 makeInt());
-            sch.genericVars.push_back(hmGenericVar);
+            sch.genericVars.push_back(hmKeyVar);
+            sch.genericVars.push_back(hmValVar);
             sch.declaredEffects.add("alloc");
             fnSchemas_["hashmap_insert"] = std::move(sch);
         }
-        // hashmap_len<V>(m: &HashMap<V>) -> i64
+        // hashmap_len<K,V>(m: &HashMap<K,V>) -> i64
         {
             FnSchema sch;
             sch.signature = makeFunction(
                 {makeRef(hashMapInst, /*isMut=*/false)}, makeInt());
-            sch.genericVars.push_back(hmGenericVar);
+            sch.genericVars.push_back(hmKeyVar);
+            sch.genericVars.push_back(hmValVar);
             fnSchemas_["hashmap_len"] = std::move(sch);
+        }
+
+        // Phase 28: `HashSet<T>` — a set over a hashable element T. Codegen
+        // reuses the HashMap table machinery with a dummy i64 value, so T must
+        // be hashable just like a HashMap key (checked in resolveTypeRef).
+        TypePtr hsVar = makeFreshVar();
+        TypePtr hashSetInst = makeStruct("HashSet", {});
+        hashSetInst->typeArgs = {hsVar};
+        {
+            StructSchema sch;
+            sch.type = hashSetInst;
+            sch.genericVars.push_back(hsVar);
+            structSchemas_["HashSet"] = std::move(sch);
+        }
+        // hashset_new<T>() -> HashSet<T> ! { alloc }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({}, hashSetInst);
+            sch.genericVars.push_back(hsVar);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["hashset_new"] = std::move(sch);
+        }
+        // hashset_insert<T>(s: &mut HashSet<T>, k: T) -> i64 ! { alloc }
+        // Returns 1 if the element was newly added, 0 if already present.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(hashSetInst, /*isMut=*/true), hsVar}, makeInt());
+            sch.genericVars.push_back(hsVar);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["hashset_insert"] = std::move(sch);
+        }
+        // hashset_contains<T>(s: &HashSet<T>, k: T) -> bool
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(hashSetInst, /*isMut=*/false), hsVar}, makeBool());
+            sch.genericVars.push_back(hsVar);
+            fnSchemas_["hashset_contains"] = std::move(sch);
+        }
+        // hashset_len<T>(s: &HashSet<T>) -> i64
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(hashSetInst, /*isMut=*/false)}, makeInt());
+            sch.genericVars.push_back(hsVar);
+            fnSchemas_["hashset_len"] = std::move(sch);
         }
 
         // Phase 13b built-in: `&[i64]` slices (MVP element = i64). A slice is
@@ -674,16 +762,18 @@ public:
             TypePtr optV;
             if (!optSchema.genericVars.empty()) {
                 std::unordered_map<int, TypePtr> subst;
-                subst[optSchema.genericVars[0]->varId] = hmGenericVar;
+                subst[optSchema.genericVars[0]->varId] = hmValVar;
                 optV = instantiate(optSchema.type, subst);
-                optV->typeArgs = {hmGenericVar};
+                optV->typeArgs = {hmValVar};
             } else {
                 optV = optSchema.type;
             }
+            // hashmap_get<K,V>(m: &HashMap<K,V>, k: K) -> Option<V>
             FnSchema sch;
             sch.signature = makeFunction(
-                {makeRef(hashMapInst, /*isMut=*/false), makeInt()}, optV);
-            sch.genericVars.push_back(hmGenericVar);
+                {makeRef(hashMapInst, /*isMut=*/false), hmKeyVar}, optV);
+            sch.genericVars.push_back(hmKeyVar);
+            sch.genericVars.push_back(hmValVar);
             fnSchemas_["hashmap_get"] = std::move(sch);
         }
 
@@ -962,9 +1052,11 @@ public:
             std::unordered_map<std::string, TypePtr> genEnv;
             std::vector<TypePtr> genVars;
             std::vector<std::string> genBounds;
+            std::vector<std::vector<std::string>> genExtraBounds;
             std::vector<std::pair<std::string, TypePtr>> effectRowVars;
             genVars.reserve(fn.genericParams.size());
             genBounds.reserve(fn.genericParams.size());
+            genExtraBounds.reserve(fn.genericParams.size());
             // Phase 21a: the AST TypeParam backing each genVars[i], so a
             // second pass can resolve its parameterized-bound args once every
             // type param is registered in genEnv (a bound may reference a
@@ -998,8 +1090,17 @@ public:
                                   gp.name + "'",
                               gp.line, gp.column);
                     }
+                    // Phase 28: validate each additional bound (`T: A + B`).
+                    for (const auto& eb : gp.extraBounds) {
+                        if (!eb.empty() && !traits_.count(eb)) {
+                            error("unknown trait bound '" + eb + "' on '" +
+                                      gp.name + "'",
+                                  gp.line, gp.column);
+                        }
+                    }
                     genVars.push_back(v);
                     genBounds.push_back(gp.bound);
+                    genExtraBounds.push_back(gp.extraBounds);
                     genBoundParam.push_back(&gp);
                 }
             }
@@ -1073,6 +1174,7 @@ public:
             schema.signature = makeFunction(std::move(argTypes), ret);
             schema.genericVars = std::move(genVars);
             schema.genericBounds = std::move(genBounds);
+            schema.genericExtraBounds = std::move(genExtraBounds);
             schema.genericBoundArgs = std::move(genBoundArgs);
             // Note: effect-row vars are deliberately NOT added to
             // genericVars — that list drives codegen monomorphization, and
@@ -1137,12 +1239,14 @@ public:
                 std::unordered_map<std::string, TypePtr> genEnv;
                 std::vector<TypePtr> genVars;
                 std::vector<std::string> genBounds;
+                std::vector<std::vector<std::string>> genExtraBounds;
                 std::vector<const ast::TypeParam*> genBoundParam;
                 for (const auto& gp : fn.genericParams) {
                     TypePtr v = makeFreshVar();
                     genEnv[gp.name] = v;
                     genVars.push_back(v);
                     genBounds.push_back(gp.bound);
+                    genExtraBounds.push_back(gp.extraBounds); // Phase 28
                     genBoundParam.push_back(&gp);
                 }
                 // Bind Self to the impl's forType while resolving params /
@@ -1196,6 +1300,7 @@ public:
                 sch.signature = makeFunction(std::move(argTypes), ret);
                 sch.genericVars = std::move(genVars);
                 sch.genericBounds = std::move(genBounds);
+                sch.genericExtraBounds = std::move(genExtraBounds);
                 sch.genericBoundArgs = std::move(genBoundArgs);
                 for (const auto& [name, v] : effectRowVars) {
                     bool dup = false;
@@ -2217,6 +2322,24 @@ private:
         }
     }
 
+    // Phase 28: is `tyIn` usable as a HashMap/HashSet key? i64 and String are
+    // built-in hashable (the container hashes/compares them directly with
+    // identity/FNV-1a + icmp/str_eq); a user struct or enum qualifies iff it
+    // provides both an `impl Hash` and an `impl Eq`.
+    bool keyIsHashable(const TypePtr& tyIn) {
+        TypePtr ty = resolve(tyIn);
+        if (ty->kind == TypeKind::Int) return true;
+        if (ty->kind == TypeKind::Struct && ty->structName == "String")
+            return true;
+        std::string name;
+        if (ty->kind == TypeKind::Struct) name = ty->structName;
+        else if (ty->kind == TypeKind::Enum) name = ty->enumName;
+        else return false;
+        auto it = implMethodByType_.find(name);
+        if (it == implMethodByType_.end()) return false;
+        return it->second.count("Hash") && it->second.count("Eq");
+    }
+
     TypePtr resolveTypeRef(const ast::TypeRef& tr) {
         // Phase 13b: slice type `&[T]`. The `&` is part of the slice spelling
         // (a slice is its own fat-pointer borrow), so handle it before the
@@ -2403,17 +2526,27 @@ private:
         std::vector<TypePtr> argTypes;
         argTypes.reserve(tr.typeArgs.size());
         for (const auto& a : tr.typeArgs) argTypes.push_back(resolveTypeRef(a));
-        // Phase 17b: `HashMap<i64, V>` surface form. The key is fixed to i64
-        // (no Hash trait yet), so internally we store only V; accept the
-        // two-arg spelling, validate the key is i64, and drop it to the
-        // one-arg `HashMap<V>` representation the schema/codegen use.
+        // Phase 28: `HashMap<K, V>` is generic over BOTH the key and the value.
+        // The key K must be a hashable type: i64 or String (built-in Hash+Eq),
+        // or a user struct/enum that impls both Hash and Eq. Both args are kept
+        // (the schema is generic over K and V); codegen stores K in the bucket
+        // entry and dispatches hashing/equality on K.
         if (tr.name == "HashMap" && argTypes.size() == 2) {
-            if (resolve(argTypes[0])->kind != TypeKind::Int) {
-                error("HashMap key type must be i64 (no Hash trait yet), got " +
-                          typeToString(argTypes[0]),
+            if (!keyIsHashable(argTypes[0])) {
+                error("HashMap key type must implement Hash + Eq (use i64, "
+                      "String, or a user type with `impl Hash` and `impl Eq`), "
+                      "got " + typeToString(argTypes[0]),
                       tr.line, tr.column);
             }
-            argTypes = {argTypes[1]};
+        }
+        // Phase 28: a HashSet's element must be hashable too (it is the key).
+        if (tr.name == "HashSet" && argTypes.size() == 1) {
+            if (!keyIsHashable(argTypes[0])) {
+                error("HashSet element type must implement Hash + Eq (use i64, "
+                      "String, or a user type with `impl Hash` and `impl Eq`), "
+                      "got " + typeToString(argTypes[0]),
+                      tr.line, tr.column);
+            }
         }
         if (auto sit = structSchemas_.find(tr.name);
             sit != structSchemas_.end()) {
@@ -3296,48 +3429,70 @@ private:
         // monomorphic instance.
         if (r->kind == TypeKind::Var) {
             int rId = r->varId;
-            std::string bound;
-            // Phase 21a: alongside the bound trait name, capture the bound's
-            // resolved trait type-args (the `<T>` in `<I: Iterator<T>>`) so we
-            // can bind the trait's params and resolve the method's element
-            // type back to the enclosing fn's own type param.
-            std::vector<TypePtr> boundArgs;
-            // Find the bound by scanning the enclosing fn's schema.
-            // `currentGenericEnv_` holds name -> Var; we need the parallel
-            // bound list. Look up via fnSchemas_.
+            // Phase 28: gather ALL of the var's bounds — the primary bound
+            // (with its Phase-21a parameterized trait-args, e.g. the `<T>` in
+            // `<I: Iterator<T>>`) plus any extra bounds (`T: A + B`, which are
+            // non-parameterized). A method call resolves against whichever
+            // bound trait declares it.
+            std::vector<std::string> candBounds;
+            std::vector<std::vector<TypePtr>> candArgs;
             for (const auto& [_n, schema] : fnSchemas_) {
+                bool hit = false;
                 for (std::size_t i = 0; i < schema.genericVars.size(); ++i) {
-                    if (schema.genericVars[i]->varId == rId &&
-                        i < schema.genericBounds.size() &&
+                    if (schema.genericVars[i]->varId != rId) continue;
+                    if (i < schema.genericBounds.size() &&
                         !schema.genericBounds[i].empty()) {
-                        bound = schema.genericBounds[i];
-                        if (i < schema.genericBoundArgs.size())
-                            boundArgs = schema.genericBoundArgs[i];
-                        break;
+                        candBounds.push_back(schema.genericBounds[i]);
+                        candArgs.push_back(
+                            i < schema.genericBoundArgs.size()
+                                ? schema.genericBoundArgs[i]
+                                : std::vector<TypePtr>{});
                     }
+                    if (i < schema.genericExtraBounds.size()) {
+                        for (const auto& eb : schema.genericExtraBounds[i]) {
+                            if (eb.empty()) continue;
+                            candBounds.push_back(eb);
+                            candArgs.emplace_back();
+                        }
+                    }
+                    hit = true;
+                    break;
                 }
-                if (!bound.empty()) break;
+                if (hit) break;
             }
-            if (bound.empty()) {
+            if (candBounds.empty()) {
                 error("method call on unbounded generic parameter; add a "
                       "trait bound like `<T: Trait>`",
                       mc.line, mc.column);
                 for (const auto& a : mc.args) checkExpr(*a);
                 return makeFreshVar();
             }
-            auto traitIt = traits_.find(bound);
-            if (traitIt == traits_.end()) {
-                error("unknown trait bound '" + bound + "'",
-                      mc.line, mc.column);
-                return makeFreshVar();
-            }
+            // Find the bound trait that declares the called method.
             const ast::MethodSig* sig = nullptr;
-            for (const auto& m : traitIt->second) {
-                if (m.name == mc.methodName) { sig = &m; break; }
+            std::string bound;
+            std::vector<TypePtr> boundArgs;
+            for (std::size_t k = 0; k < candBounds.size(); ++k) {
+                auto traitIt = traits_.find(candBounds[k]);
+                if (traitIt == traits_.end()) continue; // reported in pass 1a
+                for (const auto& m : traitIt->second) {
+                    if (m.name == mc.methodName) {
+                        sig = &m;
+                        bound = candBounds[k];
+                        boundArgs = candArgs[k];
+                        break;
+                    }
+                }
+                if (sig) break;
             }
             if (!sig) {
-                error("trait '" + bound + "' has no method '" +
-                          mc.methodName + "'",
+                std::string boundsList;
+                for (std::size_t k = 0; k < candBounds.size(); ++k) {
+                    if (k) boundsList += " + ";
+                    boundsList += candBounds[k];
+                }
+                error("no method '" + mc.methodName +
+                          "' in the bound(s) '" + boundsList +
+                          "' of the generic parameter",
                       mc.line, mc.column);
                 return makeFreshVar();
             }

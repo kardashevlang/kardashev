@@ -71,9 +71,14 @@ struct FnSchema {
     TypePtr signature;
     std::vector<TypePtr> genericVars;
     // One entry per genericVars[i]: the trait-name bound (empty for an
-    // unbounded param). Phase 3.3 only supports a single trait bound per
-    // param; multi-bounds (`T: A + B`) can append entries here later.
+    // unbounded param). This is the PRIMARY bound; Phase 28 carries any
+    // additional bounds (`T: A + B`) in `genericExtraBounds` below.
     std::vector<std::string> genericBounds;
+    // Phase 28: one entry per genericVars[i], parallel to genericBounds: the
+    // additional trait bounds beyond the primary one (the B, C in `T: A+B+C`).
+    // Empty vector for an unbounded or single-bounded param. A method call on
+    // a bounded param searches the primary bound then these in order.
+    std::vector<std::vector<std::string>> genericExtraBounds;
     // Phase 21a: one entry per genericVars[i], parallel to genericBounds:
     // the resolved type arguments of a *parameterized* trait bound
     // (`<I: Iterator<T>>` -> the bound's `T`, resolved against this fn's own

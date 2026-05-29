@@ -1423,6 +1423,84 @@ private:
             declaredFns_["println"] = fn;
         }
 
+        // --- Phase 28: hash_i64(s: &i64) -> i64 (identity hash) ---
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "hash_i64",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            b.CreateRet(b.CreateLoad(i64Ty, fn->getArg(0), "v"));
+            declaredFns_["hash_i64"] = fn;
+        }
+
+        // --- Phase 28: int_eq(a: &i64, b: &i64) -> bool ---
+        {
+            auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+            auto* fnTy =
+                llvm::FunctionType::get(i1Ty, {i8PtrTy, i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "int_eq", module_.get());
+            fn->getArg(0)->setName("a");
+            fn->getArg(1)->setName("b");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* av = b.CreateLoad(i64Ty, fn->getArg(0), "av");
+            auto* bv = b.CreateLoad(i64Ty, fn->getArg(1), "bv");
+            b.CreateRet(b.CreateICmpEQ(av, bv, "int_eq"));
+            declaredFns_["int_eq"] = fn;
+        }
+
+        // --- Phase 28: hash_string(s: &String) -> i64 (FNV-1a) ---
+        // h = 0xcbf29ce484222325; for each byte: h = (h ^ byte) * 0x100000001b3.
+        // The multiply wraps mod 2^64 (fine for hashing); the result is used as
+        // a signed i64 bucket index after the container's (h%cap+cap)%cap.
+        {
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "hash_string",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* condBB = llvm::BasicBlock::Create(ctx, "cond", fn);
+            auto* bodyBB = llvm::BasicBlock::Create(ctx, "body", fn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "done", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* hSlot = b.CreateAlloca(i64Ty, nullptr, "h");
+            auto* iSlot = b.CreateAlloca(i64Ty, nullptr, "i");
+            b.CreateStore(
+                llvm::ConstantInt::get(i64Ty, 1469598103934665603ULL), hSlot);
+            b.CreateStore(zeroI64, iSlot);
+            auto* dataPtr = b.CreateStructGEP(strTy, fn->getArg(0), 0, "data_p");
+            auto* lenPtr = b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_p");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            b.CreateBr(condBB);
+            b.SetInsertPoint(condBB);
+            auto* i = b.CreateLoad(i64Ty, iSlot, "i_cur");
+            b.CreateCondBr(b.CreateICmpSLT(i, len, "more"), bodyBB, doneBB);
+            b.SetInsertPoint(bodyBB);
+            auto* bytePtr = b.CreateGEP(i8Ty, data, i, "byte_p");
+            auto* byte = b.CreateZExt(b.CreateLoad(i8Ty, bytePtr, "byte"), i64Ty,
+                                      "byte64");
+            auto* h = b.CreateLoad(i64Ty, hSlot, "h_cur");
+            auto* mixed =
+                b.CreateMul(b.CreateXor(h, byte, "hxor"),
+                            llvm::ConstantInt::get(i64Ty, 1099511628211ULL),
+                            "hmul");
+            b.CreateStore(mixed, hSlot);
+            b.CreateStore(b.CreateAdd(i, llvm::ConstantInt::get(i64Ty, 1),
+                                      "i_next"),
+                          iSlot);
+            b.CreateBr(condBB);
+            b.SetInsertPoint(doneBB);
+            b.CreateRet(b.CreateLoad(i64Ty, hSlot, "h_final"));
+            declaredFns_["hash_string"] = fn;
+        }
+
         // --- Phase 13b: slice read ops. A slice value is the {ptr,len} fat
         // pointer produced by `&v[a..b]` (emitSlice). Both ops take the slice
         // BY VALUE (a 16-byte aggregate). MVP element = i64; slice_get uses an
@@ -1492,6 +1570,12 @@ private:
         auto* hmTy = llvm::StructType::create(
             ctx, {i8PtrTy, i64Ty, i64Ty}, "HashMap");
         structTypes_["HashMap"] = hmTy;
+        // Phase 28: HashSet IS a HashMap-with-a-dummy-value at runtime, so it
+        // shares the identical LLVM type (the two stay nominally distinct only
+        // in the kardashev type system, which drives dispatch via the callee
+        // name). Sharing the LLVM type keeps `hashset_new` returning the same
+        // struct the underlying `hashmap_new` produces.
+        structTypes_["HashSet"] = hmTy;
     }
 
     // Phase 17b: build the concrete `Option<V>` Kardashev TypePtr by
@@ -1517,8 +1601,46 @@ private:
     // `hashmap_get__<V>`, `hashmap_len__<V>`) over a per-V bucket entry
     // `{ i64 state, i64 key, V value }`, then return the one named by `op`.
     // Mirrors getOrEmitVecOp; the `%HashMap` struct itself stays single-layout.
-    llvm::Function* getOrEmitHashMapOp(const std::string& op, const TypePtr& V) {
-        std::string vMangle = mangleType(V);
+    // Phase 28: the AST-style type name of a HashMap key, matching
+    // implMethodMangle's forType.name, so a user key type's Hash/Eq impl can be
+    // found. i64/String are special-cased by the caller, so this is only
+    // consulted for user key types.
+    std::string keyTypeName(const TypePtr& K) {
+        TypePtr k = resolve(K);
+        if (k->kind == TypeKind::Struct) return k->structName;
+        if (k->kind == TypeKind::Enum) return k->enumName;
+        if (k->kind == TypeKind::Int) return "i64";
+        if (k->kind == TypeKind::Bool) return "bool";
+        return "";
+    }
+    // hash(&K) -> i64 for a non-i64 key: the hash_string builtin for String,
+    // else the user's `impl Hash for K` method. Null if none is available.
+    llvm::Function* keyHashFn(const TypePtr& K) {
+        TypePtr k = resolve(K);
+        if (k->kind == TypeKind::Struct && k->structName == "String")
+            return declaredFns_.count("hash_string") ? declaredFns_["hash_string"]
+                                                      : nullptr;
+        auto it =
+            declaredFns_.find("__impl_Hash_for_" + keyTypeName(K) + "__hash");
+        return it != declaredFns_.end() ? it->second : nullptr;
+    }
+    // eq(&K, &K) -> bool for a non-i64 key: the str_eq builtin for String, else
+    // the user's `impl Eq for K` method. Null if none is available.
+    llvm::Function* keyEqFn(const TypePtr& K) {
+        TypePtr k = resolve(K);
+        if (k->kind == TypeKind::Struct && k->structName == "String")
+            return declaredFns_.count("str_eq") ? declaredFns_["str_eq"]
+                                                : nullptr;
+        auto it = declaredFns_.find("__impl_Eq_for_" + keyTypeName(K) + "__eq");
+        return it != declaredFns_.end() ? it->second : nullptr;
+    }
+
+    llvm::Function* getOrEmitHashMapOp(const std::string& op, const TypePtr& K,
+                                       const TypePtr& V) {
+        // The per-specialization suffix now covers BOTH key and value, so all
+        // the `"...__" + vMangle` symbol names + the bucket-entry struct pick
+        // up K automatically (K=i64 keeps the historic `{state,i64,V}` layout).
+        std::string vMangle = mangleType(K) + "_" + mangleType(V);
         std::string want = op + "__" + vMangle;
         if (auto it = declaredFns_.find(want); it != declaredFns_.end())
             return it->second;
@@ -1529,10 +1651,46 @@ private:
         auto* zero = llvm::ConstantInt::get(i64Ty, 0);
         auto* one = llvm::ConstantInt::get(i64Ty, 1);
         auto* hmTy = structTypes_["HashMap"];
+        auto* keyTy = mapKardashevType(K);
         auto* valTy = mapKardashevType(V);
-        // entry = { i64 state, i64 key, V value }
+        // Phase 28: i64 keys probe/compare inline (identity hash + icmp), byte
+        // -identical to the historic i64-only HashMap. Any other key hashes via
+        // hash(&K)->i64 and compares via eq(&K,&K)->bool (String builtins or a
+        // user Hash/Eq impl).
+        bool keyIsInt = resolve(K)->kind == TypeKind::Int;
+        llvm::Function* hashFn = keyIsInt ? nullptr : keyHashFn(K);
+        llvm::Function* eqFn = keyIsInt ? nullptr : keyEqFn(K);
+        if (!keyIsInt && (!hashFn || !eqFn)) {
+            errors_.push_back(
+                "codegen: HashMap key type '" + keyTypeName(K) +
+                "' lacks a Hash/Eq impl");
+            return nullptr;
+        }
+        // entry = { i64 state, K key, V value }
         auto* entryTy = llvm::StructType::create(
-            ctx, {i64Ty, i64Ty, valTy}, "kd.hm_entry." + vMangle);
+            ctx, {i64Ty, keyTy, valTy}, "kd.hm_entry." + vMangle);
+
+        // Probe-start index ((hash(k) % cap) + cap) % cap. `kSlot` (an alloca
+        // holding the key) is only read when K is not i64.
+        auto emitStart = [&](llvm::IRBuilder<>& b, llvm::Value* kVal,
+                             llvm::Value* kSlot,
+                             llvm::Value* cap) -> llvm::Value* {
+            llvm::Value* h =
+                keyIsInt ? kVal : b.CreateCall(hashFn, {kSlot}, "kh");
+            auto* rem = b.CreateSRem(h, cap, "rem");
+            auto* plus = b.CreateAdd(rem, cap, "plus");
+            return b.CreateURem(plus, cap, "start");
+        };
+        // i1: does the stored key at `keyPtr` equal the probe key?
+        auto emitEq = [&](llvm::IRBuilder<>& b, llvm::Value* kVal,
+                          llvm::Value* kSlot,
+                          llvm::Value* keyPtr) -> llvm::Value* {
+            if (keyIsInt) {
+                auto* cur = b.CreateLoad(i64Ty, keyPtr, "curKey");
+                return b.CreateICmpEQ(cur, kVal, "keyEq");
+            }
+            return b.CreateCall(eqFn, {kSlot, keyPtr}, "keyEq");
+        };
 
         // __hm_raw_insert__<V>(buckets: i8*, cap: i64, k: i64, v: V) -> i64.
         // Linear-probe from k % cap; if it finds the key, overwrite value and
@@ -1541,7 +1699,7 @@ private:
         // least one empty slot exists (guaranteed by the load-factor grow).
         {
             auto* fnTy = llvm::FunctionType::get(
-                i64Ty, {i8PtrTy, i64Ty, i64Ty, valTy}, false);
+                i64Ty, {i8PtrTy, i64Ty, keyTy, valTy}, false);
             auto* fn = llvm::Function::Create(
                 fnTy, llvm::Function::ExternalLinkage,
                 "__hm_raw_insert__" + vMangle, module_.get());
@@ -1561,13 +1719,14 @@ private:
             auto* hitBB = llvm::BasicBlock::Create(ctx, "hit", fn);
             auto* nextBB = llvm::BasicBlock::Create(ctx, "next", fn);
             llvm::IRBuilder<> b(entry);
+            // Spill the key once (for non-i64 Hash/Eq calls); reused in probe.
+            llvm::Value* kSlot = nullptr;
+            if (!keyIsInt) {
+                kSlot = b.CreateAlloca(keyTy, nullptr, "kslot");
+                b.CreateStore(k, kSlot);
+            }
             auto* idxSlot = b.CreateAlloca(i64Ty, nullptr, "idx");
-            // start = ((k % cap) + cap) % cap  — urem keeps it in range for
-            // non-negative; for negative keys the extra +cap,%cap normalizes.
-            auto* rem = b.CreateSRem(k, cap, "rem");
-            auto* plus = b.CreateAdd(rem, cap, "plus");
-            auto* start = b.CreateURem(plus, cap, "start");
-            b.CreateStore(start, idxSlot);
+            b.CreateStore(emitStart(b, k, kSlot, cap), idxSlot);
             b.CreateBr(loopBB);
 
             b.SetInsertPoint(loopBB);
@@ -1588,8 +1747,7 @@ private:
 
             b.SetInsertPoint(checkBB);
             auto* keyP2 = b.CreateStructGEP(entryTy, eptr, 1, "keyP2");
-            auto* curKey = b.CreateLoad(i64Ty, keyP2, "curKey");
-            auto* keyEq = b.CreateICmpEQ(curKey, k, "keyEq");
+            auto* keyEq = emitEq(b, k, kSlot, keyP2);
             b.CreateCondBr(keyEq, hitBB, notEmptyBB);
 
             b.SetInsertPoint(hitBB);
@@ -1635,7 +1793,7 @@ private:
             auto* rawInsert = declaredFns_["__hm_raw_insert__" + vMangle];
 
             auto* fnTy = llvm::FunctionType::get(
-                i64Ty, {i8PtrTy, i64Ty, valTy}, false);
+                i64Ty, {i8PtrTy, keyTy, valTy}, false);
             auto* fn = llvm::Function::Create(
                 fnTy, llvm::Function::ExternalLinkage,
                 "hashmap_insert__" + vMangle, module_.get());
@@ -1705,7 +1863,7 @@ private:
 
             b.SetInsertPoint(rehashOcc);
             auto* okeyP = b.CreateStructGEP(entryTy, oeptr, 1, "okeyP");
-            auto* okey = b.CreateLoad(i64Ty, okeyP, "okey");
+            auto* okey = b.CreateLoad(keyTy, okeyP, "okey");
             auto* ovalP = b.CreateStructGEP(entryTy, oeptr, 2, "ovalP");
             auto* oval = b.CreateLoad(valTy, ovalP, "oval");
             b.CreateCall(rawInsert, {newBuf, newCap, okey, oval}, "");
@@ -1758,7 +1916,7 @@ private:
             auto* i32Ty = llvm::Type::getInt32Ty(ctx);
 
             auto* fnTy = llvm::FunctionType::get(
-                optLlvm, {i8PtrTy, i64Ty}, false);
+                optLlvm, {i8PtrTy, keyTy}, false);
             auto* fn = llvm::Function::Create(
                 fnTy, llvm::Function::ExternalLinkage,
                 "hashmap_get__" + vMangle, module_.get());
@@ -1783,20 +1941,23 @@ private:
 
             llvm::IRBuilder<> b(entry);
             auto* idxSlot = b.CreateAlloca(i64Ty, nullptr, "idx");
+            // Spill the key once for non-i64 Hash/Eq calls (reused in probe).
+            llvm::Value* kSlot = nullptr;
+            if (!keyIsInt) {
+                kSlot = b.CreateAlloca(keyTy, nullptr, "kslot");
+                b.CreateStore(k, kSlot);
+            }
             auto* bucketsP = b.CreateStructGEP(hmTy, mPtr, 0, "bucketsP");
             auto* capP = b.CreateStructGEP(hmTy, mPtr, 2, "capP");
             auto* cap = b.CreateLoad(i64Ty, capP, "cap");
             auto* buckets = b.CreateLoad(i8PtrTy, bucketsP, "buckets");
             auto* capZero = b.CreateICmpEQ(cap, zero, "capZero");
-            // Seed idxSlot = ((k % cap)+cap)%cap, but guard the modulo: when
-            // cap==0 we'd divide by zero, so branch to None first.
+            // Seed idxSlot = ((hash(k) % cap)+cap)%cap, but guard the modulo:
+            // when cap==0 we'd divide by zero, so branch to None first.
             auto* nonZeroBB = llvm::BasicBlock::Create(ctx, "nonzero", fn);
             b.CreateCondBr(capZero, noneBB, nonZeroBB);
             b.SetInsertPoint(nonZeroBB);
-            auto* rem = b.CreateSRem(k, cap, "rem");
-            auto* plus = b.CreateAdd(rem, cap, "plus");
-            auto* start = b.CreateURem(plus, cap, "start");
-            b.CreateStore(start, idxSlot);
+            b.CreateStore(emitStart(b, k, kSlot, cap), idxSlot);
             b.CreateBr(loopBB);
 
             b.SetInsertPoint(loopBB);
@@ -1812,8 +1973,7 @@ private:
 
             b.SetInsertPoint(checkBB);
             auto* keyP = b.CreateStructGEP(entryTy, eptr, 1, "keyP");
-            auto* curKey = b.CreateLoad(i64Ty, keyP, "curKey");
-            auto* keyEq = b.CreateICmpEQ(curKey, k, "keyEq");
+            auto* keyEq = emitEq(b, k, kSlot, keyP);
             b.CreateCondBr(keyEq, hitBB, stepBB);
 
             b.SetInsertPoint(hitBB);
@@ -1849,6 +2009,95 @@ private:
         }
 
         // All five are now emitted for this V; return the requested one.
+        auto it = declaredFns_.find(want);
+        return it != declaredFns_.end() ? it->second : nullptr;
+    }
+
+    // Phase 28: HashSet<T> ops, layered on the generic HashMap<T, i64> table
+    // (a dummy i64 value). Emits new/insert/contains/len on first use for
+    // element type T and returns the requested one. %HashSet has the same
+    // layout as %HashMap, so a &HashSet pointer flows straight to the map ops.
+    llvm::Function* getOrEmitHashSetOp(const std::string& op, const TypePtr& T) {
+        std::string suffix = mangleType(T);
+        std::string want = op + "__set_" + suffix;
+        if (auto it = declaredFns_.find(want); it != declaredFns_.end())
+            return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* hsTy = structTypes_["HashSet"];
+        auto* elemTy = mapKardashevType(T);
+        TypePtr i64T = makeInt();
+        llvm::Function* mapNew = getOrEmitHashMapOp("hashmap_new", T, i64T);
+        llvm::Function* mapInsert =
+            getOrEmitHashMapOp("hashmap_insert", T, i64T);
+        llvm::Function* mapGet = getOrEmitHashMapOp("hashmap_get", T, i64T);
+        llvm::Function* mapLen = getOrEmitHashMapOp("hashmap_len", T, i64T);
+        if (!mapNew || !mapInsert || !mapGet || !mapLen) return nullptr;
+
+        // hashset_new() -> HashSet
+        {
+            auto* fnTy = llvm::FunctionType::get(hsTy, {}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashset_new__set_" + suffix, module_.get());
+            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(e);
+            b.CreateRet(b.CreateCall(mapNew, {}, "m"));
+            declaredFns_["hashset_new__set_" + suffix] = fn;
+        }
+        // hashset_insert(s, k) -> i64 : insert k with a dummy value 1.
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i8PtrTy, elemTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashset_insert__set_" + suffix, module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("k");
+            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(e);
+            b.CreateCall(mapInsert,
+                         {fn->getArg(0), fn->getArg(1),
+                          llvm::ConstantInt::get(i64Ty, 1)},
+                         "ins");
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_["hashset_insert__set_" + suffix] = fn;
+        }
+        // hashset_len(s) -> i64
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashset_len__set_" + suffix, module_.get());
+            fn->getArg(0)->setName("s");
+            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(e);
+            b.CreateRet(b.CreateCall(mapLen, {fn->getArg(0)}, "len"));
+            declaredFns_["hashset_len__set_" + suffix] = fn;
+        }
+        // hashset_contains(s, k) -> bool : get(k) is Some?
+        {
+            TypePtr optTy = optionType(i64T);
+            unsigned someIdx = variantIndexInEnum(optTy, "Some");
+            auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+            auto* fnTy =
+                llvm::FunctionType::get(i1Ty, {i8PtrTy, elemTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashset_contains__set_" + suffix, module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("k");
+            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(e);
+            auto* opt =
+                b.CreateCall(mapGet, {fn->getArg(0), fn->getArg(1)}, "opt");
+            auto* disc = b.CreateExtractValue(opt, {0}, "disc");
+            b.CreateRet(b.CreateICmpEQ(
+                disc, llvm::ConstantInt::get(i32Ty, someIdx), "found"));
+            declaredFns_["hashset_contains__set_" + suffix] = fn;
+        }
         auto it = declaredFns_.find(want);
         return it != declaredFns_.end() ? it->second : nullptr;
     }
@@ -4107,7 +4356,7 @@ private:
                 // that would mismatch the value the constructor produces.
                 if (r->structName == "Vec" || r->structName == "String" ||
                     r->structName == "Slice" || r->structName == "HashMap" ||
-                    r->structName == "Future") {
+                    r->structName == "HashSet" || r->structName == "Future") {
                     auto bit = structTypes_.find(r->structName);
                     if (bit != structTypes_.end()) return bit->second;
                 }
@@ -5527,7 +5776,7 @@ private:
         case TypeKind::Struct: {
             // Heap-owning built-ins.
             if (r->structName == "Vec" || r->structName == "String" ||
-                r->structName == "HashMap")
+                r->structName == "HashMap" || r->structName == "HashSet")
                 return true;
             // Slice / Range / fn-value / future structs own no heap (Slice is
             // a borrow; Range/Future are plain scalars in the MVP).
@@ -5605,10 +5854,12 @@ private:
                 emitFreeBufferIfOwned(valuePtr, llvmTy);
                 return;
             }
-            if (r->structName == "HashMap") {
-                // { i8* buckets, i64 len, i64 cap }. MVP keys/values are i64
-                // (non-droppable), so just free the bucket array (guarded on
-                // cap != 0, i.e. an actually-allocated table).
+            if (r->structName == "HashMap" || r->structName == "HashSet") {
+                // { i8* buckets, i64 len, i64 cap }. Free the bucket array
+                // (guarded on cap != 0). Phase 28: droppable keys/values stored
+                // inside the table are NOT yet individually dropped — a
+                // documented leak (no UAF), in the same class as a droppable
+                // Vec element; interior drop is deferred to Phase 29.
                 emitFreeBufferIfOwned(valuePtr, llvmTy);
                 return;
             }
@@ -7024,15 +7275,35 @@ private:
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
                 return builder_->CreateCall(fn, args, "call_join");
             }
-            // Phase 17b: `hashmap_*<V>` are generic built-ins with no AST body
-            // — synthesize a per-value-type specialization (key fixed i64).
+            // Phase 17b/28: `hashmap_*<K,V>` are generic built-ins with no AST
+            // body — synthesize a per-(key,value) specialization. typeArgs are
+            // [K, V] (matching the schema's genericVars order).
             if ((call.callee == "hashmap_new" ||
                  call.callee == "hashmap_insert" ||
                  call.callee == "hashmap_get" ||
                  call.callee == "hashmap_len") &&
+                concreteTypeArgs.size() >= 2) {
+                llvm::Function* fn = getOrEmitHashMapOp(
+                    call.callee, concreteTypeArgs[0], concreteTypeArgs[1]);
+                if (!fn) {
+                    errors_.push_back(
+                        "codegen: cannot specialize " + call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
+            }
+            // Phase 28: `hashset_*<T>` over the HashMap-backed set table.
+            if ((call.callee == "hashset_new" ||
+                 call.callee == "hashset_insert" ||
+                 call.callee == "hashset_contains" ||
+                 call.callee == "hashset_len") &&
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
-                    getOrEmitHashMapOp(call.callee, concreteTypeArgs[0]);
+                    getOrEmitHashSetOp(call.callee, concreteTypeArgs[0]);
                 if (!fn) {
                     errors_.push_back(
                         "codegen: cannot specialize " + call.callee);

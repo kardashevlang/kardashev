@@ -105,6 +105,31 @@ std::string applyPrelude(const std::string& userSrc) {
             "    }\n"
             "}\n";
     }
+    // Phase 28: the `Hash` and `Eq` traits with built-in impls for i64 and
+    // String, so user code can call `k.hash()` / `a.eq(&b)` and bound a
+    // generic on them (`fn f<K: Hash + Eq>(...)`). The impl bodies forward to
+    // pure builtins (identity / FNV-1a hash; scalar / byte-wise equality). The
+    // generic `HashMap<K,V>` / `HashSet<T>` container hashes i64 and String
+    // keys directly via the same primitives and dispatches user key types
+    // through their `Hash`/`Eq` impls — so these traits are what make a key
+    // type pluggable. Each guarded so a user-defined `Hash`/`Eq` wins without a
+    // duplicate-decl error.
+    if (userSrc.find("trait Hash") == std::string::npos) {
+        prelude +=
+            "trait Hash { fn hash(&self) -> i64; }\n"
+            "impl Hash for i64 { fn hash(&self) -> i64 { hash_i64(self) } }\n"
+            "impl Hash for String"
+            " { fn hash(&self) -> i64 { hash_string(self) } }\n";
+    }
+    if (userSrc.find("trait Eq") == std::string::npos) {
+        prelude +=
+            "trait Eq { fn eq(&self, other: &Self) -> bool; }\n"
+            "impl Eq for i64"
+            " { fn eq(&self, other: &i64) -> bool { int_eq(self, other) } }\n"
+            "impl Eq for String"
+            " { fn eq(&self, other: &String) -> bool"
+            " { str_eq(self, other) } }\n";
+    }
     // Phase 13b: Option / Result combinators as effect-row-polymorphic
     // prelude functions. They lower like any other generic kardashev fn —
     // closures + `! {e}` rows mean a combinator's call-site inherits its

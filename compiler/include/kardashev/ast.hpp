@@ -555,19 +555,26 @@ struct EffectRow {
 };
 
 // A generic type parameter binding, e.g. `T` in `fn id<T>(x: T) -> T` or
-// `T: Show` in `fn use_show<T: Show>(t: T) -> i64`. Phase 3.3 adds a
-// single optional trait bound per param; multiple bounds (`T: A + B`)
-// can wait for a later phase.
+// `T: Show` in `fn use_show<T: Show>(t: T) -> i64`. Phase 3.3 added a single
+// optional trait bound (`bound`); Phase 28 adds additional bounds via
+// `extraBounds`, so `T: A + B + C` (and `where T: A, T: B`) carry A in
+// `bound` and B, C in `extraBounds`.
 struct TypeParam {
     std::string name;
-    std::string bound; // empty = unbounded
+    std::string bound; // the first/primary bound; empty = unbounded
+    // Phase 28: additional trait bounds beyond the primary one (`T: A + B`).
+    // Plain trait names (the multi-bound case in practice — Hash + Eq — is
+    // non-generic). Method dispatch on a bounded param searches `bound` then
+    // each of these in order.
+    std::vector<std::string> extraBounds;
     // Phase 21a: type arguments supplied to a *parameterized* trait bound,
     // e.g. the `<T>` in `<I: Iterator<T>>`. Empty when the bound trait takes
     // no type params (or there is no bound). Each TypeRef typically names
     // another of the enclosing decl's generic params (the trait's element
     // type is bound to the fn's own type param), so the typechecker resolves
     // them against the enclosing generic env. Stored on TypeParam (additive,
-    // so non-generic bounds are byte-for-byte unchanged).
+    // so non-generic bounds are byte-for-byte unchanged). Applies to the
+    // primary `bound` only; `extraBounds` are non-parameterized.
     std::vector<TypeRef> boundTypeArgs;
     std::size_t line = 1;
     std::size_t column = 1;
