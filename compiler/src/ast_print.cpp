@@ -160,6 +160,11 @@ private:
         std::string s = "<";
         for (std::size_t i = 0; i < gps.size(); ++i) {
             if (i) s += ", ";
+            // Phase 57: a const-generic param prints as `const N: i64`.
+            if (gps[i].isConst) {
+                s += "const " + gps[i].name + ": i64";
+                continue;
+            }
             s += gps[i].name;
             if (!gps[i].bound.empty()) {
                 s += ": " + gps[i].bound;
@@ -405,6 +410,9 @@ private:
                     out_ += let->tupleNames[i];
                 }
                 out_ += ")";
+                // Phase 57: optional tuple-let annotation `: (T, ...)`.
+                if (let->annotation)
+                    out_ += ": " + typeToString(*let->annotation);
             } else {
                 out_ += let->name;
                 if (let->annotation)

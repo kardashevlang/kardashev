@@ -1809,6 +1809,49 @@ void test_array_len_const_fn_call() {
                let->annotation->arrayLenExpr.get()) != nullptr);
 }
 
+// Phase 57 (v10): const-generic params + symbolic array length + tuple-let
+// annotation.
+void test_const_generic_param() {
+    auto r = parse("struct Mat<const N: i64> { data: [i64; N] }");
+    assert(r.ok());
+    const auto& s = r.program.structs[0];
+    assert(s.genericParams.size() == 1);
+    assert(s.genericParams[0].isConst);
+    assert(s.genericParams[0].name == "N");
+    // mixed type + const params: `<T, const N: i64>`
+    auto r2 = parse("struct Buf<T, const CAP: i64> { x: T }");
+    assert(r2.ok());
+    const auto& gp = r2.program.structs[0].genericParams;
+    assert(gp.size() == 2 && !gp[0].isConst && gp[1].isConst &&
+           gp[1].name == "CAP");
+    // `[i64; N]` keeps N as the length expr (an identifier).
+    assert(s.fields[0].type.isArray);
+    assert(dynamic_cast<const ast::IdentExpr*>(
+               s.fields[0].type.arrayLenExpr.get()) != nullptr);
+}
+
+void test_const_generic_param_non_i64_rejected() {
+    auto r = parse("struct Mat<const N: bool> { x: i64 }");
+    assert(!r.ok()); // must be i64
+}
+
+void test_tuple_let_annotation() {
+    auto r = parse("fn f() -> i64 { let (a, b): (i64, i64) = (3, 4); a }");
+    assert(r.ok());
+    const auto* let = dynamic_cast<const ast::LetStmt*>(
+        r.program.functions[0].body->stmts[0].get());
+    assert(let && let->tupleNames.size() == 2);
+    assert(let->tupleNames[0] == "a" && let->tupleNames[1] == "b");
+    assert(let->annotation && let->annotation->isTuple);
+    assert(let->annotation->tupleElems.size() == 2);
+    // the no-annotation tuple-let still parses (regression).
+    auto r2 = parse("fn f() -> i64 { let (a, b) = (3, 4); a }");
+    assert(r2.ok());
+    const auto* let2 = dynamic_cast<const ast::LetStmt*>(
+        r2.program.functions[0].body->stmts[0].get());
+    assert(let2 && let2->tupleNames.size() == 2 && !let2->annotation);
+}
+
 } // namespace
 
 int main() {
@@ -1957,6 +2000,10 @@ int main() {
     test_array_len_literal_still_literal();
     test_array_len_const_expr();
     test_array_len_const_fn_call();
-    std::cout << "All parser tests passed (128 cases)\n";
+    // Phase 57 (v10): const-generic params + tuple-let annotation.
+    test_const_generic_param();
+    test_const_generic_param_non_i64_rejected();
+    test_tuple_let_annotation();
+    std::cout << "All parser tests passed (131 cases)\n";
     return 0;
 }

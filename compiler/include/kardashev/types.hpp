@@ -129,6 +129,11 @@ struct Type {
     // an LLVM `[arrayLen x <arrayElem>]`.
     TypePtr arrayElem;
     std::size_t arrayLen = 0;
+    // Phase 57 (v10): a SYMBOLIC array length `[T; N]` where N is a
+    // const-generic parameter in scope (empty = concrete `arrayLen`). The
+    // length isn't known until the type is instantiated; Phase 58 substitutes
+    // this name with the supplied const value to recover a concrete arrayLen.
+    std::string arrayLenParam;
 
     // Tuple (Phase 22): the ordered element types of `(A, B, ...)`.
     std::vector<TypePtr> tupleElems;

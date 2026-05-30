@@ -849,6 +849,7 @@ public:
             GenericEnv genEnv = buildGenericEnv(sd.genericParams,
                                                   it->second.genericVars);
             currentGenericEnv_ = &genEnv;
+            setConstParamsInScope(sd.genericParams); // Phase 57
             std::vector<std::pair<std::string, TypePtr>> resolvedFields;
             resolvedFields.reserve(sd.fields.size());
             std::unordered_set<std::string> seen;
@@ -863,6 +864,7 @@ public:
             }
             it->second.type->structFields = std::move(resolvedFields);
             currentGenericEnv_ = nullptr;
+            currentConstParams_.clear();
         }
 
         for (const auto& ed : program.enums) {
@@ -1876,6 +1878,16 @@ private:
     // specialization in a body — e.g. `x + 1` in `fn id<T>(x: T) -> T` —
     // doesn't taint the stored schema).
     const GenericEnv* currentGenericEnv_ = nullptr;
+    // Phase 57 (v10): names of CONST-generic params in scope for the decl
+    // currently being resolved, so `resolveTypeRef` treats `[T; N]` as a
+    // symbolic-length array (recorded, not const-evaluated). Set/cleared in
+    // lockstep with currentGenericEnv_.
+    std::unordered_set<std::string> currentConstParams_;
+    void setConstParamsInScope(const std::vector<ast::TypeParam>& ps) {
+        currentConstParams_.clear();
+        for (const auto& p : ps)
+            if (p.isConst) currentConstParams_.insert(p.name);
+    }
     // Phase 10a: names of generic params that are effect-row variables in
     // the signature currently being resolved. Active alongside
     // `currentGenericEnv_`; lets `resolveTypeRef` distinguish a row-var name
@@ -2760,6 +2772,19 @@ private:
             // negative / non-evaluable length is an error; length falls back
             // to 0 so resolution continues (the error is already reported).
             std::size_t len = tr.arrayLen;
+            // Phase 57: a SYMBOLIC length `[T; N]` where N is a const-generic
+            // param in scope. Don't const-eval (N has no value until the type
+            // is instantiated) — record the name so Phase 58 substitutes it.
+            if (tr.arrayLenExpr) {
+                if (auto* id =
+                        dynamic_cast<const ast::IdentExpr*>(tr.arrayLenExpr.get());
+                    id && currentConstParams_.count(id->name)) {
+                    TypePtr arr = makeArray(elem, 0);
+                    arr->arrayLenParam = id->name;
+                    if (tr.isRef) return makeRef(arr, tr.refIsMut);
+                    return arr;
+                }
+            }
             if (tr.arrayLenExpr) {
                 std::int64_t n = 0;
                 if (evalConstI64(*tr.arrayLenExpr, n)) {
@@ -6341,9 +6366,37 @@ private:
                           let->line, let->column);
                     return;
                 }
+                // Phase 57: an optional `: (T, ...)` annotation pins each
+                // element type (and is a coercion target per element), so a
+                // multi-value generic call whose element types can't be
+                // inferred is spell-able: `let (a, b): (T, T) = f()`.
+                std::vector<TypePtr> elemTys = r->tupleElems;
+                if (let->annotation) {
+                    TypePtr annot = resolve(resolveTypeRef(*let->annotation));
+                    if (annot->kind != TypeKind::Tuple ||
+                        annot->tupleElems.size() != let->tupleNames.size()) {
+                        error("tuple-`let` annotation must be a tuple type with "
+                                  + std::to_string(let->tupleNames.size()) +
+                                  " element(s), got " + typeToString(annot),
+                              let->line, let->column);
+                        return;
+                    }
+                    for (std::size_t i = 0; i < let->tupleNames.size(); ++i) {
+                        if (!coerceOrUnify(*let->value, r->tupleElems[i],
+                                           annot->tupleElems[i])) {
+                            error("tuple-`let` element " + std::to_string(i + 1) +
+                                      " has type " +
+                                      typeToString(r->tupleElems[i]) +
+                                      " but the annotation says " +
+                                      typeToString(annot->tupleElems[i]),
+                                  let->line, let->column);
+                        }
+                    }
+                    elemTys = annot->tupleElems;
+                }
                 for (std::size_t i = 0; i < let->tupleNames.size(); ++i) {
                     if (let->tupleNames[i] == "_") continue;
-                    scopes_.back()[let->tupleNames[i]] = r->tupleElems[i];
+                    scopes_.back()[let->tupleNames[i]] = elemTys[i];
                     if (let->isMut) markMut(let->tupleNames[i]);
                 }
                 return;
