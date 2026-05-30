@@ -670,6 +670,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 72 (v12 — real stdlib): String methods (starts_with/ends_with/contains/
+# index_of, to_upper/to_lower/concat/repeat).
+sh_test(
+    name = "smoke_test_phase72",
+    srcs = ["smoke_test_phase72.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

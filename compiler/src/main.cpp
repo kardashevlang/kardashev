@@ -723,6 +723,120 @@ std::string applyPrelude(const std::string& userSrc) {
             "    out\n"
             "}\n";
     }
+    // v12 Phase 72: string methods, written in kardashev over str_char_at /
+    // str_len / str_push_byte. The query methods (starts_with / ends_with /
+    // index_of / contains) are pure reads; the transforms (to_upper / to_lower
+    // / concat / repeat) build a fresh heap String (`! { alloc }`).
+    if (userSrc.find("fn str_starts_with") == std::string::npos) {
+        prelude +=
+            "fn str_starts_with(s: &String, prefix: &String) -> bool {\n"
+            "    let pl = str_len(prefix);\n"
+            "    let mut ok = pl <= str_len(s);\n"
+            "    let mut i = 0;\n"
+            "    while i < pl {\n"
+            "        if ok {\n"
+            "            if str_char_at(s, i) != str_char_at(prefix, i) { ok = false; } else {}\n"
+            "        } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    ok\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_ends_with") == std::string::npos) {
+        prelude +=
+            "fn str_ends_with(s: &String, suffix: &String) -> bool {\n"
+            "    let sl = str_len(s);\n"
+            "    let fl = str_len(suffix);\n"
+            "    let mut ok = fl <= sl;\n"
+            "    let mut i = 0;\n"
+            "    while i < fl {\n"
+            "        if ok {\n"
+            "            if str_char_at(s, sl - fl + i) != str_char_at(suffix, i) { ok = false; } else {}\n"
+            "        } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    ok\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_index_of") == std::string::npos) {
+        prelude +=
+            "fn str_index_of(s: &String, needle: &String) -> i64 {\n"
+            "    let sl = str_len(s);\n"
+            "    let nl = str_len(needle);\n"
+            "    let mut idx = 0 - 1;\n"
+            "    if nl == 0 { idx = 0; } else {\n"
+            "        let mut i = 0;\n"
+            "        while i + nl <= sl {\n"
+            "            if idx < 0 {\n"
+            "                let mut j = 0;\n"
+            "                let mut m = true;\n"
+            "                while j < nl {\n"
+            "                    if str_char_at(s, i + j) != str_char_at(needle, j) { m = false; } else {}\n"
+            "                    j = j + 1;\n"
+            "                }\n"
+            "                if m { idx = i; } else {}\n"
+            "            } else {}\n"
+            "            i = i + 1;\n"
+            "        }\n"
+            "    }\n"
+            "    idx\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_contains") == std::string::npos) {
+        prelude +=
+            "fn str_contains(s: &String, needle: &String) -> bool {\n"
+            "    str_index_of(s, needle) >= 0\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_to_upper") == std::string::npos) {
+        prelude +=
+            "fn str_to_upper(s: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < str_len(s) {\n"
+            "        let c = str_char_at(s, i);\n"
+            "        let up = if c >= 97 && c <= 122 { c - 32 } else { c };\n"
+            "        str_push_byte(&mut out, up);\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_to_lower") == std::string::npos) {
+        prelude +=
+            "fn str_to_lower(s: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < str_len(s) {\n"
+            "        let c = str_char_at(s, i);\n"
+            "        let lo = if c >= 65 && c <= 90 { c + 32 } else { c };\n"
+            "        str_push_byte(&mut out, lo);\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_concat") == std::string::npos) {
+        prelude +=
+            "fn str_concat(a: &String, b: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    string_push_str(&mut out, clone(a));\n"
+            "    string_push_str(&mut out, clone(b));\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_repeat") == std::string::npos) {
+        prelude +=
+            "fn str_repeat(s: &String, n: i64) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < n {\n"
+            "        string_push_str(&mut out, clone(s));\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
     if (userSrc.find("fn option_unwrap_or") == std::string::npos) {
         prelude +=
             "fn option_unwrap_or(o: Option<i64>, default: i64) -> i64 {\n"

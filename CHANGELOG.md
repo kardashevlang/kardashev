@@ -49,6 +49,11 @@ step toward production use.
   delegating to the backing map's keys). `hashmap_remove` / `hashset_remove`
   are a deliberate deferral (open-addressing deletion needs tombstone-aware
   get/insert).
+- **String methods** (Phase 72): `str_starts_with` / `str_ends_with` /
+  `str_contains` / `str_index_of` (pure reads, substring index or −1) and
+  `str_to_upper` / `str_to_lower` / `str_concat` / `str_repeat` (fresh heap
+  Strings). All kardashev prelude functions over `str_char_at` / `str_len` /
+  `str_push_byte` — high-level string manipulation without a manual char loop.
 
 ## [0.11.0] — Roadmap v11 "real machine integers" (Phases 63–68)
 
