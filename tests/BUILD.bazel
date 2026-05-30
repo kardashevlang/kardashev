@@ -931,6 +931,17 @@ sh_test(
     ],
 )
 
+# v17 Phase 102 (self-hosting, cont.): a whole-FUNCTION type checker — params,
+# `let` typing, and the body's type checked against the declared return type.
+sh_test(
+    name = "smoke_test_phase102",
+    srcs = ["smoke_test_phase102.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:funcheck.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

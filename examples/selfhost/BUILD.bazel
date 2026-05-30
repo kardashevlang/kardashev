@@ -2,7 +2,7 @@ load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary")
 
 # Readable by //tests:smoke_test_phase88..93.
 exports_files(
-    ["lexer.kd", "tokens.kd", "parser.kd", "printer.kd", "checker.kd", "front.kd", "expr.kd", "stmt.kd", "scopechk.kd", "interp.kd", "func.kd", "typeck.kd"],
+    ["lexer.kd", "tokens.kd", "parser.kd", "printer.kd", "checker.kd", "front.kd", "expr.kd", "stmt.kd", "scopechk.kd", "interp.kd", "func.kd", "typeck.kd", "funcheck.kd"],
     visibility = ["//visibility:public"],
 )
 
@@ -28,3 +28,5 @@ kardashev_binary(name = "interp", src = "interp.kd")
 kardashev_binary(name = "func", src = "func.kd")
 # v17 Phase 101: a real TYPE CHECKER over an i64/bool expression language.
 kardashev_binary(name = "typeck", src = "typeck.kd")
+# v17 Phase 102: a whole-FUNCTION type checker (params, lets, body vs return type).
+kardashev_binary(name = "funcheck", src = "funcheck.kd")

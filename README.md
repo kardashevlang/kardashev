@@ -464,8 +464,20 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   (→`TBool`). JIT + AOT; pinned by `tests/smoke_test_phase101.sh`. A type
 >   checker for kardashev, written in kardashev.
 >
-> Planned: thread the type checker through whole functions; eventually emit
-> IR/code — toward a bootstrap.
+> - **Phase 102 — a whole-FUNCTION type checker, self-hosted (done).** Threads the
+>   Phase-101 checker through an entire `fn NAME(PARAMS) -> RET { LETS ; RESULT }`
+>   (`examples/selfhost/funcheck.kd`). It parses params with their declared types
+>   (`i64` / `bool`), builds a type environment from them, type-checks each `let`
+>   (binding the inferred type of its RHS, rejecting an ill-typed one), and
+>   requires the body's result type to EQUAL the declared return type. Checked on
+>   a well-typed `i64` function (→ok), a well-typed `bool` function (→ok), a
+>   body/return-type mismatch (`a < a` returned where `i64` is declared → rejected),
+>   and a `let` that makes the body ill-typed (`let y = a < a ; y + 1` → rejected).
+>   JIT + AOT; pinned by `tests/smoke_test_phase102.sh`. This is the real check a
+>   compiler runs on a function definition — name resolution *plus* type agreement.
+>
+> Planned: emit IR / a tiny bytecode for the checked function — the first codegen
+> step toward a bootstrap.
 
 ## Roadmap v16 — shipped
 
