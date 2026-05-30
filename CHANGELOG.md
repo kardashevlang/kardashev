@@ -18,10 +18,11 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
-## [Unreleased] — Roadmap v10 (Phases 57–62, in progress)
+## [0.10.0] — Roadmap v10 "sized and sound at compile time" (Phases 57–62)
 
 Theme: **sized and sound at compile time** — const-generic type params + the
-effect system's last soundness floor.
+effect system's last soundness floor. A pre-merge adversarial multi-agent review
+hardened 5 blockers + 5 majors the green smoke suite had missed (see Fixed).
 
 ### Added
 - Const-generic parameters parse and bind: `const N: i64` (mixed with type
