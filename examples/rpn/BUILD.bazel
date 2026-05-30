@@ -1,5 +1,11 @@
 load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary")
 
+# Readable by //tests:smoke_test_differential (the cross-backend JIT/AOT sweep).
+exports_files(
+    ["main.kd"],
+    visibility = ["//visibility:public"],
+)
+
 # Phase 20a capstone: a reverse-Polish-notation calculator written in
 # kardashev, exercising Vec / HashMap / struct / trait dispatch / match /
 # Option / Result / loops. AOT-compiled via //compiler:kardc.

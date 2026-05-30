@@ -449,8 +449,19 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   Sender leaves an env, so sound code always has one): zero false positives
 >   across the whole v13 channel suite; pinned in `smoke_test_v13_review.sh`.
 >
-> Planned: JIT-vs-AOT differential / property testing; the macOS `codegen_test`
-> flake (needs a macOS-arm64 runner to diagnose).
+ - **Phase 87 — a JIT-vs-AOT differential sweep.** One test (`smoke_test_differential`)
+>   runs all 9 single-file capstones (calc, checksum, csvstats, json, kdlex,
+>   matrix, parstats, rpn, wordfreq) through BOTH backends and asserts they agree:
+>   the JIT prints `main`'s `i64` return as a trailing line while the AOT process
+>   exits with it (& 255), so AOT stdout must equal JIT stdout minus that line and
+>   the line mod 256 must equal the AOT exit code. A single place that any future
+>   codegen change must keep green — catches an ORC-JIT-vs-clang-AOT divergence on
+>   real, diverse programs (parsing, the numeric tower, generics, traits,
+>   collections, recursion, threads/channels, const-generics, Drop).
+>
+> Planned: property/fuzz testing (grammar-aware program generation); the macOS
+> `codegen_test` flake (needs a macOS-arm64 runner to diagnose); then the v14
+> close-out (version 0.14.0, PR to main, tag/release).
 
 ## Roadmap v13 — shipped
 
