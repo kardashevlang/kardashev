@@ -36,6 +36,7 @@ TokenKind keywordOrIdent(std::string_view s) {
     if (s == "false") return TokenKind::KwFalse;
     if (s == "extern") return TokenKind::KwExtern;
     if (s == "const") return TokenKind::KwConst; // Phase 25
+    if (s == "as") return TokenKind::KwAs;        // Phase 65 numeric cast
     // A bare `_` is the wildcard pattern; `_foo` stays an Identifier.
     if (s == "_") return TokenKind::Underscore;
     return TokenKind::Identifier;
@@ -353,6 +354,7 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::KwFalse: return "KwFalse";
     case TokenKind::KwExtern: return "KwExtern";
     case TokenKind::KwConst: return "KwConst";
+    case TokenKind::KwAs: return "KwAs";
     case TokenKind::DoubleColon: return "DoubleColon";
     case TokenKind::Plus: return "Plus";
     case TokenKind::Minus: return "Minus";

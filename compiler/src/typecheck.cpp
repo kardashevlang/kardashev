@@ -2103,6 +2103,10 @@ private:
             collectEffects(*un->operand, out);
             return;
         }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            collectEffects(*ce->operand, out); // Phase 65: cast is pure glue
+            return;
+        }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             for (const auto& a : call->args) collectEffects(*a, out);
             // Phase 10a: prefer the per-call-site contribution recorded
@@ -3572,6 +3576,32 @@ private:
                 constFail("unary `!` requires bool in a const expr", e);
             return {true, v.i ? 0 : 1};
         }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            // Phase 65: a numeric `as` cast inside a const expr. Only int->int
+            // is const-foldable (the const evaluator is integer-valued); a
+            // cast to/from f64 is rejected honestly. The value wraps into the
+            // target width with two's-complement semantics, matching codegen.
+            ConstValue v = evalConstExpr(*ce->operand, env, depth);
+            if (v.isBool)
+                constFail("`as` cast requires a numeric operand in a const "
+                          "expr",
+                          e);
+            TypePtr dst = resolve(resolveTypeRef(ce->targetType));
+            if (dst->kind != TypeKind::Int || dst->isConstValue)
+                constFail("`as` to a non-integer type is not allowed in a "
+                          "const expr",
+                          e);
+            long long val = v.i;
+            if (dst->intWidth < 64) {
+                unsigned long long mask = (1ULL << dst->intWidth) - 1;
+                unsigned long long u =
+                    static_cast<unsigned long long>(val) & mask;
+                if (dst->intSigned && (u & (1ULL << (dst->intWidth - 1))))
+                    u |= ~mask; // sign-extend the narrow signed value
+                val = static_cast<long long>(u);
+            }
+            return {false, val};
+        }
         if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
             return evalConstBinary(*bin, env, depth);
         }
@@ -3842,6 +3872,9 @@ private:
         }
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             return checkUnary(*un);
+        }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            return checkCast(*ce);
         }
         if (dynamic_cast<const ast::StringLitExpr*>(&e)) {
             auto it = structSchemas_.find("String");
@@ -5062,6 +5095,10 @@ private:
             collectFreeVars(*un->operand, bound, order, seen);
             return;
         }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            collectFreeVars(*ce->operand, bound, order, seen);
+            return;
+        }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             // The callee name can itself be a captured fn value.
             noteUse(call->callee);
@@ -5293,6 +5330,8 @@ private:
         }
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e))
             return bodyMutatesCapture(*un->operand, name, bound);
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e))
+            return bodyMutatesCapture(*ce->operand, name, bound);
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             for (const auto& a : call->args)
                 if (bodyMutatesCapture(*a, name, bound)) return true;
@@ -6195,6 +6234,30 @@ private:
 
     // Phase 15: prefix unary operators. `-x` negates an i64; `!x` logically
     // negates a bool. Both are total over their input type and reproduce it.
+    // Phase 65: `operand as Type` — an explicit numeric cast. Both the source
+    // and the target must be a primitive numeric type (an int of any
+    // width/signedness, or f64); the result type is the target. This is the
+    // only bridge across the non-coercive lattice — every other int-width or
+    // int/float crossing is a type error. Casting from/to a non-numeric type
+    // (a struct, bool, String, reference, ...) is rejected.
+    TypePtr checkCast(const ast::CastExpr& ce) {
+        TypePtr src = resolve(checkExpr(*ce.operand));
+        TypePtr dst = resolve(resolveTypeRef(ce.targetType));
+        auto isNumeric = [](const TypePtr& t) {
+            return (t->kind == TypeKind::Int && !t->isConstValue) ||
+                   t->kind == TypeKind::Float;
+        };
+        if (!isNumeric(src) || !isNumeric(dst)) {
+            error("`as` cast is only allowed between numeric types (integers "
+                  "and f64), got " +
+                      typeToString(src) + " as " + typeToString(dst),
+                  ce.line, ce.column);
+            // Recover with the target if it is at least numeric, else i64.
+            return isNumeric(dst) ? dst : makeInt();
+        }
+        return dst;
+    }
+
     TypePtr checkUnary(const ast::UnaryExpr& un) {
         TypePtr operand = checkExpr(*un.operand);
         switch (un.op) {

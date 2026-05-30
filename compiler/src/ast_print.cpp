@@ -549,6 +549,14 @@ private:
             printExpr(*un->operand, depth, /*parentPrec=*/100);
             return;
         }
+        // Phase 65: `operand as Type`. `as` binds tighter than any binary op but
+        // looser than a prefix unary, so print the operand at unary precedence
+        // (wrapping a binary operand in parens) and append ` as Type`.
+        if (auto* ce = dynamic_cast<const CastExpr*>(&e)) {
+            printExpr(*ce->operand, depth, /*parentPrec=*/90);
+            out_ += " as " + typeToString(ce->targetType);
+            return;
+        }
         if (auto* sl = dynamic_cast<const StringLitExpr*>(&e)) {
             out_ += "\"" + escapeString(sl->value) + "\"";
             return;

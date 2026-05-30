@@ -275,6 +275,8 @@ public:
             return exprMayPanic(*x->lhs) || exprMayPanic(*x->rhs);
         if (auto* x = dynamic_cast<const ast::UnaryExpr*>(&e))
             return exprMayPanic(*x->operand);
+        if (auto* x = dynamic_cast<const ast::CastExpr*>(&e))
+            return exprMayPanic(*x->operand); // Phase 65: a cast never panics
         if (auto* x = dynamic_cast<const ast::CallValueExpr*>(&e)) {
             if (exprMayPanic(*x->callee)) return true;
             for (const auto& a : x->args)
@@ -6636,6 +6638,10 @@ private:
             collectAsyncLocalTypes(*ue->operand, out, seen);
             return;
         }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            collectAsyncLocalTypes(*ce->operand, out, seen);
+            return;
+        }
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
             collectAsyncLocalTypes(*mc->receiver, out, seen);
             for (const auto& a : mc->args) collectAsyncLocalTypes(*a, out, seen);
@@ -6735,6 +6741,10 @@ private:
         }
         if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             asyncLivenessWalk(*ue->operand, boundAt, awaitCounter, promoted);
+            return;
+        }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            asyncLivenessWalk(*ce->operand, boundAt, awaitCounter, promoted);
             return;
         }
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
@@ -8148,6 +8158,10 @@ private:
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             return emitUnary(*un);
         }
+        // Phase 65: `operand as Type` numeric cast.
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            return emitCast(*ce);
+        }
         if (auto* sl = dynamic_cast<const ast::StringLitExpr*>(&e)) {
             return emitStringLit(*sl);
         }
@@ -8682,6 +8696,51 @@ private:
         }
         }
         return v; // unreachable
+    }
+
+    // Phase 65: lower `operand as Type` to the width/signedness-correct LLVM
+    // cast — the numeric conversion matrix. The typechecker has constrained
+    // both sides to a numeric type (an int of any width/signedness, or f64).
+    // LLVM integers are sign-agnostic, so signedness comes from the kardashev
+    // types: a widening sext/zext's by the SOURCE's sign, a narrowing truncs,
+    // int<->float uses si/ui<->fp by the relevant sign, and a same-width or
+    // same-float cast is a no-op (a two's-complement reinterpret).
+    llvm::Value* emitCast(const ast::CastExpr& ce) {
+        llvm::Value* v = emitExpr(*ce.operand);
+        TypePtr srcTy = lookupExprType(*ce.operand);
+        if (srcTy) srcTy = resolveInInstance(srcTy);
+        TypePtr dstTy = lookupExprType(ce);
+        if (dstTy) dstTy = resolveInInstance(dstTy);
+        bool srcIsFloat = srcTy ? srcTy->kind == TypeKind::Float
+                                : v->getType()->isDoubleTy();
+        bool dstIsFloat = dstTy && dstTy->kind == TypeKind::Float;
+        bool srcSigned = srcTy ? srcTy->intSigned : true;
+        bool dstSigned = dstTy ? dstTy->intSigned : true;
+        llvm::Type* dstLL = dstTy ? mapKardashevType(dstTy)
+                                  : llvm::Type::getInt64Ty(*ctx_);
+
+        if (srcIsFloat && dstIsFloat) {
+            // f64 -> f64 (the only float width today) is a no-op; f32 conversions
+            // (fpext / fptrunc) land in Phase 67.
+            return v;
+        }
+        if (srcIsFloat) {
+            // float -> int.
+            return dstSigned ? builder_->CreateFPToSI(v, dstLL, "fptosi")
+                             : builder_->CreateFPToUI(v, dstLL, "fptoui");
+        }
+        if (dstIsFloat) {
+            // int -> float.
+            return srcSigned ? builder_->CreateSIToFP(v, dstLL, "sitofp")
+                             : builder_->CreateUIToFP(v, dstLL, "uitofp");
+        }
+        // int -> int.
+        unsigned srcW = v->getType()->getIntegerBitWidth();
+        unsigned dstW = dstLL->getIntegerBitWidth();
+        if (dstW == srcW) return v; // reinterpret — a no-op in two's complement
+        if (dstW < srcW) return builder_->CreateTrunc(v, dstLL, "trunc");
+        return srcSigned ? builder_->CreateSExt(v, dstLL, "sext")
+                         : builder_->CreateZExt(v, dstLL, "zext");
     }
 
     llvm::Value* emitBinary(const ast::BinaryExpr& bin) {

@@ -2642,6 +2642,57 @@ void test_unsigned_suffix_deferred_errors() {
                       "unsigned_suffix_deferred_errors");
 }
 
+// Phase 65 (v11): the `as` numeric cast operator.
+void test_cast_bridges_mixed_width_ok() {
+    // A cast is the ONLY bridge across the non-coercive lattice: an i32 widened
+    // to i64 can be added to an i64.
+    expectOk("fn main() -> i64 { let a: i32 = 5; let b: i64 = 7;"
+             " let c: i64 = a as i64 + b; c }",
+             "cast_bridges_mixed_width_ok");
+}
+
+void test_cast_int_float_roundtrip_ok() {
+    expectOk("fn main() -> i64 { let x: i64 = 7; let f: f64 = x as f64 / 2.0;"
+             " let back: i64 = f as i64; back }",
+             "cast_int_float_roundtrip_ok");
+}
+
+void test_cast_narrowing_ok() {
+    // Narrowing is allowed (it truncates) — it is NOT a range error like an
+    // implicit literal narrow; the cast is explicit.
+    expectOk("fn main() -> i64 { let c: i64 = 1000; let d: i32 = c as i32;"
+             " d as i64 }",
+             "cast_narrowing_ok");
+}
+
+void test_cast_chains_ok() {
+    expectOk("fn main() -> i64 { let a: i64 = 10; a as i32 as i64 }",
+             "cast_chains_ok");
+}
+
+void test_cast_struct_rejected() {
+    expectErrContains("struct P { x: i64 }\n"
+                      "fn main() -> i64 { let p = P { x: 1 };"
+                      " let n = p as i32; 0 }",
+                      "numeric",
+                      "cast_struct_rejected");
+}
+
+void test_cast_bool_rejected() {
+    expectErrContains("fn main() -> i64 { let b = true; let n = b as i64; n }",
+                      "numeric",
+                      "cast_bool_rejected");
+}
+
+void test_cast_result_type_is_target() {
+    // The cast result type is exactly the target: `(a as i32)` is an i32, so
+    // assigning it to an i64 binding without a further cast is a type error.
+    expectErrContains("fn main() -> i64 { let a: i64 = 5; let b: i64 = a as i32;"
+                      " b }",
+                      "i32",
+                      "cast_result_type_is_target");
+}
+
 } // namespace
 
 int main() {
@@ -2931,6 +2982,13 @@ int main() {
     test_int_suffix_out_of_range_errors();
     test_int_suffix_width_mismatch_errors();
     test_unsigned_suffix_deferred_errors();
+    test_cast_bridges_mixed_width_ok();
+    test_cast_int_float_roundtrip_ok();
+    test_cast_narrowing_ok();
+    test_cast_chains_ok();
+    test_cast_struct_rejected();
+    test_cast_bool_rejected();
+    test_cast_result_type_is_target();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -2939,6 +2997,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (269 cases)\n";
+    std::cout << "All typecheck tests passed (276 cases)\n";
     return 0;
 }

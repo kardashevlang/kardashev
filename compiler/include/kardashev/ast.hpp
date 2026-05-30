@@ -526,6 +526,20 @@ struct TypeRef {
     std::size_t column = 1;
 };
 
+// Phase 65 (v11): `operand as Type` — an explicit numeric cast, the only way to
+// move between the non-coercive integer/float lattice (`i32` <-> `i64`,
+// `i64` <-> `f64`, ...). Binds tighter than any binary operator but looser than
+// a prefix unary, so `-x as i32` is `(-x) as i32` and `a as i32 * 2` is
+// `(a as i32) * 2` (the Rust precedence). Typecheck: both `operand` and
+// `targetType` must be numeric (int or f64); the result type is `targetType`.
+// Codegen lowers to the width/signedness-correct LLVM cast (trunc / sext / zext
+// / sitofp / uitofp / fptosi / fptoui / fpext / fptrunc). Defined here (after
+// TypeRef) because it holds a TypeRef by value.
+struct CastExpr : Expr {
+    ExprPtr operand;
+    TypeRef targetType;
+};
+
 struct Param {
     std::string name;
     TypeRef type;

@@ -603,6 +603,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 65 (v11 — the numeric tower): the `as` cast operator + conversion matrix
+# (sext/trunc/sitofp/fptosi), precedence, chaining, const-fold, non-numeric reject.
+sh_test(
+    name = "smoke_test_phase65",
+    srcs = ["smoke_test_phase65.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

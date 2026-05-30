@@ -1362,8 +1362,28 @@ private:
         return lhs;
     }
 
+    // Phase 65: `operand as Type` casts. `as` binds tighter than every binary
+    // operator (so it sits below the precedence loop) but looser than a prefix
+    // unary (so the operand is a full parseUnary): `-x as i32` is `(-x) as i32`
+    // and `a as i32 * 2` is `(a as i32) * 2`. Casts chain left-to-right
+    // (`x as i32 as i64`).
+    ast::ExprPtr parseCast() {
+        auto expr = parseUnary();
+        while (check(TokenKind::KwAs)) {
+            Token asTok = consume();
+            ast::TypeRef ty = parseTypeRef();
+            auto ce = std::make_unique<ast::CastExpr>();
+            ce->line = asTok.line;
+            ce->column = asTok.column;
+            ce->operand = std::move(expr);
+            ce->targetType = std::move(ty);
+            expr = std::move(ce);
+        }
+        return expr;
+    }
+
     ast::ExprPtr parseExprPrec(int minPrec) {
-        auto lhs = parseUnary();
+        auto lhs = parseCast();
         while (true) {
             int prec = binPrec(peek().kind);
             if (prec == 0 || prec < minPrec) break;

@@ -42,6 +42,18 @@ instead of i64-only. The first step toward production use.
   patterns (`0xFF => …`). Unsigned suffixes (`u8`..`u64`) are parsed and
   rejected with a clear "arrives in a later phase" diagnostic until Phase 66
   lands unsigned integers — never silently mis-typed.
+- The **`as` cast operator** (Phase 65) — the only bridge across the
+  non-coercive lattice. `operand as Type` converts between any two numeric
+  types (an int of any width/signedness, or `f64`): integer widen (`sext`),
+  narrow (`trunc`), and `int`↔`f64` (`sitofp` / `fptosi`, truncating toward
+  zero), lowered to the width/signedness-correct LLVM cast. A cast is the only
+  way to add an `i32` to an `i64` (`a as i64 + b`). `as` binds tighter than
+  every binary operator but looser than a prefix unary (`-x as i32` is
+  `(-x) as i32`, `a as i32 * 2` is `(a as i32) * 2`) and chains left-to-right
+  (`x as i32 as i64`). An `int`→`int` cast is const-foldable and wraps with
+  two's-complement semantics (`300 as i8` == 44) identically at compile time
+  and run time. Casting from/to a non-numeric type (a struct, `bool`, String,
+  reference) is a compile error.
 
 ## [0.10.0] — Roadmap v10 "sized and sound at compile time" (Phases 57–62)
 
