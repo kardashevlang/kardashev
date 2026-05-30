@@ -820,6 +820,17 @@ sh_test(
     ],
 )
 
+# v15 Phase 91 (self-hosting): an AST printer — reprints the FnSig AST and checks
+# the source -> AST -> source round-trip is lossless.
+sh_test(
+    name = "smoke_test_phase91",
+    srcs = ["smoke_test_phase91.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:printer.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

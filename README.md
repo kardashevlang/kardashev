@@ -439,11 +439,17 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   (first `a: i64`), return `i64`, witness 1211, JIT + AOT. (Arithmetic-expression
 >   parsing was already shown by `examples/calc`; this parses the *language's own*
 >   grammar — the genuine step toward a self-hosted front-end.)
+> - **Phase 91 — an AST printer + round-trip (done).** `examples/selfhost/printer.kd`
+>   reprints the parsed `FnSig` back to source and checks it ROUND-TRIPS:
+>   `fn add(a: i64, b: i64) -> i64` → tokens → AST → source is byte-identical
+>   (length 29, `round_trips = 1`), JIT + AOT. A lossless round-trip proves the
+>   AST captures everything the surface syntax carries — the invariant a real
+>   parser must hold.
 >
 > Planned: parse more of the grammar (items, statements, expressions) → a fuller
-> `enum` AST; an AST printer + a scope/type checker; a capstone that
-> self-lexes/parses a real kardashev source file — closing language gaps (richer
-> errors, string ops) as self-hosting surfaces them.
+> `enum` AST; a scope/type checker; a capstone that self-lexes/parses a real
+> kardashev source file — closing language gaps (richer errors, string ops) as
+> self-hosting surfaces them.
 
 ## Roadmap v14 — shipped
 
