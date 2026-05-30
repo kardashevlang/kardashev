@@ -686,6 +686,16 @@ private:
         // inline path is jumped over). The SAME drop flag guards both, so the
         // value is dropped at most once on either path. See the panic runtime.
         bool pushedCleanup = false;
+        // Phase 100 (v17): per-direct-field partial-move flags. Non-empty ONLY
+        // for a plain user struct local (no user Drop, non-panic program) — see
+        // perFieldPartialMoveEligible. Each entry {fieldIndex, flag} guards
+        // droppable struct field `fieldIndex`; at scope exit each LIVE field is
+        // dropped individually (a moved-out field's flag is cleared, so it is
+        // skipped while its SIBLINGS are still freed). This replaces the
+        // conservative "disable the whole struct's drop" fix (which leaked the
+        // siblings) with true partial-move tracking. When non-empty, the whole
+        // `flag` above is not consulted at drop time for this local.
+        std::vector<std::pair<unsigned, llvm::AllocaInst*>> fieldFlags;
     };
     // Lexical scope stack of droppable locals, innermost last. Each entry is
     // the declaration-ordered list of owning locals in that scope; scope exit
@@ -8648,7 +8658,74 @@ private:
             builder_->CreateCall(cleanupPushFn_, {flag, storage, thunk});
             pushedCleanup = true;
         }
-        dropScopes_.back().push_back({name, storage, flag, rty, pushedCleanup});
+        // Phase 100: per-field partial-move tracking. For an eligible plain
+        // struct, give each droppable field its own live flag (re-set each loop
+        // iteration, like the whole flag). Moving a field out clears only that
+        // field's flag, so the SIBLINGS are still dropped at scope exit instead
+        // of leaking (the conservative whole-disable was the prior behavior).
+        std::vector<std::pair<unsigned, llvm::AllocaInst*>> fieldFlags;
+        if (perFieldPartialMoveEligible(rty)) {
+            for (unsigned i = 0; i < rty->structFields.size(); ++i) {
+                if (!isDroppable(rty->structFields[i].second)) continue;
+                auto* ff = entryAlloca(llvm::Type::getInt1Ty(*ctx_),
+                                       name + ".f" + std::to_string(i) + "live");
+                builder_->CreateStore(llvm::ConstantInt::getTrue(*ctx_), ff);
+                fieldFlags.push_back({i, ff});
+            }
+        }
+        dropScopes_.back().push_back(
+            {name, storage, flag, rty, pushedCleanup, std::move(fieldFlags)});
+    }
+
+    // Phase 100: is `rty` a plain user struct whose fields can be partially
+    // moved with per-field drop tracking? Mirrors emitDropGlue's plain-struct
+    // field loop (the ONLY drop path where a moved-out field would otherwise be
+    // double-freed or leak its siblings). DISABLED in may-panic programs (the
+    // unwind cleanup thunk drops the whole struct via the single flag, which
+    // per-field flags would desync into a double-free on unwind) and for structs
+    // with a user `impl Drop` (a partial move must not skip or duplicate the
+    // user destructor — such a move stays whole-disabled, leak-but-safe).
+    bool perFieldPartialMoveEligible(const TypePtr& rty) {
+        if (inAsyncFn_) return false;
+        if (programMayPanic_) return false;
+        if (!rty || rty->kind != TypeKind::Struct) return false;
+        const std::string& n = rty->structName;
+        if (n == "Vec" || n == "String" || n == "HashMap" || n == "HashSet" ||
+            n == "Rc" || n == "Sender" || n == "Receiver" || n == "Box")
+            return false;                 // built-in special drops, not field-by-field
+        if (dropImpls_.count(n)) return false;            // user destructor
+        if (rty->structFields.empty()) return false;
+        for (const auto& f : rty->structFields)
+            if (isDroppable(f.second)) return true;       // ≥1 droppable field
+        return false;
+    }
+
+    // Phase 100: drop a per-field-tracked local's still-live droppable fields,
+    // each guarded by its own flag, in declaration order (matching the
+    // plain-struct order in emitDropGlue). A moved-out field's flag is already
+    // clear, so it is skipped — its siblings are still freed. No user destructor
+    // runs (eligibility excludes structs with one). Leaves every flag cleared.
+    void emitPerFieldDrops(const DropLocal& d) {
+        if (currentBlockTerminated()) return;
+        auto& ctx = *ctx_;
+        llvm::Type* llvmTy = mapKardashevType(d.type);
+        for (const auto& [fidx, fflag] : d.fieldFlags) {
+            if (currentBlockTerminated()) break;
+            auto* live = builder_->CreateLoad(llvm::Type::getInt1Ty(ctx), fflag,
+                                              d.name + ".fld.live");
+            auto* dropBB =
+                llvm::BasicBlock::Create(ctx, "drop." + d.name + ".f", currentFn_);
+            auto* afterBB = llvm::BasicBlock::Create(
+                ctx, "drop." + d.name + ".f.after", currentFn_);
+            builder_->CreateCondBr(live, dropBB, afterBB);
+            builder_->SetInsertPoint(dropBB);
+            builder_->CreateStore(llvm::ConstantInt::getFalse(ctx), fflag);
+            auto* fldP =
+                builder_->CreateStructGEP(llvmTy, d.storage, fidx, "drop.pfld");
+            emitDropGlue(fldP, d.type->structFields[fidx].second);
+            if (!currentBlockTerminated()) builder_->CreateBr(afterBB);
+            builder_->SetInsertPoint(afterBB);
+        }
     }
 
     // Emit drops for one scope's locals in reverse declaration order, each
@@ -8660,6 +8737,10 @@ private:
         auto& ctx = *ctx_;
         for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
             const DropLocal& d = *it;
+            // Phase 100: a per-field-tracked struct drops its live fields
+            // individually (a partially-moved field is skipped; its siblings
+            // are still freed) instead of via the single whole-struct flag.
+            if (!d.fieldFlags.empty()) { emitPerFieldDrops(d); continue; }
             auto* live = builder_->CreateLoad(
                 llvm::Type::getInt1Ty(ctx), d.flag, d.name + ".live");
             auto* dropBB = llvm::BasicBlock::Create(
@@ -8735,40 +8816,72 @@ private:
     // inner one). Walks innermost-out so shadowing resolves to the nearest.
     void clearDropFlagIfMoved(const ast::Expr& e) {
         if (inAsyncFn_) return;
-        // v17 soundness fix: a consumed-by-value FIELD / tuple-field / index
-        // projection is a PARTIAL MOVE of its root binding (e.g.
-        // `vec_push(&mut v, p.name)` moves `p.name` out). Codegen copies the
-        // field's bits without a per-field move flag, so the root struct's drop
-        // would free it AGAIN — a double-free. Walk to the root binding and
-        // clear ITS drop flag, conservatively disabling the whole struct's drop
-        // so the moved field can't be double-freed. (Trade-off until per-field
-        // tracking lands: a struct's OTHER still-owned droppable fields then leak
-        // rather than being freed — safe, not memory-unsafety. See the
-        // field-move bug note.)
+        // A consumed-by-value FIELD / tuple-field / index projection is a
+        // PARTIAL MOVE of its root binding (e.g. `vec_push(&mut v, p.name)`
+        // moves `p.name` out). Codegen copies the field's bits without marking
+        // the source moved, so the root struct's drop would free it AGAIN — a
+        // double-free. Walk to the root binding, remembering the projection
+        // applied DIRECTLY to the root (`child`).
         const ast::Expr* cur = &e;
+        const ast::Expr* child = nullptr;   // projection whose object is the root
         while (true) {
+            const ast::Expr* next = nullptr;
             if (auto* fe = dynamic_cast<const ast::FieldExpr*>(cur)) {
-                cur = fe->object.get();
+                next = fe->object.get();
             } else if (auto* tf =
                            dynamic_cast<const ast::TupleFieldExpr*>(cur)) {
-                cur = tf->object.get();
+                next = tf->object.get();
             } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(cur)) {
-                cur = ix->object.get();
+                next = ix->object.get();
             } else {
                 break;
             }
+            child = cur;
+            cur = next;
         }
         const auto* id = dynamic_cast<const ast::IdentExpr*>(cur);
         if (!id) return;
-        for (auto sit = dropScopes_.rbegin(); sit != dropScopes_.rend(); ++sit) {
-            for (auto it = sit->rbegin(); it != sit->rend(); ++it) {
-                if (it->name == id->name) {
-                    builder_->CreateStore(
-                        llvm::ConstantInt::getFalse(*ctx_), it->flag);
-                    return;
-                }
-            }
+        DropLocal* d = findDropLocal(id->name);
+        if (!d) return;
+
+        if (d->fieldFlags.empty()) {
+            // Whole-binding (conservative) tracking: any move of the binding or
+            // a projection within it clears the single flag — for a non-struct
+            // binding (whole move) or a struct that isn't per-field eligible
+            // (may-panic / user Drop), where disabling the whole drop is the
+            // safe behavior. (A struct's siblings then leak — see the field-move
+            // bug note — but never double-free.)
+            builder_->CreateStore(llvm::ConstantInt::getFalse(*ctx_), d->flag);
+            return;
         }
+
+        // Phase 100: per-field partial-move tracking for a plain struct local.
+        if (!child) {
+            // The whole struct moved away — none of its fields drop here.
+            for (const auto& [fidx, fflag] : d->fieldFlags)
+                builder_->CreateStore(llvm::ConstantInt::getFalse(*ctx_), fflag);
+            return;
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(child)) {
+            // A direct field move `root.name`: clear ONLY that field's flag, so
+            // its siblings are still dropped at scope exit. (Deeper projections
+            // below — `root.name.x` — still clear the whole `name` field's flag,
+            // containing the leak to that one field's subtree rather than the
+            // whole struct.) A non-droppable field has no flag → nothing to do.
+            for (unsigned i = 0; i < d->type->structFields.size(); ++i) {
+                if (d->type->structFields[i].first != fe->fieldName) continue;
+                for (const auto& [fidx, fflag] : d->fieldFlags)
+                    if (fidx == i)
+                        builder_->CreateStore(
+                            llvm::ConstantInt::getFalse(*ctx_), fflag);
+                return;
+            }
+            return;
+        }
+        // Defensive: a tuple-field/index applied directly to a struct root
+        // shouldn't occur; if it ever does, disable the whole struct's drop.
+        for (const auto& [fidx, fflag] : d->fieldFlags)
+            builder_->CreateStore(llvm::ConstantInt::getFalse(*ctx_), fflag);
     }
 
     // Emit an expression that is being CONSUMED by value into the surrounding
@@ -8960,6 +9073,10 @@ private:
                 builder_->CreateStore(v, slot);
                 builder_->CreateStore(llvm::ConstantInt::getTrue(*ctx_),
                                       d->flag);
+                // Phase 100: the fresh struct's fields are all live again.
+                for (const auto& [fidx, fflag] : d->fieldFlags)
+                    builder_->CreateStore(llvm::ConstantInt::getTrue(*ctx_),
+                                          fflag);
                 return;
             }
         }
@@ -8982,6 +9099,10 @@ private:
     // emitScopeDrops for one local.
     void emitDropLocalGuarded(DropLocal& d) {
         if (currentBlockTerminated()) return;
+        // Phase 100: a per-field-tracked struct drops its still-live fields
+        // individually on reassignment-overwrite too (the caller re-sets every
+        // field flag live after storing the fresh struct — see emitAssign).
+        if (!d.fieldFlags.empty()) { emitPerFieldDrops(d); return; }
         auto& ctx = *ctx_;
         auto* live = builder_->CreateLoad(
             llvm::Type::getInt1Ty(ctx), d.flag, d.name + ".live");

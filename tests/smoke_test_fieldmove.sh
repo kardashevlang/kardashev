@@ -4,8 +4,10 @@
 # struct field BY VALUE (`vec_push(&mut v, s.field)`) used to double-free: codegen
 # copies the field's {ptr,len,cap} out without a per-field move flag, so the
 # struct's drop freed it AGAIN. Fixed by clearing the ROOT binding's drop flag on
-# a field/index partial move. Verifies (1) a Drop-counted field drops EXACTLY once
-# (was twice), and (2) a loop of String field-moves has no heap corruption.
+# a field/index partial move; Phase 100 refines this to PER-FIELD tracking so the
+# siblings are still dropped (no leak). Verifies (1) a Drop-counted field drops
+# EXACTLY once (was twice), (2) a loop of String field-moves has no heap
+# corruption, and (3) after a partial move the SIBLING fields still drop (no leak).
 set -euo pipefail
 KARDC=""
 for candidate in \
@@ -62,5 +64,28 @@ for r in 1 2 3 4 5 6; do
 done
 [[ "$bad" -eq 0 ]] || { echo "FAIL [no-double-free]: $bad/6 runs corrupted the heap"; exit 1; }
 echo "PASS [no-double-free]: a loop of String field-moves is heap-clean (MALLOC_CHECK_=3 x6)"
+
+# 3. Phase 100 per-field partial-move: moving ONE droppable field out must still
+# drop the SIBLINGS (no leak). Two Drop-counted fields; move `a` out into a Vec,
+# `b` must still drop exactly once at scope exit. (The earlier conservative fix
+# disabled the whole struct's drop, leaking `b` — this asserts that's gone.)
+cat > "$TMP/sib.kd" <<'EOF'
+trait Drop { fn drop(&mut self) ! { io }; }
+struct Noisy { id: i64 }
+impl Drop for Noisy { fn drop(&mut self) ! { io } { print(self.id); } }
+struct S { a: Noisy, b: Noisy }
+fn main() -> i64 ! { io, alloc } {
+    let mut v = vec_new();
+    let s = S { a: Noisy { id: 11 }, b: Noisy { id: 22 } };
+    vec_push(&mut v, s.a);     // move field a out; sibling b must STILL drop
+    print(999);
+    0
+}
+EOF
+got=$("$KARDC" "$TMP/sib.kd" 2>/dev/null)
+n11=$(grep -cx "11" <<< "$got"); n22=$(grep -cx "22" <<< "$got")
+[[ "$n11" -eq 1 ]] || { echo "FAIL [sibling-drop]: moved field a(11) dropped $n11 times (expected 1); output: $got"; exit 1; }
+[[ "$n22" -eq 1 ]] || { echo "FAIL [sibling-drop]: SIBLING b(22) dropped $n22 times (expected 1 — 0 means it leaked); output: $got"; exit 1; }
+echo "PASS [sibling-drop]: after a partial move the moved field drops once AND its sibling still drops once (no leak)"
 
 echo "ALL FIELD-MOVE REGRESSION TESTS PASSED"

@@ -434,14 +434,26 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   field types with no compile-error regression. Verified: the field now drops
 >   exactly once; a loop of String field-moves is heap-clean (MALLOC_CHECK_=3);
 >   all unit + smoke suites green. Pinned by `tests/smoke_test_fieldmove.sh`.
->   (Trade-off, not UB: a struct's other still-owned droppable fields leak after a
->   partial move — the complete leak-free fix is per-field move tracking, a
->   follow-up; `examples/selfhost/` uses `clone` to avoid even the leak.) **This
->   is the payoff of self-hosting: dogfooding the compiler found a real
+>   **This is the payoff of self-hosting: dogfooding the compiler found a real
 >   memory-safety bug.**
 >
-> Planned: per-field partial-move tracking (the leak-free fix); a real type
-> checker (i64-typed) over the body; eventually emit IR/code — toward a bootstrap.
+> - **Phase 100 — per-field partial-move tracking, leak-free (done).** Phase 99's
+>   fix was conservative: disabling the whole struct's drop after a partial move
+>   left the *sibling* fields leaked (safe, but a leak). Phase 100 makes it
+>   precise — an eligible plain struct local (no user `Drop`, non-panic program)
+>   gets one drop flag **per droppable field**; moving a field out clears only
+>   that field's flag, so its siblings are still freed at scope exit. Gated off
+>   in may-panic programs (the unwind cleanup thunk drops the whole struct via a
+>   single flag, which per-field flags would desync into a double-free on unwind)
+>   and for structs with a user destructor (a partial move must not skip it) —
+>   those keep the conservative whole-disable, leak-but-safe. Verified: after
+>   `vec_push(&mut v, s.a)`, field `a` drops exactly once **and** sibling `b`
+>   drops exactly once (was 0 — leaked); all unit + smoke suites stay green
+>   including the panic/unwind path. Pinned by `tests/smoke_test_fieldmove.sh`
+>   (sibling-drop case).
+>
+> Planned: a real type checker (i64-typed) over the body; eventually emit IR/code
+> — toward a bootstrap.
 
 ## Roadmap v16 — shipped
 
