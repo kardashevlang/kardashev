@@ -6296,6 +6296,38 @@ private:
                   al.line, al.column);
             return makeArray(makeInt(), 0);
         }
+        // Phase 62: array-REPEAT `[value; count]`. The element type is the
+        // value's type; the length is `count` — a const-generic param (a
+        // symbolic length) or a compile-time const (a concrete length).
+        if (al.repeatCount) {
+            TypePtr elemTy = checkExpr(*al.elements[0]);
+            // The value is evaluated once and broadcast to every slot, so a
+            // non-Copy (owning) element would alias one heap value N times (a
+            // later N-fold free). Restrict repeat to Copy elements.
+            if (!isCopyAggregateElem(elemTy)) {
+                error("array-repeat `[value; N]` requires a Copy element "
+                      "(i64/bool/f64 or nested arrays of those), got " +
+                          typeToString(elemTy) +
+                          "; build a non-Copy array with an explicit element "
+                          "list instead",
+                      al.line, al.column);
+            }
+            if (auto* id =
+                    dynamic_cast<const ast::IdentExpr*>(al.repeatCount.get());
+                id && currentConstParams_.count(id->name)) {
+                TypePtr arr = makeArray(elemTy, 0);
+                arr->arrayLenParam = id->name; // symbolic, per Phase 58/59
+                return arr;
+            }
+            std::int64_t n = 0;
+            if (!evalConstI64(*al.repeatCount, n) || n < 0) {
+                error("array-repeat length must be a non-negative compile-time "
+                      "constant or a const-generic param",
+                      al.repeatCount->line, al.repeatCount->column);
+                n = 0;
+            }
+            return makeArray(elemTy, static_cast<std::size_t>(n));
+        }
         TypePtr elemTy = checkExpr(*al.elements[0]);
         for (std::size_t i = 1; i < al.elements.size(); ++i) {
             TypePtr et = checkExpr(*al.elements[i]);

@@ -50,6 +50,15 @@ effect system's last soundness floor.
   RingBuffer<T, CAP>`) and `derive(Clone)`. Plus closure-param INFERENCE:
   `vec_map(v, |x| *x * 2)` infers `x`'s type from the callee's fn-typed
   parameter — no `|x: &i64|` annotation needed.
+- Array-repeat `[value; N]` (Phase 62) — `N` a literal, const item, or a
+  const-generic param (a symbolic length).
+- **Capstone** `examples/matrix` (Phase 62) — a fixed-size linear-algebra
+  library: `Matrix<const R, const C>` carries its shape in the TYPE,
+  `transpose() -> Matrix<C, R>` swaps the dims, and a dimension-checked
+  `matmul(Matrix<R, K>, Matrix<K, C>) -> Matrix<R, C>` rejects a shape mismatch
+  at COMPILE time (the shared inner dim `K` can't be two values). Integrates the
+  whole v10 line: monomorphize-over-a-value, dimension unification, symbolic
+  const params, non-Copy arrays, and array-repeat.
 
 ### Changed
 - The **effect-subset rule** (Phase 60), the effect system's last soundness

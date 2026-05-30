@@ -759,9 +759,16 @@ private:
         // Phase 22: array literal `[a, b, c]`.
         if (auto* al = dynamic_cast<const ArrayLitExpr*>(&e)) {
             out_ += "[";
-            for (std::size_t i = 0; i < al->elements.size(); ++i) {
-                if (i) out_ += ", ";
-                printExpr(*al->elements[i], depth, 0);
+            // Phase 62: array-repeat `[value; count]`.
+            if (al->repeatCount && !al->elements.empty()) {
+                printExpr(*al->elements[0], depth, 0);
+                out_ += "; ";
+                printExpr(*al->repeatCount, depth, 0);
+            } else {
+                for (std::size_t i = 0; i < al->elements.size(); ++i) {
+                    if (i) out_ += ", ";
+                    printExpr(*al->elements[i], depth, 0);
+                }
             }
             out_ += "]";
             return;

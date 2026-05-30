@@ -1538,10 +1538,16 @@ private:
             bool prev = restrictStructLit_;
             restrictStructLit_ = false;
             if (!check(TokenKind::RBracket)) {
-                while (true) {
-                    arr->elements.push_back(parseExpr());
-                    if (!accept(TokenKind::Comma)) break;
-                    if (check(TokenKind::RBracket)) break; // trailing comma
+                arr->elements.push_back(parseExpr());
+                // Phase 62: array-REPEAT `[value; count]`. A `;` after the first
+                // element (instead of `,`) means "this value, `count` times".
+                if (accept(TokenKind::Semi)) {
+                    arr->repeatCount = parseExpr();
+                } else {
+                    while (accept(TokenKind::Comma)) {
+                        if (check(TokenKind::RBracket)) break; // trailing comma
+                        arr->elements.push_back(parseExpr());
+                    }
                 }
             }
             restrictStructLit_ = prev;

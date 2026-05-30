@@ -8468,6 +8468,16 @@ private:
             return llvm::UndefValue::get(llvmTy);
         }
         llvm::Value* agg = llvm::UndefValue::get(arrTy);
+        // Phase 62: array-REPEAT `[value; N]` — evaluate the (Copy) value once
+        // and broadcast it to all N slots. N is the resolved array length
+        // (concrete for this instance, even when the source length was a
+        // symbolic const-generic param).
+        if (al.repeatCount) {
+            llvm::Value* v = emitConsume(*al.elements[0]);
+            for (unsigned i = 0; i < arrTy->getNumElements(); ++i)
+                agg = builder_->CreateInsertValue(agg, v, {i}, "arr.rep");
+            return agg;
+        }
         for (unsigned i = 0; i < al.elements.size(); ++i) {
             llvm::Value* v = emitConsume(*al.elements[i]);
             agg = builder_->CreateInsertValue(agg, v, {i}, "arr.elt");

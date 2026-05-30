@@ -1886,6 +1886,29 @@ void test_nested_tuple_field_access() {
     assert(lit != nullptr); // 3.14 is still a float
 }
 
+// Phase 62 (v10): array-repeat `[value; N]` parses (repeatCount set), distinct
+// from an element list `[a, b]`.
+void test_array_repeat() {
+    auto r = parse("fn f() -> i64 { let a = [7; 3]; a[0] }");
+    assert(r.ok());
+    const auto* let = dynamic_cast<const ast::LetStmt*>(
+        r.program.functions[0].body->stmts[0].get());
+    assert(let != nullptr);
+    const auto* arr =
+        dynamic_cast<const ast::ArrayLitExpr*>(let->value.get());
+    assert(arr != nullptr);
+    assert(arr->elements.size() == 1);
+    assert(arr->repeatCount != nullptr); // it's a repeat, not a list
+    // an ordinary element list has no repeatCount.
+    auto r2 = parse("fn f() -> i64 { let a = [1, 2, 3]; a[0] }");
+    assert(r2.ok());
+    const auto* let2 = dynamic_cast<const ast::LetStmt*>(
+        r2.program.functions[0].body->stmts[0].get());
+    const auto* arr2 =
+        dynamic_cast<const ast::ArrayLitExpr*>(let2->value.get());
+    assert(arr2 && arr2->elements.size() == 3 && !arr2->repeatCount);
+}
+
 } // namespace
 
 int main() {
@@ -2040,6 +2063,7 @@ int main() {
     test_const_generic_arg(); // Phase 58
     test_tuple_let_annotation();
     test_nested_tuple_field_access(); // v10 regression
-    std::cout << "All parser tests passed (134 cases)\n";
+    test_array_repeat(); // Phase 62
+    std::cout << "All parser tests passed (136 cases)\n";
     return 0;
 }

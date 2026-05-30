@@ -351,6 +351,7 @@ private:
         // they just walk children for position accounting.
         if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
             for (const auto& el : al->elements) prePass(*el);
+            if (al->repeatCount) prePass(*al->repeatCount); // Phase 62
             return;
         }
         if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
@@ -807,6 +808,9 @@ private:
             for (const auto& el : al->elements)
                 lastInSubtree =
                     std::max(lastInSubtree, consume(*el, expectExpire));
+            if (al->repeatCount) // Phase 62
+                lastInSubtree = std::max(
+                    lastInSubtree, consume(*al->repeatCount, expectExpire));
             return lastInSubtree;
         }
         if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {

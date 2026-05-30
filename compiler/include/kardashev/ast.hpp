@@ -281,6 +281,12 @@ struct SliceExpr : Expr {
 // array value built via insertvalue (value type, copied like a struct).
 struct ArrayLitExpr : Expr {
     std::vector<ExprPtr> elements;
+    // Phase 62 (v10): array-REPEAT `[value; N]` — `elements[0]` is the repeated
+    // value and `repeatCount` is the length expression (a literal, a const
+    // item, or a const-generic param `N`). null for an ordinary `[a, b, c]`
+    // element list. Lets a const-generic fn build a `[T; N]` result of
+    // symbolic size (e.g. a transposed/zeroed matrix).
+    ExprPtr repeatCount;
 };
 
 // Phase 22: indexing `arr[i]` — reads element `i` (an i64 index) of a

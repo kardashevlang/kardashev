@@ -564,6 +564,18 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 62 (v10) CAPSTONE: a fixed-size linear-algebra library —
+# Matrix<const R, const C>, transpose() -> Matrix<C,R>, dimension-checked
+# matmul; a shape mismatch is a COMPILE error. Builds examples/matrix/main.kd.
+sh_test(
+    name = "smoke_test_phase62",
+    srcs = ["smoke_test_phase62.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/matrix:main.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
