@@ -48,7 +48,7 @@ trap 'rm -rf "$TMP"' EXIT
 cat > "$TMP/spawn.kd" <<'EOF'
 fn compute_a() -> i64 { 10 + 11 }       // 21
 fn compute_b() -> i64 { 100 + 23 }      // 123
-fn main() -> i64 ! { io } {
+fn main() -> i64 ! { io, share } {
     let a = thread_spawn(compute_a);
     let b = thread_spawn(compute_b);
     let ra = thread_join(a);
@@ -73,7 +73,7 @@ echo "PASS (1): two threads compute 21 + 123 => 144, both joined (JIT+AOT)"
 
 # Also prove it works with capturing closures (by-value i64 capture of `base`).
 cat > "$TMP/spawn_cl.kd" <<'EOF'
-fn main() -> i64 ! { io } {
+fn main() -> i64 ! { io, share } {
     let base = 1000;
     let a = thread_spawn(|| base + 21);   // 1021
     let b = thread_spawn(|| base + 23);   // 1023
@@ -106,7 +106,7 @@ fn bump(counter: i64, n: i64) -> i64 ! { io } {
     }
     0
 }
-fn main() -> i64 ! { alloc, io } {
+fn main() -> i64 ! { alloc, io, share } {
     let counter = mutex_new(0);
     let n = 100000;
     // The SAME i64 Mutex handle is captured by value into both closures, so
@@ -142,7 +142,7 @@ echo "PASS (2): 2 threads x 100000 shared Mutex increments == 200000, determinis
 #     compile time; the by-VALUE equivalent must compile + run.
 # ---------------------------------------------------------------------------
 cat > "$TMP/byref.kd" <<'EOF'
-fn main() -> i64 ! { io } {
+fn main() -> i64 ! { io, share } {
     let mut n = 0;
     let t = thread_spawn(|| { n = n + 1; n });   // by-ref capture: must reject
     thread_join(t);
@@ -178,7 +178,7 @@ echo "PASS (3b): rejection also blocks AOT object/binary emission"
 
 # By-value equivalent: capture `n` by value (read-only) — compiles + runs.
 cat > "$TMP/byval.kd" <<'EOF'
-fn main() -> i64 ! { io } {
+fn main() -> i64 ! { io, share } {
     let n = 41;
     let t = thread_spawn(|| n + 1);   // by-value Copy capture: fine
     print(thread_join(t));            // 42

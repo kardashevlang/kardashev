@@ -585,6 +585,81 @@ public:
             sch.genericVars.push_back(hsVar);
             structSchemas_["HashSet"] = std::move(sch);
         }
+
+        // Phase 76 (v13): `Sender<T>` / `Receiver<T>` — typed channel endpoints.
+        // Both lower to a single i64 HANDLE (a heap pointer to the shared
+        // channel block), so they are Copy — a Sender can be captured BY VALUE
+        // into a producer thread's closure (the cross-thread send path). They
+        // are DISTINCT named types so the receiver endpoint can be marked
+        // single-consumer / not-Send (Phase 77): a Receiver may not be moved
+        // into a second thread.
+        TypePtr senderVar = makeFreshVar();
+        TypePtr senderInst = makeStruct("Sender", {});
+        senderInst->typeArgs = {senderVar};
+        {
+            StructSchema sch;
+            sch.type = senderInst;
+            sch.genericVars.push_back(senderVar);
+            structSchemas_["Sender"] = std::move(sch);
+        }
+        TypePtr receiverVar = makeFreshVar();
+        TypePtr receiverInst = makeStruct("Receiver", {});
+        receiverInst->typeArgs = {receiverVar};
+        {
+            StructSchema sch;
+            sch.type = receiverInst;
+            sch.genericVars.push_back(receiverVar);
+            structSchemas_["Receiver"] = std::move(sch);
+        }
+
+        // Phase 78 (v13): `Rc<T>` — a NON-ATOMIC reference-counted shared owner
+        // (a pointer to a heap `{ i64 strong, T value }`). rc_clone shares (the
+        // count++); the value is dropped + freed when the last Rc drops. It is
+        // the canonical NOT-Send type: its refcount is non-atomic, so two
+        // threads racing on rc_clone/drop would corrupt it — sending or
+        // capturing an Rc across a thread is a compile error (isSend(Rc)=false).
+        // The legible witness for the Send rule (vs sharing safely via Mutex).
+        TypePtr rcVar = makeFreshVar();
+        TypePtr rcInst = makeStruct("Rc", {});
+        rcInst->typeArgs = {rcVar};
+        {
+            StructSchema sch;
+            sch.type = rcInst;
+            sch.genericVars.push_back(rcVar);
+            structSchemas_["Rc"] = std::move(sch);
+        }
+        // rc_new<T>(v: T) -> Rc<T> ! { alloc }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({rcVar}, rcInst);
+            sch.declaredEffects.add("alloc");
+            sch.genericVars.push_back(rcVar);
+            fnSchemas_["rc_new"] = std::move(sch);
+        }
+        // rc_clone<T>(r: &Rc<T>) -> Rc<T>  (shares; bumps the strong count)
+        {
+            FnSchema sch;
+            sch.signature =
+                makeFunction({makeRef(rcInst, /*isMut=*/false)}, rcInst);
+            sch.genericVars.push_back(rcVar);
+            fnSchemas_["rc_clone"] = std::move(sch);
+        }
+        // rc_get<T>(r: &Rc<T>) -> &T   (borrow the shared value)
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeRef(rcInst, /*isMut=*/false)},
+                                         makeRef(rcVar, /*isMut=*/false));
+            sch.genericVars.push_back(rcVar);
+            fnSchemas_["rc_get"] = std::move(sch);
+        }
+        // rc_strong_count<T>(r: &Rc<T>) -> i64
+        {
+            FnSchema sch;
+            sch.signature =
+                makeFunction({makeRef(rcInst, /*isMut=*/false)}, makeInt());
+            sch.genericVars.push_back(rcVar);
+            fnSchemas_["rc_strong_count"] = std::move(sch);
+        }
         // hashset_new<T>() -> HashSet<T> ! { alloc }
         {
             FnSchema sch;
@@ -768,6 +843,17 @@ public:
             FnSchema sch;
             sch.signature = makeFunction({fnParam}, makeInt());
             sch.declaredEffects.add("io");
+            // Phase 75 (v13): `share` — the cross-thread / concurrency effect.
+            // Spawning a thread crosses a thread boundary, so the spawning fn
+            // must declare `! { share }`. Because `share` is a built-in effect,
+            // it rides the existing effect-SUBSET rule: a trait method declared
+            // pure (or without `share`) can NEVER transitively spawn through a
+            // `<T: Trait>` / `&dyn Trait` dispatch — the checker attributes the
+            // trait's declared effects and rejects a super-effecting impl. So
+            // thread-safety becomes a CHECKED property, not a convention. (The
+            // value-safety half — that only `Send` data crosses — is enforced
+            // structurally at chan_send, Phase 77.)
+            sch.declaredEffects.add("share");
             sch.declaredEffects.add("e"); // row-var name (flows the closure's)
             sch.effectRowVars.emplace_back("e", rowVar);
             fnSchemas_["thread_spawn"] = std::move(sch);
@@ -1051,6 +1137,112 @@ public:
                 rsch.genericVars.push_back(hmKeyVar);
                 rsch.genericVars.push_back(hmValVar);
                 fnSchemas_["hashmap_get_ref"] = std::move(rsch);
+            }
+
+            // Phase 76/77 (v13): the typed MPSC channel API, GENERIC over the
+            // message type T (a channel MOVES a real T across threads). A
+            // channel splits into a Copy Sender (multi-producer) and a single
+            // Receiver. The ops carry `share` (Phase 75) — channels are the
+            // cross-thread communication path, so a pure-declared interface
+            // can't smuggle one in. recv returns Option (None once the channel
+            // is closed AND drained). isSend(T) is enforced at the chan_send
+            // call site (Phase 77).
+            {
+                TypePtr chanVar = makeFreshVar();
+                TypePtr senderT = makeStruct("Sender", {});
+                senderT->typeArgs = {chanVar};
+                TypePtr receiverT = makeStruct("Receiver", {});
+                receiverT->typeArgs = {chanVar};
+                TypePtr optT;
+                if (!optSchema.genericVars.empty()) {
+                    std::unordered_map<int, TypePtr> subst;
+                    subst[optSchema.genericVars[0]->varId] = chanVar;
+                    optT = instantiate(optSchema.type, subst);
+                    optT->typeArgs = {chanVar};
+                } else {
+                    optT = optSchema.type;
+                }
+                // channel<T>() -> (Sender<T>, Receiver<T>) ! { alloc }
+                {
+                    TypePtr pair = std::make_shared<Type>();
+                    pair->kind = TypeKind::Tuple;
+                    pair->tupleElems = {senderT, receiverT};
+                    FnSchema sch;
+                    sch.signature = makeFunction({}, pair);
+                    sch.declaredEffects.add("alloc");
+                    sch.genericVars.push_back(chanVar);
+                    fnSchemas_["channel"] = std::move(sch);
+                }
+                // Phase 81 (v13 review fix): the endpoints are refcounted,
+                // move-only OWNERS now (not Copy handles), so chan_send / recv /
+                // try_recv BORROW the endpoint (`&Sender` / `&Receiver`) — a
+                // Sender can be sent on in a loop, and a Receiver recv'd in a
+                // loop, without being moved. Multi-producer uses sender_clone;
+                // an endpoint's drop decrements the refcount (close on the last
+                // sender, drain + free on the last endpoint).
+                // chan_send<T>(s: &Sender<T>, v: T) -> i64 ! { share }
+                {
+                    FnSchema sch;
+                    sch.signature = makeFunction(
+                        {makeRef(senderT, /*isMut=*/false), chanVar}, makeInt());
+                    sch.declaredEffects.add("share");
+                    sch.genericVars.push_back(chanVar);
+                    fnSchemas_["chan_send"] = std::move(sch);
+                }
+                // chan_recv<T>(r: &Receiver<T>) -> Option<T> ! { share }
+                {
+                    FnSchema sch;
+                    sch.signature = makeFunction(
+                        {makeRef(receiverT, /*isMut=*/false)}, optT);
+                    sch.declaredEffects.add("share");
+                    sch.genericVars.push_back(chanVar);
+                    fnSchemas_["chan_recv"] = std::move(sch);
+                }
+                // sender_clone<T>(s: &Sender<T>) -> Sender<T> ! { share } — the
+                // multi-producer primitive: a second owning Sender on the same
+                // channel (bumps the live-sender + endpoint counts).
+                {
+                    FnSchema sch;
+                    sch.signature = makeFunction(
+                        {makeRef(senderT, /*isMut=*/false)}, senderT);
+                    sch.declaredEffects.add("share");
+                    sch.genericVars.push_back(chanVar);
+                    fnSchemas_["sender_clone"] = std::move(sch);
+                }
+                // Phase 79: chan_try_recv<T>(r) -> Option<T> ! { share } — a
+                // NON-BLOCKING recv: Some if an item is ready, None if the queue
+                // is momentarily empty (does NOT block on the condvar). For
+                // poll loops / draining the tail of a fork-join gather. Needs a
+                // FRESH Option<T> (instantiating reuses a Var-bearing schema).
+                {
+                    TypePtr optT2;
+                    if (!optSchema.genericVars.empty()) {
+                        std::unordered_map<int, TypePtr> subst;
+                        subst[optSchema.genericVars[0]->varId] = chanVar;
+                        optT2 = instantiate(optSchema.type, subst);
+                        optT2->typeArgs = {chanVar};
+                    } else {
+                        optT2 = optSchema.type;
+                    }
+                    FnSchema sch;
+                    sch.signature = makeFunction(
+                        {makeRef(receiverT, /*isMut=*/false)}, optT2);
+                    sch.declaredEffects.add("share");
+                    sch.genericVars.push_back(chanVar);
+                    fnSchemas_["chan_try_recv"] = std::move(sch);
+                }
+                // chan_close<T>(s: Sender<T>) -> i64 ! { share } — takes the
+                // Sender BY VALUE (consumes it): the explicit "this producer is
+                // done" that decrements the live-sender count (closing only when
+                // it is the LAST sender), so one producer closing can no longer
+                // abandon another's queued items.
+                {
+                    FnSchema sch;
+                    sch.signature = makeFunction({senderT}, makeInt());
+                    sch.declaredEffects.add("share");
+                    sch.genericVars.push_back(chanVar);
+                    fnSchemas_["chan_close"] = std::move(sch);
+                }
             }
         }
 
@@ -2106,7 +2298,7 @@ private:
     // declared in the fn's generic-parameter list (Phase 4.3).
     static bool isBuiltinEffect(const std::string& l) {
         return l == "alloc" || l == "io" || l == "panic" ||
-               l == "async" || l == "unwind";
+               l == "async" || l == "unwind" || l == "share";
     }
 
     // Phase 10a classification: collect, from a signature, the names that
@@ -2448,7 +2640,8 @@ private:
                 result.add(l);
             } else {
                 error("unknown effect label `" + l + "` on fn '" + fnName +
-                          "' (built-ins: alloc, io, panic, async, unwind; or "
+                          "' (built-ins: alloc, io, panic, async, unwind, "
+                          "share; or "
                           "declare `" + l + "` as a generic effect-row "
                           "parameter)",
                       row.line, row.column);
@@ -5784,6 +5977,17 @@ private:
             bool copyable = rt->kind == TypeKind::Int ||
                             rt->kind == TypeKind::Bool ||
                             rt->kind == TypeKind::Unit;
+            // Phase 81 (v13 review fix): a channel `Sender<T>` is Send, so it
+            // may be captured into a producer thread's closure. It is no longer
+            // Copy — capturing it CLONES it (codegen emits sender_clone when
+            // building the env), so each producer thread gets its own refcounted
+            // handle and the enclosing binding keeps its own. The captured clone
+            // must be moved into the spawned worker by value (so the worker's
+            // by-value `Sender` param drops it on that thread). A `Receiver<T>`
+            // is NOT capturable — single-consumer / not-Send — and falls through
+            // to the rejection below (a Receiver can't cross a thread boundary).
+            if (rt->kind == TypeKind::Struct && rt->structName == "Sender")
+                copyable = true;
             if (mutated) {
                 // FnMut: capture by reference. The mutation requires the
                 // enclosing binding be `let mut`.
@@ -5794,6 +5998,17 @@ private:
                               "needs a mutable binding",
                           cl.line, cl.column);
                 }
+            } else if (rt->kind == TypeKind::Struct &&
+                       rt->structName == "Receiver") {
+                // Phase 76 (v13): a channel Receiver is the SINGLE-CONSUMER
+                // endpoint — it is not Send, so it can't be moved into another
+                // thread (only the Sender crosses). This is what keeps the MPSC
+                // contract sound; recv on the owning thread.
+                error("cannot move a channel `Receiver` into a thread — it is "
+                      "the single-consumer endpoint and is not Send; keep the "
+                      "Receiver on the owning thread and move the Sender across "
+                      "instead",
+                      cl.line, cl.column);
             } else if (!copyable) {
                 // By-value capture: keep the Phase 10b Copy-only rule.
                 // Capturing a non-Copy aggregate (struct / enum / &mut /
@@ -6320,6 +6535,23 @@ private:
                           call.args[0]->line, call.args[0]->column);
                 }
             }
+            // Phase 77 (v13): the value sent on a channel crosses a thread
+            // boundary, so its type must be `Send` (the value-safety half of
+            // the concurrency story). This rejects sending a `&T` borrow, a
+            // Receiver, an Rc (Phase 78), or a struct that contains one — the
+            // structural Send rule's teeth.
+            if (call.callee == "chan_send" && call.args.size() == 2) {
+                auto vit = exprTypes_.find(call.args[1].get());
+                TypePtr vt =
+                    vit != exprTypes_.end() ? resolve(vit->second) : nullptr;
+                if (vt && vt->kind != TypeKind::Var && !isSend(vt)) {
+                    error("cannot send a value of type " + typeToString(vt) +
+                              " on a channel: it is not `Send` (it can't safely "
+                              "cross a thread boundary). Send an owned value "
+                              "(move it) — not a borrow / Receiver / Rc",
+                          call.args[1]->line, call.args[1]->column);
+                }
+            }
             // PR#20: reject a unit element type for the Vec builtins. The
             // codegen vec_* specialization sizes the element via DataLayout;
             // a zero-sized unit element makes the stride 0 and crashes the
@@ -6763,6 +6995,77 @@ private:
     // aggregates (Vec/String/struct/enum/Box/refs) are rejected so we never
     // need to track moves through array/tuple element copies (stated as an MVP
     // restriction — full move-tracking through aggregates is deferred).
+    // Phase 77 (v13): the structural `Send` predicate — the VALUE-SAFETY half
+    // of the concurrency story (the `share` effect is the control half). A
+    // value may cross a thread boundary (move into a thread closure / send on a
+    // channel) only if its type is Send. Send is decided STRUCTURALLY on the
+    // solved type at the boundary call site (sound regardless of where the
+    // value later runs): scalars + String + the Mutex / Sender handles are
+    // Send; owning aggregates are Send iff every part is; a `&T` / `&mut T`
+    // borrow, the single-consumer Receiver, a non-atomic Rc (Phase 78), and a
+    // closure / fn value (may capture by reference) are NOT Send. The MPSC
+    // contract — only the Sender crosses, never the Receiver — and the
+    // no-dangling-borrow guarantee both fall out of this.
+    bool isSend(const TypePtr& t) {
+        std::unordered_set<std::string> seen;
+        return isSendImpl(t, seen);
+    }
+    bool isSendImpl(const TypePtr& t, std::unordered_set<std::string>& seen) {
+        TypePtr r = resolve(t);
+        switch (r->kind) {
+        case TypeKind::Int:
+        case TypeKind::Float:
+        case TypeKind::Bool:
+        case TypeKind::Unit:
+            return true;
+        case TypeKind::Box:
+            return isSendImpl(r->refInner, seen);
+        case TypeKind::Array:
+            return isSendImpl(r->arrayElem, seen);
+        case TypeKind::Tuple:
+            for (const auto& el : r->tupleElems)
+                if (!isSendImpl(el, seen)) return false;
+            return true;
+        case TypeKind::Struct: {
+            // String owns its bytes (Send); the Mutex handle (a raw i64) is
+            // Send by being an Int; the channel Sender is Send. The Receiver
+            // (single-consumer) and an Rc (non-atomic refcount) are NOT.
+            if (r->structName == "String" || r->structName == "Sender")
+                return true;
+            if (r->structName == "Receiver" || r->structName == "Rc")
+                return false;
+            // Containers carry their element(s) in typeArgs, not structFields.
+            if (r->structName == "Vec" || r->structName == "HashMap" ||
+                r->structName == "HashSet") {
+                for (const auto& a : r->typeArgs)
+                    if (!isSendImpl(a, seen)) return false;
+                return true;
+            }
+            // A user struct is Send iff every field is.
+            if (!seen.insert(r->structName).second) return true; // recursive
+            for (const auto& f : r->structFields)
+                if (!isSendImpl(f.second, seen)) return false;
+            return true;
+        }
+        case TypeKind::Enum: {
+            if (!seen.insert(r->enumName).second) return true;
+            for (const auto& v : r->enumVariants)
+                for (const auto& p : v.payloadTypes)
+                    if (!isSendImpl(p, seen)) return false;
+            return true;
+        }
+        // A borrow can't cross a thread boundary in this MVP (its referent's
+        // lifetime can't be proven to outlive the thread); a closure may
+        // capture by reference; an unsolved Var / dyn is conservatively unsafe.
+        case TypeKind::Ref:
+        case TypeKind::Function:
+        case TypeKind::Dyn:
+        case TypeKind::Var:
+        default:
+            return false;
+        }
+    }
+
     bool isCopyAggregateElem(const TypePtr& t) {
         TypePtr r = resolve(t);
         switch (r->kind) {

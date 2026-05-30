@@ -2154,14 +2154,43 @@ void test_duplicate_method_across_impls_errors() {
 // --- Phase 19: OS threads + Mutex + Send (compile-time data-race freedom) ---
 
 void test_thread_spawn_join_ok() {
-    // A bare fn value spawned + joined; thread ops carry `io`.
+    // A bare fn value spawned + joined; thread ops carry `io` + (Phase 75)
+    // `share` (the concurrency effect).
     expectOk(
+        "fn w() -> i64 { 7 }\n"
+        "fn main() -> i64 ! { io, share } {\n"
+        "  let h = thread_spawn(w);\n"
+        "  thread_join(h)\n"
+        "}",
+        "thread_spawn_join_ok");
+}
+
+void test_thread_spawn_requires_share_effect() {
+    // Phase 75 (v13): spawning crosses a thread boundary -> the `share` effect.
+    expectErrContains(
         "fn w() -> i64 { 7 }\n"
         "fn main() -> i64 ! { io } {\n"
         "  let h = thread_spawn(w);\n"
         "  thread_join(h)\n"
         "}",
-        "thread_spawn_join_ok");
+        "share",
+        "thread_spawn_requires_share_effect");
+}
+
+void test_pure_trait_cannot_launder_spawn() {
+    // The differentiator: because `share` is a built-in effect, the effect-
+    // subset rule forbids an impl of a pure-declared trait method from spawning
+    // — concurrent work can't be smuggled past a pure-looking interface.
+    expectErrContains(
+        "fn w() -> i64 { 1 }\n"
+        "trait Task { fn run(&self) -> i64; }\n"
+        "struct S {}\n"
+        "impl Task for S {\n"
+        "  fn run(&self) -> i64 { let h = thread_spawn(w); thread_join(h) }\n"
+        "}\n"
+        "fn main() -> i64 { 0 }",
+        "share",
+        "pure_trait_cannot_launder_spawn");
 }
 
 void test_thread_spawn_requires_io_effect() {
@@ -2178,7 +2207,7 @@ void test_thread_spawn_requires_io_effect() {
 void test_thread_spawn_byvalue_closure_ok() {
     // A closure capturing an i64 BY VALUE is Send — accepted.
     expectOk(
-        "fn main() -> i64 ! { io } {\n"
+        "fn main() -> i64 ! { io, share } {\n"
         "  let base = 41;\n"
         "  let h = thread_spawn(|| base + 1);\n"
         "  thread_join(h)\n"
@@ -2203,7 +2232,7 @@ void test_thread_spawn_propagates_closure_io_effect() {
     // polymorphic so that flows to the caller, which here declares it: ok.
     expectOk(
         "fn bump(m: i64) -> i64 ! { io } { mutex_lock(m); mutex_unlock(m); 0 }\n"
-        "fn main() -> i64 ! { alloc, io } {\n"
+        "fn main() -> i64 ! { alloc, io, share } {\n"
         "  let m = mutex_new(0);\n"
         "  let h = thread_spawn(|| bump(m));\n"
         "  thread_join(h)\n"
@@ -3085,6 +3114,8 @@ int main() {
     // Phase 19: OS threads + Mutex + Send
     test_thread_spawn_join_ok();
     test_thread_spawn_requires_io_effect();
+    test_thread_spawn_requires_share_effect();
+    test_pure_trait_cannot_launder_spawn();
     test_thread_spawn_byvalue_closure_ok();
     test_thread_spawn_byref_capture_rejected();
     test_thread_spawn_propagates_closure_io_effect();
@@ -3175,6 +3206,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (298 cases)\n";
+    std::cout << "All typecheck tests passed (300 cases)\n";
     return 0;
 }

@@ -2197,7 +2197,7 @@ void test_thread_spawn_join_runs() {
     auto v = compileAndRun(
         "fn ca() -> i64 { 10 + 11 }\n"
         "fn cb() -> i64 { 100 + 23 }\n"
-        "fn main() -> i64 ! { io } {\n"
+        "fn main() -> i64 ! { io, share } {\n"
         "  let a = thread_spawn(ca);\n"
         "  let b = thread_spawn(cb);\n"
         "  thread_join(a) + thread_join(b)\n"
@@ -2208,7 +2208,7 @@ void test_thread_spawn_join_runs() {
 
 void test_thread_spawn_closure_byvalue_runs() {
     auto v = compileAndRun(
-        "fn main() -> i64 ! { io } {\n"
+        "fn main() -> i64 ! { io, share } {\n"
         "  let base = 1000;\n"
         "  let a = thread_spawn(|| base + 21);\n"
         "  let b = thread_spawn(|| base + 23);\n"
@@ -2246,7 +2246,7 @@ void test_mutex_mutual_exclusion_two_threads() {
         "  }\n"
         "  0\n"
         "}\n"
-        "fn main() -> i64 ! { alloc, io } {\n"
+        "fn main() -> i64 ! { alloc, io, share } {\n"
         "  let c = mutex_new(0);\n"
         "  let n = 50000;\n"
         "  let t1 = thread_spawn(|| bump(c, n));\n"
@@ -2263,7 +2263,7 @@ void test_thread_runtime_emits_pthread_externs() {
     // The pthread externs + trampoline must appear in the emitted IR.
     std::string ir = compileToIR(
         "fn w() -> i64 { 1 }\n"
-        "fn main() -> i64 ! { io } { thread_join(thread_spawn(w)) }",
+        "fn main() -> i64 ! { io, share } { thread_join(thread_spawn(w)) }",
         "thread_runtime_emits_pthread_externs");
     expectContains(ir, "pthread_create", "thread_runtime_emits_pthread_externs");
     expectContains(ir, "pthread_join", "thread_runtime_emits_pthread_externs");

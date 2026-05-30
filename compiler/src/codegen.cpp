@@ -797,6 +797,24 @@ private:
     llvm::StructType* mutexBlkTy_ = nullptr;
     llvm::Function* threadTrampolineFn_ = nullptr; // __kd_thread_trampoline
 
+    // --- Phase 76 (v13): typed MPSC channels (pthread mutex + condvar) ---
+    // The channel block `{ [64 x i8] mtx, [64 x i8] cond, i8* head, i8* tail,
+    // i64 count, i64 closed }` guards an unbounded linked-list queue of nodes
+    // `{ i64 value, i8* next }` (i64 cells this phase). 64 bytes each covers
+    // pthread_mutex_t / pthread_cond_t on both glibc and macOS. Declared lazily
+    // (channelRuntimeDeclared_) on first use of any chan_* builtin.
+    llvm::Function* pthreadCondInitFn_ = nullptr;
+    llvm::Function* pthreadCondWaitFn_ = nullptr;
+    llvm::Function* pthreadCondSignalFn_ = nullptr;
+    llvm::Function* pthreadCondBroadcastFn_ = nullptr;
+    // Phase 81 (v13 review fix): the teardown externs. The endpoints are now
+    // refcounted owners (senders + refs counts in the block), so the LAST
+    // endpoint to drop destroys the mutex/cond and frees the block.
+    llvm::Function* pthreadMutexDestroyFn_ = nullptr;
+    llvm::Function* pthreadCondDestroyFn_ = nullptr;
+    llvm::StructType* chanBlkTy_ = nullptr;
+    bool channelRuntimeDeclared_ = false;
+
     // --- Phase 23: real panic + unwinding (setjmp/longjmp + cleanup stack) ---
     // `programMayPanic_` is computed once in run(): true iff the program text
     // contains a `panic`/`catch` call or any array `[T;N]` indexing (which can
@@ -3307,6 +3325,490 @@ private:
             b.CreateRet(fn->getArg(1));
             declaredFns_["mutex_set"] = fn;
         }
+    }
+
+    // --- Phase 76 (v13): typed MPSC channels (pthread mutex + condition var) ---
+    // An unbounded linked-list queue guarded by a mutex + condvar. The handle is
+    // a Copy i64 (PtrToInt of the block), so a Sender can be captured by value
+    // into a producer thread; both endpoints point at the same block. send
+    // appends a node + signals; recv pops (blocking on the condvar while empty +
+    // open) and returns Option (None once closed AND drained); close sets the
+    // flag + broadcasts so blocked receivers wake. Reuses the thread runtime's
+    // pthread mutex externs; declared lazily on first chan_* use.
+    void ensureChannelRuntime() {
+        if (channelRuntimeDeclared_) return;
+        channelRuntimeDeclared_ = true;
+        ensureThreadRuntime(); // for the pthread mutex externs + malloc/free
+        declareChannelRuntime();
+    }
+    // Phase 76 base: the T-agnostic part of the channel runtime — the
+    // pthread_cond_* externs and the channel block layout. The per-T ops
+    // (channel/chan_send/chan_recv/chan_close, with a T-sized node) are emitted
+    // on demand by getOrEmitChannelOp (Phase 77).
+    void declareChannelRuntime() {
+        auto& ctx = *ctx_;
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto mkFn = [&](llvm::FunctionType* ty, const char* nm) {
+            return llvm::Function::Create(
+                ty, llvm::Function::ExternalLinkage, nm, module_.get());
+        };
+        auto* cond2Ty = llvm::FunctionType::get(i32Ty, {i8PtrTy, i8PtrTy}, false);
+        auto* cond1Ty = llvm::FunctionType::get(i32Ty, {i8PtrTy}, false);
+        pthreadCondInitFn_ = mkFn(cond2Ty, "pthread_cond_init");
+        pthreadCondWaitFn_ = mkFn(cond2Ty, "pthread_cond_wait");
+        pthreadCondSignalFn_ = mkFn(cond1Ty, "pthread_cond_signal");
+        pthreadCondBroadcastFn_ = mkFn(cond1Ty, "pthread_cond_broadcast");
+        pthreadMutexDestroyFn_ = mkFn(cond1Ty, "pthread_mutex_destroy");
+        pthreadCondDestroyFn_ = mkFn(cond1Ty, "pthread_cond_destroy");
+        // { [64] mtx, [64] cond, i8* head, i8* tail, i64 count, i64 closed,
+        //   i64 senders, i64 refs } — T-agnostic (head/tail are i8* node
+        // pointers). 64 bytes covers pthread_mutex_t / pthread_cond_t on glibc
+        // and macOS. Phase 81: `senders` (live Sender count) and `refs` (live
+        // endpoint count, senders + the one Receiver) make the endpoints
+        // refcounted owners: recv ends only when senders==0 AND drained (so one
+        // producer closing can't abandon another's items), and the block is
+        // drained + freed when the last endpoint (refs==0) drops.
+        auto* pad64 = llvm::ArrayType::get(i8Ty, 64);
+        chanBlkTy_ = llvm::StructType::create(
+            ctx, {pad64, pad64, i8PtrTy, i8PtrTy, i64Ty, i64Ty, i64Ty, i64Ty},
+            "kd.chan_blk");
+    }
+
+    // Phase 77 (v13): the per-T channel ops. The queue node is `{ T value,
+    // i8* next }` (T-sized), so a channel MOVES a real T across threads: send
+    // bytewise-copies T into a node (the borrow checker already move-tracks the
+    // by-value arg, so use-after-send is rejected); recv loads T out and frees
+    // the node (ownership transfers sender -> node -> receiver, freed exactly
+    // once — no clone, no double-free). channel/chan_close ignore T but are
+    // emitted per-T for a uniform dispatch.
+    llvm::Function* getOrEmitChannelOp(const std::string& op, const TypePtr& T) {
+        ensureChannelRuntime();
+        std::string suffix = mangleType(T);
+        std::string mangled = op + "__" + suffix;
+        if (auto it = declaredFns_.find(mangled); it != declaredFns_.end())
+            return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* z64 = llvm::ConstantInt::get(i64Ty, 0);
+        auto* nullp = llvm::ConstantPointerNull::get(i8PtrTy);
+        llvm::Type* elemTy = mapKardashevType(T);
+        auto* nodeTy = llvm::StructType::create(ctx, {elemTy, i8PtrTy},
+                                                "kd.chan_node__" + suffix);
+        auto* nodeSzK = llvm::ConstantInt::get(
+            i64Ty, module_->getDataLayout().getTypeAllocSize(nodeTy));
+        auto* blkSzK = llvm::ConstantInt::get(
+            i64Ty, module_->getDataLayout().getTypeAllocSize(chanBlkTy_));
+        auto mkFn = [&](llvm::FunctionType* ty) {
+            return llvm::Function::Create(ty, llvm::Function::ExternalLinkage,
+                                          mangled, module_.get());
+        };
+        auto mtxOf = [&](llvm::IRBuilder<>& b, llvm::Value* blk) {
+            return b.CreateStructGEP(chanBlkTy_, blk, 0, "mtx");
+        };
+        auto condOf = [&](llvm::IRBuilder<>& b, llvm::Value* blk) {
+            return b.CreateStructGEP(chanBlkTy_, blk, 1, "cond");
+        };
+
+        if (op == "channel") {
+            auto* pairTy = llvm::StructType::get(ctx, {i64Ty, i64Ty});
+            auto* fn = mkFn(llvm::FunctionType::get(pairTy, {}, false));
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateCall(mallocFn_, {blkSzK}, "chan_blk");
+            b.CreateCall(pthreadMutexInitFn_, {mtxOf(b, blk), nullp});
+            b.CreateCall(pthreadCondInitFn_, {condOf(b, blk), nullp});
+            b.CreateStore(nullp, b.CreateStructGEP(chanBlkTy_, blk, 2, "head"));
+            b.CreateStore(nullp, b.CreateStructGEP(chanBlkTy_, blk, 3, "tail"));
+            b.CreateStore(z64, b.CreateStructGEP(chanBlkTy_, blk, 4, "count"));
+            b.CreateStore(z64, b.CreateStructGEP(chanBlkTy_, blk, 5, "closed"));
+            // Phase 81: one live Sender, two live endpoints (the Sender + the
+            // Receiver) at birth.
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 1),
+                          b.CreateStructGEP(chanBlkTy_, blk, 6, "senders"));
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 2),
+                          b.CreateStructGEP(chanBlkTy_, blk, 7, "refs"));
+            auto* h = b.CreatePtrToInt(blk, i64Ty, "handle");
+            llvm::Value* pair = llvm::UndefValue::get(pairTy);
+            pair = b.CreateInsertValue(pair, h, {0}, "tx");
+            pair = b.CreateInsertValue(pair, h, {1}, "rx");
+            b.CreateRet(pair);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "chan_send") {
+            // Phase 81: arg0 is now `&Sender<T>` — a pointer to the i64 handle
+            // (so a Sender can be sent on in a loop without being moved).
+            auto* fn =
+                mkFn(llvm::FunctionType::get(i64Ty, {i8PtrTy, elemTy}, false));
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* firstBB = llvm::BasicBlock::Create(ctx, "first", fn);
+            auto* appendBB = llvm::BasicBlock::Create(ctx, "append", fn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "done", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* handle = b.CreateLoad(i64Ty, fn->getArg(0), "handle");
+            auto* blk = b.CreateIntToPtr(handle, i8PtrTy, "blk");
+            b.CreateCall(pthreadMutexLockFn_, {mtxOf(b, blk)});
+            auto* node = b.CreateCall(mallocFn_, {nodeSzK}, "node");
+            b.CreateStore(fn->getArg(1),
+                          b.CreateStructGEP(nodeTy, node, 0, "nval"));
+            b.CreateStore(nullp, b.CreateStructGEP(nodeTy, node, 1, "nnext"));
+            auto* tailP = b.CreateStructGEP(chanBlkTy_, blk, 3, "tailP");
+            auto* tail = b.CreateLoad(i8PtrTy, tailP, "tail");
+            b.CreateCondBr(b.CreateICmpEQ(tail, nullp, "empty"), firstBB,
+                           appendBB);
+            b.SetInsertPoint(firstBB);
+            b.CreateStore(node, b.CreateStructGEP(chanBlkTy_, blk, 2, "headP"));
+            b.CreateBr(doneBB);
+            b.SetInsertPoint(appendBB);
+            b.CreateStore(node, b.CreateStructGEP(nodeTy, tail, 1, "tnext"));
+            b.CreateBr(doneBB);
+            b.SetInsertPoint(doneBB);
+            b.CreateStore(node, tailP);
+            auto* cntP = b.CreateStructGEP(chanBlkTy_, blk, 4, "cntP");
+            b.CreateStore(b.CreateAdd(b.CreateLoad(i64Ty, cntP, "cnt"),
+                                      llvm::ConstantInt::get(i64Ty, 1), "cnt1"),
+                          cntP);
+            b.CreateCall(pthreadCondSignalFn_, {condOf(b, blk)});
+            b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blk)});
+            b.CreateRet(z64);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "chan_recv") {
+            TypePtr optTy = optionType(T);
+            mapKardashevType(optTy);
+            const std::string optMangled =
+                mangleStructInstance(optTy->enumName, optTy->typeArgs);
+            auto* optLlvm = enumTypes_[optMangled];
+            unsigned someIdx = variantIndexInEnum(optTy, "Some");
+            unsigned noneIdx = variantIndexInEnum(optTy, "None");
+            unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+            // Phase 81: arg0 is now `&Receiver<T>` — a pointer to the i64 handle.
+            auto* fn = mkFn(llvm::FunctionType::get(optLlvm, {i8PtrTy}, false));
+            fn->getArg(0)->setName("r");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* loopBB = llvm::BasicBlock::Create(ctx, "wait_loop", fn);
+            auto* closedBB = llvm::BasicBlock::Create(ctx, "check_closed", fn);
+            auto* waitBB = llvm::BasicBlock::Create(ctx, "cwait", fn);
+            auto* popBB = llvm::BasicBlock::Create(ctx, "pop", fn);
+            auto* clrTailBB = llvm::BasicBlock::Create(ctx, "clear_tail", fn);
+            auto* afterBB = llvm::BasicBlock::Create(ctx, "after", fn);
+            auto* noneBB = llvm::BasicBlock::Create(ctx, "none", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* rhandle = b.CreateLoad(i64Ty, fn->getArg(0), "handle");
+            auto* blk = b.CreateIntToPtr(rhandle, i8PtrTy, "blk");
+            b.CreateCall(pthreadMutexLockFn_, {mtxOf(b, blk)});
+            b.CreateBr(loopBB);
+            b.SetInsertPoint(loopBB);
+            auto* cntP = b.CreateStructGEP(chanBlkTy_, blk, 4, "cntP");
+            auto* cnt = b.CreateLoad(i64Ty, cntP, "cnt");
+            b.CreateCondBr(b.CreateICmpSGT(cnt, z64, "has"), popBB, closedBB);
+            b.SetInsertPoint(closedBB);
+            auto* closed = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(chanBlkTy_, blk, 5, "closedP"),
+                "closed");
+            b.CreateCondBr(b.CreateICmpNE(closed, z64, "isClosed"), noneBB,
+                           waitBB);
+            b.SetInsertPoint(waitBB);
+            b.CreateCall(pthreadCondWaitFn_, {condOf(b, blk), mtxOf(b, blk)});
+            b.CreateBr(loopBB);
+            b.SetInsertPoint(popBB);
+            auto* headP = b.CreateStructGEP(chanBlkTy_, blk, 2, "headP");
+            auto* head = b.CreateLoad(i8PtrTy, headP, "head");
+            auto* val = b.CreateLoad(
+                elemTy, b.CreateStructGEP(nodeTy, head, 0, "hval"), "val");
+            auto* next = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(nodeTy, head, 1, "hnext"), "next");
+            b.CreateStore(next, headP);
+            b.CreateStore(b.CreateSub(cnt, llvm::ConstantInt::get(i64Ty, 1),
+                                      "cntm1"),
+                          cntP);
+            b.CreateCall(freeFn_, {head});
+            b.CreateCondBr(b.CreateICmpEQ(next, nullp, "drained"), clrTailBB,
+                           afterBB);
+            b.SetInsertPoint(clrTailBB);
+            b.CreateStore(nullp, b.CreateStructGEP(chanBlkTy_, blk, 3, "tailP"));
+            b.CreateBr(afterBB);
+            b.SetInsertPoint(afterBB);
+            b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blk)});
+            llvm::Value* some = llvm::UndefValue::get(optLlvm);
+            some = b.CreateInsertValue(
+                some, llvm::ConstantInt::get(i32Ty, someIdx), {0}, "some");
+            some = b.CreateInsertValue(some, val, {someSlot}, "someV");
+            b.CreateRet(some);
+            b.SetInsertPoint(noneBB);
+            b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blk)});
+            llvm::Value* none = llvm::UndefValue::get(optLlvm);
+            none = b.CreateInsertValue(
+                none, llvm::ConstantInt::get(i32Ty, noneIdx), {0}, "none");
+            b.CreateRet(none);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "chan_try_recv") {
+            // Non-blocking: pop if an item is ready, else return None at once
+            // (no condvar wait). Otherwise identical to chan_recv.
+            TypePtr optTy = optionType(T);
+            mapKardashevType(optTy);
+            const std::string optMangled =
+                mangleStructInstance(optTy->enumName, optTy->typeArgs);
+            auto* optLlvm = enumTypes_[optMangled];
+            unsigned someIdx = variantIndexInEnum(optTy, "Some");
+            unsigned noneIdx = variantIndexInEnum(optTy, "None");
+            unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+            // Phase 81: arg0 is now `&Receiver<T>` — a pointer to the i64 handle.
+            auto* fn = mkFn(llvm::FunctionType::get(optLlvm, {i8PtrTy}, false));
+            fn->getArg(0)->setName("r");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* popBB = llvm::BasicBlock::Create(ctx, "pop", fn);
+            auto* clrTailBB = llvm::BasicBlock::Create(ctx, "clear_tail", fn);
+            auto* afterBB = llvm::BasicBlock::Create(ctx, "after", fn);
+            auto* noneBB = llvm::BasicBlock::Create(ctx, "none", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* trhandle = b.CreateLoad(i64Ty, fn->getArg(0), "handle");
+            auto* blk = b.CreateIntToPtr(trhandle, i8PtrTy, "blk");
+            b.CreateCall(pthreadMutexLockFn_, {mtxOf(b, blk)});
+            auto* cntP = b.CreateStructGEP(chanBlkTy_, blk, 4, "cntP");
+            auto* cnt = b.CreateLoad(i64Ty, cntP, "cnt");
+            b.CreateCondBr(b.CreateICmpSGT(cnt, z64, "has"), popBB, noneBB);
+            b.SetInsertPoint(popBB);
+            auto* headP = b.CreateStructGEP(chanBlkTy_, blk, 2, "headP");
+            auto* head = b.CreateLoad(i8PtrTy, headP, "head");
+            auto* val = b.CreateLoad(
+                elemTy, b.CreateStructGEP(nodeTy, head, 0, "hval"), "val");
+            auto* next = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(nodeTy, head, 1, "hnext"), "next");
+            b.CreateStore(next, headP);
+            b.CreateStore(b.CreateSub(cnt, llvm::ConstantInt::get(i64Ty, 1),
+                                      "cntm1"),
+                          cntP);
+            b.CreateCall(freeFn_, {head});
+            b.CreateCondBr(b.CreateICmpEQ(next, nullp, "drained"), clrTailBB,
+                           afterBB);
+            b.SetInsertPoint(clrTailBB);
+            b.CreateStore(nullp, b.CreateStructGEP(chanBlkTy_, blk, 3, "tailP"));
+            b.CreateBr(afterBB);
+            b.SetInsertPoint(afterBB);
+            b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blk)});
+            llvm::Value* some = llvm::UndefValue::get(optLlvm);
+            some = b.CreateInsertValue(
+                some, llvm::ConstantInt::get(i32Ty, someIdx), {0}, "some");
+            some = b.CreateInsertValue(some, val, {someSlot}, "someV");
+            b.CreateRet(some);
+            b.SetInsertPoint(noneBB);
+            b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blk)});
+            llvm::Value* none = llvm::UndefValue::get(optLlvm);
+            none = b.CreateInsertValue(
+                none, llvm::ConstantInt::get(i32Ty, noneIdx), {0}, "none");
+            b.CreateRet(none);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        auto* one64 = llvm::ConstantInt::get(i64Ty, 1);
+        if (op == "sender_clone") {
+            // Phase 81: sender_clone(s: &Sender<T>) -> Sender<T>. Multi-producer:
+            // each new Sender bumps the live-sender AND endpoint counts under the
+            // lock, then returns the same handle. The cross-thread auto-clone at
+            // closure capture (emitClosure) routes here too.
+            auto* fn = mkFn(llvm::FunctionType::get(i64Ty, {i8PtrTy}, false));
+            fn->getArg(0)->setName("s");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* handle = b.CreateLoad(i64Ty, fn->getArg(0), "handle");
+            auto* blk = b.CreateIntToPtr(handle, i8PtrTy, "blk");
+            b.CreateCall(pthreadMutexLockFn_, {mtxOf(b, blk)});
+            auto* sP = b.CreateStructGEP(chanBlkTy_, blk, 6, "sendersP");
+            b.CreateStore(b.CreateAdd(b.CreateLoad(i64Ty, sP, "s"), one64, "s1"),
+                          sP);
+            auto* rP = b.CreateStructGEP(chanBlkTy_, blk, 7, "refsP");
+            b.CreateStore(b.CreateAdd(b.CreateLoad(i64Ty, rP, "r"), one64, "r1"),
+                          rP);
+            b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blk)});
+            b.CreateRet(handle);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "chan_destroy") {
+            // Phase 81: the last-endpoint teardown. Drain any remaining queued
+            // nodes (dropping a droppable payload, freeing each node), destroy
+            // the mutex + condvar, then free the block. Runs only when refs==0,
+            // so no other endpoint can touch the block — no lock needed.
+            // Emitted against the member builder_ so the payload drop can route
+            // through emitDropGlueInline (which builds BBs on currentFn_).
+            auto* fn = mkFn(llvm::FunctionType::get(
+                llvm::Type::getVoidTy(ctx), {i64Ty}, false));
+            fn->getArg(0)->setName("h");
+            declaredFns_[mangled] = fn;
+            auto* savedFn = currentFn_;
+            auto savedIP = builder_->saveIP();
+            currentFn_ = fn;
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* loopBB = llvm::BasicBlock::Create(ctx, "drain_loop", fn);
+            auto* bodyBB = llvm::BasicBlock::Create(ctx, "drain_body", fn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "drain_done", fn);
+            builder_->SetInsertPoint(entry);
+            auto* blk = builder_->CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* headP = builder_->CreateStructGEP(chanBlkTy_, blk, 2, "headP");
+            builder_->CreateBr(loopBB);
+            builder_->SetInsertPoint(loopBB);
+            auto* cur = builder_->CreateLoad(i8PtrTy, headP, "cur");
+            builder_->CreateCondBr(
+                builder_->CreateICmpEQ(cur, nullp, "atEnd"), doneBB, bodyBB);
+            builder_->SetInsertPoint(bodyBB);
+            auto* next = builder_->CreateLoad(
+                i8PtrTy, builder_->CreateStructGEP(nodeTy, cur, 1, "nnext"),
+                "next");
+            builder_->CreateStore(next, headP);
+            if (isDroppable(T)) {
+                emitDropGlueInline(
+                    builder_->CreateStructGEP(nodeTy, cur, 0, "nval"), T);
+            }
+            builder_->CreateCall(freeFn_, {cur});
+            builder_->CreateBr(loopBB);
+            builder_->SetInsertPoint(doneBB);
+            builder_->CreateCall(pthreadMutexDestroyFn_, {mtxOf(*builder_, blk)});
+            builder_->CreateCall(pthreadCondDestroyFn_, {condOf(*builder_, blk)});
+            builder_->CreateCall(freeFn_, {blk});
+            builder_->CreateRetVoid();
+            currentFn_ = savedFn;
+            builder_->restoreIP(savedIP);
+            return fn;
+        }
+        if (op == "sender_drop" || op == "receiver_drop" || op == "chan_close") {
+            // Phase 81: dropping an endpoint. A Sender drop (also reached by the
+            // explicit, by-value chan_close) decrements `senders`; when it hits
+            // zero the channel is closed + every blocked receiver woken — so a
+            // producer finishing can no longer abandon another producer's queued
+            // items (the multi-producer-close data-loss bug). Both drops then
+            // decrement `refs`, and the last endpoint out (refs==0) tears the
+            // block down. chan_close returns i64 0; the drops return void.
+            const bool isSender = (op != "receiver_drop");
+            const bool isClose = (op == "chan_close");
+            auto* retTy = isClose ? static_cast<llvm::Type*>(i64Ty)
+                                  : llvm::Type::getVoidTy(ctx);
+            auto* fn = mkFn(llvm::FunctionType::get(retTy, {i64Ty}, false));
+            fn->getArg(0)->setName(isSender ? "s" : "r");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* destroyBB = llvm::BasicBlock::Create(ctx, "destroy", fn);
+            auto* retBB = llvm::BasicBlock::Create(ctx, "ret", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            b.CreateCall(pthreadMutexLockFn_, {mtxOf(b, blk)});
+            if (isSender) {
+                auto* closeBB = llvm::BasicBlock::Create(ctx, "do_close", fn);
+                auto* afterBB = llvm::BasicBlock::Create(ctx, "after_close", fn);
+                auto* sP = b.CreateStructGEP(chanBlkTy_, blk, 6, "sendersP");
+                auto* s1 = b.CreateSub(b.CreateLoad(i64Ty, sP, "s"), one64, "s1");
+                b.CreateStore(s1, sP);
+                b.CreateCondBr(b.CreateICmpEQ(s1, z64, "lastSender"), closeBB,
+                               afterBB);
+                b.SetInsertPoint(closeBB);
+                b.CreateStore(one64,
+                              b.CreateStructGEP(chanBlkTy_, blk, 5, "closedP"));
+                b.CreateCall(pthreadCondBroadcastFn_, {condOf(b, blk)});
+                b.CreateBr(afterBB);
+                b.SetInsertPoint(afterBB);
+            }
+            auto* rP = b.CreateStructGEP(chanBlkTy_, blk, 7, "refsP");
+            auto* r1 = b.CreateSub(b.CreateLoad(i64Ty, rP, "r"), one64, "r1");
+            b.CreateStore(r1, rP);
+            auto* rc0 = b.CreateICmpEQ(r1, z64, "lastRef");
+            b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blk)});
+            b.CreateCondBr(rc0, destroyBB, retBB);
+            b.SetInsertPoint(destroyBB);
+            b.CreateCall(getOrEmitChannelOp("chan_destroy", T), {fn->getArg(0)});
+            b.CreateBr(retBB);
+            b.SetInsertPoint(retBB);
+            if (isClose)
+                b.CreateRet(z64);
+            else
+                b.CreateRetVoid();
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        return nullptr;
+    }
+
+    // Phase 78 (v13): the per-T `Rc<T>` ops over a heap `{ i64 strong, T value }`
+    // block. rc_new allocates with strong=1; rc_clone shares (count++) and
+    // returns the same block; rc_get borrows the value; rc_strong_count reads
+    // the count. The DROP (a non-atomic decrement + free-at-zero) lives in
+    // emitDropGlueInline — non-atomic on purpose, which is exactly why an Rc is
+    // not Send.
+    llvm::Function* getOrEmitRcOp(const std::string& op, const TypePtr& T) {
+        std::string suffix = mangleType(T);
+        std::string mangled = op + "__" + suffix;
+        if (auto it = declaredFns_.find(mangled); it != declaredFns_.end())
+            return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* one = llvm::ConstantInt::get(i64Ty, 1);
+        llvm::Type* elemTy = mapKardashevType(T);
+        auto* blkTy = rcBlockType(T);
+        auto* blkSzK = llvm::ConstantInt::get(
+            i64Ty, module_->getDataLayout().getTypeAllocSize(blkTy));
+        auto mk = [&](llvm::FunctionType* ty) {
+            auto* fn = llvm::Function::Create(
+                ty, llvm::Function::ExternalLinkage, mangled, module_.get());
+            return fn;
+        };
+        if (op == "rc_new") {
+            auto* fn = mk(llvm::FunctionType::get(i8PtrTy, {elemTy}, false));
+            fn->getArg(0)->setName("v");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateCall(mallocFn_, {blkSzK}, "rc_blk");
+            b.CreateStore(one, b.CreateStructGEP(blkTy, blk, 0, "strong"));
+            b.CreateStore(fn->getArg(0),
+                          b.CreateStructGEP(blkTy, blk, 1, "value"));
+            b.CreateRet(blk);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "rc_clone") {
+            auto* fn = mk(llvm::FunctionType::get(i8PtrTy, {i8PtrTy}, false));
+            fn->getArg(0)->setName("r");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            auto* cntP = b.CreateStructGEP(blkTy, blk, 0, "strongP");
+            b.CreateStore(b.CreateAdd(b.CreateLoad(i64Ty, cntP, "cnt"), one,
+                                      "inc"),
+                          cntP);
+            b.CreateRet(blk);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "rc_get") {
+            auto* fn = mk(llvm::FunctionType::get(i8PtrTy, {i8PtrTy}, false));
+            fn->getArg(0)->setName("r");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            b.CreateRet(b.CreateStructGEP(blkTy, blk, 1, "valueP"));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "rc_strong_count") {
+            auto* fn = mk(llvm::FunctionType::get(i64Ty, {i8PtrTy}, false));
+            fn->getArg(0)->setName("r");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            b.CreateRet(b.CreateLoad(
+                i64Ty, b.CreateStructGEP(blkTy, blk, 0, "strongP"), "cnt"));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        return nullptr;
+    }
+    // The `{ i64 strong, T value }` layout of an Rc<T> block. Anonymous so the
+    // drop glue and the ops agree on field offsets without a name table.
+    llvm::StructType* rcBlockType(const TypePtr& T) {
+        return llvm::StructType::get(
+            *ctx_, {llvm::Type::getInt64Ty(*ctx_), mapKardashevType(T)});
     }
 
     // --- Phase 23: real panic + unwinding (setjmp/longjmp + cleanup stack) ---
@@ -5992,6 +6494,16 @@ private:
                 return llvm::PointerType::get(*ctx_, /*AS=*/0);
             }
             case TypeKind::Struct: {
+                // Phase 76 (v13): the channel endpoints `Sender<T>` /
+                // `Receiver<T>` are Copy i64 HANDLES (a pointer to the shared
+                // channel block, PtrToInt'd) — they lower to i64 regardless of
+                // T, like the Mutex handle.
+                if (r->structName == "Sender" || r->structName == "Receiver")
+                    return llvm::Type::getInt64Ty(*ctx_);
+                // Phase 78 (v13): `Rc<T>` is a pointer to a heap
+                // `{ i64 strong, T value }` refcount block.
+                if (r->structName == "Rc")
+                    return llvm::PointerType::get(*ctx_, 0);
                 // Built-in single-layout generics: `Vec<T>`, `String`,
                 // `Slice`, `HashMap<V>` and `Future<T>` always lower to one
                 // hand-built struct regardless of their type arg(s). Vec keeps
@@ -7596,6 +8108,17 @@ private:
             if (r->structName == "Vec" || r->structName == "String" ||
                 r->structName == "HashMap" || r->structName == "HashSet")
                 return true;
+            // Phase 78 (v13): Rc<T> owns a refcount block — droppable (its drop
+            // decrements + frees at zero).
+            if (r->structName == "Rc") return true;
+            // Phase 81 (v13 review fix): Sender/Receiver are now refcounted
+            // OWNERS of the channel block — droppable. A Sender drop decrements
+            // the live-sender count (closing the channel at zero) and the
+            // endpoint count; a Receiver drop decrements the endpoint count; the
+            // last endpoint out drains + frees the block. (Their handle is still
+            // an i64, so they lower as scalars, but they are no longer Copy.)
+            if (r->structName == "Sender" || r->structName == "Receiver")
+                return true;
             // Slice / Range / fn-value / future structs own no heap (Slice is
             // a borrow; Range/Future are plain scalars in the MVP).
             if (r->structName == "Slice" || r->structName == "Range" ||
@@ -7762,6 +8285,55 @@ private:
                 emitDropGlue(boxPtr, inner);
             }
             builder_->CreateCall(freeFn_, {boxPtr});
+            return;
+        }
+
+        // Phase 78 (v13): Rc<T> drop — decrement the (non-atomic) strong count;
+        // when it reaches zero, drop the shared value and free the block. The
+        // count lives in the shared block, so cloning + dropping balance and
+        // the value is freed exactly once (by the last owner). Non-atomic by
+        // design — which is why an Rc is not Send.
+        if (r->kind == TypeKind::Struct && r->structName == "Rc" &&
+            !r->typeArgs.empty()) {
+            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+            TypePtr inner = resolveInInstance(r->typeArgs[0]);
+            auto* blkTy = rcBlockType(inner);
+            auto* blk = builder_->CreateLoad(i8PtrTy, valuePtr, "rc.ptr");
+            auto* cntP = builder_->CreateStructGEP(blkTy, blk, 0, "rc.strongP");
+            auto* dec = builder_->CreateSub(
+                builder_->CreateLoad(i64Ty, cntP, "rc.cnt"),
+                llvm::ConstantInt::get(i64Ty, 1), "rc.dec");
+            builder_->CreateStore(dec, cntP);
+            auto* curFn = builder_->GetInsertBlock()->getParent();
+            auto* freeBB = llvm::BasicBlock::Create(ctx, "rc.free", curFn);
+            auto* contBB = llvm::BasicBlock::Create(ctx, "rc.cont", curFn);
+            builder_->CreateCondBr(
+                builder_->CreateICmpEQ(dec, llvm::ConstantInt::get(i64Ty, 0),
+                                       "rc.last"),
+                freeBB, contBB);
+            builder_->SetInsertPoint(freeBB);
+            if (isDroppable(inner))
+                emitDropGlue(builder_->CreateStructGEP(blkTy, blk, 1, "rc.val"),
+                             inner);
+            builder_->CreateCall(freeFn_, {blk});
+            builder_->CreateBr(contBB);
+            builder_->SetInsertPoint(contBB);
+            return;
+        }
+
+        // Phase 81 (v13 review fix): Sender/Receiver drop. The storage holds the
+        // i64 channel handle; route to the per-T sender_drop / receiver_drop
+        // runtime (which decrements the refcount under the lock, closes on the
+        // last sender, and drains + frees the block on the last endpoint).
+        if (r->kind == TypeKind::Struct &&
+            (r->structName == "Sender" || r->structName == "Receiver") &&
+            !r->typeArgs.empty()) {
+            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+            TypePtr msgT = resolveInInstance(r->typeArgs[0]);
+            auto* handle = builder_->CreateLoad(i64Ty, valuePtr, "chan.handle");
+            const char* dropOp =
+                (r->structName == "Sender") ? "sender_drop" : "receiver_drop";
+            builder_->CreateCall(getOrEmitChannelOp(dropOp, msgT), {handle});
             return;
         }
 
@@ -8223,6 +8795,13 @@ private:
                     if (tupTy && tupTy->kind == TypeKind::Tuple &&
                         i < tupTy->tupleElems.size()) {
                         localTypes_[let->tupleNames[i]] = tupTy->tupleElems[i];
+                        // Phase 81 (v13 review fix): a destructured binding owns
+                        // its element and must be dropped at scope exit — e.g.
+                        // `let (tx, rx) = channel()` binds two refcounted channel
+                        // endpoints whose drop reclaims the block. (Latent until
+                        // now: tuple elements used to be restricted to Copy.)
+                        registerDroppableLocal(let->tupleNames[i], alloca,
+                                               tupTy->tupleElems[i]);
                     }
                 }
                 return;
@@ -9518,6 +10097,9 @@ private:
             call.callee == "mutex_set") {
             ensureThreadRuntime();
         }
+        // (Phase 77: the channel ops are GENERIC builtins — they route through
+        // the generic dispatch to getOrEmitChannelOp, which ensures the channel
+        // runtime per-T; no non-generic ensure-dispatch needed here.)
         // Phase 10b: indirect call through a fn VALUE (fat pointer). Applies
         // to let-bound fn values, fn-typed params, and if-selected fns. We
         // try this BEFORE the direct/generic paths so a binding that shadows
@@ -9598,6 +10180,49 @@ private:
                 return builder_->CreateCall(
                 fn, args,
                 fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
+            }
+            // Phase 77 (v13): the per-T channel ops, specialized over the
+            // message type T (the node carries a T-sized cell). channel<T>()
+            // infers T from the (Sender<T>, Receiver<T>) it is unified into.
+            if ((call.callee == "channel" || call.callee == "chan_send" ||
+                 call.callee == "chan_recv" || call.callee == "chan_close" ||
+                 call.callee == "chan_try_recv" ||
+                 call.callee == "sender_clone") &&
+                !concreteTypeArgs.empty()) {
+                llvm::Function* fn =
+                    getOrEmitChannelOp(call.callee, concreteTypeArgs[0]);
+                if (!fn) {
+                    errors_.push_back("codegen: cannot specialize " +
+                                      call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(
+                    fn, args,
+                    fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
+            }
+            // Phase 78 (v13): the per-T Rc<T> ops.
+            if ((call.callee == "rc_new" || call.callee == "rc_clone" ||
+                 call.callee == "rc_get" ||
+                 call.callee == "rc_strong_count") &&
+                !concreteTypeArgs.empty()) {
+                llvm::Function* fn =
+                    getOrEmitRcOp(call.callee, concreteTypeArgs[0]);
+                if (!fn) {
+                    errors_.push_back("codegen: cannot specialize " +
+                                      call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(
+                    fn, args,
+                    fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
             }
             // Phase 35: `clone<T>(&T) -> T` deep-copies via a per-type clone fn.
             // The argument is a `&T` borrow, so emitConsume yields the pointer
@@ -10814,6 +11439,24 @@ private:
                     // borrowed for the closure's lifetime, which (MVP) does not
                     // outlive this scope.
                     builder_->CreateStore(lit->second, slot);
+                    continue;
+                }
+                // Phase 81 (v13 review fix): capturing a Sender into a closure
+                // (the cross-thread producer path) CLONES it — each closure /
+                // thread gets its own refcounted handle, balanced by the
+                // by-value `Sender` param's drop in the worker it is moved into.
+                // The enclosing binding keeps its OWN Sender (no flag-clear), so
+                // it still drops once at its own scope exit. This is what makes
+                // capturing the same `tx` into N producer threads sound under
+                // the refcount (N clones, N worker-drops).
+                TypePtr capR = resolveInInstance(cl.captures[i].type);
+                if (capR->kind == TypeKind::Struct &&
+                    capR->structName == "Sender" && !capR->typeArgs.empty()) {
+                    llvm::Function* cloneFn = getOrEmitChannelOp(
+                        "sender_clone", resolveInInstance(capR->typeArgs[0]));
+                    llvm::Value* h = builder_->CreateCall(cloneFn, {lit->second},
+                                                          "cap_clone_" + name);
+                    builder_->CreateStore(h, slot);
                     continue;
                 }
                 // By-value capture (Phase 10b): load + copy the value in.

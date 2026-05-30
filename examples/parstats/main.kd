@@ -1,0 +1,84 @@
+// Roadmap v13 CAPSTONE — "concurrency, applied."
+//
+// A PARALLEL MAP-REDUCE that is safe by construction. The dataset is the
+// deterministic series data(i) = (i*7 + 13) mod 1000 for i in 0..N. We split
+// it across W worker THREADS; each worker reduces its chunk to a `Stats`
+// (sum / count / min / max) and SENDS that struct on a shared channel; the main
+// thread GATHERS the W partials over the MPSC channel and MERGES them into the
+// global stats. The merge is checked against the known sequential answer.
+//
+// It exercises the whole v13 concurrency line at once:
+//   - `thread_spawn` (the `share` effect — a fn that spawns must declare it);
+//   - typed CHANNELS that MOVE a real value (a `Stats` struct) across threads;
+//   - the `Send` rule — `Stats` is all-i64 so it is Send and may cross; the
+//     shared `Sender` is Copy + Send (multi-producer), gathered by one consumer;
+//   - fork-join over a worker pool, results folded deterministically;
+//   - the v12 numeric helpers (`i64_min` / `i64_max`).
+// None of this is expressible — soundly — without the v13 primitives.
+
+struct Stats { sum: i64, count: i64, lo_v: i64, hi_v: i64 }
+
+// Reduce the chunk [lo, hi) of the series to a Stats and send it.
+fn analyze(lo: i64, hi: i64, tx: Sender<Stats>) -> i64 ! { share } {
+    let mut sum = 0;
+    let mut mn = 1000;      // above the data max (data is in 0..1000)
+    let mut mx = 0 - 1;     // below the data min
+    let mut i = lo;
+    while i < hi {
+        let v = (i * 7 + 13) - ((i * 7 + 13) / 1000) * 1000;   // mod 1000
+        sum = sum + v;
+        mn = i64_min(mn, v);
+        mx = i64_max(mx, v);
+        i = i + 1;
+    }
+    chan_send(&tx, Stats { sum: sum, count: hi - lo, lo_v: mn, hi_v: mx });
+    0
+}
+
+fn main() -> i64 ! { io, alloc, share } {
+    let n = 10000;
+    let w = 4;
+    let (tx, rx) = channel();
+    let chunk = n / w;
+
+    // FORK: spawn W workers over disjoint chunks; the last takes the remainder.
+    let mut handles = vec_new();
+    let mut k = 0;
+    while k < w {
+        let lo = k * chunk;
+        let hi = if k == w - 1 { n } else { (k + 1) * chunk };
+        let h = thread_spawn(|| analyze(lo, hi, tx));   // tx cloned per worker
+        vec_push(&mut handles, h);
+        k = k + 1;
+    }
+
+    // JOIN + REDUCE: gather the W partial Stats and merge them.
+    let mut total_sum = 0;
+    let mut total_count = 0;
+    let mut gmin = 1000;
+    let mut gmax = 0 - 1;
+    let mut got = 0;
+    while got < w {
+        match chan_recv(&rx) {
+            Some(s) => {
+                total_sum = total_sum + s.sum;
+                total_count = total_count + s.count;
+                gmin = i64_min(gmin, s.lo_v);
+                gmax = i64_max(gmax, s.hi_v);
+                got = got + 1;
+            },
+            None => {},
+        }
+    }
+    let mut j = 0;
+    while j < w { thread_join(vec_get(&handles, j)); j = j + 1; }
+
+    print(total_sum);     // 4995000
+    print(total_count);   // 10000
+    print(gmin);          // 0
+    print(gmax);          // 999
+
+    // A single witness, correct only if the parallel reduce matches the
+    // sequential answer: 4995000 + 0*1000000 + 999*1000 + 10000 = 6004000.
+    total_sum + gmin * 1000000 + gmax * 1000 + total_count
+}
