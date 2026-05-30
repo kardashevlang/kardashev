@@ -47,6 +47,15 @@ witness).
   handle, so a `Sender` (multi-producer, `Send`) is captured by value into a
   worker thread — while a `Receiver` is the single-consumer endpoint and is
   **not** `Send`: moving one into a thread is a compile error.
+- **Generic channels + the `Send` rule** (Phase 77) — `channel<T>` now MOVES a
+  real `T` across threads (the queue node carries a `T`-sized cell, specialized
+  per `T`), so an owned `String` or `Vec<i64>` is sent from one thread and
+  received on another with ownership transferring sender → node → receiver,
+  freed exactly once (no clone, no double-free). The structural **`Send`**
+  predicate (`isSend`) gets teeth at `chan_send`: scalars / `String` / owning
+  aggregates / the channel `Sender` are `Send`, while a `&T` borrow, the
+  `Receiver`, and (Phase 78) `Rc` are not — sending a non-`Send` value on a
+  channel is a compile error, so no borrow can dangle across a thread.
 
 ## [0.12.0] — Roadmap v12 "real stdlib" (Phases 69–74)
 

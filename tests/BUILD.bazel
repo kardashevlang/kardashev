@@ -721,6 +721,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 77 (v13 — concurrency): the generic channel<T> moves a real T (String,
+# Vec) across threads; the structural Send rule rejects sending a borrow.
+sh_test(
+    name = "smoke_test_phase77",
+    srcs = ["smoke_test_phase77.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
