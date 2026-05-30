@@ -450,10 +450,20 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   real semantic checks: it RESOLVES a parameter's type by name (`b` → `i64`) and
 >   REJECTS a duplicate parameter name (`fn bad(a: i64, a: i64)` is flagged). The
 >   analysis phase a compiler runs after parsing, in kardashev — JIT + AOT.
+> - **Phase 93 — CAPSTONE: the front-end, end to end (done).** `examples/selfhost/front.kd`
+>   runs the WHOLE front it built (lex → parse → check → reprint) over a function
+>   signature in one program, scoring it, and proves it generalizes across a
+>   2-param and a 3-param signature (`211`, `311`, pipeline witness `211311`),
+>   JIT + AOT. A self-hosted compiler **front-end written in the language it
+>   compiles** — tokens with spans, a real `FnSig` AST, a HashMap symbol table
+>   with duplicate-param + type-resolution checks, and a lossless source
+>   round-trip.
 >
-> Planned: parse more of the grammar (statements, expressions) → a fuller `enum`
-> AST; a capstone that self-lexes/parses/checks a real kardashev source file —
-> closing language gaps (richer errors, string ops) as self-hosting surfaces them.
+> v15 delivers the self-hosted **front-end** (lexer + parser + checker). Full
+> self-hosting (the whole compiler, incl. codegen) is a multi-roadmap effort the
+> later roadmaps continue — parsing more of the grammar (statements, expressions,
+> items) → a fuller `enum` AST → a real type checker → eventually emitting code,
+> closing language gaps (richer errors, string ops) as they surface.
 
 ## Roadmap v14 — shipped
 

@@ -842,6 +842,17 @@ sh_test(
     ],
 )
 
+# v15 Phase 93 CAPSTONE (self-hosting): the whole compiler front end-to-end
+# (lex -> parse -> check -> reprint) over real signatures, in kardashev.
+sh_test(
+    name = "smoke_test_phase93",
+    srcs = ["smoke_test_phase93.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:front.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
