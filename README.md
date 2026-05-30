@@ -445,11 +445,15 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   (length 29, `round_trips = 1`), JIT + AOT. A lossless round-trip proves the
 >   AST captures everything the surface syntax carries — the invariant a real
 >   parser must hold.
+> - **Phase 92 — a scope/semantic checker (done).** `examples/selfhost/checker.kd`
+>   builds a `HashMap<String, String>` SYMBOL TABLE over the `FnSig` AST and runs
+>   real semantic checks: it RESOLVES a parameter's type by name (`b` → `i64`) and
+>   REJECTS a duplicate parameter name (`fn bad(a: i64, a: i64)` is flagged). The
+>   analysis phase a compiler runs after parsing, in kardashev — JIT + AOT.
 >
-> Planned: parse more of the grammar (items, statements, expressions) → a fuller
-> `enum` AST; a scope/type checker; a capstone that self-lexes/parses a real
-> kardashev source file — closing language gaps (richer errors, string ops) as
-> self-hosting surfaces them.
+> Planned: parse more of the grammar (statements, expressions) → a fuller `enum`
+> AST; a capstone that self-lexes/parses/checks a real kardashev source file —
+> closing language gaps (richer errors, string ops) as self-hosting surfaces them.
 
 ## Roadmap v14 — shipped
 
