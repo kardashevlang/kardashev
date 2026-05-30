@@ -705,6 +705,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 75 (v13 — concurrency): the `share` effect — thread-safety as a CHECKED
+# effect (a pure-declared trait can't launder a thread_spawn via the subset rule).
+sh_test(
+    name = "smoke_test_phase75",
+    srcs = ["smoke_test_phase75.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

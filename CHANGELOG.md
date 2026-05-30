@@ -18,6 +18,25 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [Unreleased] — Roadmap v13 "concurrency" (Phases 75–80, in progress)
+
+Theme: make concurrency SAFE BY CONSTRUCTION — typed channels that move data
+between threads, with thread-safety enforced *through the effect system* (the
+language's differentiator). Designed via a 3-proposal / 3-judge multi-agent
+panel (MVP-first won, grafting the structural Send/Sync rule + an `Rc` negative
+witness).
+
+### Added
+- The **`share` effect** (Phase 75) — the concurrency effect that makes
+  thread-safety a CHECKED property rather than a library convention.
+  `thread_spawn` now carries `share`, so a fn that spawns must declare
+  `! { share }`. Because `share` is a built-in effect it rides the existing
+  effect-SUBSET rule: a trait method declared without `share` can NEVER have an
+  impl that spawns, so concurrent work can't be smuggled past a pure-looking
+  `<T: Task>` / `&dyn Task` interface (the super-effecting impl is rejected).
+  This is the value-crossing *control* half; the value-*safety* half (only
+  `Send` data crosses) lands with channels in Phase 77.
+
 ## [0.12.0] — Roadmap v12 "real stdlib" (Phases 69–74)
 
 Theme: turn a language you can *compute* in into one you can *get data in and

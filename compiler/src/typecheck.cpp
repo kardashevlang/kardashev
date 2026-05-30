@@ -768,6 +768,17 @@ public:
             FnSchema sch;
             sch.signature = makeFunction({fnParam}, makeInt());
             sch.declaredEffects.add("io");
+            // Phase 75 (v13): `share` — the cross-thread / concurrency effect.
+            // Spawning a thread crosses a thread boundary, so the spawning fn
+            // must declare `! { share }`. Because `share` is a built-in effect,
+            // it rides the existing effect-SUBSET rule: a trait method declared
+            // pure (or without `share`) can NEVER transitively spawn through a
+            // `<T: Trait>` / `&dyn Trait` dispatch — the checker attributes the
+            // trait's declared effects and rejects a super-effecting impl. So
+            // thread-safety becomes a CHECKED property, not a convention. (The
+            // value-safety half — that only `Send` data crosses — is enforced
+            // structurally at chan_send, Phase 77.)
+            sch.declaredEffects.add("share");
             sch.declaredEffects.add("e"); // row-var name (flows the closure's)
             sch.effectRowVars.emplace_back("e", rowVar);
             fnSchemas_["thread_spawn"] = std::move(sch);
@@ -2106,7 +2117,7 @@ private:
     // declared in the fn's generic-parameter list (Phase 4.3).
     static bool isBuiltinEffect(const std::string& l) {
         return l == "alloc" || l == "io" || l == "panic" ||
-               l == "async" || l == "unwind";
+               l == "async" || l == "unwind" || l == "share";
     }
 
     // Phase 10a classification: collect, from a signature, the names that
@@ -2448,7 +2459,8 @@ private:
                 result.add(l);
             } else {
                 error("unknown effect label `" + l + "` on fn '" + fnName +
-                          "' (built-ins: alloc, io, panic, async, unwind; or "
+                          "' (built-ins: alloc, io, panic, async, unwind, "
+                          "share; or "
                           "declare `" + l + "` as a generic effect-row "
                           "parameter)",
                       row.line, row.column);
