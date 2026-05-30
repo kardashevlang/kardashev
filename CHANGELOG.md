@@ -78,6 +78,16 @@ instead of i64-only. The first step toward production use.
   `255u8 + 1 == 0`), identically at compile and run time. Negative narrow-int
   literals narrow in context — `let x: i8 = -128` (i8::MIN) is valid even
   though `+128` would not fit, while `let x: u8 = -1` is a compile error.
+- **Capstone** `examples/checksum` (Phase 68) — "the numeric tower, applied":
+  three textbook algorithms written in kardashev, each checked against its
+  known answer. **FNV-1a** (64-bit) uses a `u64` offset basis past `i64::MAX`
+  (`0xcbf29ce484222325`) and a wrapping `u64` multiply; **CRC-32** (IEEE) uses
+  a `u32` with a logical `>>`, the bitwise ops, and a branchless mask built by
+  wrapping subtraction (`0 - (crc & 1)`); a **binary parser** assembles `u16`
+  / `u32` from raw `u8` bytes with shifts and casts in both byte orders. Each
+  routine is generic over its input length with a const-generic `[u8; N]`,
+  integrating the v10 const-generic line with the whole v11 numeric tower —
+  none of it is expressible in an i64-only language.
 
 ## [0.10.0] — Roadmap v10 "sized and sound at compile time" (Phases 57–62)
 

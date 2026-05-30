@@ -627,6 +627,17 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 68 (v11) CAPSTONE: FNV-1a + CRC-32 + a binary parser in kardashev, each
+# checked against its known answer. Builds the real examples/checksum/main.kd.
+sh_test(
+    name = "smoke_test_phase68",
+    srcs = ["smoke_test_phase68.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/checksum:main.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
