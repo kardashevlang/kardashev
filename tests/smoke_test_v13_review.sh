@@ -203,4 +203,37 @@ jit=$("$KARDC" "$TMP/sp.kd" 2>/dev/null | tail -1)
 [[ "$jit" == "500" ]] || { echo "FAIL [single-producer-drain]: expected 500 got '$jit'"; exit 1; }
 echo "PASS [single-producer-drain]: send 500 then close drains all then None -> 500"
 
+# ---------------------------------------------------------------------------
+# 4. v14 Phase 86: the channel capture-and-keep FOOTGUN is a compile error.
+#    A Sender captured into a closure but never moved out (every use is `&tx`)
+#    is never dropped -> the channel never closes -> recv-until-None hangs.
+# ---------------------------------------------------------------------------
+cat > "$TMP/footgun.kd" <<'EOF'
+fn main() -> i64 ! { io, alloc, share } {
+    let (tx, rx) = channel();
+    let h = thread_spawn(|| { chan_send(&tx, 5); 0 });   // tx never moved out
+    thread_join(h);
+    0
+}
+EOF
+set +e; out=$("$KARDC" "$TMP/footgun.kd" 2>&1); compiled=$("$KARDC" "$TMP/footgun.kd" >/dev/null 2>&1; echo $?); set -e
+[[ "$compiled" -ne 0 ]] || { echo "FAIL [footgun]: captured-and-kept Sender compiled"; exit 1; }
+grep -qi "Sender" <<< "$out" && grep -qi "moves it out\|never moves" <<< "$out" || { echo "FAIL [footgun]: wrong diagnostic: $out"; exit 1; }
+echo "PASS [footgun]: a Sender captured but never moved out of a closure is rejected"
+
+# And the SOUND forms — moved into the worker by value, or chan_close'd — compile.
+cat > "$TMP/okmove.kd" <<'EOF'
+fn worker(tx: Sender<i64>) -> i64 ! { share } { chan_send(&tx, 7); 0 }
+fn main() -> i64 ! { io, alloc, share } {
+    let (tx, rx) = channel();
+    let h = thread_spawn(|| worker(tx));   // moved into worker by value
+    let v = match chan_recv(&rx) { Some(x) => x, None => 0 };
+    thread_join(h);
+    v   // 7
+}
+EOF
+jit=$("$KARDC" "$TMP/okmove.kd" 2>/dev/null | tail -1)
+[[ "$jit" == "7" ]] || { echo "FAIL [footgun-ok]: moving the Sender into the worker broke: '$jit'"; exit 1; }
+echo "PASS [footgun-ok]: a Sender moved into the spawned worker by value still works -> 7"
+
 echo "ALL v13 REVIEW REGRESSION TESTS PASSED"

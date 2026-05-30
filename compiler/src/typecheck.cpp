@@ -5487,6 +5487,120 @@ private:
     // not in `bound` is a capture iff `lookupLocal` finds it (i.e. it is an
     // enclosing local, not a global fn / constructor). Order of first
     // appearance is preserved via `order` so codegen's env layout is stable.
+    // v14 (channel footgun): does `name` appear as a BARE (by-value) use
+    // anywhere in `e` — i.e. used in some way OTHER than `&name`? For a non-Copy
+    // `Sender`, a bare use is a MOVE, and a move is the ONLY way the Sender can
+    // leave a closure's heap env (which never drops its captures). So a captured
+    // Sender with NO bare use is captured-and-kept: it is never dropped, the
+    // channel never closes, and a `recv`-until-`None` consumer hangs. We reject
+    // that at compile time. Errs toward ALLOWING (returns true for any node type
+    // it doesn't model precisely), so it can never reject a sound program — it
+    // only catches the clear footgun (every use is `&name`).
+    bool hasBareIdentUse(const ast::Expr& e, const std::string& name) {
+        if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e))
+            return id->name == name;
+        if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
+            // `&name` is a by-reference use, not a move. But `&(expr...)` over a
+            // compound operand may still contain a bare use deeper inside.
+            if (dynamic_cast<const ast::IdentExpr*>(re->operand.get()))
+                return false; // `&name` (by-ref) or `&other` — no bare use
+            return hasBareIdentUse(*re->operand, name);
+        }
+        auto any = [&](const ast::Expr* p) {
+            return p && hasBareIdentUse(*p, name);
+        };
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e))
+            return any(b->lhs.get()) || any(b->rhs.get());
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e))
+            return any(u->operand.get());
+        if (auto* c = dynamic_cast<const ast::CastExpr*>(&e))
+            return any(c->operand.get());
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(&e)) {
+            for (const auto& a : c->args) if (any(a.get())) return true;
+            return false;
+        }
+        if (auto* c = dynamic_cast<const ast::CallValueExpr*>(&e)) {
+            if (any(c->callee.get())) return true;
+            for (const auto& a : c->args) if (any(a.get())) return true;
+            return false;
+        }
+        if (auto* m = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
+            if (any(m->receiver.get())) return true;
+            for (const auto& a : m->args) if (any(a.get())) return true;
+            return false;
+        }
+        if (auto* i = dynamic_cast<const ast::IfExpr*>(&e))
+            return any(i->cond.get()) || any(i->thenBranch.get()) ||
+                   any(i->elseBranch.get());
+        if (auto* bl = dynamic_cast<const ast::BlockExpr*>(&e)) {
+            for (const auto& s : bl->stmts) {
+                if (auto* l = dynamic_cast<const ast::LetStmt*>(s.get())) {
+                    if (any(l->value.get())) return true;
+                } else if (auto* r =
+                               dynamic_cast<const ast::ReturnStmt*>(s.get())) {
+                    if (r->value && any(r->value.get())) return true;
+                } else if (auto* a =
+                               dynamic_cast<const ast::AssignStmt*>(s.get())) {
+                    if (any(a->value.get())) return true;
+                } else if (auto* x =
+                               dynamic_cast<const ast::ExprStmt*>(s.get())) {
+                    if (any(x->expr.get())) return true;
+                }
+            }
+            return bl->tail && any(bl->tail.get());
+        }
+        if (auto* m = dynamic_cast<const ast::MatchExpr*>(&e)) {
+            if (any(m->scrutinee.get())) return true;
+            for (const auto& arm : m->arms)
+                if (any(arm.body.get())) return true;
+            return false;
+        }
+        if (auto* w = dynamic_cast<const ast::WhileExpr*>(&e))
+            return any(w->cond.get()) || any(w->body.get());
+        if (auto* l = dynamic_cast<const ast::LoopExpr*>(&e))
+            return any(l->body.get());
+        if (auto* f = dynamic_cast<const ast::ForExpr*>(&e))
+            return any(f->iter.get()) || any(f->body.get());
+        if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
+            for (const auto& [_n, v] : sl->fields)
+                if (any(v.get())) return true;
+            return false;
+        }
+        if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
+            for (const auto& el : al->elements) if (any(el.get())) return true;
+            return false;
+        }
+        if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
+            for (const auto& el : tl->elements) if (any(el.get())) return true;
+            return false;
+        }
+        if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e))
+            return be->value && any(be->value.get());
+        if (auto* te = dynamic_cast<const ast::TryExpr*>(&e))
+            return any(te->operand.get());
+        if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e))
+            return any(ae->operand.get());
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
+            return any(ix->object.get()) || any(ix->index.get());
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e))
+            return any(fe->object.get());
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e))
+            return any(tf->object.get());
+        if (auto* rg = dynamic_cast<const ast::RangeExpr*>(&e))
+            return any(rg->start.get()) || any(rg->end.get());
+        if (auto* sl = dynamic_cast<const ast::SliceExpr*>(&e))
+            return any(sl->operand.get()) || any(sl->start.get()) ||
+                   any(sl->end.get());
+        if (auto* nc = dynamic_cast<const ast::ClosureExpr*>(&e))
+            return any(nc->body.get()); // a nested closure may move it out
+        // Leaves (IntLit / StringLit / Continue / …) reference no binding, so
+        // they contribute no bare use. Every COMPOUND node that can hold a
+        // `Sender` ident is modeled above; default false. (If a sound move-out
+        // ever hid in an unmodeled node this would over-reject — the full v13
+        // channel suite guards against that.)
+        return false;
+    }
+
     void collectFreeVars(const ast::Expr& e,
                          std::unordered_set<std::string>& bound,
                          std::vector<std::string>& order,
@@ -5986,8 +6100,27 @@ private:
             // by-value `Sender` param drops it on that thread). A `Receiver<T>`
             // is NOT capturable — single-consumer / not-Send — and falls through
             // to the rejection below (a Receiver can't cross a thread boundary).
-            if (rt->kind == TypeKind::Struct && rt->structName == "Sender")
+            if (rt->kind == TypeKind::Struct && rt->structName == "Sender") {
                 copyable = true;
+                // Phase 86 (v14): close the capture-and-keep footgun. The clone
+                // this capture makes is owned by the closure's heap env, which
+                // never drops its captures — so the ONLY way it gets dropped
+                // (and the channel eventually closes) is being MOVED out of the
+                // closure, i.e. a bare by-value use of `name` somewhere in the
+                // body (e.g. `worker(.., tx)` or `chan_close(tx)`). If every use
+                // is `&tx` (send-only, never moved/closed), the Sender leaks and
+                // a `recv`-until-`None` consumer hangs forever. Reject it.
+                if (!hasBareIdentUse(*cl.body, name)) {
+                    error("closure captures the `Sender` `" + name +
+                              "` but never moves it out (every use is `&" + name +
+                              "`), so it is never dropped — the channel can't "
+                              "close and a `chan_recv`-until-`None` consumer "
+                              "hangs. Move it into the spawned worker by value "
+                              "(e.g. `worker(.., " + name +
+                              ")`) or `chan_close(" + name + ")` when done.",
+                          cl.line, cl.column);
+                }
+            }
             if (mutated) {
                 // FnMut: capture by reference. The mutation requires the
                 // enclosing binding be `let mut`.

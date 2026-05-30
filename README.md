@@ -431,9 +431,26 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   it needs a macOS-arm64 environment. Documented as the remaining blocker to a
 >   *guaranteed-stable* green macOS, rather than papered over.
 >
-> Planned: the channel capture-and-keep footgun → compile error; smoke-harness
-> `| tail` SIGPIPE robustness; JIT-vs-AOT differential / property testing; the
-> macOS `codegen_test` flake (needs a macOS-arm64 runner to diagnose).
+ - **Phases 84–85 — a SIGPIPE-robust smoke harness.** `echo "$big" | grep -q` /
+>   `awk '…exit'` / `$CMD | head -N` make the producer die with SIGPIPE (exit
+>   141) when the consumer closes the pipe early — a load-sensitive flake under
+>   `set -o pipefail` that can bite shared CI runners. Swept ~51 such pipelines
+>   across 31 files to here-strings / capture-then-process (consumers that read
+>   to EOF — `tail`, `wc`, plain `grep` — left alone). const.sh went from ~3/5 to
+>   12/12 under load.
+> - **Phase 86 — the channel capture-and-keep footgun is now a compile error.**
+>   A `Sender` captured into a closure is owned by the closure's heap env, which
+>   never drops its captures — so the only way it is ever dropped (and the channel
+>   eventually closes) is being *moved out* of the closure. If every use is `&tx`
+>   (send-only, never moved into the worker or `chan_close`'d), the Sender leaks
+>   and a `recv`-until-`None` consumer hangs. The typechecker now rejects exactly
+>   that — a captured `Sender` with no by-value (move) use — with an actionable
+>   message. The rule is *precise* (a bare by-value use is the only way a non-Copy
+>   Sender leaves an env, so sound code always has one): zero false positives
+>   across the whole v13 channel suite; pinned in `smoke_test_v13_review.sh`.
+>
+> Planned: JIT-vs-AOT differential / property testing; the macOS `codegen_test`
+> flake (needs a macOS-arm64 runner to diagnose).
 
 ## Roadmap v13 — shipped
 
