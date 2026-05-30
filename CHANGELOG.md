@@ -27,6 +27,13 @@ effect system's last soundness floor.
 - Const-generic parameters parse and bind: `const N: i64` (mixed with type
   params), a symbolic `[i64; N]` array length, and the `let (a, b): (T, T) = ..`
   tuple-pattern annotation (Phase 57 — declaration shell only).
+- Monomorphization over a const VALUE (Phase 58): `Mat<3>` and `Mat<5>` become
+  DISTINCT LLVM struct types (`{ [3 x i64] }` vs `{ [5 x i64] }`, mangled
+  `Mat__c3` / `Mat__c5`), incl. nested `Matrix<R, C>` over `[[i64; C]; R]`. The
+  const value substitutes the symbolic array length; a struct literal infers
+  each `const N` from the dimensions of the field that carries it
+  (`Mat { data: [1,2,3] }` is a `Mat<3>`). Type/const argument slot mismatches,
+  a const-value dimension mismatch, and negative const args are compile errors.
 
 ## [0.9.0] — Roadmap v9 "data in motion" (Phases 51–56)
 

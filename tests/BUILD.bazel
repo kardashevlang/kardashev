@@ -528,6 +528,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 58 (v10): monomorphize over a const VALUE — `Mat<3>` and `Mat<5>` become
+# distinct LLVM struct types (`[3 x i64]` vs `[5 x i64]`), incl. a 2-D
+# `Matrix<R, C>`; dimension / slot mismatches are compile errors. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase58",
+    srcs = ["smoke_test_phase58.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

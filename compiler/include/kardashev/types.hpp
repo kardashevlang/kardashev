@@ -135,6 +135,15 @@ struct Type {
     // this name with the supplied const value to recover a concrete arrayLen.
     std::string arrayLenParam;
 
+    // Phase 58 (v10): a const-generic VALUE used as a type argument — the `3`
+    // in `Mat<3>`. Modeled as a `TypeKind::Int` node with `isConstValue` set
+    // and the integer in `constValue`. It only ever appears inside a
+    // struct/enum/fn instance's `typeArgs`; it is mangled by value (so
+    // `Mat<3>` and `Mat<5>` become DISTINCT monomorphized LLVM types) and is
+    // the source value that substitutes a symbolic array length `[T; N]`.
+    bool isConstValue = false;
+    long long constValue = 0;
+
     // Tuple (Phase 22): the ordered element types of `(A, B, ...)`.
     std::vector<TypePtr> tupleElems;
 };
@@ -170,6 +179,33 @@ TypePtr makeFuture(TypePtr result);
 // `(A, B, ...)` value type. Both are copied by value like structs.
 TypePtr makeArray(TypePtr elem, std::size_t len);
 TypePtr makeTuple(std::vector<TypePtr> elems);
+
+// Phase 58 (v10): a const-generic VALUE argument (the `3` in `Mat<3>`). A
+// fresh `TypeKind::Int` node carrying `isConstValue` + the integer; lives
+// only inside a struct/enum/fn instance's `typeArgs`.
+TypePtr makeConstValue(long long v);
+
+// Phase 58 (v10): materialize a generic struct/enum instance from a schema.
+// Splits `typeArgs` (in declaration order) into a type-Var substitution and a
+// const-param name->length map (using `constParamNames`, one entry per
+// genericVars position, empty = type param), substitutes the type Vars in the
+// fields, resolves symbolic array lengths `[T; N]` to the bound const values,
+// and stamps `typeArgs` onto a guaranteed-fresh node. `isStruct` selects the
+// struct vs enum freshness clone. Shared by the typechecker and codegen so
+// both agree on the monomorphic identity (`Mat<3>` -> distinct from `Mat<5>`).
+TypePtr instantiateGeneric(const TypePtr& schemaType,
+                           const std::vector<TypePtr>& genericVars,
+                           const std::vector<std::string>& constParamNames,
+                           std::vector<TypePtr> typeArgs, bool isStruct);
+
+// Phase 58 (v10): deep-copy `t`, replacing every symbolic array length
+// `[T; N]` (an `Array` whose `arrayLenParam` is a key in `lengths`) with its
+// concrete length. Used by monomorphization to materialize a generic type's
+// fields once a `const N` parameter is bound to a value. Recursive types are
+// cycle-guarded; nodes with no symbolic length are returned unchanged.
+TypePtr substituteConstLengths(
+    const TypePtr& t,
+    const std::unordered_map<std::string, std::size_t>& lengths);
 
 // Follow the union-find link chain to the representative. Performs
 // path compression as a side effect.

@@ -2421,11 +2421,18 @@ private:
         Schema s;
         s.type = isStruct ? makeStruct(name, {}) : makeEnum(name, {});
         s.genericVars.reserve(genericParams.size());
+        s.constParamNames.reserve(genericParams.size());
         // One fresh Var per declared generic param, positionally; duplicate
         // names get one Var each (and we report the duplicate below) so the
         // genericVars vector stays index-aligned with `genericParams`.
+        // Phase 58: const params occupy a position too (their Var is never
+        // referenced by field types — `[T; N]` carries N as `arrayLenParam`,
+        // a name); `constParamNames[i]` records the name so monomorphization
+        // can bind the supplied value.
         for (std::size_t i = 0; i < genericParams.size(); ++i) {
             s.genericVars.push_back(makeFreshVar());
+            s.constParamNames.push_back(
+                genericParams[i].isConst ? genericParams[i].name : std::string{});
         }
         // Reject obvious shadowing here (i64/bool plus already-bound types
         // are reported once for each generic param in the order they
@@ -2501,30 +2508,140 @@ private:
     // already in hand (e.g. from a `Vec<i64>` annotation). Returns a fresh
     // Type whose typeArgs are exactly the caller-supplied types and whose
     // fields/payloads have been substituted accordingly.
+    // Phase 58: structurally match a generic struct's symbolic field type
+    // against a concrete value type to discover each symbolic array length
+    // `[T; N]`. Records name->length in `out` (first binding wins; a
+    // conflicting second use surfaces as a field-unify mismatch). Recurses
+    // through arrays, refs/boxes, tuples and nested struct/enum fields — so
+    // `data: [[i64; C]; R]` recovers both R (outer) and C (inner).
+    void solveConstLengths(const TypePtr& schemaTy, const TypePtr& valTy,
+                           std::unordered_map<std::string, std::size_t>& out) {
+        TypePtr s = resolve(schemaTy);
+        TypePtr v = resolve(valTy);
+        if (s->kind != v->kind) return;
+        switch (s->kind) {
+        case TypeKind::Array:
+            if (!s->arrayLenParam.empty())
+                out.emplace(s->arrayLenParam, v->arrayLen);
+            solveConstLengths(s->arrayElem, v->arrayElem, out);
+            break;
+        case TypeKind::Ref:
+        case TypeKind::Box:
+            solveConstLengths(s->refInner, v->refInner, out);
+            break;
+        case TypeKind::Tuple:
+            for (std::size_t i = 0; i < s->tupleElems.size() &&
+                                    i < v->tupleElems.size(); ++i)
+                solveConstLengths(s->tupleElems[i], v->tupleElems[i], out);
+            break;
+        case TypeKind::Struct:
+            for (std::size_t i = 0; i < s->structFields.size() &&
+                                    i < v->structFields.size(); ++i)
+                solveConstLengths(s->structFields[i].second,
+                                  v->structFields[i].second, out);
+            for (std::size_t i = 0; i < s->typeArgs.size() &&
+                                    i < v->typeArgs.size(); ++i)
+                solveConstLengths(s->typeArgs[i], v->typeArgs[i], out);
+            break;
+        case TypeKind::Enum:
+            for (std::size_t i = 0; i < s->typeArgs.size() &&
+                                    i < v->typeArgs.size(); ++i)
+                solveConstLengths(s->typeArgs[i], v->typeArgs[i], out);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // Shared field validation for a struct literal once its instance type is
+    // fixed: unify each supplied field against the declared type, and report
+    // unknown / duplicate / missing fields. `pre` (Phase 58) carries the
+    // already-checked value types (so the const-generic path doesn't re-check
+    // exprs); pass nullptr to check exprs inline.
+    void validateStructLitFields(
+        const ast::StructLitExpr& sl, const TypePtr& instType,
+        const std::unordered_map<std::string, TypePtr>* pre) {
+        std::unordered_map<std::string, TypePtr> declared;
+        declared.reserve(instType->structFields.size());
+        for (const auto& df : instType->structFields)
+            declared.emplace(df.first, df.second);
+        std::unordered_set<std::string> initialised;
+        for (const auto& f : sl.fields) {
+            TypePtr valT;
+            if (pre) {
+                auto pit = pre->find(f.first);
+                valT = pit != pre->end() ? pit->second : checkExpr(*f.second);
+            } else {
+                valT = checkExpr(*f.second);
+            }
+            auto declIt = declared.find(f.first);
+            if (declIt == declared.end()) {
+                error("unknown field '" + f.first + "' for struct '" +
+                          sl.structName + "'",
+                      f.second->line, f.second->column);
+                continue;
+            }
+            if (!initialised.insert(f.first).second) {
+                error("duplicate field '" + f.first + "' in struct literal",
+                      f.second->line, f.second->column);
+                continue;
+            }
+            if (!unify(valT, declIt->second)) {
+                error("field '" + f.first + "' of struct '" + sl.structName +
+                          "' has type " + typeToString(declIt->second) +
+                          ", got " + typeToString(valT),
+                      f.second->line, f.second->column);
+            }
+        }
+        for (const auto& df : instType->structFields) {
+            if (!initialised.count(df.first)) {
+                error("missing field '" + df.first + "' in struct '" +
+                          sl.structName + "' literal",
+                      sl.line, sl.column);
+            }
+        }
+    }
+
+    // Phase 58: a const-param slot must be given a const value (`Mat<3>`),
+    // and a type-param slot a type (`Vec<i64>`). Report a mix-up at the use
+    // site. `kind` is "struct" / "enum" for the message.
+    void checkConstSlots(const std::string& kind, const std::string& name,
+                         const std::vector<std::string>& constParamNames,
+                         const std::vector<TypePtr>& argTypes,
+                         std::size_t line, std::size_t col) {
+        for (std::size_t i = 0;
+             i < argTypes.size() && i < constParamNames.size(); ++i) {
+            bool isConstSlot = !constParamNames[i].empty();
+            bool gotConst = resolve(argTypes[i])->isConstValue;
+            if (isConstSlot && !gotConst) {
+                error(kind + " '" + name + "' parameter '" +
+                          constParamNames[i] +
+                          "' is a `const` parameter; expected a const value, "
+                          "got type '" + typeToString(argTypes[i]) + "'",
+                      line, col);
+            } else if (!isConstSlot && gotConst) {
+                error(kind + " '" + name + "' expects a type at argument " +
+                          std::to_string(i + 1) + ", got const value '" +
+                          typeToString(argTypes[i]) + "'",
+                      line, col);
+            }
+        }
+    }
+
     TypePtr instantiateStructWithArgs(const StructSchema& schema,
                                        std::vector<TypePtr> typeArgs) {
         if (schema.genericVars.empty()) return schema.type;
-        std::unordered_map<int, TypePtr> subst;
-        for (std::size_t i = 0;
-             i < schema.genericVars.size() && i < typeArgs.size(); ++i) {
-            subst[schema.genericVars[i]->varId] = typeArgs[i];
-        }
-        TypePtr inst = instantiate(schema.type, subst);
-        inst->typeArgs = std::move(typeArgs);
-        return inst;
+        return instantiateGeneric(schema.type, schema.genericVars,
+                                  schema.constParamNames, std::move(typeArgs),
+                                  /*isStruct=*/true);
     }
 
     TypePtr instantiateEnumWithArgs(const EnumSchema& schema,
                                      std::vector<TypePtr> typeArgs) {
         if (schema.genericVars.empty()) return schema.type;
-        std::unordered_map<int, TypePtr> subst;
-        for (std::size_t i = 0;
-             i < schema.genericVars.size() && i < typeArgs.size(); ++i) {
-            subst[schema.genericVars[i]->varId] = typeArgs[i];
-        }
-        TypePtr inst = instantiate(schema.type, subst);
-        inst->typeArgs = std::move(typeArgs);
-        return inst;
+        return instantiateGeneric(schema.type, schema.genericVars,
+                                  schema.constParamNames, std::move(typeArgs),
+                                  /*isStruct=*/false);
     }
 
     // Phase 21b: resolve an associated-type projection `Base::Assoc`.
@@ -2751,6 +2868,18 @@ private:
     }
 
     TypePtr resolveTypeRef(const ast::TypeRef& tr) {
+        // Phase 58 (v10): a const-generic VALUE in type-arg position — the `3`
+        // in `Mat<3>`. It is not a type; produce a const-value Type that the
+        // struct/enum/fn instantiation matches against its `const N` slot.
+        if (tr.isConstArg) {
+            if (tr.constArgValue < 0) {
+                error("const generic argument must be non-negative, got " +
+                          std::to_string(tr.constArgValue),
+                      tr.line, tr.column);
+                return makeConstValue(0);
+            }
+            return makeConstValue(tr.constArgValue);
+        }
         // Phase 13b: slice type `&[T]`. The `&` is part of the slice spelling
         // (a slice is its own fat-pointer borrow), so handle it before the
         // generic ref-peel below, which would otherwise wrap it in an extra
@@ -2990,6 +3119,8 @@ private:
                       tr.line, tr.column);
                 return sit->second.type;
             }
+            checkConstSlots("struct", tr.name, sit->second.constParamNames,
+                            argTypes, tr.line, tr.column);
             return instantiateStructWithArgs(sit->second, std::move(argTypes));
         }
         if (auto eit = enumSchemas_.find(tr.name);
@@ -3002,6 +3133,8 @@ private:
                       tr.line, tr.column);
                 return eit->second.type;
             }
+            checkConstSlots("enum", tr.name, eit->second.constParamNames,
+                            argTypes, tr.line, tr.column);
             return instantiateEnumWithArgs(eit->second, std::move(argTypes));
         }
         error("unknown type: " + tr.name, tr.line, tr.column);
@@ -4375,44 +4508,69 @@ private:
             for (const auto& f : sl.fields) checkExpr(*f.second);
             return freshInstantiateStruct(it->second);
         }
+        const StructSchema& schema = it->second;
+        bool hasConst = false;
+        for (const auto& nm : schema.constParamNames)
+            if (!nm.empty()) { hasConst = true; break; }
+
+        // Phase 58: a const-generic struct literal infers each `const N`
+        // parameter from the dimensions of the field that carries `[..; N]`
+        // (so `Mat { data: [1,2,3] }` is a `Mat<3>` with no annotation), then
+        // checks the fields against the now-concrete instance. Type params
+        // (mixed `Foo<T, const N>`) keep the fresh-Var-and-unify treatment.
+        if (hasConst) {
+            std::unordered_map<std::string, TypePtr> valTypes;
+            valTypes.reserve(sl.fields.size());
+            for (const auto& f : sl.fields)
+                valTypes[f.first] = checkExpr(*f.second);
+
+            std::unordered_map<std::string, std::size_t> constSubst;
+            for (const auto& [fname, fty] : schema.type->structFields) {
+                auto vit = valTypes.find(fname);
+                if (vit != valTypes.end())
+                    solveConstLengths(fty, vit->second, constSubst);
+            }
+            for (const auto& nm : schema.constParamNames) {
+                if (!nm.empty() && !constSubst.count(nm)) {
+                    error("cannot infer const parameter '" + nm +
+                              "' of struct '" + sl.structName +
+                              "' from the literal; a field typed `[..; " + nm +
+                              "]` must be given a fixed-size array value",
+                          sl.line, sl.column);
+                    constSubst.emplace(nm, 0); // continue with a placeholder
+                }
+            }
+
+            std::unordered_map<int, TypePtr> subst;
+            std::vector<TypePtr> args;
+            args.reserve(schema.genericVars.size());
+            for (std::size_t i = 0; i < schema.genericVars.size(); ++i) {
+                bool isConstSlot = i < schema.constParamNames.size() &&
+                                   !schema.constParamNames[i].empty();
+                if (isConstSlot) {
+                    args.push_back(makeConstValue(static_cast<long long>(
+                        constSubst[schema.constParamNames[i]])));
+                } else {
+                    TypePtr fr = makeFreshVar();
+                    subst[schema.genericVars[i]->varId] = fr;
+                    args.push_back(fr);
+                }
+            }
+            TypePtr inst = instantiate(schema.type, subst);
+            if (!constSubst.empty())
+                inst = substituteConstLengths(inst, constSubst);
+            if (inst.get() == schema.type.get())
+                inst = makeStruct(inst->structName, inst->structFields);
+            inst->typeArgs = std::move(args);
+            validateStructLitFields(sl, inst, &valTypes);
+            return inst;
+        }
+
         // For generic structs, build a fresh instantiation so field-type
         // unification with each literal expr leaves the instance's
         // typeArgs in a fully-solved state.
-        TypePtr instType = freshInstantiateStruct(it->second);
-        std::unordered_map<std::string, TypePtr> declared;
-        declared.reserve(instType->structFields.size());
-        for (const auto& df : instType->structFields) {
-            declared.emplace(df.first, df.second);
-        }
-        std::unordered_set<std::string> initialised;
-        for (const auto& f : sl.fields) {
-            TypePtr valT = checkExpr(*f.second);
-            auto declIt = declared.find(f.first);
-            if (declIt == declared.end()) {
-                error("unknown field '" + f.first + "' for struct '" +
-                          sl.structName + "'",
-                      f.second->line, f.second->column);
-                continue;
-            }
-            if (!initialised.insert(f.first).second) {
-                error("duplicate field '" + f.first + "' in struct literal",
-                      f.second->line, f.second->column);
-                continue;
-            }
-            if (!unify(valT, declIt->second)) {
-                error("field '" + f.first + "' of struct '" + sl.structName +
-                          "' has type " + typeToString(declIt->second) +
-                          ", got " + typeToString(valT),
-                      f.second->line, f.second->column);
-            }
-        }
-        for (const auto& df : instType->structFields) {
-            if (!initialised.count(df.first)) {
-                error("missing field '" + df.first + "' in struct '" +
-                          sl.structName + "' literal",
-                      sl.line, sl.column);
-            }
-        }
+        TypePtr instType = freshInstantiateStruct(schema);
+        validateStructLitFields(sl, instType, nullptr);
         return instType;
     }
 

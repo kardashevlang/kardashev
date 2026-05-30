@@ -669,7 +669,27 @@ private:
         if (accept(TokenKind::Lt)) {
             if (!check(TokenKind::Gt)) {
                 while (true) {
-                    tr.typeArgs.push_back(parseTypeRef());
+                    // Phase 58 (v10): a const-generic VALUE argument — the `3`
+                    // in `Mat<3>`. An integer literal in type-arg position is
+                    // unambiguously a const value (a type never starts with a
+                    // digit). It binds to the type's `const N` parameter.
+                    if (check(TokenKind::Integer)) {
+                        Token n = consume();
+                        ast::TypeRef carg;
+                        carg.isConstArg = true;
+                        carg.line = n.line;
+                        carg.column = n.column;
+                        try {
+                            carg.constArgValue = std::stoll(n.lexeme);
+                        } catch (const std::exception&) {
+                            errorHere("const generic argument out of range: " +
+                                      n.lexeme);
+                            carg.constArgValue = 0;
+                        }
+                        tr.typeArgs.push_back(std::move(carg));
+                    } else {
+                        tr.typeArgs.push_back(parseTypeRef());
+                    }
                     if (!accept(TokenKind::Comma)) break;
                     if (check(TokenKind::Gt)) break; // trailing comma
                 }

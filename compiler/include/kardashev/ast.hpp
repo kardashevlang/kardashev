@@ -497,6 +497,15 @@ struct TypeRef {
     // `typeArgs` are unused. A 1-tuple isn't a type (`(T)` == `T`).
     bool isTuple = false;
     std::vector<TypeRef> tupleElems;
+    // Phase 58 (v10): a const-generic VALUE supplied in type-argument
+    // position — the `3` in `Mat<3>`. When `isConstArg` is true this TypeRef
+    // is NOT a type but an integer literal bound to a `const N` parameter;
+    // `name` / `typeArgs` are unused and the value lives in `constArgValue`.
+    // The typechecker turns it into a const-value Type (TypeKind::Int with
+    // `isConstValue`) that drives a distinct monomorphized instance and
+    // substitutes symbolic array lengths `[T; N]`.
+    bool isConstArg = false;
+    long long constArgValue = 0;
     // Function-type fields (valid only when isFn == true).
     bool isFn = false;
     std::vector<TypeRef> fnParams;

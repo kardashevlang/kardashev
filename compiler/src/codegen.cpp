@@ -5684,6 +5684,11 @@ private:
     // the current generic-instance substitution and recursively
     // instantiating generic struct / enum references like `Pair<X, Y>`.
     TypePtr astTypeRefToConcrete(const ast::TypeRef& tr) {
+        // Phase 58 (v10): a const-generic VALUE argument — the `3` in
+        // `Mat<3>`. Mirror typecheck's resolveTypeRef so codegen agrees on the
+        // monomorphic identity (otherwise the signature would mangle to
+        // `Mat__i64` with a `[0 x i64]` field and clash with `Mat__c3`).
+        if (tr.isConstArg) return makeConstValue(tr.constArgValue);
         // Phase 13b: slice type `&[T]`. Handle before the ref-peel (the `&`
         // is part of the slice spelling, not an extra Ref wrapper).
         if (tr.isSlice) {
@@ -5768,28 +5773,19 @@ private:
             sit != tc_.structs.end()) {
             const StructSchema& schema = sit->second;
             if (schema.genericVars.empty()) return schema.type;
-            std::unordered_map<int, TypePtr> subst;
-            for (std::size_t i = 0;
-                 i < schema.genericVars.size() && i < resolvedArgs.size();
-                 ++i) {
-                subst[schema.genericVars[i]->varId] = resolvedArgs[i];
-            }
-            TypePtr inst = instantiate(schema.type, subst);
-            inst->typeArgs = std::move(resolvedArgs);
-            return inst;
+            // Phase 58: const-aware materialization (shared with typecheck) so
+            // `Mat<3>` resolves to `Mat__c3` with a concrete `[3 x i64]` field.
+            return instantiateGeneric(schema.type, schema.genericVars,
+                                      schema.constParamNames,
+                                      std::move(resolvedArgs), /*isStruct=*/true);
         }
         if (auto eit = tc_.enums.find(tr.name); eit != tc_.enums.end()) {
             const EnumSchema& schema = eit->second;
             if (schema.genericVars.empty()) return schema.type;
-            std::unordered_map<int, TypePtr> subst;
-            for (std::size_t i = 0;
-                 i < schema.genericVars.size() && i < resolvedArgs.size();
-                 ++i) {
-                subst[schema.genericVars[i]->varId] = resolvedArgs[i];
-            }
-            TypePtr inst = instantiate(schema.type, subst);
-            inst->typeArgs = std::move(resolvedArgs);
-            return inst;
+            return instantiateGeneric(schema.type, schema.genericVars,
+                                      schema.constParamNames,
+                                      std::move(resolvedArgs),
+                                      /*isStruct=*/false);
         }
         errors_.push_back("codegen: unknown type " + tr.name);
         return makeInt();
@@ -5988,7 +5984,13 @@ private:
             return out;
         };
         switch (r->kind) {
-        case TypeKind::Int:    return "i64";
+        case TypeKind::Int:
+            // Phase 58: a const-generic value argument mangles by VALUE, so
+            // `Mat<3>` (`Mat__c3`) and `Mat<5>` (`Mat__c5`) become distinct
+            // monomorphized instances / LLVM types. Lexer literals are
+            // non-negative, so `c<value>` is always a valid symbol fragment.
+            return r->isConstValue ? ("c" + std::to_string(r->constValue))
+                                   : "i64";
         case TypeKind::Float:  return "f64";
         case TypeKind::Bool:   return "bool";
         case TypeKind::Unit:   return "unit";

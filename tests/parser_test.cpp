@@ -1835,6 +1835,25 @@ void test_const_generic_param_non_i64_rejected() {
     assert(!r.ok()); // must be i64
 }
 
+// Phase 58 (v10): a const-generic VALUE argument `Mat<3>` parses as a const-arg
+// TypeRef (not a type) and round-trips through ast_print.
+void test_const_generic_arg() {
+    auto r = parse("fn f(m: Mat<3>) -> i64 { 0 }");
+    assert(r.ok());
+    const auto& pty = r.program.functions[0].params[0].type;
+    assert(pty.name == "Mat");
+    assert(pty.typeArgs.size() == 1);
+    assert(pty.typeArgs[0].isConstArg);
+    assert(pty.typeArgs[0].constArgValue == 3);
+    // mixed: a type then a const value, `Matrix<i64, 4>`.
+    auto r2 = parse("fn g(m: Matrix<i64, 4>) -> i64 { 0 }");
+    assert(r2.ok());
+    const auto& g = r2.program.functions[0].params[0].type;
+    assert(g.typeArgs.size() == 2);
+    assert(!g.typeArgs[0].isConstArg && g.typeArgs[0].name == "i64");
+    assert(g.typeArgs[1].isConstArg && g.typeArgs[1].constArgValue == 4);
+}
+
 void test_tuple_let_annotation() {
     auto r = parse("fn f() -> i64 { let (a, b): (i64, i64) = (3, 4); a }");
     assert(r.ok());
@@ -2003,7 +2022,8 @@ int main() {
     // Phase 57 (v10): const-generic params + tuple-let annotation.
     test_const_generic_param();
     test_const_generic_param_non_i64_rejected();
+    test_const_generic_arg(); // Phase 58
     test_tuple_let_annotation();
-    std::cout << "All parser tests passed (131 cases)\n";
+    std::cout << "All parser tests passed (133 cases)\n";
     return 0;
 }

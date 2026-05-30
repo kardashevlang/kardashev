@@ -119,6 +119,12 @@ struct FnSchema {
 struct StructSchema {
     TypePtr type;
     std::vector<TypePtr> genericVars;
+    // Phase 58 (v10): one entry per genericVars[i] — the const-param NAME if
+    // that position is a `const N` parameter, else empty (an ordinary type
+    // param). Lets monomorphization map the supplied const value to its name
+    // and substitute symbolic array lengths `[T; N]` in the materialized
+    // fields.
+    std::vector<std::string> constParamNames;
 };
 
 // Schema of a generic enum. Same shape as StructSchema, but `type`'s
@@ -126,6 +132,8 @@ struct StructSchema {
 struct EnumSchema {
     TypePtr type;
     std::vector<TypePtr> genericVars;
+    // Phase 58 (v10): parallels StructSchema::constParamNames.
+    std::vector<std::string> constParamNames;
 };
 
 // Per-call-site result of resolving a `receiver.method(args)` expression

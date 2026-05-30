@@ -77,6 +77,9 @@ private:
 
     std::string typeToString(const TypeRef& t) {
         std::string s;
+        // Phase 58 (v10): a const-generic value argument (`Mat<3>`) renders as
+        // its integer value, not as a type.
+        if (t.isConstArg) return std::to_string(t.constArgValue);
         if (t.isFn) {
             // `fn(P0, P1) -> R ! { e }`
             s += "fn(";
