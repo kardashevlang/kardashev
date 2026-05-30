@@ -52,13 +52,13 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-All fifteen roadmaps (Phases 0–93, **v1–v15**) have shipped and are merged to
+All sixteen roadmaps (Phases 0–97, **v1–v16**) have shipped and are merged to
 `main` — 6 unit suites plus the full smoke-test aggregate pass **JIT and AOT**
-on a cleared clean build. v15 ("self-hosting") delivers a self-hosted compiler
-**front-end** (lexer + parser + scope checker) written *in* kardashev — the
-north-star arc toward a bootstrap (`examples/selfhost/`, capstone `front.kd`
-running lex → parse → check → reprint end-to-end). v14 ("hardening") made the
-toolchain trustworthy
+on a cleared clean build. v15–v16 ("self-hosting") build a self-hosted compiler
+front *in* kardashev — the north-star arc toward a bootstrap: v15 the front-end
+(lexer + parser + signature checker), v16 the BODY (expression/statement parser,
+scope checker, and a function-body interpreter; `examples/selfhost/`, capstone
+`interp.kd`). v14 ("hardening") made the toolchain trustworthy
 across platforms: **macOS CI went green for the first time** (portable leak
 gates), the smoke harness is SIGPIPE-robust, the channel capture-and-keep footgun
 is now a precise compile error, and a JIT-vs-AOT differential sweep over the 9
@@ -409,12 +409,13 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
 
-## Roadmap v16 — in progress
+## Roadmap v16 — shipped
 
-> **Status: in progress** on `feat/roadmap-v16`. "Self-hosting, continued" — grow
-> the self-hosted front from signatures (v15) toward a full compiler: expressions,
-> statements, a fuller AST, a real type checker, and eventually codegen. Each
-> phase a real, tested kardashev program in `examples/selfhost/`.
+> **Status: shipped.** "Self-hosting, continued" — grow the self-hosted front from
+> v15's signatures to the BODY grammar: expressions, statements, scope checking,
+> and a function-body interpreter, all written in kardashev in
+> `examples/selfhost/`. All of v16 (Phases 94–97) is implemented and green — 6
+> unit suites + the smoke aggregate, JIT **and** AOT.
 >
 > - **Phase 94 — an expression parser + evaluator (done).** `examples/selfhost/expr.kd`
 >   is a recursive-descent parser for the body grammar: it builds an `enum Expr`
