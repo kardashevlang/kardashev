@@ -432,9 +432,16 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   the first reconstructs (via `str_substring` over its span) to `"fn"` and the
 >   arrow token to `"->"`, proving the spans are correct, with a deterministic
 >   stream fingerprint — JIT + AOT.
+> - **Phase 90 — a parser for kardashev syntax (done).** `examples/selfhost/parser.kd`
+>   parses a function SIGNATURE — `fn add(a: i64, b: i64) -> i64` — into a
+>   structured AST (`FnSig { name, params: Vec<Param>, ret }`), recovering each
+>   name/type by `str_substring` over the token spans: name `"add"`, 2 params
+>   (first `a: i64`), return `i64`, witness 1211, JIT + AOT. (Arithmetic-expression
+>   parsing was already shown by `examples/calc`; this parses the *language's own*
+>   grammar — the genuine step toward a self-hosted front-end.)
 >
-> Planned: a recursive-descent parser for a kardashev subset → an `enum` AST; an
-> AST printer + a scope/type checker for the subset; a capstone that
+> Planned: parse more of the grammar (items, statements, expressions) → a fuller
+> `enum` AST; an AST printer + a scope/type checker; a capstone that
 > self-lexes/parses a real kardashev source file — closing language gaps (richer
 > errors, string ops) as self-hosting surfaces them.
 

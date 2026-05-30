@@ -809,6 +809,17 @@ sh_test(
     ],
 )
 
+# v15 Phase 90 (self-hosting): a parser for kardashev syntax — a function
+# signature parsed into a structured FnSig AST (names/types via str_substring).
+sh_test(
+    name = "smoke_test_phase90",
+    srcs = ["smoke_test_phase90.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:parser.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
