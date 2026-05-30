@@ -813,7 +813,6 @@ private:
     llvm::Function* pthreadMutexDestroyFn_ = nullptr;
     llvm::Function* pthreadCondDestroyFn_ = nullptr;
     llvm::StructType* chanBlkTy_ = nullptr;
-    llvm::StructType* chanNodeTy_ = nullptr;
     bool channelRuntimeDeclared_ = false;
 
     // --- Phase 23: real panic + unwinding (setjmp/longjmp + cleanup stack) ---
