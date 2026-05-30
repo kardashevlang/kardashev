@@ -71,6 +71,15 @@ witness).
   MPSC channel (W producers → 1 consumer) and folding — deterministic, JIT and
   AOT. Plus `chan_try_recv` — a non-blocking receive (`Some` if ready, `None`
   if momentarily empty, never blocks on the condvar) for poll loops.
+- **Capstone** `examples/parstats` (Phase 80) — "concurrency, applied": a
+  parallel map-reduce, safe by construction. The series
+  `data(i) = (i*7+13) mod 1000` over `0..10000` is split across 4 worker
+  threads; each reduces its chunk to a `Stats` struct and SENDS it on a shared
+  MPSC channel; the main thread gathers + merges into the global stats —
+  deterministic and checked against the sequential answer (sum 4995000,
+  count 10000, min 0, max 999). Exercises the whole v13 line at once:
+  `thread_spawn` (`share`), channels moving a `Stats` struct across threads,
+  the `Send` rule, fork-join, and the v12 `i64_min`/`i64_max` helpers.
 
 ## [0.12.0] — Roadmap v12 "real stdlib" (Phases 69–74)
 

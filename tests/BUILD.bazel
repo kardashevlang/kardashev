@@ -745,6 +745,17 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 80 (v13) CAPSTONE: a parallel map-reduce in kardashev. Builds the real
+# examples/parstats/main.kd.
+sh_test(
+    name = "smoke_test_phase80",
+    srcs = ["smoke_test_phase80.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/parstats:main.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
