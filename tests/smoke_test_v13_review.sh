@@ -170,11 +170,17 @@ fn main() -> i64 ! { io, alloc, share } {
 }
 EOF
 "$KARDC" --no-cache -o "$TMP/mpc" "$TMP/mpc.kd" >/dev/null 2>&1
+# A hang-guard if a `timeout`-like command exists (GNU `timeout` on Linux,
+# `gtimeout` from coreutils on macOS); otherwise run directly — a sound build
+# never hangs, and macOS lacks `timeout` by default.
+TIMEOUT=""
+if command -v timeout >/dev/null 2>&1; then TIMEOUT="timeout 10";
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT="gtimeout 10"; fi
 bad=0
 for r in $(seq 1 60); do
-    set +e; got=$(timeout 10 "$TMP/mpc" 2>/dev/null); rc=$?; set -e
-    if [[ "$rc" -eq 124 ]]; then echo "FAIL [mpc]: hang on run $r"; exit 1; fi
-    # exit code is total & 255 = 600 & 255 = 88; also assert no loss via the value
+    set +e; $TIMEOUT "$TMP/mpc" >/dev/null 2>&1; rc=$?; set -e
+    if [[ -n "$TIMEOUT" && "$rc" -eq 124 ]]; then echo "FAIL [mpc]: hang on run $r"; exit 1; fi
+    # exit code is total & 255 = 600 & 255 = 88; a lost item changes the total.
     [[ "$rc" -eq $((600 & 255)) ]] || { bad=$((bad+1)); echo "run $r: exit $rc (expected $((600 & 255)))"; }
 done
 [[ "$bad" -eq 0 ]] || { echo "FAIL [mpc]: $bad/60 runs lost data (multi-producer close)"; exit 1; }
