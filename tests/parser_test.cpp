@@ -1871,6 +1871,21 @@ void test_tuple_let_annotation() {
     assert(let2 && let2->tupleNames.size() == 2 && !let2->annotation);
 }
 
+// Regression (v10): a nested tuple field access `n.0.0` must NOT lex `0.0` as
+// a float (which swallowed the second `.0`). `1.0` elsewhere stays a float.
+void test_nested_tuple_field_access() {
+    auto r = parse("fn f() -> i64 { let n = ((1, 2), 3); n.0.0 + n.0.1 + n.1 }");
+    assert(r.ok());
+    // a float literal in value position is unaffected.
+    auto r2 = parse("fn f() -> f64 { let x = 3.14; x }");
+    assert(r2.ok());
+    const auto* let = dynamic_cast<const ast::LetStmt*>(
+        r2.program.functions[0].body->stmts[0].get());
+    assert(let != nullptr);
+    const auto* lit = dynamic_cast<const ast::FloatLitExpr*>(let->value.get());
+    assert(lit != nullptr); // 3.14 is still a float
+}
+
 } // namespace
 
 int main() {
@@ -2024,6 +2039,7 @@ int main() {
     test_const_generic_param_non_i64_rejected();
     test_const_generic_arg(); // Phase 58
     test_tuple_let_annotation();
-    std::cout << "All parser tests passed (133 cases)\n";
+    test_nested_tuple_field_access(); // v10 regression
+    std::cout << "All parser tests passed (134 cases)\n";
     return 0;
 }

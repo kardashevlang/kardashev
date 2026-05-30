@@ -583,15 +583,23 @@ private:
             // double-free). Reject it; reading (`*x` of a Copy type), borrowing
             // (`&*r`), or cloning is fine, and a method receiver deref goes
             // through consumeReceiver (a read), not here.
-            if (un->op == ast::UnaryOp::Deref && !derefMoveCheckSuppressed_) {
-                TypePtr opTy = typeOf(*un->operand);
-                TypePtr resTy = typeOf(e);
-                if (opTy && resolve(opTy)->kind == TypeKind::Ref && resTy &&
-                    !isCopyType(resTy)) {
-                    error("cannot move a non-Copy value out of a borrowed "
-                          "reference (`*r` where `r: &T`); clone it instead",
-                          e.line, e.column);
+            if (un->op == ast::UnaryOp::Deref) {
+                if (!derefMoveCheckSuppressed_) {
+                    TypePtr opTy = typeOf(*un->operand);
+                    TypePtr resTy = typeOf(e);
+                    if (opTy && resolve(opTy)->kind == TypeKind::Ref && resTy &&
+                        !isCopyType(resTy)) {
+                        error("cannot move a non-Copy value out of a borrowed "
+                              "reference (`*r` where `r: &T`); clone it instead",
+                              e.line, e.column);
+                    }
                 }
+                // The operand of a deref is a PLACE projection — read to reach
+                // the pointee, not moved. So a NESTED deref `**t` (`*t` being
+                // re-deref'd) doesn't move the intermediate out of its borrow;
+                // consume it as a place to suppress a spurious inner move check.
+                return std::max(lastInSubtree,
+                                consumePlace(*un->operand, expectExpire));
             }
             return std::max(lastInSubtree,
                             consume(*un->operand, expectExpire));

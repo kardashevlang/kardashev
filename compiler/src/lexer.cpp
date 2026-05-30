@@ -127,6 +127,13 @@ std::vector<Token> lex(std::string_view source) {
         // [+-]? DIGIT+)?` with at least one of the fractional/exponent parts.
         if (std::isdigit(static_cast<unsigned char>(c))) {
             std::size_t start = i;
+            // A number that immediately follows a `.` is a TUPLE FIELD INDEX
+            // (`t.0`, and crucially `n.0.0` = `(n.0).0`), never a float — so we
+            // must NOT let `0.0` lex as a single float and swallow the second
+            // access. `1.0` elsewhere (after `=`, `(`, `,`, an operator, ...)
+            // still lexes as a float.
+            bool afterDot =
+                !tokens.empty() && tokens.back().kind == TokenKind::Dot;
             while (i < source.size() &&
                    std::isdigit(static_cast<unsigned char>(source[i]))) {
                 ++i;
@@ -134,7 +141,7 @@ std::vector<Token> lex(std::string_view source) {
             }
             bool isFloat = false;
             // Fractional part: `.` then a digit (NOT `..`, the range op).
-            if (i + 1 < source.size() && source[i] == '.' &&
+            if (!afterDot && i + 1 < source.size() && source[i] == '.' &&
                 std::isdigit(static_cast<unsigned char>(source[i + 1]))) {
                 isFloat = true;
                 ++i;
@@ -145,8 +152,10 @@ std::vector<Token> lex(std::string_view source) {
                     ++col;
                 }
             }
-            // Exponent: `e`/`E` [+-]? DIGIT+.
-            if (i < source.size() && (source[i] == 'e' || source[i] == 'E')) {
+            // Exponent: `e`/`E` [+-]? DIGIT+. Also suppressed after a `.` (a
+            // tuple index is a plain integer).
+            if (!afterDot && i < source.size() &&
+                (source[i] == 'e' || source[i] == 'E')) {
                 std::size_t j = i + 1;
                 if (j < source.size() && (source[j] == '+' || source[j] == '-'))
                     ++j;
