@@ -61,7 +61,7 @@ check multibound "$TMP/multibound.kd" 21 21
 # --- 2. Hash + Eq traits over i64 and String, used through generic bounds. ---
 cat > "$TMP/hasheq.kd" <<'EOF'
 fn h<T: Hash>(x: &T) -> i64 { x.hash() }
-fn same<T: Eq>(a: &T, b: &T) -> bool { a.eq(b) }
+fn same<T: Eq>(a: &T, b: &T) -> bool ! { alloc } { a.eq(b) }
 fn main() -> i64 ! { alloc } {
     let a = 5; let b = 5; let c = 6;
     let s1 = "key"; let s2 = "key"; let s3 = "no";

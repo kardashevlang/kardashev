@@ -2461,6 +2461,122 @@ void test_const_array_len_calls_nonconst_fn_errors() {
                       "const_array_len_calls_nonconst_fn_errors");
 }
 
+// Phase 58/59 (v10): const-generic monomorphization.
+void test_const_generic_struct_ok() {
+    expectOk("struct Mat<const N: i64> { data: [i64; N] }\n"
+             "fn main() -> i64 { let a: Mat<3> = Mat { data: [1, 2, 3] };"
+             " a.data[0] + a.data[2] }",
+             "const_generic_struct_ok");
+}
+
+void test_const_generic_type_in_const_slot_errors() {
+    expectErrContains("struct Mat<const N: i64> { data: [i64; N] }\n"
+                      "fn main() -> i64 { let a: Mat<i64> = Mat { data: [1] };"
+                      " 0 }",
+                      "const", "const_generic_type_in_const_slot_errors");
+}
+
+void test_const_generic_const_in_type_slot_errors() {
+    expectErrContains("struct W<T> { x: T }\n"
+                      "fn main() -> i64 { let a: W<3> = W { x: 1 }; 0 }",
+                      "expects a type",
+                      "const_generic_const_in_type_slot_errors");
+}
+
+void test_const_generic_fn_ok() {
+    expectOk("fn dot<const N: i64>(a: [i64; N], b: [i64; N]) -> i64 {\n"
+             "    let mut acc = 0; let mut i = 0;\n"
+             "    while i < N { acc = acc + a[i] * b[i]; i = i + 1; }\n"
+             "    acc\n"
+             "}\n"
+             "fn main() -> i64 {\n"
+             "    let x: [i64; 3] = [1, 2, 3];\n"
+             "    let y: [i64; 3] = [4, 5, 6];\n"
+             "    dot(x, y)\n"
+             "}",
+             "const_generic_fn_ok");
+}
+
+void test_const_generic_dim_mismatch_errors() {
+    expectErrContains("fn dot<const N: i64>(a: [i64; N], b: [i64; N]) -> i64 {"
+                      " a[0] }\n"
+                      "fn main() -> i64 {\n"
+                      "    let x: [i64; 3] = [1, 2, 3];\n"
+                      "    let y: [i64; 2] = [4, 5];\n"
+                      "    dot(x, y)\n"
+                      "}",
+                      "dimension mismatch",
+                      "const_generic_dim_mismatch_errors");
+}
+
+void test_const_generic_fn_uninferable_errors() {
+    expectErrContains("fn mk<const N: i64>() -> i64 { N }\n"
+                      "fn main() -> i64 { mk() }",
+                      "cannot infer const generic parameter",
+                      "const_generic_fn_uninferable_errors");
+}
+
+// Phase 60 (v10): the effect-subset rule. (These run WITHOUT the prelude, so
+// they avoid builtins like `print`; the subset check fires on the DECLARED
+// effect row alone.)
+void test_effect_subset_super_effecting_errors() {
+    expectErrContains("trait Greet { fn greet(&self) -> i64; }\n"
+                      "struct S {}\n"
+                      "impl Greet for S { fn greet(&self) -> i64 ! { io } { 0 } }\n"
+                      "fn main() -> i64 { 0 }",
+                      "does not permit",
+                      "effect_subset_super_effecting_errors");
+}
+
+void test_effect_subset_fewer_ok() {
+    // An impl with FEWER effects than the trait permits is allowed.
+    expectOk("trait Greet { fn greet(&self) -> i64 ! { io }; }\n"
+             "struct S {}\n"
+             "impl Greet for S { fn greet(&self) -> i64 { 7 } }\n"
+             "fn main() -> i64 { let s = S {}; s.greet() }",
+             "effect_subset_fewer_ok");
+}
+
+void test_effect_subset_drop_io_trait_ok() {
+    // Review fix: Drop is NOT exempt — it follows the subset rule like any
+    // trait (so a `dyn Drop` dispatch can't launder effects). An io Drop impl
+    // under an io-DECLARING Drop trait is fine...
+    expectOk("trait Drop { fn drop(&mut self) ! { io }; }\n"
+             "struct Noisy { id: i64 }\n"
+             "impl Drop for Noisy { fn drop(&mut self) ! { io } { } }\n"
+             "fn main() -> i64 { 0 }",
+             "effect_subset_drop_io_trait_ok");
+}
+
+void test_effect_subset_drop_super_effecting_errors() {
+    // ...but an io Drop impl under a PURE Drop trait is rejected (the old
+    // name-based exemption laundered io through dyn Drop dispatch).
+    expectErrContains("trait Drop { fn drop(&mut self); }\n"
+                      "struct Noisy { id: i64 }\n"
+                      "impl Drop for Noisy { fn drop(&mut self) ! { io } { } }\n"
+                      "fn main() -> i64 { 0 }",
+                      "does not permit",
+                      "effect_subset_drop_super_effecting_errors");
+}
+
+// Phase 61 (v10): non-Copy arrays + RingBuffer<T, const CAP> + closure infer.
+void test_noncopy_array_ok() {
+    // A non-Copy element type in a fixed-size array is now allowed (used WITHOUT
+    // the prelude here, so a tiny user `String`-like struct stands in for it).
+    expectOk("struct S { x: i64 }\n"
+             "fn main() -> i64 { let a: [S; 2] = [S { x: 1 }, S { x: 2 }];"
+             " a[0].x + a[1].x }",
+             "noncopy_array_ok");
+}
+
+void test_const_generic_mixed_struct_ok() {
+    // A struct generic over BOTH a type param and a const param.
+    expectOk("struct Buf<T, const N: i64> { data: [T; N] }\n"
+             "fn main() -> i64 { let b: Buf<i64, 2> = Buf { data: [3, 4] };"
+             " b.data[0] + b.data[1] }",
+             "const_generic_mixed_struct_ok");
+}
+
 } // namespace
 
 int main() {
@@ -2726,6 +2842,21 @@ int main() {
     test_const_fn_in_const_context_ok();
     test_const_fn_at_runtime_ok();
     test_const_generic_array_len_ok();
+    // Phase 58/59 (v10): const-generic monomorphization + dimension unification.
+    test_const_generic_struct_ok();
+    test_const_generic_type_in_const_slot_errors();
+    test_const_generic_const_in_type_slot_errors();
+    test_const_generic_fn_ok();
+    test_const_generic_dim_mismatch_errors();
+    test_const_generic_fn_uninferable_errors();
+    // Phase 60 (v10): effect-subset rule.
+    test_effect_subset_super_effecting_errors();
+    test_effect_subset_fewer_ok();
+    test_effect_subset_drop_io_trait_ok();
+    test_effect_subset_drop_super_effecting_errors();
+    // Phase 61 (v10): non-Copy arrays + mixed type+const generics.
+    test_noncopy_array_ok();
+    test_const_generic_mixed_struct_ok();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -2734,6 +2865,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (248 cases)\n";
+    std::cout << "All typecheck tests passed (260 cases)\n";
     return 0;
 }

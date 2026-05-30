@@ -94,7 +94,7 @@ aot_expect() {
 # their Drop impls in REVERSE order (g2 then g1 -> 2,1) before catch returns 99.
 # ============================================================================
 cat > "$TMP/drop_on_panic.kd" <<'EOF'
-trait Drop { fn drop(&mut self); }
+trait Drop { fn drop(&mut self) ! { io }; }
 struct Guard { id: i64 }
 impl Drop for Guard { fn drop(&mut self) ! { io } { print(self.id); } }
 fn boom() -> i64 ! { io, panic } {
@@ -196,7 +196,7 @@ echo "PASS [c]: uncaught panic prints 'fatal boom' to stderr and exits 101 (no s
 # shape dropped on the PANIC path is dropped exactly once. We count the Drop
 # impl's print lines for each id.
 cat > "$TMP/exactly_once.kd" <<'EOF'
-trait Drop { fn drop(&mut self); }
+trait Drop { fn drop(&mut self) ! { io }; }
 struct Cnt { id: i64 }
 impl Drop for Cnt { fn drop(&mut self) ! { io } { print(self.id); } }
 fn normal() -> i64 ! { io } {
@@ -229,7 +229,7 @@ echo "PASS [d.1]: normal-path value (11) and panic-path value (22) each dropped 
 # panics. The callee drops it once (on unwind); the caller's frame must NOT drop
 # it again (its drop flag was cleared by the move). Total drops of id 33 == 1.
 cat > "$TMP/move_then_panic.kd" <<'EOF'
-trait Drop { fn drop(&mut self); }
+trait Drop { fn drop(&mut self) ! { io }; }
 struct Cnt { id: i64 }
 impl Drop for Cnt { fn drop(&mut self) ! { io } { print(self.id); } }
 fn sink(t: Cnt) -> i64 ! { io, panic } { panic("after move"); 0 }

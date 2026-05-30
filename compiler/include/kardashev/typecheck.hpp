@@ -70,6 +70,13 @@ struct EffectSet {
 struct FnSchema {
     TypePtr signature;
     std::vector<TypePtr> genericVars;
+    // Phase 59 (v10): one entry per genericVars[i] — the const-param NAME if
+    // that position is a `const N` parameter, else empty (an ordinary type
+    // param). A const param's Var is a placeholder (never referenced by the
+    // signature, which carries N as an array `arrayLenParam`); this lets the
+    // call site infer N from the argument array lengths and codegen
+    // monomorphize per value (`dot<3>` vs `dot<5>`).
+    std::vector<std::string> constParamNames;
     // One entry per genericVars[i]: the trait-name bound (empty for an
     // unbounded param). This is the PRIMARY bound; Phase 28 carries any
     // additional bounds (`T: A + B`) in `genericExtraBounds` below.
@@ -119,6 +126,12 @@ struct FnSchema {
 struct StructSchema {
     TypePtr type;
     std::vector<TypePtr> genericVars;
+    // Phase 58 (v10): one entry per genericVars[i] — the const-param NAME if
+    // that position is a `const N` parameter, else empty (an ordinary type
+    // param). Lets monomorphization map the supplied const value to its name
+    // and substitute symbolic array lengths `[T; N]` in the materialized
+    // fields.
+    std::vector<std::string> constParamNames;
 };
 
 // Schema of a generic enum. Same shape as StructSchema, but `type`'s
@@ -126,6 +139,8 @@ struct StructSchema {
 struct EnumSchema {
     TypePtr type;
     std::vector<TypePtr> genericVars;
+    // Phase 58 (v10): parallels StructSchema::constParamNames.
+    std::vector<std::string> constParamNames;
 };
 
 // Per-call-site result of resolving a `receiver.method(args)` expression

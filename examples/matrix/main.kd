@@ -1,0 +1,53 @@
+// Phase 62 (v10) capstone: a fixed-size linear-algebra library in kardashev.
+// Dimensions are const-generic type params, checked at COMPILE time — a shape
+// mismatch is a type error, not a runtime crash.
+
+struct Matrix<const R: i64, const C: i64> { data: [[i64; C]; R] }
+
+// transpose: Matrix<R, C> -> Matrix<C, R> (dims swap in the type).
+fn transpose<const R: i64, const C: i64>(m: &Matrix<R, C>) -> Matrix<C, R> {
+    let mut out: [[i64; R]; C] = [[0; R]; C];
+    let mut i = 0;
+    while i < R {
+        let mut j = 0;
+        while j < C {
+            out[j][i] = m.data[i][j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    Matrix { data: out }
+}
+
+// dimension-checked matmul: Matrix<R, K> x Matrix<K, C> -> Matrix<R, C>.
+// The shared inner dimension K is one const param used in BOTH arg types, so a
+// mismatch is a compile-time "dimension mismatch".
+fn matmul<const R: i64, const K: i64, const C: i64>(
+    a: &Matrix<R, K>, b: &Matrix<K, C>) -> Matrix<R, C> {
+    let mut out: [[i64; C]; R] = [[0; C]; R];
+    let mut i = 0;
+    while i < R {
+        let mut j = 0;
+        while j < C {
+            let mut acc = 0;
+            let mut k = 0;
+            while k < K {
+                acc = acc + a.data[i][k] * b.data[k][j];
+                k = k + 1;
+            }
+            out[i][j] = acc;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    Matrix { data: out }
+}
+
+fn main() -> i64 {
+    let a: Matrix<2, 3> = Matrix { data: [[1, 2, 3], [4, 5, 6]] };
+    let at = transpose(&a);                 // Matrix<3, 2>; at.data[2][1] = 6
+    let b: Matrix<3, 2> = Matrix { data: [[1, 0], [0, 1], [1, 1]] };
+    let c = matmul(&a, &b);                  // Matrix<2, 2>
+    // c[0][0] = 1*1+2*0+3*1 = 4 ; c[1][1] = 4*0+5*1+6*1 = 11
+    at.data[2][1] + c.data[0][0] + c.data[1][1]   // 6 + 4 + 11 = 21
+}

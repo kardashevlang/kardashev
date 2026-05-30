@@ -351,6 +351,7 @@ private:
         // they just walk children for position accounting.
         if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
             for (const auto& el : al->elements) prePass(*el);
+            if (al->repeatCount) prePass(*al->repeatCount); // Phase 62
             return;
         }
         if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
@@ -556,7 +557,12 @@ private:
         int lastInSubtree = startPos;
 
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
-            consumeIdent(*id);
+            // Phase 61: in a PLACE context (consuming the base/root of a
+            // `&place`, an index `a[i]`, or a deref projection), the ident is
+            // READ, not moved — so borrowing/indexing into a non-Copy local
+            // (`&a[i]`) doesn't move the whole local out.
+            if (derefMoveCheckSuppressed_) checkRead(*id);
+            else consumeIdent(*id);
             return startPos;
         }
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) {
@@ -583,15 +589,23 @@ private:
             // double-free). Reject it; reading (`*x` of a Copy type), borrowing
             // (`&*r`), or cloning is fine, and a method receiver deref goes
             // through consumeReceiver (a read), not here.
-            if (un->op == ast::UnaryOp::Deref && !derefMoveCheckSuppressed_) {
-                TypePtr opTy = typeOf(*un->operand);
-                TypePtr resTy = typeOf(e);
-                if (opTy && resolve(opTy)->kind == TypeKind::Ref && resTy &&
-                    !isCopyType(resTy)) {
-                    error("cannot move a non-Copy value out of a borrowed "
-                          "reference (`*r` where `r: &T`); clone it instead",
-                          e.line, e.column);
+            if (un->op == ast::UnaryOp::Deref) {
+                if (!derefMoveCheckSuppressed_) {
+                    TypePtr opTy = typeOf(*un->operand);
+                    TypePtr resTy = typeOf(e);
+                    if (opTy && resolve(opTy)->kind == TypeKind::Ref && resTy &&
+                        !isCopyType(resTy)) {
+                        error("cannot move a non-Copy value out of a borrowed "
+                              "reference (`*r` where `r: &T`); clone it instead",
+                              e.line, e.column);
+                    }
                 }
+                // The operand of a deref is a PLACE projection — read to reach
+                // the pointee, not moved. So a NESTED deref `**t` (`*t` being
+                // re-deref'd) doesn't move the intermediate out of its borrow;
+                // consume it as a place to suppress a spurious inner move check.
+                return std::max(lastInSubtree,
+                                consumePlace(*un->operand, expectExpire));
             }
             return std::max(lastInSubtree,
                             consume(*un->operand, expectExpire));
@@ -794,6 +808,9 @@ private:
             for (const auto& el : al->elements)
                 lastInSubtree =
                     std::max(lastInSubtree, consume(*el, expectExpire));
+            if (al->repeatCount) // Phase 62
+                lastInSubtree = std::max(
+                    lastInSubtree, consume(*al->repeatCount, expectExpire));
             return lastInSubtree;
         }
         if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
@@ -803,8 +820,22 @@ private:
             return lastInSubtree;
         }
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
-            lastInSubtree =
-                std::max(lastInSubtree, consume(*ix->object, expectExpire));
+            // Phase 61: indexing PROJECTS into the base array — the base is a
+            // place (read), not moved (so `&a[i]`, `a[i] = x`, and reading a
+            // Copy `a[i]` never move `a`). Moving a NON-COPY element OUT in
+            // value position (`let x = a[i];`) is a partial move we don't
+            // track; reject it — clone (`a[i].clone()`) or borrow (`&a[i]`).
+            if (!derefMoveCheckSuppressed_) {
+                TypePtr et = typeOf(e);
+                if (et && !isCopyType(et)) {
+                    error("cannot move a non-Copy value out of an array index "
+                          "(`a[i]`); clone it (`a[i].clone()`) or borrow it "
+                          "(`&a[i]`) instead",
+                          e.line, e.column);
+                }
+            }
+            lastInSubtree = std::max(
+                lastInSubtree, consumePlace(*ix->object, expectExpire));
             lastInSubtree =
                 std::max(lastInSubtree, consume(*ix->index, expectExpire));
             return lastInSubtree;
@@ -1030,7 +1061,12 @@ private:
                     if (Binding* tb = lookupBinding(tid->name))
                         tb->state = OwnState::Owned;
                 } else {
-                    p = std::max(p, consume(*as->target, /*expectExpire=*/-1));
+                    // Review fix (Phase 61): the LHS of `a[i] = x` / `t.0 = x`
+                    // is a WRITE place, not a move — consume it as a PLACE so
+                    // the non-Copy index move-out check doesn't fire on the
+                    // assignment target (mirrors how a FieldExpr write reads its
+                    // root). The old value is dropped in codegen's emitAssign.
+                    p = std::max(p, consumePlace(*as->target, /*expectExpire=*/-1));
                 }
                 retireExpiredLoans(p);
                 last = std::max(last, p);

@@ -77,6 +77,9 @@ private:
 
     std::string typeToString(const TypeRef& t) {
         std::string s;
+        // Phase 58 (v10): a const-generic value argument (`Mat<3>`) renders as
+        // its integer value, not as a type.
+        if (t.isConstArg) return std::to_string(t.constArgValue);
         if (t.isFn) {
             // `fn(P0, P1) -> R ! { e }`
             s += "fn(";
@@ -160,6 +163,11 @@ private:
         std::string s = "<";
         for (std::size_t i = 0; i < gps.size(); ++i) {
             if (i) s += ", ";
+            // Phase 57: a const-generic param prints as `const N: i64`.
+            if (gps[i].isConst) {
+                s += "const " + gps[i].name + ": i64";
+                continue;
+            }
             s += gps[i].name;
             if (!gps[i].bound.empty()) {
                 s += ": " + gps[i].bound;
@@ -405,6 +413,9 @@ private:
                     out_ += let->tupleNames[i];
                 }
                 out_ += ")";
+                // Phase 57: optional tuple-let annotation `: (T, ...)`.
+                if (let->annotation)
+                    out_ += ": " + typeToString(*let->annotation);
             } else {
                 out_ += let->name;
                 if (let->annotation)
@@ -748,9 +759,16 @@ private:
         // Phase 22: array literal `[a, b, c]`.
         if (auto* al = dynamic_cast<const ArrayLitExpr*>(&e)) {
             out_ += "[";
-            for (std::size_t i = 0; i < al->elements.size(); ++i) {
-                if (i) out_ += ", ";
-                printExpr(*al->elements[i], depth, 0);
+            // Phase 62: array-repeat `[value; count]`.
+            if (al->repeatCount && !al->elements.empty()) {
+                printExpr(*al->elements[0], depth, 0);
+                out_ += "; ";
+                printExpr(*al->repeatCount, depth, 0);
+            } else {
+                for (std::size_t i = 0; i < al->elements.size(); ++i) {
+                    if (i) out_ += ", ";
+                    printExpr(*al->elements[i], depth, 0);
+                }
             }
             out_ += "]";
             return;

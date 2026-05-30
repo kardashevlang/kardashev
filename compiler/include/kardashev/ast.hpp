@@ -281,6 +281,12 @@ struct SliceExpr : Expr {
 // array value built via insertvalue (value type, copied like a struct).
 struct ArrayLitExpr : Expr {
     std::vector<ExprPtr> elements;
+    // Phase 62 (v10): array-REPEAT `[value; N]` — `elements[0]` is the repeated
+    // value and `repeatCount` is the length expression (a literal, a const
+    // item, or a const-generic param `N`). null for an ordinary `[a, b, c]`
+    // element list. Lets a const-generic fn build a `[T; N]` result of
+    // symbolic size (e.g. a transposed/zeroed matrix).
+    ExprPtr repeatCount;
 };
 
 // Phase 22: indexing `arr[i]` — reads element `i` (an i64 index) of a
@@ -497,6 +503,15 @@ struct TypeRef {
     // `typeArgs` are unused. A 1-tuple isn't a type (`(T)` == `T`).
     bool isTuple = false;
     std::vector<TypeRef> tupleElems;
+    // Phase 58 (v10): a const-generic VALUE supplied in type-argument
+    // position — the `3` in `Mat<3>`. When `isConstArg` is true this TypeRef
+    // is NOT a type but an integer literal bound to a `const N` parameter;
+    // `name` / `typeArgs` are unused and the value lives in `constArgValue`.
+    // The typechecker turns it into a const-value Type (TypeKind::Int with
+    // `isConstValue`) that drives a distinct monomorphized instance and
+    // substitutes symbolic array lengths `[T; N]`.
+    bool isConstArg = false;
+    long long constArgValue = 0;
     // Function-type fields (valid only when isFn == true).
     bool isFn = false;
     std::vector<TypeRef> fnParams;
@@ -599,6 +614,12 @@ struct TypeParam {
     // so non-generic bounds are byte-for-byte unchanged). Applies to the
     // primary `bound` only; `extraBounds` are non-parameterized.
     std::vector<TypeRef> boundTypeArgs;
+    // Phase 57 (v10): a CONST-generic parameter `const N: i64` (vs a type
+    // parameter). When true, `name` is the const param's name; it carries no
+    // trait bounds, and its type is always i64 (the only const-generic kind).
+    // A `[T; N]` length or a use-site `Foo<3>` arg binds it to a compile-time
+    // integer; Phase 58 monomorphizes over that value.
+    bool isConst = false;
     std::size_t line = 1;
     std::size_t column = 1;
 };

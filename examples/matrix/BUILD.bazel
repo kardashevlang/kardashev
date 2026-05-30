@@ -1,0 +1,21 @@
+load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary")
+
+# Make the capstone source readable by //tests:smoke_test_phase62, which builds
+# the real file (rather than an inlined copy) so the test doubles as a build
+# check of the shipped example.
+exports_files(
+    ["main.kd"],
+    visibility = ["//visibility:public"],
+)
+
+# Phase 62 (v10) CAPSTONE — a fixed-size linear-algebra library in kardashev.
+# Matrix<const R, const C> carries its shape in the TYPE; `transpose()` returns
+# Matrix<C, R> (dims swap) and a dimension-checked `matmul` over the shared
+# inner dim K rejects shape mismatches at COMPILE time. Exercises the whole v10
+# const-generic line (monomorphize-over-a-value, dimension unification, symbolic
+# const params, array-repeat). AOT-compiled via //compiler:kardc and exercised
+# by //tests:smoke_test_phase62.
+kardashev_binary(
+    name = "matrix",
+    src = "main.kd",
+)

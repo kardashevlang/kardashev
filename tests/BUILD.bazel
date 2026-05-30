@@ -520,6 +520,73 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 57 (v10): const-generic params parse/bind + symbolic `[T; N]` lengths +
+# tuple-let annotation (declaration shell only). JIT + AOT.
+sh_test(
+    name = "smoke_test_phase57",
+    srcs = ["smoke_test_phase57.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 58 (v10): monomorphize over a const VALUE — `Mat<3>` and `Mat<5>` become
+# distinct LLVM struct types (`[3 x i64]` vs `[5 x i64]`), incl. a 2-D
+# `Matrix<R, C>`; dimension / slot mismatches are compile errors. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase58",
+    srcs = ["smoke_test_phase58.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 59 (v10): const-generic FUNCTIONS — `dot<const N>` infers N from the
+# argument array lengths, uses it as a value, monomorphizes per size, and a
+# dimension mismatch is a compile error. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase59",
+    srcs = ["smoke_test_phase59.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 60 (v10): the effect-subset rule — a trait impl method's effects must be
+# a SUBSET of the trait method's, so dyn/generic effect attribution is sound by
+# construction. Drop (static drop glue) is exempt. JIT.
+sh_test(
+    name = "smoke_test_phase60",
+    srcs = ["smoke_test_phase60.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 61 (v10): RingBuffer<T, const CAP> — mixed type+const generics, Drop +
+# deep clone over a NON-Copy element, symbolic const params through a generic
+# impl; plus closure-param inference (`vec_map(v, |x| ..)`). JIT + AOT.
+sh_test(
+    name = "smoke_test_phase61",
+    srcs = ["smoke_test_phase61.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 62 (v10) CAPSTONE: a fixed-size linear-algebra library —
+# Matrix<const R, const C>, transpose() -> Matrix<C,R>, dimension-checked
+# matmul; a shape mismatch is a COMPILE error. Builds examples/matrix/main.kd.
+sh_test(
+    name = "smoke_test_phase62",
+    srcs = ["smoke_test_phase62.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/matrix:main.kd",
+    ],
+)
+
+# v10 adversarial-review regression guard: pins the 5 blockers + majors a
+# 6-dimension multi-agent review found (and that the green smoke suite missed)
+# — nested const-generic field mangling, const enums, bare const-generic clone,
+# dyn-Drop effect laundering, bounded-generic effect attribution, symbolic
+# dimension forwarding, and the mangling collision. The v10 soundness floor.
+sh_test(
+    name = "smoke_test_v10_review",
+    srcs = ["smoke_test_v10_review.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

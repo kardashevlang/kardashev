@@ -18,15 +18,84 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
-## [Unreleased] — Roadmap v10 (Phases 57–62, in progress)
+## [0.10.0] — Roadmap v10 "sized and sound at compile time" (Phases 57–62)
 
 Theme: **sized and sound at compile time** — const-generic type params + the
-effect system's last soundness floor.
+effect system's last soundness floor. A pre-merge adversarial multi-agent review
+hardened 5 blockers + 5 majors the green smoke suite had missed (see Fixed).
 
 ### Added
 - Const-generic parameters parse and bind: `const N: i64` (mixed with type
   params), a symbolic `[i64; N]` array length, and the `let (a, b): (T, T) = ..`
   tuple-pattern annotation (Phase 57 — declaration shell only).
+- Monomorphization over a const VALUE (Phase 58): `Mat<3>` and `Mat<5>` become
+  DISTINCT LLVM struct types (`{ [3 x i64] }` vs `{ [5 x i64] }`, mangled
+  `Mat__c3` / `Mat__c5`), incl. nested `Matrix<R, C>` over `[[i64; C]; R]`. The
+  const value substitutes the symbolic array length; a struct literal infers
+  each `const N` from the dimensions of the field that carries it
+  (`Mat { data: [1,2,3] }` is a `Mat<3>`). Type/const argument slot mismatches,
+  a const-value dimension mismatch, and negative const args are compile errors.
+- Const-generic FUNCTIONS + compile-time dimension unification (Phase 59):
+  `fn dot<const N>(a: [i64; N], b: [i64; N]) -> i64` infers N from the argument
+  array lengths, lets `N` be used as a value in the body, and monomorphizes per
+  size (`@dot__c3` over `[3 x i64]` vs `@dot__c2`). A dimension MISMATCH
+  (`dot([i64;3], [i64;2])`) and a const param that appears in no argument array
+  type are compile errors.
+
+- `RingBuffer<T, const CAP>` (Phase 61): a struct generic over BOTH a type and
+  a const param, with element-wise Drop and deep clone over a NON-Copy element.
+  Fixed-size arrays `[T; N]` now allow non-Copy elements (String/struct/Vec/Box)
+  — clone element-wise, drop element-wise; moving a non-Copy element out by
+  index (`let x = a[i]`) is a compile error (clone or borrow instead). Symbolic
+  const params flow through generic impls (`impl<T, const CAP> Clone for
+  RingBuffer<T, CAP>`) and `derive(Clone)`. Plus closure-param INFERENCE:
+  `vec_map(v, |x| *x * 2)` infers `x`'s type from the callee's fn-typed
+  parameter — no `|x: &i64|` annotation needed.
+- Array-repeat `[value; N]` (Phase 62) — `N` a literal, const item, or a
+  const-generic param (a symbolic length).
+- **Capstone** `examples/matrix` (Phase 62) — a fixed-size linear-algebra
+  library: `Matrix<const R, const C>` carries its shape in the TYPE,
+  `transpose() -> Matrix<C, R>` swaps the dims, and a dimension-checked
+  `matmul(Matrix<R, K>, Matrix<K, C>) -> Matrix<R, C>` rejects a shape mismatch
+  at COMPILE time (the shared inner dim `K` can't be two values). Integrates the
+  whole v10 line: monomorphize-over-a-value, dimension unification, symbolic
+  const params, non-Copy arrays, and array-repeat.
+
+### Fixed
+- A pre-merge adversarial multi-agent review (6 dimensions) hardened **5
+  blockers + 5 majors** the green smoke suite had missed — every one with a
+  verified repro — now pinned by `tests/smoke_test_v10_review.sh`:
+  - a const param not threaded into a NESTED struct/enum field's type-args
+    (`Inner<N>` field of `Outer<N>` mangled `Inner__c0` → LLVM-verifier failure);
+  - a bare `b.clone()` on a const-generic struct leaving the const arg symbolic
+    (mangled `c0`) → result type confusion;
+  - `Drop` is no longer EXEMPT from the effect-subset rule — a `dyn Drop`
+    dispatch could launder io/alloc through a pure-declared `Drop` trait;
+  - a BOUNDED-generic method call (`<T: Trait>` + `t.method()`) attributed ZERO
+    effects (vs the trait's declared effects) — the subset rule's actual floor;
+  - forwarding a SYMBOLIC array length alongside a concrete one was accepted
+    ill-typed (LLVM miscompile) and legitimate symbolic forwarding was wrongly
+    rejected;
+  - const-generic ENUM variant payloads (`[i64; N]`) were wrongly rejected;
+  - a monomorphization name colliding with a user identifier (`g__i64`) silently
+    resolved to the user fn — now a clear compile error;
+  - assigning to a non-Copy array element `a[i] = x` was wrongly rejected;
+  - array-repeat `[v; N]` ignored a local shadowing a const param;
+  - a method-level const param leaked an internal mangled name — now a clear
+    "declare it on the impl block" diagnostic.
+
+### Changed
+- The **effect-subset rule** (Phase 60), the effect system's last soundness
+  floor: a trait impl method's effects must be a SUBSET of the trait method's
+  declared effects, so a `dyn Trait` / `<T: Trait>` dispatch (which attributes
+  the TRAIT's effects) can never under-count what an impl actually does. A
+  super-effecting impl is a compile error. `Drop` is exempt (static drop glue,
+  never dyn-dispatched). To make the prelude honest, `Eq::eq`,
+  `Iterator::next`, `Display::to_string` and `Default::default` now declare
+  `! { alloc }` (their container/heap impls allocate); a concrete `for` loop
+  still attributes its concrete `next`'s effects, so pure (Range) loops stay
+  pure, and `derive(Eq)` annotates `! { alloc }` only when a field's `eq`
+  actually allocates (a map-/Vec-/generic-free struct's derived `eq` is pure).
 
 ## [0.9.0] — Roadmap v9 "data in motion" (Phases 51–56)
 

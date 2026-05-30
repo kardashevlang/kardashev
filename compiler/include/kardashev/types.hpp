@@ -129,6 +129,26 @@ struct Type {
     // an LLVM `[arrayLen x <arrayElem>]`.
     TypePtr arrayElem;
     std::size_t arrayLen = 0;
+    // Phase 57 (v10): a SYMBOLIC array length `[T; N]` where N is a
+    // const-generic parameter in scope (empty = concrete `arrayLen`). The
+    // length isn't known until the type is instantiated; Phase 58 substitutes
+    // this name with the supplied const value to recover a concrete arrayLen.
+    std::string arrayLenParam;
+
+    // Phase 58 (v10): a const-generic VALUE used as a type argument — the `3`
+    // in `Mat<3>`. Modeled as a `TypeKind::Int` node with `isConstValue` set
+    // and the integer in `constValue`. It only ever appears inside a
+    // struct/enum/fn instance's `typeArgs`; it is mangled by value (so
+    // `Mat<3>` and `Mat<5>` become DISTINCT monomorphized LLVM types) and is
+    // the source value that substitutes a symbolic array length `[T; N]`.
+    bool isConstValue = false;
+    long long constValue = 0;
+    // Phase 61 (v10): a SYMBOLIC const-generic argument — the `CAP` in `impl<..,
+    // const CAP> Clone for RingBuffer<T, CAP>` or the `C` in `transpose() ->
+    // Matrix<C, R>`. When non-empty this const value's `constValue` is unknown;
+    // it names a const param in scope and is resolved to a concrete value at
+    // the leaf monomorphization (codegen's currentConstParamSubst_).
+    std::string constValueName;
 
     // Tuple (Phase 22): the ordered element types of `(A, B, ...)`.
     std::vector<TypePtr> tupleElems;
@@ -165,6 +185,45 @@ TypePtr makeFuture(TypePtr result);
 // `(A, B, ...)` value type. Both are copied by value like structs.
 TypePtr makeArray(TypePtr elem, std::size_t len);
 TypePtr makeTuple(std::vector<TypePtr> elems);
+
+// Phase 58 (v10): a const-generic VALUE argument (the `3` in `Mat<3>`). A
+// fresh `TypeKind::Int` node carrying `isConstValue` + the integer; lives
+// only inside a struct/enum/fn instance's `typeArgs`.
+TypePtr makeConstValue(long long v);
+
+// Phase 61 (v10): a SYMBOLIC const-generic argument naming a const param in
+// scope (value resolved at the leaf monomorphization).
+TypePtr makeConstSymbol(std::string name);
+
+// Phase 58 (v10): materialize a generic struct/enum instance from a schema.
+// Splits `typeArgs` (in declaration order) into a type-Var substitution and a
+// const-param name->length map (using `constParamNames`, one entry per
+// genericVars position, empty = type param), substitutes the type Vars in the
+// fields, resolves symbolic array lengths `[T; N]` to the bound const values,
+// and stamps `typeArgs` onto a guaranteed-fresh node. `isStruct` selects the
+// struct vs enum freshness clone. Shared by the typechecker and codegen so
+// both agree on the monomorphic identity (`Mat<3>` -> distinct from `Mat<5>`).
+TypePtr instantiateGeneric(const TypePtr& schemaType,
+                           const std::vector<TypePtr>& genericVars,
+                           const std::vector<std::string>& constParamNames,
+                           std::vector<TypePtr> typeArgs, bool isStruct);
+
+// Phase 58 (v10): deep-copy `t`, replacing every symbolic array length
+// `[T; N]` (an `Array` whose `arrayLenParam` is a key in `lengths`) with its
+// concrete length. Used by monomorphization to materialize a generic type's
+// fields once a `const N` parameter is bound to a value. Recursive types are
+// cycle-guarded; nodes with no symbolic length are returned unchanged.
+TypePtr substituteConstLengths(
+    const TypePtr& t,
+    const std::unordered_map<std::string, std::size_t>& lengths);
+
+// Phase 61 (v10): deep-copy `t`, RENAMING every symbolic const (an array length
+// `[T; N]` or a const-value typeArg) whose name is a key in `renames` to the new
+// (still symbolic) name. Used when forwarding a const-generic array into another
+// const-generic fn: the callee's `[i64; N]` is rebound to the caller's `[i64; M]`.
+TypePtr renameConstLengths(
+    const TypePtr& t,
+    const std::unordered_map<std::string, std::string>& renames);
 
 // Follow the union-find link chain to the representative. Performs
 // path compression as a side effect.

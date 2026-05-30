@@ -98,7 +98,10 @@ public:
         programMayPanic_ = programContainsPanic(program);
         for (const auto& fn : program.functions) {
             fnAst_[fn.name] = &fn;
+            userSourceNames_.insert(fn.name); // review fix: collision guard
         }
+        for (const auto& s : program.structs) userSourceNames_.insert(s.name);
+        for (const auto& e : program.enums) userSourceNames_.insert(e.name);
         // Phase 24: record extern "C" declarations so emitCall can resolve
         // their C-ABI signature + per-arg coercions.
         for (const auto& ef : program.externFns) {
@@ -568,6 +571,20 @@ private:
     // Source-fn name -> AST node, populated once up front so the worklist
     // loop can look up bodies without re-walking the program.
     std::unordered_map<std::string, const ast::FnDecl*> fnAst_;
+    // Review fix: every user-written top-level fn/struct/enum NAME, so a
+    // monomorphization mangled name (`f__c3`, `Mat__c3`) that collides with a
+    // user identifier is a clear compile error instead of a silent miscompile
+    // (mangling shares LLVM's flat symbol namespace with user symbols).
+    std::unordered_set<std::string> userSourceNames_;
+    void checkManglingCollision(const std::string& base,
+                                const std::string& mangled) {
+        if (mangled != base && userSourceNames_.count(mangled))
+            errors_.push_back(
+                "codegen: monomorphization name `" + mangled +
+                "` (from generic `" + base +
+                "`) collides with a user-defined name; rename the user "
+                "fn/type (mangled instance names are reserved)");
+    }
 
     // Phase 24: extern "C" fn name -> its AST declaration. Populated up front
     // in run(); emitCall consults it to (a) recognize an extern callee and
@@ -604,6 +621,11 @@ private:
     // Same information keyed by schema-Var ID, so we can resolve TypePtrs
     // recovered from `tc_.callInstantiations` (which carry Vars, not names).
     std::unordered_map<int, TypePtr> currentSchemaVarSubst_;
+    // Phase 59 (v10): const-generic param NAME -> concrete value for the
+    // instance being emitted. Resolves a symbolic array length `[T; N]` in the
+    // signature / body to its size, and a bare `N` used as a value to a
+    // literal. Empty outside a const-generic instance.
+    std::unordered_map<std::string, std::size_t> currentConstParamSubst_;
 
     // Module-wide: struct name -> LLVM struct type.
     std::unordered_map<std::string, llvm::StructType*> structTypes_;
@@ -3750,8 +3772,25 @@ private:
             return builder_->CreateLoad(st, resultSlot, "clone.enum");
         }
         case TypeKind::Array: {
-            // Phase 22 arrays are Copy-element only — a value bit-copy clones.
-            return builder_->CreateLoad(mapKardashevType(r), src, "clone.arr");
+            // Phase 61: a non-owning (non-droppable) element bit-copies as a
+            // clone; an owning element (String/struct/Vec/Box) is deep-cloned
+            // element-wise, mirroring the Tuple case but with array GEP {0, i}.
+            if (!isDroppable(r->arrayElem)) {
+                return builder_->CreateLoad(mapKardashevType(r), src,
+                                            "clone.arr");
+            }
+            llvm::Type* arrTy = mapKardashevType(r);
+            auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
+            auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+            llvm::Value* agg = llvm::UndefValue::get(arrTy);
+            for (unsigned i = 0; i < r->arrayLen; ++i) {
+                auto* ep = builder_->CreateInBoundsGEP(
+                    arrTy, src, {zero, llvm::ConstantInt::get(i64Ty, i)},
+                    "arr.p");
+                llvm::Value* cv = emitCloneValue(ep, r->arrayElem);
+                agg = builder_->CreateInsertValue(agg, cv, {i}, "arr.clone");
+            }
+            return agg;
         }
         case TypeKind::Tuple: {
             llvm::Type* st = mapKardashevType(r);
@@ -5509,6 +5548,7 @@ private:
         std::string mangled = mangleStructInstance(base, r->typeArgs);
         auto it = structTypes_.find(mangled);
         if (it != structTypes_.end()) return it->second;
+        checkManglingCollision(base, mangled); // review fix
         auto* st = llvm::StructType::create(*ctx_, mangled);
         structTypes_[mangled] = st;
         std::vector<llvm::Type*> elems;
@@ -5526,6 +5566,7 @@ private:
         std::string mangled = mangleStructInstance(base, r->typeArgs);
         auto it = enumTypes_.find(mangled);
         if (it != enumTypes_.end()) return it->second;
+        checkManglingCollision(base, mangled); // review fix
         auto* st = llvm::StructType::create(*ctx_, mangled);
         enumTypes_[mangled] = st;
         buildEnumBody(mangled, r);
@@ -5684,6 +5725,21 @@ private:
     // the current generic-instance substitution and recursively
     // instantiating generic struct / enum references like `Pair<X, Y>`.
     TypePtr astTypeRefToConcrete(const ast::TypeRef& tr) {
+        // Phase 58 (v10): a const-generic VALUE argument — the `3` in
+        // `Mat<3>`. Mirror typecheck's resolveTypeRef so codegen agrees on the
+        // monomorphic identity (otherwise the signature would mangle to
+        // `Mat__i64` with a `[0 x i64]` field and clash with `Mat__c3`).
+        if (tr.isConstArg) return makeConstValue(tr.constArgValue);
+        // Phase 61: a bare const-generic param as a type argument (`RingBuffer
+        // <T, CAP>` / `Matrix<C, R>`) resolves to this instance's concrete
+        // value. (Outside an instance it stays a symbolic const placeholder.)
+        if (!tr.isRef && !tr.isDyn && !tr.isSlice && !tr.isArray &&
+            !tr.isTuple && !tr.isFn && tr.assocName.empty() &&
+            tr.typeArgs.empty()) {
+            if (auto it = currentConstParamSubst_.find(tr.name);
+                it != currentConstParamSubst_.end())
+                return makeConstValue(static_cast<long long>(it->second));
+        }
         // Phase 13b: slice type `&[T]`. Handle before the ref-peel (the `&`
         // is part of the slice spelling, not an extra Ref wrapper).
         if (tr.isSlice) {
@@ -5697,7 +5753,24 @@ private:
             TypePtr elem = tr.typeArgs.empty()
                                ? makeInt()
                                : astTypeRefToConcrete(tr.typeArgs[0]);
-            TypePtr arr = makeArray(elem, tr.arrayLen);
+            // Phase 59: a SYMBOLIC length `[T; N]` (N a const-generic param)
+            // resolves to the instance's bound value. tr.arrayLen is 0 for a
+            // symbolic length (typecheck never folds it); the name lives in the
+            // arrayLenExpr identifier.
+            std::size_t len = tr.arrayLen;
+            std::string param;
+            if (tr.arrayLenExpr) {
+                if (auto* id = dynamic_cast<const ast::IdentExpr*>(
+                        tr.arrayLenExpr.get())) {
+                    auto it = currentConstParamSubst_.find(id->name);
+                    if (it != currentConstParamSubst_.end())
+                        len = it->second;
+                    else
+                        param = id->name; // still symbolic (template, not used)
+                }
+            }
+            TypePtr arr = makeArray(elem, len);
+            arr->arrayLenParam = param;
             if (tr.isRef) return makeRef(arr, tr.refIsMut);
             return arr;
         }
@@ -5768,28 +5841,19 @@ private:
             sit != tc_.structs.end()) {
             const StructSchema& schema = sit->second;
             if (schema.genericVars.empty()) return schema.type;
-            std::unordered_map<int, TypePtr> subst;
-            for (std::size_t i = 0;
-                 i < schema.genericVars.size() && i < resolvedArgs.size();
-                 ++i) {
-                subst[schema.genericVars[i]->varId] = resolvedArgs[i];
-            }
-            TypePtr inst = instantiate(schema.type, subst);
-            inst->typeArgs = std::move(resolvedArgs);
-            return inst;
+            // Phase 58: const-aware materialization (shared with typecheck) so
+            // `Mat<3>` resolves to `Mat__c3` with a concrete `[3 x i64]` field.
+            return instantiateGeneric(schema.type, schema.genericVars,
+                                      schema.constParamNames,
+                                      std::move(resolvedArgs), /*isStruct=*/true);
         }
         if (auto eit = tc_.enums.find(tr.name); eit != tc_.enums.end()) {
             const EnumSchema& schema = eit->second;
             if (schema.genericVars.empty()) return schema.type;
-            std::unordered_map<int, TypePtr> subst;
-            for (std::size_t i = 0;
-                 i < schema.genericVars.size() && i < resolvedArgs.size();
-                 ++i) {
-                subst[schema.genericVars[i]->varId] = resolvedArgs[i];
-            }
-            TypePtr inst = instantiate(schema.type, subst);
-            inst->typeArgs = std::move(resolvedArgs);
-            return inst;
+            return instantiateGeneric(schema.type, schema.genericVars,
+                                      schema.constParamNames,
+                                      std::move(resolvedArgs),
+                                      /*isStruct=*/false);
         }
         errors_.push_back("codegen: unknown type " + tr.name);
         return makeInt();
@@ -5988,7 +6052,13 @@ private:
             return out;
         };
         switch (r->kind) {
-        case TypeKind::Int:    return "i64";
+        case TypeKind::Int:
+            // Phase 58: a const-generic value argument mangles by VALUE, so
+            // `Mat<3>` (`Mat__c3`) and `Mat<5>` (`Mat__c5`) become distinct
+            // monomorphized instances / LLVM types. Lexer literals are
+            // non-negative, so `c<value>` is always a valid symbol fragment.
+            return r->isConstValue ? ("c" + std::to_string(r->constValue))
+                                   : "i64";
         case TypeKind::Float:  return "f64";
         case TypeKind::Bool:   return "bool";
         case TypeKind::Unit:   return "unit";
@@ -6050,6 +6120,16 @@ private:
     }
 
     TypePtr resolveInInstanceImpl(const TypePtr& r) {
+        // Phase 61: a SYMBOLIC const value (a const param like `CAP` carried in
+        // a type's typeArgs) resolves to this instance's concrete value, so
+        // `RingBuffer<T, CAP>` in a method body mangles to the right `c<N>`.
+        if (r->kind == TypeKind::Int && r->isConstValue &&
+            !r->constValueName.empty()) {
+            auto it = currentConstParamSubst_.find(r->constValueName);
+            if (it != currentConstParamSubst_.end())
+                return makeConstValue(static_cast<long long>(it->second));
+            return r;
+        }
         switch (r->kind) {
         case TypeKind::Var: {
             if (auto it = currentSchemaVarSubst_.find(r->varId);
@@ -6106,8 +6186,23 @@ private:
         case TypeKind::Array: {
             // Phase 22: pin a generic element type to the instance's concrete.
             TypePtr elem = resolveInInstance(r->arrayElem);
-            if (elem.get() == r->arrayElem.get()) return r;
-            return makeArray(elem, r->arrayLen);
+            // Phase 59: resolve a symbolic length `[T; N]` to the instance's
+            // bound const value.
+            std::size_t len = r->arrayLen;
+            std::string param = r->arrayLenParam;
+            if (!param.empty()) {
+                auto it = currentConstParamSubst_.find(param);
+                if (it != currentConstParamSubst_.end()) {
+                    len = it->second;
+                    param.clear();
+                }
+            }
+            if (elem.get() == r->arrayElem.get() && len == r->arrayLen &&
+                param == r->arrayLenParam)
+                return r;
+            TypePtr a = makeArray(elem, len);
+            a->arrayLenParam = param;
+            return a;
         }
         case TypeKind::Tuple: {
             bool changed = false;
@@ -6176,10 +6271,26 @@ private:
         }
     }
 
+    // Phase 59: record `name -> value` for each const-value type-arg of an
+    // instance, reading the position->name map from the schema's
+    // constParamNames. `sch` may be null (no schema) — then no const params.
+    void recordConstParamSubst(const std::vector<std::string>& constParamNames,
+                               const std::vector<TypePtr>& typeArgs) {
+        for (std::size_t i = 0;
+             i < constParamNames.size() && i < typeArgs.size(); ++i) {
+            if (constParamNames[i].empty()) continue;
+            TypePtr a = resolve(typeArgs[i]);
+            if (a->kind == TypeKind::Int && a->isConstValue && a->constValue >= 0)
+                currentConstParamSubst_[constParamNames[i]] =
+                    static_cast<std::size_t>(a->constValue);
+        }
+    }
+
     void setInstanceContext(const ast::FnDecl& fn,
                             const std::vector<TypePtr>& typeArgs) {
         currentInstanceTypeMap_.clear();
         currentSchemaVarSubst_.clear();
+        currentConstParamSubst_.clear();
         // Phase 40: a method of a GENERIC impl. typeArgs are the impl's own
         // generic params (= the receiver's type args). Bind them by name +
         // their schema Vars (the schema, keyed by the mangled base, lists the
@@ -6204,6 +6315,18 @@ private:
                         currentSchemaVarSubst_[gv->varId] = typeArgs[i];
                 }
             }
+            // Phase 61: an impl's const params (e.g. `RingBuffer<T, const CAP>`)
+            // bind their concrete values for the method body's `[T; CAP]` types
+            // and `RingBuffer<T, CAP>` type-args.
+            for (std::size_t i = 0;
+                 i < impl->genericParams.size() && i < typeArgs.size(); ++i) {
+                if (!impl->genericParams[i].isConst) continue;
+                TypePtr a = resolve(typeArgs[i]);
+                if (a->kind == TypeKind::Int && a->isConstValue &&
+                    a->constValueName.empty() && a->constValue >= 0)
+                    currentConstParamSubst_[impl->genericParams[i].name] =
+                        static_cast<std::size_t>(a->constValue);
+            }
             // Self = the impl's forType with the params now bound.
             currentInstanceTypeMap_["Self"] = astTypeRefToConcrete(impl->forType);
             return;
@@ -6218,6 +6341,9 @@ private:
                     typeArgs[i];
             }
         }
+        // Phase 59: bind const-generic param values for `[T; N]` / `N`-as-value.
+        if (schemaIt != tc_.fnSchemas.end())
+            recordConstParamSubst(schemaIt->second.constParamNames, typeArgs);
     }
 
     void declareMonoFn(const ast::FnDecl& fn) {
@@ -6285,6 +6411,7 @@ private:
                                      const std::string& mangledName) {
         auto savedMap = currentInstanceTypeMap_;
         auto savedSubst = currentSchemaVarSubst_;
+        auto savedConst = currentConstParamSubst_; // Phase 59
         setInstanceContext(fn, typeArgs);
         llvm::FunctionType* fty = fnTypeFromDecl(fn);
         auto* f = llvm::Function::Create(
@@ -6294,9 +6421,11 @@ private:
             if (i < fn.params.size()) arg.setName(fn.params[i].name);
             ++i;
         }
+        checkManglingCollision(fn.name, mangledName); // review fix
         declaredFns_[mangledName] = f;
         currentInstanceTypeMap_ = std::move(savedMap);
         currentSchemaVarSubst_ = std::move(savedSubst);
+        currentConstParamSubst_ = std::move(savedConst);
         return f;
     }
 
@@ -7096,12 +7225,14 @@ private:
         // reclaims everything a closure owns.
         case TypeKind::Function:
             return true;
-        // Phase 36: a tuple owns its elements, so it is droppable iff any
-        // element is. (Arrays stay Copy-only -> never droppable.)
+        // Phase 36 / 61: a tuple or fixed-size array owns its elements, so it
+        // is droppable iff an element is (Phase 61 lifted arrays to non-Copy).
         case TypeKind::Tuple:
             for (const auto& el : r->tupleElems)
                 if (isDroppableImpl(el, seen)) return true;
             return false;
+        case TypeKind::Array:
+            return isDroppableImpl(r->arrayElem, seen);
         // Scalars, references, dyn objects, arrays: never owning.
         default:
             return false;
@@ -7302,6 +7433,23 @@ private:
         if (r->kind == TypeKind::Enum) {
             emitUserDrop(valuePtr, r);
             emitDropEnum(valuePtr, r);
+            return;
+        }
+
+        // Phase 61: a fixed-size array owns its elements — drop each in turn.
+        // Inline storage (no heap); element pointers via array GEP {0, i}.
+        if (r->kind == TypeKind::Array) {
+            if (isDroppable(r->arrayElem)) {
+                llvm::Type* arrTy = mapKardashevType(r);
+                auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
+                auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+                for (unsigned i = 0; i < r->arrayLen; ++i) {
+                    auto* ep = builder_->CreateInBoundsGEP(
+                        arrTy, valuePtr,
+                        {zero, llvm::ConstantInt::get(i64Ty, i)}, "drop.arr");
+                    emitDropGlue(ep, r->arrayElem);
+                }
+            }
             return;
         }
 
@@ -8001,6 +8149,15 @@ private:
                         llvm::Type::getInt64Ty(*ctx_),
                         static_cast<uint64_t>(cv.value), /*isSigned=*/true);
                 }
+                // Phase 59: a const-generic param used as a VALUE (`N` in the
+                // body of `dot<const N>`) lowers to this instance's concrete
+                // literal — zero runtime cost, distinct per monomorphization.
+                if (auto cpIt = currentConstParamSubst_.find(id->name);
+                    cpIt != currentConstParamSubst_.end()) {
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_),
+                        static_cast<uint64_t>(cpIt->second), /*isSigned=*/true);
+                }
             }
             // Phase 17a: a by-ref capture reads through the env pointer into
             // the enclosing variable's storage.
@@ -8331,6 +8488,16 @@ private:
             return llvm::UndefValue::get(llvmTy);
         }
         llvm::Value* agg = llvm::UndefValue::get(arrTy);
+        // Phase 62: array-REPEAT `[value; N]` — evaluate the (Copy) value once
+        // and broadcast it to all N slots. N is the resolved array length
+        // (concrete for this instance, even when the source length was a
+        // symbolic const-generic param).
+        if (al.repeatCount) {
+            llvm::Value* v = emitConsume(*al.elements[0]);
+            for (unsigned i = 0; i < arrTy->getNumElements(); ++i)
+                agg = builder_->CreateInsertValue(agg, v, {i}, "arr.rep");
+            return agg;
+        }
         for (unsigned i = 0; i < al.elements.size(); ++i) {
             llvm::Value* v = emitConsume(*al.elements[i]);
             agg = builder_->CreateInsertValue(agg, v, {i}, "arr.elt");
@@ -8983,6 +9150,11 @@ private:
             }
             const std::string mangled =
                 mangleInstance(call.callee, concreteTypeArgs);
+            // Review fix: if a generic call's mangled instance name equals a
+            // user-defined fn name, the call would silently resolve to the user
+            // fn (a miscompile). Catch it here — declareInstance below is
+            // skipped when the name already resolves.
+            checkManglingCollision(call.callee, mangled);
             auto fnIt = declaredFns_.find(mangled);
             if (fnIt == declaredFns_.end()) {
                 // Pre-declare so the call IR resolves now; queue for body

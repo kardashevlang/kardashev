@@ -1809,6 +1809,106 @@ void test_array_len_const_fn_call() {
                let->annotation->arrayLenExpr.get()) != nullptr);
 }
 
+// Phase 57 (v10): const-generic params + symbolic array length + tuple-let
+// annotation.
+void test_const_generic_param() {
+    auto r = parse("struct Mat<const N: i64> { data: [i64; N] }");
+    assert(r.ok());
+    const auto& s = r.program.structs[0];
+    assert(s.genericParams.size() == 1);
+    assert(s.genericParams[0].isConst);
+    assert(s.genericParams[0].name == "N");
+    // mixed type + const params: `<T, const N: i64>`
+    auto r2 = parse("struct Buf<T, const CAP: i64> { x: T }");
+    assert(r2.ok());
+    const auto& gp = r2.program.structs[0].genericParams;
+    assert(gp.size() == 2 && !gp[0].isConst && gp[1].isConst &&
+           gp[1].name == "CAP");
+    // `[i64; N]` keeps N as the length expr (an identifier).
+    assert(s.fields[0].type.isArray);
+    assert(dynamic_cast<const ast::IdentExpr*>(
+               s.fields[0].type.arrayLenExpr.get()) != nullptr);
+}
+
+void test_const_generic_param_non_i64_rejected() {
+    auto r = parse("struct Mat<const N: bool> { x: i64 }");
+    assert(!r.ok()); // must be i64
+}
+
+// Phase 58 (v10): a const-generic VALUE argument `Mat<3>` parses as a const-arg
+// TypeRef (not a type) and round-trips through ast_print.
+void test_const_generic_arg() {
+    auto r = parse("fn f(m: Mat<3>) -> i64 { 0 }");
+    assert(r.ok());
+    const auto& pty = r.program.functions[0].params[0].type;
+    assert(pty.name == "Mat");
+    assert(pty.typeArgs.size() == 1);
+    assert(pty.typeArgs[0].isConstArg);
+    assert(pty.typeArgs[0].constArgValue == 3);
+    // mixed: a type then a const value, `Matrix<i64, 4>`.
+    auto r2 = parse("fn g(m: Matrix<i64, 4>) -> i64 { 0 }");
+    assert(r2.ok());
+    const auto& g = r2.program.functions[0].params[0].type;
+    assert(g.typeArgs.size() == 2);
+    assert(!g.typeArgs[0].isConstArg && g.typeArgs[0].name == "i64");
+    assert(g.typeArgs[1].isConstArg && g.typeArgs[1].constArgValue == 4);
+}
+
+void test_tuple_let_annotation() {
+    auto r = parse("fn f() -> i64 { let (a, b): (i64, i64) = (3, 4); a }");
+    assert(r.ok());
+    const auto* let = dynamic_cast<const ast::LetStmt*>(
+        r.program.functions[0].body->stmts[0].get());
+    assert(let && let->tupleNames.size() == 2);
+    assert(let->tupleNames[0] == "a" && let->tupleNames[1] == "b");
+    assert(let->annotation && let->annotation->isTuple);
+    assert(let->annotation->tupleElems.size() == 2);
+    // the no-annotation tuple-let still parses (regression).
+    auto r2 = parse("fn f() -> i64 { let (a, b) = (3, 4); a }");
+    assert(r2.ok());
+    const auto* let2 = dynamic_cast<const ast::LetStmt*>(
+        r2.program.functions[0].body->stmts[0].get());
+    assert(let2 && let2->tupleNames.size() == 2 && !let2->annotation);
+}
+
+// Regression (v10): a nested tuple field access `n.0.0` must NOT lex `0.0` as
+// a float (which swallowed the second `.0`). `1.0` elsewhere stays a float.
+void test_nested_tuple_field_access() {
+    auto r = parse("fn f() -> i64 { let n = ((1, 2), 3); n.0.0 + n.0.1 + n.1 }");
+    assert(r.ok());
+    // a float literal in value position is unaffected.
+    auto r2 = parse("fn f() -> f64 { let x = 3.14; x }");
+    assert(r2.ok());
+    const auto* let = dynamic_cast<const ast::LetStmt*>(
+        r2.program.functions[0].body->stmts[0].get());
+    assert(let != nullptr);
+    const auto* lit = dynamic_cast<const ast::FloatLitExpr*>(let->value.get());
+    assert(lit != nullptr); // 3.14 is still a float
+}
+
+// Phase 62 (v10): array-repeat `[value; N]` parses (repeatCount set), distinct
+// from an element list `[a, b]`.
+void test_array_repeat() {
+    auto r = parse("fn f() -> i64 { let a = [7; 3]; a[0] }");
+    assert(r.ok());
+    const auto* let = dynamic_cast<const ast::LetStmt*>(
+        r.program.functions[0].body->stmts[0].get());
+    assert(let != nullptr);
+    const auto* arr =
+        dynamic_cast<const ast::ArrayLitExpr*>(let->value.get());
+    assert(arr != nullptr);
+    assert(arr->elements.size() == 1);
+    assert(arr->repeatCount != nullptr); // it's a repeat, not a list
+    // an ordinary element list has no repeatCount.
+    auto r2 = parse("fn f() -> i64 { let a = [1, 2, 3]; a[0] }");
+    assert(r2.ok());
+    const auto* let2 = dynamic_cast<const ast::LetStmt*>(
+        r2.program.functions[0].body->stmts[0].get());
+    const auto* arr2 =
+        dynamic_cast<const ast::ArrayLitExpr*>(let2->value.get());
+    assert(arr2 && arr2->elements.size() == 3 && !arr2->repeatCount);
+}
+
 } // namespace
 
 int main() {
@@ -1957,6 +2057,13 @@ int main() {
     test_array_len_literal_still_literal();
     test_array_len_const_expr();
     test_array_len_const_fn_call();
-    std::cout << "All parser tests passed (128 cases)\n";
+    // Phase 57 (v10): const-generic params + tuple-let annotation.
+    test_const_generic_param();
+    test_const_generic_param_non_i64_rejected();
+    test_const_generic_arg(); // Phase 58
+    test_tuple_let_annotation();
+    test_nested_tuple_field_access(); // v10 regression
+    test_array_repeat(); // Phase 62
+    std::cout << "All parser tests passed (136 cases)\n";
     return 0;
 }

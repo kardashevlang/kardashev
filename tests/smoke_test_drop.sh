@@ -48,7 +48,7 @@ trap 'rm -rf "$TMP"' EXIT
 # moved into `sink`, which drops it at ITS exit (printing 900 first). Then
 # main's own `c,b,a` drop 3,2,1. Final JIT line is main's printed return 0.
 cat > "$TMP/order.kd" <<'EOF'
-trait Drop { fn drop(&mut self); }
+trait Drop { fn drop(&mut self) ! { io }; }
 struct Noisy { id: i64 }
 impl Drop for Noisy { fn drop(&mut self) ! { io } { print(self.id); } }
 fn sink(n: Noisy) -> i64 ! { io } { print(900); 0 }
@@ -76,7 +76,7 @@ echo "PASS [order]: reverse drop order (3,2,1); moved value dropped at callee (5
 # `a` is moved into `b`; only `b` owns the value at scope exit, so the Drop
 # impl runs once. We count the marker lines: must be exactly 1.
 cat > "$TMP/nodouble.kd" <<'EOF'
-trait Drop { fn drop(&mut self); }
+trait Drop { fn drop(&mut self) ! { io }; }
 struct Noisy { id: i64 }
 impl Drop for Noisy { fn drop(&mut self) ! { io } { print(self.id); } }
 fn main() -> i64 ! { io } {
@@ -97,7 +97,7 @@ echo "PASS [nodouble]: moved-out value dropped exactly once (drop counter == 1)"
 # Used-after-move is still rejected by the borrow checker (no UAF reaches
 # codegen). The moved value `a` is read after `let b = a;`.
 cat > "$TMP/uam.kd" <<'EOF'
-trait Drop { fn drop(&mut self); }
+trait Drop { fn drop(&mut self) ! { io }; }
 struct Noisy { id: i64 }
 impl Drop for Noisy { fn drop(&mut self) ! { io } { print(self.id); } }
 fn use_it(n: Noisy) -> i64 { 0 }
@@ -120,7 +120,7 @@ echo "PASS [uam]: use-after-move still rejected by the borrow checker"
 # pick(false): `a` not moved -> pick drops `a` (1) at exit, returns 7.
 # Each path drops `a` exactly once — never zero, never twice.
 cat > "$TMP/cond.kd" <<'EOF'
-trait Drop { fn drop(&mut self); }
+trait Drop { fn drop(&mut self) ! { io }; }
 struct Noisy { id: i64 }
 impl Drop for Noisy { fn drop(&mut self) ! { io } { print(self.id); } }
 fn sink(n: Noisy) -> i64 ! { io } { print(900); 0 }
@@ -149,7 +149,7 @@ echo "PASS [cond]: conditional move dropped exactly once on each path (drop flag
 # Each iteration binds a fresh Noisy that drops at the end of the loop body.
 # Over 5 iterations the Drop impl prints exactly 5 times.
 cat > "$TMP/loopcount.kd" <<'EOF'
-trait Drop { fn drop(&mut self); }
+trait Drop { fn drop(&mut self) ! { io }; }
 struct Tick { n: i64 }
 impl Drop for Tick { fn drop(&mut self) ! { io } { print(self.n); } }
 fn main() -> i64 ! { io } {

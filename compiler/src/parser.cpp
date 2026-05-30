@@ -669,7 +669,27 @@ private:
         if (accept(TokenKind::Lt)) {
             if (!check(TokenKind::Gt)) {
                 while (true) {
-                    tr.typeArgs.push_back(parseTypeRef());
+                    // Phase 58 (v10): a const-generic VALUE argument — the `3`
+                    // in `Mat<3>`. An integer literal in type-arg position is
+                    // unambiguously a const value (a type never starts with a
+                    // digit). It binds to the type's `const N` parameter.
+                    if (check(TokenKind::Integer)) {
+                        Token n = consume();
+                        ast::TypeRef carg;
+                        carg.isConstArg = true;
+                        carg.line = n.line;
+                        carg.column = n.column;
+                        try {
+                            carg.constArgValue = std::stoll(n.lexeme);
+                        } catch (const std::exception&) {
+                            errorHere("const generic argument out of range: " +
+                                      n.lexeme);
+                            carg.constArgValue = 0;
+                        }
+                        tr.typeArgs.push_back(std::move(carg));
+                    } else {
+                        tr.typeArgs.push_back(parseTypeRef());
+                    }
                     if (!accept(TokenKind::Comma)) break;
                     if (check(TokenKind::Gt)) break; // trailing comma
                 }
@@ -730,14 +750,36 @@ private:
         if (!accept(TokenKind::Lt)) return result;
         if (!check(TokenKind::Gt)) {
             while (true) {
-                Token tpTok = expect(TokenKind::Identifier,
-                                     "generic type parameter name");
                 ast::TypeParam tp;
-                tp.name = tpTok.lexeme;
-                tp.line = tpTok.line;
-                tp.column = tpTok.column;
-                if (accept(TokenKind::Colon)) {
-                    parseTraitBoundInto(tp);
+                if (check(TokenKind::KwConst)) {
+                    // Phase 57: a const-generic parameter `const N: i64`.
+                    Token kw = consume();
+                    Token nameTok = expect(TokenKind::Identifier,
+                                           "const-generic parameter name "
+                                           "after `const`");
+                    tp.isConst = true;
+                    tp.name = nameTok.lexeme;
+                    tp.line = kw.line;
+                    tp.column = kw.column;
+                    expect(TokenKind::Colon,
+                           ": (a const-generic param needs a type, "
+                           "e.g. `const N: i64`)");
+                    Token tyTok =
+                        expect(TokenKind::Identifier, "const-generic param type");
+                    if (tyTok.lexeme != "i64") {
+                        errorAt("const generic parameter `" + tp.name +
+                                    "` must be `i64`, got `" + tyTok.lexeme + "`",
+                                tyTok.line, tyTok.column);
+                    }
+                } else {
+                    Token tpTok = expect(TokenKind::Identifier,
+                                         "generic type parameter name");
+                    tp.name = tpTok.lexeme;
+                    tp.line = tpTok.line;
+                    tp.column = tpTok.column;
+                    if (accept(TokenKind::Colon)) {
+                        parseTraitBoundInto(tp);
+                    }
                 }
                 result.push_back(std::move(tp));
                 if (!accept(TokenKind::Comma)) break;
@@ -1156,6 +1198,14 @@ private:
                 }
             }
             expect(TokenKind::RParen, ")");
+            // Phase 57: optional `: (T, ...)` annotation on a tuple-pattern let
+            // (`let (a, b): (T, T) = ..`) — useful to pin generic element types
+            // a multi-value generic call can't infer. The typechecker unifies
+            // each binding against its annotated element (and the RHS element).
+            if (accept(TokenKind::Colon)) {
+                stmt->annotation =
+                    std::make_shared<ast::TypeRef>(parseTypeRef());
+            }
             expect(TokenKind::Eq, "=");
             stmt->value = parseExpr();
             expect(TokenKind::Semi, ";");
@@ -1488,10 +1538,16 @@ private:
             bool prev = restrictStructLit_;
             restrictStructLit_ = false;
             if (!check(TokenKind::RBracket)) {
-                while (true) {
-                    arr->elements.push_back(parseExpr());
-                    if (!accept(TokenKind::Comma)) break;
-                    if (check(TokenKind::RBracket)) break; // trailing comma
+                arr->elements.push_back(parseExpr());
+                // Phase 62: array-REPEAT `[value; count]`. A `;` after the first
+                // element (instead of `,`) means "this value, `count` times".
+                if (accept(TokenKind::Semi)) {
+                    arr->repeatCount = parseExpr();
+                } else {
+                    while (accept(TokenKind::Comma)) {
+                        if (check(TokenKind::RBracket)) break; // trailing comma
+                        arr->elements.push_back(parseExpr());
+                    }
                 }
             }
             restrictStructLit_ = prev;

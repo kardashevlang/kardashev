@@ -1,5 +1,7 @@
 #include "kardashev/types.hpp"
 
+#include <unordered_set>
+
 namespace kardashev {
 
 namespace {
@@ -125,6 +127,332 @@ TypePtr makeTuple(std::vector<TypePtr> elems) {
     t->kind = TypeKind::Tuple;
     t->tupleElems = std::move(elems);
     return t;
+}
+
+TypePtr makeConstValue(long long v) {
+    // Phase 58 (v10): a const-generic VALUE argument. A fresh Int node so it
+    // is safe to stamp `isConstValue` / `constValue` (makeInt() never returns
+    // a shared singleton). Lives only in a struct/enum/fn instance typeArgs.
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Int;
+    t->isConstValue = true;
+    t->constValue = v;
+    return t;
+}
+
+TypePtr makeConstSymbol(std::string name) {
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Int;
+    t->isConstValue = true;
+    t->constValueName = std::move(name);
+    return t;
+}
+
+namespace {
+TypePtr substConstLenRec(
+    const TypePtr& t,
+    const std::unordered_map<std::string, std::size_t>& lengths,
+    std::unordered_set<const Type*>& visiting) {
+    TypePtr r = resolve(t);
+    switch (r->kind) {
+    case TypeKind::Array: {
+        TypePtr elem = substConstLenRec(r->arrayElem, lengths, visiting);
+        std::size_t len = r->arrayLen;
+        std::string param = r->arrayLenParam;
+        bool changed = (elem.get() != r->arrayElem.get());
+        if (!param.empty()) {
+            if (auto it = lengths.find(param); it != lengths.end()) {
+                len = it->second;
+                param.clear(); // length is now concrete
+                changed = true;
+            }
+        }
+        if (!changed) return r;
+        TypePtr a = makeArray(elem, len);
+        a->arrayLenParam = param;
+        return a;
+    }
+    case TypeKind::Struct: {
+        // Cycle guard: a self-recursive named type re-enters its own node.
+        if (!visiting.insert(r.get()).second) return r;
+        bool changed = false;
+        std::vector<std::pair<std::string, TypePtr>> nf;
+        nf.reserve(r->structFields.size());
+        for (const auto& [n, f] : r->structFields) {
+            TypePtr f2 = substConstLenRec(f, lengths, visiting);
+            if (f2.get() != f.get()) changed = true;
+            nf.emplace_back(n, std::move(f2));
+        }
+        std::vector<TypePtr> na;
+        na.reserve(r->typeArgs.size());
+        for (const auto& a : r->typeArgs) {
+            TypePtr a2 = substConstLenRec(a, lengths, visiting);
+            if (a2.get() != a.get()) changed = true;
+            na.push_back(std::move(a2));
+        }
+        visiting.erase(r.get());
+        if (!changed) return r;
+        TypePtr res = makeStruct(r->structName, std::move(nf));
+        res->typeArgs = std::move(na);
+        return res;
+    }
+    case TypeKind::Enum: {
+        if (!visiting.insert(r.get()).second) return r;
+        bool changed = false;
+        std::vector<EnumVariantType> nv;
+        nv.reserve(r->enumVariants.size());
+        for (const auto& v : r->enumVariants) {
+            EnumVariantType e;
+            e.name = v.name;
+            e.payloadTypes.reserve(v.payloadTypes.size());
+            for (const auto& p : v.payloadTypes) {
+                TypePtr p2 = substConstLenRec(p, lengths, visiting);
+                if (p2.get() != p.get()) changed = true;
+                e.payloadTypes.push_back(std::move(p2));
+            }
+            nv.push_back(std::move(e));
+        }
+        std::vector<TypePtr> na;
+        na.reserve(r->typeArgs.size());
+        for (const auto& a : r->typeArgs) {
+            TypePtr a2 = substConstLenRec(a, lengths, visiting);
+            if (a2.get() != a.get()) changed = true;
+            na.push_back(std::move(a2));
+        }
+        visiting.erase(r.get());
+        if (!changed) return r;
+        TypePtr res = makeEnum(r->enumName, std::move(nv));
+        res->typeArgs = std::move(na);
+        return res;
+    }
+    case TypeKind::Ref: {
+        TypePtr inner = substConstLenRec(r->refInner, lengths, visiting);
+        if (inner.get() == r->refInner.get()) return r;
+        return makeRef(inner, r->refIsMut);
+    }
+    case TypeKind::Box: {
+        TypePtr inner = substConstLenRec(r->refInner, lengths, visiting);
+        if (inner.get() == r->refInner.get()) return r;
+        return makeBox(inner);
+    }
+    case TypeKind::Tuple: {
+        bool changed = false;
+        std::vector<TypePtr> ne;
+        ne.reserve(r->tupleElems.size());
+        for (const auto& el : r->tupleElems) {
+            TypePtr e2 = substConstLenRec(el, lengths, visiting);
+            if (e2.get() != el.get()) changed = true;
+            ne.push_back(std::move(e2));
+        }
+        if (!changed) return r;
+        return makeTuple(std::move(ne));
+    }
+    case TypeKind::Function: {
+        bool changed = false;
+        std::vector<TypePtr> na;
+        na.reserve(r->args.size());
+        for (const auto& a : r->args) {
+            TypePtr a2 = substConstLenRec(a, lengths, visiting);
+            if (a2.get() != a.get()) changed = true;
+            na.push_back(std::move(a2));
+        }
+        TypePtr nr = substConstLenRec(r->ret, lengths, visiting);
+        if (nr.get() != r->ret.get()) changed = true;
+        if (!changed) return r;
+        return makeFunction(std::move(na), nr, r->effectLabels,
+                            r->effectRowVar);
+    }
+    case TypeKind::Int:
+        // Phase 61/62 fix: a SYMBOLIC const-value typeArg (e.g. the `N` passed
+        // to a nested `Inner<N>` field of `Outer<N>`) must resolve to the bound
+        // value — not just symbolic array lengths. Without this the nested
+        // field keeps a symbolic `N` and mangles to `Inner__c0`, clashing with
+        // the value's `Inner__c<N>` (an LLVM-verifier failure).
+        if (r->isConstValue && !r->constValueName.empty()) {
+            if (auto it = lengths.find(r->constValueName); it != lengths.end())
+                return makeConstValue(static_cast<long long>(it->second));
+        }
+        return r;
+    default:
+        return r;
+    }
+}
+} // namespace
+
+TypePtr substituteConstLengths(
+    const TypePtr& t,
+    const std::unordered_map<std::string, std::size_t>& lengths) {
+    if (lengths.empty()) return t;
+    std::unordered_set<const Type*> visiting;
+    return substConstLenRec(t, lengths, visiting);
+}
+
+namespace {
+// Phase 61: deep-copy `t`, RENAMING every symbolic array length `[T; N]` whose
+// `arrayLenParam` is a key in `renames` to the new (still symbolic) name. Used
+// when a generic type is instantiated with a SYMBOLIC const arg — e.g.
+// `Matrix<C, R>` rebinds `Matrix`'s `R`/`C` field lengths to the enclosing
+// scope's `C`/`R`. Recursive types are cycle-guarded.
+TypePtr renameConstLenRec(const TypePtr& t,
+                          const std::unordered_map<std::string, std::string>& rn,
+                          std::unordered_set<const Type*>& visiting) {
+    TypePtr r = resolve(t);
+    switch (r->kind) {
+    case TypeKind::Array: {
+        TypePtr elem = renameConstLenRec(r->arrayElem, rn, visiting);
+        std::string param = r->arrayLenParam;
+        bool changed = (elem.get() != r->arrayElem.get());
+        if (!param.empty()) {
+            if (auto it = rn.find(param); it != rn.end()) {
+                param = it->second;
+                changed = true;
+            }
+        }
+        if (!changed) return r;
+        TypePtr a = makeArray(elem, r->arrayLen);
+        a->arrayLenParam = param;
+        return a;
+    }
+    case TypeKind::Struct: {
+        if (!visiting.insert(r.get()).second) return r;
+        bool changed = false;
+        std::vector<std::pair<std::string, TypePtr>> nf;
+        for (const auto& [n, f] : r->structFields) {
+            TypePtr f2 = renameConstLenRec(f, rn, visiting);
+            if (f2.get() != f.get()) changed = true;
+            nf.emplace_back(n, std::move(f2));
+        }
+        std::vector<TypePtr> na;
+        for (const auto& a : r->typeArgs) {
+            TypePtr a2 = renameConstLenRec(a, rn, visiting);
+            if (a2.get() != a.get()) changed = true;
+            na.push_back(std::move(a2));
+        }
+        visiting.erase(r.get());
+        if (!changed) return r;
+        TypePtr res = makeStruct(r->structName, std::move(nf));
+        res->typeArgs = std::move(na);
+        return res;
+    }
+    case TypeKind::Ref:
+        { TypePtr i = renameConstLenRec(r->refInner, rn, visiting);
+          return i.get() == r->refInner.get() ? r : makeRef(i, r->refIsMut); }
+    case TypeKind::Box:
+        { TypePtr i = renameConstLenRec(r->refInner, rn, visiting);
+          return i.get() == r->refInner.get() ? r : makeBox(i); }
+    case TypeKind::Tuple: {
+        bool changed = false;
+        std::vector<TypePtr> ne;
+        for (const auto& el : r->tupleElems) {
+            TypePtr e2 = renameConstLenRec(el, rn, visiting);
+            if (e2.get() != el.get()) changed = true;
+            ne.push_back(std::move(e2));
+        }
+        return changed ? makeTuple(std::move(ne)) : r;
+    }
+    case TypeKind::Int:
+        // Phase 61/62 fix: rename a SYMBOLIC const-value typeArg (a nested
+        // `Inner<N>` field) through the symbolic rename map, mirroring the
+        // array-length rename — so `Matrix<C, R>` with a nested const-generic
+        // field rebinds correctly instead of keeping a stale symbol.
+        if (r->isConstValue && !r->constValueName.empty()) {
+            if (auto it = rn.find(r->constValueName); it != rn.end())
+                return makeConstSymbol(it->second);
+        }
+        return r;
+    case TypeKind::Function: {
+        // Needed so renaming a fn SIGNATURE (forwarding a const-generic array
+        // into another const-generic fn) reaches the param/return types.
+        bool changed = false;
+        std::vector<TypePtr> na;
+        na.reserve(r->args.size());
+        for (const auto& a : r->args) {
+            TypePtr a2 = renameConstLenRec(a, rn, visiting);
+            if (a2.get() != a.get()) changed = true;
+            na.push_back(std::move(a2));
+        }
+        TypePtr nr = renameConstLenRec(r->ret, rn, visiting);
+        if (nr.get() != r->ret.get()) changed = true;
+        if (!changed) return r;
+        return makeFunction(std::move(na), nr, r->effectLabels, r->effectRowVar);
+    }
+    case TypeKind::Enum: {
+        if (!visiting.insert(r.get()).second) return r;
+        bool changed = false;
+        std::vector<EnumVariantType> nv;
+        for (const auto& v : r->enumVariants) {
+            EnumVariantType e;
+            e.name = v.name;
+            for (const auto& p : v.payloadTypes) {
+                TypePtr p2 = renameConstLenRec(p, rn, visiting);
+                if (p2.get() != p.get()) changed = true;
+                e.payloadTypes.push_back(std::move(p2));
+            }
+            nv.push_back(std::move(e));
+        }
+        std::vector<TypePtr> na;
+        for (const auto& a : r->typeArgs) {
+            TypePtr a2 = renameConstLenRec(a, rn, visiting);
+            if (a2.get() != a.get()) changed = true;
+            na.push_back(std::move(a2));
+        }
+        visiting.erase(r.get());
+        if (!changed) return r;
+        TypePtr res = makeEnum(r->enumName, std::move(nv));
+        res->typeArgs = std::move(na);
+        return res;
+    }
+    default:
+        return r;
+    }
+}
+} // namespace
+
+TypePtr renameConstLengths(
+    const TypePtr& t,
+    const std::unordered_map<std::string, std::string>& renames) {
+    if (renames.empty()) return t;
+    std::unordered_set<const Type*> visiting;
+    return renameConstLenRec(t, renames, visiting);
+}
+
+TypePtr instantiateGeneric(const TypePtr& schemaType,
+                           const std::vector<TypePtr>& genericVars,
+                           const std::vector<std::string>& constParamNames,
+                           std::vector<TypePtr> typeArgs, bool isStruct) {
+    std::unordered_map<int, TypePtr> subst;
+    std::unordered_map<std::string, std::size_t> constSubst;
+    std::unordered_map<std::string, std::string> constRename;
+    for (std::size_t i = 0;
+         i < genericVars.size() && i < typeArgs.size(); ++i) {
+        bool isConstSlot =
+            i < constParamNames.size() && !constParamNames[i].empty();
+        if (isConstSlot) {
+            TypePtr a = resolve(typeArgs[i]);
+            if (a->isConstValue && !a->constValueName.empty())
+                constRename[constParamNames[i]] = a->constValueName; // symbolic
+            else if (a->isConstValue && a->constValue >= 0)
+                constSubst[constParamNames[i]] =
+                    static_cast<std::size_t>(a->constValue);
+        } else {
+            subst[genericVars[i]->varId] = typeArgs[i];
+        }
+    }
+    TypePtr inst = instantiate(schemaType, subst);
+    if (!constRename.empty()) {
+        std::unordered_set<const Type*> v;
+        inst = renameConstLenRec(inst, constRename, v);
+    }
+    if (!constSubst.empty())
+        inst = substituteConstLengths(inst, constSubst);
+    // Guarantee a fresh node before stamping typeArgs (an all-const generic
+    // with no symbolic length leaves `inst` aliasing the shared schema).
+    if (inst.get() == schemaType.get()) {
+        inst = isStruct ? makeStruct(inst->structName, inst->structFields)
+                        : makeEnum(inst->enumName, inst->enumVariants);
+    }
+    inst->typeArgs = std::move(typeArgs);
+    return inst;
 }
 
 TypePtr makeFuture(TypePtr result) {
@@ -352,7 +680,11 @@ bool unify(const TypePtr& a, const TypePtr& b) {
 
     if (ra->kind == TypeKind::Array) {
         // Phase 22: `[T; N] ~ [U; M]` iff N == M and T ~ U.
-        if (ra->arrayLen != rb->arrayLen) return false;
+        // Phase 61: a SYMBOLIC length (arrayLenParam set, e.g. `[T; CAP]` in a
+        // generic impl) matches any length; two CONCRETE lengths must be equal.
+        if (ra->arrayLenParam.empty() && rb->arrayLenParam.empty() &&
+            ra->arrayLen != rb->arrayLen)
+            return false;
         return unify(ra->arrayElem, rb->arrayElem);
     }
 
@@ -380,6 +712,23 @@ bool unify(const TypePtr& a, const TypePtr& b) {
             }
         }
         return true;
+    }
+
+    // Phase 58: const-generic VALUE arguments are Int nodes carrying a value.
+    // `Mat<3>` and `Mat<5>` must NOT unify; a const value never unifies with
+    // an ordinary i64 (they only ever meet in matching type-arg slots). Two
+    // concrete const values unify iff equal — a mismatch is the compile-time
+    // dimension error the const-generic feature promises.
+    if (ra->kind == TypeKind::Int &&
+        (ra->isConstValue || rb->isConstValue)) {
+        // Phase 61: a SYMBOLIC const arg (a const param in scope, value not yet
+        // known) matches any const value — the concrete check happens at the
+        // leaf monomorphization. Two CONCRETE const values must be equal (the
+        // Phase 59 dimension check).
+        if (!ra->constValueName.empty() || !rb->constValueName.empty())
+            return ra->isConstValue && rb->isConstValue;
+        return ra->isConstValue && rb->isConstValue &&
+               ra->constValue == rb->constValue;
     }
 
     // Same primitive kind (Int=Int, Bool=Bool, Unit=Unit).
@@ -481,7 +830,11 @@ TypePtr instantiate(const TypePtr& t,
     case TypeKind::Array: {
         TypePtr elem = instantiate(r->arrayElem, subst);
         if (elem.get() == r->arrayElem.get()) return r;
-        return makeArray(elem, r->arrayLen);
+        TypePtr a = makeArray(elem, r->arrayLen);
+        // Phase 58: a symbolic length `[T; N]` survives element substitution;
+        // it is resolved to a concrete length later by substituteConstLengths.
+        a->arrayLenParam = r->arrayLenParam;
+        return a;
     }
     case TypeKind::Tuple: {
         bool changed = false;
@@ -503,7 +856,14 @@ TypePtr instantiate(const TypePtr& t,
 std::string typeToString(const TypePtr& t) {
     TypePtr r = resolve(t);
     switch (r->kind) {
-    case TypeKind::Int: return "i64";
+    case TypeKind::Int:
+        // Phase 58/61: a const-generic value argument prints as its value (or
+        // its symbolic param name), so `Matrix<3, 4>` / `Matrix<C, R>` read
+        // naturally in diagnostics, not `i64`.
+        if (r->isConstValue)
+            return r->constValueName.empty() ? std::to_string(r->constValue)
+                                             : r->constValueName;
+        return "i64";
     case TypeKind::Bool: return "bool";
     case TypeKind::Unit: return "()";
     case TypeKind::Var: return "'" + std::to_string(r->varId);
