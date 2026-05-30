@@ -2740,6 +2740,48 @@ void test_u64_large_literal_ok() {
              "u64_large_literal_ok");
 }
 
+// Phase 67 (v11): f32 + defined overflow + negative narrow-int literals.
+void test_f32_ok() {
+    expectOk("fn scale(x: f32, k: f32) -> f32 { x * k }\n"
+             "fn main() -> i64 { let a: f32 = 1.5; let b = scale(a, 4.0f32);"
+             " b as i64 }",
+             "f32_ok");
+}
+
+void test_f32_f64_distinct() {
+    // f32 and f64 are distinct non-coercive types — no implicit crossing.
+    expectErrContains("fn main() -> i64 { let a: f32 = 1.0; let b: f64 = 2.0;"
+                      " let c = a + b; 0 }",
+                      "same float",
+                      "f32_f64_distinct");
+}
+
+void test_f32_f64_cast_ok() {
+    expectOk("fn main() -> i64 { let d: f64 = 3.5; let s: f32 = d as f32;"
+             " let back: f64 = s as f64; back as i64 }",
+             "f32_f64_cast_ok");
+}
+
+void test_negative_narrow_literal_ok() {
+    // i8::MIN (-128) narrows even though +128 would not fit i8.
+    expectOk("fn main() -> i64 { let a: i8 = -100; let b: i8 = -128;"
+             " (a as i64) + (b as i64) }",
+             "negative_narrow_literal_ok");
+}
+
+void test_negative_unsigned_literal_rejected() {
+    expectErrContains("fn main() -> i64 { let x: u8 = -1; 0 }",
+                      "out of range",
+                      "negative_unsigned_literal_rejected");
+}
+
+void test_unsuffixed_float_narrows_to_f32() {
+    // An f64-default literal narrows to an f32 binding / operand.
+    expectOk("fn main() -> i64 { let x: f32 = 2.5; let y: f32 = x + 1.0;"
+             " y as i64 }",
+             "unsuffixed_float_narrows_to_f32");
+}
+
 } // namespace
 
 int main() {
@@ -3043,6 +3085,12 @@ int main() {
     test_bitwise_on_float_rejected();
     test_unsigned_literal_range_checked();
     test_u64_large_literal_ok();
+    test_f32_ok();
+    test_f32_f64_distinct();
+    test_f32_f64_cast_ok();
+    test_negative_narrow_literal_ok();
+    test_negative_unsigned_literal_rejected();
+    test_unsuffixed_float_narrows_to_f32();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -3051,6 +3099,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (283 cases)\n";
+    std::cout << "All typecheck tests passed (289 cases)\n";
     return 0;
 }

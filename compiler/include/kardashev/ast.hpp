@@ -163,6 +163,10 @@ struct IntLitExpr : Expr {
 struct FloatLitExpr : Expr {
     std::string lexeme;
     double value = 0.0;
+    // Phase 67 (v11): an explicit `f32` / `f64` suffix pins the literal width.
+    // `suffixWidth == 0` means no suffix (an unsuffixed float is f64 by default
+    // and narrows to f32 in context).
+    int suffixWidth = 0;
 };
 
 // Phase 15: `true` / `false` boolean literal. Codegen lowers to an i1

@@ -83,6 +83,13 @@ struct Type {
     // unused in Phase 63 — the narrowing approach above is used instead.
     bool intLitVar = false;
 
+    // Float (Phase 67): a float's BIT WIDTH — 64 (f64, LLVM `double`, the
+    // default) or 32 (f32, LLVM `float`). Like the int tower, f32 and f64 are
+    // DISTINCT non-coercive types — only an explicit `as` cast bridges them —
+    // and an unsuffixed float literal is f64 by default, narrowing to f32 in
+    // context. makeFloat() is f64, so every pre-Phase-67 site is unchanged.
+    int floatWidth = 64;
+
     // Function:
     std::vector<TypePtr> args;
     TypePtr ret;
@@ -176,6 +183,10 @@ TypePtr makeIntLitVar();
 // v11: the canonical name (`i32`, `u8`, ...) of an Int type, for diagnostics.
 std::string intTypeName(int width, bool isSigned);
 TypePtr makeFloat();
+// Phase 67: a sized float. makeFloat() == makeFloatW(64) == f64; makeFloatW(32)
+// is f32. The canonical name is `f32` / `f64`.
+TypePtr makeFloatW(int width);
+std::string floatTypeName(int width);
 TypePtr makeBool();
 TypePtr makeUnit();
 // Build a function type. The 2-arg form yields a pure (empty) effect row;

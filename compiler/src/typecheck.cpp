@@ -3233,6 +3233,11 @@ private:
                 error("f64 takes no type arguments", tr.line, tr.column);
             return makeFloat();
         }
+        if (tr.name == "f32") { // Phase 67: single-precision float
+            if (!tr.typeArgs.empty())
+                error("f32 takes no type arguments", tr.line, tr.column);
+            return makeFloatW(32);
+        }
         // Phase 16: `unit` is the type of a function with no `-> T` return
         // annotation (the parser synthesizes a "unit" TypeRef there). Maps to
         // the unit type — codegen lowers it to `void`.
@@ -3891,7 +3896,11 @@ private:
             // re-records its exprType — see coerceOrUnify.
             return makeInt();
         }
-        if (dynamic_cast<const ast::FloatLitExpr*>(&e)) {
+        if (auto* fl = dynamic_cast<const ast::FloatLitExpr*>(&e)) {
+            // Phase 67: a suffixed float literal (`1.5f32`) IS that width; an
+            // unsuffixed one is f64 by default and narrows to f32 in context
+            // (narrowFloatLiteral, at coercion sites — see coerceOrUnify).
+            if (fl->suffixWidth != 0) return makeFloatW(fl->suffixWidth);
             return makeFloat();
         }
         if (dynamic_cast<const ast::BoolLitExpr*>(&e)) {
@@ -4124,14 +4133,48 @@ private:
     }
 
     bool narrowIntLiteral(const ast::Expr& srcExpr, const TypePtr& target) {
-        auto* lit = dynamic_cast<const ast::IntLitExpr*>(&srcExpr);
-        if (!lit) return false;
         TypePtr t = resolve(target);
         if (t->kind != TypeKind::Int || t->isConstValue) return false;
-        if (!intLitFitsWidth(lit->value, t->intWidth, t->intSigned))
-            error("integer literal " + std::to_string(lit->value) +
-                      " out of range for " + typeToString(t),
-                  srcExpr.line, srcExpr.column);
+        if (auto* lit = dynamic_cast<const ast::IntLitExpr*>(&srcExpr)) {
+            if (!intLitFitsWidth(lit->value, t->intWidth, t->intSigned))
+                error("integer literal " + std::to_string(lit->value) +
+                          " out of range for " + typeToString(t),
+                      srcExpr.line, srcExpr.column);
+            exprTypes_[&srcExpr] = t;
+            return true;
+        }
+        // Phase 67: a NEGATED literal `-N` narrows too, so a narrow signed type
+        // can hold its minimum (`let x: i8 = -128`). The NEGATED value is the
+        // one range-checked (and `let x: u8 = -1` is correctly rejected). The
+        // inner literal is recorded at the target width as well, so codegen
+        // emits both at that width (the negate wraps in two's complement).
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&srcExpr)) {
+            if (un->op == ast::UnaryOp::Neg) {
+                if (auto* lit = dynamic_cast<const ast::IntLitExpr*>(
+                        un->operand.get())) {
+                    long long neg = -lit->value;
+                    if (!intLitFitsWidth(neg, t->intWidth, t->intSigned))
+                        error("integer literal " + std::to_string(neg) +
+                                  " out of range for " + typeToString(t),
+                              srcExpr.line, srcExpr.column);
+                    exprTypes_[un] = t;
+                    exprTypes_[un->operand.get()] = t;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Phase 67: narrow an unsuffixed FLOAT literal `srcExpr` to a concrete
+    // float `target` (a float literal is f64 by default; in a context that
+    // wants f32 it adopts f32). Records its exprType so codegen emits the right
+    // width. No-op (false) for non-literals or a non-float target.
+    bool narrowFloatLiteral(const ast::Expr& srcExpr, const TypePtr& target) {
+        auto* lit = dynamic_cast<const ast::FloatLitExpr*>(&srcExpr);
+        if (!lit || lit->suffixWidth != 0) return false;
+        TypePtr t = resolve(target);
+        if (t->kind != TypeKind::Float) return false;
         exprTypes_[&srcExpr] = t;
         return true;
     }
@@ -4146,6 +4189,11 @@ private:
         if (e->kind == TypeKind::Int && !e->isConstValue &&
             a->kind == TypeKind::Int && !a->isConstValue && a->intWidth == 64 &&
             a->intSigned && narrowIntLiteral(srcExpr, e))
+            return true;
+        // Phase 67: an f64-default float literal narrows to an expected f32.
+        if (e->kind == TypeKind::Float && e->floatWidth == 32 &&
+            a->kind == TypeKind::Float && a->floatWidth == 64 &&
+            narrowFloatLiteral(srcExpr, e))
             return true;
         // Unwrap one pointer layer on each side, tracking whether it's a Box.
         bool expIsBox = e->kind == TypeKind::Box;
@@ -4966,31 +5014,41 @@ private:
                                (bin.op == ast::BinOp::Shr);
         const char* what =
             isComparison ? "comparison" : isBitwise ? "bitwise" : "arithmetic";
-        // Phase 39: f64 arithmetic / comparison. If a side is already f64, both
-        // sides must be f64 — there is NO implicit i64<->f64 coercion (use
-        // to_f64 / float_to_int). `%` and the bitwise ops are integer-only.
+        // Phase 39/67: float arithmetic / comparison. If a side is a float,
+        // both sides must be the SAME float width (f32 or f64) — there is NO
+        // implicit i64<->float or f32<->f64 coercion (use `as`). `%` and the
+        // bitwise ops are integer-only. An unsuffixed f64-default float literal
+        // narrows to the other operand's width (`x + 1.0` with `x: f32`).
         if (resolve(lhs)->kind == TypeKind::Float ||
             resolve(rhs)->kind == TypeKind::Float) {
             if (bin.op == ast::BinOp::Mod) {
-                error("`%` (modulo) is not defined for f64", bin.line,
+                error("`%` (modulo) is not defined for floats", bin.line,
                       bin.column);
             }
             if (isBitwise) {
                 error("bitwise operators (& | ^ << >>) are not defined for "
-                      "f64",
+                      "floats",
                       bin.line, bin.column);
             }
-            if (!unify(lhs, makeFloat())) {
-                error(std::string(what) + " op expects f64 on lhs, got " +
-                          typeToString(lhs),
-                      bin.lhs->line, bin.lhs->column);
-            }
-            if (!unify(rhs, makeFloat())) {
-                error(std::string(what) + " op expects f64 on rhs, got " +
+            TypePtr rl = resolve(lhs), rr = resolve(rhs);
+            // Narrow an f64-default float literal to the other side's f32.
+            if (rl->kind == TypeKind::Float && rl->floatWidth == 32 &&
+                rr->kind == TypeKind::Float && rr->floatWidth == 64 &&
+                narrowFloatLiteral(*bin.rhs, rl))
+                rhs = rl;
+            else if (rr->kind == TypeKind::Float && rr->floatWidth == 32 &&
+                     rl->kind == TypeKind::Float && rl->floatWidth == 64 &&
+                     narrowFloatLiteral(*bin.lhs, rr))
+                lhs = rr;
+            if (!unify(lhs, rhs)) {
+                error(std::string(what) +
+                          " op requires both operands to be the same float "
+                          "type, got " + typeToString(lhs) + " and " +
                           typeToString(rhs),
-                      bin.rhs->line, bin.rhs->column);
+                      bin.line, bin.column);
+                return isComparison ? makeBool() : resolve(lhs);
             }
-            return isComparison ? makeBool() : makeFloat();
+            return isComparison ? makeBool() : resolve(lhs);
         }
         // v11: integer arithmetic/comparison over the sized-int tower. Both
         // operands must be the SAME int type; an i64 LITERAL operand narrows to
@@ -6303,8 +6361,9 @@ private:
         TypePtr operand = checkExpr(*un.operand);
         switch (un.op) {
         case ast::UnaryOp::Neg:
-            // Phase 39: `-x` negates an i64 OR an f64.
-            if (resolve(operand)->kind == TypeKind::Float) return makeFloat();
+            // Phase 39/67: `-x` negates an i64 OR a float of either width.
+            if (resolve(operand)->kind == TypeKind::Float)
+                return resolve(operand);
             if (!unify(operand, makeInt())) {
                 error("unary `-` requires an i64 or f64 operand, got " +
                           typeToString(operand),

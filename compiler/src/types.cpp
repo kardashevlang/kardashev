@@ -36,7 +36,18 @@ std::string intTypeName(int width, bool isSigned) {
 TypePtr makeFloat() {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Float;
+    return t; // floatWidth defaults to 64
+}
+
+TypePtr makeFloatW(int width) {
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Float;
+    t->floatWidth = width;
     return t;
+}
+
+std::string floatTypeName(int width) {
+    return std::string("f") + std::to_string(width);
 }
 
 TypePtr makeBool() {
@@ -650,6 +661,11 @@ bool unify(const TypePtr& a, const TypePtr& b) {
             return false;
     }
 
+    // Phase 67: two floats unify iff same width (f32 != f64; `as` bridges).
+    if (ra->kind == TypeKind::Float) {
+        if (ra->floatWidth != rb->floatWidth) return false;
+    }
+
     if (ra->kind == TypeKind::Function) {
         if (ra->args.size() != rb->args.size()) return false;
         for (std::size_t i = 0; i < ra->args.size(); ++i) {
@@ -890,6 +906,7 @@ std::string typeToString(const TypePtr& t) {
             return r->constValueName.empty() ? std::to_string(r->constValue)
                                              : r->constValueName;
         return intTypeName(r->intWidth, r->intSigned); // v11: i8..u64
+    case TypeKind::Float: return floatTypeName(r->floatWidth); // Phase 67
     case TypeKind::Bool: return "bool";
     case TypeKind::Unit: return "()";
     case TypeKind::Var:

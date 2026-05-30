@@ -212,8 +212,25 @@ std::vector<Token> lex(std::string_view source) {
                     }
                 }
             }
-            // Phase 64: an integer (not a float) may carry a width suffix.
-            if (!isFloat) consumeIntSuffix();
+            // Phase 67: a trailing `f32`/`f64` suffix. It makes ANY numeric
+            // literal a float — even an otherwise-integer one (`5f32` == 5.0f32),
+            // mirroring Rust — so it is tried before the integer suffix.
+            auto consumeFloatSuffix = [&]() -> bool {
+                if (i + 2 < source.size() && source[i] == 'f' &&
+                    ((source[i + 1] == '3' && source[i + 2] == '2') ||
+                     (source[i + 1] == '6' && source[i + 2] == '4'))) {
+                    i += 3;
+                    col += 3;
+                    return true;
+                }
+                return false;
+            };
+            // Phase 64/67: a trailing width suffix. `i`/`u` keeps an integer an
+            // integer; `f32`/`f64` makes it a float.
+            if (consumeFloatSuffix())
+                isFloat = true;
+            else if (!isFloat)
+                consumeIntSuffix();
             tokens.push_back({isFloat ? TokenKind::Float : TokenKind::Integer,
                               std::string(source.substr(start, i - start)),
                               line, startCol});

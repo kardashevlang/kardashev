@@ -5587,7 +5587,9 @@ private:
         switch (r->kind) {
             case TypeKind::Int: // v11: sized machine int (default i64)
                 return llvm::Type::getIntNTy(*ctx_, r->intWidth);
-            case TypeKind::Float: return llvm::Type::getDoubleTy(*ctx_);
+            case TypeKind::Float: // Phase 67: f32 -> float, f64 -> double
+                return r->floatWidth == 32 ? llvm::Type::getFloatTy(*ctx_)
+                                           : llvm::Type::getDoubleTy(*ctx_);
             case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
             case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
             case TypeKind::Ref: {
@@ -5841,6 +5843,7 @@ private:
         if (tr.name == "u32") return makeIntW(32, false);  // Phase 66
         if (tr.name == "u64") return makeIntW(64, false);  // Phase 66
         if (tr.name == "f64") return makeFloat(); // Phase 39/44
+        if (tr.name == "f32") return makeFloatW(32); // Phase 67
         if (tr.name == "bool") return makeBool();
         // Phase 16: a fn with no `-> T` annotation returns unit (parser
         // synthesizes a "unit" TypeRef). Mirrors typecheck's resolveTypeRef.
@@ -5907,7 +5910,9 @@ private:
         TypePtr r = resolve(astTypeRefToConcrete(tr));
         switch (r->kind) {
             case TypeKind::Int:  return llvm::Type::getInt64Ty(*ctx_);
-            case TypeKind::Float: return llvm::Type::getDoubleTy(*ctx_);
+            case TypeKind::Float: // Phase 67: f32 -> float, f64 -> double
+                return r->floatWidth == 32 ? llvm::Type::getFloatTy(*ctx_)
+                                           : llvm::Type::getDoubleTy(*ctx_);
             case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
             case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
             case TypeKind::Ref:
@@ -6073,7 +6078,7 @@ private:
             // v11: an ordinary sized int mangles by name (i8..u64).
             return r->isConstValue ? ("c" + std::to_string(r->constValue))
                                    : intTypeName(r->intWidth, r->intSigned);
-        case TypeKind::Float:  return "f64";
+        case TypeKind::Float:  return floatTypeName(r->floatWidth); // Phase 67
         case TypeKind::Bool:   return "bool";
         case TypeKind::Unit:   return "unit";
         case TypeKind::Struct: return r->structName + mangleTypeArgs(r->typeArgs);
@@ -8148,10 +8153,17 @@ private:
             return llvm::ConstantInt::get(
                 ity, static_cast<uint64_t>(lit->value), /*isSigned=*/true);
         }
-        // Phase 39: f64 literal -> double ConstantFP.
+        // Phase 39/67: float literal -> ConstantFP at its RESOLVED width (f64
+        // by default, or the f32 it adapted to in context — `let x: f32 = 1.5`
+        // narrows the literal so it emits a `float`).
         if (auto* fl = dynamic_cast<const ast::FloatLitExpr*>(&e)) {
-            return llvm::ConstantFP::get(llvm::Type::getDoubleTy(*ctx_),
-                                         fl->value);
+            llvm::Type* fty = llvm::Type::getDoubleTy(*ctx_);
+            if (TypePtr t = lookupExprType(*fl)) {
+                TypePtr r = resolveInInstance(t);
+                if (r->kind == TypeKind::Float && r->floatWidth == 32)
+                    fty = llvm::Type::getFloatTy(*ctx_);
+            }
+            return llvm::ConstantFP::get(fty, fl->value);
         }
         // Phase 15: boolean literal -> i1 constant (1/0).
         if (auto* bl = dynamic_cast<const ast::BoolLitExpr*>(&e)) {
@@ -8684,9 +8696,10 @@ private:
         llvm::Value* v = emitExpr(*un.operand);
         switch (un.op) {
         case ast::UnaryOp::Neg:
-            // Phase 39: `-x` on an f64 negates with FNeg.
-            return v->getType()->isDoubleTy() ? builder_->CreateFNeg(v, "fneg")
-                                              : builder_->CreateNeg(v, "neg");
+            // Phase 39/67: `-x` on a float (f32 OR f64) negates with FNeg.
+            return v->getType()->isFloatingPointTy()
+                       ? builder_->CreateFNeg(v, "fneg")
+                       : builder_->CreateNeg(v, "neg");
         case ast::UnaryOp::Not:
             return builder_->CreateNot(v, "not");
         case ast::UnaryOp::BitNot:
@@ -8720,7 +8733,7 @@ private:
         TypePtr dstTy = lookupExprType(ce);
         if (dstTy) dstTy = resolveInInstance(dstTy);
         bool srcIsFloat = srcTy ? srcTy->kind == TypeKind::Float
-                                : v->getType()->isDoubleTy();
+                                : v->getType()->isFloatingPointTy();
         bool dstIsFloat = dstTy && dstTy->kind == TypeKind::Float;
         bool srcSigned = srcTy ? srcTy->intSigned : true;
         bool dstSigned = dstTy ? dstTy->intSigned : true;
@@ -8728,9 +8741,13 @@ private:
                                   : llvm::Type::getInt64Ty(*ctx_);
 
         if (srcIsFloat && dstIsFloat) {
-            // f64 -> f64 (the only float width today) is a no-op; f32 conversions
-            // (fpext / fptrunc) land in Phase 67.
-            return v;
+            // Phase 67: float -> float. Same width is a no-op; otherwise widen
+            // (fpext, f32 -> f64) or narrow (fptrunc, f64 -> f32).
+            unsigned srcFW = v->getType()->isFloatTy() ? 32 : 64;
+            unsigned dstFW = dstTy->floatWidth;
+            if (dstFW == srcFW) return v;
+            return dstFW > srcFW ? builder_->CreateFPExt(v, dstLL, "fpext")
+                                 : builder_->CreateFPTrunc(v, dstLL, "fptrunc");
         }
         if (srcIsFloat) {
             // float -> int.
@@ -8776,9 +8793,10 @@ private:
         }
         llvm::Value* L = emitExpr(*bin.lhs);
         llvm::Value* R = emitExpr(*bin.rhs);
-        // Phase 39: f64 operands use floating-point ops (ordered comparisons —
-        // a NaN compares false). `%` never reaches here for f64 (typecheck).
-        if (L->getType()->isDoubleTy()) {
+        // Phase 39/67: float operands (f32 OR f64) use floating-point ops
+        // (ordered comparisons — a NaN compares false). `%` / bitwise never
+        // reach here for a float (typecheck rejects them).
+        if (L->getType()->isFloatingPointTy()) {
             switch (bin.op) {
             case ast::BinOp::Add: return builder_->CreateFAdd(L, R, "fadd");
             case ast::BinOp::Sub: return builder_->CreateFSub(L, R, "fsub");

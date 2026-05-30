@@ -68,6 +68,16 @@ instead of i64-only. The first step toward production use.
   are parsed by token adjacency so nested generics `Vec<Vec<T>>` stay
   unambiguous. Operator precedence now matches Rust: `&&` < comparison < `|` <
   `^` < `&` < shift < `+ -` < `* / %`.
+- The **`f32`** single-precision float and **defined overflow semantics**
+  (Phase 67). `f32` is a real type lowering to LLVM `float` (`f64` stays the
+  default `double`); it is a distinct non-coercive type (`f32` ≠ `f64`), so an
+  `as` cast bridges them with `fpext` (`f32`→`f64`) / `fptrunc` (`f64`→`f32`),
+  an unsuffixed float literal is `f64` by default and narrows to `f32` in
+  context, and `1.5f32` pins the width. Integer overflow is now DEFINED as
+  two's-complement **wrapping** at every width (`127i8 + 1 == -128`,
+  `255u8 + 1 == 0`), identically at compile and run time. Negative narrow-int
+  literals narrow in context — `let x: i8 = -128` (i8::MIN) is valid even
+  though `+128` would not fit, while `let x: u8 = -1` is a compile error.
 
 ## [0.10.0] — Roadmap v10 "sized and sound at compile time" (Phases 57–62)
 

@@ -1700,9 +1700,19 @@ private:
             auto e = std::make_unique<ast::FloatLitExpr>();
             e->line = tok.line;
             e->column = tok.column;
-            e->lexeme = tok.lexeme;
+            // Phase 67: strip a trailing `f32`/`f64` suffix (the lexeme may be
+            // `5f32` with no decimal point — still a float). std::stod parses
+            // the numeric prefix and ignores the suffix, but we record the
+            // width and keep a clean lexeme for the formatter.
+            std::string lex = tok.lexeme;
+            if (lex.size() > 3) {
+                std::string tail = lex.substr(lex.size() - 3);
+                if (tail == "f32") { e->suffixWidth = 32; lex.resize(lex.size() - 3); }
+                else if (tail == "f64") { e->suffixWidth = 64; lex.resize(lex.size() - 3); }
+            }
+            e->lexeme = lex;
             try {
-                e->value = std::stod(tok.lexeme);
+                e->value = std::stod(lex);
             } catch (const std::exception&) {
                 errorHere("float literal out of range: " + tok.lexeme);
                 e->value = 0.0;
