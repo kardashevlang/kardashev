@@ -1277,6 +1277,7 @@ public:
             std::vector<TypePtr> genVars;
             std::vector<std::string> genBounds;
             std::vector<std::vector<std::string>> genExtraBounds;
+            std::vector<std::string> genConstNames; // Phase 59, parallel to genVars
             std::vector<std::pair<std::string, TypePtr>> effectRowVars;
             genVars.reserve(fn.genericParams.size());
             genBounds.reserve(fn.genericParams.size());
@@ -1326,6 +1327,8 @@ public:
                     genBounds.push_back(gp.bound);
                     genExtraBounds.push_back(gp.extraBounds);
                     genBoundParam.push_back(&gp);
+                    genConstNames.push_back(gp.isConst ? gp.name
+                                                       : std::string{});
                 }
             }
             // Implicit row vars (named only in fn-type rows, not in `<...>`)
@@ -1388,12 +1391,16 @@ public:
                                     : std::vector<std::string>{});
             }
 
+            // Phase 59: const-generic params in scope so `[i64; N]` in the
+            // signature is a SYMBOLIC length (not a const-eval failure).
+            setConstParamsInScope(fn.genericParams);
             std::vector<TypePtr> argTypes;
             argTypes.reserve(fn.params.size());
             for (const auto& p : fn.params) {
                 argTypes.push_back(resolveTypeRef(p.type));
             }
             TypePtr ret = resolveTypeRef(fn.returnType);
+            currentConstParams_.clear();
 
             currentGenericEnv_ = nullptr;
             currentEffectRowVarNames_ = nullptr;
@@ -1403,6 +1410,7 @@ public:
             FnSchema schema;
             schema.signature = makeFunction(std::move(argTypes), ret);
             schema.genericVars = std::move(genVars);
+            schema.constParamNames = std::move(genConstNames); // Phase 59
             schema.genericBounds = std::move(genBounds);
             schema.genericExtraBounds = std::move(genExtraBounds);
             schema.genericBoundArgs = std::move(genBoundArgs);
@@ -2407,6 +2415,7 @@ private:
         currentEffectRowVarById_.clear();
         currentVarBound_.clear();
         currentVarAllBounds_.clear();
+        currentConstParams_.clear(); // Phase 59
     }
 
     // Allocate a schema shell: an opaque Type (Struct or Enum kind, empty
@@ -3266,6 +3275,9 @@ private:
                                 fn.genericParams[i].extraBounds);
         }
 
+        // Phase 59: const-generic params are in scope for the whole body — so
+        // `[i64; N]` param types are symbolic and a bare `N` is a const value.
+        setConstParamsInScope(fn.genericParams);
         pushScope();
         for (const auto& p : fn.params) {
             scopes_.back()[p.name] = resolveTypeRef(p.type);
@@ -3312,6 +3324,7 @@ private:
         currentEffectRowVarById_.clear();
         currentVarBound_.clear();
         currentVarAllBounds_.clear();
+        currentConstParams_.clear(); // Phase 59
     }
 
     // --- Phase 25: the compile-time evaluator -------------------------------
@@ -3678,6 +3691,13 @@ private:
                     // give the use site a sensible type.
                 }
                 return declared;
+            }
+            // Phase 59: a bare const-generic param used as a VALUE (`N` in
+            // `dot<const N>`'s body) — type i64, monomorphized to the concrete
+            // value per instance (codegen emits a literal). A local of the same
+            // name shadows it (handled by lookupLocal above).
+            if (currentConstParams_.count(id->name)) {
+                return makeInt();
             }
             auto fnIt = fnSchemas_.find(id->name);
             if (fnIt != fnSchemas_.end()) {
@@ -5567,8 +5587,65 @@ private:
             }
             const std::size_t n =
                 std::min(instSig->args.size(), call.args.size());
+
+            // Phase 59: a const-generic fn (`dot<const N>(a: [i64; N], ...)`)
+            // infers each `const N` from the argument array dimensions. Uses
+            // that disagree are a compile-time DIMENSION MISMATCH; the inferred
+            // lengths are substituted into the signature (so ordinary arg
+            // unification then validates them) and recorded as const-value
+            // type-args so codegen monomorphizes per value.
+            bool fnHasConst = false;
+            for (const auto& nm : schema.constParamNames)
+                if (!nm.empty()) { fnHasConst = true; break; }
+            std::vector<TypePtr> preArgTypes;
+            if (fnHasConst) {
+                preArgTypes.reserve(call.args.size());
+                for (const auto& a : call.args)
+                    preArgTypes.push_back(checkExpr(*a));
+                std::unordered_map<std::string, std::size_t> constSubst;
+                for (std::size_t i = 0; i < n; ++i) {
+                    std::unordered_map<std::string, std::size_t> local;
+                    solveConstLengths(instSig->args[i], preArgTypes[i], local);
+                    for (const auto& [nm, val] : local) {
+                        auto it = constSubst.find(nm);
+                        if (it == constSubst.end())
+                            constSubst[nm] = val;
+                        else if (it->second != val)
+                            error("const generic parameter '" + nm + "' of '" +
+                                      call.callee +
+                                      "' is used with conflicting sizes " +
+                                      std::to_string(it->second) + " and " +
+                                      std::to_string(val) +
+                                      " (dimension mismatch)",
+                                  call.line, call.column);
+                    }
+                }
+                for (std::size_t i = 0; i < schema.genericVars.size(); ++i) {
+                    if (i < schema.constParamNames.size() &&
+                        !schema.constParamNames[i].empty() &&
+                        !constSubst.count(schema.constParamNames[i])) {
+                        error("cannot infer const generic parameter '" +
+                                  schema.constParamNames[i] + "' of '" +
+                                  call.callee +
+                                  "' from the arguments (it must appear in an "
+                                  "argument's array type)",
+                              call.line, call.column);
+                        constSubst[schema.constParamNames[i]] = 0;
+                    }
+                }
+                instSig = substituteConstLengths(instSig, constSubst);
+                for (std::size_t i = 0; i < schema.genericVars.size() &&
+                                        i < typeArgs.size(); ++i) {
+                    if (i < schema.constParamNames.size() &&
+                        !schema.constParamNames[i].empty())
+                        typeArgs[i] = makeConstValue(static_cast<long long>(
+                            constSubst[schema.constParamNames[i]]));
+                }
+            }
+
             for (std::size_t i = 0; i < n; ++i) {
-                TypePtr argType = checkExpr(*call.args[i]);
+                TypePtr argType =
+                    fnHasConst ? preArgTypes[i] : checkExpr(*call.args[i]);
                 // Phase 11: a `&Concrete`/`Box<Concrete>` arg coerces into a
                 // `&dyn Trait`/`Box<dyn Trait>` parameter.
                 if (!coerceOrUnify(*call.args[i], argType, instSig->args[i])) {
@@ -5580,7 +5657,7 @@ private:
                 }
             }
             for (std::size_t i = n; i < call.args.size(); ++i) {
-                checkExpr(*call.args[i]);
+                if (!fnHasConst) checkExpr(*call.args[i]);
             }
             // Phase 21b: now that args are unified, the callee's generic params
             // are pinned. Resolve each `C::Item` projection at this call site:
@@ -6104,14 +6181,20 @@ private:
                   ix.object->line, ix.object->column);
             return makeInt();
         }
-        // Compile-time bounds check for a constant literal index.
-        if (auto* lit = dynamic_cast<const ast::IntLitExpr*>(ix.index.get())) {
-            if (lit->value < 0 ||
-                static_cast<std::size_t>(lit->value) >= objTy->arrayLen) {
-                error("array index " + std::to_string(lit->value) +
-                          " out of bounds for array of length " +
-                          std::to_string(objTy->arrayLen),
-                      ix.index->line, ix.index->column);
+        // Compile-time bounds check for a constant literal index. Phase 59:
+        // skip it for a SYMBOLIC length `[T; N]` (N a const-generic param) —
+        // the length isn't known until the fn is monomorphized, so the check
+        // happens per instance / at runtime, not against the placeholder 0.
+        if (objTy->arrayLenParam.empty()) {
+            if (auto* lit =
+                    dynamic_cast<const ast::IntLitExpr*>(ix.index.get())) {
+                if (lit->value < 0 ||
+                    static_cast<std::size_t>(lit->value) >= objTy->arrayLen) {
+                    error("array index " + std::to_string(lit->value) +
+                              " out of bounds for array of length " +
+                              std::to_string(objTy->arrayLen),
+                          ix.index->line, ix.index->column);
+                }
             }
         }
         return objTy->arrayElem;

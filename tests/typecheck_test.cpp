@@ -2461,6 +2461,61 @@ void test_const_array_len_calls_nonconst_fn_errors() {
                       "const_array_len_calls_nonconst_fn_errors");
 }
 
+// Phase 58/59 (v10): const-generic monomorphization.
+void test_const_generic_struct_ok() {
+    expectOk("struct Mat<const N: i64> { data: [i64; N] }\n"
+             "fn main() -> i64 { let a: Mat<3> = Mat { data: [1, 2, 3] };"
+             " a.data[0] + a.data[2] }",
+             "const_generic_struct_ok");
+}
+
+void test_const_generic_type_in_const_slot_errors() {
+    expectErrContains("struct Mat<const N: i64> { data: [i64; N] }\n"
+                      "fn main() -> i64 { let a: Mat<i64> = Mat { data: [1] };"
+                      " 0 }",
+                      "const", "const_generic_type_in_const_slot_errors");
+}
+
+void test_const_generic_const_in_type_slot_errors() {
+    expectErrContains("struct W<T> { x: T }\n"
+                      "fn main() -> i64 { let a: W<3> = W { x: 1 }; 0 }",
+                      "expects a type",
+                      "const_generic_const_in_type_slot_errors");
+}
+
+void test_const_generic_fn_ok() {
+    expectOk("fn dot<const N: i64>(a: [i64; N], b: [i64; N]) -> i64 {\n"
+             "    let mut acc = 0; let mut i = 0;\n"
+             "    while i < N { acc = acc + a[i] * b[i]; i = i + 1; }\n"
+             "    acc\n"
+             "}\n"
+             "fn main() -> i64 {\n"
+             "    let x: [i64; 3] = [1, 2, 3];\n"
+             "    let y: [i64; 3] = [4, 5, 6];\n"
+             "    dot(x, y)\n"
+             "}",
+             "const_generic_fn_ok");
+}
+
+void test_const_generic_dim_mismatch_errors() {
+    expectErrContains("fn dot<const N: i64>(a: [i64; N], b: [i64; N]) -> i64 {"
+                      " a[0] }\n"
+                      "fn main() -> i64 {\n"
+                      "    let x: [i64; 3] = [1, 2, 3];\n"
+                      "    let y: [i64; 2] = [4, 5];\n"
+                      "    dot(x, y)\n"
+                      "}",
+                      "dimension mismatch",
+                      "const_generic_dim_mismatch_errors");
+}
+
+void test_const_generic_fn_uninferable_errors() {
+    expectErrContains("fn mk<const N: i64>() -> i64 { N }\n"
+                      "fn main() -> i64 { mk() }",
+                      "cannot infer const generic parameter",
+                      "const_generic_fn_uninferable_errors");
+}
+
 } // namespace
 
 int main() {
@@ -2726,6 +2781,13 @@ int main() {
     test_const_fn_in_const_context_ok();
     test_const_fn_at_runtime_ok();
     test_const_generic_array_len_ok();
+    // Phase 58/59 (v10): const-generic monomorphization + dimension unification.
+    test_const_generic_struct_ok();
+    test_const_generic_type_in_const_slot_errors();
+    test_const_generic_const_in_type_slot_errors();
+    test_const_generic_fn_ok();
+    test_const_generic_dim_mismatch_errors();
+    test_const_generic_fn_uninferable_errors();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -2734,6 +2796,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (248 cases)\n";
+    std::cout << "All typecheck tests passed (254 cases)\n";
     return 0;
 }

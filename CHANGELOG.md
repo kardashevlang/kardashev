@@ -34,6 +34,12 @@ effect system's last soundness floor.
   each `const N` from the dimensions of the field that carries it
   (`Mat { data: [1,2,3] }` is a `Mat<3>`). Type/const argument slot mismatches,
   a const-value dimension mismatch, and negative const args are compile errors.
+- Const-generic FUNCTIONS + compile-time dimension unification (Phase 59):
+  `fn dot<const N>(a: [i64; N], b: [i64; N]) -> i64` infers N from the argument
+  array lengths, lets `N` be used as a value in the body, and monomorphizes per
+  size (`@dot__c3` over `[3 x i64]` vs `@dot__c2`). A dimension MISMATCH
+  (`dot([i64;3], [i64;2])`) and a const param that appears in no argument array
+  type are compile errors.
 
 ## [0.9.0] — Roadmap v9 "data in motion" (Phases 51–56)
 

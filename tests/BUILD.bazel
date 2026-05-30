@@ -537,6 +537,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 59 (v10): const-generic FUNCTIONS — `dot<const N>` infers N from the
+# argument array lengths, uses it as a value, monomorphizes per size, and a
+# dimension mismatch is a compile error. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase59",
+    srcs = ["smoke_test_phase59.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

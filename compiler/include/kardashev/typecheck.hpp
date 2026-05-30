@@ -70,6 +70,13 @@ struct EffectSet {
 struct FnSchema {
     TypePtr signature;
     std::vector<TypePtr> genericVars;
+    // Phase 59 (v10): one entry per genericVars[i] — the const-param NAME if
+    // that position is a `const N` parameter, else empty (an ordinary type
+    // param). A const param's Var is a placeholder (never referenced by the
+    // signature, which carries N as an array `arrayLenParam`); this lets the
+    // call site infer N from the argument array lengths and codegen
+    // monomorphize per value (`dot<3>` vs `dot<5>`).
+    std::vector<std::string> constParamNames;
     // One entry per genericVars[i]: the trait-name bound (empty for an
     // unbounded param). This is the PRIMARY bound; Phase 28 carries any
     // additional bounds (`T: A + B`) in `genericExtraBounds` below.

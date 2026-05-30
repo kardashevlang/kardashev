@@ -604,6 +604,11 @@ private:
     // Same information keyed by schema-Var ID, so we can resolve TypePtrs
     // recovered from `tc_.callInstantiations` (which carry Vars, not names).
     std::unordered_map<int, TypePtr> currentSchemaVarSubst_;
+    // Phase 59 (v10): const-generic param NAME -> concrete value for the
+    // instance being emitted. Resolves a symbolic array length `[T; N]` in the
+    // signature / body to its size, and a bare `N` used as a value to a
+    // literal. Empty outside a const-generic instance.
+    std::unordered_map<std::string, std::size_t> currentConstParamSubst_;
 
     // Module-wide: struct name -> LLVM struct type.
     std::unordered_map<std::string, llvm::StructType*> structTypes_;
@@ -5702,7 +5707,24 @@ private:
             TypePtr elem = tr.typeArgs.empty()
                                ? makeInt()
                                : astTypeRefToConcrete(tr.typeArgs[0]);
-            TypePtr arr = makeArray(elem, tr.arrayLen);
+            // Phase 59: a SYMBOLIC length `[T; N]` (N a const-generic param)
+            // resolves to the instance's bound value. tr.arrayLen is 0 for a
+            // symbolic length (typecheck never folds it); the name lives in the
+            // arrayLenExpr identifier.
+            std::size_t len = tr.arrayLen;
+            std::string param;
+            if (tr.arrayLenExpr) {
+                if (auto* id = dynamic_cast<const ast::IdentExpr*>(
+                        tr.arrayLenExpr.get())) {
+                    auto it = currentConstParamSubst_.find(id->name);
+                    if (it != currentConstParamSubst_.end())
+                        len = it->second;
+                    else
+                        param = id->name; // still symbolic (template, not used)
+                }
+            }
+            TypePtr arr = makeArray(elem, len);
+            arr->arrayLenParam = param;
             if (tr.isRef) return makeRef(arr, tr.refIsMut);
             return arr;
         }
@@ -6108,8 +6130,23 @@ private:
         case TypeKind::Array: {
             // Phase 22: pin a generic element type to the instance's concrete.
             TypePtr elem = resolveInInstance(r->arrayElem);
-            if (elem.get() == r->arrayElem.get()) return r;
-            return makeArray(elem, r->arrayLen);
+            // Phase 59: resolve a symbolic length `[T; N]` to the instance's
+            // bound const value.
+            std::size_t len = r->arrayLen;
+            std::string param = r->arrayLenParam;
+            if (!param.empty()) {
+                auto it = currentConstParamSubst_.find(param);
+                if (it != currentConstParamSubst_.end()) {
+                    len = it->second;
+                    param.clear();
+                }
+            }
+            if (elem.get() == r->arrayElem.get() && len == r->arrayLen &&
+                param == r->arrayLenParam)
+                return r;
+            TypePtr a = makeArray(elem, len);
+            a->arrayLenParam = param;
+            return a;
         }
         case TypeKind::Tuple: {
             bool changed = false;
@@ -6178,10 +6215,26 @@ private:
         }
     }
 
+    // Phase 59: record `name -> value` for each const-value type-arg of an
+    // instance, reading the position->name map from the schema's
+    // constParamNames. `sch` may be null (no schema) — then no const params.
+    void recordConstParamSubst(const std::vector<std::string>& constParamNames,
+                               const std::vector<TypePtr>& typeArgs) {
+        for (std::size_t i = 0;
+             i < constParamNames.size() && i < typeArgs.size(); ++i) {
+            if (constParamNames[i].empty()) continue;
+            TypePtr a = resolve(typeArgs[i]);
+            if (a->kind == TypeKind::Int && a->isConstValue && a->constValue >= 0)
+                currentConstParamSubst_[constParamNames[i]] =
+                    static_cast<std::size_t>(a->constValue);
+        }
+    }
+
     void setInstanceContext(const ast::FnDecl& fn,
                             const std::vector<TypePtr>& typeArgs) {
         currentInstanceTypeMap_.clear();
         currentSchemaVarSubst_.clear();
+        currentConstParamSubst_.clear();
         // Phase 40: a method of a GENERIC impl. typeArgs are the impl's own
         // generic params (= the receiver's type args). Bind them by name +
         // their schema Vars (the schema, keyed by the mangled base, lists the
@@ -6206,6 +6259,9 @@ private:
                         currentSchemaVarSubst_[gv->varId] = typeArgs[i];
                 }
             }
+            // Phase 61: an impl's const params (e.g. `RingBuffer<T, const CAP>`)
+            // bind their values for the method body's `[T; CAP]` types.
+            if (sch) recordConstParamSubst(sch->constParamNames, typeArgs);
             // Self = the impl's forType with the params now bound.
             currentInstanceTypeMap_["Self"] = astTypeRefToConcrete(impl->forType);
             return;
@@ -6220,6 +6276,9 @@ private:
                     typeArgs[i];
             }
         }
+        // Phase 59: bind const-generic param values for `[T; N]` / `N`-as-value.
+        if (schemaIt != tc_.fnSchemas.end())
+            recordConstParamSubst(schemaIt->second.constParamNames, typeArgs);
     }
 
     void declareMonoFn(const ast::FnDecl& fn) {
@@ -6287,6 +6346,7 @@ private:
                                      const std::string& mangledName) {
         auto savedMap = currentInstanceTypeMap_;
         auto savedSubst = currentSchemaVarSubst_;
+        auto savedConst = currentConstParamSubst_; // Phase 59
         setInstanceContext(fn, typeArgs);
         llvm::FunctionType* fty = fnTypeFromDecl(fn);
         auto* f = llvm::Function::Create(
@@ -6299,6 +6359,7 @@ private:
         declaredFns_[mangledName] = f;
         currentInstanceTypeMap_ = std::move(savedMap);
         currentSchemaVarSubst_ = std::move(savedSubst);
+        currentConstParamSubst_ = std::move(savedConst);
         return f;
     }
 
@@ -8002,6 +8063,15 @@ private:
                     return llvm::ConstantInt::get(
                         llvm::Type::getInt64Ty(*ctx_),
                         static_cast<uint64_t>(cv.value), /*isSigned=*/true);
+                }
+                // Phase 59: a const-generic param used as a VALUE (`N` in the
+                // body of `dot<const N>`) lowers to this instance's concrete
+                // literal — zero runtime cost, distinct per monomorphization.
+                if (auto cpIt = currentConstParamSubst_.find(id->name);
+                    cpIt != currentConstParamSubst_.end()) {
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_),
+                        static_cast<uint64_t>(cpIt->second), /*isSigned=*/true);
                 }
             }
             // Phase 17a: a by-ref capture reads through the env pointer into
