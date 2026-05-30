@@ -697,6 +697,14 @@ sh_test(
     ],
 )
 
+# v12 pre-merge adversarial-review regressions: parse_int ERANGE overflow ->
+# None, and a discarded owned call-result (vec_remove statement) dropped once.
+sh_test(
+    name = "smoke_test_v12_review",
+    srcs = ["smoke_test_v12_review.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

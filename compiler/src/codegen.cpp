@@ -1723,12 +1723,27 @@ private:
             auto* nulP = b.CreateInBoundsGEP(i8Ty, buf, len, "nul_p");
             b.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulP);
             llvm::Value* val;
+            // Review fix (v12): an integer that OVERFLOWS i64 must be None, not
+            // a silently-clamped Some. strtoll clamps to LLONG_MAX/MIN and sets
+            // errno=ERANGE, so we clear errno before the call and treat ERANGE
+            // as a parse failure. (strtod's ERANGE is overflow-to-inf, which IS
+            // a valid f64 parse — Rust agrees — so the float path skips this.)
+            llvm::Value* notOverflow = llvm::ConstantInt::getTrue(ctx);
             if (isFloat) {
                 auto* strtodTy = llvm::FunctionType::get(
                     valTy, {i8PtrTy, i8PtrTy}, false);
                 auto strtod = module_->getOrInsertFunction("strtod", strtodTy);
                 val = b.CreateCall(strtod, {buf, endSlot}, "pval");
             } else {
+                // errno is `*__errno_location()` on glibc/musl, `*__error()` on
+                // Darwin. ERANGE == 34 on both.
+                llvm::Triple triple(llvm::sys::getDefaultTargetTriple());
+                const char* errnoSym =
+                    triple.isOSDarwin() ? "__error" : "__errno_location";
+                auto errnoLoc = module_->getOrInsertFunction(
+                    errnoSym, llvm::FunctionType::get(i8PtrTy, {}, false));
+                b.CreateStore(llvm::ConstantInt::get(i32Ty, 0),
+                              b.CreateCall(errnoLoc, {}, "errno_loc0"));
                 auto* strtollTy = llvm::FunctionType::get(
                     valTy, {i8PtrTy, i8PtrTy, i32Ty}, false);
                 auto strtoll =
@@ -1736,6 +1751,10 @@ private:
                 val = b.CreateCall(
                     strtoll,
                     {buf, endSlot, llvm::ConstantInt::get(i32Ty, 10)}, "pval");
+                auto* errv = b.CreateLoad(
+                    i32Ty, b.CreateCall(errnoLoc, {}, "errno_loc1"), "errno_v");
+                notOverflow = b.CreateICmpNE(
+                    errv, llvm::ConstantInt::get(i32Ty, 34), "not_erange");
             }
             // Valid iff (a) the whole string was consumed (endptr at the NUL)
             // AND (b) there was no leading whitespace. strtoll/strtod silently
@@ -1751,6 +1770,7 @@ private:
             auto* notWs = b.CreateICmpUGT(
                 firstU, llvm::ConstantInt::get(i32Ty, 32), "not_ws");
             consumed = b.CreateAnd(consumed, notWs, "valid");
+            consumed = b.CreateAnd(consumed, notOverflow, "valid_no_ovf");
             b.CreateStore(val, outArg);
             b.CreateBr(mergeBB);
 
@@ -8274,7 +8294,30 @@ private:
             return;
         }
         if (auto* es = dynamic_cast<const ast::ExprStmt*>(&s)) {
-            emitExpr(*es->expr);
+            llvm::Value* v = emitExpr(*es->expr);
+            // Review fix (v12): a discarded owned temporary leaks. The String
+            // moved out by `vec_remove(&mut v, 0);` (or `int_to_string(n);`)
+            // used as an expression-statement is never bound, so without this it
+            // is never dropped and its heap is orphaned. Only a CALL result is a
+            // fresh, untracked owned temporary that is safe to drop here
+            // unconditionally (a bare place / identifier has its own move+drop
+            // accounting). The temp slot is an ENTRY-block alloca so a discard
+            // inside a loop doesn't grow the stack.
+            bool callLike =
+                dynamic_cast<const ast::CallExpr*>(es->expr.get()) ||
+                dynamic_cast<const ast::MethodCallExpr*>(es->expr.get()) ||
+                dynamic_cast<const ast::CallValueExpr*>(es->expr.get());
+            if (callLike && v) {
+                auto tit = tc_.exprTypes.find(es->expr.get());
+                if (tit != tc_.exprTypes.end()) {
+                    TypePtr ty = resolveInInstance(tit->second);
+                    if (isDroppable(ty)) {
+                        auto* tmp = entryAlloca(v->getType(), "discard.tmp");
+                        builder_->CreateStore(v, tmp);
+                        emitDropGlue(tmp, ty);
+                    }
+                }
+            }
             return;
         }
     }

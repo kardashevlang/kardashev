@@ -71,4 +71,19 @@ EOF
 [[ "$("$KARDC" "$TMP/big.kd" 2>/dev/null | head -1)" == "9223372036854775807" ]] || { echo "FAIL [big]: i64::MAX did not round-parse"; exit 1; }
 echo "PASS [big]: parse_int handles i64::MAX"
 
+# Review fix: a value that OVERFLOWS i64 is None, not a silently-clamped Some.
+cat > "$TMP/ovf.kd" <<'EOF'
+fn p(s: &String) -> i64 { match parse_int(s) { Some(v) => v, None => 0 - 1 } }
+fn main() -> i64 ! { io } {
+    let a = "9223372036854775808";    // i64::MAX + 1
+    let b = "-9223372036854775809";   // i64::MIN - 1
+    let c = "99999999999999999999";   // 20 nines
+    let d = "-9223372036854775808";   // i64::MIN (valid)
+    print(p(&a)); print(p(&b)); print(p(&c)); print(p(&d));
+    0
+}
+EOF
+[[ "$("$KARDC" "$TMP/ovf.kd" 2>/dev/null | head -4)" == $'-1\n-1\n-1\n-9223372036854775808' ]] || { echo "FAIL [overflow]: i64 overflow not rejected"; exit 1; }
+echo "PASS [overflow]: parse_int rejects values past i64 range (ERANGE), accepts i64::MIN"
+
 echo "ALL PHASE 69 SMOKE TESTS PASSED"
