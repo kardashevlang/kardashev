@@ -72,11 +72,15 @@ for ex in $EXAMPLES; do
     fi
 
     # The first AOT-many lines of the JIT output must equal the AOT output.
-    jit_printed=$(printf '%s\n' "$jit" | head -n "$na")
-    if [[ "$na" -gt 0 && "$jit_printed" != "$aot" ]]; then
-        echo "FAIL [$ex]: JIT/AOT printed output diverges"
-        diff <(printf '%s\n' "$jit_printed") <(printf '%s\n' "$aot") || true
-        exit 1
+    # (Guard on na>0: BSD/macOS `head -n 0` errors out — GNU treats it as empty —
+    # and an all-printing-suppressed program like matrix has na==0.)
+    if [[ "$na" -gt 0 ]]; then
+        jit_printed=$(printf '%s\n' "$jit" | head -n "$na")
+        if [[ "$jit_printed" != "$aot" ]]; then
+            echo "FAIL [$ex]: JIT/AOT printed output diverges"
+            diff <(printf '%s\n' "$jit_printed") <(printf '%s\n' "$aot") || true
+            exit 1
+        fi
     fi
 
     # The JIT's trailing line (main's return) mod 256 must equal the AOT exit.
