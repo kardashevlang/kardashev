@@ -200,6 +200,16 @@ private:
         long long value = 0;
         try {
             value = std::stoll(lex, nullptr, base);
+        } catch (const std::out_of_range&) {
+            // Phase 66: a value past i64::MAX is still valid for u64 (the FNV
+            // offset basis `0xcbf29ce484222325`, etc.) — parse it as unsigned
+            // and keep the 64-bit pattern (codegen emits it as a u64 constant).
+            try {
+                value = static_cast<long long>(std::stoull(lex, nullptr, base));
+            } catch (const std::exception&) {
+                errorHere("integer literal out of range: " + tok.lexeme);
+                value = 0;
+            }
         } catch (const std::exception&) {
             errorHere("integer literal out of range: " + tok.lexeme);
             value = 0;
@@ -1300,9 +1310,14 @@ private:
 
     // --- Expressions ---
 
+    // Precedence tiers (tighter = larger). Phase 66 inserts the bitwise tiers
+    // BETWEEN comparison and additive, matching Rust: `&&` < comparison <
+    // `|` < `^` < `&` < shift < `+ -` < `* / %`. Shift (`<< >>`) is a two-token
+    // operator handled by adjacency in parseExprPrec (kShiftPrec).
+    static constexpr int kShiftPrec = 6;
     static int binPrec(TokenKind k) {
         switch (k) {
-        case TokenKind::AmpAmp: // Phase 33: `&&` binds loosest (below comparisons)
+        case TokenKind::AmpAmp: // `&&` binds loosest (below comparisons)
             return 1;
         case TokenKind::EqEq:
         case TokenKind::NotEq:
@@ -1311,13 +1326,20 @@ private:
         case TokenKind::Gt:
         case TokenKind::Ge:
             return 2;
+        case TokenKind::Pipe: // Phase 66: infix bitwise-or
+            return 3;
+        case TokenKind::Caret: // Phase 66: bitwise-xor
+            return 4;
+        case TokenKind::Ampersand: // Phase 66: infix bitwise-and
+            return 5;
+        // kShiftPrec == 6 (handled by adjacency, not a single token)
         case TokenKind::Plus:
         case TokenKind::Minus:
-            return 3;
+            return 7;
         case TokenKind::Star:
         case TokenKind::Slash:
-        case TokenKind::Percent: // Phase 33: `%` at the multiplicative tier
-            return 4;
+        case TokenKind::Percent: // `%` at the multiplicative tier
+            return 8;
         default:
             return 0; // not a binop
         }
@@ -1337,6 +1359,9 @@ private:
         case TokenKind::Ge: return ast::BinOp::Ge;
         case TokenKind::EqEq: return ast::BinOp::Eq;
         case TokenKind::NotEq: return ast::BinOp::NotEq;
+        case TokenKind::Pipe: return ast::BinOp::BitOr;      // Phase 66
+        case TokenKind::Caret: return ast::BinOp::BitXor;    // Phase 66
+        case TokenKind::Ampersand: return ast::BinOp::BitAnd; // Phase 66
         default: return ast::BinOp::Add; // unreachable
         }
     }
@@ -1385,6 +1410,31 @@ private:
     ast::ExprPtr parseExprPrec(int minPrec) {
         auto lhs = parseCast();
         while (true) {
+            // Phase 66: a shift operator is two column-adjacent `<`/`>` tokens.
+            // Detecting it by adjacency (not a dedicated lexer token) keeps a
+            // nested-generic close `Vec<Vec<T>>` — which is also two adjacent
+            // `>` but only ever parsed in TYPE context — unambiguous, since the
+            // expression parser never parses a type.
+            bool isShl = peek().kind == TokenKind::Lt &&
+                         peek(1).kind == TokenKind::Lt &&
+                         peek(1).column == peek().column + 1;
+            bool isShr = peek().kind == TokenKind::Gt &&
+                         peek(1).kind == TokenKind::Gt &&
+                         peek(1).column == peek().column + 1;
+            if (isShl || isShr) {
+                if (kShiftPrec < minPrec) break;
+                Token opTok = consume(); // first '<' / '>'
+                consume();               // second '<' / '>'
+                auto rhs = parseExprPrec(kShiftPrec + 1); // left-associative
+                auto bin = std::make_unique<ast::BinaryExpr>();
+                bin->line = opTok.line;
+                bin->column = opTok.column;
+                bin->op = isShl ? ast::BinOp::Shl : ast::BinOp::Shr;
+                bin->lhs = std::move(lhs);
+                bin->rhs = std::move(rhs);
+                lhs = std::move(bin);
+                continue;
+            }
             int prec = binPrec(peek().kind);
             if (prec == 0 || prec < minPrec) break;
             Token opTok = consume();
@@ -1413,7 +1463,7 @@ private:
         // multiplication, handled in the precedence parser — position
         // disambiguates, the standard prefix/infix split).
         if (check(TokenKind::Minus) || check(TokenKind::Bang) ||
-            check(TokenKind::Star)) {
+            check(TokenKind::Star) || check(TokenKind::Tilde)) {
             Token opTok = consume();
             auto operand = parseUnary();
             auto ue = std::make_unique<ast::UnaryExpr>();
@@ -1421,7 +1471,8 @@ private:
             ue->column = opTok.column;
             ue->op = opTok.kind == TokenKind::Minus  ? ast::UnaryOp::Neg
                      : opTok.kind == TokenKind::Bang ? ast::UnaryOp::Not
-                                                     : ast::UnaryOp::Deref;
+                     : opTok.kind == TokenKind::Tilde ? ast::UnaryOp::BitNot
+                                                      : ast::UnaryOp::Deref;
             ue->operand = std::move(operand);
             return ue;
         }

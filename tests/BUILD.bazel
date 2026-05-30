@@ -611,6 +611,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 66 (v11 — the numeric tower): unsigned ints u8..u64 + bitwise ops
+# (& | ^ << >> ~); unsigned div/cmp/lshr vs signed sdiv/cmp/ashr; FNV-1a step.
+sh_test(
+    name = "smoke_test_phase66",
+    srcs = ["smoke_test_phase66.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

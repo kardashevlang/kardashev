@@ -2635,11 +2635,11 @@ void test_int_suffix_width_mismatch_errors() {
                       "int_suffix_width_mismatch_errors");
 }
 
-void test_unsigned_suffix_deferred_errors() {
-    // u8..u64 suffixes are honestly rejected until Phase 66 lands unsigned ints.
-    expectErrContains("fn main() -> i64 { let x = 5u8; 0 }",
-                      "unsigned",
-                      "unsigned_suffix_deferred_errors");
+void test_unsigned_suffix_ok() {
+    // Phase 66: an unsigned suffix `5u8` is now a real u8 (Phase 64 deferred it).
+    expectOk("fn use8(x: u8) -> u8 { x }\n"
+             "fn main() -> i64 { let x = use8(5u8); 0 }",
+             "unsigned_suffix_ok");
 }
 
 // Phase 65 (v11): the `as` numeric cast operator.
@@ -2691,6 +2691,53 @@ void test_cast_result_type_is_target() {
                       " b }",
                       "i32",
                       "cast_result_type_is_target");
+}
+
+// Phase 66 (v11): unsigned integers + bitwise operators.
+void test_unsigned_types_ok() {
+    expectOk("fn f(a: u8, b: u16, c: u32, d: u64) -> u64 { d }\n"
+             "fn main() -> i64 { let r = f(1u8, 2u16, 3u32, 4u64); 0 }",
+             "unsigned_types_ok");
+}
+
+void test_unsigned_is_distinct_from_signed() {
+    // u32 and i32 are distinct non-coercive types — no implicit crossing.
+    expectErrContains("fn main() -> i64 { let a: u32 = 5; let b: i32 = 7;"
+                      " let c = a + b; 0 }",
+                      "same integer",
+                      "unsigned_is_distinct_from_signed");
+}
+
+void test_bitwise_ops_ok() {
+    expectOk("fn main() -> i64 { let x: u32 = 240; let y: u32 = 15;"
+             " let a = x & y; let b = x | y; let c = x ^ y;"
+             " let d = x << 2; let e = x >> 1; (a | b | c | d | e) as i64 }",
+             "bitwise_ops_ok");
+}
+
+void test_bitnot_ok() {
+    expectOk("fn main() -> i64 { let x: u8 = 15; let y = ~x; y as i64 }",
+             "bitnot_ok");
+}
+
+void test_bitwise_on_float_rejected() {
+    expectErrContains("fn main() -> i64 { let x: f64 = 1.0; let y = x & x;"
+                      " 0 }",
+                      "bitwise",
+                      "bitwise_on_float_rejected");
+}
+
+void test_unsigned_literal_range_checked() {
+    // u8 max is 255 — an out-of-range annotated literal is an error.
+    expectErrContains("fn main() -> i64 { let x: u8 = 300; 0 }",
+                      "out of range",
+                      "unsigned_literal_range_checked");
+}
+
+void test_u64_large_literal_ok() {
+    // A u64 literal past i64::MAX (the FNV offset basis) is valid.
+    expectOk("fn main() -> i64 { let x: u64 = 0xcbf29ce484222325; 0 }",
+             "u64_large_literal_ok");
 }
 
 } // namespace
@@ -2981,7 +3028,7 @@ int main() {
     test_radix_suffix_combo_ok();
     test_int_suffix_out_of_range_errors();
     test_int_suffix_width_mismatch_errors();
-    test_unsigned_suffix_deferred_errors();
+    test_unsigned_suffix_ok();
     test_cast_bridges_mixed_width_ok();
     test_cast_int_float_roundtrip_ok();
     test_cast_narrowing_ok();
@@ -2989,6 +3036,13 @@ int main() {
     test_cast_struct_rejected();
     test_cast_bool_rejected();
     test_cast_result_type_is_target();
+    test_unsigned_types_ok();
+    test_unsigned_is_distinct_from_signed();
+    test_bitwise_ops_ok();
+    test_bitnot_ok();
+    test_bitwise_on_float_rejected();
+    test_unsigned_literal_range_checked();
+    test_u64_large_literal_ok();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -2997,6 +3051,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (276 cases)\n";
+    std::cout << "All typecheck tests passed (283 cases)\n";
     return 0;
 }

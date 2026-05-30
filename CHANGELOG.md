@@ -54,6 +54,20 @@ instead of i64-only. The first step toward production use.
   two's-complement semantics (`300 as i8` == 44) identically at compile time
   and run time. Casting from/to a non-numeric type (a struct, `bool`, String,
   reference) is a compile error.
+- **Unsigned integers** `u8` / `u16` / `u32` / `u64` and the integer **bitwise
+  operators** `& | ^ << >> ~` (Phase 66). Each unsigned type is a distinct
+  non-coercive type (`u32` ≠ `i32`; `as` bridges), and codegen lowers its
+  division, remainder, ordering comparison, and right-shift to the UNSIGNED
+  opcode (`udiv` / `urem` / `icmp u…` / `lshr`) — a signed right-shift stays
+  arithmetic (`ashr`). A `u64` literal past `i64::MAX` (e.g. the FNV-1a offset
+  basis `0xcbf29ce484222325`) parses, and a wrapping `u64` multiply yields the
+  textbook hash. Bitwise operators work on any integer width/signedness, fold
+  in const expressions, and are rejected on `f64`. The `&` and `|` tokens are
+  position-disambiguated (prefix `&` is still a borrow, a primary `|…|` is
+  still a closure; infix they are bitwise-and / bitwise-or), and `<<` / `>>`
+  are parsed by token adjacency so nested generics `Vec<Vec<T>>` stay
+  unambiguous. Operator precedence now matches Rust: `&&` < comparison < `|` <
+  `^` < `&` < shift < `+ -` < `* / %`.
 
 ## [0.10.0] — Roadmap v10 "sized and sound at compile time" (Phases 57–62)
 

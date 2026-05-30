@@ -3209,18 +3209,22 @@ private:
                 error("i64 takes no type arguments", tr.line, tr.column);
             return makeInt();
         }
-        // v11 Phase 63: the SIZED SIGNED machine integers i8/i16/i32 (i64 is
-        // the default above). Unsigned u8..u64 land in Phase 66 with their own
-        // division/shift/comparison semantics.
+        // v11: the SIZED machine integers — signed i8/i16/i32 (Phase 63) and
+        // unsigned u8/u16/u32/u64 (Phase 66); i64 is the signed default above.
+        // Each is a distinct non-coercive type (unify checks width AND sign);
+        // `as` bridges between them, and codegen picks udiv/urem/lshr/icmp-u
+        // for the unsigned ones.
         {
-            static const std::pair<const char*, int> kInts[] = {
-                {"i8", 8}, {"i16", 16}, {"i32", 32}};
-            for (const auto& [nm, w] : kInts) {
-                if (tr.name == nm) {
+            static const struct { const char* nm; int w; bool sg; } kInts[] = {
+                {"i8", 8, true},  {"i16", 16, true},  {"i32", 32, true},
+                {"u8", 8, false}, {"u16", 16, false}, {"u32", 32, false},
+                {"u64", 64, false}};
+            for (const auto& it : kInts) {
+                if (tr.name == it.nm) {
                     if (!tr.typeArgs.empty())
-                        error(std::string(nm) + " takes no type arguments",
+                        error(std::string(it.nm) + " takes no type arguments",
                               tr.line, tr.column);
-                    return makeIntW(w, /*isSigned=*/true);
+                    return makeIntW(it.w, it.sg);
                 }
             }
         }
@@ -3684,6 +3688,38 @@ private:
             if (of) constFail("integer overflow in const expr", bin);
             return {false, out};
         }
+        case Op::BitAnd:
+        case Op::BitOr:
+        case Op::BitXor:
+        case Op::Shl:
+        case Op::Shr: {
+            // Phase 66: integer bitwise ops fold at const time. Signedness only
+            // matters for `>>` (arithmetic vs logical); the const evaluator is
+            // i64-valued, so it folds as a signed i64 (arithmetic shift), which
+            // matches a signed-typed const. An unsigned const that needs a
+            // logical shift should compute at run time.
+            if (l.isBool || r.isBool)
+                constFail("bitwise op requires integer operands in a const "
+                          "expr",
+                          bin);
+            std::int64_t out = 0;
+            if (bin.op == Op::BitAnd) out = l.i & r.i;
+            else if (bin.op == Op::BitOr) out = l.i | r.i;
+            else if (bin.op == Op::BitXor) out = l.i ^ r.i;
+            else if (bin.op == Op::Shl) {
+                if (r.i < 0 || r.i >= 64)
+                    constFail("shift amount out of range (0..63) in const expr",
+                              bin);
+                out = static_cast<std::int64_t>(static_cast<std::uint64_t>(l.i)
+                                                << r.i);
+            } else { // Shr (arithmetic, for the signed const evaluator)
+                if (r.i < 0 || r.i >= 64)
+                    constFail("shift amount out of range (0..63) in const expr",
+                              bin);
+                out = l.i >> r.i;
+            }
+            return {false, out};
+        }
         }
         constFail("unsupported operator in const expr", bin);
     }
@@ -3838,17 +3874,8 @@ private:
             // and signedness — it does not narrow, it IS that type. A range
             // check at the suffixed width still applies (see below).
             if (lit->suffixWidth != 0) {
-                // Phase 66 lands unsigned integers (u8..u64); until then an
-                // unsigned suffix names a type with no real semantics, so
-                // reject it honestly rather than silently mis-typing.
-                if (!lit->suffixSigned) {
-                    error("unsigned integer literals (" +
-                              intTypeName(lit->suffixWidth, false) +
-                              ") arrive with unsigned integers in a later "
-                              "phase; use a signed width for now",
-                          e.line, e.column);
-                    return makeInt();
-                }
+                // Phase 64/66: a suffixed literal IS its concrete type (signed
+                // i8..i64 or unsigned u8..u64), range-checked at that width.
                 if (!intLitFitsWidth(lit->value, lit->suffixWidth,
                                      lit->suffixSigned)) {
                     error("integer literal " + std::to_string(lit->value) +
@@ -4929,15 +4956,29 @@ private:
                                   (bin.op == ast::BinOp::Ge) ||
                                   (bin.op == ast::BinOp::Eq) ||
                                   (bin.op == ast::BinOp::NotEq);
-        const char* what = isComparison ? "comparison" : "arithmetic";
+        // Phase 66: integer bitwise operators (& | ^ << >>). Integer-only (any
+        // width/signedness); like arithmetic they return the operand int type,
+        // but they are NOT defined for f64.
+        const bool isBitwise = (bin.op == ast::BinOp::BitAnd) ||
+                               (bin.op == ast::BinOp::BitOr) ||
+                               (bin.op == ast::BinOp::BitXor) ||
+                               (bin.op == ast::BinOp::Shl) ||
+                               (bin.op == ast::BinOp::Shr);
+        const char* what =
+            isComparison ? "comparison" : isBitwise ? "bitwise" : "arithmetic";
         // Phase 39: f64 arithmetic / comparison. If a side is already f64, both
         // sides must be f64 — there is NO implicit i64<->f64 coercion (use
-        // to_f64 / float_to_int). `%` is integer-only.
+        // to_f64 / float_to_int). `%` and the bitwise ops are integer-only.
         if (resolve(lhs)->kind == TypeKind::Float ||
             resolve(rhs)->kind == TypeKind::Float) {
             if (bin.op == ast::BinOp::Mod) {
                 error("`%` (modulo) is not defined for f64", bin.line,
                       bin.column);
+            }
+            if (isBitwise) {
+                error("bitwise operators (& | ^ << >>) are not defined for "
+                      "f64",
+                      bin.line, bin.column);
             }
             if (!unify(lhs, makeFloat())) {
                 error(std::string(what) + " op expects f64 on lhs, got " +
@@ -6277,6 +6318,18 @@ private:
                       un.operand->line, un.operand->column);
             }
             return makeBool();
+        case ast::UnaryOp::BitNot: {
+            // Phase 66: `~x` is the bitwise complement of an integer of any
+            // width/signedness; the result is that same int type.
+            TypePtr r = resolve(operand);
+            if (r->kind != TypeKind::Int || r->isConstValue) {
+                error("unary `~` requires an integer operand, got " +
+                          typeToString(operand),
+                      un.operand->line, un.operand->column);
+                return makeInt();
+            }
+            return r;
+        }
         case ast::UnaryOp::Deref: {
             // Phase 34: `*r` reads the pointee of a `&T` / `&mut T` / Box<T>.
             TypePtr r = resolve(operand);

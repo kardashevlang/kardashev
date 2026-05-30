@@ -314,6 +314,8 @@ std::vector<Token> lex(std::string_view source) {
         case '&': push1(TokenKind::Ampersand, startCol); continue;
         case '!': push1(TokenKind::Bang, startCol); continue;
         case '|': push1(TokenKind::Pipe, startCol); continue;
+        case '^': push1(TokenKind::Caret, startCol); continue; // Phase 66 bit-xor
+        case '~': push1(TokenKind::Tilde, startCol); continue; // Phase 66 bit-not
         default: break;
         }
 
@@ -389,6 +391,8 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::Bang: return "Bang";
     case TokenKind::Pipe: return "Pipe";
     case TokenKind::PipePipe: return "PipePipe";
+    case TokenKind::Caret: return "Caret";
+    case TokenKind::Tilde: return "Tilde";
     case TokenKind::Underscore: return "Underscore";
     case TokenKind::EndOfInput: return "EndOfInput";
     case TokenKind::Invalid: return "Invalid";

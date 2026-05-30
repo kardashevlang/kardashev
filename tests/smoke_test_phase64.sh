@@ -8,8 +8,8 @@
 #      with a radix (`0xFFi32`).
 #   3. The suffix is HONEST about the lattice: an out-of-range suffixed literal
 #      (`200i8`) is a compile error, a suffixed/var width mismatch (`5i32 + i64`)
-#      is a compile error, and an unsigned suffix (`5u8`, Phase 66) is rejected
-#      with a clear "later phase" message rather than silently mis-typed.
+#      is a compile error, and an unsigned suffix (`5u8`) is a real u8 (Phase 66
+#      lands unsigned integers; in Phase 64 it was deferred).
 set -euo pipefail
 
 KARDC=""
@@ -105,8 +105,9 @@ rejects suffix-out-of-range "$TMP/oor.kd" "out of range"
 printf 'fn main() -> i64 { let a = 5i32; let b: i64 = 7; let c = a + b; 0 }\n' > "$TMP/mix.kd"
 rejects suffix-width-mismatch "$TMP/mix.kd" "same integer"
 
-# 3c. an unsigned suffix is rejected honestly (lands in Phase 66).
-printf 'fn main() -> i64 { let x = 5u8; 0 }\n' > "$TMP/uns.kd"
-rejects unsigned-suffix-deferred "$TMP/uns.kd" "unsigned"
+# 3c. an unsigned suffix `5u8` is a real u8 as of Phase 66 (Phase 64 deferred it).
+printf 'fn use8(x: u8) -> u8 { x }\nfn main() -> i64 { let x = use8(5u8); 0 }\n' > "$TMP/uns.kd"
+"$KARDC" "$TMP/uns.kd" >/dev/null 2>&1 || { echo "FAIL [unsigned-suffix]: 5u8 did not compile"; exit 1; }
+echo "PASS [unsigned-suffix]: 5u8 is a u8 (Phase 66)"
 
 echo "ALL PHASE 64 SMOKE TESTS PASSED"

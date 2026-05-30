@@ -67,15 +67,24 @@ enum class BinOp {
     Lt, Le, Gt, Ge,
     Eq, NotEq,
     And,          // Phase 33: `&&` short-circuit logical-and (bool -> bool)
+    // Phase 66: integer bitwise operators (int -> int, any width/signedness).
+    // `Shr` is arithmetic (sign-extending) for a signed operand and logical
+    // (zero-filling) for an unsigned one — codegen picks ashr/lshr by type.
+    BitAnd,       // &  (infix; prefix `&` is still borrow)
+    BitOr,        // |  (infix; primary `|...|` is still a closure)
+    BitXor,       // ^
+    Shl,          // <<
+    Shr,          // >>
 };
 
 // Phase 15: prefix unary operators. `Neg` is integer negation (`-x`,
 // i64 -> i64); `Not` is logical not (`!x`, bool -> bool). Both bind
 // tighter than every binary operator.
 enum class UnaryOp {
-    Neg,   // -x
-    Not,   // !x
-    Deref, // *r — Phase 34: read the pointee of a `&T` / `Box<T>` (yields T)
+    Neg,    // -x
+    Not,    // !x
+    Deref,  // *r — Phase 34: read the pointee of a `&T` / `Box<T>` (yields T)
+    BitNot, // ~x — Phase 66: integer bitwise complement (int -> same int)
 };
 
 // Base expression. Polymorphic by design — use `dynamic_cast<...*>` in

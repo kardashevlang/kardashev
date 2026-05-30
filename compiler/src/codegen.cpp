@@ -5836,6 +5836,10 @@ private:
         if (tr.name == "i8") return makeIntW(8, true);   // v11
         if (tr.name == "i16") return makeIntW(16, true); // v11
         if (tr.name == "i32") return makeIntW(32, true); // v11
+        if (tr.name == "u8") return makeIntW(8, false);    // Phase 66
+        if (tr.name == "u16") return makeIntW(16, false);  // Phase 66
+        if (tr.name == "u32") return makeIntW(32, false);  // Phase 66
+        if (tr.name == "u64") return makeIntW(64, false);  // Phase 66
         if (tr.name == "f64") return makeFloat(); // Phase 39/44
         if (tr.name == "bool") return makeBool();
         // Phase 16: a fn with no `-> T` annotation returns unit (parser
@@ -8685,6 +8689,10 @@ private:
                                               : builder_->CreateNeg(v, "neg");
         case ast::UnaryOp::Not:
             return builder_->CreateNot(v, "not");
+        case ast::UnaryOp::BitNot:
+            // Phase 66: `~x` — bitwise complement (LLVM `xor x, -1`), same
+            // width as the operand. `CreateNot` is the all-ones xor.
+            return builder_->CreateNot(v, "bnot");
         case ast::UnaryOp::Deref: {
             // Phase 34: `*r` — `v` is the pointer (a `&T`/Box value); load the
             // pointee, whose type the typechecker recorded for this expr.
@@ -8783,24 +8791,70 @@ private:
             case ast::BinOp::Eq:  return builder_->CreateFCmpOEQ(L, R, "feq");
             case ast::BinOp::NotEq: return builder_->CreateFCmpUNE(L, R, "fne");
             case ast::BinOp::Mod:
-            case ast::BinOp::And: return nullptr; // not valid for f64
+            case ast::BinOp::And:
+            case ast::BinOp::BitAnd:
+            case ast::BinOp::BitOr:
+            case ast::BinOp::BitXor:
+            case ast::BinOp::Shl:
+            case ast::BinOp::Shr: return nullptr; // not valid for f64
             }
         }
+        // Phase 66: signedness drives the division / remainder / right-shift /
+        // comparison opcode (LLVM integers are sign-agnostic). Both operands
+        // share one int type (typecheck unified them), so the lhs settles it.
+        bool uns = operandUnsigned(bin);
         switch (bin.op) {
         case ast::BinOp::Add: return builder_->CreateAdd(L, R, "add");
         case ast::BinOp::Sub: return builder_->CreateSub(L, R, "sub");
         case ast::BinOp::Mul: return builder_->CreateMul(L, R, "mul");
-        case ast::BinOp::Div: return builder_->CreateSDiv(L, R, "div");
-        case ast::BinOp::Mod: return builder_->CreateSRem(L, R, "mod");
-        case ast::BinOp::Lt:  return builder_->CreateICmpSLT(L, R, "lt");
-        case ast::BinOp::Le:  return builder_->CreateICmpSLE(L, R, "le");
-        case ast::BinOp::Gt:  return builder_->CreateICmpSGT(L, R, "gt");
-        case ast::BinOp::Ge:  return builder_->CreateICmpSGE(L, R, "ge");
+        case ast::BinOp::Div:
+            return uns ? builder_->CreateUDiv(L, R, "udiv")
+                       : builder_->CreateSDiv(L, R, "div");
+        case ast::BinOp::Mod:
+            return uns ? builder_->CreateURem(L, R, "urem")
+                       : builder_->CreateSRem(L, R, "mod");
+        case ast::BinOp::Lt:
+            return uns ? builder_->CreateICmpULT(L, R, "ult")
+                       : builder_->CreateICmpSLT(L, R, "lt");
+        case ast::BinOp::Le:
+            return uns ? builder_->CreateICmpULE(L, R, "ule")
+                       : builder_->CreateICmpSLE(L, R, "le");
+        case ast::BinOp::Gt:
+            return uns ? builder_->CreateICmpUGT(L, R, "ugt")
+                       : builder_->CreateICmpSGT(L, R, "gt");
+        case ast::BinOp::Ge:
+            return uns ? builder_->CreateICmpUGE(L, R, "uge")
+                       : builder_->CreateICmpSGE(L, R, "ge");
         case ast::BinOp::Eq:  return builder_->CreateICmpEQ(L, R, "eq");
         case ast::BinOp::NotEq: return builder_->CreateICmpNE(L, R, "ne");
+        case ast::BinOp::BitAnd: return builder_->CreateAnd(L, R, "band");
+        case ast::BinOp::BitOr:  return builder_->CreateOr(L, R, "bor");
+        case ast::BinOp::BitXor: return builder_->CreateXor(L, R, "bxor");
+        case ast::BinOp::Shl:    return builder_->CreateShl(L, R, "shl");
+        case ast::BinOp::Shr:
+            // Arithmetic (sign-extending) for signed, logical for unsigned.
+            return uns ? builder_->CreateLShr(L, R, "lshr")
+                       : builder_->CreateAShr(L, R, "ashr");
         case ast::BinOp::And: return nullptr; // handled above
         }
         return nullptr;
+    }
+
+    // Phase 66: is this binary op's (shared) integer operand type unsigned?
+    // Drives udiv/urem/lshr and the unsigned icmp predicates. Reads whichever
+    // operand has a recorded concrete int type (they unify to the same type).
+    bool operandUnsigned(const ast::BinaryExpr& bin) {
+        auto unsignedSide = [&](const ast::Expr& e) -> int {
+            TypePtr t = lookupExprType(e);
+            if (!t) return -1; // unknown
+            t = resolveInInstance(t);
+            if (t->kind != TypeKind::Int || t->isConstValue) return -1;
+            return t->intSigned ? 0 : 1;
+        };
+        int l = unsignedSide(*bin.lhs);
+        if (l >= 0) return l == 1;
+        int r = unsignedSide(*bin.rhs);
+        return r == 1;
     }
 
     // Phase 10b: the env-aware LLVM signature of a fn VALUE whose kardashev
