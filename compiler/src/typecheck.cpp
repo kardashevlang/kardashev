@@ -272,6 +272,13 @@ public:
                 makeBool());
             fnSchemas_["str_parse_f64"] = std::move(sch);
         }
+        // v12 Phase 73: f64 math (f64 -> f64), pure. sqrt / floor / ceil / abs.
+        for (const char* nm :
+             {"f64_sqrt", "f64_floor", "f64_ceil", "f64_abs"}) {
+            FnSchema sch;
+            sch.signature = makeFunction({makeFloat()}, makeFloat());
+            fnSchemas_[nm] = std::move(sch);
+        }
         // print_no_nl(s: &String) -> i64 ! { io } — writes s with NO trailing
         // newline (print_str / print_string / println all force one), so
         // output can be composed piece by piece on a single line.

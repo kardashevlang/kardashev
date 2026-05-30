@@ -1768,6 +1768,26 @@ private:
         emitStrParse("str_parse_f64", llvm::Type::getDoubleTy(ctx),
                      /*isFloat=*/true);
 
+        // --- v12 Phase 73: f64 math (libm via LLVM intrinsics) ---
+        // f64_sqrt / f64_floor / f64_ceil / f64_abs lower to the LLVM unary
+        // float intrinsics (resolved by both the JIT and the AOT link), so a
+        // real-number program no longer needs an FFI declaration of its own.
+        auto emitF64Math = [&](const char* name, llvm::Intrinsic::ID id) {
+            auto* dblTy = llvm::Type::getDoubleTy(ctx);
+            auto* fnTy = llvm::FunctionType::get(dblTy, {dblTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, name, module_.get());
+            fn->getArg(0)->setName("x");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            b.CreateRet(b.CreateUnaryIntrinsic(id, fn->getArg(0)));
+            declaredFns_[name] = fn;
+        };
+        emitF64Math("f64_sqrt", llvm::Intrinsic::sqrt);
+        emitF64Math("f64_floor", llvm::Intrinsic::floor);
+        emitF64Math("f64_ceil", llvm::Intrinsic::ceil);
+        emitF64Math("f64_abs", llvm::Intrinsic::fabs);
+
         // --- Phase 27: print_no_nl(s: &String) -> i64 (no trailing newline) ---
         {
             auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);

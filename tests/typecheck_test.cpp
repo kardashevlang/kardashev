@@ -2834,6 +2834,13 @@ void test_vec_pop_returns_element_type() {
              "vec_pop_returns_element_type");
 }
 
+// v12 Phase 73: f64 math builtins.
+void test_f64_math_ok() {
+    expectOk("fn main() -> i64 { (f64_sqrt(4.0) + f64_floor(2.9)"
+             " + f64_ceil(1.1) + f64_abs(0.0 - 3.0)) as i64 }",
+             "f64_math_ok");
+}
+
 // v12 Phase 71: hashset_items builtin returns Vec<T>.
 void test_hashset_items_ok() {
     expectOk("fn main() -> i64 ! { alloc } { let mut s = hashset_new();"
@@ -3159,6 +3166,7 @@ int main() {
     test_vec_mutation_ok();
     test_vec_pop_returns_element_type();
     test_hashset_items_ok();
+    test_f64_math_ok();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -3167,6 +3175,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (297 cases)\n";
+    std::cout << "All typecheck tests passed (298 cases)\n";
     return 0;
 }

@@ -678,6 +678,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 73 (v12 — real stdlib): integer math helpers + f64 math (LLVM
+# float intrinsics) + a few Option/Result inspectors.
+sh_test(
+    name = "smoke_test_phase73",
+    srcs = ["smoke_test_phase73.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

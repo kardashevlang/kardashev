@@ -54,6 +54,12 @@ step toward production use.
   `str_to_upper` / `str_to_lower` / `str_concat` / `str_repeat` (fresh heap
   Strings). All kardashev prelude functions over `str_char_at` / `str_len` /
   `str_push_byte` — high-level string manipulation without a manual char loop.
+- **Numeric + math helpers** (Phase 73): integer `i64_abs` / `i64_min` /
+  `i64_max` / `i64_pow` (prelude) and the f64 math `f64_sqrt` / `f64_floor` /
+  `f64_ceil` / `f64_abs` (built-ins lowering to LLVM float intrinsics; the AOT
+  link now pulls in `-lm`), plus more Option/Result inspectors
+  (`option_is_some`, `option_ok_or`, `result_is_ok`). A real-number program no
+  longer needs its own FFI declaration of libm.
 
 ## [0.11.0] — Roadmap v11 "real machine integers" (Phases 63–68)
 

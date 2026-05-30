@@ -864,6 +864,47 @@ std::string applyPrelude(const std::string& userSrc) {
             "    match r { Ok(x) => x, Err(e) => default }\n"
             "}\n";
     }
+    // v12 Phase 73: integer math helpers (concrete i64), and a few more
+    // Option/Result inspectors. The numeric tower has the operators; a real
+    // stdlib also wants abs / min / max / pow as named functions.
+    if (userSrc.find("fn i64_abs") == std::string::npos) {
+        prelude += "fn i64_abs(n: i64) -> i64 { if n < 0 { 0 - n } else { n } }\n";
+    }
+    if (userSrc.find("fn i64_min") == std::string::npos) {
+        prelude +=
+            "fn i64_min(a: i64, b: i64) -> i64 { if a < b { a } else { b } }\n";
+    }
+    if (userSrc.find("fn i64_max") == std::string::npos) {
+        prelude +=
+            "fn i64_max(a: i64, b: i64) -> i64 { if a > b { a } else { b } }\n";
+    }
+    if (userSrc.find("fn i64_pow") == std::string::npos) {
+        prelude +=
+            "fn i64_pow(base: i64, exp: i64) -> i64 {\n"
+            "    let mut r = 1;\n"
+            "    let mut i = 0;\n"
+            "    while i < exp { r = r * base; i = i + 1; }\n"
+            "    r\n"
+            "}\n";
+    }
+    if (userSrc.find("fn option_is_some") == std::string::npos) {
+        prelude +=
+            "fn option_is_some(o: Option<i64>) -> bool {\n"
+            "    match o { Some(x) => true, None => false }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn option_ok_or") == std::string::npos) {
+        prelude +=
+            "fn option_ok_or(o: Option<i64>, err: i64) -> Result<i64, i64> {\n"
+            "    match o { Some(x) => Ok(x), None => Err(err) }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn result_is_ok") == std::string::npos) {
+        prelude +=
+            "fn result_is_ok(r: Result<i64, i64>) -> bool {\n"
+            "    match r { Ok(x) => true, Err(e) => false }\n"
+            "}\n";
+    }
     return prelude + userSrc;
 }
 
@@ -1698,8 +1739,11 @@ bool linkObject(const std::string& objPath, const std::string& outExePath) {
         std::cerr << "kardc: cannot find 'clang' on PATH for linking\n";
         return false;
     }
+    // -lm: the f64 math builtins (Phase 73) lower to LLVM float intrinsics that
+    // the backend turns into libm calls (floor/ceil are not inlined like sqrt /
+    // fabs), so the AOT link needs the math library. Harmless when unused.
     llvm::SmallVector<llvm::StringRef, 8> argv{
-        *clangPath, objPath, "-o", outExePath, "-lpthread"};
+        *clangPath, objPath, "-o", outExePath, "-lpthread", "-lm"};
     std::string errMsg;
     int rc = llvm::sys::ExecuteAndWait(*clangPath, argv, std::nullopt, {}, 0, 0,
                                        &errMsg);
