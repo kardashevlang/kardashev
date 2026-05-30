@@ -440,9 +440,16 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   checked before its own name binds; each `let` extends the scope). With params
 >   `{ a, b }`: `let x = a + 1 ; x + b` → 0 undefined; `let x = a + 1 ; x + c` → 1
 >   (the undeclared `c`), JIT + AOT.
+> - **Phase 97 — CAPSTONE: a function-body interpreter (done).** `examples/selfhost/interp.kd`
+>   ties the whole body pipeline (lex → parse → scope-check → evaluate) into one
+>   `interpret(body, params, args)`: it REJECTS a body referencing an undefined
+>   variable (returns `-1`), and otherwise binds the arguments to the parameters
+>   and runs the block to a value. `fn f(x=3, y=4) { let sq = x*x; let dbl = y+y;
+>   sq + dbl }` → `17`; an ill-scoped body → `-1`. A self-hosted interpreter for
+>   kardashev function bodies, written in the language it interprets, JIT + AOT.
 >
-> Planned: a capstone interpreter (parse → scope-check → evaluate a function body
-> with arguments); then wiring to the v15 `FnSig` and, eventually, codegen.
+> Planned: wire the body interpreter to the v15 `FnSig` (a full `Fn`); a real type
+> checker; eventually emit code — closing language gaps as they surface.
 
 ## Roadmap v15 — shipped
 

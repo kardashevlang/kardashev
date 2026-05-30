@@ -886,6 +886,17 @@ sh_test(
     ],
 )
 
+# v16 Phase 97 CAPSTONE (self-hosting, cont.): a function-body interpreter tying
+# lex -> parse -> scope-check -> evaluate, running a body with arguments.
+sh_test(
+    name = "smoke_test_phase97",
+    srcs = ["smoke_test_phase97.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:interp.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
