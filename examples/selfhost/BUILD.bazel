@@ -1,14 +1,20 @@
 load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary")
 
-# Readable by //tests:smoke_test_phase88 (builds the real lexer).
+# Readable by //tests:smoke_test_phase88 / :smoke_test_phase89.
 exports_files(
-    ["lexer.kd"],
+    ["lexer.kd", "tokens.kd"],
     visibility = ["//visibility:public"],
 )
 
-# Roadmap v15 (self-hosting) Phase 88: a lexer for kardashev, written IN
-# kardashev — the foundation proof for a future bootstrap.
+# Roadmap v15 (self-hosting): a lexer for kardashev written IN kardashev — the
+# foundation for a future bootstrap. Phase 88 = byte classifier; Phase 89 = a
+# token-stream lexer (Vec<Token> with kind + span).
 kardashev_binary(
     name = "lexer",
     src = "lexer.kd",
+)
+
+kardashev_binary(
+    name = "tokens",
+    src = "tokens.kd",
 )

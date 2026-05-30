@@ -798,6 +798,17 @@ sh_test(
     ],
 )
 
+# v15 Phase 89 (self-hosting): a token-stream lexer (Vec<Token> with kind + span)
+# — the typed interface a parser consumes; spans reconstruct via str_substring.
+sh_test(
+    name = "smoke_test_phase89",
+    srcs = ["smoke_test_phase89.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:tokens.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

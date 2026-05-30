@@ -425,12 +425,18 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   punctuation, whitespace skipped — reporting 9 idents / 1 number / 1 arrow /
 >   9 punct and a position-weighted witness (9010109), checked JIT + AOT. Proves
 >   the compiler front is expressible in the language itself.
+> - **Phase 89 — a token-stream lexer (done).** `examples/selfhost/tokens.kd`
+>   grows the classifier into a real lexer that returns a `Vec<Token>` — each
+>   token carrying its KIND and its SPAN (`start` + `len`) into the source, the
+>   typed interface a parser sits on. Over the same snippet it yields 20 tokens;
+>   the first reconstructs (via `str_substring` over its span) to `"fn"` and the
+>   arrow token to `"->"`, proving the spans are correct, with a deterministic
+>   stream fingerprint — JIT + AOT.
 >
-> Planned: a token-stream lexer (`Vec<Token>` with kind + text + span); a
-> recursive-descent parser for a kardashev subset → an `enum` AST; an AST printer
-> + a scope/type checker for the subset; a capstone that self-lexes/parses a real
-> kardashev source file — closing language gaps (richer errors, string ops) as
-> self-hosting surfaces them.
+> Planned: a recursive-descent parser for a kardashev subset → an `enum` AST; an
+> AST printer + a scope/type checker for the subset; a capstone that
+> self-lexes/parses a real kardashev source file — closing language gaps (richer
+> errors, string ops) as self-hosting surfaces them.
 
 ## Roadmap v14 — shipped
 
