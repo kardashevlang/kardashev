@@ -74,13 +74,17 @@ check_jit_aot "const_item" "$TMP/size.kd" 5
 # `add` and no global storage for SIZE. Check at -O0 (where folding is purely
 # the const-evaluator's doing, not the optimizer's).
 IR=$("$KARDC" --emit-llvm -O0 "$TMP/size.kd")
-MAIN_BODY=$(echo "$IR" | awk '/define .*@main\(/{f=1} f{print} /^}/{if(f)exit}')
-if ! echo "$MAIN_BODY" | grep -q 'ret i64 5'; then
+# Here-strings (not `echo "$x" | cmd`): awk's `exit` and grep -q's match-and-stop
+# close the pipe early, which SIGPIPEs the `echo` producer -> 141 under
+# `set -o pipefail` (a load-sensitive flake on a large IR dump). A here-string
+# has no producer process to kill.
+MAIN_BODY=$(awk '/define .*@main\(/{f=1} f{print} /^}/{if(f)exit}' <<< "$IR")
+if ! grep -q 'ret i64 5' <<< "$MAIN_BODY"; then
     echo "FAIL: expected folded 'ret i64 5' in main; got:"
     echo "$MAIN_BODY"
     exit 1
 fi
-if echo "$MAIN_BODY" | grep -Eq '\badd\b|\bload\b'; then
+if grep -Eq '\badd\b|\bload\b' <<< "$MAIN_BODY"; then
     echo "FAIL: main contains a runtime add/load — const was not folded:"
     echo "$MAIN_BODY"
     exit 1
@@ -172,12 +176,12 @@ expect_error() {
         exit 1
     fi
     # A clean diagnostic, not a C++ crash (segfault / std::terminate / abort).
-    if echo "$out" | grep -Eqi 'std::bad_alloc|terminate|Segmentation|core dumped|Assertion'; then
+    if grep -Eqi 'std::bad_alloc|terminate|Segmentation|core dumped|Assertion' <<< "$out"; then
         echo "FAIL ($label): compiler crashed instead of reporting an error:"
         echo "$out"
         exit 1
     fi
-    if ! echo "$out" | grep -qi "$needle"; then
+    if ! grep -qi "$needle" <<< "$out"; then
         echo "FAIL ($label): error message missing '$needle'; got:"
         echo "$out"
         exit 1

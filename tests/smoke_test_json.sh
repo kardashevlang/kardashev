@@ -42,11 +42,25 @@ done
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Portable peak-RSS (KB): GNU `time -v` (Linux) or BSD `time -l` (macOS); empty
+# if neither exists (caller SKIPs the gate). Safe under `set -e`/`pipefail`.
+peak_rss_kb() {
+    local f; f=$(mktemp)
+    if /usr/bin/time -v true >/dev/null 2>&1; then
+        { /usr/bin/time -v "$@" >/dev/null; } 2>"$f" || true
+        awk '/Maximum resident set size/ {print $NF}' "$f"
+    elif /usr/bin/time -l true >/dev/null 2>&1; then
+        { /usr/bin/time -l "$@" >/dev/null; } 2>"$f" || true
+        awk '/maximum resident set size/ {print int($1/1024)}' "$f"
+    fi
+    rm -f "$f"
+}
+
 # 1. correctness: round-trips via derived Eq; signal = serialized length (51).
 jit=$("$KARDC" "$SRC")
 echo "$jit"
-echo "$jit" | grep -q "round-trips = yes" || { echo "FAIL: round-trip not confirmed"; exit 1; }
-echo "$jit" | grep -q 'serialized = {"a":\[1,2.5\],"b":2,"c":"x\\ny"}' \
+grep -q "round-trips = yes" <<< "$jit" || { echo "FAIL: round-trip not confirmed"; exit 1; }
+grep -q 'serialized = {"a":\[1,2.5\],"b":2,"c":"x\\ny"}' <<< "$jit" \
     || { echo "FAIL: canonical (sorted-key) serialized form unexpected"; exit 1; }
 sig=$(echo "$jit" | tail -1)
 echo "$jit" | tail -1 | grep -qx "30" || { echo "FAIL: expected signal 30, got $sig"; exit 1; }
@@ -72,11 +86,15 @@ fn main() -> i64 ! { io, alloc } {
 }
 EOF
 "$KARDC" --no-cache -o "$TMP/loop" "$TMP/loop.kd" >/dev/null
-rss=$( /usr/bin/time -v "$TMP/loop" 2>&1 | awk '/Maximum resident/ {print $NF}' )
-echo "INFO [loop]: peak RSS over 200k JSON-3.0 parse+serialize+drop = ${rss} KB"
-if [[ -n "$rss" && "$rss" -gt 32768 ]]; then
-    echo "FAIL [loop]: RSS ${rss} KB > 32 MB — the JSON pipeline leaks"; exit 1
+rss=$(peak_rss_kb "$TMP/loop")
+if [[ -z "$rss" ]]; then
+    echo "SKIP [loop]: no GNU/BSD /usr/bin/time available for the RSS gate"
+else
+    echo "INFO [loop]: peak RSS over 200k JSON-3.0 parse+serialize+drop = ${rss} KB"
+    if [[ "$rss" -gt 32768 ]]; then
+        echo "FAIL [loop]: RSS ${rss} KB > 32 MB — the JSON pipeline leaks"; exit 1
+    fi
+    echo "PASS [loop]: JSON-3.0 parse+serialize+drop (incl. HashMap objects) — RSS flat (<= 32 MB)"
 fi
-echo "PASS [loop]: JSON-3.0 parse+serialize+drop (incl. HashMap objects) — RSS flat (<= 32 MB)"
 
 echo "PASS: Phase 50 — JSON 3.0 (HashMap objects + full derive + canonical sorted output) JIT + AOT"
