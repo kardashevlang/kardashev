@@ -65,16 +65,26 @@ fn main() -> i64 { let s = S {}; s.greet() }
 EOF
 runs subset-ok "$TMP/subset.kd" 7
 
-# 3. Drop is exempt — drop glue is statically resolved, never dyn-dispatched.
-cat > "$TMP/drop.kd" <<'EOF'
-trait Drop { fn drop(&mut self); }
+# 3. Drop follows the subset rule like every other trait (a `&dyn Drop` /
+# generic dispatch must not launder effects). A Drop trait that DECLARES io
+# admits an io impl; a PURE Drop trait with an io impl is rejected.
+cat > "$TMP/drop_ok.kd" <<'EOF'
+trait Drop { fn drop(&mut self) ! { io }; }
 struct Noisy { id: i64 }
 impl Drop for Noisy { fn drop(&mut self) ! { io } { print(self.id); } }
 fn main() -> i64 ! { io } { let n = Noisy { id: 5 }; 0 }
 EOF
-"$KARDC" "$TMP/drop.kd" >/dev/null 2>&1 \
-    || { echo "FAIL [drop-exempt]: a Drop impl doing io must compile"; exit 1; }
-echo "PASS [drop-exempt]: Drop impl with io compiles (drop glue is static)"
+"$KARDC" "$TMP/drop_ok.kd" >/dev/null 2>&1 \
+    || { echo "FAIL [drop-ok]: io Drop impl under an io Drop trait must compile"; exit 1; }
+echo "PASS [drop-ok]: io Drop impl under an io-declaring Drop trait compiles"
+cat > "$TMP/drop_bad.kd" <<'EOF'
+trait Drop { fn drop(&mut self); }
+struct Sneaky {}
+impl Drop for Sneaky { fn drop(&mut self) ! { io } { print(7); } }
+fn pure(x: &dyn Drop) -> i64 ! { } { x.drop(); 0 }
+fn main() -> i64 { let s = Sneaky {}; pure(&s) }
+EOF
+rejects drop-not-exempt "$TMP/drop_bad.kd" "subset of the trait"
 
 # 4a. a generic `<T: Eq>` call attributes the trait's alloc — must be declared.
 cat > "$TMP/eqgen.kd" <<'EOF'

@@ -2537,14 +2537,26 @@ void test_effect_subset_fewer_ok() {
              "effect_subset_fewer_ok");
 }
 
-void test_effect_subset_drop_exempt_ok() {
-    // Drop is statically-resolved glue — a Drop impl may carry io even though
-    // the `Drop` trait method is pure.
-    expectOk("trait Drop { fn drop(&mut self); }\n"
+void test_effect_subset_drop_io_trait_ok() {
+    // Review fix: Drop is NOT exempt — it follows the subset rule like any
+    // trait (so a `dyn Drop` dispatch can't launder effects). An io Drop impl
+    // under an io-DECLARING Drop trait is fine...
+    expectOk("trait Drop { fn drop(&mut self) ! { io }; }\n"
              "struct Noisy { id: i64 }\n"
              "impl Drop for Noisy { fn drop(&mut self) ! { io } { } }\n"
              "fn main() -> i64 { 0 }",
-             "effect_subset_drop_exempt_ok");
+             "effect_subset_drop_io_trait_ok");
+}
+
+void test_effect_subset_drop_super_effecting_errors() {
+    // ...but an io Drop impl under a PURE Drop trait is rejected (the old
+    // name-based exemption laundered io through dyn Drop dispatch).
+    expectErrContains("trait Drop { fn drop(&mut self); }\n"
+                      "struct Noisy { id: i64 }\n"
+                      "impl Drop for Noisy { fn drop(&mut self) ! { io } { } }\n"
+                      "fn main() -> i64 { 0 }",
+                      "does not permit",
+                      "effect_subset_drop_super_effecting_errors");
 }
 
 // Phase 61 (v10): non-Copy arrays + RingBuffer<T, const CAP> + closure infer.
@@ -2840,7 +2852,8 @@ int main() {
     // Phase 60 (v10): effect-subset rule.
     test_effect_subset_super_effecting_errors();
     test_effect_subset_fewer_ok();
-    test_effect_subset_drop_exempt_ok();
+    test_effect_subset_drop_io_trait_ok();
+    test_effect_subset_drop_super_effecting_errors();
     // Phase 61 (v10): non-Copy arrays + mixed type+const generics.
     test_noncopy_array_ok();
     test_const_generic_mixed_struct_ok();
@@ -2852,6 +2865,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (259 cases)\n";
+    std::cout << "All typecheck tests passed (260 cases)\n";
     return 0;
 }

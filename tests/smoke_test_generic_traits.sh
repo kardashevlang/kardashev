@@ -81,7 +81,7 @@ struct BoolBox { b: bool }
 impl Container<i64> for IntBox { fn first(&self) -> i64 { self.v } }
 impl Container<bool> for BoolBox { fn first(&self) -> bool { self.b } }
 fn head<T, C: Container<T>>(c: C) -> T { c.first() }
-fn main() -> i64 {
+fn main() -> i64 ! { alloc } {
     let ib = IntBox { v: 42 };
     let bb = BoolBox { b: true };
     let direct = ib.first();
@@ -111,7 +111,7 @@ impl Iterator<bool> for Count {
         }
     }
 }
-fn main() -> i64 {
+fn main() -> i64 ! { alloc } {
     let c = Count { n: 5 };
     let mut trues = 0;
     for b in c {
@@ -137,7 +137,7 @@ impl Iterator<bool> for Count {
         }
     }
 }
-fn fold<T, I: Iterator<T>>(it: I, init: i64, f: fn(i64, T) -> i64) -> i64 {
+fn fold<T, I: Iterator<T>>(it: I, init: i64, f: fn(i64, T) -> i64) -> i64 ! { alloc } {
     let mut iter = it;
     let mut acc = init;
     loop {
@@ -149,7 +149,7 @@ fn fold<T, I: Iterator<T>>(it: I, init: i64, f: fn(i64, T) -> i64) -> i64 {
     acc
 }
 fn count_true(acc: i64, b: bool) -> i64 { if b { acc + 1 } else { acc } }
-fn main() -> i64 {
+fn main() -> i64 ! { alloc } {
     let c = Count { n: 5 };
     fold(c, 0, count_true)
 }' 3
@@ -159,7 +159,7 @@ fn main() -> i64 {
 # range fast path. fold of Countdown{n:4}: 4+3+2+1 == 10, plus 1..=5 == 15 via
 # the range -> 25. Proves i64 iteration survives the migration.
 run_case fold_i64_and_range '
-fn fold<T, I: Iterator<T>>(it: I, init: i64, f: fn(i64, T) -> i64) -> i64 {
+fn fold<T, I: Iterator<T>>(it: I, init: i64, f: fn(i64, T) -> i64) -> i64 ! { alloc } {
     let mut iter = it;
     let mut acc = init;
     loop {
@@ -177,7 +177,7 @@ impl Iterator<i64> for Countdown {
     }
 }
 fn add(a: i64, b: i64) -> i64 { a + b }
-fn main() -> i64 {
+fn main() -> i64 ! { alloc } {
     let c = Countdown { n: 4 };
     let cd = fold(c, 0, add);
     let mut rs = 0;
@@ -189,7 +189,7 @@ fn main() -> i64 {
 # compiles + runs over i64 after migrating Iterator to Iterator<T>. Sum the
 # prelude Range via fold (1..=10 -> 55).
 run_case unparam_iterator_bound '
-fn fold<I: Iterator>(it: I, init: i64, f: fn(i64, i64) -> i64) -> i64 {
+fn fold<I: Iterator>(it: I, init: i64, f: fn(i64, i64) -> i64) -> i64 ! { alloc } {
     let mut iter = it;
     let mut acc = init;
     loop {
@@ -201,7 +201,7 @@ fn fold<I: Iterator>(it: I, init: i64, f: fn(i64, i64) -> i64) -> i64 {
     acc
 }
 fn add(a: i64, b: i64) -> i64 { a + b }
-fn main() -> i64 {
+fn main() -> i64 ! { alloc } {
     fold(1..=10, 0, add)
 }' 55
 

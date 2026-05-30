@@ -875,6 +875,7 @@ public:
             GenericEnv genEnv = buildGenericEnv(ed.genericParams,
                                                   it->second.genericVars);
             currentGenericEnv_ = &genEnv;
+            setConstParamsInScope(ed.genericParams); // review fix: const enums
             std::vector<EnumVariantType> resolvedVariants;
             resolvedVariants.reserve(ed.variants.size());
             std::unordered_set<std::string> seenVariant;
@@ -913,6 +914,7 @@ public:
             }
             it->second.type->enumVariants = std::move(resolvedVariants);
             currentGenericEnv_ = nullptr;
+            currentConstParams_.clear(); // review fix: don't leak const enums
         }
 
         // Phase 13b / 17b: now that the prelude's generic `Option<T>` enum is
@@ -1501,6 +1503,17 @@ public:
                     genBoundParam.push_back(&gp);
                 }
                 for (const auto& gp : fn.genericParams) {
+                    // Review fix: a METHOD-level const param isn't monomorphized
+                    // (no constParamNames on the impl-method schema), so it'd
+                    // later leak an internal mangled name in codegen. Reject it
+                    // early with a real diagnostic; declare it on the impl block.
+                    if (gp.isConst)
+                        error("const generic parameter '" + gp.name +
+                                  "' on impl method '" + fn.name +
+                                  "' is not supported; declare it on the `impl` "
+                                  "block (`impl<.., const " + gp.name +
+                                  ": i64> ..`) instead",
+                              gp.line, gp.column);
                     TypePtr v = makeFreshVar();
                     if (!gp.isConst) genEnv[gp.name] = v; // Phase 61
                     genVars.push_back(v);
@@ -1622,11 +1635,12 @@ public:
         // compared.)
         for (const auto& impl : program.impls) {
             if (impl.isInherent()) continue; // inherent impls answer to no trait
-            // `Drop` is exempt: it is STATICALLY-RESOLVED drop glue (a value's
-            // destructor runs by concrete type at the drop site, never through
-            // `dyn Drop`), so its effects are already attributed where the value
-            // is dropped — there is no trait-dispatch attribution to keep sound.
-            if (impl.traitName == "Drop") continue;
+            // Review fix: `Drop` is NOT exempt. It is a user-declarable trait,
+            // so `&dyn Drop` dispatch (and a `<T: Drop>` bound) attributes the
+            // trait method's declared effects — the earlier name-based exemption
+            // let a pure-declared `dyn Drop::drop()` launder io/alloc/panic. The
+            // subset rule now applies to every trait uniformly; a `Drop` impl
+            // that performs io must declare it on the trait method.
             auto trIt = traits_.find(impl.traitName);
             if (trIt == traits_.end()) continue; // unknown trait (reported)
             for (const auto& fn : impl.methods) {
@@ -4365,7 +4379,40 @@ private:
                            ? ResolvedMethod::SelfKind::ByValue
                            : selfKindFromSlot(instSig->args[0]);
         methodResolutions_[&mc] = std::move(res);
-        return instSig->ret;
+        // Review fix (B2): a bare `b.clone()` on a const-generic struct returns
+        // a type still mentioning the struct's SYMBOLIC const params (`Buf<T,
+        // CAP>`); pin them to the receiver's CONCRETE const args so the result
+        // mangles to `Buf__..._c2` (else a symbolic CAP mangles to c0 and the
+        // call result type-confuses). The explicit-annotation path already
+        // lands on the concrete type; this makes the inferred path agree.
+        TypePtr retTy = instSig->ret;
+        {
+            TypePtr rr = resolve(recvT);
+            while (rr->kind == TypeKind::Ref) rr = resolve(rr->refInner);
+            const std::vector<std::string>* cpn = nullptr;
+            if (rr->kind == TypeKind::Struct) {
+                if (auto s = structSchemas_.find(rr->structName);
+                    s != structSchemas_.end())
+                    cpn = &s->second.constParamNames;
+            } else if (rr->kind == TypeKind::Enum) {
+                if (auto e = enumSchemas_.find(rr->enumName);
+                    e != enumSchemas_.end())
+                    cpn = &e->second.constParamNames;
+            }
+            if (cpn) {
+                std::unordered_map<std::string, std::size_t> cs;
+                for (std::size_t i = 0;
+                     i < cpn->size() && i < rr->typeArgs.size(); ++i) {
+                    if ((*cpn)[i].empty()) continue;
+                    TypePtr a = resolve(rr->typeArgs[i]);
+                    if (a->isConstValue && a->constValueName.empty() &&
+                        a->constValue >= 0)
+                        cs[(*cpn)[i]] = static_cast<std::size_t>(a->constValue);
+                }
+                if (!cs.empty()) retTy = substituteConstLengths(retTy, cs);
+            }
+        }
+        return retTy;
     }
 
     TypePtr checkMethodCallAgainstSig(const ast::MethodCallExpr& mc,
@@ -4438,6 +4485,17 @@ private:
         res.boundedVarId = boundedVarId;
         res.selfKind = selfKindFromSig(sig);
         methodResolutions_[&mc] = std::move(res);
+        // Review fix (Phase 60): a BOUNDED-GENERIC method call (`<T: Trait>` +
+        // `t.method()`) has no concrete impl to mangle, so attribute the TRAIT
+        // method's declared effects here — exactly like checkDynMethodCall —
+        // else a generic caller of an io/alloc trait method contributes ZERO
+        // effects (the subset-rule's whole soundness floor). The Concrete case
+        // already unions the real impl effects via methodResolutions_ in
+        // collectEffects, so only do this for the bounded-generic case.
+        if (!concrete) {
+            exprEffects_[&mc] =
+                buildEffectSet(sig.effects, {}, mc.methodName, nullptr);
+        }
         return retTy;
     }
 
@@ -5743,30 +5801,54 @@ private:
                 preArgTypes.reserve(call.args.size());
                 for (const auto& a : call.args)
                     preArgTypes.push_back(checkExpr(*a));
+                // Review fix (B5/M5): a callee const param can be bound from an
+                // arg either to a CONCRETE length or to a CALLER-symbolic length
+                // (forwarding `a: [i64; M]` into `dot<const N>(a: [i64; N])`).
+                // Collect both; a param bound to two different concretes, two
+                // different symbols, OR a concrete AND a symbol (unprovable
+                // equal) is a dimension-mismatch error.
                 std::unordered_map<std::string, std::size_t> constSubst;
+                std::unordered_map<std::string, std::string> constSymSubst;
+                auto dimErr = [&](const std::string& nm, const std::string& a,
+                                  const std::string& b) {
+                    error("const generic parameter '" + nm + "' of '" +
+                              call.callee + "' is used with conflicting sizes " +
+                              a + " and " + b + " (dimension mismatch)",
+                          call.line, call.column);
+                };
                 for (std::size_t i = 0; i < n; ++i) {
                     std::unordered_map<std::string, std::size_t> local;
                     std::unordered_map<std::string, std::string> localSym;
                     solveConstLengths(instSig->args[i], preArgTypes[i], local,
                                       localSym);
                     for (const auto& [nm, val] : local) {
-                        auto it = constSubst.find(nm);
-                        if (it == constSubst.end())
+                        if (auto s = constSymSubst.find(nm);
+                            s != constSymSubst.end())
+                            dimErr(nm, s->second, std::to_string(val));
+                        else if (auto it = constSubst.find(nm);
+                                 it != constSubst.end()) {
+                            if (it->second != val)
+                                dimErr(nm, std::to_string(it->second),
+                                       std::to_string(val));
+                        } else
                             constSubst[nm] = val;
-                        else if (it->second != val)
-                            error("const generic parameter '" + nm + "' of '" +
-                                      call.callee +
-                                      "' is used with conflicting sizes " +
-                                      std::to_string(it->second) + " and " +
-                                      std::to_string(val) +
-                                      " (dimension mismatch)",
-                                  call.line, call.column);
+                    }
+                    for (const auto& [nm, sym] : localSym) {
+                        if (auto it = constSubst.find(nm);
+                            it != constSubst.end())
+                            dimErr(nm, std::to_string(it->second), sym);
+                        else if (auto s = constSymSubst.find(nm);
+                                 s != constSymSubst.end()) {
+                            if (s->second != sym) dimErr(nm, s->second, sym);
+                        } else
+                            constSymSubst[nm] = sym;
                     }
                 }
                 for (std::size_t i = 0; i < schema.genericVars.size(); ++i) {
                     if (i < schema.constParamNames.size() &&
                         !schema.constParamNames[i].empty() &&
-                        !constSubst.count(schema.constParamNames[i])) {
+                        !constSubst.count(schema.constParamNames[i]) &&
+                        !constSymSubst.count(schema.constParamNames[i])) {
                         error("cannot infer const generic parameter '" +
                                   schema.constParamNames[i] + "' of '" +
                                   call.callee +
@@ -5777,12 +5859,20 @@ private:
                     }
                 }
                 instSig = substituteConstLengths(instSig, constSubst);
+                if (!constSymSubst.empty())
+                    instSig = renameConstLengths(instSig, constSymSubst);
                 for (std::size_t i = 0; i < schema.genericVars.size() &&
                                         i < typeArgs.size(); ++i) {
                     if (i < schema.constParamNames.size() &&
-                        !schema.constParamNames[i].empty())
-                        typeArgs[i] = makeConstValue(static_cast<long long>(
-                            constSubst[schema.constParamNames[i]]));
+                        !schema.constParamNames[i].empty()) {
+                        const std::string& pn = schema.constParamNames[i];
+                        if (auto s = constSymSubst.find(pn);
+                            s != constSymSubst.end())
+                            typeArgs[i] = makeConstSymbol(s->second);
+                        else
+                            typeArgs[i] = makeConstValue(
+                                static_cast<long long>(constSubst[pn]));
+                    }
                 }
             }
 
@@ -6314,7 +6404,11 @@ private:
             }
             if (auto* id =
                     dynamic_cast<const ast::IdentExpr*>(al.repeatCount.get());
-                id && currentConstParams_.count(id->name)) {
+                id && !lookupLocal(id->name) &&
+                currentConstParams_.count(id->name)) {
+                // Review fix: a LOCAL of the same name shadows the const param,
+                // so only treat the length as a symbolic const param when no
+                // local binds the name (else fall to const-eval below).
                 TypePtr arr = makeArray(elemTy, 0);
                 arr->arrayLenParam = id->name; // symbolic, per Phase 58/59
                 return arr;

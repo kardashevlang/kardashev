@@ -70,14 +70,14 @@ run_case mut_self_counter '
 trait Inc { fn inc(&mut self) -> i64; }
 struct Counter { n: i64 }
 impl Inc for Counter { fn inc(&mut self) -> i64 { self.n = self.n + 1; self.n } }
-fn main() -> i64 {
+fn main() -> i64 ! { alloc } {
     let mut c = Counter { n: 0 };
     c.inc(); c.inc(); c.inc()
 }' 3
 
 # 2. Phase 9 regression: for over an inclusive range still sums to 55.
 run_case for_inclusive_range '
-fn main() -> i64 {
+fn main() -> i64 ! { alloc } {
     let mut s = 0;
     for x in 1..=10 { s = s + x; }
     s
@@ -92,7 +92,7 @@ impl Iterator for Countdown {
         if self.n <= 0 { None } else { self.n = self.n - 1; Some(self.n + 1) }
     }
 }
-fn main() -> i64 {
+fn main() -> i64 ! { alloc } {
     let cd = Countdown { n: 4 };
     let mut s = 0;
     for x in cd { s = s + x; }
@@ -101,7 +101,7 @@ fn main() -> i64 {
 
 # 4. fold driven by a closure over an inclusive range: 1+2+3+4+5 == 15.
 run_case fold_closure '
-fn fold<I: Iterator, e>(it: I, init: i64, f: fn(i64, i64) -> i64 ! {e}) -> i64 ! {e} {
+fn fold<I: Iterator, e>(it: I, init: i64, f: fn(i64, i64) -> i64 ! {e}) -> i64 ! { alloc, e } {
     let mut iter = it;
     let mut acc = init;
     loop {
@@ -112,7 +112,7 @@ fn fold<I: Iterator, e>(it: I, init: i64, f: fn(i64, i64) -> i64 ! {e}) -> i64 !
     }
     acc
 }
-fn main() -> i64 {
+fn main() -> i64 ! { alloc } {
     fold(1..=5, 0, |acc, x| acc + x)
 }' 15
 
@@ -161,7 +161,7 @@ fn main() -> i64 ! { alloc } {
 # 6. Effect composition POSITIVE: a fold with an io closure typechecks in an
 #    io fn. Prints 1,2,3 then returns 6.
 cat > "$TMP/fold_io.kd" <<'EOF'
-fn fold<I: Iterator, e>(it: I, init: i64, f: fn(i64, i64) -> i64 ! {e}) -> i64 ! {e} {
+fn fold<I: Iterator, e>(it: I, init: i64, f: fn(i64, i64) -> i64 ! {e}) -> i64 ! { alloc, e } {
     let mut iter = it;
     let mut acc = init;
     loop {
@@ -172,7 +172,7 @@ fn fold<I: Iterator, e>(it: I, init: i64, f: fn(i64, i64) -> i64 ! {e}) -> i64 !
     }
     acc
 }
-fn main() -> i64 ! { io } {
+fn main() -> i64 ! { io, alloc } {
     fold(1..=3, 0, |acc, x| { print(x); acc + x })
 }
 EOF
@@ -199,7 +199,7 @@ echo "PASS [fold_io_positive]: io closure in io fold prints 1,2,3 -> 6 (JIT + AO
 # 7. Effect composition NEGATIVE: the same fold + io closure in a PURE fn is
 #    rejected (the io effect leaks to the undeclared call site).
 cat > "$TMP/fold_io_neg.kd" <<'EOF'
-fn fold<I: Iterator, e>(it: I, init: i64, f: fn(i64, i64) -> i64 ! {e}) -> i64 ! {e} {
+fn fold<I: Iterator, e>(it: I, init: i64, f: fn(i64, i64) -> i64 ! {e}) -> i64 ! { alloc, e } {
     let mut iter = it;
     let mut acc = init;
     loop {
@@ -210,7 +210,7 @@ fn fold<I: Iterator, e>(it: I, init: i64, f: fn(i64, i64) -> i64 ! {e}) -> i64 !
     }
     acc
 }
-fn main() -> i64 {
+fn main() -> i64 ! { alloc } {
     fold(1..=3, 0, |acc, x| { print(x); acc + x })
 }
 EOF

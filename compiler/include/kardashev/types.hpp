@@ -217,6 +217,14 @@ TypePtr substituteConstLengths(
     const TypePtr& t,
     const std::unordered_map<std::string, std::size_t>& lengths);
 
+// Phase 61 (v10): deep-copy `t`, RENAMING every symbolic const (an array length
+// `[T; N]` or a const-value typeArg) whose name is a key in `renames` to the new
+// (still symbolic) name. Used when forwarding a const-generic array into another
+// const-generic fn: the callee's `[i64; N]` is rebound to the caller's `[i64; M]`.
+TypePtr renameConstLengths(
+    const TypePtr& t,
+    const std::unordered_map<std::string, std::string>& renames);
+
 // Follow the union-find link chain to the representative. Performs
 // path compression as a side effect.
 TypePtr resolve(const TypePtr& t);

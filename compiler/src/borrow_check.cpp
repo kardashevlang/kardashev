@@ -1061,7 +1061,12 @@ private:
                     if (Binding* tb = lookupBinding(tid->name))
                         tb->state = OwnState::Owned;
                 } else {
-                    p = std::max(p, consume(*as->target, /*expectExpire=*/-1));
+                    // Review fix (Phase 61): the LHS of `a[i] = x` / `t.0 = x`
+                    // is a WRITE place, not a move — consume it as a PLACE so
+                    // the non-Copy index move-out check doesn't fire on the
+                    // assignment target (mirrors how a FieldExpr write reads its
+                    // root). The old value is dropped in codegen's emitAssign.
+                    p = std::max(p, consumePlace(*as->target, /*expectExpire=*/-1));
                 }
                 retireExpiredLoans(p);
                 last = std::max(last, p);

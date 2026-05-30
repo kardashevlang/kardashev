@@ -68,7 +68,7 @@ impl<T: Clone> Clone for Pair<T> {
     }
 }
 impl<T: Eq> Eq for Pair<T> {
-    fn eq(&self, other: &Pair<T>) -> bool {
+    fn eq(&self, other: &Pair<T>) -> bool ! { alloc } {
         if self.a.eq(&other.a) { self.b.eq(&other.b) } else { false }
     }
 }
@@ -92,7 +92,7 @@ impl<T: Clone> Clone for Pair<T> {
     }
 }
 impl<T: Eq> Eq for Pair<T> {
-    fn eq(&self, other: &Pair<T>) -> bool {
+    fn eq(&self, other: &Pair<T>) -> bool ! { alloc } {
         if self.a.eq(&other.a) { self.b.eq(&other.b) } else { false }
     }
 }
@@ -113,7 +113,7 @@ impl<T: Clone> Clone for Pair<T> {
     fn clone(&self) -> Pair<T> ! { alloc } { Pair { a: self.a.clone(), b: self.b.clone() } }
 }
 impl<T: Eq> Eq for Pair<T> {
-    fn eq(&self, other: &Pair<T>) -> bool { if self.a.eq(&other.a) { self.b.eq(&other.b) } else { false } }
+    fn eq(&self, other: &Pair<T>) -> bool ! { alloc } { if self.a.eq(&other.a) { self.b.eq(&other.b) } else { false } }
 }
 fn main() -> i64 ! { alloc } {
     let mut i = 0; let mut acc = 0;

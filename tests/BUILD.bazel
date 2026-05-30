@@ -576,6 +576,17 @@ sh_test(
     ],
 )
 
+# v10 adversarial-review regression guard: pins the 5 blockers + majors a
+# 6-dimension multi-agent review found (and that the green smoke suite missed)
+# — nested const-generic field mangling, const enums, bare const-generic clone,
+# dyn-Drop effect laundering, bounded-generic effect attribution, symbolic
+# dimension forwarding, and the mangling collision. The v10 soundness floor.
+sh_test(
+    name = "smoke_test_v10_review",
+    srcs = ["smoke_test_v10_review.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

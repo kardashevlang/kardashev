@@ -262,6 +262,17 @@ TypePtr substConstLenRec(
         return makeFunction(std::move(na), nr, r->effectLabels,
                             r->effectRowVar);
     }
+    case TypeKind::Int:
+        // Phase 61/62 fix: a SYMBOLIC const-value typeArg (e.g. the `N` passed
+        // to a nested `Inner<N>` field of `Outer<N>`) must resolve to the bound
+        // value — not just symbolic array lengths. Without this the nested
+        // field keeps a symbolic `N` and mangles to `Inner__c0`, clashing with
+        // the value's `Inner__c<N>` (an LLVM-verifier failure).
+        if (r->isConstValue && !r->constValueName.empty()) {
+            if (auto it = lengths.find(r->constValueName); it != lengths.end())
+                return makeConstValue(static_cast<long long>(it->second));
+        }
+        return r;
     default:
         return r;
     }
@@ -339,11 +350,71 @@ TypePtr renameConstLenRec(const TypePtr& t,
         }
         return changed ? makeTuple(std::move(ne)) : r;
     }
+    case TypeKind::Int:
+        // Phase 61/62 fix: rename a SYMBOLIC const-value typeArg (a nested
+        // `Inner<N>` field) through the symbolic rename map, mirroring the
+        // array-length rename — so `Matrix<C, R>` with a nested const-generic
+        // field rebinds correctly instead of keeping a stale symbol.
+        if (r->isConstValue && !r->constValueName.empty()) {
+            if (auto it = rn.find(r->constValueName); it != rn.end())
+                return makeConstSymbol(it->second);
+        }
+        return r;
+    case TypeKind::Function: {
+        // Needed so renaming a fn SIGNATURE (forwarding a const-generic array
+        // into another const-generic fn) reaches the param/return types.
+        bool changed = false;
+        std::vector<TypePtr> na;
+        na.reserve(r->args.size());
+        for (const auto& a : r->args) {
+            TypePtr a2 = renameConstLenRec(a, rn, visiting);
+            if (a2.get() != a.get()) changed = true;
+            na.push_back(std::move(a2));
+        }
+        TypePtr nr = renameConstLenRec(r->ret, rn, visiting);
+        if (nr.get() != r->ret.get()) changed = true;
+        if (!changed) return r;
+        return makeFunction(std::move(na), nr, r->effectLabels, r->effectRowVar);
+    }
+    case TypeKind::Enum: {
+        if (!visiting.insert(r.get()).second) return r;
+        bool changed = false;
+        std::vector<EnumVariantType> nv;
+        for (const auto& v : r->enumVariants) {
+            EnumVariantType e;
+            e.name = v.name;
+            for (const auto& p : v.payloadTypes) {
+                TypePtr p2 = renameConstLenRec(p, rn, visiting);
+                if (p2.get() != p.get()) changed = true;
+                e.payloadTypes.push_back(std::move(p2));
+            }
+            nv.push_back(std::move(e));
+        }
+        std::vector<TypePtr> na;
+        for (const auto& a : r->typeArgs) {
+            TypePtr a2 = renameConstLenRec(a, rn, visiting);
+            if (a2.get() != a.get()) changed = true;
+            na.push_back(std::move(a2));
+        }
+        visiting.erase(r.get());
+        if (!changed) return r;
+        TypePtr res = makeEnum(r->enumName, std::move(nv));
+        res->typeArgs = std::move(na);
+        return res;
+    }
     default:
         return r;
     }
 }
 } // namespace
+
+TypePtr renameConstLengths(
+    const TypePtr& t,
+    const std::unordered_map<std::string, std::string>& renames) {
+    if (renames.empty()) return t;
+    std::unordered_set<const Type*> visiting;
+    return renameConstLenRec(t, renames, visiting);
+}
 
 TypePtr instantiateGeneric(const TypePtr& schemaType,
                            const std::vector<TypePtr>& genericVars,

@@ -98,7 +98,10 @@ public:
         programMayPanic_ = programContainsPanic(program);
         for (const auto& fn : program.functions) {
             fnAst_[fn.name] = &fn;
+            userSourceNames_.insert(fn.name); // review fix: collision guard
         }
+        for (const auto& s : program.structs) userSourceNames_.insert(s.name);
+        for (const auto& e : program.enums) userSourceNames_.insert(e.name);
         // Phase 24: record extern "C" declarations so emitCall can resolve
         // their C-ABI signature + per-arg coercions.
         for (const auto& ef : program.externFns) {
@@ -568,6 +571,20 @@ private:
     // Source-fn name -> AST node, populated once up front so the worklist
     // loop can look up bodies without re-walking the program.
     std::unordered_map<std::string, const ast::FnDecl*> fnAst_;
+    // Review fix: every user-written top-level fn/struct/enum NAME, so a
+    // monomorphization mangled name (`f__c3`, `Mat__c3`) that collides with a
+    // user identifier is a clear compile error instead of a silent miscompile
+    // (mangling shares LLVM's flat symbol namespace with user symbols).
+    std::unordered_set<std::string> userSourceNames_;
+    void checkManglingCollision(const std::string& base,
+                                const std::string& mangled) {
+        if (mangled != base && userSourceNames_.count(mangled))
+            errors_.push_back(
+                "codegen: monomorphization name `" + mangled +
+                "` (from generic `" + base +
+                "`) collides with a user-defined name; rename the user "
+                "fn/type (mangled instance names are reserved)");
+    }
 
     // Phase 24: extern "C" fn name -> its AST declaration. Populated up front
     // in run(); emitCall consults it to (a) recognize an extern callee and
@@ -5531,6 +5548,7 @@ private:
         std::string mangled = mangleStructInstance(base, r->typeArgs);
         auto it = structTypes_.find(mangled);
         if (it != structTypes_.end()) return it->second;
+        checkManglingCollision(base, mangled); // review fix
         auto* st = llvm::StructType::create(*ctx_, mangled);
         structTypes_[mangled] = st;
         std::vector<llvm::Type*> elems;
@@ -5548,6 +5566,7 @@ private:
         std::string mangled = mangleStructInstance(base, r->typeArgs);
         auto it = enumTypes_.find(mangled);
         if (it != enumTypes_.end()) return it->second;
+        checkManglingCollision(base, mangled); // review fix
         auto* st = llvm::StructType::create(*ctx_, mangled);
         enumTypes_[mangled] = st;
         buildEnumBody(mangled, r);
@@ -6402,6 +6421,7 @@ private:
             if (i < fn.params.size()) arg.setName(fn.params[i].name);
             ++i;
         }
+        checkManglingCollision(fn.name, mangledName); // review fix
         declaredFns_[mangledName] = f;
         currentInstanceTypeMap_ = std::move(savedMap);
         currentSchemaVarSubst_ = std::move(savedSubst);
@@ -9130,6 +9150,11 @@ private:
             }
             const std::string mangled =
                 mangleInstance(call.callee, concreteTypeArgs);
+            // Review fix: if a generic call's mangled instance name equals a
+            // user-defined fn name, the call would silently resolve to the user
+            // fn (a miscompile). Catch it here — declareInstance below is
+            // skipped when the name already resolves.
+            checkManglingCollision(call.callee, mangled);
             auto fnIt = declaredFns_.find(mangled);
             if (fnIt == declaredFns_.end()) {
                 // Pre-declare so the call IR resolves now; queue for body

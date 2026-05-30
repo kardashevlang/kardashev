@@ -60,6 +60,29 @@ effect system's last soundness floor.
   whole v10 line: monomorphize-over-a-value, dimension unification, symbolic
   const params, non-Copy arrays, and array-repeat.
 
+### Fixed
+- A pre-merge adversarial multi-agent review (6 dimensions) hardened **5
+  blockers + 5 majors** the green smoke suite had missed — every one with a
+  verified repro — now pinned by `tests/smoke_test_v10_review.sh`:
+  - a const param not threaded into a NESTED struct/enum field's type-args
+    (`Inner<N>` field of `Outer<N>` mangled `Inner__c0` → LLVM-verifier failure);
+  - a bare `b.clone()` on a const-generic struct leaving the const arg symbolic
+    (mangled `c0`) → result type confusion;
+  - `Drop` is no longer EXEMPT from the effect-subset rule — a `dyn Drop`
+    dispatch could launder io/alloc through a pure-declared `Drop` trait;
+  - a BOUNDED-generic method call (`<T: Trait>` + `t.method()`) attributed ZERO
+    effects (vs the trait's declared effects) — the subset rule's actual floor;
+  - forwarding a SYMBOLIC array length alongside a concrete one was accepted
+    ill-typed (LLVM miscompile) and legitimate symbolic forwarding was wrongly
+    rejected;
+  - const-generic ENUM variant payloads (`[i64; N]`) were wrongly rejected;
+  - a monomorphization name colliding with a user identifier (`g__i64`) silently
+    resolved to the user fn — now a clear compile error;
+  - assigning to a non-Copy array element `a[i] = x` was wrongly rejected;
+  - array-repeat `[v; N]` ignored a local shadowing a const param;
+  - a method-level const param leaked an internal mangled name — now a clear
+    "declare it on the impl block" diagnostic.
+
 ### Changed
 - The **effect-subset rule** (Phase 60), the effect system's last soundness
   floor: a trait impl method's effects must be a SUBSET of the trait method's
