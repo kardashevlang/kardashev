@@ -504,8 +504,22 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   (`unit_fn_tail_match_returns_void`, 155 cases). Another bug found *and* fixed
 >   by dogfooding self-hosting.
 >
-> Planned: widen the self-hosted codegen toward whole functions and more types —
-> continuing toward a bootstrap.
+> - **Phase 105 — CAPSTONE: a self-hosted mini-compiler, end-to-end (done).**
+>   `examples/selfhost/compile.kd` ties every stage together: it takes a whole
+>   `fn NAME(PARAMS) -> RET { LETS ; RESULT }`, TYPE-CHECKS it, and — only if
+>   well-typed — COMPILES the body to stack-machine bytecode and EXECUTES it on a
+>   set of argument values. The codegen now handles `let` LOCALS: each `let`
+>   lowers to a `STORE` into a register slot (params + lets share a slot-keyed
+>   register file), so functions with local variables compile and run. Checked:
+>   `f(a,b){ let x=a+b ; x*2 }` → f(3,4)=14; `g(a){ let y=a*a ; let z=y+a ; z }` →
+>   g(5)=30; a `bool` function `h(a,b){ a<b }` → h(3,4)=1; and an ill-typed
+>   function (`fn bad(a)->i64 { a<a }`) is REJECTED before any code is emitted
+>   (sentinel −1). JIT + AOT; pinned by `tests/smoke_test_phase105.sh`.
+>
+>   **lex → parse → type-check → code-generate → execute, every stage written in
+>   kardashev — a complete compiler front-to-back, running real functions.** Two
+>   real host-compiler bugs (the field-move double-free, the unit-tail-`match`
+>   miscompile) were found *and fixed* by dogfooding this self-hosting work.
 
 ## Roadmap v16 — shipped
 
