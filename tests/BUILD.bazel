@@ -787,6 +787,72 @@ sh_test(
     ],
 )
 
+# v15 Phase 88 (self-hosting): a lexer for kardashev written IN kardashev — the
+# foundation proof that the compiler front can be expressed in the language.
+sh_test(
+    name = "smoke_test_phase88",
+    srcs = ["smoke_test_phase88.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:lexer.kd",
+    ],
+)
+
+# v15 Phase 89 (self-hosting): a token-stream lexer (Vec<Token> with kind + span)
+# — the typed interface a parser consumes; spans reconstruct via str_substring.
+sh_test(
+    name = "smoke_test_phase89",
+    srcs = ["smoke_test_phase89.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:tokens.kd",
+    ],
+)
+
+# v15 Phase 90 (self-hosting): a parser for kardashev syntax — a function
+# signature parsed into a structured FnSig AST (names/types via str_substring).
+sh_test(
+    name = "smoke_test_phase90",
+    srcs = ["smoke_test_phase90.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:parser.kd",
+    ],
+)
+
+# v15 Phase 91 (self-hosting): an AST printer — reprints the FnSig AST and checks
+# the source -> AST -> source round-trip is lossless.
+sh_test(
+    name = "smoke_test_phase91",
+    srcs = ["smoke_test_phase91.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:printer.kd",
+    ],
+)
+
+# v15 Phase 92 (self-hosting): a scope checker — a HashMap symbol table over the
+# FnSig AST that resolves param types and rejects duplicate parameter names.
+sh_test(
+    name = "smoke_test_phase92",
+    srcs = ["smoke_test_phase92.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:checker.kd",
+    ],
+)
+
+# v15 Phase 93 CAPSTONE (self-hosting): the whole compiler front end-to-end
+# (lex -> parse -> check -> reprint) over real signatures, in kardashev.
+sh_test(
+    name = "smoke_test_phase93",
+    srcs = ["smoke_test_phase93.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:front.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

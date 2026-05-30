@@ -18,6 +18,45 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.15.0] — Roadmap v15 "self-hosting" (Phases 88–93)
+
+Theme: the north-star arc toward a bootstrap — grow kardashev until a kardashev
+compiler can be written *in* kardashev. v15 delivers a self-hosted compiler
+**front-end** (lexer + parser + checker), each phase a real, tested kardashev
+program in `examples/selfhost/`. The gating primitives already existed (file I/O
+via `fs_read_to_string` → `Result<String, IoError>`; byte string access via
+`str_char_at` / `str_push_byte` / `str_substring`; `enum` + `Box` for a recursive
+AST; `HashMap` for symbol tables), so the front of the pipeline is expressible
+today.
+
+### Added
+- **A lexer in kardashev** (Phase 88, `lexer.kd`) — scans a kardashev snippet
+  byte-by-byte and groups the bytes into real tokens with correct boundaries
+  (identifiers, numbers, the multi-char `->`, punctuation), whitespace skipped.
+- **A token-stream lexer** (Phase 89, `tokens.kd`) — produces a `Vec<Token>` with
+  each token's KIND and SPAN; the spans reconstruct via `str_substring` to `"fn"`
+  / `"->"`, the typed interface a parser consumes.
+- **A parser for kardashev syntax** (Phase 90, `parser.kd`) — parses a function
+  SIGNATURE into a structured `FnSig { name, params: Vec<Param>, ret }` AST,
+  recovering each name/type from the token spans. (Arithmetic-expression parsing
+  was already shown by `examples/calc`; this parses the language's own grammar.)
+- **An AST printer + round-trip** (Phase 91, `printer.kd`) — reprints the `FnSig`
+  AST back to source and checks it is byte-identical, proving the AST losslessly
+  captures the surface syntax.
+- **A scope/semantic checker** (Phase 92, `checker.kd`) — builds a
+  `HashMap<String, String>` symbol table over the AST, resolves a parameter's
+  type by name, and rejects a duplicate parameter name.
+- **Capstone: the front-end, end to end** (Phase 93, `front.kd`) — one program
+  runs the whole front (lex → parse → check → reprint) over a function signature
+  and proves it generalizes across a 2-param and a 3-param signature. A
+  self-hosted compiler front-end written in the language it compiles.
+
+### Notes
+- All six phases green, JIT **and** AOT, deterministic; Linux CI green, macOS CI
+  green except a flaky `codegen_test` abort (carried from v14, an arm64-JIT issue
+  needing a macOS-arm64 environment). Full self-hosting (the whole compiler,
+  incl. codegen) is a multi-roadmap effort the later roadmaps continue.
+
 ## [0.14.0] — Roadmap v14 "hardening" (Phases 82–87)
 
 Theme: make the toolchain trustworthy across platforms and inputs — a green

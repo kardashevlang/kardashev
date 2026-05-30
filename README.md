@@ -52,9 +52,13 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-All fourteen roadmaps (Phases 0–87, **v1–v14**) have shipped and are merged to
+All fifteen roadmaps (Phases 0–93, **v1–v15**) have shipped and are merged to
 `main` — 6 unit suites plus the full smoke-test aggregate pass **JIT and AOT**
-on a cleared clean build. v14 ("hardening") made the toolchain trustworthy
+on a cleared clean build. v15 ("self-hosting") delivers a self-hosted compiler
+**front-end** (lexer + parser + scope checker) written *in* kardashev — the
+north-star arc toward a bootstrap (`examples/selfhost/`, capstone `front.kd`
+running lex → parse → check → reprint end-to-end). v14 ("hardening") made the
+toolchain trustworthy
 across platforms: **macOS CI went green for the first time** (portable leak
 gates), the smoke harness is SIGPIPE-robust, the channel capture-and-keep footgun
 is now a precise compile error, and a JIT-vs-AOT differential sweep over the 9
@@ -404,6 +408,67 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 30's `Result<String, IoError>` drops cleanly on the error path *because* 29 closed that
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
+
+## Roadmap v15 — shipped
+
+> **Status: shipped.** "Self-hosting" — the north-star arc toward a bootstrap.
+> v15 delivers a self-hosted compiler **front-end** (lexer + parser + checker)
+> written *in* kardashev, in `examples/selfhost/`. All of v15 (Phases 88–93) is
+> implemented and green — 6 unit suites + the smoke aggregate, JIT **and** AOT.
+> The language already had the gating primitives — file I/O (`fs_read_to_string`
+> → `Result<String, IoError>`), byte-level string access (`str_char_at` /
+> `str_push_byte` / `str_substring`), recursive data (`enum` + `Box`), and symbol
+> tables (`HashMap`) — so the front of the pipeline is expressible today. Full
+> self-hosting (the whole compiler, incl. codegen) is a multi-roadmap effort the
+> later roadmaps continue.
+>
+> - **Phase 88 — the lexer foundation proof (done).** `examples/selfhost/lexer.kd`
+>   is a lexer *written in kardashev*: it scans a kardashev snippet
+>   (`fn add(a: i64, b: i64) -> i64 { a + b + 42 }`) byte-by-byte and groups the
+>   bytes into real tokens with correct boundaries — identifiers (`is_alpha` then
+>   `is_alnum*`), integer literals, the multi-char `->`, and single-char
+>   punctuation, whitespace skipped — reporting 9 idents / 1 number / 1 arrow /
+>   9 punct and a position-weighted witness (9010109), checked JIT + AOT. Proves
+>   the compiler front is expressible in the language itself.
+> - **Phase 89 — a token-stream lexer (done).** `examples/selfhost/tokens.kd`
+>   grows the classifier into a real lexer that returns a `Vec<Token>` — each
+>   token carrying its KIND and its SPAN (`start` + `len`) into the source, the
+>   typed interface a parser sits on. Over the same snippet it yields 20 tokens;
+>   the first reconstructs (via `str_substring` over its span) to `"fn"` and the
+>   arrow token to `"->"`, proving the spans are correct, with a deterministic
+>   stream fingerprint — JIT + AOT.
+> - **Phase 90 — a parser for kardashev syntax (done).** `examples/selfhost/parser.kd`
+>   parses a function SIGNATURE — `fn add(a: i64, b: i64) -> i64` — into a
+>   structured AST (`FnSig { name, params: Vec<Param>, ret }`), recovering each
+>   name/type by `str_substring` over the token spans: name `"add"`, 2 params
+>   (first `a: i64`), return `i64`, witness 1211, JIT + AOT. (Arithmetic-expression
+>   parsing was already shown by `examples/calc`; this parses the *language's own*
+>   grammar — the genuine step toward a self-hosted front-end.)
+> - **Phase 91 — an AST printer + round-trip (done).** `examples/selfhost/printer.kd`
+>   reprints the parsed `FnSig` back to source and checks it ROUND-TRIPS:
+>   `fn add(a: i64, b: i64) -> i64` → tokens → AST → source is byte-identical
+>   (length 29, `round_trips = 1`), JIT + AOT. A lossless round-trip proves the
+>   AST captures everything the surface syntax carries — the invariant a real
+>   parser must hold.
+> - **Phase 92 — a scope/semantic checker (done).** `examples/selfhost/checker.kd`
+>   builds a `HashMap<String, String>` SYMBOL TABLE over the `FnSig` AST and runs
+>   real semantic checks: it RESOLVES a parameter's type by name (`b` → `i64`) and
+>   REJECTS a duplicate parameter name (`fn bad(a: i64, a: i64)` is flagged). The
+>   analysis phase a compiler runs after parsing, in kardashev — JIT + AOT.
+> - **Phase 93 — CAPSTONE: the front-end, end to end (done).** `examples/selfhost/front.kd`
+>   runs the WHOLE front it built (lex → parse → check → reprint) over a function
+>   signature in one program, scoring it, and proves it generalizes across a
+>   2-param and a 3-param signature (`211`, `311`, pipeline witness `211311`),
+>   JIT + AOT. A self-hosted compiler **front-end written in the language it
+>   compiles** — tokens with spans, a real `FnSig` AST, a HashMap symbol table
+>   with duplicate-param + type-resolution checks, and a lossless source
+>   round-trip.
+>
+> v15 delivers the self-hosted **front-end** (lexer + parser + checker). Full
+> self-hosting (the whole compiler, incl. codegen) is a multi-roadmap effort the
+> later roadmaps continue — parsing more of the grammar (statements, expressions,
+> items) → a fuller `enum` AST → a real type checker → eventually emitting code,
+> closing language gaps (richer errors, string ops) as they surface.
 
 ## Roadmap v14 — shipped
 
