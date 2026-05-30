@@ -52,9 +52,13 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-All fourteen roadmaps (Phases 0–87, **v1–v14**) have shipped and are merged to
+All fifteen roadmaps (Phases 0–93, **v1–v15**) have shipped and are merged to
 `main` — 6 unit suites plus the full smoke-test aggregate pass **JIT and AOT**
-on a cleared clean build. v14 ("hardening") made the toolchain trustworthy
+on a cleared clean build. v15 ("self-hosting") delivers a self-hosted compiler
+**front-end** (lexer + parser + scope checker) written *in* kardashev — the
+north-star arc toward a bootstrap (`examples/selfhost/`, capstone `front.kd`
+running lex → parse → check → reprint end-to-end). v14 ("hardening") made the
+toolchain trustworthy
 across platforms: **macOS CI went green for the first time** (portable leak
 gates), the smoke harness is SIGPIPE-robust, the channel capture-and-keep footgun
 is now a precise compile error, and a JIT-vs-AOT differential sweep over the 9
@@ -405,17 +409,18 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
 
-## Roadmap v15 — in progress
+## Roadmap v15 — shipped
 
-> **Status: in progress** on `feat/roadmap-v15`. "Self-hosting" — the north-star
-> arc: grow kardashev until a kardashev compiler can be written *in* kardashev,
-> toward a bootstrap. The language already has the gating primitives — file I/O
-> (`fs_read_to_string` → `Result<String, IoError>`, `fs_write`), byte-level
-> string access (`str_char_at` / `str_push_byte` / `str_substring`), recursive
-> data (`enum` + `Box`), and symbol tables (`HashMap`) — so the front of the
-> pipeline is expressible today. This is a multi-roadmap effort, built the same
-> way: each phase a real, tested kardashev program, validated against the C++
-> reference.
+> **Status: shipped.** "Self-hosting" — the north-star arc toward a bootstrap.
+> v15 delivers a self-hosted compiler **front-end** (lexer + parser + checker)
+> written *in* kardashev, in `examples/selfhost/`. All of v15 (Phases 88–93) is
+> implemented and green — 6 unit suites + the smoke aggregate, JIT **and** AOT.
+> The language already had the gating primitives — file I/O (`fs_read_to_string`
+> → `Result<String, IoError>`), byte-level string access (`str_char_at` /
+> `str_push_byte` / `str_substring`), recursive data (`enum` + `Box`), and symbol
+> tables (`HashMap`) — so the front of the pipeline is expressible today. Full
+> self-hosting (the whole compiler, incl. codegen) is a multi-roadmap effort the
+> later roadmaps continue.
 >
 > - **Phase 88 — the lexer foundation proof (done).** `examples/selfhost/lexer.kd`
 >   is a lexer *written in kardashev*: it scans a kardashev snippet
