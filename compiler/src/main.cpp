@@ -590,6 +590,37 @@ std::string applyPrelude(const std::string& userSrc) {
             "    if str_parse_f64(s, &mut out) { Some(out) } else { None }\n"
             "}\n";
     }
+    // v12 Phase 70: Vec membership queries over the Eq trait, written in
+    // kardashev (a linear scan calling `.eq`). `! { alloc }` because the Eq
+    // trait method declares it (the effect-subset floor: a bounded `<T: Eq>`
+    // call attributes the trait's declared effects). vec_index_of returns the
+    // first matching index or -1.
+    if (userSrc.find("fn vec_contains") == std::string::npos) {
+        prelude +=
+            "fn vec_contains<T: Eq>(v: &Vec<T>, x: &T) -> bool ! { alloc } {\n"
+            "    let mut i = 0;\n"
+            "    let mut found = false;\n"
+            "    while i < vec_len(v) {\n"
+            "        if vec_get_ref(v, i).eq(x) { found = true; } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    found\n"
+            "}\n";
+    }
+    if (userSrc.find("fn vec_index_of") == std::string::npos) {
+        prelude +=
+            "fn vec_index_of<T: Eq>(v: &Vec<T>, x: &T) -> i64 ! { alloc } {\n"
+            "    let mut i = 0;\n"
+            "    let mut idx = 0 - 1;\n"
+            "    while i < vec_len(v) {\n"
+            "        if idx < 0 {\n"
+            "            if vec_get_ref(v, i).eq(x) { idx = i; } else {}\n"
+            "        } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    idx\n"
+            "}\n";
+    }
     // Phase 53 (v9): generic Vec higher-order combinators over closures, each
     // effect-polymorphic in the closure's effect row `e` (so a pure mapper
     // keeps the caller pure, an allocating one adds `alloc`). The closure

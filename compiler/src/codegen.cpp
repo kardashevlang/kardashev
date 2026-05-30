@@ -5583,6 +5583,198 @@ private:
             declaredFns_[mangled] = fn;
             return fn;
         }
+        // v12 Phase 70: vec_pop(v: &mut Vec<T>) -> T — remove and return the
+        // last element (moved out; len decremented so the slot is no longer
+        // owned, no double-free). An empty Vec yields a type-correct zero, the
+        // same out-of-bounds contract as vec_get — check vec_len first.
+        if (op == "vec_pop") {
+            auto* fnTy = llvm::FunctionType::get(elemLlvmTy, {vecPtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* popBB = llvm::BasicBlock::Create(ctx, "pop", fn);
+            auto* emptyBB = llvm::BasicBlock::Create(ctx, "empty", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* dataPtr = b.CreateStructGEP(vecTy, fn->getArg(0), 0, "data_p");
+            auto* lenPtr = b.CreateStructGEP(vecTy, fn->getArg(0), 1, "len_p");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* nonEmpty = b.CreateAnd(
+                b.CreateICmpSGT(len, zero, "gt0"),
+                b.CreateICmpNE(data, llvm::Constant::getNullValue(i8PtrTy),
+                               "nn"),
+                "non_empty");
+            b.CreateCondBr(nonEmpty, popBB, emptyBB);
+            b.SetInsertPoint(popBB);
+            auto* newLen =
+                b.CreateSub(len, llvm::ConstantInt::get(i64Ty, 1), "new_len");
+            auto* elemPtr = b.CreateGEP(elemLlvmTy, data, newLen, "elem_p");
+            auto* elem = b.CreateLoad(elemLlvmTy, elemPtr, "elem");
+            b.CreateStore(newLen, lenPtr);
+            b.CreateRet(elem);
+            b.SetInsertPoint(emptyBB);
+            b.CreateRet(llvm::Constant::getNullValue(elemLlvmTy));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        // v12 Phase 70: vec_remove(v: &mut Vec<T>, i) -> T — remove the element
+        // at index i (moved out, returned), shifting the tail down by one slot
+        // (memmove). Out-of-range yields a zero, like vec_get.
+        if (op == "vec_remove") {
+            auto* fnTy = llvm::FunctionType::get(
+                elemLlvmTy, {vecPtrTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("v");
+            fn->getArg(1)->setName("i");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* doBB = llvm::BasicBlock::Create(ctx, "do_rm", fn);
+            auto* oobBB = llvm::BasicBlock::Create(ctx, "oob", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* dataPtr = b.CreateStructGEP(vecTy, fn->getArg(0), 0, "data_p");
+            auto* lenPtr = b.CreateStructGEP(vecTy, fn->getArg(0), 1, "len_p");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* idx = fn->getArg(1);
+            auto* ok = b.CreateAnd(
+                b.CreateAnd(b.CreateICmpSGE(idx, zero, "nn"),
+                            b.CreateICmpSLT(idx, len, "lt"), "in_range"),
+                b.CreateICmpNE(data, llvm::Constant::getNullValue(i8PtrTy),
+                               "data_nn"),
+                "ok");
+            b.CreateCondBr(ok, doBB, oobBB);
+            b.SetInsertPoint(doBB);
+            auto* elemPtr = b.CreateGEP(elemLlvmTy, data, idx, "elem_p");
+            auto* elem = b.CreateLoad(elemLlvmTy, elemPtr, "elem");
+            // Shift the (len - 1 - i) elements after i down by one.
+            auto* tail = b.CreateSub(
+                b.CreateSub(len, idx, "len_minus_i"),
+                llvm::ConstantInt::get(i64Ty, 1), "tail_count");
+            auto* srcPtr = b.CreateGEP(
+                elemLlvmTy, data,
+                b.CreateAdd(idx, llvm::ConstantInt::get(i64Ty, 1), "i_plus_1"),
+                "src_p");
+            auto* bytes = b.CreateMul(tail, elemBytesK, "shift_bytes");
+            b.CreateMemMove(elemPtr, llvm::MaybeAlign(1), srcPtr,
+                            llvm::MaybeAlign(1), bytes);
+            b.CreateStore(
+                b.CreateSub(len, llvm::ConstantInt::get(i64Ty, 1), "new_len"),
+                lenPtr);
+            b.CreateRet(elem);
+            b.SetInsertPoint(oobBB);
+            b.CreateRet(llvm::Constant::getNullValue(elemLlvmTy));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        // v12 Phase 70: vec_insert(v: &mut Vec<T>, i, x) -> i64 — insert x at
+        // index i, shifting the tail up by one (growing if full). i is clamped
+        // to [0, len] (insert at len == push). Returns 0.
+        if (op == "vec_insert") {
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {vecPtrTy, i64Ty, elemLlvmTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("v");
+            fn->getArg(1)->setName("i");
+            fn->getArg(2)->setName("x");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* growBB = llvm::BasicBlock::Create(ctx, "grow", fn);
+            auto* shiftBB = llvm::BasicBlock::Create(ctx, "shift", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* vPtr = fn->getArg(0);
+            auto* dataPtr = b.CreateStructGEP(vecTy, vPtr, 0, "data_p");
+            auto* lenPtr = b.CreateStructGEP(vecTy, vPtr, 1, "len_p");
+            auto* capPtr = b.CreateStructGEP(vecTy, vPtr, 2, "cap_p");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* cap = b.CreateLoad(i64Ty, capPtr, "cap");
+            // Clamp index to [0, len].
+            auto* idxNN = b.CreateSelect(
+                b.CreateICmpSLT(fn->getArg(1), zero, "neg"), zero,
+                fn->getArg(1), "idx_nn");
+            auto* idx = b.CreateSelect(b.CreateICmpSGT(idxNN, len, "over"), len,
+                                       idxNN, "idx");
+            auto* needGrow = b.CreateICmpEQ(len, cap, "need_grow");
+            b.CreateCondBr(needGrow, growBB, shiftBB);
+            b.SetInsertPoint(growBB);
+            auto* capIsZero = b.CreateICmpEQ(cap, zero, "cap0");
+            auto* newCap = b.CreateSelect(
+                capIsZero, llvm::ConstantInt::get(i64Ty, 4),
+                b.CreateMul(cap, llvm::ConstantInt::get(i64Ty, 2), "dbl"),
+                "new_cap");
+            auto* oldData = b.CreateLoad(i8PtrTy, dataPtr, "old_data");
+            auto* newData = b.CreateCall(
+                reallocFn_, {oldData, b.CreateMul(newCap, elemBytesK, "nb")},
+                "new_data");
+            b.CreateStore(newData, dataPtr);
+            b.CreateStore(newCap, capPtr);
+            b.CreateBr(shiftBB);
+            b.SetInsertPoint(shiftBB);
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* atPtr = b.CreateGEP(elemLlvmTy, data, idx, "at_p");
+            // Shift the (len - i) tail elements up by one to open a slot at i.
+            auto* tail = b.CreateSub(len, idx, "tail_count");
+            auto* dstPtr = b.CreateGEP(
+                elemLlvmTy, data,
+                b.CreateAdd(idx, llvm::ConstantInt::get(i64Ty, 1), "i_plus_1"),
+                "dst_p");
+            b.CreateMemMove(dstPtr, llvm::MaybeAlign(1), atPtr,
+                            llvm::MaybeAlign(1),
+                            b.CreateMul(tail, elemBytesK, "shift_bytes"));
+            b.CreateStore(fn->getArg(2), atPtr);
+            b.CreateStore(
+                b.CreateAdd(len, llvm::ConstantInt::get(i64Ty, 1), "new_len"),
+                lenPtr);
+            b.CreateRet(zero);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        // v12 Phase 70: vec_reverse(v: &mut Vec<T>) -> i64 — reverse in place
+        // (a load/store swap of slots i and len-1-i, ownership-neutral like
+        // vec_swap). Returns 0.
+        if (op == "vec_reverse") {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {vecPtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* condBB = llvm::BasicBlock::Create(ctx, "cond", fn);
+            auto* bodyBB = llvm::BasicBlock::Create(ctx, "body", fn);
+            auto* retBB = llvm::BasicBlock::Create(ctx, "ret", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* data = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(vecTy, fn->getArg(0), 0, "data_p"),
+                "data");
+            auto* len = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(vecTy, fn->getArg(0), 1, "len_p"),
+                "len");
+            auto* iSlot = b.CreateAlloca(i64Ty, nullptr, "i_slot");
+            b.CreateStore(zero, iSlot);
+            auto* half =
+                b.CreateSDiv(len, llvm::ConstantInt::get(i64Ty, 2), "half");
+            b.CreateBr(condBB);
+            b.SetInsertPoint(condBB);
+            auto* i = b.CreateLoad(i64Ty, iSlot, "i");
+            b.CreateCondBr(b.CreateICmpSLT(i, half, "more"), bodyBB, retBB);
+            b.SetInsertPoint(bodyBB);
+            auto* j = b.CreateSub(
+                b.CreateSub(len, i, "len_minus_i"),
+                llvm::ConstantInt::get(i64Ty, 1), "j");
+            auto* pi = b.CreateGEP(elemLlvmTy, data, i, "slot_i");
+            auto* pj = b.CreateGEP(elemLlvmTy, data, j, "slot_j");
+            auto* vi = b.CreateLoad(elemLlvmTy, pi, "elem_i");
+            auto* vj = b.CreateLoad(elemLlvmTy, pj, "elem_j");
+            b.CreateStore(vj, pi);
+            b.CreateStore(vi, pj);
+            b.CreateStore(b.CreateAdd(i, llvm::ConstantInt::get(i64Ty, 1),
+                                      "i_next"),
+                          iSlot);
+            b.CreateBr(condBB);
+            b.SetInsertPoint(retBB);
+            b.CreateRet(zero);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
         return nullptr;
     }
 
@@ -9307,7 +9499,9 @@ private:
             // body — synthesize their specialization directly.
             if ((call.callee == "vec_new" || call.callee == "vec_push" ||
                  call.callee == "vec_get" || call.callee == "vec_get_ref" ||
-                 call.callee == "vec_len" || call.callee == "vec_swap") &&
+                 call.callee == "vec_len" || call.callee == "vec_swap" ||
+                 call.callee == "vec_pop" || call.callee == "vec_remove" ||
+                 call.callee == "vec_insert" || call.callee == "vec_reverse") &&
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
                     getOrEmitVecOp(call.callee, concreteTypeArgs[0]);

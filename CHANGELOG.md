@@ -34,6 +34,13 @@ step toward production use.
   whitespace validation). Plus `int_to_hex(i64) -> String` (lowercase hex, the
   two's-complement pattern for a negative). Reading data no longer needs a
   hand-rolled digit loop.
+- **Vec mutation + query** (Phase 70): `vec_pop` / `vec_remove` / `vec_insert`
+  / `vec_reverse` (built-ins) and `vec_contains` / `vec_index_of`
+  (`Eq`-bounded prelude scans; index −1 when absent). `vec_pop` and
+  `vec_remove` MOVE the element out (the length is decremented so the Vec no
+  longer owns that slot — no clone, no double-free, the dual of the cloning
+  `vec_get`), so they are sound for a non-Copy element type (`Vec<String>`).
+  `vec_insert` grows when full and clamps its index to `[0, len]`.
 
 ## [0.11.0] — Roadmap v11 "real machine integers" (Phases 63–68)
 

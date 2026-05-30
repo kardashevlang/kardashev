@@ -434,6 +434,46 @@ public:
             sch.genericVars.push_back(vecFnGenericVar);
             fnSchemas_["vec_swap"] = std::move(sch);
         }
+        // v12 Phase 70: Vec mutation. vec_pop / vec_remove MOVE the element out
+        // (len decremented, so the Vec no longer owns that slot — no clone, no
+        // double-free; the dual of vec_get which CLONES because the Vec keeps
+        // its copy). An empty/out-of-range index yields a zero (vec_get's
+        // contract). vec_insert may grow (alloc); the others are pure mutators.
+        // vec_pop<T>(v: &mut Vec<T>) -> T
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecFnInst, /*isMut=*/true)}, vecFnGenericVar);
+            sch.genericVars.push_back(vecFnGenericVar);
+            fnSchemas_["vec_pop"] = std::move(sch);
+        }
+        // vec_remove<T>(v: &mut Vec<T>, i: i64) -> T
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecFnInst, /*isMut=*/true), makeInt()},
+                vecFnGenericVar);
+            sch.genericVars.push_back(vecFnGenericVar);
+            fnSchemas_["vec_remove"] = std::move(sch);
+        }
+        // vec_insert<T>(v: &mut Vec<T>, i: i64, x: T) -> i64 ! { alloc }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecFnInst, /*isMut=*/true), makeInt(), vecFnGenericVar},
+                makeInt());
+            sch.declaredEffects.add("alloc");
+            sch.genericVars.push_back(vecFnGenericVar);
+            fnSchemas_["vec_insert"] = std::move(sch);
+        }
+        // vec_reverse<T>(v: &mut Vec<T>) -> i64
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecFnInst, /*isMut=*/true)}, makeInt());
+            sch.genericVars.push_back(vecFnGenericVar);
+            fnSchemas_["vec_reverse"] = std::move(sch);
+        }
         // Phase 35: clone<T>(x: &T) -> T ! { alloc } — a DEEP copy. The result
         // owns freshly-allocated heap storage (String buffer, Vec/HashMap
         // backing array, Box payload — recursively), so the clone and the
