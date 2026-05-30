@@ -8193,9 +8193,20 @@ private:
                     if (cv.isBool)
                         return llvm::ConstantInt::get(
                             llvm::Type::getInt1Ty(*ctx_), cv.value ? 1 : 0);
+                    // v11 fix: emit the folded value at the const's RESOLVED
+                    // int width (a narrow / unsigned const), not always i64 —
+                    // otherwise an i64 immediate flows into an i32/u8 slot and
+                    // produces invalid IR (`call i32 @id(i64 ...)`) or a silent
+                    // out-of-range value. The const evaluator already wrapped
+                    // the value to this width.
+                    llvm::Type* cty = llvm::Type::getInt64Ty(*ctx_);
+                    if (TypePtr t = lookupExprType(*id)) {
+                        TypePtr r = resolveInInstance(t);
+                        if (r->kind == TypeKind::Int && !r->isConstValue)
+                            cty = llvm::Type::getIntNTy(*ctx_, r->intWidth);
+                    }
                     return llvm::ConstantInt::get(
-                        llvm::Type::getInt64Ty(*ctx_),
-                        static_cast<uint64_t>(cv.value), /*isSigned=*/true);
+                        cty, static_cast<uint64_t>(cv.value), /*isSigned=*/true);
                 }
                 // Phase 59: a const-generic param used as a VALUE (`N` in the
                 // body of `dot<const N>`) lowers to this instance's concrete

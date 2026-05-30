@@ -1396,7 +1396,21 @@ private:
         auto expr = parseUnary();
         while (check(TokenKind::KwAs)) {
             Token asTok = consume();
-            ast::TypeRef ty = parseTypeRef();
+            // The cast target is a bare numeric type NAME (`i8`..`u64`, `f32`,
+            // `f64`). We deliberately do NOT call parseTypeRef here: in
+            // expression position a trailing `<` / `<<` is a comparison / shift,
+            // not a generic-argument list, but parseTypeRef would greedily eat
+            // it as `Name<...>` (it assumes a type only ever appears after
+            // `:` / `->` / `(` / `,`). So `x as i32 << 2` must parse as
+            // `(x as i32) << 2`, not `x as (i32 << ...)`. Reading just the name
+            // leaves the operator for the precedence loop. (Casts are
+            // numeric-only — typecheck rejects a non-numeric target — so a bare
+            // scalar name covers every valid target.)
+            Token nameTok = expect(TokenKind::Identifier, "a type name after `as`");
+            ast::TypeRef ty;
+            ty.name = nameTok.lexeme;
+            ty.line = nameTok.line;
+            ty.column = nameTok.column;
             auto ce = std::make_unique<ast::CastExpr>();
             ce->line = asTok.line;
             ce->column = asTok.column;

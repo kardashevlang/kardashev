@@ -638,6 +638,14 @@ sh_test(
     ],
 )
 
+# v11 pre-merge adversarial-review regressions: const-eval width/sign agreement
+# with runtime, the `expr as Type <<`/`<` cast-parse fix, the tuple-index suffix.
+sh_test(
+    name = "smoke_test_v11_review",
+    srcs = ["smoke_test_v11_review.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

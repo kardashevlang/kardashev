@@ -2782,6 +2782,29 @@ void test_unsuffixed_float_narrows_to_f32() {
              "unsuffixed_float_narrows_to_f32");
 }
 
+// v11 pre-merge review fixes (const items with sized/unsigned types).
+void test_plain_literal_narrow_const_ok() {
+    // BUG F: a plain narrow / unsigned const literal narrows like a `let`
+    // (previously a raw unify rejected it).
+    expectOk("const C: i32 = 100;\nconst O: u64 = 0xcbf29ce484222325;\n"
+             "fn main() -> i64 { (C as i64) + ((O >> 60) as i64) }",
+             "plain_literal_narrow_const_ok");
+}
+
+void test_out_of_range_const_rejected() {
+    // The narrowing path range-checks a const initializer too.
+    expectErrContains("const C: i8 = 200;\nfn main() -> i64 { C as i64 }",
+                      "out of range",
+                      "out_of_range_const_rejected");
+}
+
+void test_cast_then_shift_parses() {
+    // PARSE regression: `(x as i32) << 2` — the cast target must not eat the
+    // `<<` as a generic-arg list.
+    expectOk("fn main() -> i64 { let x: i64 = 3; ((x as i32) << 2) as i64 }",
+             "cast_then_shift_parses");
+}
+
 } // namespace
 
 int main() {
@@ -3091,6 +3114,9 @@ int main() {
     test_negative_narrow_literal_ok();
     test_negative_unsigned_literal_rejected();
     test_unsuffixed_float_narrows_to_f32();
+    test_plain_literal_narrow_const_ok();
+    test_out_of_range_const_rejected();
+    test_cast_then_shift_parses();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -3099,6 +3125,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (289 cases)\n";
+    std::cout << "All typecheck tests passed (292 cases)\n";
     return 0;
 }

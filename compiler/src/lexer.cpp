@@ -226,10 +226,14 @@ std::vector<Token> lex(std::string_view source) {
                 return false;
             };
             // Phase 64/67: a trailing width suffix. `i`/`u` keeps an integer an
-            // integer; `f32`/`f64` makes it a float.
-            if (consumeFloatSuffix())
+            // integer; `f32`/`f64` makes it a float. NOT after a `.`: a tuple
+            // index (`t.0`, `t.0.1`) is a plain integer and must never absorb a
+            // following `i`/`u`/`f` (which begins the next field access or an
+            // invalid suffix) — same `afterDot` guard the radix/float scanning
+            // above uses.
+            if (!afterDot && consumeFloatSuffix())
                 isFloat = true;
-            else if (!isFloat)
+            else if (!afterDot && !isFloat)
                 consumeIntSuffix();
             tokens.push_back({isFloat ? TokenKind::Float : TokenKind::Integer,
                               std::string(source.substr(start, i - start)),

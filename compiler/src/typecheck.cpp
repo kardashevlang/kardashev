@@ -3578,7 +3578,7 @@ private:
                     constFail("integer overflow in const expr (negating "
                               "i64::MIN)",
                               e);
-                return {false, -v.i};
+                return {false, wrapConstToType(-v.i, e)};
             }
             // Not (bool -> bool).
             if (!v.isBool)
@@ -3632,6 +3632,28 @@ private:
                   "`if`/`else`, `let`, and calls to `const fn`s are "
                   "const-evaluable)",
                   e);
+    }
+
+    // v11 fix: wrap a const-folded integer value to the width/signedness of
+    // `e`'s recorded type, with two's-complement semantics that MATCH runtime
+    // codegen. A narrow UNSIGNED result becomes a POSITIVE i64 in range, and a
+    // narrow SIGNED result is sign-extended — so every subsequent i64 op
+    // (compare, `/`, `>>`, ...) on the wrapped value gives the type-correct
+    // answer (an unsigned `>>` becomes a logical shift for free). i64/u64 (or
+    // an untyped expr) pass through unchanged. This is what makes a sized/
+    // unsigned `const` fold identically to the same expression at run time.
+    long long wrapConstToType(long long val, const ast::Expr& e) {
+        auto it = exprTypes_.find(&e);
+        if (it == exprTypes_.end()) return val;
+        TypePtr t = resolve(it->second);
+        if (t->kind != TypeKind::Int || t->isConstValue || t->intWidth >= 64)
+            return val;
+        int w = t->intWidth;
+        unsigned long long mask = (1ULL << w) - 1;
+        unsigned long long u = static_cast<unsigned long long>(val) & mask;
+        if (t->intSigned && (u & (1ULL << (w - 1))))
+            u |= ~mask; // sign-extend a narrow signed value
+        return static_cast<long long>(u);
     }
 
     ConstValue evalConstBinary(const ast::BinaryExpr& bin, ConstEnv* env,
@@ -3691,18 +3713,20 @@ private:
                 out = l.i / r.i;
             }
             if (of) constFail("integer overflow in const expr", bin);
-            return {false, out};
+            // Wrap to the result's width so a narrow const folds like runtime.
+            return {false, wrapConstToType(out, bin)};
         }
         case Op::BitAnd:
         case Op::BitOr:
         case Op::BitXor:
         case Op::Shl:
         case Op::Shr: {
-            // Phase 66: integer bitwise ops fold at const time. Signedness only
-            // matters for `>>` (arithmetic vs logical); the const evaluator is
-            // i64-valued, so it folds as a signed i64 (arithmetic shift), which
-            // matches a signed-typed const. An unsigned const that needs a
-            // logical shift should compute at run time.
+            // Phase 66 + v11 fix: integer bitwise ops fold at const time. Each
+            // operand is already WRAPPED to its own type's width (an unsigned
+            // narrow value is a positive i64, a signed one is sign-extended), so
+            // `l.i >> r.i` is a LOGICAL shift for an unsigned operand and an
+            // ARITHMETIC shift for a signed one — matching runtime — and the
+            // result is re-wrapped to the op's width below.
             if (l.isBool || r.isBool)
                 constFail("bitwise op requires integer operands in a const "
                           "expr",
@@ -3723,7 +3747,7 @@ private:
                               bin);
                 out = l.i >> r.i;
             }
-            return {false, out};
+            return {false, wrapConstToType(out, bin)};
         }
         }
         constFail("unsupported operator in const expr", bin);
@@ -3840,10 +3864,14 @@ private:
                   cd.type.line, cd.type.column);
         }
         // Type-check the initializer expression (records exprTypes for codegen
-        // + surfaces ordinary type errors), then unify with the declared type.
+        // + surfaces ordinary type errors), then coerce to the declared type.
         if (cd.value) {
             TypePtr initTy = checkExpr(*cd.value);
-            if (okType && !unify(initTy, declared)) {
+            // v11 fix: route through coerceOrUnify (not a raw unify) so a plain
+            // narrow/unsigned literal initializer narrows just like a `let`
+            // (`const C: i32 = 100`, `const O: u64 = 0xcbf...`) — and so an
+            // out-of-range literal is range-checked here too.
+            if (okType && !coerceOrUnify(*cd.value, initTy, declared)) {
                 error("const initializer has type " + typeToString(initTy) +
                           ", but '" + cd.name + "' is declared " +
                           typeToString(declared),
@@ -3858,6 +3886,10 @@ private:
         try {
             constEvalSteps_ = 0;
             ConstValue v = evalConstByName(cd.name, *cd.value);
+            // v11 fix: wrap the final value to the DECLARED width too, so a
+            // bare-literal or otherwise-unwrapped initializer (`const C: i8 =
+            // 200i8`) is stored at the right width — codegen emits it narrow.
+            if (!v.isBool) v.i = wrapConstToType(v.i, *cd.value);
             constExprValues_[cd.value.get()] = v;
         } catch (const ConstEvalError& ce) {
             // Make sure a half-finished evaluation doesn't wedge the
