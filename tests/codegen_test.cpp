@@ -146,6 +146,25 @@ void test_logical_or_shortcircuit() {
     expectEquals(v3, 0, "or_both_false");
 }
 
+void test_ref_to_temporary() {
+    // Phase 125: `&<rvalue>` materializes a fresh slot and borrows it — an enum
+    // literal, an int literal, and a struct literal (previously hard errors).
+    auto v1 = compileAndRun(
+        "enum W { Val(i64), Nil } fn u(w: &W) -> i64 { match w { Val(x) => *x, "
+        "Nil => 0, } } fn main() -> i64 { u(&Val(42)) }",
+        "main", "ref_enum_literal");
+    expectEquals(v1, 42, "ref_enum_literal");
+    auto v2 = compileAndRun(
+        "fn d(x: &i64) -> i64 { *x } fn main() -> i64 { d(&5) }", "main",
+        "ref_int_literal");
+    expectEquals(v2, 5, "ref_int_literal");
+    auto v3 = compileAndRun(
+        "struct P { x: i64, y: i64 } fn s(p: &P) -> i64 { p.x + p.y } "
+        "fn main() -> i64 { s(&P { x: 10, y: 5 }) }",
+        "main", "ref_struct_literal");
+    expectEquals(v3, 15, "ref_struct_literal");
+}
+
 void test_subtraction_left_assoc() {
     // 10 - 3 - 2 == 5  (left-assoc, not 10 - (3 - 2) = 9)
     auto v = compileAndRun("fn main() -> i64 { 10 - 3 - 2 }", "main",
@@ -2461,6 +2480,7 @@ int main() {
     test_subtraction_left_assoc();
     test_signed_division();
     test_logical_or_shortcircuit();
+    test_ref_to_temporary();
     test_let_and_use();
     test_function_call();
     test_if_then();
@@ -2636,7 +2656,7 @@ int main() {
     test_const_fn_runtime_call_runs();
     test_const_folds_to_literal_in_ir();
     test_unit_fn_tail_match_returns_void();
-    std::cout << "All codegen tests passed (158 cases) — Phase 16 Drop/RAII: "
+    std::cout << "All codegen tests passed (161 cases) — Phase 16 Drop/RAII: "
                  "reverse-order scope drops, move semantics, conditional-move "
                  "drop flags, Vec/Box free, scalar codegen unchanged; Phase "
                  "17a fn-value field calls + FnMut captures; Phase 17b generic "
@@ -2653,6 +2673,8 @@ int main() {
                  "&String->C pointer, unmangled C symbol name); Phase 104 "
                  "unit-returning fn with a tail match emits ret void (not ret "
                  "i64 into a void fn); Phase 124 || short-circuit logical-or "
-                 "(binds below &&, dead rhs not evaluated)\n";
+                 "(binds below &&, dead rhs not evaluated); Phase 125 "
+                 "&<temporary> materializes a dropped slot (&enum/&int/&struct "
+                 "literal)\n";
     return 0;
 }

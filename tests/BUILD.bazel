@@ -222,6 +222,16 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v22 Phase 125: `&<temporary>` materializes a dropped statement-scoped slot
+# (the &A(10) ref-to-enum-literal fix). &enum/&int/&struct-literal borrow; a
+# droppable temporary drops exactly once (RSS-flat, MALLOC_CHECK clean over
+# 500k); `&()` (a unit value) stays a clean codegen error. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase125",
+    srcs = ["smoke_test_phase125.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
 # crashed the compiler (void load/return); now compiles + runs.
 sh_test(
