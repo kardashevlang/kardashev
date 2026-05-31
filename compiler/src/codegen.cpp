@@ -9828,9 +9828,21 @@ private:
                 // literal — zero runtime cost, distinct per monomorphization.
                 if (auto cpIt = currentConstParamSubst_.find(id->name);
                     cpIt != currentConstParamSubst_.end()) {
+                    // v28 Phase 153: emit at the param's declared width — i1 for
+                    // a `const _: bool`, i32 for `const _: char`, else i64.
+                    llvm::Type* lit = llvm::Type::getInt64Ty(*ctx_);
+                    if (TypePtr t = lookupExprType(*id)) {
+                        TypePtr r = resolveInInstance(t);
+                        if (r->kind == TypeKind::Bool)
+                            lit = llvm::Type::getInt1Ty(*ctx_);
+                        else if (r->kind == TypeKind::Char)
+                            lit = llvm::Type::getInt32Ty(*ctx_);
+                        else if (r->kind == TypeKind::Int)
+                            lit = llvm::Type::getIntNTy(*ctx_, r->intWidth);
+                    }
                     return llvm::ConstantInt::get(
-                        llvm::Type::getInt64Ty(*ctx_),
-                        static_cast<uint64_t>(cpIt->second), /*isSigned=*/true);
+                        lit, static_cast<uint64_t>(cpIt->second),
+                        /*isSigned=*/true);
                 }
             }
             // Phase 17a: a by-ref capture reads through the env pointer into

@@ -342,6 +342,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v28 Phase 153: const-generics beyond i64 (bool/char const params).
+sh_test(
+    name = "smoke_test_phase153",
+    srcs = ["smoke_test_phase153.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v28 Phase 152: const-eval beyond i64/bool (array/tuple/struct/enum consts).
 sh_test(
     name = "smoke_test_phase152",

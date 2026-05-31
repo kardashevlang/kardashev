@@ -561,6 +561,12 @@ struct TypeRef {
     // substitutes symbolic array lengths `[T; N]`.
     bool isConstArg = false;
     long long constArgValue = 0;
+    // v28 Phase 153: the const-arg's apparent type — `i64` (default, an integer
+    // literal), `bool` (`true`/`false`), or `char` (a char literal). Lets the
+    // typechecker check the arg matches the `const N: <type>` parameter and
+    // gives the const-value Type the right kind. The value is still a long long
+    // (bool 0/1, char codepoint) so monomorphization keys unchanged.
+    std::string constArgTypeName = "i64";
     // Function-type fields (valid only when isFn == true).
     bool isFn = false;
     std::vector<TypeRef> fnParams;
@@ -705,6 +711,12 @@ struct TypeParam {
     // A `[T; N]` length or a use-site `Foo<3>` arg binds it to a compile-time
     // integer; Phase 58 monomorphizes over that value.
     bool isConst = false;
+    // v28 Phase 153: the const param's declared type name — `i64` (default),
+    // `bool`, or `char`. The value is still carried as a `long long` (bool ->
+    // 0/1, char -> codepoint) so the value-based monomorphization keys
+    // unchanged; this drives the value-use TYPE (i64 / bool / char) + the
+    // codegen width (i64 / i1 / i32). Only meaningful when `isConst`.
+    std::string constTypeName = "i64";
     std::size_t line = 1;
     std::size_t column = 1;
 };

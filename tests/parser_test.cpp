@@ -1857,8 +1857,12 @@ void test_const_generic_param() {
 }
 
 void test_const_generic_param_non_i64_rejected() {
-    auto r = parse("struct Mat<const N: bool> { x: i64 }");
-    assert(!r.ok()); // must be i64
+    // v28 Phase 153: i64/bool/char const params are now ACCEPTED; only an
+    // unsupported type (e.g. f64) is rejected at the declaration.
+    assert(parse("struct Mat<const N: bool> { x: i64 }").ok());
+    assert(parse("struct Mat<const N: char> { x: i64 }").ok());
+    auto r = parse("struct Mat<const N: f64> { x: i64 }");
+    assert(!r.ok()); // must be i64 / bool / char
 }
 
 // Phase 58 (v10): a const-generic VALUE argument `Mat<3>` parses as a const-arg

@@ -1067,6 +1067,28 @@ private:
                             carg.constArgValue = 0;
                         }
                         tr.typeArgs.push_back(std::move(carg));
+                    } else if (check(TokenKind::KwTrue) ||
+                               check(TokenKind::KwFalse)) {
+                        // v28 Phase 153: a `bool` const-generic argument.
+                        Token b = consume();
+                        ast::TypeRef carg;
+                        carg.isConstArg = true;
+                        carg.constArgTypeName = "bool";
+                        carg.constArgValue = (b.kind == TokenKind::KwTrue) ? 1 : 0;
+                        carg.line = b.line;
+                        carg.column = b.column;
+                        tr.typeArgs.push_back(std::move(carg));
+                    } else if (check(TokenKind::CharLit)) {
+                        // v28 Phase 153: a `char` const-generic argument.
+                        Token ch = consume();
+                        ast::TypeRef carg;
+                        carg.isConstArg = true;
+                        carg.constArgTypeName = "char";
+                        carg.constArgValue =
+                            static_cast<long long>(std::stoul(ch.lexeme));
+                        carg.line = ch.line;
+                        carg.column = ch.column;
+                        tr.typeArgs.push_back(std::move(carg));
                     } else {
                         tr.typeArgs.push_back(parseTypeRef());
                     }
@@ -1146,11 +1168,16 @@ private:
                            "e.g. `const N: i64`)");
                     Token tyTok =
                         expect(TokenKind::Identifier, "const-generic param type");
-                    if (tyTok.lexeme != "i64") {
+                    // v28 Phase 153: a const-generic param may be `i64`, `bool`,
+                    // or `char` (its value is still monomorphized by value).
+                    if (tyTok.lexeme != "i64" && tyTok.lexeme != "bool" &&
+                        tyTok.lexeme != "char") {
                         errorAt("const generic parameter `" + tp.name +
-                                    "` must be `i64`, got `" + tyTok.lexeme + "`",
+                                    "` must be `i64`, `bool`, or `char`, got `" +
+                                    tyTok.lexeme + "`",
                                 tyTok.line, tyTok.column);
                     }
+                    tp.constTypeName = tyTok.lexeme;
                 } else {
                     Token tpTok = expect(TokenKind::Identifier,
                                          "generic type parameter name");

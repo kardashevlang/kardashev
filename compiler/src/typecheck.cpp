@@ -2409,6 +2409,14 @@ private:
     // symbolic-length array (recorded, not const-evaluated). Set/cleared in
     // lockstep with currentGenericEnv_.
     std::unordered_set<std::string> currentConstParams_;
+    // v28 Phase 153: each in-scope const-generic param's declared type name
+    // (i64/bool/char), so a value-use of the param has the right type + width.
+    std::unordered_map<std::string, std::string> currentConstParamTypes_;
+    // v28 Phase 153/154: the expected type of the expression currently being
+    // checked, when known from an annotation/coercion target. A struct literal
+    // consults it to adopt const-generic args it can't infer from a field
+    // (`let s: Sel<true> = Sel { .. }`). null = no expectation.
+    TypePtr currentExpectedType_ = nullptr;
     // Phase 61: when checking a call argument that is a closure, the callee's
     // expected fn-typed parameter — so `checkClosure` can infer an unannotated
     // `|x|`'s param type before checking the body. Consumed (cleared) by
@@ -2416,19 +2424,30 @@ private:
     TypePtr expectedArgType_;
     void setConstParamsInScope(const std::vector<ast::TypeParam>& ps) {
         currentConstParams_.clear();
+        currentConstParamTypes_.clear();
         for (const auto& p : ps)
-            if (p.isConst) currentConstParams_.insert(p.name);
+            if (p.isConst) {
+                currentConstParams_.insert(p.name);
+                currentConstParamTypes_[p.name] = p.constTypeName;
+            }
     }
     // Phase 61: an impl method sees BOTH the impl's const params and its own
     // (`impl<.., const CAP> .. for RingBuffer<T, CAP>` + a `fn f<const M>`).
     void setConstParamsInScope(const std::vector<ast::TypeParam>& implPs,
                                const std::vector<ast::TypeParam>& fnPs) {
         currentConstParams_.clear();
+        currentConstParamTypes_.clear();
         for (const auto& p : implPs) {
-            if (p.isConst) currentConstParams_.insert(p.name);
+            if (p.isConst) {
+                currentConstParams_.insert(p.name);
+                currentConstParamTypes_[p.name] = p.constTypeName;
+            }
         }
         for (const auto& p : fnPs)
-            if (p.isConst) currentConstParams_.insert(p.name);
+            if (p.isConst) {
+                currentConstParams_.insert(p.name);
+                currentConstParamTypes_[p.name] = p.constTypeName;
+            }
     }
     // Phase 10a: names of generic params that are effect-row variables in
     // the signature currently being resolved. Active alongside
@@ -4556,6 +4575,12 @@ private:
             // value per instance (codegen emits a literal). A local of the same
             // name shadows it (handled by lookupLocal above).
             if (currentConstParams_.count(id->name)) {
+                // v28 Phase 153: the value's type is the param's declared type.
+                auto tit = currentConstParamTypes_.find(id->name);
+                if (tit != currentConstParamTypes_.end()) {
+                    if (tit->second == "bool") return makeBool();
+                    if (tit->second == "char") return makeChar();
+                }
                 return makeInt();
             }
             auto fnIt = fnSchemas_.find(id->name);
@@ -5566,6 +5591,26 @@ private:
                 auto vit = valTypes.find(fname);
                 if (vit != valTypes.end())
                     solveConstLengths(fty, vit->second, constSubst, constSym);
+            }
+            // v28 Phase 153/154: adopt const-generic args from the expected
+            // type (an annotation) for params not inferable from a field.
+            if (currentExpectedType_) {
+                TypePtr et = resolve(currentExpectedType_);
+                if (et->kind == TypeKind::Struct &&
+                    et->structName == sl.structName &&
+                    et->typeArgs.size() >= schema.constParamNames.size()) {
+                    for (std::size_t i = 0; i < schema.constParamNames.size();
+                         ++i) {
+                        const std::string& pn = schema.constParamNames[i];
+                        if (pn.empty() || constSubst.count(pn) ||
+                            constSym.count(pn))
+                            continue;
+                        TypePtr a = resolve(et->typeArgs[i]);
+                        if (a->kind == TypeKind::Int && a->isConstValue)
+                            constSubst[pn] =
+                                static_cast<std::size_t>(a->constValue);
+                    }
+                }
             }
             for (const auto& nm : schema.constParamNames) {
                 if (!nm.empty() && !constSubst.count(nm) && !constSym.count(nm)) {
@@ -8153,7 +8198,14 @@ private:
 
     void checkStmt(const ast::Stmt& s) {
         if (auto* let = dynamic_cast<const ast::LetStmt*>(&s)) {
+            // v28 Phase 153/154: a scalar annotation is an expected-type hint
+            // for the value (lets a struct literal adopt the annotation's
+            // const-generic args). Restored right after the value is checked.
+            TypePtr savedExpected = currentExpectedType_;
+            if (let->annotation && let->tupleNames.empty())
+                currentExpectedType_ = resolveTypeRef(*let->annotation);
             TypePtr valT = checkExpr(*let->value);
+            currentExpectedType_ = savedExpected;
             // Phase 22: tuple-destructuring `let (x, y) = t;`. The RHS must be
             // a tuple of matching arity; each non-`_` name binds to the
             // corresponding element type. `mut` applies to every bound name.
