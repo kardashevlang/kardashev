@@ -1035,6 +1035,17 @@ sh_test(
     ],
 )
 
+# v20 Phase 117: the self-hosted compiler handles STRUCTS — struct literals +
+# field access -> LLVM insertvalue/extractvalue, differential-gated vs the host.
+sh_test(
+    name = "smoke_test_phase117",
+    srcs = ["smoke_test_phase117.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:structgen.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

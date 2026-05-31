@@ -73,8 +73,13 @@ step past "toy":
   with random args, the self-hosted-emitted LLVM IR (clang → native) must equal
   the host compiler's result. 75 functions across 3 seeds agree
   (`tests/smoke_test_phase116.sh`) — the self-hosted codegen matches the host.
-- Extend the source language the in-kardashev compiler accepts past `i64`/`bool`
-  — at least **structs and enums** (the shapes the real compiler is built from).
+- ✅ **Phase 117 (structs, done)** — the self-hosted compiler now accepts
+  `struct NAME { f: i64, ... }`, builds struct literals, reads fields, and lowers
+  them to first-class LLVM aggregates (`insertvalue`/`extractvalue`); every value
+  carries its type so the emitter prints the right LLVM type. Differential-gated
+  vs the host on several struct programs (`tests/smoke_test_phase117.sh`).
+- Extend the source language further — **enums + `match`** (the other shape the
+  real compiler is built from).
 
 ### v21 — prove it, and close the leaks
 
