@@ -924,6 +924,21 @@ struct ExternFn {
     std::size_t column = 1;
 };
 
+// v26 Phase 146: an import / re-export. `use a::b::c;` brings `c` into scope;
+// `use a::b as d;` introduces a call alias `d` for the imported item; `pub use`
+// re-exports it (isReexport). Under the flat-merge module model every item is
+// already globally visible by bare name, so a plain `use` is a scope hint that
+// also validates the imported name resolves; the `as` form installs a working
+// function-name alias (`d()` calls the imported fn). `path` holds the segments
+// in order; `alias` is empty unless an `as` clause was given.
+struct UseDecl {
+    std::vector<std::string> path;
+    std::string alias;
+    bool isReexport = false;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
 struct Program {
     std::vector<FnDecl> functions;
     std::vector<StructDecl> structs;
@@ -938,6 +953,8 @@ struct Program {
     // v26 Phase 144: top-level type aliases `type Name = Target;` (name -> the
     // aliased TypeRef). The typechecker resolves an alias name to its target.
     std::vector<std::pair<std::string, TypeRef>> typeAliases;
+    // v26 Phase 146: `use a::b::c;` / `use a::b as d;` / `pub use a::b;`.
+    std::vector<UseDecl> uses;
 };
 
 } // namespace kardashev::ast

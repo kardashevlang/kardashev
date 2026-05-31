@@ -328,6 +328,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v26 Phase 146: two-phase borrows + module visibility + use/pub-use imports.
+sh_test(
+    name = "smoke_test_phase146",
+    srcs = ["smoke_test_phase146.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v26 Phase 144: type aliases (type Name = Target).
 sh_test(
     name = "smoke_test_phase144",

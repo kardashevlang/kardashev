@@ -69,6 +69,12 @@ public:
                     prog.consts.push_back(parseConstDecl());
                 }
             } else if (check(TokenKind::Identifier) &&
+                       peek().lexeme == "use") {
+                // v26 Phase 146: a top-level import `use a::b::c;` /
+                // `use a::b as d;` (the `pub use` re-export is handled in the
+                // KwPub branch below).
+                prog.uses.push_back(parseUseDecl());
+            } else if (check(TokenKind::Identifier) &&
                        peek().lexeme == "type") {
                 // v26 Phase 144: a top-level type alias `type Name = Target;`.
                 consume(); // `type`
@@ -89,43 +95,55 @@ public:
                 // the report). Bare-name type references still resolve under
                 // flat-merge, matching the fn behavior.
                 advance();
+                // v26 Phase 146: an optional visibility restriction
+                // `pub(crate)` / `pub(super)` / `pub(self)` / `pub(in path)`.
+                // `pub(self)` is private (Rust semantics); the rest are
+                // path-reachable in this crate. See parsePubRestriction.
+                bool pubReach = parsePubRestriction();
                 if (check(TokenKind::KwFn) ||
                     (peek().kind == TokenKind::Identifier &&
                      peek().lexeme == "async" &&
                      peek(1).kind == TokenKind::KwFn)) {
                     auto fn = parseFnDecl();
-                    fn.isPub = true;
+                    fn.isPub = pubReach;
                     prog.functions.push_back(std::move(fn));
                 } else if (check(TokenKind::KwStruct)) {
                     auto s = parseStructDecl();
-                    s.isPub = true;
+                    s.isPub = pubReach;
                     prog.structs.push_back(std::move(s));
                 } else if (check(TokenKind::KwEnum)) {
                     auto en = parseEnumDecl();
-                    en.isPub = true;
+                    en.isPub = pubReach;
                     prog.enums.push_back(std::move(en));
                 } else if (check(TokenKind::KwTrait)) {
                     auto tr = parseTraitDecl();
-                    tr.isPub = true;
+                    tr.isPub = pubReach;
                     prog.traits.push_back(std::move(tr));
                 } else if (check(TokenKind::KwImpl)) {
                     auto im = parseImplDecl();
-                    im.isPub = true;
+                    im.isPub = pubReach;
                     prog.impls.push_back(std::move(im));
                 } else if (check(TokenKind::KwConst)) {
                     // Phase 25: `pub const fn` / `pub const NAME ...`.
                     if (peek(1).kind == TokenKind::KwFn) {
                         auto fn = parseConstFnDecl();
-                        fn.isPub = true;
+                        fn.isPub = pubReach;
                         prog.functions.push_back(std::move(fn));
                     } else {
                         auto c = parseConstDecl();
-                        c.isPub = true;
+                        c.isPub = pubReach;
                         prog.consts.push_back(std::move(c));
                     }
+                } else if (check(TokenKind::Identifier) &&
+                           peek().lexeme == "use") {
+                    // v26 Phase 146: `pub use path;` — a re-export. Parsed and
+                    // recorded (with isReexport); see parseUseDecl.
+                    auto u = parseUseDecl();
+                    u.isReexport = true;
+                    prog.uses.push_back(std::move(u));
                 } else {
                     errorHere("`pub` must precede fn / struct / enum / "
-                              "trait / impl / const");
+                              "trait / impl / const / use");
                     advance();
                 }
             } else {
@@ -595,6 +613,58 @@ private:
         inner.line = ampTok.line;
         inner.column = ampTok.column;
         return inner;
+    }
+
+    // v26 Phase 146: parse an optional visibility restriction after `pub` —
+    // `pub(crate)` / `pub(super)` / `pub(self)` / `pub(in a::b)`. Returns
+    // whether the item is reachable via path-qualified syntax in THIS crate:
+    // `pub`, `pub(crate)`, `pub(super)` and `pub(in ...)` are reachable;
+    // `pub(self)` is equivalent to private (Rust semantics) and is not. The
+    // crate/super/in distinctions collapse to "reachable within the crate"
+    // under the single-crate flat-merge model — the cross-crate boundary they
+    // gate doesn't exist yet — but the syntax is fully parsed and validated.
+    bool parsePubRestriction() {
+        if (!check(TokenKind::LParen)) return true; // bare `pub`
+        consume(); // (
+        bool reachable = true;
+        if (check(TokenKind::Identifier) && peek().lexeme == "self") {
+            consume();
+            reachable = false; // pub(self) == private
+        } else if (check(TokenKind::Identifier) &&
+                   (peek().lexeme == "crate" || peek().lexeme == "super")) {
+            consume();
+        } else if (check(TokenKind::Identifier) && peek().lexeme == "in") {
+            consume(); // in
+            expect(TokenKind::Identifier, "module path after `pub(in`");
+            while (accept(TokenKind::DoubleColon))
+                expect(TokenKind::Identifier, "path segment after `::`");
+        } else {
+            errorHere("expected `crate`, `super`, `self`, or `in <path>` "
+                      "inside `pub(...)`");
+        }
+        expect(TokenKind::RParen, ")");
+        return reachable;
+    }
+
+    // v26 Phase 146: parse a `use a::b::c;` import or `use a::b as d;` alias.
+    // The leading `use` (an identifier, not a keyword) is consumed here.
+    ast::UseDecl parseUseDecl() {
+        Token useTok = consume(); // `use`
+        ast::UseDecl u;
+        u.line = useTok.line;
+        u.column = useTok.column;
+        u.path.push_back(
+            expect(TokenKind::Identifier, "path segment after `use`").lexeme);
+        while (accept(TokenKind::DoubleColon))
+            u.path.push_back(
+                expect(TokenKind::Identifier, "path segment after `::`").lexeme);
+        // `as` is the cast keyword (KwAs), reused here for the rename clause.
+        if (accept(TokenKind::KwAs)) {
+            u.alias =
+                expect(TokenKind::Identifier, "alias name after `as`").lexeme;
+        }
+        expect(TokenKind::Semi, "; after `use` import");
+        return u;
     }
 
     ast::TypeRef parseTypeRef() {

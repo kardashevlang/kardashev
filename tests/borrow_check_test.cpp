@@ -515,6 +515,33 @@ void test_shared_while_mut_errors() {
               "shared_while_mut_errors");
 }
 
+void test_two_phase_borrow_ok() {
+    // Phase 146: `&mut p` taken as a call argument is a two-phase RESERVED
+    // borrow — it does not conflict with a `&p` read nested in a SIBLING
+    // argument (`get(&p)`). This is the `v.push(v.len())` shape.
+    expectOk("struct Pt { x: i64 }\n"
+             "fn get(p: &Pt) -> i64 { p.x }\n"
+             "fn set(p: &mut Pt, v: i64) -> i64 { v }\n"
+             "fn main() -> i64 {\n"
+             "    let mut p = Pt { x: 10 };\n"
+             "    set(&mut p, get(&p))\n"
+             "}",
+             "two_phase_borrow_ok");
+}
+
+void test_two_phase_sibling_alias_errors() {
+    // Phase 146: the reservation does NOT extend to a `&p` taken as a DIRECT
+    // sibling argument — `f(&mut p, &p)` aliases a shared and a mutable ref
+    // into the same callee and is still rejected.
+    expectErr("struct Pt { x: i64 }\n"
+              "fn bad(a: &mut Pt, b: &Pt) -> i64 { b.x }\n"
+              "fn main() -> i64 {\n"
+              "    let mut p = Pt { x: 1 };\n"
+              "    bad(&mut p, &p)\n"
+              "}",
+              "two_phase_sibling_alias_errors");
+}
+
 void test_mut_borrow_then_move_errors() {
     expectErr("struct P { x: i64 }\n"
               "fn write(p: &mut P) -> i64 { p.x }\n"
@@ -734,6 +761,8 @@ int main() {
     test_nll_shared_then_mut_ok();
     test_mut_while_shared_errors();
     test_two_mut_errors();
+    test_two_phase_borrow_ok();
+    test_two_phase_sibling_alias_errors();
     test_shared_while_mut_errors();
     test_mut_borrow_then_move_errors();
     // Phase 9 loop bodies
