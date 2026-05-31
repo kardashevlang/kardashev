@@ -114,9 +114,17 @@ Turn anecdotes into numbers and fix the real footprint gaps:
   2.2× C. Correctness pinned by `tests/smoke_test_bench.sh`; perf ratios committed
   in `BENCHMARKS.md`. (Replaces the "-O2 default"/"flat RSS" anecdote with data;
   the ~2.2× tight-loop gap is a concrete codegen-opt target.)
-- Fix the **spawn/join frame leak** (the one real leak measurement found — a frame
-  per spawned task is not reclaimed). *(HashMap interior-K/V drop and block_on/
-  await frame reclaim were measured clean — not leaks.)*
+- ✅ **Phase 121 (spawn/join frame leak, done)** — the one real leak measurement
+  found: `spawn` + `join` leaked a heap frame per spawned task (the executor task
+  array grew unbounded), because `join` drove + read the result but never
+  reclaimed the task (unlike `block_on`, which reaps). A naive reap-after-join is
+  *wrong* — driving one handle also completes sibling tasks (the executor
+  interleaves), so an all-done reap frees a sibling's result before its own
+  `join` reads it. Fixed with a **per-handle release** (`__kd_exec_release(h)`):
+  free only task `h`'s frame+slot, resetting the executor only once every task is
+  released. Now a spawn+join loop is RSS-flat and multi-handle joins return the
+  right distinct results; pinned by `tests/smoke_test_spawnleak.sh`. *(HashMap
+  interior-K/V drop and block_on/await frame reclaim were measured clean.)*
 - Add `HashMap`/`HashSet` **`remove`** (tombstone-aware probing) — the one
   genuinely-missing stdlib operation.
 - Generalize the remaining `i64`/`bool`-MVP surfaces toward arbitrary types.

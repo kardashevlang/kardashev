@@ -781,6 +781,7 @@ private:
     llvm::Function* execPushFn_ = nullptr;     // __kd_exec_push
     llvm::Function* execStepFn_ = nullptr;     // __kd_exec_step
     llvm::Function* execReapFn_ = nullptr;     // __kd_exec_reap_if_idle (P43)
+    llvm::Function* execReleaseFn_ = nullptr;  // __kd_exec_release (v21 P121, per-handle)
     llvm::Function* execWaitFn_ = nullptr;     // __kd_exec_wait (reactor sleep)
     llvm::Function* execDriveFn_ = nullptr;    // __kd_exec_drive_until
     llvm::Function* execSlotFn_ = nullptr;     // __kd_exec_task_slot
@@ -5081,6 +5082,80 @@ private:
             execReapFn_ = fn;
         }
 
+        // ---- void __kd_exec_release(i64 h) (v21 Phase 121): free task[h]'s
+        // frame + poll slot (guarded on frame != null, so a double-release is a
+        // no-op) and mark it released (frame/slot = null). Then, if EVERY task's
+        // frame is now null, reset the task count to 0 so the array is reused
+        // rather than growing across a spawn+join loop. Releasing only `h` (not
+        // a global all-done reap) leaves un-joined sibling tasks — which the
+        // interleaving driver may have already completed — intact for their own
+        // join. Called by join after it has read the result.
+        {
+            auto* fnTy = llvm::FunctionType::get(voidTy, {i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::InternalLinkage, "__kd_exec_release",
+                module_.get());
+            fn->getArg(0)->setName("h");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* freeBB = llvm::BasicBlock::Create(ctx, "free.it", fn);
+            auto* checkAll = llvm::BasicBlock::Create(ctx, "check.all", fn);
+            auto* scan = llvm::BasicBlock::Create(ctx, "scan", fn);
+            auto* scanBody = llvm::BasicBlock::Create(ctx, "scan.body", fn);
+            auto* scanNext = llvm::BasicBlock::Create(ctx, "scan.next", fn);
+            auto* resetAll = llvm::BasicBlock::Create(ctx, "reset", fn);
+            auto* retBB = llvm::BasicBlock::Create(ctx, "ret", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+            auto* one = llvm::ConstantInt::get(i64Ty, 1);
+            auto* nullp = llvm::ConstantPointerNull::get(i8PtrTy);
+            auto* h = fn->getArg(0);
+            auto* cntP =
+                b.CreateStructGEP(execTy_, execGlobal_, EXEC_COUNT, "cntP");
+            auto* count = b.CreateLoad(i64Ty, cntP, "count");
+            auto* sh = b.CreateCall(execSlotFn_, {h}, "sh");
+            auto* frP = b.CreateStructGEP(taskTy_, sh, TASK_FRAME, "frP");
+            auto* fr = b.CreateLoad(i8PtrTy, frP, "fr");
+            // in range AND frame != null -> free it; else skip to the scan.
+            auto* inRange = b.CreateICmpULT(h, count, "in_range");
+            auto* notNull = b.CreateICmpNE(fr, nullp, "fr_nn");
+            b.CreateCondBr(b.CreateAnd(inRange, notNull, "do_free"), freeBB,
+                           checkAll);
+            b.SetInsertPoint(freeBB);
+            b.CreateCall(freeFn_, {fr});
+            auto* slP = b.CreateStructGEP(taskTy_, sh, TASK_SLOT, "slP");
+            auto* sl = b.CreateLoad(i8PtrTy, slP, "sl");
+            b.CreateCall(freeFn_, {sl});
+            b.CreateStore(nullp, frP);
+            b.CreateStore(nullp, slP);
+            b.CreateBr(checkAll);
+            // check.all: if every task's frame == null, the executor is empty.
+            b.SetInsertPoint(checkAll);
+            auto* iP = b.CreateAlloca(i64Ty, nullptr, "i");
+            b.CreateStore(zero, iP);
+            b.CreateBr(scan);
+            b.SetInsertPoint(scan);
+            auto* i1 = b.CreateLoad(i64Ty, iP, "i1");
+            b.CreateCondBr(b.CreateICmpULT(i1, count, "more"), scanBody,
+                           resetAll);
+            b.SetInsertPoint(scanBody);
+            auto* si = b.CreateCall(execSlotFn_, {i1}, "si");
+            auto* fi = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(taskTy_, si, TASK_FRAME, "fiP"),
+                "fi");
+            // a non-null frame -> a task is still live -> don't reset.
+            b.CreateCondBr(b.CreateICmpEQ(fi, nullp, "fi_null"), scanNext,
+                           retBB);
+            b.SetInsertPoint(scanNext);
+            b.CreateStore(b.CreateAdd(i1, one, "i1n"), iP);
+            b.CreateBr(scan);
+            b.SetInsertPoint(resetAll);
+            b.CreateStore(zero, cntP);
+            b.CreateBr(retBB);
+            b.SetInsertPoint(retBB);
+            b.CreateRetVoid();
+            execReleaseFn_ = fn;
+        }
+
         declareExecSetDeadline();
         declareExecWait();
         declareExecDrive(execPtrTy);
@@ -5627,6 +5702,16 @@ private:
             "pslot");
         auto* valP = b.CreateStructGEP(pollT, pslot, 1, "val_ptr");
         auto* val = b.CreateLoad(valTy, valP, "result");
+        // v21 Phase 121: release THIS task (free its frame + poll slot) now that
+        // its result has been read — and reset the executor only when every task
+        // has been released. Without this, `spawn` + `join` in a loop leaks a
+        // frame per spawned task. We must NOT use the global reap-if-idle here:
+        // driving h to completion also completes sibling tasks (the executor
+        // interleaves), so reaping all-done tasks would free a sibling's result
+        // before its own `join` reads it. Releasing only `h` keeps un-joined
+        // siblings intact. `val` is a register copy; any heap it owns lives
+        // outside the frame/slot, so freeing after the load is safe.
+        if (execReleaseFn_) b.CreateCall(execReleaseFn_, {h});
         b.CreateRet(val);
         declaredFns_[mangled] = fn;
         return fn;

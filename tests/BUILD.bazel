@@ -188,6 +188,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v21 Phase 121: the spawn+join async frame leak — per-handle release, RSS-flat.
+sh_test(
+    name = "smoke_test_spawnleak",
+    srcs = ["smoke_test_spawnleak.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
 # crashed the compiler (void load/return); now compiles + runs.
 sh_test(
