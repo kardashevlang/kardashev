@@ -27,6 +27,7 @@
 // works cleanly (smoke_test exercises this).
 
 #include "kardashev/borrow_check.hpp"
+#include "kardashev/ast_clone.hpp"
 #include "kardashev/codegen.hpp"
 #include "kardashev/emit_c.hpp"
 #include "kardashev/lint.hpp"
@@ -1306,6 +1307,36 @@ void expandDerives(kardashev::ast::Program& prog) {
         prog.impls.push_back(std::move(impl));
 }
 
+// v25 Phase 135: fill trait DEFAULT method bodies into impls that don't override
+// them. For each trait impl, any trait method that has a default body and is not
+// provided by the impl gets a synthesized impl method whose body is a deep-clone
+// of the default — so the rest of the pipeline (typecheck binds Self to the impl
+// type, codegen monomorphizes) treats it exactly like a hand-written method.
+void fillTraitDefaults(kardashev::ast::Program& prog) {
+    std::unordered_map<std::string, const kardashev::ast::TraitDecl*> traits;
+    for (const auto& t : prog.traits) traits[t.name] = &t;
+    for (auto& impl : prog.impls) {
+        if (impl.traitName.empty()) continue; // inherent impl: no defaults
+        auto it = traits.find(impl.traitName);
+        if (it == traits.end()) continue;
+        std::set<std::string> provided;
+        for (const auto& m : impl.methods) provided.insert(m.name);
+        for (const auto& sig : it->second->methods) {
+            if (!sig.body) continue;                 // abstract — impl provides
+            if (provided.count(sig.name)) continue;  // overridden
+            kardashev::ast::FnDecl fn;
+            fn.name = sig.name;
+            fn.params = sig.params; // incl. `self: Self` — bound to forType
+            fn.returnType = sig.returnType;
+            fn.effects = sig.effects;
+            fn.line = sig.line;
+            fn.column = sig.column;
+            fn.body = kardashev::ast::cloneBlock(*sig.body);
+            impl.methods.push_back(std::move(fn));
+        }
+    }
+}
+
 // Phase 7.1: resolve `mod foo;` directives by reading sibling `.kd`
 // files and merging their declarations into the caller's program. The
 // merge is FLAT — module contents become part of the top-level program
@@ -1656,6 +1687,7 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
     if (!progOpt) return std::nullopt;
     auto& program = *progOpt;
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
+    fillTraitDefaults(program); // v25 Phase 135
     // PR#26 (ABI safety): the JIT calls `entry` through an i64()-typed
     // function pointer, so reject any entry whose signature doesn't match —
     // a non-empty parameter list or a non-integer return would corrupt the
@@ -2091,6 +2123,7 @@ bool compileToObject(const std::string& srcRaw, const std::string& srcDir,
     if (!progOpt) return false;
     auto& program = *progOpt;
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
+    fillTraitDefaults(program); // v25 Phase 135
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr, srcRaw, sourceFile);
@@ -2124,6 +2157,7 @@ int emitLlvmIr(const std::string& srcRaw, const std::string& srcDir,
     if (!progOpt) return 1;
     auto& program = *progOpt;
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
+    fillTraitDefaults(program); // v25 Phase 135
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr, srcRaw, sourceFile);
@@ -2156,6 +2190,7 @@ int emitCSource(const std::string& srcRaw, const std::string& srcDir) {
     if (!progOpt) return 1;
     auto& program = *progOpt;
     expandDerives(program);
+    fillTraitDefaults(program); // v25 Phase 135
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr, srcRaw);
@@ -2294,6 +2329,7 @@ int runTests(const std::string& srcRaw, const std::string& srcDir,
     if (!progOpt) return 1;
     auto& program = *progOpt;
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
+    fillTraitDefaults(program); // v25 Phase 135
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr, srcRaw, sourceFile);

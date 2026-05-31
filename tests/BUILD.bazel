@@ -258,6 +258,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v25 Phase 135: default trait methods (inherit / override / chain).
+sh_test(
+    name = "smoke_test_phase135",
+    srcs = ["smoke_test_phase135.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v24 Phase 132: opt-in lint (-W) — unused vars + unreachable code, non-fatal,
 # no false positives (closure / fn-ptr / method / match uses recognized).
 sh_test(

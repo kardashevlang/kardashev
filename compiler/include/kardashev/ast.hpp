@@ -734,6 +734,11 @@ struct MethodSig {
     std::vector<Param> params;
     TypeRef returnType;
     EffectRow effects; // Phase 4: declared effect row on trait methods
+    // v25 Phase 135: an optional DEFAULT method body (`fn foo(&self) -> T {…}`
+    // in a trait). null = an abstract signature an impl must provide. shared_ptr
+    // (not unique_ptr) so MethodSig stays copyable; the fill-defaults pass
+    // deep-clones it into each impl that doesn't override it.
+    std::shared_ptr<BlockExpr> body;
     std::size_t line = 1;
     std::size_t column = 1;
 };

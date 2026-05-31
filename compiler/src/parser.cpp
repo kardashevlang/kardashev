@@ -995,7 +995,13 @@ private:
         expect(TokenKind::RParen, ")");
         sig.returnType = parseOptionalReturnType();
         sig.effects = parseOptionalEffectRow();
-        expect(TokenKind::Semi, ";");
+        // v25 Phase 135: a trait method may carry a DEFAULT body `{ … }` instead
+        // of `;`; impls that don't override it inherit the default.
+        if (check(TokenKind::LBrace)) {
+            sig.body = parseBlockExpr();
+        } else {
+            expect(TokenKind::Semi, ";");
+        }
         return sig;
     }
 
