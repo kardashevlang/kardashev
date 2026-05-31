@@ -4687,6 +4687,15 @@ private:
                 r->structName == "Future")
                 return builder_->CreateLoad(mapKardashevType(r), src,
                                             "clone.opaque");
+            // Phase 123: a `Mutex<T>` value is a Copy i64 handle whose block is
+            // process-lifetime (never freed), so cloning it is a plain bit-copy
+            // of the handle — NOT a deep clone of the cell (two Mutex copies
+            // legitimately share the one lock + cell). Must special-case it
+            // here: with empty structFields it would otherwise fall through to
+            // the "clone each field" loop below and return `undef`.
+            if (r->structName == "Mutex")
+                return builder_->CreateLoad(mapKardashevType(r), src,
+                                            "clone.mutex");
             // User struct: clone each field.
             llvm::Type* st = mapKardashevType(r);
             llvm::Value* agg = llvm::UndefValue::get(st);
@@ -6874,6 +6883,13 @@ private:
                 // T, like the Mutex handle.
                 if (r->structName == "Sender" || r->structName == "Receiver")
                     return llvm::Type::getInt64Ty(*ctx_);
+                // Phase 123 (v21): `Mutex<T>` is a Copy i64 HANDLE (PtrToInt of
+                // the heap `{ pthread_mutex_t, T value }` block) — phantom-typed
+                // over T so mutex_get/set are tied to the cell type, but the ABI
+                // is a bare i64 like the channel handles (shareable across
+                // threads). The per-T block layout lives in getOrEmitMutexOp.
+                if (r->structName == "Mutex")
+                    return llvm::Type::getInt64Ty(*ctx_);
                 // Phase 78 (v13): `Rc<T>` is a pointer to a heap
                 // `{ i64 strong, T value }` refcount block.
                 if (r->structName == "Rc")
@@ -8509,9 +8525,12 @@ private:
             if (r->structName == "Sender" || r->structName == "Receiver")
                 return true;
             // Slice / Range / fn-value / future structs own no heap (Slice is
-            // a borrow; Range/Future are plain scalars in the MVP).
+            // a borrow; Range/Future are plain scalars in the MVP). A `Mutex<T>`
+            // is a Copy i64 handle whose lock+cell block is process-lifetime
+            // (never freed — like the pre-123 raw-i64 Mutex), so it is NOT
+            // dropped (the cell's final contents leak with the block, by design).
             if (r->structName == "Slice" || r->structName == "Range" ||
-                r->structName == "Future")
+                r->structName == "Future" || r->structName == "Mutex")
                 return false;
             std::string key = mangleStructInstance(r->structName, r->typeArgs);
             if (!seen.insert("S:" + key).second) return false;
@@ -10909,9 +10928,20 @@ private:
                 fn, args,
                 fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
             }
-            // Phase 123: `Mutex<T>` cell ops — generic over the guarded type T.
-            // `mutex_get<T>`'s T is return-only, so an unconstrained call leaves
-            // it an unsolved Var; default to i64 (like join) so it codegens.
+            // Phase 123: `Mutex<T>` cell ops. mutex_new/get/set are specialized
+            // per cell type T (their `{ pthread_mutex_t, T }` block); the cell
+            // T is tied to the phantom `Mutex<T>` handle type (so get/set T ==
+            // new T — no wrong-T punning). lock/unlock are T-agnostic (they only
+            // touch the pthread_mutex_t at field 0), so they route to the fixed
+            // i64 impl regardless of T — their `Mutex<T>` arg lowers to i64.
+            if (call.callee == "mutex_lock" || call.callee == "mutex_unlock") {
+                ensureThreadRuntime();
+                llvm::Function* fn = declaredFns_[call.callee];
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
+            }
             if ((call.callee == "mutex_new" || call.callee == "mutex_get" ||
                  call.callee == "mutex_set") &&
                 !concreteTypeArgs.empty()) {

@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # Phase 123 (Roadmap v21 — "generalize the i64/bool-MVP surfaces"): Mutex was
-# Mutex<i64> only; its guarded cell is now an arbitrary T. mutex_new/get/set are
-# specialized per cell type over a block `{ [64 x i8] pthread_mutex_t, T value }`
-# while the i64 HANDLE stays Copy + shareable (so it still captures by value into
-# a thread closure). This mirrors the handle-based `join<T>`/`spawn<T>` idiom: T
-# is type-erased through the i64 handle, so `mutex_get<T>` (T return-only) is
-# pinned by context or an explicit annotation. This test pins:
-#   (1) a bool cell (T pinned by `if`), a struct cell (annotated), and i64
-#       backward-compat all read/write correctly;
+# Mutex<i64> only; its guarded cell is now an arbitrary T. `Mutex<T>` is a
+# PHANTOM-TYPED i64 handle — the value is a bare i64 (Copy + shareable into a
+# thread closure), but the type carries the cell T so mutex_get/mutex_set are
+# tied to it (T flows from the handle, NO annotation needed, and NO wrong-T
+# punning). mutex_new/get/set are specialized per cell type over a block
+# `{ [64 x i8] pthread_mutex_t, T value }`. This test pins:
+#   (1) bool / struct / i64 cells read+write correctly, with the struct `get`
+#       inferring its type from the handle (no annotation);
 #   (2) mutex_get CLONES the cell + mutex_set DROPS the old value, so a String
 #       cell over 100k sets is RSS-flat and heap-clean (MALLOC_CHECK_=3);
 #   (3) a STRUCT cell shared across two threads with lock/unlock lands on the
-#       exact total (mutual exclusion holds for a non-i64 cell).
+#       exact total under contention (correct non-i64 cell codegen across threads);
+#   (4) the v21-review soundness gates are COMPILE ERRORS: a non-Send / handle
+#       cell (Mutex<Rc>), and a wrong-T mutex_set / mutex_get on a typed handle
+#       (the heap-overflow / punning holes the phantom type + Send gate close).
 # The struct/String/thread (AOT) parts skip cleanly if no clang.
 set -uo pipefail
 KARDC=""
@@ -35,10 +38,10 @@ fn main() -> i64 ! { alloc, io } {
     print(if mutex_get(bm) { 1 } else { 0 });   // 0
 
     let pm = mutex_new(Point { x: 3, y: 4 });
-    let p: Point = mutex_get(pm);                // annotation pins T = Point
-    print(p.x + p.y);                            // 7
+    let p = mutex_get(pm);                       // T = Point inferred from pm
+    print(p.x + p.y);                            // 7 (no annotation needed)
     mutex_set(pm, Point { x: 10, y: 20 });
-    let q: Point = mutex_get(pm);
+    let q = mutex_get(pm);
     print(q.x + q.y);                            // 30
 
     let im = mutex_new(100);                      // backward-compat: i64 cell
@@ -49,7 +52,38 @@ fn main() -> i64 ! { alloc, io } {
 EOF
 got=$("$KARDC" "$TMP/cells.kd" 2>/dev/null)
 [[ "$got" == $'1\n0\n7\n30\n101\n0' ]] || { echo "FAIL [cells]: got '$got' want 1,0,7,30,101,0"; exit 1; }
-echo "PASS [cells]: Mutex over bool / struct / i64 reads + writes the right values"
+echo "PASS [cells]: Mutex over bool / struct / i64 reads + writes (struct get inferred, no annotation)"
+
+# 1b. SOUNDNESS GATES (v21 review): each of these must be a COMPILE ERROR. A
+#     program that compiles here is a regression of a memory-safety hole.
+#     assert_reject <file> <tag> <substr> — kardc must fail AND mention <substr>.
+assert_reject() {
+    local f="$1" tag="$2" substr="$3"
+    if "$KARDC" "$f" >/dev/null 2>"$TMP/err"; then
+        echo "FAIL [reject/$tag]: program COMPILED but must be rejected"; cat "$TMP/err"; exit 1
+    fi
+    grep -qi "$substr" "$TMP/err" || { echo "FAIL [reject/$tag]: rejected, but error lacks '$substr':"; cat "$TMP/err"; exit 1; }
+    echo "PASS [reject/$tag]: rejected ($substr)"
+}
+# (a) non-Send / handle cell: a Mutex<Rc> would race the non-atomic refcount
+#     across threads (and clone-to-undef on get) — must be rejected at mutex_new.
+cat > "$TMP/rc.kd" <<'EOF'
+fn main() -> i64 ! { alloc, io } { let m = mutex_new(rc_new(123)); 0 }
+EOF
+assert_reject "$TMP/rc.kd" "rc-cell" "Mutex"
+# (b) wrong-T mutex_set: a Mutex<i64> handle cannot take a Point — this is the
+#     heap-overflow hole (store a >8-byte T into an i64-sized cell). Type error.
+cat > "$TMP/wset.kd" <<'EOF'
+struct Point { x: i64, y: i64 }
+fn main() -> i64 ! { alloc, io } { let m = mutex_new(0); mutex_set(m, Point { x: 1, y: 2 }); 0 }
+EOF
+assert_reject "$TMP/wset.kd" "wrong-set" "type"
+# (c) wrong-T mutex_get: reading a Mutex<Point> as i64 (the punning hole). Type error.
+cat > "$TMP/wget.kd" <<'EOF'
+struct Point { x: i64, y: i64 }
+fn main() -> i64 ! { alloc, io } { let m = mutex_new(Point { x: 111, y: 222 }); let bad: i64 = mutex_get(m); print(bad); 0 }
+EOF
+assert_reject "$TMP/wget.kd" "wrong-get" "type"
 
 CLANG="$(command -v clang || true)"
 if [[ -z "$CLANG" ]]; then
@@ -90,11 +124,19 @@ fi
 #    non-i64 cell (an unsynchronized struct read-modify-write would lose updates).
 cat > "$TMP/threads.kd" <<'EOF'
 struct Counter { hits: i64, sum: i64 }
-fn worker(m: i64) -> i64 ! { io } {
+// Two threads each do a locked read-modify-write of a STRUCT cell 100000 times.
+// Landing on the exact 200000/400000 requires mutex_get/mutex_set to read+write
+// the struct correctly across threads and the lock to hold under contention.
+// (Note: this gates correct struct-cell codegen + spawn/join + no deadlock/crash
+// under contention; it does NOT by itself *prove* mutual exclusion, since on a
+// fast machine the get->set window can be too narrow for a lost update to
+// manifest even unsynchronized — the lock is exercised, not adversarially
+// stress-tested.)
+fn worker(m: Mutex<Counter>) -> i64 ! { io } {
     let mut i = 0;
     while i < 100000 {
         mutex_lock(m);
-        let c: Counter = mutex_get(m);
+        let c = mutex_get(m);
         mutex_set(m, Counter { hits: c.hits + 1, sum: c.sum + 2 });
         mutex_unlock(m);
         i = i + 1;
@@ -120,10 +162,10 @@ for r in 1 2 3; do
     out=$("$TMP/threads" 2>/dev/null)
     [[ "$out" == $'200000\n400000' ]] || { bad=$((bad+1)); }
 done
-[[ "$bad" -eq 0 ]] || { echo "FAIL [threads]: $bad/3 runs lost updates (last '$out', want 200000,400000)"; exit 1; }
+[[ "$bad" -eq 0 ]] || { echo "FAIL [threads]: $bad/3 runs wrong total (last '$out', want 200000,400000)"; exit 1; }
 # JIT path also echoes main's return value (trailing 0).
 jout=$("$KARDC" "$TMP/threads.kd" 2>/dev/null)
 [[ "$jout" == $'200000\n400000\n0' ]] || { echo "FAIL [threads/JIT]: got '$jout' want 200000,400000,0"; exit 1; }
-echo "PASS [threads]: Mutex<struct> across 2 threads -> exact 200000/400000 (mutual exclusion, JIT+AOT)"
+echo "PASS [threads]: Mutex<struct> across 2 threads -> exact 200000/400000 under contention (struct-cell get/set, JIT+AOT)"
 
 echo "ALL MUTEX-GENERIC SMOKE TESTS PASSED"

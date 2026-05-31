@@ -877,61 +877,81 @@ public:
             sch.declaredEffects.add("io");
             fnSchemas_["thread_join"] = std::move(sch);
         }
-        // Phase 19 / 123 built-in: `Mutex<T>` represented as an i64 HANDLE (a
-        // pointer to a heap `{ pthread_mutex_t, T value }`). The handle is
-        // i64 — therefore Copy — so it can be captured BY VALUE into each
-        // thread's closure, giving every thread the same underlying lock +
-        // cell (the cross-thread sharing mechanism). v21 Phase 123 lifts the
-        // guarded cell from i64-only to an arbitrary `T`: mutex_new/get/set are
-        // now generic over the cell type (mirroring the handle-based `join<T>` /
-        // `spawn<T>` idiom — T flows via the call's type args; the i64 handle is
-        // type-erased exactly like a thread/async handle). mutex_lock/unlock
-        // stay T-agnostic (they only touch the pthread_mutex_t at offset 0).
-        //
-        //   mutex_new<T>(v: T) -> i64 ! { alloc }   (heap-allocates the block)
+        // Phase 19 / 123 built-in: `Mutex<T>` — a lock guarding a cell of type
+        // T. It is a PHANTOM-TYPED i64 HANDLE: the value is a bare i64 (PtrToInt
+        // of a heap `{ pthread_mutex_t, T value }` block) so it stays Copy and
+        // can be captured BY VALUE into each thread's closure (giving every
+        // thread the same lock + cell — the cross-thread sharing mechanism), but
+        // the type carries T so `mutex_get`/`mutex_set` are tied to the cell
+        // type. v21 Phase 123 lifts the cell from i64-only to an arbitrary T.
+        // Because the handle is shareable across threads, the cell T must be
+        // `Send` (enforced at the mutex_new call site, like chan_send) — so a
+        // non-Send value (`Rc`, a `Receiver`, a borrow) can't be smuggled across
+        // a thread boundary through the cell.
+        TypePtr mutexVar = makeFreshVar();
+        TypePtr mutexInst = makeStruct("Mutex", {});
+        mutexInst->typeArgs = {mutexVar};
+        {
+            StructSchema sch;
+            sch.type = mutexInst;
+            sch.genericVars.push_back(mutexVar);
+            structSchemas_["Mutex"] = std::move(sch);
+        }
+        // A fresh `Mutex<T>` instance over a fresh cell var — one per signature.
+        auto mkMutex = [&](const TypePtr& cell) {
+            TypePtr m = makeStruct("Mutex", {});
+            m->typeArgs = {cell};
+            return m;
+        };
+        //   mutex_new<T>(v: T) -> Mutex<T> ! { alloc }   (allocates the block)
         {
             FnSchema sch;
-            TypePtr mv = makeFreshVar();
-            sch.signature = makeFunction({mv}, makeInt());
-            sch.genericVars.push_back(mv);
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({c}, mkMutex(c));
+            sch.genericVars.push_back(c);
             sch.declaredEffects.add("alloc");
             fnSchemas_["mutex_new"] = std::move(sch);
         }
-        //   mutex_lock(h: i64) -> i64 ! { io }
-        //   mutex_unlock(h: i64) -> i64 ! { io }
+        //   mutex_lock<T>(m: Mutex<T>) -> i64 ! { io }
+        //   mutex_unlock<T>(m: Mutex<T>) -> i64 ! { io }
         // Acquire / release the lock; `io`-effecting (cross-thread sync is an
-        // observable side effect). Return 0 (an i64 so they compose).
+        // observable side effect). T-agnostic in codegen (they only touch the
+        // pthread_mutex_t at field 0). Return 0 (an i64 so they compose).
         {
             FnSchema sch;
-            sch.signature = makeFunction({makeInt()}, makeInt());
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({mkMutex(c)}, makeInt());
+            sch.genericVars.push_back(c);
             sch.declaredEffects.add("io");
             fnSchemas_["mutex_lock"] = std::move(sch);
         }
         {
             FnSchema sch;
-            sch.signature = makeFunction({makeInt()}, makeInt());
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({mkMutex(c)}, makeInt());
+            sch.genericVars.push_back(c);
             sch.declaredEffects.add("io");
             fnSchemas_["mutex_unlock"] = std::move(sch);
         }
-        //   mutex_get<T>(h: i64) -> T           (read the guarded cell)
-        //   mutex_set<T>(h: i64, v: T) -> i64   (write the guarded cell, ret 0)
-        // The caller is expected to hold the lock. `io`-effecting for the
-        // write (a shared-memory mutation other threads observe); the read is
-        // left pure so reading under a lock needs no extra annotation. `get`'s
-        // T appears only in return position (pinned by the call context, like
-        // `join<T>`); an unconstrained `mutex_get` defaults T to i64 in codegen.
+        //   mutex_get<T>(m: Mutex<T>) -> T           (read the guarded cell)
+        //   mutex_set<T>(m: Mutex<T>, v: T) -> i64   (write the guarded cell)
+        // The caller is expected to hold the lock. `io`-effecting for the write
+        // (a shared-memory mutation other threads observe); the read is left
+        // pure so reading under a lock needs no extra annotation. T flows from
+        // the `Mutex<T>` handle, so a `mutex_get` on a `Mutex<Point>` is a
+        // `Point` (no annotation needed, and no wrong-T punning).
         {
             FnSchema sch;
-            TypePtr mv = makeFreshVar();
-            sch.signature = makeFunction({makeInt()}, mv);
-            sch.genericVars.push_back(mv);
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({mkMutex(c)}, c);
+            sch.genericVars.push_back(c);
             fnSchemas_["mutex_get"] = std::move(sch);
         }
         {
             FnSchema sch;
-            TypePtr mv = makeFreshVar();
-            sch.signature = makeFunction({makeInt(), mv}, makeInt());
-            sch.genericVars.push_back(mv);
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({mkMutex(c), c}, makeInt());
+            sch.genericVars.push_back(c);
             sch.declaredEffects.add("io");
             fnSchemas_["mutex_set"] = std::move(sch);
         }
@@ -6137,6 +6157,15 @@ private:
             bool copyable = rt->kind == TypeKind::Int ||
                             rt->kind == TypeKind::Bool ||
                             rt->kind == TypeKind::Unit;
+            // Phase 123: a `Mutex<T>` is a true Copy i64 handle (the lock+cell
+            // block is process-lifetime, never freed), so capturing it by value
+            // just copies the handle — both the closure and the enclosing
+            // binding share the one lock + cell (exactly the cross-thread
+            // sharing mechanism, like the pre-123 raw-i64 Mutex handle). No
+            // clone, no drop. Its cell T is Send-gated at mutex_new, so the
+            // captured value can't smuggle a non-Send across the boundary.
+            if (rt->kind == TypeKind::Struct && rt->structName == "Mutex")
+                copyable = true;
             // Phase 81 (v13 review fix): a channel `Sender<T>` is Send, so it
             // may be captured into a producer thread's closure. It is no longer
             // Copy — capturing it CLONES it (codegen emits sender_clone when
@@ -6731,6 +6760,41 @@ private:
                           call.args[1]->line, call.args[1]->column);
                 }
             }
+            // Phase 123: the Mutex CELL type (the only entry point is mutex_new)
+            // must be `Send` and must not be a shared handle. The i64 Mutex
+            // handle is Copy + shareable across threads, so storing a non-Send
+            // value would smuggle it across a thread boundary, bypassing the
+            // chan_send / capture Send floors (the data-race hole on
+            // Mutex<Rc<_>>). And Rc/Sender/Receiver are refcounted handles whose
+            // deep clone is not a plain copy — a Mutex guards owned DATA; share
+            // those handles via a channel, not a Mutex cell. Gating mutex_new
+            // alone suffices: get/set/lock/unlock can only act on a Mutex<T>
+            // that was already constructed here.
+            if (call.callee == "mutex_new" && !typeArgs.empty()) {
+                TypePtr cell = resolve(typeArgs[0]);
+                size_t ln = call.args.empty() ? call.line : call.args[0]->line;
+                size_t col =
+                    call.args.empty() ? call.column : call.args[0]->column;
+                bool handleTy = cell->kind == TypeKind::Struct &&
+                                (cell->structName == "Rc" ||
+                                 cell->structName == "Sender" ||
+                                 cell->structName == "Receiver");
+                if (handleTy) {
+                    error("cannot store a `" + cell->structName +
+                              "` in a Mutex: it is a shared handle, not owned "
+                              "data — share it across threads via a channel "
+                              "instead of a Mutex cell",
+                          ln, col);
+                } else if (cell->kind != TypeKind::Var && !isSend(cell)) {
+                    error("cannot store a value of type " + typeToString(cell) +
+                              " in a Mutex: it is not `Send`, and the Mutex "
+                              "handle is shareable across threads (a non-Send "
+                              "cell could be smuggled across a thread boundary). "
+                              "Store an owned Send value — not a borrow / "
+                              "Receiver / Rc",
+                          ln, col);
+                }
+            }
             // PR#20: reject a unit element type for the Vec builtins. The
             // codegen vec_* specialization sizes the element via DataLayout;
             // a zero-sized unit element makes the stride 0 and crashes the
@@ -7206,16 +7270,18 @@ private:
                 if (!isSendImpl(el, seen)) return false;
             return true;
         case TypeKind::Struct: {
-            // String owns its bytes (Send); the Mutex handle (a raw i64) is
-            // Send by being an Int; the channel Sender is Send. The Receiver
-            // (single-consumer) and an Rc (non-atomic refcount) are NOT.
+            // String owns its bytes (Send); the channel Sender is Send. The
+            // Receiver (single-consumer) and an Rc (non-atomic refcount) are NOT.
             if (r->structName == "String" || r->structName == "Sender")
                 return true;
             if (r->structName == "Receiver" || r->structName == "Rc")
                 return false;
-            // Containers carry their element(s) in typeArgs, not structFields.
+            // Containers + the Mutex handle carry their element(s)/cell in
+            // typeArgs, not structFields. A `Mutex<T>` is Send iff its cell T is
+            // (the cell is also Send-gated at mutex_new, so this is belt-and-
+            // braces — sharing a Mutex<NonSend> across threads is rejected).
             if (r->structName == "Vec" || r->structName == "HashMap" ||
-                r->structName == "HashSet") {
+                r->structName == "HashSet" || r->structName == "Mutex") {
                 for (const auto& a : r->typeArgs)
                     if (!isSendImpl(a, seen)) return false;
                 return true;

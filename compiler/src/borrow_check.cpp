@@ -69,6 +69,12 @@ bool isCopyType(const TypePtr& t) {
         // Phase 13b: a slice `&[T]` is a fat pointer (a borrow), so it's
         // Copy — like `&T`. Other structs move by default.
         if (r->structName == "Slice") return true;
+        // Phase 123: a `Mutex<T>` is a Copy i64 handle (the lock+cell block is
+        // process-lifetime, never freed — no drop glue, unlike Sender/Rc), so
+        // it copies freely. This is what lets `let m = mutex_new(v); mutex_lock(m);
+        // mutex_get(m)` use the handle repeatedly without a move error and lets
+        // it be captured by value into multiple thread closures.
+        if (r->structName == "Mutex") return true;
         // Phase 81 (v13 review fix): the channel endpoints `Sender<T>` /
         // `Receiver<T>` are now refcounted, move-only OWNERS (NOT Copy) — they
         // have drop glue that decrements the channel refcount, so copying a

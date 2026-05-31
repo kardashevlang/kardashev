@@ -116,28 +116,37 @@ if [[ -z "$CLANG" ]]; then
     exit 0
 fi
 
-# 4. String key/value remove: the removed key is dropped, the value moved out;
-#    repeated under MALLOC_CHECK_=3 a double-free would abort.
+# 4. String key/value remove: the removed key must be DROPPED and the value
+#    moved out (then dropped by the caller) — exactly once each. This churns a
+#    64-entry String->String table (keys+values ~290 B each) for 3000 rounds
+#    (~190k removes) with BOTH a double-free gate (MALLOC_CHECK_=3) AND an RSS
+#    gate: a forgotten stored-key drop, a forgotten lookup-key drop, or a leaked
+#    moved-out value would each accumulate ~50 MB and trip the RSS threshold
+#    (the prior version only caught a double-free, so a drop-LEAK passed silently).
 cat > "$TMP/str.kd" <<'EOF'
+fn pad(seed: i64) -> String ! { alloc } {
+    let mut s = int_to_string(seed);
+    let mut k = 0;
+    while k < 8 { string_push_str(&mut s, "abcdefghijklmnopqrstuvwxyz0123456789".to_string()); k = k + 1; }
+    s
+}
 fn main() -> i64 ! { alloc } {
+    let mut m: HashMap<String, String> = hashmap_new();
     let mut total = 0;
-    let mut n = 0;
-    while n < 20000 {
-        let mut m: HashMap<String, String> = hashmap_new();
-        hashmap_insert(&mut m, "alpha".to_string(), "A".to_string());
-        hashmap_insert(&mut m, "beta".to_string(), "B".to_string());
-        hashmap_insert(&mut m, "gamma".to_string(), "G".to_string());
-        match hashmap_remove(&mut m, "beta".to_string()) {
-            Some(v) => { total = total + str_len(&v); },   // value moved out, then dropped
-            None => { total = total + 0; },
+    let mut round = 0;
+    while round < 3000 {
+        let mut j = 0;
+        while j < 64 { hashmap_insert(&mut m, pad(j), pad(j + 1000)); j = j + 1; }
+        j = 0;
+        while j < 64 {
+            match hashmap_remove(&mut m, pad(j)) {   // drops stored key, moves out value
+                Some(v) => { total = total + str_len(&v); },  // v dropped at arm end
+                None => { total = total + 0; },
+            }
+            j = j + 1;
         }
-        // miss path drops the lookup key too
-        match hashmap_remove(&mut m, "zzz".to_string()) {
-            Some(v) => { total = total + str_len(&v); },
-            None => { total = total + 0; },
-        }
-        total = total + hashmap_len(&m);  // 2 each iter
-        n = n + 1;
+        total = total + hashmap_len(&m);  // 0 each round (fully drained)
+        round = round + 1;
     }
     total
 }
@@ -149,7 +158,17 @@ for r in 1 2 3; do
     if [[ "$rc" -eq 134 ]] || grep -qi 'free\|corrupt' "$TMP/e"; then bad=$((bad+1)); fi
 done
 [[ "$bad" -eq 0 ]] || { echo "FAIL [heap/str]: $bad/3 runs corrupted the heap (remove drops the key/value wrong)"; exit 1; }
-echo "PASS [heap/str]: 20k String-map remove (hit+miss) heap-clean under MALLOC_CHECK_=3"
+rss=""
+if command -v /usr/bin/time >/dev/null 2>&1; then
+    /usr/bin/time -v "$TMP/str" >/dev/null 2>"$TMP/t"
+    rss=$(grep -oE 'Maximum resident set size \(kbytes\): [0-9]+' "$TMP/t" 2>/dev/null | grep -oE '[0-9]+$' || true)
+fi
+if [[ -n "$rss" ]]; then
+    [[ "$rss" -lt 32768 ]] || { echo "FAIL [heap/str]: RSS $rss KB over ~190k String removes — remove leaks the dropped key or moved-out value"; exit 1; }
+    echo "PASS [heap/str]: ~190k String-map removes (key dropped + value moved out) RSS-flat (${rss} KB), heap-clean"
+else
+    echo "PASS [heap/str]: ~190k String-map removes heap-clean under MALLOC_CHECK_=3 (RSS gate skipped — no GNU time)"
+fi
 
 # 5. Churn: 200k insert+remove over 64 keys must stay RSS-flat and never hang
 #    (no tombstone accumulation => no infinite probe).

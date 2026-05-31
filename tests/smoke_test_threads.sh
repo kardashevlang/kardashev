@@ -96,7 +96,7 @@ echo "PASS (1b): by-value-capturing closures spawn + join => 2044 (JIT+AOT)"
 #     Mutex counter == exactly 200000. Deterministic with the lock.
 # ---------------------------------------------------------------------------
 cat > "$TMP/mutex.kd" <<'EOF'
-fn bump(counter: i64, n: i64) -> i64 ! { io } {
+fn bump(counter: Mutex<i64>, n: i64) -> i64 ! { io } {
     let mut i = 0;
     while i < n {
         mutex_lock(counter);
@@ -109,8 +109,8 @@ fn bump(counter: i64, n: i64) -> i64 ! { io } {
 fn main() -> i64 ! { alloc, io, share } {
     let counter = mutex_new(0);
     let n = 100000;
-    // The SAME i64 Mutex handle is captured by value into both closures, so
-    // both threads share one underlying lock + cell.
+    // The SAME Mutex<i64> handle (Copy) is captured by value into both closures,
+    // so both threads share one underlying lock + cell.
     let t1 = thread_spawn(|| bump(counter, n));
     let t2 = thread_spawn(|| bump(counter, n));
     thread_join(t1);
