@@ -2182,6 +2182,16 @@ private:
     struct ConstValue {
         bool isBool = false;
         std::int64_t i = 0;
+        // v28 Phase 152: aggregate const values. `isAgg` marks an array / tuple
+        // / struct (`elems` in order; `fieldNames` parallel for a struct) or an
+        // enum (`enumTag` >= 0, `elems` = the variant's payload). A scalar use
+        // keeps isAgg=false. Aggregates exist so a `const` of these types can be
+        // built + PROJECTED (`A[i]`, `p.field`) at compile time; codegen emits a
+        // runtime use of the const by re-emitting its initializer.
+        bool isAgg = false;
+        int enumTag = -1;
+        std::vector<ConstValue> elems;
+        std::vector<std::string> fieldNames;
     };
     // Raised (and caught at const-eval entry points) when an initializer /
     // array length / const fn cannot be evaluated at compile time, or hits a
@@ -4022,7 +4032,15 @@ private:
                 auto it = env->find(id->name);
                 if (it != env->end()) return it->second;
             }
-            // Not a local — must be another const.
+            // v28 Phase 152: a bare unit enum variant (`None`) in a const expr.
+            auto vl = lookupVariant(id->name);
+            if (vl.enumInstance) {
+                ConstValue agg;
+                agg.isAgg = true;
+                agg.enumTag = static_cast<int>(vl.variantIdx);
+                return agg;
+            }
+            // Not a local / variant — must be another const.
             return evalConstByName(id->name, e);
         }
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
@@ -4080,13 +4098,95 @@ private:
         if (auto* blk = dynamic_cast<const ast::BlockExpr*>(&e)) {
             return evalConstBlock(*blk, env, depth);
         }
+        // v28 Phase 152: aggregate const values — array / tuple / struct
+        // literals, enum constructors, and projection out of them.
+        if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
+            ConstValue agg;
+            agg.isAgg = true;
+            if (al->repeatCount) {
+                // `[value; N]` — N copies of the repeated value.
+                if (al->elements.empty())
+                    constFail("malformed array-repeat in const expr", e);
+                ConstValue v = evalConstExpr(*al->elements[0], env, depth);
+                std::int64_t n = 0;
+                if (!evalConstI64(*al->repeatCount, n) || n < 0)
+                    constFail("array-repeat length must be a non-negative const "
+                              "in a const expr",
+                              e);
+                agg.elems.assign(static_cast<std::size_t>(n), v);
+            } else {
+                for (const auto& el : al->elements)
+                    agg.elems.push_back(evalConstExpr(*el, env, depth));
+            }
+            return agg;
+        }
+        if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
+            ConstValue agg;
+            agg.isAgg = true;
+            for (const auto& el : tl->elements)
+                agg.elems.push_back(evalConstExpr(*el, env, depth));
+            return agg;
+        }
+        if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
+            ConstValue agg;
+            agg.isAgg = true;
+            for (const auto& [fname, fexpr] : sl->fields) {
+                agg.fieldNames.push_back(fname);
+                agg.elems.push_back(evalConstExpr(*fexpr, env, depth));
+            }
+            return agg;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+            ConstValue obj = evalConstExpr(*ix->object, env, depth);
+            if (!obj.isAgg || obj.enumTag >= 0)
+                constFail("indexing requires an array/tuple const value", e);
+            ConstValue idx = evalConstExpr(*ix->index, env, depth);
+            if (idx.isBool || idx.isAgg)
+                constFail("array index must be an integer in a const expr", e);
+            if (idx.i < 0 ||
+                static_cast<std::size_t>(idx.i) >= obj.elems.size())
+                constFail("const array index " + std::to_string(idx.i) +
+                              " out of bounds (len " +
+                              std::to_string(obj.elems.size()) + ")",
+                          e);
+            return obj.elems[static_cast<std::size_t>(idx.i)];
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
+            ConstValue obj = evalConstExpr(*fe->object, env, depth);
+            if (!obj.isAgg || obj.enumTag >= 0)
+                constFail("field access requires a struct const value", e);
+            for (std::size_t k = 0; k < obj.fieldNames.size(); ++k)
+                if (obj.fieldNames[k] == fe->fieldName) return obj.elems[k];
+            constFail("unknown field `" + fe->fieldName + "` in const struct value",
+                      e);
+        }
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e)) {
+            ConstValue obj = evalConstExpr(*tf->object, env, depth);
+            if (!obj.isAgg || obj.enumTag >= 0)
+                constFail("tuple-field access requires a tuple const value", e);
+            if (tf->index >= obj.elems.size())
+                constFail("const tuple index out of bounds", e);
+            return obj.elems[tf->index];
+        }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            // v28 Phase 152: an enum constructor with a payload in a const expr
+            // (e.g. `Some(5)`). A unit variant arrives as a bare IdentExpr and is
+            // handled by evalConstByName -> lookupVariant below.
+            auto vl = lookupVariant(call->callee);
+            if (vl.enumInstance) {
+                ConstValue agg;
+                agg.isAgg = true;
+                agg.enumTag = static_cast<int>(vl.variantIdx);
+                for (const auto& a : call->args)
+                    agg.elems.push_back(evalConstExpr(*a, env, depth));
+                return agg;
+            }
             return evalConstCall(*call, env, depth);
         }
         constFail("expression is not allowed in a const context (only int/"
                   "bool literals, arithmetic/comparison/unary operators, "
-                  "`if`/`else`, `let`, and calls to `const fn`s are "
-                  "const-evaluable)",
+                  "`if`/`else`, `let`, calls to `const fn`s, and "
+                  "array/tuple/struct/enum aggregates are const-evaluable)",
                   e);
     }
 
@@ -4314,10 +4414,21 @@ private:
     void checkConstItem(const ast::ConstDecl& cd) {
         TypePtr declared = resolveTypeRef(cd.type);
         TypePtr rDeclared = resolve(declared);
+        // v28 Phase 152: a const may be a scalar (i64/bool) OR an aggregate
+        // (array / tuple / struct / enum) whose leaves are const-evaluable. The
+        // evaluator enforces leaf-level evaluability; the type gate just admits
+        // the aggregate shapes here. (char / f64 scalar consts stay a documented
+        // follow-on — the integer evaluator + the const-use codegen width handle
+        // i64/bool today.)
         bool okType = rDeclared->kind == TypeKind::Int ||
-                      rDeclared->kind == TypeKind::Bool;
+                      rDeclared->kind == TypeKind::Bool ||
+                      rDeclared->kind == TypeKind::Array ||
+                      rDeclared->kind == TypeKind::Tuple ||
+                      rDeclared->kind == TypeKind::Struct ||
+                      rDeclared->kind == TypeKind::Enum;
         if (!okType) {
-            error("a `const` must have type i64 or bool in this version, got " +
+            error("a `const` must be a scalar (i64/bool) or an aggregate "
+                  "(array/tuple/struct/enum) of const-evaluable values, got " +
                       typeToString(declared),
                   cd.type.line, cd.type.column);
         }
@@ -4344,11 +4455,18 @@ private:
         try {
             constEvalSteps_ = 0;
             ConstValue v = evalConstByName(cd.name, *cd.value);
-            // v11 fix: wrap the final value to the DECLARED width too, so a
-            // bare-literal or otherwise-unwrapped initializer (`const C: i8 =
-            // 200i8`) is stored at the right width — codegen emits it narrow.
-            if (!v.isBool) v.i = wrapConstToType(v.i, *cd.value);
-            constExprValues_[cd.value.get()] = v;
+            // v28 Phase 152: an AGGREGATE const value (array/tuple/struct/enum)
+            // isn't a scalar immediate — codegen re-emits the initializer at a
+            // runtime use, so only a SCALAR result flows through constExprValues_
+            // (the codegen-facing folded-literal table). The aggregate stays in
+            // constValues_ for compile-time PROJECTION by other const exprs.
+            if (!v.isAgg) {
+                // v11 fix: wrap the final value to the DECLARED width too, so a
+                // bare-literal initializer (`const C: i8 = 200i8`) is stored at
+                // the right width — codegen emits it narrow.
+                if (!v.isBool) v.i = wrapConstToType(v.i, *cd.value);
+                constExprValues_[cd.value.get()] = v;
+            }
         } catch (const ConstEvalError& ce) {
             // Make sure a half-finished evaluation doesn't wedge the
             // in-progress set for later look-ups.
@@ -4422,7 +4540,10 @@ private:
                 try {
                     constEvalSteps_ = 0;
                     ConstValue v = evalConstByName(id->name, *id);
-                    constExprValues_[id] = v;
+                    // v28 Phase 152: only a SCALAR const use is a folded
+                    // immediate; an aggregate const use is re-emitted from its
+                    // initializer by codegen (so don't record a bogus scalar).
+                    if (!v.isAgg) constExprValues_[id] = v;
                 } catch (const ConstEvalError& ce) {
                     // The error is reported once at the const's own definition
                     // site (checkConstItem); avoid a duplicate here, but still

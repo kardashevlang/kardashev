@@ -106,6 +106,13 @@ public:
         }
         for (const auto& s : program.structs) userSourceNames_.insert(s.name);
         for (const auto& e : program.enums) userSourceNames_.insert(e.name);
+        // v28 Phase 152: index each top-level `const`'s initializer by name. A
+        // runtime use of an AGGREGATE const (array/tuple/struct/enum — these are
+        // not scalar immediates in constExprValues) re-emits this initializer at
+        // the use site (Rust-style per-use inlining). Scalar consts keep the
+        // folded-immediate path (constExprValues) and are absent here is fine.
+        for (const auto& c : program.consts)
+            if (c.value) constInits_[c.name] = c.value.get();
         // Phase 24: record extern "C" declarations so emitCall can resolve
         // their C-ABI signature + per-arg coercions.
         for (const auto& ef : program.externFns) {
@@ -632,6 +639,9 @@ private:
     std::unordered_map<const ast::FnDecl*, const ast::ImplDecl*> genericImplOf_;
     // v26 Phase 144: top-level type aliases (name -> aliased TypeRef).
     std::unordered_map<std::string, ast::TypeRef> typeAliases_;
+    // v28 Phase 152: top-level const name -> its initializer expr, for re-emitting
+    // an aggregate const at a runtime use site.
+    std::unordered_map<std::string, const ast::Expr*> constInits_;
 
     // Active during emission of a generic fn instance. Maps the source's
     // generic-param name (`T`) to the concrete TypePtr for this instance,
@@ -9806,6 +9816,13 @@ private:
                     return llvm::ConstantInt::get(
                         cty, static_cast<uint64_t>(cv.value), /*isSigned=*/true);
                 }
+                // v28 Phase 152: a runtime use of an AGGREGATE const
+                // (array/tuple/struct/enum) — not a scalar immediate, so re-emit
+                // its initializer here (each use is a fresh value, the Rust
+                // const-inlining semantics).
+                if (auto ciIt = constInits_.find(id->name);
+                    ciIt != constInits_.end())
+                    return emitExpr(*ciIt->second);
                 // Phase 59: a const-generic param used as a VALUE (`N` in the
                 // body of `dot<const N>`) lowers to this instance's concrete
                 // literal — zero runtime cost, distinct per monomorphization.
