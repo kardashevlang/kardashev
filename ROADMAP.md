@@ -190,23 +190,31 @@ Turn anecdotes into numbers and fix the real footprint gaps:
   test is deterministic on Linux, so a genuine regression still fails all 5
   attempts and reddens CI.
 
-### v23 — a second backend (and the leftover platform reach)
+### v23 — a second backend — *the C backend lands (v0.23.0)*
 
 The v22 "second platform/backend" item is its own roadmap: a full second code
 generator is comparable in scope to the LLVM backend it parallels, so it is
-broken out here rather than rushed into a single phase.
+grown by subset rather than rushed. v0.23.0 ships the foundation (the i64/bool
+subset, differentially gated); the remaining bullets continue in later phases.
 
-- **A C-source backend (`--emit-c`), recommended first.** Walk the same
-  typechecked AST that `codegen.cpp` lowers and emit portable C, compiled by the
-  system C compiler. It is the most *verifiable* option in this environment (a C
-  toolchain is present), so it can be **differentially gated** against the LLVM
-  backend exactly as the self-hosted compiler already is — the existing
-  arithmetic / control-flow fuzzers (Phases 110–111) become the oracle
-  (`emit-c` output == LLVM AOT output == reference). Scope it as a SUBSET first —
-  i64/bool, arithmetic / comparison / bitwise, `&&`/`||`, `if` / `while`,
-  functions + recursion — then grow it (structs → enums + match → strings / Vec →
-  Drop) phase by phase, each differentially green, before claiming portability.
-  This breaks the LLVM/Linux monoculture for a real subset without shipping a stub.
+- ✅ **Phase 129 (the C-source backend, done)** — `kardc --emit-c` walks the
+  same typechecked AST that `codegen.cpp` lowers and emits portable C (compiled
+  by the system C compiler), the most *verifiable* second backend in this
+  environment. `compiler/src/emit_c.cpp` maps the SUBSET — i64/bool, the full
+  operator set (arithmetic / comparison / `&&`/`||` / bitwise / unary), `let`
+  (incl. `mut` + assignment), `if`/`else` as a value, `while`, blocks, direct
+  calls + recursion (forward prototypes for mutual recursion), and top-level
+  `const` — to `int64_t` C, using GNU statement-expressions for the
+  expression-oriented constructs. Anything outside the subset is REFUSED with a
+  clear error (never miscompiled). **Differentially gated** against the LLVM
+  backend by `tests/smoke_test_phase129.sh`: for each program the LLVM AOT exit
+  code must equal the emitted-C (`cc -fwrapv`) exit code — 12 programs across
+  recursion / loops / logic / bitwise / signed-mod / const all match, and a
+  struct program is cleanly refused.
+- **Next subset growth** — extend `--emit-c` phase by phase: structs →
+  enums + `match` → strings / `Vec` → `Drop`, each differentially green, plus
+  wiring the existing arithmetic / control-flow fuzzers (Phases 110–111) as a
+  randomized oracle (`emit-c` == LLVM == reference), before claiming portability.
 - **WASM** and a **Windows target** are the follow-on reach once the C backend
   proves the AST→target seam. WASM needs a committed runtime in CI (wasmtime or
   node) so it can be differentially tested the same way; the Windows port is
