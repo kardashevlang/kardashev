@@ -781,6 +781,7 @@ private:
     llvm::Function* execPushFn_ = nullptr;     // __kd_exec_push
     llvm::Function* execStepFn_ = nullptr;     // __kd_exec_step
     llvm::Function* execReapFn_ = nullptr;     // __kd_exec_reap_if_idle (P43)
+    llvm::Function* execReleaseFn_ = nullptr;  // __kd_exec_release (v21 P121, per-handle)
     llvm::Function* execWaitFn_ = nullptr;     // __kd_exec_wait (reactor sleep)
     llvm::Function* execDriveFn_ = nullptr;    // __kd_exec_drive_until
     llvm::Function* execSlotFn_ = nullptr;     // __kd_exec_task_slot
@@ -2780,6 +2781,186 @@ private:
             }
         }
 
+        // Phase 122 (v21): hashmap_remove<K,V>(m: &mut HashMap, k: K)
+        // -> Option<V>. Open-addressing deletion via BACKWARD-SHIFT (Knuth
+        // Algorithm R): instead of leaving a tombstone, the rest of the probe
+        // chain is shifted back into the hole so the table stays TOMBSTONE-FREE.
+        // That keeps get/insert/grow completely untouched — their "stop at the
+        // first empty slot" invariant still holds because every live key remains
+        // reachable from its home slot by a contiguous run of occupied slots.
+        // On a hit: MOVE the value out (returned as Some — ownership transfers,
+        // so NO clone, unlike get), DROP the stored key + the consumed lookup
+        // key, decrement len, back-shift the chain, and empty the trailing slot.
+        // On a miss: drop the lookup key and return None.
+        {
+            TypePtr optTy = optionType(V);
+            if (optTy) {
+                mapKardashevType(optTy);
+                const std::string optMangled =
+                    mangleStructInstance(optTy->enumName, optTy->typeArgs);
+                auto* optLlvm = enumTypes_[optMangled];
+                unsigned someIdx = variantIndexInEnum(optTy, "Some");
+                unsigned noneIdx = variantIndexInEnum(optTy, "None");
+                unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+                auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+                auto* fnTy =
+                    llvm::FunctionType::get(optLlvm, {i8PtrTy, keyTy}, false);
+                auto* fn = llvm::Function::Create(
+                    fnTy, llvm::Function::ExternalLinkage,
+                    "hashmap_remove__" + vMangle, module_.get());
+                fn->getArg(0)->setName("m");
+                fn->getArg(1)->setName("k");
+                auto* mPtr = fn->getArg(0);
+                auto* k = fn->getArg(1);
+                auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* seedBB = llvm::BasicBlock::Create(ctx, "seed", fn);
+                auto* findBB = llvm::BasicBlock::Create(ctx, "find", fn);
+                auto* checkBB = llvm::BasicBlock::Create(ctx, "check", fn);
+                auto* stepBB = llvm::BasicBlock::Create(ctx, "step", fn);
+                auto* noneBB = llvm::BasicBlock::Create(ctx, "none", fn);
+                auto* foundBB = llvm::BasicBlock::Create(ctx, "found", fn);
+                auto* shiftHdr =
+                    llvm::BasicBlock::Create(ctx, "shift.hdr", fn);
+                auto* shiftBody =
+                    llvm::BasicBlock::Create(ctx, "shift.body", fn);
+                auto* doMoveBB =
+                    llvm::BasicBlock::Create(ctx, "shift.move", fn);
+                auto* shiftDone =
+                    llvm::BasicBlock::Create(ctx, "shift.done", fn);
+
+                auto buildNone = [&](llvm::IRBuilder<>& bb) {
+                    llvm::Value* agg = llvm::UndefValue::get(optLlvm);
+                    return bb.CreateInsertValue(
+                        agg, llvm::ConstantInt::get(i32Ty, noneIdx), {0},
+                        "none");
+                };
+
+                llvm::IRBuilder<> b(entry);
+                auto* idxSlot = b.CreateAlloca(i64Ty, nullptr, "idx");
+                auto* holeSlot = b.CreateAlloca(i64Ty, nullptr, "hole");
+                auto* jSlot = b.CreateAlloca(i64Ty, nullptr, "j");
+                llvm::Value* kSlot = nullptr;
+                if (!keyIsInt) {
+                    kSlot = b.CreateAlloca(keyTy, nullptr, "kslot");
+                    b.CreateStore(k, kSlot);
+                }
+                auto* bucketsP = b.CreateStructGEP(hmTy, mPtr, 0, "bucketsP");
+                auto* lenP = b.CreateStructGEP(hmTy, mPtr, 1, "lenP");
+                auto* capP = b.CreateStructGEP(hmTy, mPtr, 2, "capP");
+                auto* cap = b.CreateLoad(i64Ty, capP, "cap");
+                auto* buckets = b.CreateLoad(i8PtrTy, bucketsP, "buckets");
+                b.CreateCondBr(b.CreateICmpEQ(cap, zero, "capZero"), noneBB,
+                               seedBB);
+
+                b.SetInsertPoint(seedBB);
+                b.CreateStore(emitStart(b, k, kSlot, cap), idxSlot);
+                b.CreateBr(findBB);
+
+                // find: probe to the key (an empty slot first => miss).
+                b.SetInsertPoint(findBB);
+                auto* i = b.CreateLoad(i64Ty, idxSlot, "i");
+                auto* eptr = b.CreateGEP(entryTy, buckets, i, "eptr");
+                auto* state = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(entryTy, eptr, 0, "stateP"),
+                    "state");
+                b.CreateCondBr(b.CreateICmpEQ(state, zero, "isEmpty"), noneBB,
+                               checkBB);
+
+                b.SetInsertPoint(checkBB);
+                auto* keyP = b.CreateStructGEP(entryTy, eptr, 1, "keyP");
+                b.CreateCondBr(emitEq(b, k, kSlot, keyP), foundBB, stepBB);
+
+                b.SetInsertPoint(stepBB);
+                b.CreateStore(
+                    b.CreateURem(b.CreateAdd(i, one, "inc"), cap, "wrap"),
+                    idxSlot);
+                b.CreateBr(findBB);
+
+                b.SetInsertPoint(noneBB);
+                dropConsumedKey(b, kSlot);
+                b.CreateRet(buildNone(b));
+
+                // found at slot i: move the value out, drop the stored key +
+                // the lookup key, len--, then back-shift starting from the hole.
+                b.SetInsertPoint(foundBB);
+                auto* valP = b.CreateStructGEP(entryTy, eptr, 2, "valP");
+                auto* val = b.CreateLoad(valTy, valP, "val"); // MOVE out
+                b.CreateCall(getOrEmitDropThunk(K), {keyP});  // drop stored key
+                dropConsumedKey(b, kSlot);                    // drop lookup key
+                auto* len0 = b.CreateLoad(i64Ty, lenP, "len");
+                b.CreateStore(b.CreateSub(len0, one, "len.dec"), lenP);
+                b.CreateStore(i, holeSlot);
+                b.CreateStore(i, jSlot);
+                b.CreateBr(shiftHdr);
+
+                // shift.hdr: advance j; stop at the first empty slot.
+                b.SetInsertPoint(shiftHdr);
+                auto* jPrev = b.CreateLoad(i64Ty, jSlot, "j.prev");
+                auto* j =
+                    b.CreateURem(b.CreateAdd(jPrev, one, "j.inc"), cap, "j.wrap");
+                b.CreateStore(j, jSlot);
+                auto* ej = b.CreateGEP(entryTy, buckets, j, "ej");
+                auto* sj = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(entryTy, ej, 0, "ejStateP"),
+                    "sj");
+                b.CreateCondBr(b.CreateICmpEQ(sj, zero, "ejEmpty"), shiftDone,
+                               shiftBody);
+
+                // shift.body: move ej into the hole iff its home is NOT
+                // cyclically in (hole, j] — i.e. iff relocating it to the hole
+                // keeps it reachable from its home. (Knuth Algorithm R.)
+                b.SetInsertPoint(shiftBody);
+                auto* hole = b.CreateLoad(i64Ty, holeSlot, "hole");
+                auto* ejKeyP = b.CreateStructGEP(entryTy, ej, 1, "ejKeyP");
+                llvm::Value* ejKeyVal =
+                    keyIsInt ? b.CreateLoad(i64Ty, ejKeyP, "ejk") : nullptr;
+                auto* home = emitStart(b, ejKeyVal, ejKeyP, cap);
+                auto* holeLEj = b.CreateICmpULE(hole, j, "holeLEj");
+                auto* holeLTh = b.CreateICmpULT(hole, home, "holeLTh");
+                auto* hLEj = b.CreateICmpULE(home, j, "hLEj");
+                // skip(=keep) if home in (hole,j]:
+                //   hole<=j : (hole<home && home<=j);  hole>j : (hole<home || home<=j)
+                auto* keep = b.CreateSelect(
+                    holeLEj, b.CreateAnd(holeLTh, hLEj),
+                    b.CreateOr(holeLTh, hLEj), "keep");
+                b.CreateCondBr(keep, shiftHdr, doMoveBB);
+
+                // shift.move: copy ej -> hole (whole entry by value), then the
+                // vacated slot j becomes the new hole.
+                b.SetInsertPoint(doMoveBB);
+                auto* hole2 = b.CreateLoad(i64Ty, holeSlot, "hole2");
+                auto* eh = b.CreateGEP(entryTy, buckets, hole2, "eh");
+                b.CreateStore(one, b.CreateStructGEP(entryTy, eh, 0, "ehState"));
+                b.CreateStore(
+                    b.CreateLoad(keyTy,
+                                 b.CreateStructGEP(entryTy, ej, 1, "ejKeyP2"),
+                                 "ejKey"),
+                    b.CreateStructGEP(entryTy, eh, 1, "ehKey"));
+                b.CreateStore(
+                    b.CreateLoad(valTy,
+                                 b.CreateStructGEP(entryTy, ej, 2, "ejValP"),
+                                 "ejVal"),
+                    b.CreateStructGEP(entryTy, eh, 2, "ehVal"));
+                b.CreateStore(j, holeSlot);
+                b.CreateBr(shiftHdr);
+
+                // shift.done: empty the trailing hole, return Some(val).
+                b.SetInsertPoint(shiftDone);
+                auto* holeF = b.CreateLoad(i64Ty, holeSlot, "holeF");
+                auto* ehF = b.CreateGEP(entryTy, buckets, holeF, "ehF");
+                b.CreateStore(zero,
+                              b.CreateStructGEP(entryTy, ehF, 0, "ehFState"));
+                llvm::Value* someAgg = llvm::UndefValue::get(optLlvm);
+                someAgg = b.CreateInsertValue(
+                    someAgg, llvm::ConstantInt::get(i32Ty, someIdx), {0},
+                    "some");
+                someAgg =
+                    b.CreateInsertValue(someAgg, val, {someSlot}, "someV");
+                b.CreateRet(someAgg);
+                declaredFns_["hashmap_remove__" + vMangle] = fn;
+            }
+        }
+
         // hashmap_len__<V>(m: &HashMap) -> i64 (value-agnostic, but emitted
         // per-V so the interception routes uniformly).
         {
@@ -2874,7 +3055,10 @@ private:
         llvm::Function* mapGet = getOrEmitHashMapOp("hashmap_get", T, i64T);
         llvm::Function* mapLen = getOrEmitHashMapOp("hashmap_len", T, i64T);
         llvm::Function* mapKeys = getOrEmitHashMapOp("hashmap_keys", T, i64T);
-        if (!mapNew || !mapInsert || !mapGet || !mapLen || !mapKeys)
+        llvm::Function* mapRemove =
+            getOrEmitHashMapOp("hashmap_remove", T, i64T);
+        if (!mapNew || !mapInsert || !mapGet || !mapLen || !mapKeys ||
+            !mapRemove)
             return nullptr;
 
         // hashset_new() -> HashSet
@@ -2938,6 +3122,29 @@ private:
             b.CreateRet(b.CreateICmpEQ(
                 disc, llvm::ConstantInt::get(i32Ty, someIdx), "found"));
             declaredFns_["hashset_contains__set_" + suffix] = fn;
+        }
+        // Phase 122 (v21): hashset_remove(s, k) -> bool : remove(k) and report
+        // whether it was present (the underlying map returned Some). The dummy
+        // i64 value is discarded; the element key is dropped by hashmap_remove.
+        {
+            TypePtr optTy = optionType(i64T);
+            unsigned someIdx = variantIndexInEnum(optTy, "Some");
+            auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+            auto* fnTy =
+                llvm::FunctionType::get(i1Ty, {i8PtrTy, elemTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashset_remove__set_" + suffix, module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("k");
+            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(e);
+            auto* opt =
+                b.CreateCall(mapRemove, {fn->getArg(0), fn->getArg(1)}, "opt");
+            auto* disc = b.CreateExtractValue(opt, {0}, "disc");
+            b.CreateRet(b.CreateICmpEQ(
+                disc, llvm::ConstantInt::get(i32Ty, someIdx), "removed"));
+            declaredFns_["hashset_remove__set_" + suffix] = fn;
         }
         // v12 Phase 71: hashset_items(s) -> Vec<T> — enumerate the set's
         // elements (the underlying map's keys). Closes the "no way to iterate a
@@ -3266,30 +3473,10 @@ private:
             declaredFns_["thread_join"] = fn;
         }
 
-        // i64 mutex_new(i64 v)
-        {
-            auto* fnTy =
-                llvm::FunctionType::get(i64Ty, {i64Ty}, /*isVarArg=*/false);
-            auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "mutex_new",
-                module_.get());
-            fn->getArg(0)->setName("v");
-            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
-            llvm::IRBuilder<> b(entry);
-            uint64_t sz =
-                module_->getDataLayout().getTypeAllocSize(mutexBlkTy_);
-            auto* blk = b.CreateCall(
-                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "mutex_blk");
-            auto* mtxPtr =
-                b.CreateStructGEP(mutexBlkTy_, blk, 0, "mtx_ptr");
-            b.CreateCall(pthreadMutexInitFn_,
-                         {mtxPtr, llvm::ConstantPointerNull::get(i8PtrTy)});
-            b.CreateStore(
-                fn->getArg(0),
-                b.CreateStructGEP(mutexBlkTy_, blk, 1, "value_slot"));
-            b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "handle"));
-            declaredFns_["mutex_new"] = fn;
-        }
+        // mutex_new/get/set are GENERIC over the cell type T (Phase 123) — they
+        // are emitted per-T by getOrEmitMutexOp (a per-T block `{[64 x i8], T}`),
+        // not here. Only the T-agnostic lock/unlock (which touch the
+        // pthread_mutex_t at field 0) are emitted in this fixed runtime.
 
         // i64 mutex_lock(i64 h) / i64 mutex_unlock(i64 h) — lock/unlock and
         // return 0 (an i64 so it composes in expression position).
@@ -3309,44 +3496,107 @@ private:
         };
         emitMutexLockOp("mutex_lock", pthreadMutexLockFn_);
         emitMutexLockOp("mutex_unlock", pthreadMutexUnlockFn_);
+        (void)voidTy;
+    }
 
-        // i64 mutex_get(i64 h): read the guarded cell.
+    // Phase 123 (v21): per-T Mutex cell ops. The guarded cell is now an
+    // arbitrary T (was i64-only), so mutex_new/get/set are specialized per cell
+    // type over a block `{ [64 x i8] pthread_mutex_t, T value }`. The i64 handle
+    // (PtrToInt of the block) is unchanged — Copy + shareable across threads,
+    // and type-erased exactly like a `join`/`spawn` handle. lock/unlock are
+    // T-agnostic (field 0) and stay in declareThreadRuntime. Mirrors
+    // getOrEmitHashMapOp / getOrEmitChannelOp (emit all three on first use of a
+    // given T, return the requested one).
+    llvm::StructType* mutexBlkTyFor(const TypePtr& T) {
+        auto& ctx = *ctx_;
+        std::string mangle = mangleType(T);
+        auto it = mutexBlkTys_.find(mangle);
+        if (it != mutexBlkTys_.end()) return it->second;
+        auto* mtxStorageTy =
+            llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx), 64);
+        auto* valTy = mapKardashevType(T);
+        auto* blkTy = llvm::StructType::create(
+            ctx, {mtxStorageTy, valTy}, "kd.mutex_blk." + mangle);
+        mutexBlkTys_[mangle] = blkTy;
+        return blkTy;
+    }
+    std::unordered_map<std::string, llvm::StructType*> mutexBlkTys_;
+
+    llvm::Function* getOrEmitMutexOp(const std::string& op, const TypePtr& T) {
+        ensureThreadRuntime();
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        std::string mangle = mangleType(T);
+        std::string want = op + "__mx_" + mangle;
+        if (auto it = declaredFns_.find(want); it != declaredFns_.end())
+            return it->second;
+        auto* blkTy = mutexBlkTyFor(T);
+        auto* valTy = mapKardashevType(T);
+
+        // mutex_new__mx_<T>(T v) -> i64 : malloc the block, init the pthread
+        // mutex (field 0), store v (field 1), return (i64)block.
         {
             auto* fnTy =
-                llvm::FunctionType::get(i64Ty, {i64Ty}, /*isVarArg=*/false);
+                llvm::FunctionType::get(i64Ty, {valTy}, /*isVarArg=*/false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "mutex_get",
-                module_.get());
+                fnTy, llvm::Function::ExternalLinkage,
+                "mutex_new__mx_" + mangle, module_.get());
+            fn->getArg(0)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            uint64_t sz = module_->getDataLayout().getTypeAllocSize(blkTy);
+            auto* blk = b.CreateCall(
+                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "mutex_blk");
+            b.CreateCall(
+                pthreadMutexInitFn_,
+                {b.CreateStructGEP(blkTy, blk, 0, "mtx_ptr"),
+                 llvm::ConstantPointerNull::get(i8PtrTy)});
+            b.CreateStore(fn->getArg(0),
+                          b.CreateStructGEP(blkTy, blk, 1, "value_slot"));
+            b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "handle"));
+            declaredFns_["mutex_new__mx_" + mangle] = fn;
+        }
+        // mutex_get__mx_<T>(i64 h) -> T : read the guarded cell BY VALUE. The
+        // cell stays in the block, so a non-Copy T must be returned as an
+        // independent CLONE (a bitwise load would alias the block's heap and
+        // double-free under the holder's drop) — for a Copy T the clone folds
+        // to a plain copy.
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(valTy, {i64Ty}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "mutex_get__mx_" + mangle, module_.get());
             fn->getArg(0)->setName("h");
             auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
             llvm::IRBuilder<> b(entry);
             auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
-            auto* v = b.CreateLoad(
-                i64Ty, b.CreateStructGEP(mutexBlkTy_, blk, 1, "value_ptr"),
-                "value");
-            b.CreateRet(v);
-            declaredFns_["mutex_get"] = fn;
+            auto* valP = b.CreateStructGEP(blkTy, blk, 1, "value_ptr");
+            b.CreateRet(b.CreateCall(getOrEmitCloneFn(T), {valP}, "value"));
+            declaredFns_["mutex_get__mx_" + mangle] = fn;
         }
-
-        // i64 mutex_set(i64 h, i64 v): write the guarded cell, return v.
+        // mutex_set__mx_<T>(i64 h, T v) -> i64 : drop the OLD cell value (it is
+        // being overwritten — else a non-Copy T leaks each set), store v, ret 0.
         {
             auto* fnTy = llvm::FunctionType::get(
-                i64Ty, {i64Ty, i64Ty}, /*isVarArg=*/false);
+                i64Ty, {i64Ty, valTy}, /*isVarArg=*/false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "mutex_set",
-                module_.get());
+                fnTy, llvm::Function::ExternalLinkage,
+                "mutex_set__mx_" + mangle, module_.get());
             fn->getArg(0)->setName("h");
             fn->getArg(1)->setName("v");
             auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
             llvm::IRBuilder<> b(entry);
             auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
-            b.CreateStore(
-                fn->getArg(1),
-                b.CreateStructGEP(mutexBlkTy_, blk, 1, "value_ptr"));
-            (void)voidTy;
-            b.CreateRet(fn->getArg(1));
-            declaredFns_["mutex_set"] = fn;
+            auto* valP = b.CreateStructGEP(blkTy, blk, 1, "value_ptr");
+            b.CreateCall(getOrEmitDropThunk(T), {valP});
+            b.CreateStore(fn->getArg(1), valP);
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_["mutex_set__mx_" + mangle] = fn;
         }
+        auto it = declaredFns_.find(want);
+        return it != declaredFns_.end() ? it->second : nullptr;
     }
 
     // --- Phase 76 (v13): typed MPSC channels (pthread mutex + condition var) ---
@@ -4437,6 +4687,15 @@ private:
                 r->structName == "Future")
                 return builder_->CreateLoad(mapKardashevType(r), src,
                                             "clone.opaque");
+            // Phase 123: a `Mutex<T>` value is a Copy i64 handle whose block is
+            // process-lifetime (never freed), so cloning it is a plain bit-copy
+            // of the handle — NOT a deep clone of the cell (two Mutex copies
+            // legitimately share the one lock + cell). Must special-case it
+            // here: with empty structFields it would otherwise fall through to
+            // the "clone each field" loop below and return `undef`.
+            if (r->structName == "Mutex")
+                return builder_->CreateLoad(mapKardashevType(r), src,
+                                            "clone.mutex");
             // User struct: clone each field.
             llvm::Type* st = mapKardashevType(r);
             llvm::Value* agg = llvm::UndefValue::get(st);
@@ -5081,6 +5340,80 @@ private:
             execReapFn_ = fn;
         }
 
+        // ---- void __kd_exec_release(i64 h) (v21 Phase 121): free task[h]'s
+        // frame + poll slot (guarded on frame != null, so a double-release is a
+        // no-op) and mark it released (frame/slot = null). Then, if EVERY task's
+        // frame is now null, reset the task count to 0 so the array is reused
+        // rather than growing across a spawn+join loop. Releasing only `h` (not
+        // a global all-done reap) leaves un-joined sibling tasks — which the
+        // interleaving driver may have already completed — intact for their own
+        // join. Called by join after it has read the result.
+        {
+            auto* fnTy = llvm::FunctionType::get(voidTy, {i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::InternalLinkage, "__kd_exec_release",
+                module_.get());
+            fn->getArg(0)->setName("h");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* freeBB = llvm::BasicBlock::Create(ctx, "free.it", fn);
+            auto* checkAll = llvm::BasicBlock::Create(ctx, "check.all", fn);
+            auto* scan = llvm::BasicBlock::Create(ctx, "scan", fn);
+            auto* scanBody = llvm::BasicBlock::Create(ctx, "scan.body", fn);
+            auto* scanNext = llvm::BasicBlock::Create(ctx, "scan.next", fn);
+            auto* resetAll = llvm::BasicBlock::Create(ctx, "reset", fn);
+            auto* retBB = llvm::BasicBlock::Create(ctx, "ret", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+            auto* one = llvm::ConstantInt::get(i64Ty, 1);
+            auto* nullp = llvm::ConstantPointerNull::get(i8PtrTy);
+            auto* h = fn->getArg(0);
+            auto* cntP =
+                b.CreateStructGEP(execTy_, execGlobal_, EXEC_COUNT, "cntP");
+            auto* count = b.CreateLoad(i64Ty, cntP, "count");
+            auto* sh = b.CreateCall(execSlotFn_, {h}, "sh");
+            auto* frP = b.CreateStructGEP(taskTy_, sh, TASK_FRAME, "frP");
+            auto* fr = b.CreateLoad(i8PtrTy, frP, "fr");
+            // in range AND frame != null -> free it; else skip to the scan.
+            auto* inRange = b.CreateICmpULT(h, count, "in_range");
+            auto* notNull = b.CreateICmpNE(fr, nullp, "fr_nn");
+            b.CreateCondBr(b.CreateAnd(inRange, notNull, "do_free"), freeBB,
+                           checkAll);
+            b.SetInsertPoint(freeBB);
+            b.CreateCall(freeFn_, {fr});
+            auto* slP = b.CreateStructGEP(taskTy_, sh, TASK_SLOT, "slP");
+            auto* sl = b.CreateLoad(i8PtrTy, slP, "sl");
+            b.CreateCall(freeFn_, {sl});
+            b.CreateStore(nullp, frP);
+            b.CreateStore(nullp, slP);
+            b.CreateBr(checkAll);
+            // check.all: if every task's frame == null, the executor is empty.
+            b.SetInsertPoint(checkAll);
+            auto* iP = b.CreateAlloca(i64Ty, nullptr, "i");
+            b.CreateStore(zero, iP);
+            b.CreateBr(scan);
+            b.SetInsertPoint(scan);
+            auto* i1 = b.CreateLoad(i64Ty, iP, "i1");
+            b.CreateCondBr(b.CreateICmpULT(i1, count, "more"), scanBody,
+                           resetAll);
+            b.SetInsertPoint(scanBody);
+            auto* si = b.CreateCall(execSlotFn_, {i1}, "si");
+            auto* fi = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(taskTy_, si, TASK_FRAME, "fiP"),
+                "fi");
+            // a non-null frame -> a task is still live -> don't reset.
+            b.CreateCondBr(b.CreateICmpEQ(fi, nullp, "fi_null"), scanNext,
+                           retBB);
+            b.SetInsertPoint(scanNext);
+            b.CreateStore(b.CreateAdd(i1, one, "i1n"), iP);
+            b.CreateBr(scan);
+            b.SetInsertPoint(resetAll);
+            b.CreateStore(zero, cntP);
+            b.CreateBr(retBB);
+            b.SetInsertPoint(retBB);
+            b.CreateRetVoid();
+            execReleaseFn_ = fn;
+        }
+
         declareExecSetDeadline();
         declareExecWait();
         declareExecDrive(execPtrTy);
@@ -5627,6 +5960,16 @@ private:
             "pslot");
         auto* valP = b.CreateStructGEP(pollT, pslot, 1, "val_ptr");
         auto* val = b.CreateLoad(valTy, valP, "result");
+        // v21 Phase 121: release THIS task (free its frame + poll slot) now that
+        // its result has been read — and reset the executor only when every task
+        // has been released. Without this, `spawn` + `join` in a loop leaks a
+        // frame per spawned task. We must NOT use the global reap-if-idle here:
+        // driving h to completion also completes sibling tasks (the executor
+        // interleaves), so reaping all-done tasks would free a sibling's result
+        // before its own `join` reads it. Releasing only `h` keeps un-joined
+        // siblings intact. `val` is a register copy; any heap it owns lives
+        // outside the frame/slot, so freeing after the load is safe.
+        if (execReleaseFn_) b.CreateCall(execReleaseFn_, {h});
         b.CreateRet(val);
         declaredFns_[mangled] = fn;
         return fn;
@@ -6539,6 +6882,13 @@ private:
                 // channel block, PtrToInt'd) — they lower to i64 regardless of
                 // T, like the Mutex handle.
                 if (r->structName == "Sender" || r->structName == "Receiver")
+                    return llvm::Type::getInt64Ty(*ctx_);
+                // Phase 123 (v21): `Mutex<T>` is a Copy i64 HANDLE (PtrToInt of
+                // the heap `{ pthread_mutex_t, T value }` block) — phantom-typed
+                // over T so mutex_get/set are tied to the cell type, but the ABI
+                // is a bare i64 like the channel handles (shareable across
+                // threads). The per-T block layout lives in getOrEmitMutexOp.
+                if (r->structName == "Mutex")
                     return llvm::Type::getInt64Ty(*ctx_);
                 // Phase 78 (v13): `Rc<T>` is a pointer to a heap
                 // `{ i64 strong, T value }` refcount block.
@@ -8175,9 +8525,12 @@ private:
             if (r->structName == "Sender" || r->structName == "Receiver")
                 return true;
             // Slice / Range / fn-value / future structs own no heap (Slice is
-            // a borrow; Range/Future are plain scalars in the MVP).
+            // a borrow; Range/Future are plain scalars in the MVP). A `Mutex<T>`
+            // is a Copy i64 handle whose lock+cell block is process-lifetime
+            // (never freed — like the pre-123 raw-i64 Mutex), so it is NOT
+            // dropped (the cell's final contents leak with the block, by design).
             if (r->structName == "Slice" || r->structName == "Range" ||
-                r->structName == "Future")
+                r->structName == "Future" || r->structName == "Mutex")
                 return false;
             std::string key = mangleStructInstance(r->structName, r->typeArgs);
             if (!seen.insert("S:" + key).second) return false;
@@ -10533,6 +10886,7 @@ private:
                  call.callee == "hashmap_insert" ||
                  call.callee == "hashmap_get" ||
                  call.callee == "hashmap_get_ref" ||
+                 call.callee == "hashmap_remove" ||
                  call.callee == "hashmap_keys" ||
                  call.callee == "hashmap_len") &&
                 concreteTypeArgs.size() >= 2) {
@@ -10555,6 +10909,7 @@ private:
             if ((call.callee == "hashset_new" ||
                  call.callee == "hashset_insert" ||
                  call.callee == "hashset_contains" ||
+                 call.callee == "hashset_remove" ||
                  call.callee == "hashset_len" ||
                  call.callee == "hashset_items") &&
                 !concreteTypeArgs.empty()) {
@@ -10572,6 +10927,37 @@ private:
                 return builder_->CreateCall(
                 fn, args,
                 fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
+            }
+            // Phase 123: `Mutex<T>` cell ops. mutex_new/get/set are specialized
+            // per cell type T (their `{ pthread_mutex_t, T }` block); the cell
+            // T is tied to the phantom `Mutex<T>` handle type (so get/set T ==
+            // new T — no wrong-T punning). lock/unlock are T-agnostic (they only
+            // touch the pthread_mutex_t at field 0), so they route to the fixed
+            // i64 impl regardless of T — their `Mutex<T>` arg lowers to i64.
+            if (call.callee == "mutex_lock" || call.callee == "mutex_unlock") {
+                ensureThreadRuntime();
+                llvm::Function* fn = declaredFns_[call.callee];
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
+            }
+            if ((call.callee == "mutex_new" || call.callee == "mutex_get" ||
+                 call.callee == "mutex_set") &&
+                !concreteTypeArgs.empty()) {
+                TypePtr mt = resolve(concreteTypeArgs[0]);
+                if (mt->kind == TypeKind::Var) mt = makeInt();
+                llvm::Function* fn = getOrEmitMutexOp(call.callee, mt);
+                if (!fn) {
+                    errors_.push_back(
+                        "codegen: cannot specialize " + call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
             }
             const std::string mangled =
                 mangleInstance(call.callee, concreteTypeArgs);

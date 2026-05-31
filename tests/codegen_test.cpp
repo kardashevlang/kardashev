@@ -2236,7 +2236,7 @@ void test_mutex_mutual_exclusion_two_threads() {
     // 100000. (Smaller N than the smoke test to keep the unit suite quick;
     // still proves mutual exclusion + that both threads run.)
     auto v = compileAndRun(
-        "fn bump(c: i64, n: i64) -> i64 ! { io } {\n"
+        "fn bump(c: Mutex<i64>, n: i64) -> i64 ! { io } {\n"
         "  let mut i = 0;\n"
         "  while i < n {\n"
         "    mutex_lock(c);\n"

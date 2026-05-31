@@ -188,6 +188,31 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v21 Phase 121: the spawn+join async frame leak — per-handle release, RSS-flat.
+sh_test(
+    name = "smoke_test_spawnleak",
+    srcs = ["smoke_test_spawnleak.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v21 Phase 122: HashMap/HashSet remove via backward-shift deletion (tombstone-
+# free). Probe-chain preservation (head/middle/tail/wrap), a 50-key oracle, and
+# heap-clean String-map remove + 200k churn under MALLOC_CHECK_=3 (RSS-flat).
+sh_test(
+    name = "smoke_test_hashremove",
+    srcs = ["smoke_test_hashremove.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v21 Phase 123: generic Mutex<T> cell (was Mutex<i64>). bool/struct/i64 cells,
+# heap-clean Mutex<String> (get-clones/set-drops, RSS-flat), and a struct cell
+# shared across two threads landing on the exact total (mutual exclusion).
+sh_test(
+    name = "smoke_test_mutex_generic",
+    srcs = ["smoke_test_mutex_generic.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
 # crashed the compiler (void load/return); now compiles + runs.
 sh_test(
@@ -1054,6 +1079,22 @@ sh_test(
     data = [
         "//compiler:kardc",
         "//examples/selfhost:enumgen.kd",
+    ],
+)
+
+# v21 Phase 120 (prove it): benchmark-correctness guard — each bench's kardashev
+# AOT output must equal the C reference (perf ratios live in BENCHMARKS.md).
+sh_test(
+    name = "smoke_test_bench",
+    srcs = ["smoke_test_bench.sh"],
+    data = [
+        "//compiler:kardc",
+        "//bench:fib.kd",
+        "//bench:loop.kd",
+        "//bench:collatz.kd",
+        "//bench:fib.c",
+        "//bench:loop.c",
+        "//bench:collatz.c",
     ],
 )
 

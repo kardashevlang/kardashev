@@ -2231,7 +2231,7 @@ void test_thread_spawn_propagates_closure_io_effect() {
     // The spawned closure performs `io` (mutex_lock); thread_spawn is effect-
     // polymorphic so that flows to the caller, which here declares it: ok.
     expectOk(
-        "fn bump(m: i64) -> i64 ! { io } { mutex_lock(m); mutex_unlock(m); 0 }\n"
+        "fn bump(m: Mutex<i64>) -> i64 ! { io } { mutex_lock(m); mutex_unlock(m); 0 }\n"
         "fn main() -> i64 ! { alloc, io, share } {\n"
         "  let m = mutex_new(0);\n"
         "  let h = thread_spawn(|| bump(m));\n"
