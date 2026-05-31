@@ -1388,25 +1388,127 @@ bool resolveModules(const std::string& srcRaw,
     return true;
 }
 
-void reportParseErrors(const kardashev::ParseResult& r) {
-    for (const auto& e : r.errors) {
-        std::cerr << "parse error " << e.line << ":" << e.column << ": "
-                  << e.message << '\n';
+// v24 Phase 130: rich diagnostics — a rustc-style source snippet with a caret
+// under the offending column. The front-end parses applyPrelude(userSource), so
+// error line numbers are offset by the prelude's length; we recover that offset
+// to show the USER's own line number + file (not "453" for user line 1). The
+// header keeps the literal "<kind> error" + message, so message-grepping tests
+// (and the one "parse error" check) still match.
+namespace {
+std::size_t countLines(const std::string& s) {
+    std::size_t n = 1;
+    for (char c : s) if (c == '\n') ++n;
+    return n;
+}
+// Extract 1-based line `n` from `s` (without the trailing newline). Empty if
+// out of range.
+std::string nthLine(const std::string& s, std::size_t n) {
+    if (n == 0) return "";
+    std::size_t cur = 1, i = 0;
+    while (cur < n && i < s.size()) {
+        if (s[i] == '\n') ++cur;
+        ++i;
     }
+    if (cur != n) return "";
+    std::size_t end = i;
+    while (end < s.size() && s[end] != '\n') ++end;
+    return s.substr(i, end - i);
+}
+// Rewrite any prelude-prepended `<line>:<col>` embedded in a message (e.g.
+// "moved at 457:18") into the user's own coordinates, so a secondary position
+// inside a message matches the snippet header rather than showing the big
+// prelude-offset line. Only a `<digits>:<digit>` run whose line exceeds the
+// prelude length is touched — coincidental small `N:M` are left alone.
+std::string adjustMessagePositions(const std::string& msg,
+                                   std::size_t preludeLines) {
+    if (preludeLines == 0) return msg;
+    auto isDigit = [](char c) { return c >= '0' && c <= '9'; };
+    std::string out;
+    out.reserve(msg.size());
+    std::size_t i = 0;
+    while (i < msg.size()) {
+        if (isDigit(msg[i])) {
+            std::size_t j = i;
+            while (j < msg.size() && isDigit(msg[j])) ++j;
+            if (j < msg.size() && msg[j] == ':' && j + 1 < msg.size() &&
+                isDigit(msg[j + 1])) {
+                std::size_t lineNo = 0;
+                for (std::size_t k = i; k < j; ++k)
+                    lineNo = lineNo * 10 + (std::size_t)(msg[k] - '0');
+                std::size_t c = j + 1;
+                while (c < msg.size() && isDigit(msg[c])) ++c;
+                if (lineNo > preludeLines) {
+                    out += std::to_string(lineNo - preludeLines);
+                    out += msg.substr(j, c - j); // ":<col>"
+                    i = c;
+                    continue;
+                }
+            }
+            out += msg.substr(i, j - i);
+            i = j;
+            continue;
+        }
+        out += msg[i];
+        ++i;
+    }
+    return out;
+}
+} // namespace
+
+void renderDiagnostic(std::ostream& os, const char* kind,
+                      const std::string& message, std::size_t line,
+                      std::size_t column, const std::string& userSource,
+                      const std::string& file) {
+    // Recover the prelude offset so the user sees their own line number (both
+    // in the header and in any position embedded in the message text).
+    const std::string full = applyPrelude(userSource);
+    std::size_t preludeLines = 0;
+    {
+        std::size_t fullL = countLines(full), userL = countLines(userSource);
+        if (fullL > userL) preludeLines = fullL - userL;
+    }
+    os << kind << " error: " << adjustMessagePositions(message, preludeLines)
+       << '\n';
+    const bool inUser = line > preludeLines;
+    const std::size_t dispLine = inUser ? (line - preludeLines) : line;
+    const std::string& snippetSrc = inUser ? userSource : full;
+    const std::string where = inUser ? file : std::string("<prelude>");
+    os << " --> " << where << ':' << dispLine << ':' << column << '\n';
+    const std::string srcLine = nthLine(snippetSrc, dispLine);
+    if (srcLine.empty() && dispLine != 0) {
+        // Out of range (e.g. a merged-module line) — header + location only.
+        return;
+    }
+    const std::string gutter = std::to_string(dispLine);
+    const std::string pad(gutter.size(), ' ');
+    os << pad << " |\n";
+    os << gutter << " | " << srcLine << '\n';
+    os << pad << " | " << std::string(column > 0 ? column - 1 : 0, ' ')
+       << "^\n";
 }
 
-void reportTypeErrors(const kardashev::TypeCheckResult& r) {
-    for (const auto& e : r.errors) {
-        std::cerr << "type error " << e.line << ":" << e.column << ": "
-                  << e.message << '\n';
-    }
+void reportParseErrors(const kardashev::ParseResult& r,
+                       const std::string& src = "",
+                       const std::string& file = "<input>") {
+    for (const auto& e : r.errors)
+        renderDiagnostic(std::cerr, "parse", e.message, e.line, e.column, src,
+                         file);
 }
 
-void reportBorrowErrors(const kardashev::BorrowCheckResult& r) {
-    for (const auto& e : r.errors) {
-        std::cerr << "borrow error " << e.line << ":" << e.column << ": "
-                  << e.message << '\n';
-    }
+void reportTypeErrors(const kardashev::TypeCheckResult& r,
+                      const std::string& src = "",
+                      const std::string& file = "<input>") {
+    for (const auto& e : r.errors)
+        renderDiagnostic(std::cerr, "type", e.message, e.line, e.column, src,
+                         file);
+}
+
+void reportBorrowErrors(const kardashev::BorrowCheckResult& r,
+                        const std::string& src = "",
+                        const std::string& file = "<input>") {
+    for (const auto& e : r.errors)
+        renderDiagnostic(std::cerr, "borrow", e.message, e.line, e.column, src,
+                         file);
 }
 
 // Compile `src` through the full pipeline and JIT-call the named entry
@@ -1428,7 +1530,15 @@ std::optional<kardashev::ast::Program> buildProgram(
     std::unordered_set<std::string> visited;
     std::vector<std::string> errors;
     if (!resolveModules(src, srcDir, visited, merged, errors)) {
-        for (const auto& e : errors) std::cerr << e << '\n';
+        // v24 Phase 130: render the (common single-file) top-level parse errors
+        // with an offset-corrected source snippet. If the main file parses but a
+        // `mod` file failed, fall back to the collected strings.
+        auto pr = kardashev::parse(src);
+        if (!pr.ok()) {
+            reportParseErrors(pr, srcRaw, "<input>");
+        } else {
+            for (const auto& e : errors) std::cerr << e << '\n';
+        }
         return std::nullopt;
     }
     if (!errors.empty()) {
@@ -1469,12 +1579,12 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
     }
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
-        reportTypeErrors(tcr);
+        reportTypeErrors(tcr, srcRaw, sourceFile);
         return std::nullopt;
     }
     auto bcr = kardashev::borrow_check(program, tcr);
     if (!bcr.ok()) {
-        reportBorrowErrors(bcr);
+        reportBorrowErrors(bcr, srcRaw, sourceFile);
         return std::nullopt;
     }
     auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile,
@@ -1569,17 +1679,17 @@ int runREPL() {
             std::string trial = accumulated + line + "\n";
             auto pr = kardashev::parse(applyPrelude(trial));
             if (!pr.ok()) {
-                reportParseErrors(pr);
+                reportParseErrors(pr, trial, "<repl>");
                 continue;
             }
             auto tcr = kardashev::typecheck(pr.program);
             if (!tcr.ok()) {
-                reportTypeErrors(tcr);
+                reportTypeErrors(tcr, trial, "<repl>");
                 continue;
             }
             auto bcr = kardashev::borrow_check(pr.program, tcr);
             if (!bcr.ok()) {
-                reportBorrowErrors(bcr);
+                reportBorrowErrors(bcr, trial, "<repl>");
                 continue;
             }
             accumulated = std::move(trial);
@@ -1887,12 +1997,12 @@ bool compileToObject(const std::string& srcRaw, const std::string& srcDir,
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
-        reportTypeErrors(tcr);
+        reportTypeErrors(tcr, srcRaw, sourceFile);
         return false;
     }
     auto bcr = kardashev::borrow_check(program, tcr);
     if (!bcr.ok()) {
-        reportBorrowErrors(bcr);
+        reportBorrowErrors(bcr, srcRaw, sourceFile);
         return false;
     }
     auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile,
@@ -1920,12 +2030,12 @@ int emitLlvmIr(const std::string& srcRaw, const std::string& srcDir,
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
-        reportTypeErrors(tcr);
+        reportTypeErrors(tcr, srcRaw, sourceFile);
         return 1;
     }
     auto bcr = kardashev::borrow_check(program, tcr);
     if (!bcr.ok()) {
-        reportBorrowErrors(bcr);
+        reportBorrowErrors(bcr, srcRaw, sourceFile);
         return 1;
     }
     auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile,
@@ -1952,12 +2062,12 @@ int emitCSource(const std::string& srcRaw, const std::string& srcDir) {
     expandDerives(program);
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
-        reportTypeErrors(tcr);
+        reportTypeErrors(tcr, srcRaw);
         return 1;
     }
     auto bcr = kardashev::borrow_check(program, tcr);
     if (!bcr.ok()) {
-        reportBorrowErrors(bcr);
+        reportBorrowErrors(bcr, srcRaw);
         return 1;
     }
     // Emit only the USER's declarations: re-parse the raw source so the
@@ -2090,12 +2200,12 @@ int runTests(const std::string& srcRaw, const std::string& srcDir,
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
-        reportTypeErrors(tcr);
+        reportTypeErrors(tcr, srcRaw, sourceFile);
         return 1;
     }
     auto bcr = kardashev::borrow_check(program, tcr);
     if (!bcr.ok()) {
-        reportBorrowErrors(bcr);
+        reportBorrowErrors(bcr, srcRaw, sourceFile);
         return 1;
     }
 

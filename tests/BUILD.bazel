@@ -242,6 +242,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v24 Phase 130: rich diagnostics — snippet + caret + user-relative line numbers
+# (the prelude offset is recovered). Asserts snippet structure on parse/type/
+# borrow errors and that a valid program emits no diagnostics.
+sh_test(
+    name = "smoke_test_phase130",
+    srcs = ["smoke_test_phase130.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
 # crashed the compiler (void load/return); now compiles + runs.
 sh_test(
