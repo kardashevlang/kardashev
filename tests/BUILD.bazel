@@ -342,6 +342,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v28 Phase 155: generic associated types (GATs).
+sh_test(
+    name = "smoke_test_phase155",
+    srcs = ["smoke_test_phase155.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v28 Phase 154: bidirectional inference (struct-field coercion + enum/struct resolution).
 sh_test(
     name = "smoke_test_phase154",

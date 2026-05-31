@@ -7010,6 +7010,34 @@ private:
                               "' base is not a concrete type");
             return makeInt();
         }
+        // v28 Phase 155 (GATs): a parameterized projection `Self::Out<i64>` —
+        // substitute the supplied args (resolved in the current instance) into
+        // the impl's raw `type Out<T> = …` binding by injecting Self + the GAT's
+        // params into the instance type map, then materialize the RHS.
+        if (!tr.assocTypeArgs.empty()) {
+            auto git = tc_.implGatBindings.find(typeName);
+            if (git != tc_.implGatBindings.end()) {
+                for (const auto& [traitName, table] : git->second) {
+                    auto bit = table.find(tr.assocName);
+                    if (bit == table.end()) continue;
+                    const auto& gb = bit->second;
+                    if (gb.paramNames.size() != tr.assocTypeArgs.size()) break;
+                    std::vector<TypePtr> argTys;
+                    for (const auto& a : tr.assocTypeArgs)
+                        argTys.push_back(astTypeRefToConcrete(a));
+                    auto savedMap = currentInstanceTypeMap_;
+                    currentInstanceTypeMap_["Self"] = gb.selfTy;
+                    for (std::size_t i = 0; i < gb.paramNames.size(); ++i)
+                        currentInstanceTypeMap_[gb.paramNames[i]] = argTys[i];
+                    TypePtr result = astTypeRefToConcrete(gb.rhs);
+                    currentInstanceTypeMap_ = savedMap;
+                    return resolveInInstance(result);
+                }
+            }
+            errors_.push_back("codegen: no generic associated type '" +
+                              tr.assocName + "' for type '" + typeName + "'");
+            return makeInt();
+        }
         auto tyIt = tc_.implAssocTypes.find(typeName);
         if (tyIt != tc_.implAssocTypes.end()) {
             for (const auto& [traitName, table] : tyIt->second) {

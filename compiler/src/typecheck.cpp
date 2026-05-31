@@ -1392,6 +1392,10 @@ public:
                     continue;
                 }
                 atypes.push_back(at.name);
+                // v28 Phase 155 (GATs): record the associated type's arity (the
+                // number of generic params it declares), so a projection
+                // `Self::Out<args>` can validate it supplies the right count.
+                traitGatArity_[td.name][at.name] = at.typeParams.size();
             }
             traitAssocTypes_[td.name] = std::move(atypes);
             std::unordered_set<std::string> seenMethod;
@@ -1602,7 +1606,23 @@ public:
                               at.line, at.column);
                         continue;
                     }
-                    resolvedAssoc[at.name] = resolveTypeRef(at.type);
+                    // v28 Phase 155 (GATs): a parameterized binding `type Out<T>
+                    // = Pair<T, T>;` can't be pre-resolved (the RHS has free
+                    // params); store it raw for per-projection substitution. A
+                    // plain (Phase 21b) binding pre-resolves as before. Counts as
+                    // "provided" either way (resolvedAssoc[name] = a placeholder).
+                    if (!at.typeParams.empty()) {
+                        GatBinding gb;
+                        gb.selfTy = forTy;
+                        for (const auto& tp : at.typeParams)
+                            gb.paramNames.push_back(tp.name);
+                        gb.rhs = at.type;
+                        implGatBindings_[typeName][impl.traitName][at.name] =
+                            std::move(gb);
+                        resolvedAssoc[at.name] = forTy; // sentinel: "provided"
+                    } else {
+                        resolvedAssoc[at.name] = resolveTypeRef(at.type);
+                    }
                 }
                 currentGenericEnv_ = savedEnv;
                 for (const auto& want : wantAssoc) {
@@ -2185,6 +2205,7 @@ public:
         result.dynVtablesNeeded = std::move(dynVtablesNeeded_);
         result.assocProjections = std::move(assocProjections_);
         result.implAssocTypes = std::move(implAssocTypes_);
+        result.implGatBindings = std::move(implGatBindings_); // v28 Phase 155
         return result;
     }
 
@@ -2279,6 +2300,22 @@ private:
         std::unordered_map<std::string,
                            std::unordered_map<std::string, TypePtr>>>
         implAssocTypes_;
+    // v28 Phase 155 (GATs): a trait's associated-type ARITY —
+    // traitGatArity_[trait][assocName] = number of generic params it declares
+    // (`type Out<T>;` -> 1). 0 (or absent) = a plain Phase-21b associated type.
+    std::unordered_map<std::string,
+                       std::unordered_map<std::string, std::size_t>>
+        traitGatArity_;
+    // v28 Phase 155 (GATs): a parameterized impl binding `type Out<T> = Pair<T,
+    // T>;` stored RAW (the RHS has free params), so a projection `Self::Out<i64>`
+    // can substitute the supplied args into it on demand. Uses the result-header
+    // GatBinding so it moves into the result for codegen verbatim.
+    using GatBinding = TypeCheckResult::GatBinding;
+    std::unordered_map<
+        std::string,
+        std::unordered_map<std::string,
+                           std::unordered_map<std::string, GatBinding>>>
+        implGatBindings_;
     // Phase 21b: during signature resolution of a generic fn / impl method, the
     // bound trait of each in-scope generic param's schema Var, keyed by var id.
     // Lets `resolveTypeRef` resolve a `C::Item` projection (C a Var) to the
@@ -3284,6 +3321,18 @@ private:
         }
         TypePtr rb = resolve(base);
         if (rb->kind == TypeKind::Var) {
+            // v28 Phase 155: a GAT projection on a BOUNDED GENERIC param
+            // (`C::Out<i64>`) would need the args threaded through
+            // monomorphization — deferred. The concrete-`Self` GAT case (an impl
+            // method) is supported above.
+            if (!tr.assocTypeArgs.empty()) {
+                error("a generic associated-type projection on a bounded "
+                      "generic param ('" + tr.name + "::" + tr.assocName +
+                      "<…>') is not yet supported; use it on a concrete type "
+                      "(e.g. `Self::" + tr.assocName + "<…>` in an impl method)",
+                      tr.line, tr.column);
+                return makeInt();
+            }
             // `C::Item`: find C's bound trait, confirm it declares `Item`, and
             // record a projection placeholder for codegen.
             auto bit = currentVarBound_.find(rb->varId);
@@ -3324,6 +3373,44 @@ private:
         else {
             error("associated type projection on unsupported base type " +
                       typeToString(base),
+                  tr.line, tr.column);
+            return makeInt();
+        }
+        // v28 Phase 155 (GATs): a parameterized projection `Self::Out<i64>` on a
+        // concrete base — substitute the supplied args into the impl's raw
+        // `type Out<T> = ...` binding and resolve it.
+        if (!tr.assocTypeArgs.empty()) {
+            auto gtyIt = implGatBindings_.find(typeName);
+            if (gtyIt != implGatBindings_.end()) {
+                for (const auto& [traitName, table] : gtyIt->second) {
+                    auto bit = table.find(tr.assocName);
+                    if (bit == table.end()) continue;
+                    const GatBinding& gb = bit->second;
+                    if (gb.paramNames.size() != tr.assocTypeArgs.size()) {
+                        error("generic associated type '" + tr.assocName +
+                                  "' of '" + typeName + "' expects " +
+                                  std::to_string(gb.paramNames.size()) +
+                                  " type argument(s), got " +
+                                  std::to_string(tr.assocTypeArgs.size()),
+                              tr.line, tr.column);
+                        return makeInt();
+                    }
+                    // Resolve the supplied args in the CURRENT env, then bind
+                    // Self + the GAT's params and resolve the binding RHS.
+                    GenericEnv env;
+                    env["Self"] = gb.selfTy;
+                    for (std::size_t i = 0; i < gb.paramNames.size(); ++i)
+                        env[gb.paramNames[i]] =
+                            resolveTypeRef(tr.assocTypeArgs[i]);
+                    const GenericEnv* saved = currentGenericEnv_;
+                    currentGenericEnv_ = &env;
+                    TypePtr result = resolveTypeRef(gb.rhs);
+                    currentGenericEnv_ = saved;
+                    return result;
+                }
+            }
+            error("type '" + typeName + "' has no generic associated type '" +
+                      tr.assocName + "'",
                   tr.line, tr.column);
             return makeInt();
         }

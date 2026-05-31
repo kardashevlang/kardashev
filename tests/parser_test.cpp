@@ -1616,6 +1616,27 @@ void test_trait_assoc_type_decl() {
     assert(t.methods[0].returnType.assocName == "Item");
 }
 
+void test_gat_decl_and_projection() {
+    // v28 Phase 155: a trait GAT `type Out<T>;`, an impl binding `type Out<T> =
+    // Pair<T, T>;`, and a projection `Self::Out<i64>` parse with their params.
+    auto r = parse("trait Wrap { type Out<T>; fn make(&self) -> Self::Out<i64>; }");
+    assert(r.ok());
+    const auto& t = r.program.traits[0];
+    assert(t.assocTypes.size() == 1);
+    assert(t.assocTypes[0].name == "Out");
+    assert(t.assocTypes[0].typeParams.size() == 1);
+    assert(t.assocTypes[0].typeParams[0].name == "T");
+    // the method return type is the projection Self::Out<i64>
+    const auto& rt = t.methods[0].returnType;
+    assert(rt.name == "Self" && rt.assocName == "Out");
+    assert(rt.assocTypeArgs.size() == 1 && rt.assocTypeArgs[0].name == "i64");
+    auto ri = parse("struct P<A,B>{a:A,b:B} impl Wrap for G { type Out<T> = P<T,T>; }");
+    assert(ri.ok());
+    const auto& im = ri.program.impls[0];
+    assert(im.assocTypes.size() == 1 && im.assocTypes[0].name == "Out");
+    assert(im.assocTypes[0].typeParams.size() == 1);
+}
+
 void test_impl_assoc_type_def() {
     // `impl Container for IntBox { type Item = i64; fn get(...) ... }`.
     auto r = parse(
@@ -2067,6 +2088,7 @@ int main() {
     test_where_clause_unknown_param_errors();
     test_where_clause_on_impl_method();
     test_trait_assoc_type_decl();
+    test_gat_decl_and_projection();
     test_impl_assoc_type_def();
     test_assoc_projection_on_generic_param();
     // Phase 24: extern "C" FFI declarations.
@@ -2095,6 +2117,6 @@ int main() {
     test_tuple_let_annotation();
     test_nested_tuple_field_access(); // v10 regression
     test_array_repeat(); // Phase 62
-    std::cout << "All parser tests passed (137 cases)\n";
+    std::cout << "All parser tests passed (138 cases)\n";
     return 0;
 }

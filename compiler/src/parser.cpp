@@ -1040,6 +1040,20 @@ private:
             Token assocTok = expect(TokenKind::Identifier,
                                     "associated type name after `::`");
             tr.assocName = assocTok.lexeme;
+            // v28 Phase 155 (GATs): type arguments on the projection —
+            // `Self::Out<i64>`. Consumed here (into `assocTypeArgs`) so the
+            // general type-arg parser below doesn't also claim them.
+            if (accept(TokenKind::Lt)) {
+                if (!check(TokenKind::Gt)) {
+                    while (true) {
+                        tr.assocTypeArgs.push_back(parseTypeRef());
+                        if (!accept(TokenKind::Comma)) break;
+                        if (check(TokenKind::Gt)) break; // trailing comma
+                    }
+                }
+                expect(TokenKind::Gt, "> (after associated-type arguments)");
+            }
+            return tr;
         }
         // Optional type-args: `Name<T1, T2>`. Position is unambiguous because
         // `<` immediately after an Ident in a type-ref slot can only be the
@@ -1279,6 +1293,8 @@ private:
                 Token nameTok =
                     expect(TokenKind::Identifier, "associated type name");
                 at.name = nameTok.lexeme;
+                // v28 Phase 155 (GATs): optional generic params `type Out<T>;`.
+                at.typeParams = parseOptionalGenericParams();
                 expect(TokenKind::Semi, ";");
                 decl.assocTypes.push_back(std::move(at));
                 continue;
@@ -1496,6 +1512,9 @@ private:
                 Token nameTok =
                     expect(TokenKind::Identifier, "associated type name");
                 at.name = nameTok.lexeme;
+                // v28 Phase 155 (GATs): the binding's own params `type Out<T> =
+                // Pair<T, T>;` — those names are in scope while parsing the RHS.
+                at.typeParams = parseOptionalGenericParams();
                 expect(TokenKind::Eq, "=");
                 at.type = parseTypeRef();
                 expect(TokenKind::Semi, ";");
