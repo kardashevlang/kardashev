@@ -1046,6 +1046,17 @@ sh_test(
     ],
 )
 
+# v20 Phase 118: the self-hosted compiler handles ENUMS + match — tagged-pair
+# aggregates + a branch-free match select-chain, differential-gated vs the host.
+sh_test(
+    name = "smoke_test_phase118",
+    srcs = ["smoke_test_phase118.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:enumgen.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

@@ -78,8 +78,20 @@ step past "toy":
   them to first-class LLVM aggregates (`insertvalue`/`extractvalue`); every value
   carries its type so the emitter prints the right LLVM type. Differential-gated
   vs the host on several struct programs (`tests/smoke_test_phase117.sh`).
-- Extend the source language further — **enums + `match`** (the other shape the
-  real compiler is built from).
+- ✅ **Phase 118 (enums + match, done)** — the self-hosted compiler now accepts
+  `enum NAME { V(i64), ... }`, constructs variants `V(e)`, and `match`es them.
+  An enum is a tagged pair `{ i64 tag, i64 payload }`; construction →
+  `insertvalue`; an enum-typed `if` → `select` over the aggregate; `match` →
+  `extractvalue` tag/payload + a branch-free **select-chain** on the tag (sound
+  because the language is pure — no phi/blocks needed). Differential-gated vs the
+  host on two- and three-variant programs across all branches
+  (`tests/smoke_test_phase118.sh`).
+
+**v20 is functionally complete:** the self-hosted compiler emits real native code
+(115) that provably matches the host (116) for the i64/bool language, plus
+**structs** (117) and **enums + match** (118) — the shapes kardashev itself is
+built from. Full kardashev-compiles-kardashev remains several roadmaps out, but
+this is well past "toy".
 
 ### v21 — prove it, and close the leaks
 
