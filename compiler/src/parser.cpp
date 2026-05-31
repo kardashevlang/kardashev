@@ -135,6 +135,7 @@ private:
     // for the declaration currently being parsed (consumed by the decl parser).
     std::map<std::size_t, std::string> docAt_;
     std::string pendingDeclDoc_;
+    int structPatCounter_ = 0; // v26 Phase 142: fresh `__sp` names
     std::string takeDocAt(std::size_t p) {
         auto it = docAt_.find(p);
         if (it == docAt_.end()) return "";
@@ -2237,7 +2238,72 @@ private:
         return me;
     }
 
+    // v26 Phase 142: a struct pattern `P { f1, f2: b, _, .. }` as a match arm,
+    // desugared to an irrefutable `__sp` binding + a block that field-binds —
+    // so the match compiler / typechecker only ever see a VarPat + a block.
+    // (`P { .. }` field-list shorthand; `f: _` / `..` skip a field.)
+    ast::MatchArm parseStructPatternArm() {
+        Token nameTok = consume(); // struct name (informational)
+        expect(TokenKind::LBrace, "{");
+        std::string sp = "__sp" + std::to_string(structPatCounter_++);
+        auto block = std::make_unique<ast::BlockExpr>();
+        block->line = nameTok.line;
+        block->column = nameTok.column;
+        while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
+            if (check(TokenKind::DotDot)) {
+                consume();
+                break;
+            }
+            Token field = expect(TokenKind::Identifier, "field name");
+            std::string bind = field.lexeme;
+            bool skip = false;
+            if (accept(TokenKind::Colon)) {
+                if (check(TokenKind::Underscore)) {
+                    consume();
+                    skip = true;
+                } else {
+                    bind = expect(TokenKind::Identifier, "a binding").lexeme;
+                }
+            }
+            if (!skip) {
+                auto let = std::make_unique<ast::LetStmt>();
+                let->name = bind;
+                let->line = field.line;
+                let->column = field.column;
+                auto id = std::make_unique<ast::IdentExpr>();
+                id->name = sp;
+                id->line = field.line;
+                id->column = field.column;
+                auto fe = std::make_unique<ast::FieldExpr>();
+                fe->line = field.line;
+                fe->column = field.column;
+                fe->object = std::move(id);
+                fe->fieldName = field.lexeme;
+                let->value = std::move(fe);
+                block->stmts.push_back(std::move(let));
+            }
+            if (!accept(TokenKind::Comma)) break;
+        }
+        expect(TokenKind::RBrace, "}");
+        expect(TokenKind::FatArrow, "=>");
+        block->tail = parseExpr();
+        auto vp = std::make_unique<ast::VarPat>();
+        vp->name = sp;
+        vp->line = nameTok.line;
+        vp->column = nameTok.column;
+        ast::MatchArm arm;
+        arm.line = nameTok.line;
+        arm.column = nameTok.column;
+        arm.pattern = std::move(vp);
+        arm.body = std::move(block);
+        return arm;
+    }
+
     ast::MatchArm parseMatchArm() {
+        // v26 Phase 142: `P { … }` in pattern position is a struct pattern.
+        if (check(TokenKind::Identifier) && peek(1).kind == TokenKind::LBrace) {
+            return parseStructPatternArm();
+        }
         auto pat = parsePattern();
         std::size_t line = pat ? pat->line : peek().line;
         std::size_t col = pat ? pat->column : peek().column;
