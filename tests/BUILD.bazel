@@ -188,6 +188,30 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
+# crashed the compiler (void load/return); now compiles + runs.
+sh_test(
+    name = "smoke_test_unitasync",
+    srcs = ["smoke_test_unitasync.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v18 Phase 110: a differential fuzzer over the arithmetic/codegen path — random
+# i64 expression programs, JIT == AOT == python reference (seeded, reproducible).
+sh_test(
+    name = "smoke_test_fuzz_arith",
+    srcs = ["smoke_test_fuzz_arith.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v18 Phase 111: a differential fuzzer over the CONTROL-FLOW path — random
+# let/comparison/if-else programs, JIT == AOT == python reference.
+sh_test(
+    name = "smoke_test_fuzz_control",
+    srcs = ["smoke_test_fuzz_control.sh"],
+    data = ["//compiler:kardc"],
+)
+
 sh_test(
     name = "smoke_test_threads",
     srcs = ["smoke_test_threads.sh"],
