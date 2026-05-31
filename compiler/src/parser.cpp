@@ -706,9 +706,11 @@ private:
         }
         expect(TokenKind::RParen, ")");
 
-        // Split into literal segments separated by `{}` holes.
+        // Split into literal segments separated by holes. A `{}` hole formats
+        // via Display (`to_string`); a `{:?}` hole via Debug (`fmt_debug`).
         std::vector<std::string> segs;
         segs.push_back("");
+        std::vector<bool> holeDebug; // per hole: true = `{:?}` (Debug)
         std::size_t holeCount = 0;
         for (std::size_t i = 0; i < fmt.size(); ++i) {
             char c = fmt[i];
@@ -719,10 +721,18 @@ private:
                 } else if (i + 1 < fmt.size() && fmt[i + 1] == '}') {
                     ++i;
                     ++holeCount;
+                    holeDebug.push_back(false);
+                    segs.push_back("");
+                } else if (i + 3 < fmt.size() && fmt[i + 1] == ':' &&
+                           fmt[i + 2] == '?' && fmt[i + 3] == '}') {
+                    // `{:?}` — Debug.
+                    i += 3;
+                    ++holeCount;
+                    holeDebug.push_back(true);
                     segs.push_back("");
                 } else {
-                    errorAt("unsupported format placeholder (only `{}` is "
-                            "supported; `{:?}` is Phase 150)",
+                    errorAt("unsupported format placeholder (only `{}` and "
+                            "`{:?}` are supported)",
                             fmtTok.line, fmtTok.column);
                 }
             } else if (c == '}') {
@@ -780,7 +790,9 @@ private:
             }
             if (i < args.size()) {
                 auto mc = std::make_unique<ast::MethodCallExpr>();
-                mc->methodName = "to_string";
+                mc->methodName =
+                    (i < holeDebug.size() && holeDebug[i]) ? "fmt_debug"
+                                                           : "to_string";
                 mc->receiver = std::move(args[i]);
                 pushSlot(std::move(mc));
             }

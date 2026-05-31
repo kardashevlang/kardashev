@@ -342,6 +342,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v27 Phase 150: the Debug trait + {:?} format spec + #[derive(Debug)].
+sh_test(
+    name = "smoke_test_phase150",
+    srcs = ["smoke_test_phase150.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v27 Phase 149: format! / print! / println! formatting forms.
 sh_test(
     name = "smoke_test_phase149",

@@ -197,6 +197,40 @@ std::string applyPrelude(const std::string& userSrc) {
             " { fn to_string(&self) -> String ! { alloc }"
             " { f64_to_string(*self) } }\n";
     }
+    // v27 Phase 150: the `Debug` trait — `fmt_debug(&self) -> String` — the
+    // developer-facing representation behind `{:?}`. Distinct from Display: a
+    // String is QUOTED (and escaped), a char is single-quoted. Built-in impls
+    // for the scalars + String; `#[derive(Debug)]` synthesizes one for a
+    // struct/enum (see expandDerives).
+    if (userSrc.find("trait Debug") == std::string::npos) {
+        prelude +=
+            "trait Debug { fn fmt_debug(&self) -> String ! { alloc }; }\n"
+            "impl Debug for i64"
+            " { fn fmt_debug(&self) -> String ! { alloc }"
+            " { int_to_string(*self) } }\n"
+            "impl Debug for f64"
+            " { fn fmt_debug(&self) -> String ! { alloc }"
+            " { f64_to_string(*self) } }\n"
+            "impl Debug for bool"
+            " { fn fmt_debug(&self) -> String"
+            " { if *self { \"true\" } else { \"false\" } } }\n"
+            "impl Debug for char"
+            " { fn fmt_debug(&self) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    str_push_byte(&mut out, 39);\n"
+            "    str_push_char(&mut out, *self);\n"
+            "    str_push_byte(&mut out, 39);\n"
+            "    out\n"
+            "} }\n"
+            "impl Debug for String"
+            " { fn fmt_debug(&self) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    str_push_byte(&mut out, 34);\n"
+            "    string_push_str(&mut out, str_escape(self));\n"
+            "    str_push_byte(&mut out, 34);\n"
+            "    out\n"
+            "} }\n";
+    }
     // Phase 41: the `Clone` trait — `clone(&self) -> Self` — a DEEP copy that
     // dispatches through each element's own impl. Built-in impls for scalars +
     // String (String copies via str_substring); a generic `impl<T: Clone> Clone
@@ -1250,6 +1284,21 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
                            s.fields[i].name + ".to_string());";
                 }
                 out += " string_push_str(&mut out, \" }\"); out } }\n";
+            } else if (d == "Debug") {
+                // v27 Phase 150: `Name { field: <field debug>, ... }`, mirroring
+                // the Display derive but routing each field through Debug.
+                out += "impl" + header(s.genericParams, "Debug") +
+                       " Debug for " + TN +
+                       " { fn fmt_debug(&self) -> String ! { alloc } { let mut "
+                       "out = \"" + s.name + " { \";";
+                for (std::size_t i = 0; i < s.fields.size(); ++i) {
+                    if (i)
+                        out += " string_push_str(&mut out, \", \");";
+                    out += " string_push_str(&mut out, \"" + s.fields[i].name +
+                           ": \"); string_push_str(&mut out, self." +
+                           s.fields[i].name + ".fmt_debug());";
+                }
+                out += " string_push_str(&mut out, \" }\"); out } }\n";
             } else if (d == "Hash") {
                 // Phase 48: combine field hashes left-to-right (h = h*31 + fi).
                 out += "impl" + header(s.genericParams, "Hash") + " Hash for " +
@@ -1370,6 +1419,36 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
                                 out += " string_push_str(&mut out, \", \");";
                             out += " string_push_str(&mut out, x" +
                                    std::to_string(i) + ".to_string());";
+                        }
+                        out += " string_push_str(&mut out, \")\"); out },";
+                    }
+                }
+                out += " } } }\n";
+            } else if (d == "Debug") {
+                // v27 Phase 150: enum Debug — `Variant` / `Variant(<payload
+                // debug>, ...)`, mirroring the Display derive via fmt_debug.
+                out += "impl" + header(e.genericParams, "Debug") +
+                       " Debug for " + TN +
+                       " { fn fmt_debug(&self) -> String ! { alloc } { match "
+                       "self {";
+                for (const auto& var : e.variants) {
+                    out += " " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("x" + std::to_string(i));
+                        out += ")";
+                    }
+                    if (var.payloadTypes.empty()) {
+                        out += " => \"" + var.name + "\",";
+                    } else {
+                        out += " => { let mut out = \"" + var.name + "(\";";
+                        for (std::size_t i = 0; i < var.payloadTypes.size();
+                             ++i) {
+                            if (i)
+                                out += " string_push_str(&mut out, \", \");";
+                            out += " string_push_str(&mut out, x" +
+                                   std::to_string(i) + ".fmt_debug());";
                         }
                         out += " string_push_str(&mut out, \")\"); out },";
                     }
