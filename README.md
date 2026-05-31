@@ -445,6 +445,16 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   200 programs across 4 seeds agree (JIT == AOT == reference) — confirming the
 >   `sdiv`/`srem`/bitwise/arithmetic-shift lowering is correct. (Writing it
 >   confirmed the compiler follows C/Rust `%` semantics, not Python's.)
+>
+> - **Phase 114 — clean codegen diagnostics (done).** When codegen reports a real
+>   error, each error path returns a placeholder and keeps emitting, so the IR
+>   ends up type-mismatched — and the module verifier then piled cascading
+>   "module verification failed" lines on top of the real diagnostic, burying it.
+>   Codegen now returns the real errors directly and skips the verifier when any
+>   error was already reported; the verifier still runs on the error-free path
+>   (its valuable role — catching a codegen bug that emits invalid IR *without*
+>   reporting an error, like the unit-async `load void` before Phase 109). Pinned
+>   by `tests/smoke_test_diag.sh`.
 
 ## Roadmap v18 — shipped
 

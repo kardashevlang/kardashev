@@ -228,6 +228,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v19 Phase 114: a codegen error reports the REAL diagnostic, not cascading
+# "module verification failed" noise from the placeholder IR.
+sh_test(
+    name = "smoke_test_diag",
+    srcs = ["smoke_test_diag.sh"],
+    data = ["//compiler:kardc"],
+)
+
 sh_test(
     name = "smoke_test_threads",
     srcs = ["smoke_test_threads.sh"],
