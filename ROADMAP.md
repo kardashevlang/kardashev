@@ -53,19 +53,53 @@ the roadmap below can close them in priority order.
 > phase green (JIT **and** AOT) → adversarial review → fix findings →
 > consolidating PR → tag/release.
 
-### v20 — toward a real bootstrap (the north star)
+### v20 — toward a real bootstrap (the north star) — *in progress*
 
 Move the self-hosted compiler from a toy toward real kardashev. Full
 kardashev-compiles-kardashev is several roadmaps out; v20 is the first concrete
 step past "toy":
 
-- Extend the source language the in-kardashev compiler accepts past `i64`/`bool`
-  — at least **structs and enums** (the shapes the real compiler is built from).
-- Emit a **real artifact** instead of running an in-process stack VM — e.g. a
-  textual LLVM-IR (or the host's bytecode), so the self-hosted compiler's output
-  is something you can compile/run, not just interpret.
-- A **differential gate**: the self-hosted compiler's result must match the host
-  compiler's on the shared subset, fuzzed like the existing JIT-vs-AOT checks.
+- ✅ **Phase 115 (done)** — emit a **real artifact** instead of running an
+  in-process stack VM. `examples/selfhost/llvmgen.kd` now lowers each `Expr` to
+  SSA-form **textual LLVM IR** (`add`/`mul`/`icmp`+`zext`/branch-free `select`)
+  and prints a complete module (`define i64 @f(...)` + a `main` calling it), so
+  `clang out.ll -o prog && ./prog` runs **natively** and the exit code is the
+  function's result. **Differential-gated**: the self-hosted compiler's result
+  must equal the host compiler's on the same function (pinned by
+  `tests/smoke_test_phase115.sh`). This is the step past "toy" — the self-hosted
+  compiler produces a real, compilable native artifact.
+- ✅ **Phase 116 (done)** — broaden the differential gate into a **fuzzer**:
+  for many random valid functions (over `+ * < ==` and parenthesized `if/else`)
+  with random args, the self-hosted-emitted LLVM IR (clang → native) must equal
+  the host compiler's result. 75 functions across 3 seeds agree
+  (`tests/smoke_test_phase116.sh`) — the self-hosted codegen matches the host.
+- ✅ **Phase 117 (structs, done)** — the self-hosted compiler now accepts
+  `struct NAME { f: i64, ... }`, builds struct literals, reads fields, and lowers
+  them to first-class LLVM aggregates (`insertvalue`/`extractvalue`); every value
+  carries its type so the emitter prints the right LLVM type. Differential-gated
+  vs the host on several struct programs (`tests/smoke_test_phase117.sh`).
+- ✅ **Phase 118 (enums + match, done)** — the self-hosted compiler now accepts
+  `enum NAME { V(i64), ... }`, constructs variants `V(e)`, and `match`es them.
+  An enum is a tagged pair `{ i64 tag, i64 payload }`; construction →
+  `insertvalue`; an enum-typed `if` → `select` over the aggregate; `match` →
+  `extractvalue` tag/payload + a branch-free **select-chain** on the tag (sound
+  because the language is pure — no phi/blocks needed). Differential-gated vs the
+  host on two- and three-variant programs across all branches
+  (`tests/smoke_test_phase118.sh`).
+
+- ✅ **Phase 119 (adversarial review + fixes, done)** — a 3-way review (~80
+  valid programs vs the host, IR validity via clang/llc, test honesty) found one
+  real bug: a `match` whose ARMS return enum values lowered its select-chain as
+  `i64` instead of the aggregate type (clang-rejected; the host compiled it). Fixed
+  to use the arm result type (mirroring the `if` lowering), plus a latent
+  aggregate-return `main` fix (extract field 0 as the exit code). Both pinned by
+  new regression cases. IR validity + test honesty came back clean.
+
+**v20 is functionally complete:** the self-hosted compiler emits real native code
+(115) that provably matches the host (116) for the i64/bool language, plus
+**structs** (117) and **enums + match** (118) — the shapes kardashev itself is
+built from, adversarially reviewed (119). Full kardashev-compiles-kardashev
+remains several roadmaps out, but this is well past "toy".
 
 ### v21 — prove it, and close the leaks
 

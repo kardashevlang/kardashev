@@ -1012,6 +1012,51 @@ sh_test(
     ],
 )
 
+# v20 Phase 115 (toward a real bootstrap): the self-hosted compiler emits REAL
+# LLVM IR (clang-compiled to native), differential-gated against the host.
+# (Skips cleanly if clang is unavailable in the test sandbox.)
+sh_test(
+    name = "smoke_test_phase115",
+    srcs = ["smoke_test_phase115.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:llvmgen.kd",
+    ],
+)
+
+# v20 Phase 116: a DIFFERENTIAL FUZZER over the self-hosted codegen — random
+# functions, self-hosted-emitted LLVM IR (clang->native) must equal the host.
+sh_test(
+    name = "smoke_test_phase116",
+    srcs = ["smoke_test_phase116.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:llvmgen.kd",
+    ],
+)
+
+# v20 Phase 117: the self-hosted compiler handles STRUCTS — struct literals +
+# field access -> LLVM insertvalue/extractvalue, differential-gated vs the host.
+sh_test(
+    name = "smoke_test_phase117",
+    srcs = ["smoke_test_phase117.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:structgen.kd",
+    ],
+)
+
+# v20 Phase 118: the self-hosted compiler handles ENUMS + match — tagged-pair
+# aggregates + a branch-free match select-chain, differential-gated vs the host.
+sh_test(
+    name = "smoke_test_phase118",
+    srcs = ["smoke_test_phase118.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:enumgen.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

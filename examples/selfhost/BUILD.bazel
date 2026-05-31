@@ -2,7 +2,7 @@ load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary")
 
 # Readable by //tests:smoke_test_phase88..93.
 exports_files(
-    ["lexer.kd", "tokens.kd", "parser.kd", "printer.kd", "checker.kd", "front.kd", "expr.kd", "stmt.kd", "scopechk.kd", "interp.kd", "func.kd", "typeck.kd", "funcheck.kd", "emit.kd", "compile.kd"],
+    ["lexer.kd", "tokens.kd", "parser.kd", "printer.kd", "checker.kd", "front.kd", "expr.kd", "stmt.kd", "scopechk.kd", "interp.kd", "func.kd", "typeck.kd", "funcheck.kd", "emit.kd", "compile.kd", "llvmgen.kd", "structgen.kd", "enumgen.kd"],
     visibility = ["//visibility:public"],
 )
 
@@ -36,3 +36,12 @@ kardashev_binary(name = "emit", src = "emit.kd")
 # v17 Phase 105 CAPSTONE: a self-hosted mini-compiler end-to-end — type-check a
 # whole function, then compile (with `let` locals) + execute it on arguments.
 kardashev_binary(name = "compile", src = "compile.kd")
+# v20 Phase 115: the self-hosted compiler emits REAL LLVM IR (a compilable .ll),
+# not a stack VM — `clang out.ll` runs natively. (toward a real bootstrap.)
+kardashev_binary(name = "llvmgen", src = "llvmgen.kd")
+# v20 Phase 117: the self-hosted compiler handles STRUCTS — struct literals +
+# field access -> LLVM insertvalue/extractvalue aggregates.
+kardashev_binary(name = "structgen", src = "structgen.kd")
+# v20 Phase 118: the self-hosted compiler handles ENUMS + match — tagged-pair
+# aggregates + a branch-free match select-chain.
+kardashev_binary(name = "enumgen", src = "enumgen.kd")

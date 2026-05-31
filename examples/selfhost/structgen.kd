@@ -1,0 +1,498 @@
+// Roadmap v20 — "toward a real bootstrap", Phase 117. The self-hosted LLVM-IR
+// compiler now handles STRUCTS — the first of kardashev's own aggregate shapes.
+// It parses `struct NAME { f: i64, ... }` declarations into a registry, then a
+// function that can build a struct literal `NAME { f: e, ... }`, `let`-bind it,
+// and read fields `p.f`. Codegen LOWERS structs to first-class LLVM aggregates:
+// a struct literal -> a chain of `insertvalue { i64, ... } undef, i64 V, IDX`;
+// a field read -> `extractvalue { i64, ... } %p, IDX`. Every value now carries
+// its TYPE (i64 or a struct), so the emitter prints the right LLVM type. As in
+// Phase 115/116 it prints a complete module compiled by clang and differential-
+// gated against the host (tests/smoke_test_phase117.sh). MVP: struct fields are
+// i64; structs are declared before the function.
+
+enum Expr {
+    Num(i64),
+    Var(String),
+    Bin(i64, Box<Expr>, Box<Expr>),     // op: 10 '+', 11 '*', 20 '<', 21 '=='
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+    SLit(i64, Vec<Box<Expr>>),          // struct literal: struct index, field values (decl order)
+    Field(Box<Expr>, String),           // field access: object, field name
+}
+enum Stmt { Let(String, Box<Expr>) }
+struct Token { kind: i64, start: i64, len: i64, value: i64 }
+struct Pos { i: i64 }
+struct Param { name: String, ty: i64 }  // ty: 1 i64, 2 bool, 100+idx struct
+struct Block { lets: Vec<Stmt>, result: Box<Expr> }
+struct SDef { name: String, fields: Vec<String> }   // a struct: name + field names (all i64)
+struct Fn { name: String, params: Vec<Param>, ret: i64, body: Block }
+struct Ctr { n: i64 }
+// A lowered value: its LLVM operand text + its type tag.
+struct Val { op: String, ty: i64 }
+
+fn is_alpha(b: i64) -> i64 {
+    if b >= 97 { if b <= 122 { 1 } else { 0 } }
+    else { if b >= 65 { if b <= 90 { 1 } else { 0 } } else { if b == 95 { 1 } else { 0 } } }
+}
+fn is_digit(b: i64) -> i64 { if b >= 48 { if b <= 57 { 1 } else { 0 } } else { 0 } }
+fn is_alnum(b: i64) -> i64 { if is_alpha(b) == 1 { 1 } else { is_digit(b) } }
+fn is_space(b: i64) -> i64 {
+    if b == 32 { 1 } else { if b == 10 { 1 } else { if b == 9 { 1 } else { 0 } } }
+}
+
+// kind: 1 num, 2 ident, 3 '->', 10 '+', 11 '*', 12 '(', 13 ')', 14 '=', 15 ';',
+//       16 ':', 17 ',', 18 '{', 19 '}', 20 '<', 21 '==', 22 '.'
+fn lex(src: &String) -> Vec<Token> ! { alloc } {
+    let n = str_len(src);
+    let mut toks = vec_new();
+    let mut i = 0;
+    while i < n {
+        let b = str_char_at(src, i);
+        if is_space(b) == 1 { i = i + 1; }
+        else {
+            if is_alpha(b) == 1 {
+                let start = i; i = i + 1;
+                let mut go = true;
+                while go {
+                    if i >= n { go = false; }
+                    else { let c = str_char_at(src, i); if is_alnum(c) == 1 { i = i + 1; } else { go = false; } }
+                }
+                vec_push(&mut toks, Token { kind: 2, start: start, len: i - start, value: 0 });
+            } else {
+                if is_digit(b) == 1 {
+                    let start = i; let mut v = 0;
+                    let mut go = true;
+                    while go {
+                        if i >= n { go = false; }
+                        else { let c = str_char_at(src, i); if is_digit(c) == 1 { v = v * 10 + (c - 48); i = i + 1; } else { go = false; } }
+                    }
+                    vec_push(&mut toks, Token { kind: 1, start: start, len: i - start, value: v });
+                } else {
+                    let is_arrow = if b == 45 {
+                        if i + 1 < n { if str_char_at(src, i + 1) == 62 { 1 } else { 0 } } else { 0 }
+                    } else { 0 };
+                    let is_eq2 = if b == 61 {
+                        if i + 1 < n { if str_char_at(src, i + 1) == 61 { 1 } else { 0 } } else { 0 }
+                    } else { 0 };
+                    if is_arrow == 1 {
+                        vec_push(&mut toks, Token { kind: 3, start: i, len: 2, value: 0 }); i = i + 2;
+                    } else { if is_eq2 == 1 {
+                        vec_push(&mut toks, Token { kind: 21, start: i, len: 2, value: 0 }); i = i + 2;
+                    } else {
+                        let k = if b == 43 { 10 } else { if b == 42 { 11 } else { if b == 40 { 12 } else { if b == 41 { 13 } else { if b == 61 { 14 } else { if b == 59 { 15 } else { if b == 58 { 16 } else { if b == 44 { 17 } else { if b == 123 { 18 } else { if b == 125 { 19 } else { if b == 60 { 20 } else { if b == 46 { 22 } else { 0 - 1 } } } } } } } } } } } };
+                        vec_push(&mut toks, Token { kind: k, start: i, len: 1, value: 0 });
+                        i = i + 1;
+                    } }
+                }
+            }
+        }
+    }
+    toks
+}
+
+fn tok_text(src: &String, t: &Token) -> String ! { alloc } { str_substring(src, t.start, t.len) }
+fn peek_kind(toks: &Vec<Token>, pos: &Pos) -> i64 {
+    if pos.i < vec_len(toks) { let t = vec_get(toks, pos.i); t.kind } else { 0 - 9 }
+}
+fn tok_text_at(src: &String, toks: &Vec<Token>, pos: &Pos) -> String ! { alloc } {
+    let t = vec_get(toks, pos.i); tok_text(src, &t)
+}
+// Index of struct `name` in the registry, or -1.
+fn struct_index(structs: &Vec<SDef>, name: &String) -> i64 ! { alloc } {
+    let ns = vec_len(structs);
+    let mut i = 0; let mut found = 0 - 1;
+    while i < ns { let sd = vec_get(structs, i); found = if str_eq(&sd.name, name) { i } else { found }; i = i + 1; }
+    found
+}
+// Index of field `fname` within struct `si`, or -1.
+fn field_index(structs: &Vec<SDef>, si: i64, fname: &String) -> i64 ! { alloc } {
+    let sd = vec_get(structs, si);
+    let nf = vec_len(&sd.fields);
+    let mut i = 0; let mut found = 0 - 1;
+    while i < nf { let f = vec_get(&sd.fields, i); found = if str_eq(&f, fname) { i } else { found }; i = i + 1; }
+    found
+}
+// Type tag for a type-name token: bool -> 2, a registered struct -> 100+idx, else i64 (1).
+fn ty_tag(src: &String, toks: &Vec<Token>, pos: &Pos, structs: &Vec<SDef>) -> i64 ! { alloc } {
+    let txt = tok_text_at(src, toks, pos); let kw_bool = "bool";
+    if str_eq(&txt, &kw_bool) { 2 }
+    else { let si = struct_index(structs, &txt); if si >= 0 { 100 + si } else { 1 } }
+}
+
+fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> Box<Expr> ! { alloc } {
+    let t = vec_get(toks, pos.i);
+    if t.kind == 1 { pos.i = pos.i + 1; parse_post(src, toks, pos, structs, Box::new(Num(t.value))) }
+    else { if t.kind == 2 {
+        let txt = tok_text(src, &t); let kw_if = "if";
+        if str_eq(&txt, &kw_if) {
+            pos.i = pos.i + 1;
+            let c = parse_expr(src, toks, pos, structs);
+            pos.i = pos.i + 1;                          // '{'
+            let th = parse_expr(src, toks, pos, structs);
+            pos.i = pos.i + 1;                          // '}'
+            pos.i = pos.i + 1;                          // 'else'
+            pos.i = pos.i + 1;                          // '{'
+            let el = parse_expr(src, toks, pos, structs);
+            pos.i = pos.i + 1;                          // '}'
+            parse_post(src, toks, pos, structs, Box::new(If(c, th, el)))
+        } else {
+            let si = struct_index(structs, &txt);
+            if si >= 0 {
+                if peek_kind_at(toks, pos, 1) == 18 {   // IDENT '{' -> struct literal
+                    pos.i = pos.i + 1;                  // name
+                    pos.i = pos.i + 1;                  // '{'
+                    let mut vals = vec_new();
+                    let mut go = true;
+                    while go {
+                        if peek_kind(toks, pos) == 2 {
+                            pos.i = pos.i + 1;          // field name
+                            pos.i = pos.i + 1;          // ':'
+                            let v = parse_expr(src, toks, pos, structs);
+                            vec_push(&mut vals, v);
+                            if peek_kind(toks, pos) == 17 { pos.i = pos.i + 1; } else { go = false; }
+                        } else { go = false; }
+                    }
+                    pos.i = pos.i + 1;                  // '}'
+                    parse_post(src, toks, pos, structs, Box::new(SLit(si, vals)))
+                } else { pos.i = pos.i + 1; parse_post(src, toks, pos, structs, Box::new(Var(txt))) }
+            } else { pos.i = pos.i + 1; parse_post(src, toks, pos, structs, Box::new(Var(txt))) }
+        }
+    } else {
+        pos.i = pos.i + 1;                              // '('
+        let e = parse_expr(src, toks, pos, structs);
+        pos.i = pos.i + 1;                              // ')'
+        parse_post(src, toks, pos, structs, e)
+    } }
+}
+// Postfix field accesses: `.f .g ...`.
+fn parse_post(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>, base: Box<Expr>) -> Box<Expr> ! { alloc } {
+    let mut e = base;
+    let mut go = true;
+    while go {
+        if peek_kind(toks, pos) == 22 {                 // '.'
+            pos.i = pos.i + 1;
+            let fname = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
+            e = Box::new(Field(e, fname));
+        } else { go = false; }
+    }
+    e
+}
+fn peek_kind_at(toks: &Vec<Token>, pos: &Pos, off: i64) -> i64 {
+    let j = pos.i + off;
+    if j < vec_len(toks) { let t = vec_get(toks, j); t.kind } else { 0 - 9 }
+}
+fn parse_term(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> Box<Expr> ! { alloc } {
+    let mut left = parse_factor(src, toks, pos, structs);
+    let mut go = true;
+    while go {
+        if peek_kind(toks, pos) == 11 { pos.i = pos.i + 1; let r = parse_factor(src, toks, pos, structs); left = Box::new(Bin(11, left, r)); }
+        else { go = false; }
+    }
+    left
+}
+fn parse_sum(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> Box<Expr> ! { alloc } {
+    let mut left = parse_term(src, toks, pos, structs);
+    let mut go = true;
+    while go {
+        if peek_kind(toks, pos) == 10 { pos.i = pos.i + 1; let r = parse_term(src, toks, pos, structs); left = Box::new(Bin(10, left, r)); }
+        else { go = false; }
+    }
+    left
+}
+fn parse_expr(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> Box<Expr> ! { alloc } {
+    let left = parse_sum(src, toks, pos, structs);
+    let k = peek_kind(toks, pos);
+    if k == 20 { pos.i = pos.i + 1; let r = parse_sum(src, toks, pos, structs); Box::new(Bin(20, left, r)) }
+    else { if k == 21 { pos.i = pos.i + 1; let r = parse_sum(src, toks, pos, structs); Box::new(Bin(21, left, r)) }
+    else { left } }
+}
+fn at_kw(src: &String, toks: &Vec<Token>, pos: &Pos, kw: &String) -> i64 ! { alloc } {
+    if peek_kind(toks, pos) == 2 { let txt = tok_text_at(src, toks, pos); if str_eq(&txt, kw) { 1 } else { 0 } } else { 0 }
+}
+fn parse_block(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> Block ! { alloc } {
+    let mut lets = vec_new();
+    let kw_let = "let";
+    let mut go = true;
+    while go {
+        if at_kw(src, toks, pos, &kw_let) == 1 {
+            pos.i = pos.i + 1;                          // 'let'
+            let name = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
+            pos.i = pos.i + 1;                          // '='
+            let e = parse_expr(src, toks, pos, structs);
+            pos.i = pos.i + 1;                          // ';'
+            vec_push(&mut lets, Let(name, e));
+        } else { go = false; }
+    }
+    let result = parse_expr(src, toks, pos, structs);
+    Block { lets: lets, result: result }
+}
+// Parse all leading `struct NAME { f: TY, ... }` declarations into the registry.
+fn parse_structs(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Vec<SDef> ! { alloc } {
+    let mut out = vec_new();
+    let kw_struct = "struct";
+    let mut go = true;
+    while go {
+        if at_kw(src, toks, pos, &kw_struct) == 1 {
+            pos.i = pos.i + 1;                          // 'struct'
+            let name = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
+            pos.i = pos.i + 1;                          // '{'
+            let mut fields = vec_new();
+            let mut g2 = true;
+            while g2 {
+                if peek_kind(toks, pos) == 2 {
+                    let fn2 = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
+                    pos.i = pos.i + 1;                  // ':'
+                    pos.i = pos.i + 1;                  // type (i64)
+                    vec_push(&mut fields, fn2);
+                    if peek_kind(toks, pos) == 17 { pos.i = pos.i + 1; } else { g2 = false; }
+                } else { g2 = false; }
+            }
+            pos.i = pos.i + 1;                          // '}'
+            vec_push(&mut out, SDef { name: name, fields: fields });
+        } else { go = false; }
+    }
+    out
+}
+fn parse_fn(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> Fn ! { alloc } {
+    pos.i = pos.i + 1;                                  // 'fn'
+    let name = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
+    pos.i = pos.i + 1;                                  // '('
+    let mut params = vec_new();
+    let mut go = true;
+    while go {
+        if peek_kind(toks, pos) == 2 {
+            let pn = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
+            pos.i = pos.i + 1;                          // ':'
+            let pty = ty_tag(src, toks, pos, structs); pos.i = pos.i + 1;
+            vec_push(&mut params, Param { name: pn, ty: pty });
+            if peek_kind(toks, pos) == 17 { pos.i = pos.i + 1; } else { go = false; }
+        } else { go = false; }
+    }
+    pos.i = pos.i + 1;                                  // ')'
+    pos.i = pos.i + 1;                                  // '->'
+    let ret = ty_tag(src, toks, pos, structs); pos.i = pos.i + 1;
+    pos.i = pos.i + 1;                                  // '{'
+    let body = parse_block(src, toks, pos, structs);
+    Fn { name: name, params: params, ret: ret, body: body }
+}
+
+// ---- type checker (i64 / bool / struct) ----
+fn type_of(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>) -> i64 ! { alloc } {
+    match e {
+        Num(_) => 1,
+        Var(name) => match hashmap_get(env, clone(name)) { Some(t) => t, None => 0 },
+        Bin(op, a, b) => {
+            let ta = type_of(&(**a), env, structs);
+            let tb = type_of(&(**b), env, structs);
+            if ta == 1 { if tb == 1 { if *op <= 11 { 1 } else { 2 } } else { 0 } } else { 0 }
+        },
+        If(c, t, e2) => {
+            let tc = type_of(&(**c), env, structs);
+            let tt = type_of(&(**t), env, structs);
+            let te = type_of(&(**e2), env, structs);
+            if tc == 2 { if tt == te { if tt == 0 { 0 } else { tt } } else { 0 } } else { 0 }
+        },
+        SLit(si, vals) => {
+            // every field value must be i64; result type is the struct.
+            let nv = vec_len(vals);
+            let mut bad = 0;
+            let mut i = 0;
+            while i < nv { let v = vec_get(vals, i); bad = if type_of(&(*v), env, structs) != 1 { 1 } else { bad }; i = i + 1; }
+            if bad == 1 { 0 } else { 100 + *si }
+        },
+        Field(obj, fname) => {
+            let to = type_of(&(**obj), env, structs);
+            if to >= 100 { let fi = field_index(structs, to - 100, fname); if fi >= 0 { 1 } else { 0 } } else { 0 }
+        },
+    }
+}
+fn check_fn(f: &Fn, structs: &Vec<SDef>) -> i64 ! { alloc } {
+    let mut env = hashmap_new();
+    let np = vec_len(&f.params);
+    let mut p = 0;
+    while p < np { let pm = vec_get(&f.params, p); hashmap_insert(&mut env, clone(&pm.name), pm.ty); p = p + 1; }
+    let nl = vec_len(&f.body.lets);
+    let mut bad = 0;
+    let mut k = 0;
+    while k < nl {
+        let s = vec_get(&f.body.lets, k);
+        match s { Let(name, e) => { let t = type_of(&(*e), &env, structs); bad = if t == 0 { 1 } else { bad }; hashmap_insert(&mut env, name, t); }, }
+        k = k + 1;
+    }
+    let rt = type_of(&(*f.body.result), &env, structs);
+    if bad == 1 { 0 } else { if rt == 0 { 0 } else { if rt == f.ret { 1 } else { 0 } } }
+}
+
+// ---- LLVM-IR codegen with typed values ----
+fn fresh(c: &mut Ctr) -> i64 { let r = c.n; c.n = c.n + 1; r }
+fn reg(n: i64) -> String ! { alloc } { let p = "%v"; let s = int_to_string(n); str_concat(&p, &s) }
+fn arg_name(i: i64) -> String ! { alloc } { let p = "%arg"; let s = int_to_string(i); str_concat(&p, &s) }
+fn app(buf: &mut String, s: String) ! { alloc } { string_push_str(buf, s); }
+// The LLVM type string for a type tag: i64/bool -> "i64", struct -> "{ i64, i64, ... }".
+fn ty_llvm(ty: i64, structs: &Vec<SDef>) -> String ! { alloc } {
+    if ty < 100 { let s = "i64"; clone(&s) }
+    else {
+        let sd = vec_get(structs, ty - 100);
+        let nf = vec_len(&sd.fields);
+        let mut out = string_new();
+        let open = "{ "; app(&mut out, clone(&open));
+        let mut i = 0;
+        while i < nf {
+            if i > 0 { let sep = ", "; app(&mut out, clone(&sep)); } else { let e = ""; app(&mut out, clone(&e)); }
+            let t = "i64"; app(&mut out, clone(&t));
+            i = i + 1;
+        }
+        let close = " }"; app(&mut out, clone(&close));
+        out
+    }
+}
+
+// Lower one expression; append instructions; return its value (operand + type).
+fn lower(e: &Expr, oenv: &HashMap<String, String>, tenv: &HashMap<String, i64>, structs: &Vec<SDef>, c: &mut Ctr, buf: &mut String) -> Val ! { alloc } {
+    match e {
+        Num(v) => Val { op: int_to_string(*v), ty: 1 },
+        Var(name) => {
+            let o = match hashmap_get(oenv, clone(name)) { Some(x) => x, None => string_new() };
+            let t = match hashmap_get(tenv, clone(name)) { Some(x) => x, None => 1 };
+            Val { op: o, ty: t }
+        },
+        Bin(op, a, b) => {
+            let va = lower(&(**a), oenv, tenv, structs, c, buf);
+            let vb = lower(&(**b), oenv, tenv, structs, c, buf);
+            let o = *op;
+            if o == 10 {
+                let r = fresh(c);
+                app(buf, "  "); app(buf, reg(r)); app(buf, " = add i64 "); app(buf, va.op); app(buf, ", "); app(buf, vb.op); app(buf, "\n");
+                Val { op: reg(r), ty: 1 }
+            } else { if o == 11 {
+                let r = fresh(c);
+                app(buf, "  "); app(buf, reg(r)); app(buf, " = mul i64 "); app(buf, va.op); app(buf, ", "); app(buf, vb.op); app(buf, "\n");
+                Val { op: reg(r), ty: 1 }
+            } else {
+                let pred = if o == 20 { "slt" } else { "eq" };
+                let t = fresh(c);
+                app(buf, "  "); app(buf, reg(t)); app(buf, " = icmp "); app(buf, pred); app(buf, " i64 "); app(buf, va.op); app(buf, ", "); app(buf, vb.op); app(buf, "\n");
+                let z = fresh(c);
+                app(buf, "  "); app(buf, reg(z)); app(buf, " = zext i1 "); app(buf, reg(t)); app(buf, " to i64\n");
+                Val { op: reg(z), ty: 2 }
+            } }
+        },
+        If(cc, tt, ee) => {
+            let vc = lower(&(**cc), oenv, tenv, structs, c, buf);
+            let vt = lower(&(**tt), oenv, tenv, structs, c, buf);
+            let ve = lower(&(**ee), oenv, tenv, structs, c, buf);
+            let ci = fresh(c);
+            app(buf, "  "); app(buf, reg(ci)); app(buf, " = icmp ne i64 "); app(buf, vc.op); app(buf, ", 0\n");
+            let r = fresh(c);
+            let lt = ty_llvm(vt.ty, structs);
+            app(buf, "  "); app(buf, reg(r)); app(buf, " = select i1 "); app(buf, reg(ci));
+            app(buf, ", "); app(buf, clone(&lt)); app(buf, " "); app(buf, vt.op);
+            app(buf, ", "); app(buf, lt); app(buf, " "); app(buf, ve.op); app(buf, "\n");
+            Val { op: reg(r), ty: vt.ty }
+        },
+        SLit(si, vals) => {
+            // build the aggregate with a chain of insertvalue over `undef`.
+            let sty = ty_llvm(100 + *si, structs);
+            let nv = vec_len(vals);
+            let mut cur = "undef"; let mut curs = clone(&cur);
+            let mut i = 0;
+            while i < nv {
+                let fv = vec_get(vals, i);
+                let vv = lower(&(*fv), oenv, tenv, structs, c, buf);
+                let r = fresh(c);
+                app(buf, "  "); app(buf, reg(r)); app(buf, " = insertvalue "); app(buf, clone(&sty)); app(buf, " ");
+                app(buf, curs); app(buf, ", i64 "); app(buf, vv.op); app(buf, ", "); app(buf, int_to_string(i)); app(buf, "\n");
+                curs = reg(r);
+                i = i + 1;
+            }
+            Val { op: curs, ty: 100 + *si }
+        },
+        Field(obj, fname) => {
+            let vo = lower(&(**obj), oenv, tenv, structs, c, buf);
+            let fi = field_index(structs, vo.ty - 100, fname);
+            let sty = ty_llvm(vo.ty, structs);
+            let r = fresh(c);
+            app(buf, "  "); app(buf, reg(r)); app(buf, " = extractvalue "); app(buf, sty); app(buf, " ");
+            app(buf, vo.op); app(buf, ", "); app(buf, int_to_string(fi)); app(buf, "\n");
+            Val { op: reg(r), ty: 1 }
+        },
+    }
+}
+
+fn emit_fn(f: &Fn, structs: &Vec<SDef>, buf: &mut String) ! { alloc } {
+    let rty = ty_llvm(f.ret, structs);
+    app(buf, "define "); app(buf, clone(&rty)); app(buf, " @"); app(buf, clone(&f.name)); app(buf, "(");
+    let np = vec_len(&f.params);
+    let mut oenv = hashmap_new();
+    let mut tenv = hashmap_new();
+    let mut i = 0;
+    while i < np {
+        if i > 0 { app(buf, ", "); } else { app(buf, ""); }
+        let p = vec_get(&f.params, i);
+        let pty = ty_llvm(p.ty, structs);
+        let an = arg_name(i);
+        app(buf, clone(&pty)); app(buf, " "); app(buf, clone(&an));
+        hashmap_insert(&mut oenv, clone(&p.name), an);
+        hashmap_insert(&mut tenv, clone(&p.name), p.ty);
+        i = i + 1;
+    }
+    app(buf, ") {\nentry:\n");
+    let mut c = Ctr { n: 0 };
+    let nl = vec_len(&f.body.lets);
+    let mut k = 0;
+    while k < nl {
+        let s = vec_get(&f.body.lets, k);
+        match s { Let(name, e) => {
+            let v = lower(&(*e), &oenv, &tenv, structs, &mut c, buf);
+            hashmap_insert(&mut tenv, clone(&name), v.ty);
+            hashmap_insert(&mut oenv, name, v.op);
+        }, }
+        k = k + 1;
+    }
+    let res = lower(&(*f.body.result), &oenv, &tenv, structs, &mut c, buf);
+    app(buf, "  ret "); app(buf, rty); app(buf, " "); app(buf, res.op); app(buf, "\n}\n");
+}
+fn emit_main(f: &Fn, args: &Vec<i64>, structs: &Vec<SDef>, buf: &mut String) ! { alloc } {
+    let rty = ty_llvm(f.ret, structs);
+    app(buf, "define i64 @main() {\nentry:\n  %r = call "); app(buf, clone(&rty)); app(buf, " @"); app(buf, clone(&f.name)); app(buf, "(");
+    let np = vec_len(&f.params);
+    let mut i = 0;
+    while i < np {
+        if i > 0 { app(buf, ", "); } else { app(buf, ""); }
+        let a = vec_get(args, i);
+        app(buf, "i64 "); app(buf, int_to_string(a));
+        i = i + 1;
+    }
+    app(buf, ")\n");
+    // The exit code must be i64. If f returns a struct, use its field 0.
+    if f.ret >= 100 { app(buf, "  %rx = extractvalue "); app(buf, rty); app(buf, " %r, 0\n  ret i64 %rx\n}\n"); }
+    else { app(buf, "  ret i64 %r\n}\n"); }
+}
+
+fn main() -> i64 ! { io, alloc } {
+    // struct P { x, y } ; f(a,b) builds P { x: a, y: b } and returns p.x + p.y.
+    let demo = "struct P { x: i64, y: i64 } fn f(a: i64, b: i64) -> i64 { let p = P { x: a, y: b } ; p.x + p.y }";
+    let mut src = string_new();
+    if arg_count() > 1 { src = arg_get(1); } else { src = clone(&demo); }
+    let toks = lex(&src);
+    let mut pos = Pos { i: 0 };
+    let structs = parse_structs(&src, &toks, &mut pos);
+    let f = parse_fn(&src, &toks, &mut pos, &structs);
+    if check_fn(&f, &structs) == 0 {
+        let err = "; TYPE ERROR\n"; print_str(&err); 0 - 1
+    } else {
+        let mut out = string_new();
+        emit_fn(&f, &structs, &mut out);
+        let mut args = vec_new();
+        let np = vec_len(&f.params);
+        let mut i = 0;
+        while i < np {
+            let idx = i + 2;
+            let v = if arg_count() > idx { let a = arg_get(idx); match parse_int(&a) { Some(x) => x, None => 0 } } else { if i == 0 { 3 } else { 4 } };
+            vec_push(&mut args, v);
+            i = i + 1;
+        }
+        emit_main(&f, &args, &structs, &mut out);
+        print_str(&out);
+        0
+    }
+}
