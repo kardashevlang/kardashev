@@ -102,11 +102,23 @@ struct CEmitter {
             "println", "int_to_string", "str_eq", "str_substring", "print"};
         return b.count(n) > 0;
     }
+    // v30 Phase 163: scalar-element Vec builtins with a C runtime (int64_t
+    // elements: Vec<i64> / Vec<bool>). Struct/String-element Vecs are refused
+    // for now (a later piece monomorphizes per element type).
+    bool usesVec_ = false;
+    bool sawVecCall_ = false; // set by the pre-scan (exprUsesString walk)
+    static bool isVecBuiltin(const std::string& n) {
+        static const std::set<std::string> b = {
+            "vec_new", "vec_push", "vec_get", "vec_get_ref", "vec_len",
+            "vec_pop", "vec_remove", "vec_insert", "vec_reverse", "vec_swap"};
+        return b.count(n) > 0;
+    }
     // v30 Phase 163: the builtins for which the C backend emits a real runtime.
-    // Currently the String set; Vec/HashMap/HashSet etc. are added as their C
-    // runtimes land. A call to anything not here (and not a user fn) is refused.
+    // Currently the String + scalar-Vec sets; HashMap/HashSet etc. are added as
+    // their C runtimes land. A call to anything not here (and not a user fn) is
+    // refused (Phase 163 part 1).
     static bool isImplementedBuiltin(const std::string& n) {
-        return isStringBuiltin(n);
+        return isStringBuiltin(n) || isVecBuiltin(n);
     }
 
     // v29 Phase 157: the C type of a kardashev TypeRef. Scalars -> int64_t, a
@@ -139,6 +151,19 @@ struct CEmitter {
         if (t.name == "unit") return "int64_t";
         // v30 Phase 162: String -> the C runtime's `struct kdstr`.
         if (t.name == "String") { usesString_ = true; return "struct kdstr"; }
+        // v30 Phase 163: Vec<T> -> the C runtime's `struct kdvec`, but only for a
+        // SCALAR element (i64/bool, both -> int64_t in C). Vec<struct>/Vec<String>
+        // need a per-element-type monomorphized runtime (a later piece) — refuse
+        // them cleanly rather than emit a wrong int64_t-element vec.
+        if (t.name == "Vec") {
+            if (t.typeArgs.size() == 1 && isScalarName(t.typeArgs[0].name)) {
+                usesVec_ = true;
+                return "struct kdvec";
+            }
+            err("Vec with a non-scalar element is outside the C-backend subset "
+                "(Vec<i64>/Vec<bool> only for now)");
+            return "";
+        }
         if (isScalarName(t.name)) return "int64_t";
         if (isStructName(t.name) || isEnumName(t.name)) {
             if (!t.typeArgs.empty()) {
@@ -238,6 +263,10 @@ struct CEmitter {
                 usesString_ = true;
                 return "struct kdstr";
             }
+            // v30 Phase 163: Vec-returning / Vec-element builtins.
+            if (call->callee == "vec_new") { usesVec_ = true; return "struct kdvec"; }
+            if (call->callee == "vec_get_ref") return "int64_t*";
+            // vec_get/pop/remove/len/push/insert/reverse/swap -> int64_t
             return "int64_t"; // a scalar builtin call
         }
         if (auto* iff = dynamic_cast<const IfExpr*>(&e))
@@ -343,6 +372,24 @@ struct CEmitter {
             // v30 Phase 162: a String builtin opts the program into the C
             // String runtime (emitted up front as `kd_<name>` definitions).
             if (isStringBuiltin(call->callee)) usesString_ = true;
+            // v30 Phase 163: a Vec builtin opts into the scalar-Vec runtime. A
+            // vec_push/insert whose pushed element isn't a scalar (int64_t)
+            // means a Vec<struct>/Vec<String> — refuse (no monomorphized runtime
+            // yet) rather than store a struct into an int64_t slot.
+            if (isVecBuiltin(call->callee)) {
+                usesVec_ = true;
+                if ((call->callee == "vec_push" && call->args.size() == 2) ||
+                    (call->callee == "vec_insert" && call->args.size() == 3)) {
+                    const Expr& elem = (call->callee == "vec_push")
+                                           ? *call->args[1]
+                                           : *call->args[2];
+                    if (ctypeOfExpr(elem) != "int64_t") {
+                        err("Vec with a non-scalar element is outside the "
+                            "C-backend subset (Vec<i64>/Vec<bool> only for now)");
+                        return "0";
+                    }
+                }
+            }
             std::string s = "kd_" + call->callee + "(";
             for (std::size_t i = 0; i < call->args.size(); ++i) {
                 if (i) s += ", ";
@@ -665,9 +712,13 @@ struct CEmitter {
         if (!e) return false;
         if (dynamic_cast<const StringLitExpr*>(e)) return true;
         if (auto* c = dynamic_cast<const CallExpr*>(e)) {
-            if (isStringBuiltin(c->callee)) return true;
-            for (auto& a : c->args) if (exprUsesString(a.get())) return true;
-            return false;
+            // v30 Phase 163: piggyback Vec detection on this whole-tree walk;
+            // always recurse args (for the sawVecCall_ side-effect) before
+            // returning the String result.
+            if (isVecBuiltin(c->callee)) sawVecCall_ = true;
+            bool found = isStringBuiltin(c->callee);
+            for (auto& a : c->args) found |= exprUsesString(a.get());
+            return found;
         }
         if (auto* b = dynamic_cast<const BinaryExpr*>(e))
             return exprUsesString(b->lhs.get()) || exprUsesString(b->rhs.get());
@@ -701,18 +752,23 @@ struct CEmitter {
             return false;
         }
         if (auto* blk = dynamic_cast<const BlockExpr*>(e)) {
+            // v30 Phase 163: visit ALL statements (don't short-circuit) so the
+            // sawVecCall_ side-effect is set even when an earlier statement
+            // already used a String; accumulate the String result.
+            bool found = false;
             for (auto& st : blk->stmts) {
                 if (auto* l = dynamic_cast<const LetStmt*>(st.get()))
-                    if (exprUsesString(l->value.get())) return true;
+                    found |= exprUsesString(l->value.get());
                 if (auto* es = dynamic_cast<const ExprStmt*>(st.get()))
-                    if (exprUsesString(es->expr.get())) return true;
+                    found |= exprUsesString(es->expr.get());
                 if (auto* as = dynamic_cast<const AssignStmt*>(st.get()))
-                    if (exprUsesString(as->value.get()) ||
-                        exprUsesString(as->target.get())) return true;
+                    found |= exprUsesString(as->value.get()) ||
+                             exprUsesString(as->target.get());
                 if (auto* rs = dynamic_cast<const ReturnStmt*>(st.get()))
-                    if (exprUsesString(rs->value.get())) return true;
+                    found |= exprUsesString(rs->value.get());
             }
-            return exprUsesString(blk->tail.get());
+            found |= exprUsesString(blk->tail.get());
+            return found;
         }
         return false;
     }
@@ -734,6 +790,23 @@ struct CEmitter {
         // Fall back to a textual probe of the whole program's call names: a
         // program may only touch String via builtins (e.g. print_str(&"x")).
         return programCallsStringBuiltin_;
+    }
+
+    // v30 Phase 163: does any signature / field / const type mention Vec<T>?
+    // (sawVecCall_ separately covers a vec builtin call in a body.)
+    bool programUsesVec(const Program& program) {
+        auto mentions = [](const TypeRef& t) { return t.name == "Vec"; };
+        for (const auto& c : program.consts)
+            if (mentions(c.type)) return true;
+        for (const auto& s : program.structs)
+            for (const auto& f : s.fields)
+                if (mentions(f.type)) return true;
+        for (const auto& fn : program.functions) {
+            if (mentions(fn.returnType)) return true;
+            for (const auto& p : fn.params)
+                if (mentions(p.type)) return true;
+        }
+        return false;
     }
 
     // v30 Phase 162: a faithful C re-implementation of the String runtime the
@@ -798,6 +871,54 @@ struct CEmitter {
         out << "\n";
     }
 
+    // v30 Phase 163: the scalar-element Vec runtime (int64_t elements: Vec<i64>/
+    // Vec<bool>). `struct kdvec { int64_t* data; int64_t len; int64_t cap; }`.
+    // Mirrors the LLVM Vec builtins: vec_new {null,0,0}; push doubles from 4;
+    // get/get_ref/pop/remove bounds-check (OOB read -> 0 / null) like the LLVM
+    // backend; remove/insert memmove the tail; reverse in place; swap by value.
+    void emitVecRuntime() {
+        out << "#include <stdlib.h>\n#include <string.h>\n";
+        out << "struct kdvec { int64_t* data; int64_t len; int64_t cap; };\n";
+        out <<
+"static struct kdvec kd_vec_new(void) { struct kdvec v; v.data=0; v.len=0; v.cap=0; return v; }\n"
+"static int64_t kd_vec_len(struct kdvec* v) { return v->len; }\n"
+"static int64_t kd_vec_push(struct kdvec* v, int64_t x) {\n"
+"  if (v->len == v->cap) { int64_t nc = v->cap ? v->cap*2 : 4;\n"
+"    v->data = (int64_t*)realloc(v->data, (size_t)nc*sizeof(int64_t)); v->cap = nc; }\n"
+"  v->data[v->len++] = x; return 0;\n"
+"}\n"
+"static int64_t kd_vec_get(struct kdvec* v, int64_t i) {\n"
+"  if (i < 0 || i >= v->len || !v->data) return 0; return v->data[i];\n"
+"}\n"
+"static int64_t* kd_vec_get_ref(struct kdvec* v, int64_t i) {\n"
+"  if (i < 0 || i >= v->len || !v->data) return 0; return &v->data[i];\n"
+"}\n"
+"static int64_t kd_vec_pop(struct kdvec* v) {\n"
+"  if (v->len <= 0 || !v->data) return 0; return v->data[--v->len];\n"
+"}\n"
+"static int64_t kd_vec_remove(struct kdvec* v, int64_t i) {\n"
+"  if (i < 0 || i >= v->len || !v->data) return 0; int64_t e = v->data[i];\n"
+"  memmove(&v->data[i], &v->data[i+1], (size_t)(v->len-i-1)*sizeof(int64_t));\n"
+"  v->len--; return e;\n"
+"}\n"
+"static int64_t kd_vec_insert(struct kdvec* v, int64_t i, int64_t x) {\n"
+"  if (i < 0 || i > v->len) return 0;\n"
+"  if (v->len == v->cap) { int64_t nc = v->cap ? v->cap*2 : 4;\n"
+"    v->data = (int64_t*)realloc(v->data, (size_t)nc*sizeof(int64_t)); v->cap = nc; }\n"
+"  memmove(&v->data[i+1], &v->data[i], (size_t)(v->len-i)*sizeof(int64_t));\n"
+"  v->data[i] = x; v->len++; return 0;\n"
+"}\n"
+"static int64_t kd_vec_reverse(struct kdvec* v) {\n"
+"  for (int64_t a=0,b=v->len-1; a<b; a++,b--) { int64_t t=v->data[a]; v->data[a]=v->data[b]; v->data[b]=t; }\n"
+"  return 0;\n"
+"}\n"
+"static int64_t kd_vec_swap(struct kdvec* v, int64_t i, int64_t j) {\n"
+"  if (i<0||j<0||i>=v->len||j>=v->len||!v->data||i==j) return 0;\n"
+"  int64_t t=v->data[i]; v->data[i]=v->data[j]; v->data[j]=t; return 0;\n"
+"}\n";
+        out << "\n";
+    }
+
     void emitProgram(const Program& program) {
         // v29 Phase 157/158: structs + enums are in the subset; traits/impls/
         // extern/mod remain refused (later phases).
@@ -833,6 +954,10 @@ struct CEmitter {
             if (exprUsesString(c.value.get()))
                 programCallsStringBuiltin_ = true;
         if (programUsesString(program)) emitStringRuntime();
+        // v30 Phase 163: the scalar-Vec runtime, gated on a vec builtin call
+        // (sawVecCall_, set during the pre-scan above) or a Vec<T> in a
+        // signature / field / const type.
+        if (sawVecCall_ || programUsesVec(program)) emitVecRuntime();
 
         // Top-level consts (a const may reference an earlier one, so keep order).
         for (const auto& c : program.consts) {
