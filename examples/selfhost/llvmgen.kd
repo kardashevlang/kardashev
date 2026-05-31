@@ -324,10 +324,13 @@ fn emit_main(f: &Fn, args: &Vec<i64>, buf: &mut String) ! { alloc } {
 }
 
 fn main() -> i64 ! { io, alloc } {
-    // A function exercising let, +, *, <, and if/else:
-    //   f(a,b) = { let s = a + b ; if a < b { s * 2 } else { s + 1 } }
-    //   f(3,4): s = 7, a<b true -> s*2 = 14.
-    let src = "fn f(a: i64, b: i64) -> i64 { let s = a + b ; if a < b { s * 2 } else { s + 1 } }";
+    // The function SOURCE comes from argv[1] (so a fuzzer can feed many random
+    // functions); with no args we fall back to a demo exercising let/+/*/</if:
+    //   f(a,b) = { let s = a + b ; if a < b { s * 2 } else { s + 1 } } ; f(3,4)=14.
+    // The call ARGS come from argv[2..] (parsed as i64), defaulting to (3, 4).
+    let demo = "fn f(a: i64, b: i64) -> i64 { let s = a + b ; if a < b { s * 2 } else { s + 1 } }";
+    let mut src = string_new();
+    if arg_count() > 1 { src = arg_get(1); } else { src = clone(&demo); }
     let toks = lex(&src);
     let f = parse_fn(&src, &toks);
     if check_fn(&f) == 0 {
@@ -335,8 +338,19 @@ fn main() -> i64 ! { io, alloc } {
     } else {
         let mut out = string_new();
         emit_fn(&f, &mut out);                 // define i64 @f(...)
-        let mut args = vec_new(); vec_push(&mut args, 3); vec_push(&mut args, 4);
-        emit_main(&f, &args, &mut out);         // define i64 @main() calling f(3,4)
+        let mut args = vec_new();
+        let np = vec_len(&f.params);
+        let mut i = 0;
+        while i < np {
+            let idx = i + 2;
+            let v = if arg_count() > idx {
+                let a = arg_get(idx);
+                match parse_int(&a) { Some(x) => x, None => 0 }
+            } else { if i == 0 { 3 } else { 4 } };
+            vec_push(&mut args, v);
+            i = i + 1;
+        }
+        emit_main(&f, &args, &mut out);         // define i64 @main() calling f(args)
         print_str(&out);                        // stdout IS the .ll module
         0
     }

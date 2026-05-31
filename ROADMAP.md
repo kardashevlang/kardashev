@@ -68,10 +68,13 @@ step past "toy":
   must equal the host compiler's on the same function (pinned by
   `tests/smoke_test_phase115.sh`). This is the step past "toy" — the self-hosted
   compiler produces a real, compilable native artifact.
+- ✅ **Phase 116 (done)** — broaden the differential gate into a **fuzzer**:
+  for many random valid functions (over `+ * < ==` and parenthesized `if/else`)
+  with random args, the self-hosted-emitted LLVM IR (clang → native) must equal
+  the host compiler's result. 75 functions across 3 seeds agree
+  (`tests/smoke_test_phase116.sh`) — the self-hosted codegen matches the host.
 - Extend the source language the in-kardashev compiler accepts past `i64`/`bool`
   — at least **structs and enums** (the shapes the real compiler is built from).
-- Broaden the **differential gate** to a fuzzer over random valid functions
-  (like the existing JIT-vs-AOT differential fuzzers).
 
 ### v21 — prove it, and close the leaks
 

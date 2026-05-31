@@ -1024,6 +1024,17 @@ sh_test(
     ],
 )
 
+# v20 Phase 116: a DIFFERENTIAL FUZZER over the self-hosted codegen — random
+# functions, self-hosted-emitted LLVM IR (clang->native) must equal the host.
+sh_test(
+    name = "smoke_test_phase116",
+    srcs = ["smoke_test_phase116.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:llvmgen.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
