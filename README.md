@@ -429,6 +429,17 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   again. Using a moved field *without* re-initializing it is still rejected
 >   (the double-free guard stays intact). Pinned by a borrow-check case (50
 >   total) + verified heap-clean under `MALLOC_CHECK_=3`.
+>
+> - **Phase 109 — a unit-returning async fn no longer crashes the compiler
+>   (done).** Found by the v17 adversarial review: an `async fn f(..) ! { .. } {
+>   stmt; }` (no `-> T`) SIGTRAP'd the compiler when its future was consumed —
+>   `block_on`, `.await`, and `spawn`+`join` all read the `Poll<T>` value slot as
+>   `T`, and for the unit result `T` maps to LLVM `void`, so a `load void` (and a
+>   named `void` call) emitted invalid IR that crashed the in-process JIT. Fixed
+>   in codegen: a void result yields the unit placeholder (`i64 0`) without a
+>   load, and the `block_on` call is left unnamed. All three drivers now compile
+>   **and** run (JIT + AOT). Pinned by `tests/smoke_test_unitasync.sh`. A
+>   production compiler must never crash on valid input.
 
 ## Roadmap v17 — shipped
 

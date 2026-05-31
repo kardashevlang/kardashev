@@ -5370,6 +5370,16 @@ private:
         auto* typeTag = llvm::ConstantInt::get(i64Ty, std::hash<std::string>{}(mangleType(T)));
         auto* h = b.CreateCall(execPushFn_, {pollPtr, framePtr, slot, typeTag}, "handle");
         b.CreateCall(execDriveFn_, {h});
+        (void)i8PtrTy;
+        // v18 Phase 109: a UNIT-result future (`async fn f(..) ! { .. } { .. }`
+        // with no `-> T`) maps T to void. There is no value to read or return —
+        // loading/returning a void would emit invalid IR (the LLVM verifier
+        // traps). Just reap and `ret void`.
+        if (valTy->isVoidTy()) {
+            if (execReapFn_) b.CreateCall(execReapFn_, {});
+            b.CreateRetVoid();
+            return fn;
+        }
         // result = Poll<T>.value from the task's slot — read it BEFORE reaping
         // (the reap may free the slot). `val` is a value copy; any heap it owns
         // (e.g. a returned String's buffer) lives outside the frame/slot.
@@ -5379,7 +5389,6 @@ private:
         // other now-done tasks) when the executor is idle — constant memory
         // across a block_on loop. Safe: only acts when nothing is live.
         if (execReapFn_) b.CreateCall(execReapFn_, {});
-        (void)i8PtrTy;
         b.CreateRet(val);
         return fn;
     }
@@ -8094,9 +8103,15 @@ private:
         // makes the free a safe no-op). Closes the awaited-frame leak.
         builder_->SetInsertPoint(readyBB);
         builder_->CreateCall(freeFn_, {subFrame});
-        auto* valP = builder_->CreateStructGEP(subPollTy, pollSlot, 1, "val_ptr");
         (void)i8PtrTy;
-        (void)i64Ty;
+        // v18 Phase 109: a UNIT-result sub-future has a void value type — there
+        // is nothing to load (a `load void` traps the verifier). The frame is
+        // freed above; yield the unit placeholder (i64 0, the codebase's
+        // unit-as-zero convention, matching finishAsyncReady).
+        if (subValTy->isVoidTy()) {
+            return llvm::ConstantInt::get(i64Ty, 0);
+        }
+        auto* valP = builder_->CreateStructGEP(subPollTy, pollSlot, 1, "val_ptr");
         return builder_->CreateLoad(subValTy, valP, "await_result");
     }
 
@@ -10469,7 +10484,11 @@ private:
                 std::vector<llvm::Value*> args;
                 args.reserve(call.args.size());
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
-                return builder_->CreateCall(fn, args, "call_block_on");
+                // v18 Phase 109: a unit-result `block_on` returns void — a named
+                // call on a void value is invalid IR.
+                return builder_->CreateCall(
+                    fn, args,
+                    fn->getReturnType()->isVoidTy() ? "" : "call_block_on");
             }
             // Phase 18: `spawn<T>(Future<T>) -> i64` and `join<T>(i64) -> T`
             // — generic executor built-ins with no AST body; synthesize per T.
