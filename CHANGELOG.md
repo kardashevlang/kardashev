@@ -18,6 +18,49 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.27.0] — Roadmap v27 "strings, text & formatting" (Phases 147–151)
+
+Theme: make text a first-class, correct part of the language — a real `char`
+type, UTF-8 correctness, and a `format!` story with `Display`/`Debug`.
+
+### Added
+- **A real `char` type** (Phase 147) — a Unicode scalar, distinct from the
+  integer tower (lowers to an i32 codepoint). Char literals `'a'` with escapes
+  (`\n \t \r \\ \' \0` and `\u{HEX}`); equality/ordering (no arithmetic); `char
+  as <int>` / `<int> as char` casts; char literal patterns in `match`; and real
+  UTF-8 char↔string bridges (`char_to_string`, `char_from_u32` validating to
+  U+FFFD, `str_push_char`, `print_char`). A Copy scalar.
+- **UTF-8 correctness** (Phase 148) — char-aware operations over a String's
+  bytes: `str_char_width_at`, `str_decode_char_at`, `str_char_count` (chars vs
+  `str_len`'s bytes), `string_chars` (`-> Vec<char>`), `str_is_valid_utf8`.
+- **`format!` / `print!` / `println!`** (Phase 149) — built-in formatting forms
+  (there is no general macro system yet), recognized in the parser and
+  desugared to string-building over `Display::to_string`. `{}` Display holes,
+  `{{`/`}}` literal braces, compile-time placeholder/argument-count checking.
+- **The `Debug` trait + `{:?}`** (Phase 150) — `fmt_debug(&self) -> String`,
+  distinct from Display (a String is quoted + escaped, a char single-quoted).
+  Built-in impls for the scalars + String; `#[derive(Debug)]` for structs
+  (`Name { f: <dbg>, … }`) and enums (`Variant(<dbg>, …)`), recursing.
+- **char classification + string encode helpers** (Phase 151) —
+  `char_is_digit`/`_alpha`/`_alnum`/`_whitespace`, `char_to_upper`/`_to_lower`
+  (ASCII), and `str_join` / `str_replace` / `str_lines`.
+
+### Fixed
+- The literal-discriminated decision-tree matcher + the codegen literal compare
+  only handled `Int` columns — extended to `Char` (a char `match` was collapsing
+  to the first arm + segfaulting at AOT). The borrow checker's param-type
+  reconstruction now knows `char` is a Copy scalar.
+
+### Deferred (documented follow-ons)
+- A distinct borrowed `&str` type (folded into the UTF-8 work; `&String` serves
+  the borrowed-string role today).
+- Grapheme-cluster segmentation (UAX #29) and full Unicode case folding — both
+  need the Unicode character database; scalar-level iteration + ASCII case
+  mapping are what's provided.
+- `{:width}` / alignment / precision format specs (only `{}` and `{:?}` today).
+
+715 unit cases (6 suites) + the full smoke sweep green, JIT and AOT.
+
 ## [0.26.0] — Roadmap v26 "patterns, types & borrow-check completeness" (Phases 141–146)
 
 Theme: close the long-standing gaps in pattern matching, the type surface, the

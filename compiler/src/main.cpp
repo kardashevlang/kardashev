@@ -187,7 +187,49 @@ std::string applyPrelude(const std::string& userSrc) {
             " { clone(self) } }\n"
             "impl Display for bool"
             " { fn to_string(&self) -> String"
-            " { if *self { \"true\" } else { \"false\" } } }\n";
+            " { if *self { \"true\" } else { \"false\" } } }\n"
+            // v27 Phase 149/150: char + f64 Display so `format!`/`{}` cover the
+            // remaining scalar types.
+            "impl Display for char"
+            " { fn to_string(&self) -> String ! { alloc }"
+            " { char_to_string(*self) } }\n"
+            "impl Display for f64"
+            " { fn to_string(&self) -> String ! { alloc }"
+            " { f64_to_string(*self) } }\n";
+    }
+    // v27 Phase 150: the `Debug` trait — `fmt_debug(&self) -> String` — the
+    // developer-facing representation behind `{:?}`. Distinct from Display: a
+    // String is QUOTED (and escaped), a char is single-quoted. Built-in impls
+    // for the scalars + String; `#[derive(Debug)]` synthesizes one for a
+    // struct/enum (see expandDerives).
+    if (userSrc.find("trait Debug") == std::string::npos) {
+        prelude +=
+            "trait Debug { fn fmt_debug(&self) -> String ! { alloc }; }\n"
+            "impl Debug for i64"
+            " { fn fmt_debug(&self) -> String ! { alloc }"
+            " { int_to_string(*self) } }\n"
+            "impl Debug for f64"
+            " { fn fmt_debug(&self) -> String ! { alloc }"
+            " { f64_to_string(*self) } }\n"
+            "impl Debug for bool"
+            " { fn fmt_debug(&self) -> String"
+            " { if *self { \"true\" } else { \"false\" } } }\n"
+            "impl Debug for char"
+            " { fn fmt_debug(&self) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    str_push_byte(&mut out, 39);\n"
+            "    str_push_char(&mut out, *self);\n"
+            "    str_push_byte(&mut out, 39);\n"
+            "    out\n"
+            "} }\n"
+            "impl Debug for String"
+            " { fn fmt_debug(&self) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    str_push_byte(&mut out, 34);\n"
+            "    string_push_str(&mut out, str_escape(self));\n"
+            "    str_push_byte(&mut out, 34);\n"
+            "    out\n"
+            "} }\n";
     }
     // Phase 41: the `Clone` trait — `clone(&self) -> Self` — a DEEP copy that
     // dispatches through each element's own impl. Built-in impls for scalars +
@@ -851,6 +893,236 @@ std::string applyPrelude(const std::string& userSrc) {
             "    out\n"
             "}\n";
     }
+    // v27 Phase 147: char <-> string bridges, written in kardashev over the
+    // `str_push_byte` builtin and the new `char as i64` / `i64 as char` casts.
+    // `str_push_char` UTF-8-ENCODES the scalar (1–4 bytes, the real codec);
+    // `char_to_string` builds a one-char String; `char_from_u32` is the
+    // VALIDATING constructor (out-of-range / surrogate -> U+FFFD replacement);
+    // `print_char` writes a char with no trailing newline.
+    if (userSrc.find("fn str_push_char") == std::string::npos) {
+        prelude +=
+            "fn str_push_char(s: &mut String, c: char) -> i64 ! { alloc } {\n"
+            "    let cp = c as i64;\n"
+            "    if cp < 128 {\n"
+            "        str_push_byte(s, cp)\n"
+            "    } else if cp < 2048 {\n"
+            "        str_push_byte(s, 192 | (cp >> 6));\n"
+            "        str_push_byte(s, 128 | (cp & 63))\n"
+            "    } else if cp < 65536 {\n"
+            "        str_push_byte(s, 224 | (cp >> 12));\n"
+            "        str_push_byte(s, 128 | ((cp >> 6) & 63));\n"
+            "        str_push_byte(s, 128 | (cp & 63))\n"
+            "    } else {\n"
+            "        str_push_byte(s, 240 | (cp >> 18));\n"
+            "        str_push_byte(s, 128 | ((cp >> 12) & 63));\n"
+            "        str_push_byte(s, 128 | ((cp >> 6) & 63));\n"
+            "        str_push_byte(s, 128 | (cp & 63))\n"
+            "    }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn char_to_string") == std::string::npos) {
+        prelude +=
+            "fn char_to_string(c: char) -> String ! { alloc } {\n"
+            "    let mut s = string_new();\n"
+            "    str_push_char(&mut s, c);\n"
+            "    s\n"
+            "}\n";
+    }
+    if (userSrc.find("fn char_from_u32") == std::string::npos) {
+        prelude +=
+            "fn char_from_u32(n: i64) -> char {\n"
+            "    if n < 0 { '\\u{FFFD}' }\n"
+            "    else if n > 1114111 { '\\u{FFFD}' }\n"
+            "    else if n >= 55296 {\n"
+            "        if n <= 57343 { '\\u{FFFD}' } else { n as char }\n"
+            "    } else { n as char }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn print_char") == std::string::npos) {
+        prelude +=
+            "fn print_char(c: char) -> i64 ! { io, alloc } {\n"
+            "    let s = char_to_string(c);\n"
+            "    print_no_nl(&s)\n"
+            "}\n";
+    }
+    // v27 Phase 148: UTF-8 correctness — decode/iterate a String's bytes as
+    // Unicode chars. `str_char_width_at` is the byte width (1-4) of the char
+    // whose lead byte is at byte index i; `str_decode_char_at` DECODES that
+    // char; `str_char_count` counts chars (vs `str_len`'s BYTES); `string_chars`
+    // collects all chars into a `Vec<char>`; `str_is_valid_utf8` structurally
+    // validates the byte sequence. All written over the byte builtin
+    // `str_char_at` + `char_from_u32`. (Byte indexing stays `str_char_at` /
+    // `str_len`; these add the char-aware layer.)
+    if (userSrc.find("fn str_char_width_at") == std::string::npos) {
+        prelude +=
+            "fn str_char_width_at(s: &String, i: i64) -> i64 {\n"
+            "    let b = str_char_at(s, i);\n"
+            "    if b < 128 { 1 } else if b < 192 { 1 }\n"
+            "    else if b < 224 { 2 } else if b < 240 { 3 } else { 4 }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_decode_char_at") == std::string::npos) {
+        prelude +=
+            "fn str_decode_char_at(s: &String, i: i64) -> char {\n"
+            "    let b0 = str_char_at(s, i);\n"
+            "    if b0 < 128 { char_from_u32(b0) }\n"
+            "    else if b0 < 224 {\n"
+            "        let b1 = str_char_at(s, i + 1);\n"
+            "        char_from_u32(((b0 & 31) << 6) | (b1 & 63))\n"
+            "    } else if b0 < 240 {\n"
+            "        let b1 = str_char_at(s, i + 1);\n"
+            "        let b2 = str_char_at(s, i + 2);\n"
+            "        char_from_u32(((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63))\n"
+            "    } else {\n"
+            "        let b1 = str_char_at(s, i + 1);\n"
+            "        let b2 = str_char_at(s, i + 2);\n"
+            "        let b3 = str_char_at(s, i + 3);\n"
+            "        char_from_u32(((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63))\n"
+            "    }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_char_count") == std::string::npos) {
+        prelude +=
+            "fn str_char_count(s: &String) -> i64 {\n"
+            "    let n = str_len(s);\n"
+            "    let mut i = 0;\n"
+            "    let mut count = 0;\n"
+            "    while i < n {\n"
+            "        i = i + str_char_width_at(s, i);\n"
+            "        count = count + 1;\n"
+            "    }\n"
+            "    count\n"
+            "}\n";
+    }
+    if (userSrc.find("fn string_chars") == std::string::npos) {
+        prelude +=
+            "fn string_chars(s: &String) -> Vec<char> ! { alloc } {\n"
+            "    let n = str_len(s);\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < n {\n"
+            "        let w = str_char_width_at(s, i);\n"
+            "        vec_push(&mut out, str_decode_char_at(s, i));\n"
+            "        i = i + w;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_is_valid_utf8") == std::string::npos) {
+        prelude +=
+            "fn str_is_valid_utf8(s: &String) -> bool {\n"
+            "    let n = str_len(s);\n"
+            "    let mut i = 0;\n"
+            "    let mut ok = true;\n"
+            "    while i < n {\n"
+            "        let b0 = str_char_at(s, i);\n"
+            "        let w = if b0 < 128 { 1 } else if b0 < 192 { 0 }\n"
+            "                else if b0 < 224 { 2 } else if b0 < 240 { 3 }\n"
+            "                else if b0 < 248 { 4 } else { 0 };\n"
+            "        if w == 0 { ok = false; i = n; }\n"
+            "        else if i + w > n { ok = false; i = n; }\n"
+            "        else {\n"
+            "            let mut k = 1;\n"
+            "            while k < w {\n"
+            "                let bc = str_char_at(s, i + k);\n"
+            "                if bc < 128 { ok = false; }\n"
+            "                else if bc >= 192 { ok = false; } else {}\n"
+            "                k = k + 1;\n"
+            "            }\n"
+            "            i = i + w;\n"
+            "        }\n"
+            "    }\n"
+            "    ok\n"
+            "}\n";
+    }
+    // v27 Phase 151: char classification + string encode helpers. The char
+    // predicates / case mappings are ASCII-correct (full Unicode case folding +
+    // the property tables are a documented future item, gated on shipping the
+    // Unicode character database). str_join / str_replace / str_lines round out
+    // the text-building vocabulary over the existing byte ops.
+    if (userSrc.find("fn char_is_digit") == std::string::npos) {
+        prelude +=
+            "fn char_is_digit(c: char) -> bool { let n = c as i64; n >= 48 && n <= 57 }\n";
+    }
+    if (userSrc.find("fn char_is_alpha") == std::string::npos) {
+        prelude +=
+            "fn char_is_alpha(c: char) -> bool {\n"
+            "    let n = c as i64;\n"
+            "    (n >= 65 && n <= 90) || (n >= 97 && n <= 122)\n"
+            "}\n";
+    }
+    if (userSrc.find("fn char_is_alnum") == std::string::npos) {
+        prelude +=
+            "fn char_is_alnum(c: char) -> bool { char_is_alpha(c) || char_is_digit(c) }\n";
+    }
+    if (userSrc.find("fn char_is_whitespace") == std::string::npos) {
+        prelude +=
+            "fn char_is_whitespace(c: char) -> bool {\n"
+            "    let n = c as i64;\n"
+            "    n == 32 || n == 9 || n == 10 || n == 13\n"
+            "}\n";
+    }
+    if (userSrc.find("fn char_to_upper") == std::string::npos) {
+        prelude +=
+            "fn char_to_upper(c: char) -> char {\n"
+            "    let n = c as i64;\n"
+            "    if n >= 97 { if n <= 122 { char_from_u32(n - 32) } else { c } } else { c }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn char_to_lower") == std::string::npos) {
+        prelude +=
+            "fn char_to_lower(c: char) -> char {\n"
+            "    let n = c as i64;\n"
+            "    if n >= 65 { if n <= 90 { char_from_u32(n + 32) } else { c } } else { c }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_join") == std::string::npos) {
+        prelude +=
+            "fn str_join(parts: &Vec<String>, sep: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let n = vec_len(parts);\n"
+            "    let mut i = 0;\n"
+            "    while i < n {\n"
+            "        if i > 0 { string_push_str(&mut out, clone(sep)); } else {}\n"
+            "        string_push_str(&mut out, vec_get(parts, i));\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_replace") == std::string::npos) {
+        prelude +=
+            "fn str_replace(s: &String, from: &String, to: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let sl = str_len(s);\n"
+            "    let fl = str_len(from);\n"
+            "    let mut i = 0;\n"
+            "    while i < sl {\n"
+            "        let mut matched = fl > 0;\n"
+            "        if i + fl > sl { matched = false; } else {\n"
+            "            let mut k = 0;\n"
+            "            while k < fl {\n"
+            "                if matched {\n"
+            "                    if str_char_at(s, i + k) != str_char_at(from, k) { matched = false; } else {}\n"
+            "                } else {}\n"
+            "                k = k + 1;\n"
+            "            }\n"
+            "        }\n"
+            "        if matched {\n"
+            "            string_push_str(&mut out, clone(to));\n"
+            "            i = i + fl;\n"
+            "        } else {\n"
+            "            str_push_byte(&mut out, str_char_at(s, i));\n"
+            "            i = i + 1;\n"
+            "        }\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_lines") == std::string::npos) {
+        prelude +=
+            "fn str_lines(s: &String) -> Vec<String> ! { alloc } { str_split(s, 10) }\n";
+    }
     if (userSrc.find("fn option_unwrap_or") == std::string::npos) {
         prelude +=
             "fn option_unwrap_or(o: Option<i64>, default: i64) -> i64 {\n"
@@ -1100,6 +1372,21 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
                            s.fields[i].name + ".to_string());";
                 }
                 out += " string_push_str(&mut out, \" }\"); out } }\n";
+            } else if (d == "Debug") {
+                // v27 Phase 150: `Name { field: <field debug>, ... }`, mirroring
+                // the Display derive but routing each field through Debug.
+                out += "impl" + header(s.genericParams, "Debug") +
+                       " Debug for " + TN +
+                       " { fn fmt_debug(&self) -> String ! { alloc } { let mut "
+                       "out = \"" + s.name + " { \";";
+                for (std::size_t i = 0; i < s.fields.size(); ++i) {
+                    if (i)
+                        out += " string_push_str(&mut out, \", \");";
+                    out += " string_push_str(&mut out, \"" + s.fields[i].name +
+                           ": \"); string_push_str(&mut out, self." +
+                           s.fields[i].name + ".fmt_debug());";
+                }
+                out += " string_push_str(&mut out, \" }\"); out } }\n";
             } else if (d == "Hash") {
                 // Phase 48: combine field hashes left-to-right (h = h*31 + fi).
                 out += "impl" + header(s.genericParams, "Hash") + " Hash for " +
@@ -1220,6 +1507,36 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
                                 out += " string_push_str(&mut out, \", \");";
                             out += " string_push_str(&mut out, x" +
                                    std::to_string(i) + ".to_string());";
+                        }
+                        out += " string_push_str(&mut out, \")\"); out },";
+                    }
+                }
+                out += " } } }\n";
+            } else if (d == "Debug") {
+                // v27 Phase 150: enum Debug — `Variant` / `Variant(<payload
+                // debug>, ...)`, mirroring the Display derive via fmt_debug.
+                out += "impl" + header(e.genericParams, "Debug") +
+                       " Debug for " + TN +
+                       " { fn fmt_debug(&self) -> String ! { alloc } { match "
+                       "self {";
+                for (const auto& var : e.variants) {
+                    out += " " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("x" + std::to_string(i));
+                        out += ")";
+                    }
+                    if (var.payloadTypes.empty()) {
+                        out += " => \"" + var.name + "\",";
+                    } else {
+                        out += " => { let mut out = \"" + var.name + "(\";";
+                        for (std::size_t i = 0; i < var.payloadTypes.size();
+                             ++i) {
+                            if (i)
+                                out += " string_push_str(&mut out, \", \");";
+                            out += " string_push_str(&mut out, x" +
+                                   std::to_string(i) + ".fmt_debug());";
                         }
                         out += " string_push_str(&mut out, \")\"); out },";
                     }

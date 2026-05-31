@@ -72,6 +72,7 @@ bool isCopyType(const TypePtr& t) {
     case TypeKind::Int:
     case TypeKind::Float: // Phase 39: f64 is a Copy scalar
     case TypeKind::Bool:
+    case TypeKind::Char:  // v27 Phase 147: a char is a Copy i32 scalar
     case TypeKind::Unit:
         return true;
     case TypeKind::Ref:
@@ -229,6 +230,7 @@ private:
         }
         if (tr.name == "i64") return makeInt();
         if (tr.name == "bool") return makeBool();
+        if (tr.name == "char") return makeChar(); // v27 Phase 147: Copy scalar
         auto t = std::make_shared<Type>();
         t->kind = TypeKind::Struct;
         t->structName = tr.name;

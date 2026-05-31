@@ -165,6 +165,7 @@ private:
     std::map<std::size_t, std::string> docAt_;
     std::string pendingDeclDoc_;
     int structPatCounter_ = 0; // v26 Phase 142: fresh `__sp` names
+    int fmtCounter_ = 0;       // v27 Phase 149: fresh `__fmt` names
     std::string takeDocAt(std::size_t p) {
         auto it = docAt_.find(p);
         if (it == docAt_.end()) return "";
@@ -665,6 +666,154 @@ private:
         }
         expect(TokenKind::Semi, "; after `use` import");
         return u;
+    }
+
+    // v27 Phase 149: desugar `format!("...{}...", a, b)` / `print!` / `println!`
+    // to string-building. The first argument MUST be a string literal so the
+    // format string is split at compile time into literal segments + `{}`
+    // holes; `{{`/`}}` are escaped literal braces. Each `{}` hole pairs with the
+    // next argument via `arg.to_string()` (the `Display` trait). `{:?}` (Debug)
+    // arrives in Phase 150. The whole thing lowers to:
+    //   { let mut __fmtN = string_new();
+    //     string_push_str(&mut __fmtN, "<seg>"); string_push_str(&mut __fmtN, (a).to_string());
+    //     ... <tail> }
+    // where the tail is `__fmtN` for `format!`, `println(&__fmtN)` for
+    // `println!`, and `print_no_nl(&__fmtN)` for `print!`.
+    ast::ExprPtr parseFormatMacro(const Token& nameTok) {
+        consume(); // `!`
+        expect(TokenKind::LParen, "(");
+        if (!check(TokenKind::StringLit)) {
+            errorAt("the first argument to `" + nameTok.lexeme +
+                        "!` must be a string literal",
+                    nameTok.line, nameTok.column);
+            while (!check(TokenKind::RParen) && !check(TokenKind::EndOfInput))
+                advance();
+            accept(TokenKind::RParen);
+            auto e = std::make_unique<ast::StringLitExpr>();
+            e->line = nameTok.line;
+            e->column = nameTok.column;
+            return e;
+        }
+        Token fmtTok = consume();
+        const std::string& fmt = fmtTok.lexeme;
+        std::vector<ast::ExprPtr> args;
+        while (accept(TokenKind::Comma)) {
+            if (check(TokenKind::RParen)) break; // trailing comma
+            bool prev = restrictStructLit_;
+            restrictStructLit_ = false;
+            args.push_back(parseExpr());
+            restrictStructLit_ = prev;
+        }
+        expect(TokenKind::RParen, ")");
+
+        // Split into literal segments separated by holes. A `{}` hole formats
+        // via Display (`to_string`); a `{:?}` hole via Debug (`fmt_debug`).
+        std::vector<std::string> segs;
+        segs.push_back("");
+        std::vector<bool> holeDebug; // per hole: true = `{:?}` (Debug)
+        std::size_t holeCount = 0;
+        for (std::size_t i = 0; i < fmt.size(); ++i) {
+            char c = fmt[i];
+            if (c == '{') {
+                if (i + 1 < fmt.size() && fmt[i + 1] == '{') {
+                    segs.back().push_back('{');
+                    ++i;
+                } else if (i + 1 < fmt.size() && fmt[i + 1] == '}') {
+                    ++i;
+                    ++holeCount;
+                    holeDebug.push_back(false);
+                    segs.push_back("");
+                } else if (i + 3 < fmt.size() && fmt[i + 1] == ':' &&
+                           fmt[i + 2] == '?' && fmt[i + 3] == '}') {
+                    // `{:?}` — Debug.
+                    i += 3;
+                    ++holeCount;
+                    holeDebug.push_back(true);
+                    segs.push_back("");
+                } else {
+                    errorAt("unsupported format placeholder (only `{}` and "
+                            "`{:?}` are supported)",
+                            fmtTok.line, fmtTok.column);
+                }
+            } else if (c == '}') {
+                if (i + 1 < fmt.size() && fmt[i + 1] == '}') {
+                    segs.back().push_back('}');
+                    ++i;
+                } else {
+                    errorAt("unmatched `}` in format string (use `}}` for a "
+                            "literal brace)",
+                            fmtTok.line, fmtTok.column);
+                }
+            } else {
+                segs.back().push_back(c);
+            }
+        }
+        if (holeCount != args.size()) {
+            errorAt("`" + nameTok.lexeme + "!` has " +
+                        std::to_string(holeCount) + " placeholder(s) but " +
+                        std::to_string(args.size()) + " argument(s)",
+                    nameTok.line, nameTok.column);
+        }
+
+        auto block = std::make_unique<ast::BlockExpr>();
+        block->line = nameTok.line;
+        block->column = nameTok.column;
+        const std::string tmp = "__fmt" + std::to_string(fmtCounter_++);
+        {
+            auto let = std::make_unique<ast::LetStmt>();
+            let->name = tmp;
+            let->isMut = true;
+            auto call = std::make_unique<ast::CallExpr>();
+            call->callee = "string_new";
+            let->value = std::move(call);
+            block->stmts.push_back(std::move(let));
+        }
+        auto pushSlot = [&](ast::ExprPtr valueExpr) {
+            auto call = std::make_unique<ast::CallExpr>();
+            call->callee = "string_push_str";
+            auto ref = std::make_unique<ast::RefExpr>();
+            ref->isMut = true;
+            auto id = std::make_unique<ast::IdentExpr>();
+            id->name = tmp;
+            ref->operand = std::move(id);
+            call->args.push_back(std::move(ref));
+            call->args.push_back(std::move(valueExpr));
+            auto es = std::make_unique<ast::ExprStmt>();
+            es->expr = std::move(call);
+            block->stmts.push_back(std::move(es));
+        };
+        for (std::size_t i = 0; i < segs.size(); ++i) {
+            if (!segs[i].empty()) {
+                auto lit = std::make_unique<ast::StringLitExpr>();
+                lit->value = segs[i];
+                pushSlot(std::move(lit));
+            }
+            if (i < args.size()) {
+                auto mc = std::make_unique<ast::MethodCallExpr>();
+                mc->methodName =
+                    (i < holeDebug.size() && holeDebug[i]) ? "fmt_debug"
+                                                           : "to_string";
+                mc->receiver = std::move(args[i]);
+                pushSlot(std::move(mc));
+            }
+        }
+        if (nameTok.lexeme == "format") {
+            auto id = std::make_unique<ast::IdentExpr>();
+            id->name = tmp;
+            block->tail = std::move(id);
+        } else {
+            auto call = std::make_unique<ast::CallExpr>();
+            call->callee =
+                (nameTok.lexeme == "println") ? "println" : "print_no_nl";
+            auto ref = std::make_unique<ast::RefExpr>();
+            ref->isMut = false;
+            auto id = std::make_unique<ast::IdentExpr>();
+            id->name = tmp;
+            ref->operand = std::move(id);
+            call->args.push_back(std::move(ref));
+            block->tail = std::move(call);
+        }
+        return block;
     }
 
     ast::TypeRef parseTypeRef() {
@@ -2013,6 +2162,18 @@ private:
             return e;
         }
 
+        // v27 Phase 147: char literal `'c'`. The lexer already decoded the
+        // scalar to a codepoint stored as a decimal string in the lexeme.
+        if (t.kind == TokenKind::CharLit) {
+            Token tok = consume();
+            auto e = std::make_unique<ast::CharLitExpr>();
+            e->line = tok.line;
+            e->column = tok.column;
+            e->codepoint =
+                static_cast<std::uint32_t>(std::stoul(tok.lexeme));
+            return e;
+        }
+
         // Phase 15: boolean literals `true` / `false`.
         if (t.kind == TokenKind::KwTrue || t.kind == TokenKind::KwFalse) {
             Token tok = consume();
@@ -2030,6 +2191,17 @@ private:
             // CallExpr so the typechecker can enforce `pub` against
             // path-qualified references.
             Token first = consume();
+            // v27 Phase 149: the built-in formatting "macros" `format!(...)`,
+            // `print!(...)`, `println!(...)`. There is no general macro system
+            // yet (that's a later roadmap), so these are recognized here and
+            // desugared to string-building over `string_new`/`string_push_str`
+            // and `Display::to_string`. Detected as `ident ! (` with one of the
+            // three names.
+            if (check(TokenKind::Bang) && peek(1).kind == TokenKind::LParen &&
+                (first.lexeme == "format" || first.lexeme == "print" ||
+                 first.lexeme == "println")) {
+                return parseFormatMacro(first);
+            }
             Token tok = first;
             Token prevSeg = first; // Phase 48: the segment just before `tok`
             bool wasPath = false;
@@ -2608,6 +2780,15 @@ private:
             p->line = tok.line;
             p->column = tok.column;
             p->value = parseIntLitLexeme(tok, nullptr, nullptr);
+            return p;
+        }
+        // v27 Phase 147: a char-literal pattern `'a'`.
+        if (t.kind == TokenKind::CharLit) {
+            Token tok = consume();
+            auto p = std::make_unique<ast::LitCharPat>();
+            p->line = tok.line;
+            p->column = tok.column;
+            p->codepoint = static_cast<std::uint32_t>(std::stoul(tok.lexeme));
             return p;
         }
         if (t.kind == TokenKind::Underscore) {

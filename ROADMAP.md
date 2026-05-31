@@ -130,7 +130,8 @@ captures (a true runtime `FnOnce` needs a closure-env drop vtable).*
   two-phase borrows, implicit reborrows — and **module visibility** scoping
   (`pub(crate)`/`pub(super)`) + re-exports (`pub use`).
 
-### v27 — strings, text & formatting (lock-in early)
+### v27 — strings, text & formatting (lock-in early) — *done (v0.27.0)*
+*Shipped: 147 a real `char` type (Unicode scalar) + UTF-8 char<->string bridges; 148 UTF-8 correctness (char iteration/indexing/validation); 149 `format!`/`print!`/`println!` (parser-desugared, no macro system yet); 150 the `Debug` trait + `{:?}` + `#[derive(Debug)]`; 151 char classification + string encode helpers (str_join/replace/lines). Documented follow-ons: a distinct borrowed `&str` type (folded into 148; `&String` serves the role today), grapheme-cluster segmentation (UAX #29) + full Unicode case folding (need the Unicode character database), `{:width}`/alignment format specs.*
 *(Survey + critic: "no `char` type; strings are byte arrays, no UTF-8 codec";
 "no `format!`".)*
 - **147** a real **`char`** type (Unicode scalar) + a `String` / `&str` split.
