@@ -152,6 +152,15 @@ struct OrPat : Pattern {
     std::vector<PatternPtr> alternatives;
 };
 
+// v26 Phase 143: a slice pattern `[a, b, _, ..]`. Each element binds a name (or
+// `_` to skip); `hasRest` is a trailing `..` (prefix match, length >= N). The
+// parser desugars a slice-pattern match into a length-checked if/else chain, so
+// this node never reaches the typechecker.
+struct SlicePat : Pattern {
+    std::vector<std::string> elements; // "_" = wildcard
+    bool hasRest = false;
+};
+
 // --- Expressions ---
 
 // Forward decl: TypeRef is defined in the "Top-level" section below, but

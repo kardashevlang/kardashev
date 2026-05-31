@@ -314,6 +314,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v26 Phase 143: slice patterns ([a, b, ..]) in match arms.
+sh_test(
+    name = "smoke_test_phase143",
+    srcs = ["smoke_test_phase143.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v26 Phase 144: type aliases (type Name = Target).
 sh_test(
     name = "smoke_test_phase144",

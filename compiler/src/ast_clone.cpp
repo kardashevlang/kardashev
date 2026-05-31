@@ -45,6 +45,11 @@ PatternPtr clonePattern(const Pattern& p) {
         for (const auto& alt : o->alternatives)
             n->alternatives.push_back(clonePatOpt(alt));
         out = std::move(n);
+    } else if (auto* sp = dynamic_cast<const SlicePat*>(&p)) {
+        auto n = std::make_unique<SlicePat>();
+        n->elements = sp->elements;
+        n->hasRest = sp->hasRest;
+        out = std::move(n);
     }
     if (out) {
         out->line = p.line;

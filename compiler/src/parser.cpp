@@ -2246,7 +2246,112 @@ private:
             }
         }
         me->arms = std::move(expanded);
+        // v26 Phase 143: a match with any slice-pattern arm desugars to a
+        // length-checked if/else chain.
+        for (auto& arm : me->arms) {
+            if (dynamic_cast<ast::SlicePat*>(arm.pattern.get()))
+                return desugarSliceMatch(std::move(me));
+        }
         return me;
+    }
+
+    // v26 Phase 143: lower `match s { [a,b] => e1, [x] => e2, _ => e3 }` to
+    //   { let __sl = s; if slice_len(__sl)==2 { let a=slice_get(__sl,0); … e1 }
+    //     else if slice_len(__sl)==1 { … e2 } else e3 }
+    // `[a, ..]` uses `>=` (prefix). The last arm must be a non-slice catch-all.
+    ast::ExprPtr desugarSliceMatch(std::unique_ptr<ast::MatchExpr> me) {
+        std::size_t ln = me->line, cn = me->column;
+        if (me->arms.empty() ||
+            dynamic_cast<ast::SlicePat*>(me->arms.back().pattern.get())) {
+            errorHere("a slice-pattern match needs a non-slice catch-all as its "
+                      "last arm");
+            return std::move(me->scrutinee);
+        }
+        const std::string sl = "__sl" + std::to_string(structPatCounter_++);
+        auto mkId = [&](const std::string& n) {
+            auto e = std::make_unique<ast::IdentExpr>();
+            e->name = n;
+            e->line = ln;
+            e->column = cn;
+            return e;
+        };
+        auto mkInt = [&](long long v) {
+            auto e = std::make_unique<ast::IntLitExpr>();
+            e->value = v;
+            e->line = ln;
+            e->column = cn;
+            return e;
+        };
+        auto mkCall = [&](const char* callee, ast::ExprPtr a0,
+                          ast::ExprPtr a1) {
+            auto c = std::make_unique<ast::CallExpr>();
+            c->callee = callee;
+            c->line = ln;
+            c->column = cn;
+            c->args.push_back(std::move(a0));
+            if (a1) c->args.push_back(std::move(a1));
+            return c;
+        };
+        ast::ExprPtr chain;
+        for (int i = (int)me->arms.size() - 1; i >= 0; --i) {
+            auto& arm = me->arms[i];
+            auto* sp = dynamic_cast<ast::SlicePat*>(arm.pattern.get());
+            if (!sp) {
+                auto blk = std::make_unique<ast::BlockExpr>();
+                blk->line = arm.line;
+                blk->column = arm.column;
+                if (auto* vp = dynamic_cast<ast::VarPat*>(arm.pattern.get())) {
+                    if (vp->name != "_") {
+                        auto let = std::make_unique<ast::LetStmt>();
+                        let->name = vp->name;
+                        let->line = arm.line;
+                        let->column = arm.column;
+                        let->value = mkId(sl);
+                        blk->stmts.push_back(std::move(let));
+                    }
+                }
+                blk->tail = std::move(arm.body);
+                chain = std::move(blk);
+                continue;
+            }
+            auto thenBlk = std::make_unique<ast::BlockExpr>();
+            thenBlk->line = arm.line;
+            thenBlk->column = arm.column;
+            for (std::size_t j = 0; j < sp->elements.size(); ++j) {
+                if (sp->elements[j] == "_") continue;
+                auto let = std::make_unique<ast::LetStmt>();
+                let->name = sp->elements[j];
+                let->line = arm.line;
+                let->column = arm.column;
+                let->value = mkCall("slice_get", mkId(sl), mkInt((long long)j));
+                thenBlk->stmts.push_back(std::move(let));
+            }
+            thenBlk->tail = std::move(arm.body);
+            auto cmp = std::make_unique<ast::BinaryExpr>();
+            cmp->line = arm.line;
+            cmp->column = arm.column;
+            cmp->op = sp->hasRest ? ast::BinOp::Ge : ast::BinOp::Eq;
+            cmp->lhs = mkCall("slice_len", mkId(sl), nullptr);
+            cmp->rhs = mkInt((long long)sp->elements.size());
+            auto iff = std::make_unique<ast::IfExpr>();
+            iff->line = arm.line;
+            iff->column = arm.column;
+            iff->cond = std::move(cmp);
+            iff->thenBranch = std::move(thenBlk);
+            iff->elseBranch = std::move(chain);
+            chain = std::move(iff);
+        }
+        auto outer = std::make_unique<ast::BlockExpr>();
+        outer->line = ln;
+        outer->column = cn;
+        auto letS = std::make_unique<ast::LetStmt>();
+        letS->name = sl;
+        letS->line = ln;
+        letS->column = cn;
+        letS->value = std::move(me->scrutinee);
+        outer->stmts.push_back(std::move(letS));
+        outer->tail = std::move(chain);
+        return outer;
     }
 
     // v26 Phase 142: a struct pattern `P { f1, f2: b, _, .. }` as a match arm,
@@ -2310,7 +2415,44 @@ private:
         return arm;
     }
 
+    // v26 Phase 143: a slice pattern `[a, b, _, ..]` as a match arm.
+    ast::PatternPtr parseSlicePat() {
+        Token lb = expect(TokenKind::LBracket, "[");
+        auto sp = std::make_unique<ast::SlicePat>();
+        sp->line = lb.line;
+        sp->column = lb.column;
+        while (!check(TokenKind::RBracket) && !check(TokenKind::EndOfInput)) {
+            if (check(TokenKind::DotDot)) {
+                consume();
+                sp->hasRest = true;
+                break;
+            }
+            if (check(TokenKind::Underscore)) {
+                consume();
+                sp->elements.push_back("_");
+            } else {
+                sp->elements.push_back(
+                    expect(TokenKind::Identifier, "a binding").lexeme);
+            }
+            if (!accept(TokenKind::Comma)) break;
+        }
+        expect(TokenKind::RBracket, "]");
+        return sp;
+    }
+
     ast::MatchArm parseMatchArm() {
+        // v26 Phase 143: `[ … ]` in pattern position is a slice pattern.
+        if (check(TokenKind::LBracket)) {
+            auto sp = parseSlicePat();
+            std::size_t l = sp->line, c = sp->column;
+            expect(TokenKind::FatArrow, "=>");
+            ast::MatchArm arm;
+            arm.line = l;
+            arm.column = c;
+            arm.pattern = std::move(sp);
+            arm.body = parseExpr();
+            return arm;
+        }
         // v26 Phase 142: `P { … }` in pattern position is a struct pattern.
         if (check(TokenKind::Identifier) && peek(1).kind == TokenKind::LBrace) {
             return parseStructPatternArm();
