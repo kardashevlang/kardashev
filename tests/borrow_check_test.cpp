@@ -679,6 +679,22 @@ void test_single_field_move_ok() {
              "single_field_move_ok");
 }
 
+// Phase 108: ASSIGNING to a moved-out field RE-INITIALIZES it — the field (and
+// the struct) are usable again afterwards. (codegen drops the old value
+// flag-guarded, so a moved-out field is not double-freed.)
+void test_field_reinit_after_move_ok() {
+    expectOk("struct Inner { x: i64 }\n"
+             "struct S { a: Inner, b: Inner }\n"
+             "fn take(i: Inner) -> i64 { i.x }\n"
+             "fn main() -> i64 {\n"
+             "    let mut s = S { a: Inner { x: 1 }, b: Inner { x: 2 } };\n"
+             "    let p = take(s.a);\n"        // move s.a out
+             "    s.a = Inner { x: 9 };\n"      // re-initialize s.a
+             "    p + take(s.a)\n"              // s.a usable again
+             "}",
+             "field_reinit_after_move_ok");
+}
+
 } // namespace
 
 int main() {
@@ -736,12 +752,14 @@ int main() {
     test_field_move_then_whole_move_errors();
     test_two_distinct_field_moves_ok();
     test_single_field_move_ok();
-    std::cout << "All borrow_check tests passed (49 cases) — Phase 2.4c "
+    test_field_reinit_after_move_ok();
+    std::cout << "All borrow_check tests passed (50 cases) — Phase 2.4c "
                  "NLL + mutable references; Phase 9 loops; Phase 13a "
                  "method-receiver autoref; Phase 15 inherent &mut self + "
                  "unary operands; Phase 16 Drop-typed move tracking; "
                  "Phase 17a fn-value calls + FnMut captures; Phase 106 "
                  "field-level partial-move tracking (same-field-twice + "
-                 "partial-then-whole rejected, distinct fields ok)\n";
+                 "partial-then-whole rejected, distinct fields ok); Phase 108 "
+                 "field re-init after move ok\n";
     return 0;
 }

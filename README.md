@@ -413,6 +413,23 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
 
+## Roadmap v18 — in progress
+
+> **Status: in progress** on `feat/roadmap-v18`. "Hardening II" — close the
+> concrete gaps that dogfooding the self-hosted compiler (v15–v17) exposed, and
+> deepen the test surface. Each phase a real, tested fix.
+>
+> - **Phase 108 — re-initializing a moved-out field is legal (done).** v17's
+>   field-level move tracking (Phase 106) conservatively rejected `s.a = new`
+>   after `s.a` was moved out — but re-initializing a moved field is sound (Rust
+>   allows it; codegen's flag-guarded field drop already handles it). The borrow
+>   checker now clears that field from the root's moved set on a `root.field = v`
+>   assignment (after the RHS is consumed, so `s.a = f(s.a)` still flags the
+>   RHS's use of the moved field), so the field — and the struct — are usable
+>   again. Using a moved field *without* re-initializing it is still rejected
+>   (the double-free guard stays intact). Pinned by a borrow-check case (50
+>   total) + verified heap-clean under `MALLOC_CHECK_=3`.
+
 ## Roadmap v17 — shipped
 
 > **Status: shipped** (`0.17.0`). "Self-hosting, continued" — unify v15's

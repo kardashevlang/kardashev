@@ -1137,6 +1137,23 @@ private:
                                                  // fields owned again
                     }
                 } else {
+                    // v18 Phase 108: a field-assignment target `root.field = v`
+                    // RE-INITIALIZES that field — legal even if it was previously
+                    // moved out (codegen's emitAssign drops the old value
+                    // guarded by the field flag, so a moved-out field isn't
+                    // double-freed). Clear it from the root's moved set BEFORE
+                    // reading the place, so it is no longer "moved" (allows the
+                    // write and unblocks later uses of the field). Done after the
+                    // RHS was consumed above, so `s.a = f(s.a)` still flags the
+                    // RHS's use of the moved field.
+                    if (auto* fe = dynamic_cast<const ast::FieldExpr*>(
+                            as->target.get())) {
+                        if (auto* rid = dynamic_cast<const ast::IdentExpr*>(
+                                fe->object.get())) {
+                            if (Binding* rb = lookupBinding(rid->name))
+                                rb->movedFields.erase(fe->fieldName);
+                        }
+                    }
                     // Review fix (Phase 61): the LHS of `a[i] = x` / `t.0 = x`
                     // is a WRITE place, not a move — consume it as a PLACE so
                     // the non-Copy index move-out check doesn't fire on the
