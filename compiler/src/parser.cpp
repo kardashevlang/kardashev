@@ -2,6 +2,7 @@
 
 #include "kardashev/lexer.hpp"
 
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -11,12 +12,32 @@ namespace {
 
 class Parser {
 public:
-    explicit Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {}
+    // v24 Phase 134: filter `///` DocComment tokens out of the stream (so the
+    // rest of the parser is untouched) into `docAt_`, keyed by the index of the
+    // token that immediately follows the doc run. Decl parsers query it.
+    explicit Parser(std::vector<Token> tokens) {
+        std::string pending;
+        for (auto& t : tokens) {
+            if (t.kind == TokenKind::DocComment) {
+                if (!pending.empty()) pending += "\n";
+                pending += t.lexeme;
+            } else {
+                if (!pending.empty()) {
+                    docAt_[tokens_.size()] = std::move(pending);
+                    pending.clear();
+                }
+                tokens_.push_back(std::move(t));
+            }
+        }
+    }
 
     ParseResult parseProgram() {
         ast::Program prog;
         while (!check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
+            // v24 Phase 134: grab the doc comment attached to this decl's first
+            // token; the decl parser (fn/struct/enum) consumes pendingDeclDoc_.
+            pendingDeclDoc_ = takeDocAt(pos_);
             // Phase 42: `#[derive(...)]` attributes precede a struct/enum; the
             // parsed list is stashed and consumed by the next struct/enum decl.
             if (check(TokenKind::Pound)) parseAttributes();
@@ -109,6 +130,17 @@ public:
 private:
     std::vector<Token> tokens_;
     std::size_t pos_ = 0;
+    // v24 Phase 134: doc comments, keyed by following-token index; and the doc
+    // for the declaration currently being parsed (consumed by the decl parser).
+    std::map<std::size_t, std::string> docAt_;
+    std::string pendingDeclDoc_;
+    std::string takeDocAt(std::size_t p) {
+        auto it = docAt_.find(p);
+        if (it == docAt_.end()) return "";
+        std::string d = std::move(it->second);
+        docAt_.erase(it);
+        return d;
+    }
     std::vector<ParseError> errors_;
     bool restrictStructLit_ = false;
     // Phase 24: set by parseOptionalEffectRow when a `! { ... }` row was
@@ -349,6 +381,7 @@ private:
         }
         Token fnTok = expect(TokenKind::KwFn, "fn");
         ast::FnDecl decl;
+        decl.doc = pendingDeclDoc_; // v24 Phase 134
         decl.isAsync = isAsync;
         decl.line = fnTok.line;
         decl.column = fnTok.column;
@@ -458,6 +491,7 @@ private:
     ast::StructDecl parseStructDecl() {
         Token structTok = expect(TokenKind::KwStruct, "struct");
         ast::StructDecl decl;
+        decl.doc = pendingDeclDoc_; // v24 Phase 134
         decl.line = structTok.line;
         decl.column = structTok.column;
 
@@ -482,6 +516,7 @@ private:
     ast::EnumDecl parseEnumDecl() {
         Token enumTok = expect(TokenKind::KwEnum, "enum");
         ast::EnumDecl decl;
+        decl.doc = pendingDeclDoc_; // v24 Phase 134
         decl.line = enumTok.line;
         decl.column = enumTok.column;
 

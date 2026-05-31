@@ -266,6 +266,17 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v24 Phase 134: /// doc comments — formatter round-trip + LSP hover surface.
+sh_test(
+    name = "smoke_test_phase134",
+    srcs = ["smoke_test_phase134.sh"],
+    data = [
+        "//compiler:kard-lsp",
+        "//compiler:kardc",
+        "//compiler:kardfmt",
+    ],
+)
+
 # v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
 # crashed the compiler (void load/return); now compiles + runs.
 sh_test(
