@@ -110,9 +110,15 @@ coherence, associated consts — all "not implemented / monomorphic-only MVP".)*
 - **140** unify the **standard-trait vocabulary** — `From`/`Into`/`Deref`/
   `Index`/`Iterator`-as-a-trait, consistently derivable and overridable.
 
-### v26 — patterns, types & borrow-check completeness
+### v26 — patterns, types & borrow-check completeness — *done (v0.26.0)*
 *(Survey: pattern gaps, type aliases, generic enum payloads, `Fn`/`FnMut`/
 `FnOnce`, module visibility, `&mut` reborrow / two-phase / NLL completeness.)*
+*Shipped: 141 guards + or-patterns; 142 struct/tuple patterns; 143 slice
+patterns + `&mut [T]`; 144 type aliases; 145 the `Fn`/`FnMut`/`FnOnce` hierarchy
++ capture classification; 146 two-phase borrows + `pub(crate)`/`pub(super)`/
+`pub(self)` + `use`/`pub use`. Documented follow-ons: full NLL region inference,
+implicit `&T`-field reborrows, cross-crate visibility, owned by-move closure
+captures (a true runtime `FnOnce` needs a closure-env drop vtable).*
 - **141** match **guards** (`x if c =>`) + **or-patterns** (`A | B =>`).
 - **142** **struct / tuple patterns** in `match` and fn params; nested
   destructuring (today tuple-in-match is unsupported).

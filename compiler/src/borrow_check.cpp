@@ -27,6 +27,19 @@ struct Binding {
     bool isMutRef = false;
     int sharedLoans = 0;
     bool mutLoanActive = false;
+    // Phase 146 (two-phase borrows): when a `&mut place` is taken directly as a
+    // call ARGUMENT, the borrow is "reserved" — it does not activate (become
+    // exclusive) until the call itself runs, after every argument is evaluated.
+    // `mutLoanTwoPhase` marks the active mut loan as such a reservation, and
+    // `mutLoanDepth` records the call-argument nesting depth it was reserved at.
+    // A shared `&place` taken at a STRICTLY DEEPER depth (i.e. nested inside
+    // computing a sibling argument's value, like `v.len()` in `v.push(v.len())`)
+    // does not conflict with it — the shared borrow produces a value and ends
+    // before the reserved `&mut` activates. A shared borrow at the SAME depth (a
+    // direct sibling argument reference, `f(&mut v, &v)`) would alias into the
+    // callee and is still rejected.
+    bool mutLoanTwoPhase = false;
+    int mutLoanDepth = 0;
     std::size_t moveLine = 0;
     std::size_t moveCol = 0;
     // v17 Phase 106: names of this binding's fields that have been moved out BY
@@ -129,6 +142,10 @@ private:
     // Active loans tracked as a flat list; we expire them lazily by
     // checking expirePos at each tick.
     std::vector<Loan> activeLoans_;
+    // Phase 146: call-argument nesting depth. Incremented around each call /
+    // method-call / call-value argument list. A `&mut` taken while this is > 0
+    // is a two-phase reserved borrow (see Binding::mutLoanTwoPhase).
+    int callArgDepth_ = 0;
     // Scope stack: each entry maps a name to its current declPos. On
     // scope exit we pop; loans hang on to their declPos independently.
     std::vector<std::unordered_map<std::string, int>> scopes_;
@@ -450,6 +467,7 @@ private:
         bindings_.clear();
         activeLoans_.clear();
         pos_ = 0;
+        callArgDepth_ = 0; // Phase 146: two-phase reservation depth
         scopes_.push_back({});
         // Pass 1: pre-walk params + body to fill lastUsePos for every
         // binding (params + lets + pattern names).
@@ -643,12 +661,14 @@ private:
                             consume(*ce->operand, expectExpire));
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            ++callArgDepth_; // Phase 146: two-phase reservation scope
             for (std::size_t i = 0; i < call->args.size(); ++i) {
                 lastInSubtree = std::max(
                     lastInSubtree,
                     consumeArg(*call->args[i], expectExpire,
                                calleeParamType(call->callee, i)));
             }
+            --callArgDepth_;
             return lastInSubtree;
         }
         if (auto* cv = dynamic_cast<const ast::CallValueExpr*>(&e)) {
@@ -662,6 +682,7 @@ private:
             lastInSubtree = std::max(lastInSubtree,
                                        consumePlace(*cv->callee, expectExpire));
             TypePtr fnTy = typeOf(*cv->callee);
+            ++callArgDepth_; // Phase 146: two-phase reservation scope
             for (std::size_t i = 0; i < cv->args.size(); ++i) {
                 TypePtr pt = nullptr;
                 if (fnTy) {
@@ -672,6 +693,7 @@ private:
                 lastInSubtree = std::max(
                     lastInSubtree, consumeArg(*cv->args[i], expectExpire, pt));
             }
+            --callArgDepth_;
             return lastInSubtree;
         }
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
@@ -680,6 +702,7 @@ private:
             // The resolved impl-method schema gives the (non-self) param types,
             // so a `&mut` method arg reborrows mutably (rejecting aliasing).
             TypePtr msig = methodSigOf(*mc);
+            ++callArgDepth_; // Phase 146: two-phase reservation scope
             for (std::size_t i = 0; i < mc->args.size(); ++i) {
                 TypePtr pt = nullptr;
                 if (msig) {
@@ -692,6 +715,7 @@ private:
                 lastInSubtree = std::max(
                     lastInSubtree, consumeArg(*mc->args[i], expectExpire, pt));
             }
+            --callArgDepth_;
             return lastInSubtree;
         }
         if (auto* bn = dynamic_cast<const ast::BoxNewExpr*>(&e)) {
@@ -1000,9 +1024,14 @@ private:
                       id.line, id.column);
             } else {
                 b->mutLoanActive = true;
+                // Phase 146: a `&mut self` method receiver is a two-phase
+                // reservation w.r.t. its own arguments — `v.push(v.len())`
+                // reads `&v` (deeper) while `&mut v` is merely reserved.
+                b->mutLoanTwoPhase = true;
+                b->mutLoanDepth = callArgDepth_;
             }
         } else {
-            if (b->mutLoanActive) {
+            if (b->mutLoanActive && !sharedAllowedUnderReservedMut(b)) {
                 error("cannot borrow `" + id.name +
                           "` immutably while a mutable borrow is active",
                       id.line, id.column);
@@ -1226,9 +1255,15 @@ private:
                       re.line, re.column);
             } else {
                 b->mutLoanActive = true;
+                // Phase 146: a `&mut` taken in call-argument position reserves
+                // (two-phase); it activates at the call, after sibling args.
+                if (callArgDepth_ > 0) {
+                    b->mutLoanTwoPhase = true;
+                    b->mutLoanDepth = callArgDepth_;
+                }
             }
         } else {
-            if (b->mutLoanActive) {
+            if (b->mutLoanActive && !sharedAllowedUnderReservedMut(b)) {
                 error("cannot borrow `" + id->name +
                           "` immutably while a mutable borrow is active",
                       re.line, re.column);
@@ -1347,9 +1382,23 @@ private:
         Binding& b = bIt->second;
         if (l.isMut) {
             b.mutLoanActive = false;
+            b.mutLoanTwoPhase = false; // Phase 146: clear the reservation
+            b.mutLoanDepth = 0;
         } else if (b.sharedLoans > 0) {
             --b.sharedLoans;
         }
+    }
+
+    // Phase 146: may a shared `&b` be taken even though a mutable loan of `b` is
+    // active? Yes iff that mut loan is a two-phase reservation (a `&mut` taken in
+    // an enclosing call's argument position) AND this shared borrow is nested
+    // STRICTLY DEEPER than the reservation — i.e. it is computing the value of a
+    // sibling argument (`v.len()` in `v.push(v.len())`) and ends before the
+    // reserved `&mut` activates. A same-depth shared sibling (`f(&mut v, &v)`)
+    // would alias into the callee and is NOT allowed.
+    bool sharedAllowedUnderReservedMut(const Binding* b) const {
+        return b->mutLoanActive && b->mutLoanTwoPhase &&
+               callArgDepth_ > b->mutLoanDepth;
     }
 
     void consumeIdent(const ast::IdentExpr& id) {

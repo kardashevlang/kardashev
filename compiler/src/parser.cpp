@@ -1,5 +1,6 @@
 #include "kardashev/parser.hpp"
 
+#include "kardashev/ast_clone.hpp"
 #include "kardashev/lexer.hpp"
 
 #include <map>
@@ -67,6 +68,23 @@ public:
                 } else {
                     prog.consts.push_back(parseConstDecl());
                 }
+            } else if (check(TokenKind::Identifier) &&
+                       peek().lexeme == "use") {
+                // v26 Phase 146: a top-level import `use a::b::c;` /
+                // `use a::b as d;` (the `pub use` re-export is handled in the
+                // KwPub branch below).
+                prog.uses.push_back(parseUseDecl());
+            } else if (check(TokenKind::Identifier) &&
+                       peek().lexeme == "type") {
+                // v26 Phase 144: a top-level type alias `type Name = Target;`.
+                consume(); // `type`
+                Token aliasName = expect(TokenKind::Identifier,
+                                         "type alias name after `type`");
+                expect(TokenKind::Eq, "=");
+                ast::TypeRef target = parseTypeRef();
+                expect(TokenKind::Semi, ";");
+                prog.typeAliases.emplace_back(aliasName.lexeme,
+                                              std::move(target));
             } else if (check(TokenKind::KwPub)) {
                 // Phase 7.3b: `pub` sticks to fn decls and is enforced on
                 // path-qualified call sites. Bare-name calls keep working
@@ -77,43 +95,55 @@ public:
                 // the report). Bare-name type references still resolve under
                 // flat-merge, matching the fn behavior.
                 advance();
+                // v26 Phase 146: an optional visibility restriction
+                // `pub(crate)` / `pub(super)` / `pub(self)` / `pub(in path)`.
+                // `pub(self)` is private (Rust semantics); the rest are
+                // path-reachable in this crate. See parsePubRestriction.
+                bool pubReach = parsePubRestriction();
                 if (check(TokenKind::KwFn) ||
                     (peek().kind == TokenKind::Identifier &&
                      peek().lexeme == "async" &&
                      peek(1).kind == TokenKind::KwFn)) {
                     auto fn = parseFnDecl();
-                    fn.isPub = true;
+                    fn.isPub = pubReach;
                     prog.functions.push_back(std::move(fn));
                 } else if (check(TokenKind::KwStruct)) {
                     auto s = parseStructDecl();
-                    s.isPub = true;
+                    s.isPub = pubReach;
                     prog.structs.push_back(std::move(s));
                 } else if (check(TokenKind::KwEnum)) {
                     auto en = parseEnumDecl();
-                    en.isPub = true;
+                    en.isPub = pubReach;
                     prog.enums.push_back(std::move(en));
                 } else if (check(TokenKind::KwTrait)) {
                     auto tr = parseTraitDecl();
-                    tr.isPub = true;
+                    tr.isPub = pubReach;
                     prog.traits.push_back(std::move(tr));
                 } else if (check(TokenKind::KwImpl)) {
                     auto im = parseImplDecl();
-                    im.isPub = true;
+                    im.isPub = pubReach;
                     prog.impls.push_back(std::move(im));
                 } else if (check(TokenKind::KwConst)) {
                     // Phase 25: `pub const fn` / `pub const NAME ...`.
                     if (peek(1).kind == TokenKind::KwFn) {
                         auto fn = parseConstFnDecl();
-                        fn.isPub = true;
+                        fn.isPub = pubReach;
                         prog.functions.push_back(std::move(fn));
                     } else {
                         auto c = parseConstDecl();
-                        c.isPub = true;
+                        c.isPub = pubReach;
                         prog.consts.push_back(std::move(c));
                     }
+                } else if (check(TokenKind::Identifier) &&
+                           peek().lexeme == "use") {
+                    // v26 Phase 146: `pub use path;` — a re-export. Parsed and
+                    // recorded (with isReexport); see parseUseDecl.
+                    auto u = parseUseDecl();
+                    u.isReexport = true;
+                    prog.uses.push_back(std::move(u));
                 } else {
                     errorHere("`pub` must precede fn / struct / enum / "
-                              "trait / impl / const");
+                              "trait / impl / const / use");
                     advance();
                 }
             } else {
@@ -134,6 +164,7 @@ private:
     // for the declaration currently being parsed (consumed by the decl parser).
     std::map<std::size_t, std::string> docAt_;
     std::string pendingDeclDoc_;
+    int structPatCounter_ = 0; // v26 Phase 142: fresh `__sp` names
     std::string takeDocAt(std::size_t p) {
         auto it = docAt_.find(p);
         if (it == docAt_.end()) return "";
@@ -584,6 +615,58 @@ private:
         return inner;
     }
 
+    // v26 Phase 146: parse an optional visibility restriction after `pub` —
+    // `pub(crate)` / `pub(super)` / `pub(self)` / `pub(in a::b)`. Returns
+    // whether the item is reachable via path-qualified syntax in THIS crate:
+    // `pub`, `pub(crate)`, `pub(super)` and `pub(in ...)` are reachable;
+    // `pub(self)` is equivalent to private (Rust semantics) and is not. The
+    // crate/super/in distinctions collapse to "reachable within the crate"
+    // under the single-crate flat-merge model — the cross-crate boundary they
+    // gate doesn't exist yet — but the syntax is fully parsed and validated.
+    bool parsePubRestriction() {
+        if (!check(TokenKind::LParen)) return true; // bare `pub`
+        consume(); // (
+        bool reachable = true;
+        if (check(TokenKind::Identifier) && peek().lexeme == "self") {
+            consume();
+            reachable = false; // pub(self) == private
+        } else if (check(TokenKind::Identifier) &&
+                   (peek().lexeme == "crate" || peek().lexeme == "super")) {
+            consume();
+        } else if (check(TokenKind::Identifier) && peek().lexeme == "in") {
+            consume(); // in
+            expect(TokenKind::Identifier, "module path after `pub(in`");
+            while (accept(TokenKind::DoubleColon))
+                expect(TokenKind::Identifier, "path segment after `::`");
+        } else {
+            errorHere("expected `crate`, `super`, `self`, or `in <path>` "
+                      "inside `pub(...)`");
+        }
+        expect(TokenKind::RParen, ")");
+        return reachable;
+    }
+
+    // v26 Phase 146: parse a `use a::b::c;` import or `use a::b as d;` alias.
+    // The leading `use` (an identifier, not a keyword) is consumed here.
+    ast::UseDecl parseUseDecl() {
+        Token useTok = consume(); // `use`
+        ast::UseDecl u;
+        u.line = useTok.line;
+        u.column = useTok.column;
+        u.path.push_back(
+            expect(TokenKind::Identifier, "path segment after `use`").lexeme);
+        while (accept(TokenKind::DoubleColon))
+            u.path.push_back(
+                expect(TokenKind::Identifier, "path segment after `::`").lexeme);
+        // `as` is the cast keyword (KwAs), reused here for the rename clause.
+        if (accept(TokenKind::KwAs)) {
+            u.alias =
+                expect(TokenKind::Identifier, "alias name after `as`").lexeme;
+        }
+        expect(TokenKind::Semi, "; after `use` import");
+        return u;
+    }
+
     ast::TypeRef parseTypeRef() {
         // Reference prefix: `&` or `&mut` wraps the rest of the type.
         // Phase 2.4b: shared `&T`. Phase 2.4c: `&mut T`. Currently we
@@ -712,6 +795,50 @@ private:
             expect(TokenKind::RParen, ")");
             expect(TokenKind::Arrow, "->");
             tr.fnRet = std::make_shared<ast::TypeRef>(parseTypeRef());
+            ast::EffectRow row = parseOptionalEffectRow();
+            tr.fnEffects = std::move(row.labels);
+            return tr;
+        }
+        // Phase 145: a closure-trait bound in type position — `Fn(A) -> R`,
+        // `FnMut(A) -> R`, `FnOnce(A) -> R`. Parsed exactly like the bare
+        // `fn(..)` form above (same fields, same fat-pointer ABI) but tagged
+        // with the required kind rank in `closureBound`. Only fires when the
+        // identifier is immediately followed by `(` so a plain type named `Fn`
+        // (unlikely, but harmless) still parses as a nominal type.
+        if (check(TokenKind::Identifier) &&
+            (peek().lexeme == "Fn" || peek().lexeme == "FnMut" ||
+             peek().lexeme == "FnOnce") &&
+            peek(1).kind == TokenKind::LParen) {
+            Token kindTok = consume();
+            ast::TypeRef tr;
+            tr.isFn = true;
+            tr.closureBound = kindTok.lexeme == "Fn"     ? 0
+                              : kindTok.lexeme == "FnMut" ? 1
+                                                          : 2;
+            tr.isRef = isRef;
+            tr.refIsMut = refIsMut;
+            tr.line = isRef ? ampTok.line : kindTok.line;
+            tr.column = isRef ? ampTok.column : kindTok.column;
+            expect(TokenKind::LParen, "(");
+            if (!check(TokenKind::RParen)) {
+                while (true) {
+                    tr.fnParams.push_back(parseTypeRef());
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::RParen)) break; // trailing comma
+                }
+            }
+            expect(TokenKind::RParen, ")");
+            // The return type is optional: `Fn(A)` (no `-> R`) means `-> ()`,
+            // matching how a unit-returning callable reads.
+            if (accept(TokenKind::Arrow)) {
+                tr.fnRet = std::make_shared<ast::TypeRef>(parseTypeRef());
+            } else {
+                ast::TypeRef unitRet;
+                unitRet.name = "unit";
+                unitRet.line = kindTok.line;
+                unitRet.column = kindTok.column;
+                tr.fnRet = std::make_shared<ast::TypeRef>(std::move(unitRet));
+            }
             ast::EffectRow row = parseOptionalEffectRow();
             tr.fnEffects = std::move(row.labels);
             return tr;
@@ -2211,13 +2338,258 @@ private:
         }
         restrictStructLit_ = prevArm;
         expect(TokenKind::RBrace, "}");
+        // v26 Phase 141: split each or-pattern arm `p1 | p2 => e` into one arm
+        // per alternative (`p1 => e, p2 => e`), deep-cloning the body so the
+        // match compiler / typechecker only ever see single-pattern arms.
+        std::vector<ast::MatchArm> expanded;
+        for (auto& arm : me->arms) {
+            auto* orp = dynamic_cast<ast::OrPat*>(arm.pattern.get());
+            if (!orp) {
+                expanded.push_back(std::move(arm));
+                continue;
+            }
+            for (std::size_t i = 0; i < orp->alternatives.size(); ++i) {
+                ast::MatchArm a;
+                a.line = arm.line;
+                a.column = arm.column;
+                a.pattern = std::move(orp->alternatives[i]);
+                a.body = (i + 1 == orp->alternatives.size())
+                             ? std::move(arm.body)
+                             : ast::cloneExpr(*arm.body);
+                expanded.push_back(std::move(a));
+            }
+        }
+        me->arms = std::move(expanded);
+        // v26 Phase 143: a match with any slice-pattern arm desugars to a
+        // length-checked if/else chain.
+        for (auto& arm : me->arms) {
+            if (dynamic_cast<ast::SlicePat*>(arm.pattern.get()))
+                return desugarSliceMatch(std::move(me));
+        }
         return me;
     }
 
+    // v26 Phase 143: lower `match s { [a,b] => e1, [x] => e2, _ => e3 }` to
+    //   { let __sl = s; if slice_len(__sl)==2 { let a=slice_get(__sl,0); … e1 }
+    //     else if slice_len(__sl)==1 { … e2 } else e3 }
+    // `[a, ..]` uses `>=` (prefix). The last arm must be a non-slice catch-all.
+    ast::ExprPtr desugarSliceMatch(std::unique_ptr<ast::MatchExpr> me) {
+        std::size_t ln = me->line, cn = me->column;
+        if (me->arms.empty() ||
+            dynamic_cast<ast::SlicePat*>(me->arms.back().pattern.get())) {
+            errorHere("a slice-pattern match needs a non-slice catch-all as its "
+                      "last arm");
+            return std::move(me->scrutinee);
+        }
+        const std::string sl = "__sl" + std::to_string(structPatCounter_++);
+        auto mkId = [&](const std::string& n) {
+            auto e = std::make_unique<ast::IdentExpr>();
+            e->name = n;
+            e->line = ln;
+            e->column = cn;
+            return e;
+        };
+        auto mkInt = [&](long long v) {
+            auto e = std::make_unique<ast::IntLitExpr>();
+            e->value = v;
+            e->line = ln;
+            e->column = cn;
+            return e;
+        };
+        auto mkCall = [&](const char* callee, ast::ExprPtr a0,
+                          ast::ExprPtr a1) {
+            auto c = std::make_unique<ast::CallExpr>();
+            c->callee = callee;
+            c->line = ln;
+            c->column = cn;
+            c->args.push_back(std::move(a0));
+            if (a1) c->args.push_back(std::move(a1));
+            return c;
+        };
+        ast::ExprPtr chain;
+        for (int i = (int)me->arms.size() - 1; i >= 0; --i) {
+            auto& arm = me->arms[i];
+            auto* sp = dynamic_cast<ast::SlicePat*>(arm.pattern.get());
+            if (!sp) {
+                auto blk = std::make_unique<ast::BlockExpr>();
+                blk->line = arm.line;
+                blk->column = arm.column;
+                if (auto* vp = dynamic_cast<ast::VarPat*>(arm.pattern.get())) {
+                    if (vp->name != "_") {
+                        auto let = std::make_unique<ast::LetStmt>();
+                        let->name = vp->name;
+                        let->line = arm.line;
+                        let->column = arm.column;
+                        let->value = mkId(sl);
+                        blk->stmts.push_back(std::move(let));
+                    }
+                }
+                blk->tail = std::move(arm.body);
+                chain = std::move(blk);
+                continue;
+            }
+            auto thenBlk = std::make_unique<ast::BlockExpr>();
+            thenBlk->line = arm.line;
+            thenBlk->column = arm.column;
+            for (std::size_t j = 0; j < sp->elements.size(); ++j) {
+                if (sp->elements[j] == "_") continue;
+                auto let = std::make_unique<ast::LetStmt>();
+                let->name = sp->elements[j];
+                let->line = arm.line;
+                let->column = arm.column;
+                let->value = mkCall("slice_get", mkId(sl), mkInt((long long)j));
+                thenBlk->stmts.push_back(std::move(let));
+            }
+            thenBlk->tail = std::move(arm.body);
+            auto cmp = std::make_unique<ast::BinaryExpr>();
+            cmp->line = arm.line;
+            cmp->column = arm.column;
+            cmp->op = sp->hasRest ? ast::BinOp::Ge : ast::BinOp::Eq;
+            cmp->lhs = mkCall("slice_len", mkId(sl), nullptr);
+            cmp->rhs = mkInt((long long)sp->elements.size());
+            auto iff = std::make_unique<ast::IfExpr>();
+            iff->line = arm.line;
+            iff->column = arm.column;
+            iff->cond = std::move(cmp);
+            iff->thenBranch = std::move(thenBlk);
+            iff->elseBranch = std::move(chain);
+            chain = std::move(iff);
+        }
+        auto outer = std::make_unique<ast::BlockExpr>();
+        outer->line = ln;
+        outer->column = cn;
+        auto letS = std::make_unique<ast::LetStmt>();
+        letS->name = sl;
+        letS->line = ln;
+        letS->column = cn;
+        letS->value = std::move(me->scrutinee);
+        outer->stmts.push_back(std::move(letS));
+        outer->tail = std::move(chain);
+        return outer;
+    }
+
+    // v26 Phase 142: a struct pattern `P { f1, f2: b, _, .. }` as a match arm,
+    // desugared to an irrefutable `__sp` binding + a block that field-binds —
+    // so the match compiler / typechecker only ever see a VarPat + a block.
+    // (`P { .. }` field-list shorthand; `f: _` / `..` skip a field.)
+    ast::MatchArm parseStructPatternArm() {
+        Token nameTok = consume(); // struct name (informational)
+        expect(TokenKind::LBrace, "{");
+        std::string sp = "__sp" + std::to_string(structPatCounter_++);
+        auto block = std::make_unique<ast::BlockExpr>();
+        block->line = nameTok.line;
+        block->column = nameTok.column;
+        while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
+            if (check(TokenKind::DotDot)) {
+                consume();
+                break;
+            }
+            Token field = expect(TokenKind::Identifier, "field name");
+            std::string bind = field.lexeme;
+            bool skip = false;
+            if (accept(TokenKind::Colon)) {
+                if (check(TokenKind::Underscore)) {
+                    consume();
+                    skip = true;
+                } else {
+                    bind = expect(TokenKind::Identifier, "a binding").lexeme;
+                }
+            }
+            if (!skip) {
+                auto let = std::make_unique<ast::LetStmt>();
+                let->name = bind;
+                let->line = field.line;
+                let->column = field.column;
+                auto id = std::make_unique<ast::IdentExpr>();
+                id->name = sp;
+                id->line = field.line;
+                id->column = field.column;
+                auto fe = std::make_unique<ast::FieldExpr>();
+                fe->line = field.line;
+                fe->column = field.column;
+                fe->object = std::move(id);
+                fe->fieldName = field.lexeme;
+                let->value = std::move(fe);
+                block->stmts.push_back(std::move(let));
+            }
+            if (!accept(TokenKind::Comma)) break;
+        }
+        expect(TokenKind::RBrace, "}");
+        expect(TokenKind::FatArrow, "=>");
+        block->tail = parseExpr();
+        auto vp = std::make_unique<ast::VarPat>();
+        vp->name = sp;
+        vp->line = nameTok.line;
+        vp->column = nameTok.column;
+        ast::MatchArm arm;
+        arm.line = nameTok.line;
+        arm.column = nameTok.column;
+        arm.pattern = std::move(vp);
+        arm.body = std::move(block);
+        return arm;
+    }
+
+    // v26 Phase 143: a slice pattern `[a, b, _, ..]` as a match arm.
+    ast::PatternPtr parseSlicePat() {
+        Token lb = expect(TokenKind::LBracket, "[");
+        auto sp = std::make_unique<ast::SlicePat>();
+        sp->line = lb.line;
+        sp->column = lb.column;
+        while (!check(TokenKind::RBracket) && !check(TokenKind::EndOfInput)) {
+            if (check(TokenKind::DotDot)) {
+                consume();
+                sp->hasRest = true;
+                break;
+            }
+            if (check(TokenKind::Underscore)) {
+                consume();
+                sp->elements.push_back("_");
+            } else {
+                sp->elements.push_back(
+                    expect(TokenKind::Identifier, "a binding").lexeme);
+            }
+            if (!accept(TokenKind::Comma)) break;
+        }
+        expect(TokenKind::RBracket, "]");
+        return sp;
+    }
+
     ast::MatchArm parseMatchArm() {
+        // v26 Phase 143: `[ … ]` in pattern position is a slice pattern.
+        if (check(TokenKind::LBracket)) {
+            auto sp = parseSlicePat();
+            std::size_t l = sp->line, c = sp->column;
+            expect(TokenKind::FatArrow, "=>");
+            ast::MatchArm arm;
+            arm.line = l;
+            arm.column = c;
+            arm.pattern = std::move(sp);
+            arm.body = parseExpr();
+            return arm;
+        }
+        // v26 Phase 142: `P { … }` in pattern position is a struct pattern.
+        if (check(TokenKind::Identifier) && peek(1).kind == TokenKind::LBrace) {
+            return parseStructPatternArm();
+        }
         auto pat = parsePattern();
         std::size_t line = pat ? pat->line : peek().line;
         std::size_t col = pat ? pat->column : peek().column;
+        // v26 Phase 141: an or-pattern `p1 | p2 | …`. In pattern position the
+        // `|` is unambiguous (no bitwise-or / closure here). Collect the
+        // alternatives into an OrPat; the expandOrPatterns pass splits the arm.
+        if (check(TokenKind::Pipe) || check(TokenKind::PipePipe)) {
+            auto orp = std::make_unique<ast::OrPat>();
+            orp->line = line;
+            orp->column = col;
+            orp->alternatives.push_back(std::move(pat));
+            while (check(TokenKind::Pipe) || check(TokenKind::PipePipe)) {
+                // `||` here is two pattern separators (an empty alternative is
+                // never valid), so treat it as a single `|`.
+                consume();
+                orp->alternatives.push_back(parsePattern());
+            }
+            pat = std::move(orp);
+        }
         expect(TokenKind::FatArrow, "=>");
         auto body = parseExpr();
         ast::MatchArm arm;

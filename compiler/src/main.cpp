@@ -1475,6 +1475,12 @@ bool resolveModules(const std::string& srcRaw,
     // Phase 25: carry top-level `const` items across the module merge.
     for (auto& cd : pr.program.consts)
         out.consts.push_back(std::move(cd));
+    // v26 Phase 144: carry top-level type aliases across the module merge.
+    for (auto& ta : pr.program.typeAliases)
+        out.typeAliases.push_back(std::move(ta));
+    // v26 Phase 146: carry `use` imports / re-exports across the module merge.
+    for (auto& u : pr.program.uses)
+        out.uses.push_back(std::move(u));
 
     // Recurse into each `mod foo;` reference.
     for (const auto& m : pr.program.mods) {
@@ -1492,6 +1498,56 @@ bool resolveModules(const std::string& srcRaw,
         }
     }
     return true;
+}
+
+// v26 Phase 146: process `use` imports after the module merge. A plain
+// `use a::b;` validates that `b`, if it names a user-defined top-level fn, is
+// path-reachable (`pub` / `pub(crate)` / ...); importing a `pub(self)` /
+// private fn is an error. A `use a::b as c;` additionally synthesizes a thin
+// forwarder `fn c(params) -> ret ! eff { b(params) }` so the alias `c` is
+// callable — but only when `b` is a non-generic, non-async user fn (a generic
+// or type alias is accepted as a scope hint, forwarding deferred). Under the
+// flat-merge model the imported item is already globally visible by bare name,
+// so a plain import is otherwise a no-op.
+void processUses(kardashev::ast::Program& prog,
+                 std::vector<std::string>& errors) {
+    using namespace kardashev::ast;
+    std::unordered_map<std::string, const FnDecl*> fnByName;
+    for (const auto& f : prog.functions) fnByName[f.name] = &f;
+    std::vector<FnDecl> synthesized;
+    for (const auto& u : prog.uses) {
+        if (u.path.empty()) continue;
+        const std::string& target = u.path.back();
+        auto it = fnByName.find(target);
+        if (it != fnByName.end() && !it->second->isPub) {
+            errors.push_back(
+                "use error: cannot import `" + target +
+                "` — it is not declared `pub` (private to its module)");
+            continue;
+        }
+        if (u.alias.empty()) continue;          // plain import: scope hint only
+        if (it == fnByName.end()) continue;     // builtin/external target
+        const FnDecl& tgt = *it->second;
+        if (!tgt.genericParams.empty() || tgt.isAsync) continue; // deferred
+        FnDecl fwd;
+        fwd.name = u.alias;
+        fwd.params = tgt.params;
+        fwd.returnType = tgt.returnType;
+        fwd.effects = tgt.effects;
+        fwd.isPub = u.isReexport;
+        auto call = std::make_unique<CallExpr>();
+        call->callee = tgt.name;
+        for (const auto& p : tgt.params) {
+            auto id = std::make_unique<IdentExpr>();
+            id->name = p.name;
+            call->args.push_back(std::move(id));
+        }
+        auto blk = std::make_unique<BlockExpr>();
+        blk->tail = std::move(call);
+        fwd.body = std::move(blk);
+        synthesized.push_back(std::move(fwd));
+    }
+    for (auto& f : synthesized) prog.functions.push_back(std::move(f));
 }
 
 // v24 Phase 130: rich diagnostics — a rustc-style source snippet with a caret
@@ -1721,6 +1777,9 @@ std::optional<kardashev::ast::Program> buildProgram(
         }
         return std::nullopt;
     }
+    // v26 Phase 146: validate imports + synthesize `use ... as` alias forwarders
+    // before the errors check below surfaces any import errors.
+    processUses(merged, errors);
     if (!errors.empty()) {
         for (const auto& e : errors) std::cerr << e << '\n';
         return std::nullopt;

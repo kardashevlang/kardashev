@@ -300,6 +300,48 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v26 Phase 141: or-patterns (p1 | p2 => e).
+sh_test(
+    name = "smoke_test_phase141",
+    srcs = ["smoke_test_phase141.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v26 Phase 142: struct patterns in match arms.
+sh_test(
+    name = "smoke_test_phase142",
+    srcs = ["smoke_test_phase142.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v26 Phase 143: slice patterns ([a, b, ..]) in match arms.
+sh_test(
+    name = "smoke_test_phase143",
+    srcs = ["smoke_test_phase143.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v26 Phase 145: Fn/FnMut/FnOnce closure-trait hierarchy + capture classification.
+sh_test(
+    name = "smoke_test_phase145",
+    srcs = ["smoke_test_phase145.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v26 Phase 146: two-phase borrows + module visibility + use/pub-use imports.
+sh_test(
+    name = "smoke_test_phase146",
+    srcs = ["smoke_test_phase146.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v26 Phase 144: type aliases (type Name = Target).
+sh_test(
+    name = "smoke_test_phase144",
+    srcs = ["smoke_test_phase144.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v24 Phase 132: opt-in lint (-W) — unused vars + unreachable code, non-fatal,
 # no false positives (closure / fn-ptr / method / match uses recognized).
 sh_test(
