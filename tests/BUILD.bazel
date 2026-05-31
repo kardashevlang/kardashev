@@ -342,6 +342,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v27 Phase 149: format! / print! / println! formatting forms.
+sh_test(
+    name = "smoke_test_phase149",
+    srcs = ["smoke_test_phase149.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v27 Phase 148: UTF-8 correctness — char iteration / indexing / validation.
 sh_test(
     name = "smoke_test_phase148",

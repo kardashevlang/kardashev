@@ -187,7 +187,15 @@ std::string applyPrelude(const std::string& userSrc) {
             " { clone(self) } }\n"
             "impl Display for bool"
             " { fn to_string(&self) -> String"
-            " { if *self { \"true\" } else { \"false\" } } }\n";
+            " { if *self { \"true\" } else { \"false\" } } }\n"
+            // v27 Phase 149/150: char + f64 Display so `format!`/`{}` cover the
+            // remaining scalar types.
+            "impl Display for char"
+            " { fn to_string(&self) -> String ! { alloc }"
+            " { char_to_string(*self) } }\n"
+            "impl Display for f64"
+            " { fn to_string(&self) -> String ! { alloc }"
+            " { f64_to_string(*self) } }\n";
     }
     // Phase 41: the `Clone` trait — `clone(&self) -> Self` — a DEEP copy that
     // dispatches through each element's own impl. Built-in impls for scalars +

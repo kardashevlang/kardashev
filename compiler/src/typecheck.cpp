@@ -1517,6 +1517,7 @@ public:
             else if (rfor->kind == TypeKind::Int) typeName = "i64";
             else if (rfor->kind == TypeKind::Float) typeName = "f64";  // Phase 44
             else if (rfor->kind == TypeKind::Bool) typeName = "bool";
+            else if (rfor->kind == TypeKind::Char) typeName = "char"; // v27 P149
             else if (rfor->kind == TypeKind::Box) typeName = "Box";    // Phase 51
             else {
                 error("impl for unsupported type " + typeToString(forTy),
@@ -3263,6 +3264,7 @@ private:
         else if (rb->kind == TypeKind::Int) typeName = "i64";
         else if (rb->kind == TypeKind::Float) typeName = "f64";  // Phase 44
         else if (rb->kind == TypeKind::Bool) typeName = "bool";
+        else if (rb->kind == TypeKind::Char) typeName = "char"; // v27 P149
         else {
             error("associated type projection on unsupported base type " +
                       typeToString(base),
@@ -5001,6 +5003,7 @@ private:
         else if (r->kind == TypeKind::Int) typeName = "i64";
         else if (r->kind == TypeKind::Float) typeName = "f64";  // Phase 44
         else if (r->kind == TypeKind::Bool) typeName = "bool";
+        else if (r->kind == TypeKind::Char) typeName = "char"; // v27 P149
         else if (r->kind == TypeKind::Box) typeName = "Box";    // Phase 51
         else {
             error("method call on unsupported receiver type " +
@@ -6895,6 +6898,7 @@ private:
                 else if (concrete->kind == TypeKind::Int) typeName = "i64";
                 else if (concrete->kind == TypeKind::Float) typeName = "f64";  // Phase 44
                 else if (concrete->kind == TypeKind::Bool) typeName = "bool";
+                else if (concrete->kind == TypeKind::Char) typeName = "char"; // v27 P149
                 else continue; // still a Var / unsupported — leave unbound
                 auto tyIt = implAssocTypes_.find(typeName);
                 if (tyIt == implAssocTypes_.end()) continue;

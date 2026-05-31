@@ -6993,6 +6993,7 @@ private:
         else if (rb->kind == TypeKind::Int) typeName = "i64";
         else if (rb->kind == TypeKind::Float) typeName = "f64";  // Phase 44
         else if (rb->kind == TypeKind::Bool) typeName = "bool";
+        else if (rb->kind == TypeKind::Char) typeName = "char"; // v27 P149
         else {
             errors_.push_back("codegen: associated type projection '" +
                               tr.name + "::" + tr.assocName +
@@ -7479,6 +7480,7 @@ private:
                     else if (base->kind == TypeKind::Int) typeName = "i64";
                     else if (base->kind == TypeKind::Float) typeName = "f64";  // Phase 44
                     else if (base->kind == TypeKind::Bool) typeName = "bool";
+                    else if (base->kind == TypeKind::Char) typeName = "char"; // v27 P149
                     if (!typeName.empty()) {
                         auto tyIt = tc_.implAssocTypes.find(typeName);
                         if (tyIt != tc_.implAssocTypes.end()) {
@@ -10712,6 +10714,7 @@ private:
                 else if (c->kind == TypeKind::Int) tn = "i64";
                 else if (c->kind == TypeKind::Float) tn = "f64";
                 else if (c->kind == TypeKind::Bool) tn = "bool";
+                else if (c->kind == TypeKind::Char) tn = "char"; // v27 P149
                 else if (c->kind == TypeKind::Box) tn = "Box";
             }
             if (tn.empty()) {
