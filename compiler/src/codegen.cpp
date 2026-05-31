@@ -10367,6 +10367,28 @@ private:
             phi->addIncoming(R, rhsEnd);
             return phi;
         }
+        // Phase 124: `a || b` == `lhs ? true : rhs` — the mirror of `&&`, with
+        // the conditional branch and the short-circuit phi constant flipped:
+        // when lhs is true we skip rhs and yield true.
+        if (bin.op == ast::BinOp::Or) {
+            auto& ctx = *ctx_;
+            auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+            llvm::Value* L = emitExpr(*bin.lhs);
+            auto* entryBB = builder_->GetInsertBlock();
+            auto* fn = entryBB->getParent();
+            auto* rhsBB = llvm::BasicBlock::Create(ctx, "or.rhs", fn);
+            auto* contBB = llvm::BasicBlock::Create(ctx, "or.cont", fn);
+            builder_->CreateCondBr(L, contBB, rhsBB); // lhs true -> short-circuit
+            builder_->SetInsertPoint(rhsBB);
+            llvm::Value* R = emitExpr(*bin.rhs);
+            auto* rhsEnd = builder_->GetInsertBlock(); // rhs may have added blocks
+            builder_->CreateBr(contBB);
+            builder_->SetInsertPoint(contBB);
+            auto* phi = builder_->CreatePHI(i1Ty, 2, "or");
+            phi->addIncoming(llvm::ConstantInt::getTrue(ctx), entryBB);
+            phi->addIncoming(R, rhsEnd);
+            return phi;
+        }
         llvm::Value* L = emitExpr(*bin.lhs);
         llvm::Value* R = emitExpr(*bin.rhs);
         // Phase 39/67: float operands (f32 OR f64) use floating-point ops
@@ -10386,6 +10408,7 @@ private:
             case ast::BinOp::NotEq: return builder_->CreateFCmpUNE(L, R, "fne");
             case ast::BinOp::Mod:
             case ast::BinOp::And:
+            case ast::BinOp::Or:
             case ast::BinOp::BitAnd:
             case ast::BinOp::BitOr:
             case ast::BinOp::BitXor:
@@ -10429,7 +10452,8 @@ private:
             // Arithmetic (sign-extending) for signed, logical for unsigned.
             return uns ? builder_->CreateLShr(L, R, "lshr")
                        : builder_->CreateAShr(L, R, "ashr");
-        case ast::BinOp::And: return nullptr; // handled above
+        case ast::BinOp::And:
+        case ast::BinOp::Or: return nullptr; // handled above
         }
         return nullptr;
     }

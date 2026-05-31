@@ -126,6 +126,26 @@ void test_parenthesized() {
     expectEquals(v, 9, "parenthesized");
 }
 
+void test_logical_or_shortcircuit() {
+    // Phase 124: `||` short-circuits — lhs true means the rhs (a trapping
+    // `10 / 0`) is never evaluated, so the program returns 7 rather than trap.
+    auto v1 = compileAndRun(
+        "fn main() -> i64 { if true || ((10 / 0) == 0) { 7 } else { 0 } }",
+        "main", "or_shortcircuit");
+    expectEquals(v1, 7, "or_shortcircuit");
+    // `||` binds looser than `&&`: `true || false && false`
+    // == `true || (false && false)` == true.
+    auto v2 = compileAndRun(
+        "fn main() -> i64 { if true || false && false { 1 } else { 0 } }",
+        "main", "or_below_and");
+    expectEquals(v2, 1, "or_below_and");
+    // false || false == false.
+    auto v3 = compileAndRun(
+        "fn main() -> i64 { if false || false { 1 } else { 0 } }", "main",
+        "or_both_false");
+    expectEquals(v3, 0, "or_both_false");
+}
+
 void test_subtraction_left_assoc() {
     // 10 - 3 - 2 == 5  (left-assoc, not 10 - (3 - 2) = 9)
     auto v = compileAndRun("fn main() -> i64 { 10 - 3 - 2 }", "main",
@@ -2440,6 +2460,7 @@ int main() {
     test_parenthesized();
     test_subtraction_left_assoc();
     test_signed_division();
+    test_logical_or_shortcircuit();
     test_let_and_use();
     test_function_call();
     test_if_then();
@@ -2615,7 +2636,7 @@ int main() {
     test_const_fn_runtime_call_runs();
     test_const_folds_to_literal_in_ir();
     test_unit_fn_tail_match_returns_void();
-    std::cout << "All codegen tests passed (155 cases) — Phase 16 Drop/RAII: "
+    std::cout << "All codegen tests passed (158 cases) — Phase 16 Drop/RAII: "
                  "reverse-order scope drops, move semantics, conditional-move "
                  "drop flags, Vec/Box free, scalar codegen unchanged; Phase "
                  "17a fn-value field calls + FnMut captures; Phase 17b generic "
@@ -2631,6 +2652,7 @@ int main() {
                  "(i32->C-int decl + trunc/sext coercions, i64->C-long, "
                  "&String->C pointer, unmangled C symbol name); Phase 104 "
                  "unit-returning fn with a tail match emits ret void (not ret "
-                 "i64 into a void fn)\n";
+                 "i64 into a void fn); Phase 124 || short-circuit logical-or "
+                 "(binds below &&, dead rhs not evaluated)\n";
     return 0;
 }

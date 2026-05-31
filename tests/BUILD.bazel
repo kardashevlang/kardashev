@@ -213,6 +213,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v22 Phase 124: `||` short-circuit logical-or. Truth table, short-circuit (a
+# trapping `10/0` in a dead rhs is skipped), precedence below `&&` (both
+# directions), and the zero-param closure `|| body` left intact. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase124",
+    srcs = ["smoke_test_phase124.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
 # crashed the compiler (void load/return); now compiles + runs.
 sh_test(
