@@ -1421,6 +1421,40 @@ public:
             }
         }
 
+        // v25 Phase 138: coherence — reject two impls of the same trait for the
+        // same type (explicit duplicates, or two overlapping blanket impls that
+        // each synthesized a concrete `impl Tr for X`). The key spells the type
+        // AND its type-args plus the trait + its trait-args, so distinct
+        // instantiations (`Pair<i64>` vs `Pair<bool>`, `Iterator<i64>` vs
+        // `Iterator<bool>`) are NOT treated as conflicting.
+        {
+            auto spellArgs = [](const std::vector<ast::TypeRef>& args) {
+                std::string s;
+                if (!args.empty()) {
+                    s += "<";
+                    for (std::size_t i = 0; i < args.size(); ++i) {
+                        if (i) s += ",";
+                        s += args[i].name;
+                    }
+                    s += ">";
+                }
+                return s;
+            };
+            std::unordered_set<std::string> seenImplPairs;
+            for (const auto& impl : program.impls) {
+                if (impl.traitName.empty()) continue;
+                std::string key = impl.forType.name +
+                                  spellArgs(impl.forType.typeArgs) + "/" +
+                                  impl.traitName + spellArgs(impl.traitTypeArgs);
+                if (!seenImplPairs.insert(key).second) {
+                    error("conflicting implementations of trait '" +
+                              impl.traitName + "' for type '" +
+                              impl.forType.name + "'",
+                          impl.line, impl.column);
+                }
+            }
+        }
+
         // Pass 1d: register impl blocks. We resolve the implementing type
         // and validate that each impl method's signature matches the
         // trait's after substituting Self -> implementing type.

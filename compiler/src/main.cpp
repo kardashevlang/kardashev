@@ -1390,7 +1390,10 @@ void expandBlanketImpls(kardashev::ast::Program& prog) {
                 if (m.body) fn.body = kardashev::ast::cloneBlock(*m.body);
                 ni.methods.push_back(std::move(fn));
             }
-            impld.insert(X + "/" + bl.traitName);
+            // NB: do NOT mark this synthesized pair as "seen" — `impld` holds
+            // only the ORIGINAL (explicit) impls, so an explicit impl still wins
+            // (X stays skipped), but two overlapping blankets both synthesize
+            // `impl Tr for X`, which the Phase 138 coherence check then rejects.
             kept.push_back(std::move(ni));
         }
     }
