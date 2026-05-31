@@ -3269,6 +3269,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (300 cases)\n";
+    std::cout << "All typecheck tests passed (304 cases)\n";
     return 0;
 }

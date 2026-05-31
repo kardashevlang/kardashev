@@ -782,13 +782,15 @@ int main() {
     test_two_distinct_field_moves_ok();
     test_single_field_move_ok();
     test_field_reinit_after_move_ok();
-    std::cout << "All borrow_check tests passed (50 cases) — Phase 2.4c "
+    std::cout << "All borrow_check tests passed (52 cases) — Phase 2.4c "
                  "NLL + mutable references; Phase 9 loops; Phase 13a "
                  "method-receiver autoref; Phase 15 inherent &mut self + "
                  "unary operands; Phase 16 Drop-typed move tracking; "
                  "Phase 17a fn-value calls + FnMut captures; Phase 106 "
                  "field-level partial-move tracking (same-field-twice + "
                  "partial-then-whole rejected, distinct fields ok); Phase 108 "
-                 "field re-init after move ok\n";
+                 "field re-init after move ok; Phase 146 two-phase borrows "
+                 "(reserved &mut arg + nested &v read ok, sibling alias "
+                 "rejected)\n";
     return 0;
 }

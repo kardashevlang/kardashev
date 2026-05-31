@@ -18,6 +18,55 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.26.0] — Roadmap v26 "patterns, types & borrow-check completeness" (Phases 141–146)
+
+Theme: close the long-standing gaps in pattern matching, the type surface, the
+closure model, the borrow checker, and module visibility. Most of the hard
+pattern features are lowered in the parser to constructs the Maranget
+decision-tree matcher already handles.
+
+### Added
+- **Match guards + or-patterns** (Phase 141) — `A | B => e` arms (split into
+  per-alternative arms) and `x if cond => e` guards.
+- **Struct / tuple patterns** (Phase 142) — destructuring `Point { x, y }` and
+  tuples in `match` arms and let-bindings (lowered to a bind + block).
+- **Slice patterns** (Phase 143) — `[a, b]`, length dispatch, and a `[first, ..]`
+  prefix, desugared to a length-checked `if/else` chain over `slice_len` /
+  `slice_get`; `&mut [T]` mutable slices.
+- **Type aliases** (Phase 144) — `type Name = Target;`, resolved in both the
+  type checker and codegen (and carried across the module merge).
+- **`Fn` / `FnMut` / `FnOnce` closure-trait hierarchy** (Phase 145) — every
+  closure is classified by how it uses its captures (reads → `Fn`, mutates →
+  `FnMut`, moves a capture out → `FnOnce`). A parameter may be spelled
+  `Fn(A) -> R` / `FnMut(A) -> R` / `FnOnce(A) -> R`; the checker enforces the
+  lattice `Fn < FnMut < FnOnce` at coercion sites. The bound is compile-time
+  only (shared fat-pointer ABI), so accepted programs lower identically.
+- **Two-phase borrows** (Phase 146) — a `&mut place` taken as a call argument
+  (or a `&mut self` receiver) is a *reserved* borrow that does not conflict with
+  a `&place` read nested in a sibling argument, so `vec_push(&mut v, vec_len(&v))`
+  (the `v.push(v.len())` shape) compiles. Genuine aliasing — `f(&mut v, &v)` as
+  direct sibling args, or two `&mut v` in one call — is still rejected.
+- **Module visibility** (Phase 146) — `pub(crate)` / `pub(super)` / `pub(self)` /
+  `pub(in path)` parse; `pub(self)` is private (path-unreachable), the rest are
+  reachable in this crate. Enforced through the existing path-qualified-call
+  visibility check.
+- **`use` / `pub use` imports** (Phase 146) — `use a::b::c;`, `use a::b as c;`,
+  `pub use a::b;`. A plain import is a scope hint; `use ... as` synthesizes a
+  forwarder so the alias is callable; importing a private fn is a `use error`.
+
+### Deferred (documented follow-ons)
+- Full NLL region inference, implicit `&T`-field reborrows, and the
+  mut-second-argument two-phase case (the borrow checker stays position-based
+  NLL-lite).
+- Cross-crate visibility distinctions (`pub` vs `pub(crate)`) — collapse to
+  "reachable within the crate" until a real crate boundary exists (the
+  package-ecosystem arc); type/const `use` aliases and generic/async alias
+  forwarders.
+- Owned (by-move, non-Copy) closure captures / a true runtime `FnOnce` — needs a
+  closure-env drop vtable (fat-pointer ABI change).
+
+710 unit cases (6 suites) + the full smoke sweep green, JIT and AOT.
+
 ## [0.25.0] — Roadmap v25 "the trait system, finished" (Phases 135–140)
 
 Theme: bring the trait system from MVP to a usable vocabulary — default methods,
