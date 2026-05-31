@@ -30,13 +30,16 @@ the roadmap below can close them in priority order.
 - **No performance numbers.** There are zero benchmarks. "Zero-cost effects" is
   true but type-system-only; the compiler's actual codegen/runtime speed vs a C
   or Rust reference is simply unmeasured.
-- **MVP / leaky stdlib.** `HashMap`/`HashSet` have no `remove` (deferred —
-  open-addressing deletion needs tombstone-aware probing). The async executor's
-  `spawn` + `join` path leaks a frame per spawned task (RSS grows ~120 B/iter);
-  the const-eval scalar set and some library surfaces are still `i64`/`bool`-MVP.
-  *(Earlier drafts also listed HashMap interior-K/V drop and async `Future`-frame
-  reclaim as leaks — measurement in v21 showed both are already clean; only the
-  `spawn`/`join` path leaks.)*
+- **MVP / leaky stdlib.** *(v21 closed the biggest items here.)* `HashMap`/
+  `HashSet` now have `remove` (v21 Phase 122, backward-shift deletion); the
+  `spawn` + `join` frame leak is fixed (v21 Phase 121, per-handle release); and
+  `Mutex` is now generic over its cell type (v21 Phase 123). What remains MVP:
+  the **const-eval scalar set** (`i64`/`bool` only) and the **OS-thread return
+  value** (`fn() -> i64` only — async/await is the generic path) are still
+  `i64`-shaped; a fully type-safe named `Mutex<T>` (vs the current type-erased
+  i64 handle) is also deferred. *(Earlier drafts also listed HashMap interior-K/V
+  drop and async `Future`-frame reclaim as leaks — measurement in v21 showed both
+  are already clean.)*
 - **A few real ergonomic gaps** (verified against the current compiler, *not* the
   stale docs): no `||` logical-or (it collides with closure `||` syntax); no `&`
   of a temporary/rvalue (`&A(10)` errors — bind to a `let` first), plus a related
@@ -125,9 +128,32 @@ Turn anecdotes into numbers and fix the real footprint gaps:
   released. Now a spawn+join loop is RSS-flat and multi-handle joins return the
   right distinct results; pinned by `tests/smoke_test_spawnleak.sh`. *(HashMap
   interior-K/V drop and block_on/await frame reclaim were measured clean.)*
-- Add `HashMap`/`HashSet` **`remove`** (tombstone-aware probing) — the one
-  genuinely-missing stdlib operation.
-- Generalize the remaining `i64`/`bool`-MVP surfaces toward arbitrary types.
+- ✅ **Phase 122 (HashMap/HashSet `remove`, done)** — the one genuinely-missing
+  stdlib operation. Open-addressing deletion is done by **backward-shift**
+  (Knuth Algorithm R) rather than tombstones, so `get`/`insert`/`grow` stay
+  untouched: the rest of the probe chain is shifted into the hole, keeping the
+  table tombstone-free (every live key stays reachable from its home by a
+  contiguous run, so there is no load-factor or infinite-probe regression).
+  `hashmap_remove<K,V>` returns `Option<V>` with the value **moved out** (the
+  stored key + lookup key dropped); `hashset_remove<T>` returns a `bool`. Pinned
+  by `tests/smoke_test_hashremove.sh`: head/middle/tail + wrap-around chain
+  preservation, a 50-key oracle, and heap-clean String-map remove + 200k churn
+  under `MALLOC_CHECK_=3` (RSS-flat).
+- ✅ **Phase 123 (generic `Mutex<T>`, done)** — the headline `i64`/`bool`-MVP
+  surface lifted: the `Mutex` guarded cell was `i64`-only and is now an
+  arbitrary `T` (guard a struct, `String`, `bool`, `Vec`, … — including shared
+  across threads). `mutex_new`/`get`/`set` are specialized per cell type over a
+  `{ pthread_mutex_t, T }` block; the i64 handle stays Copy + shareable, so it is
+  fully backward compatible (`mutex_new(0)` infers `T=i64`). `get` clones the
+  cell and `set` drops the old value (a `Mutex<String>` over 100k sets is
+  RSS-flat). Follows the handle-based `join<T>` idiom — `T` is type-erased
+  through the i64 handle, so `mutex_get<T>` (T return-only) is pinned by context
+  or an explicit annotation. Pinned by `tests/smoke_test_mutex_generic.sh`
+  (bool/struct/i64 cells, heap-clean `Mutex<String>`, and a `Mutex<struct>` across
+  two threads → exact total). *(A fully type-safe named `Mutex<T>` with `T`
+  inferred from the handle is a larger Send/Copy/capture change — deferred
+  honestly; the other handle-based surfaces, OS-thread return value and the
+  const-eval scalar set, remain `i64`/`bool`-MVP and are documented as such.)*
 
 ### v22 — ergonomics, docs, and platform
 

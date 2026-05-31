@@ -18,6 +18,72 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.21.0] — Roadmap v21 "prove it, and close the gaps" (Phases 120–123)
+
+Theme: turn anecdotes into numbers, fix the real footprint leak, and close the
+two most-cited stdlib/MVP gaps. v21 has no new surface syntax — it makes the
+existing language honest: measured, leak-free, and less `i64`-shaped.
+
+### Added
+- **Benchmark suite** (Phase 120, `bench/` + `BENCHMARKS.md`) — each workload
+  written identically in kardashev and C, AOT-compiled (`kardc -O2` / `clang
+  -O2`), run best-of-3 with outputs checked equal. Result: kardashev is
+  **C-competitive** — `fib` ≈ 1.0×, `collatz` ≈ 1.0×, a tight integer `loop` ≈
+  2.2× C. Correctness pinned by `tests/smoke_test_bench.sh`; the ratios are
+  committed in `BENCHMARKS.md`. This replaces the old "−O2 default / flat RSS"
+  anecdotes with data (and flags the ~2.2× tight-loop gap as a codegen target).
+- **`HashMap`/`HashSet` `remove`** (Phase 122) — the one genuinely-missing stdlib
+  operation. `hashmap_remove<K,V>(m: &mut HashMap<K,V>, k: K) -> Option<V>`
+  (value moved out, key dropped) and `hashset_remove<T>(s: &mut HashSet<T>, k: T)
+  -> bool`. Open-addressing deletion uses **backward-shift** (Knuth Algorithm R),
+  not tombstones, so `get`/`insert`/`grow` are untouched and the table never
+  fills with tombstones (no load-factor or infinite-probe regression). Pinned by
+  `tests/smoke_test_hashremove.sh`: head/middle/tail + wrap-around chain
+  preservation, a 50-key oracle, and heap-clean String-map remove + a 200k churn
+  loop under `MALLOC_CHECK_=3` (RSS-flat).
+- **Generic `Mutex<T>` cell** (Phase 123) — `Mutex` was `Mutex<i64>` only; its
+  guarded cell is now an arbitrary `T`, so you can guard a struct, `String`,
+  `bool`, `Vec`, … including shared across threads (a `Mutex<Counter>`
+  read-modify-write under lock lands on the exact total). It is a **phantom-typed
+  named `Mutex<T>`**: the value is a bare i64 handle (Copy, captured by value into
+  thread closures), but the type carries the cell `T`, so `mutex_get`/`mutex_set`
+  are *tied* to it — `T` flows from the handle (no annotation needed) and a
+  wrong-`T` get/set is a compile error (closing a heap-overflow/punning hole an
+  earlier type-erased draft had — found in adversarial review). `mutex_new`/`get`/
+  `set` are specialized per cell type over a `{ pthread_mutex_t, T }` block; `get`
+  clones the cell and `set` drops the old value (a `Mutex<String>` over 100k sets
+  is RSS-flat). The cell `T` must be **`Send`** and not a shared handle
+  (`Rc`/`Sender`/`Receiver`) — enforced at `mutex_new`, so a non-Send value can't
+  be smuggled across a thread boundary through the cell. Pinned by
+  `tests/smoke_test_mutex_generic.sh` (positive cells + 3 negative soundness
+  repros).
+
+### Fixed
+- **`spawn` + `join` frame leak** (Phase 121) — the async executor leaked a heap
+  frame per spawned task (its task array grew unbounded), because `join` drove +
+  read the result but never reclaimed the task (unlike `block_on`, which reaps).
+  A naïve reap-after-join is *wrong* — driving one handle also completes sibling
+  tasks (the executor interleaves), so an all-done reap frees a sibling's result
+  before its own `join` reads it. Fixed with a **per-handle release**
+  (`__kd_exec_release(h)`): free only task `h`'s frame+slot, resetting the
+  executor only once every task is released. A spawn+join loop is now RSS-flat
+  and multi-handle joins return the right distinct results
+  (`tests/smoke_test_spawnleak.sh`). *(Measurement also confirmed the previously
+  suspected HashMap interior-drop and `block_on`/`await` frame reclaim are
+  already clean — only `spawn`/`join` leaked.)*
+
+### Notes
+- **Still MVP (documented, not stubbed):** the const-eval scalar set (`i64`/
+  `bool`) and the OS-thread return value (`fn() -> i64`; async/await is the
+  generic path) remain `i64`-shaped.
+- **One source-level break (behavior unchanged):** the `Mutex` handle type is now
+  `Mutex<T>` (was a bare `i64`). Programs that let the handle be inferred (`let m
+  = mutex_new(0)`) are unaffected, but any that **named** the handle type `i64`
+  (e.g. `fn bump(m: i64)`) must spell it `Mutex<i64>`. Runtime behavior is
+  identical (the handle is still a Copy i64 at the ABI). No other v21 change
+  alters an existing program; the HashMap/async/numeric suites and the 455 unit
+  cases (155 codegen + 300 typecheck) pass unchanged.
+
 ## [0.20.0] — Roadmap v20 "toward a real bootstrap" (Phases 115–119)
 
 Theme: move the self-hosted compiler past the toy. Through v19 "self-hosting"
