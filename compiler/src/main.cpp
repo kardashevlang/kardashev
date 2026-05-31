@@ -1454,6 +1454,73 @@ std::string adjustMessagePositions(const std::string& msg,
     }
     return out;
 }
+
+// v24 Phase 133: stable error codes + `kardc --explain Exxxx`. A curated table
+// maps the most common, distinctive diagnostics to a code with an extended
+// explanation. Classification is by message substring; an unmatched message
+// gets no code (a missing code beats a wrong one). The table grows over time.
+struct ErrorCode {
+    const char* code;
+    std::vector<const char*> match; // any of these substrings => this code
+    const char* title;
+    const char* explain;
+};
+const std::vector<ErrorCode>& errorCodes() {
+    static const std::vector<ErrorCode> table = {
+        {"E0001",
+         {"expected ", "unexpected "},
+         "syntax error",
+         "The parser reached a token it did not expect. Check for a missing\n"
+         "`;`, `}`, `)`, or `else`, or a keyword used as an identifier."},
+        {"E0308",
+         {"does not match", "same integer type", "expects bool", "arm body "
+          "type", " body type ", "operands", "mismatch"},
+         "mismatched types",
+         "An expression's type does not match the type required by its\n"
+         "context (a fn return type, an operator's operands, an `if`/`match`\n"
+         "arm, or a `let` annotation). kardashev does not implicitly convert\n"
+         "between types — cast explicitly with `as`, or fix the value."},
+        {"E0382",
+         {"moved value", "use of moved", "already moved"},
+         "use of a moved value",
+         "A non-`Copy` value was used after ownership moved out of it (into a\n"
+         "fn call, a `let`, or a struct/enum). Use the value before the move,\n"
+         "clone it (`.clone()`), or borrow it (`&x`) instead of moving."},
+        {"E0425",
+         {"unknown identifier", "undefined", "cannot find"},
+         "cannot find a name in scope",
+         "A name was referenced that is not a binding, function, type, or\n"
+         "const in scope. Check the spelling, the import (`mod`/`pub`), and\n"
+         "that the binding is declared before use in an enclosing scope."},
+        {"E0599",
+         {"no field", "no method", "field access on non", "non-struct"},
+         "no such field or method",
+         "The field or method does not exist on this type. Check the name, and\n"
+         "that the relevant `impl`/trait is in scope for a method call."},
+        {"E0571",
+         {"outside of a loop", "outside a loop"},
+         "`break`/`continue` outside a loop",
+         "`break` and `continue` are only valid inside a `while`/`loop`/`for`\n"
+         "body. Move the control-flow expression inside a loop."},
+        {"E0277",
+         {"does not implement", "trait bound", "is not satisfied", "no impl"},
+         "trait bound not satisfied",
+         "A generic was used at a type that does not implement a required\n"
+         "trait. Add the missing `impl Trait for Type`, or add/relax the bound."},
+        {"E0384",
+         {"cannot assign", "not mutable", "immutable", "non-mut"},
+         "assignment to an immutable binding",
+         "Assignment requires a `let mut` binding (or a `&mut` place).\n"
+         "Declare the binding `let mut x = …;` to make it reassignable."},
+    };
+    return table;
+}
+const ErrorCode* classifyError(const std::string& msg) {
+    for (const auto& ec : errorCodes())
+        for (const char* m : ec.match)
+            if (msg.find(m) != std::string::npos) return &ec;
+    return nullptr;
+}
 } // namespace
 
 void renderDiagnostic(std::ostream& os, const char* kind,
@@ -1468,7 +1535,14 @@ void renderDiagnostic(std::ostream& os, const char* kind,
         std::size_t fullL = countLines(full), userL = countLines(userSource);
         if (fullL > userL) preludeLines = fullL - userL;
     }
-    os << kind << ": " << adjustMessagePositions(message, preludeLines)
+    // v24 Phase 133: append the error code (rustc-style `error[E0308]:`) when a
+    // curated code matches. Warnings are not coded.
+    std::string label = kind;
+    if (label.find("error") != std::string::npos) {
+        if (const ErrorCode* ec = classifyError(message))
+            label += std::string("[") + ec->code + "]";
+    }
+    os << label << ": " << adjustMessagePositions(message, preludeLines)
        << '\n';
     const bool inUser = line > preludeLines;
     const std::size_t dispLine = inUser ? (line - preludeLines) : line;
@@ -2340,6 +2414,24 @@ int main(int argc, char** argv) {
             emitIr = true;
         } else if (a == "--emit-c") {
             emitC = true;
+        } else if (a == "--explain" && i + 1 < argc) {
+            // v24 Phase 133: `kardc --explain Exxxx` — print a code's extended
+            // explanation. A standalone command (no input file).
+            std::string want = argv[++i];
+            for (char& ch : want)
+                if (ch >= 'a' && ch <= 'z') ch = char(ch - 32);
+            for (const auto& ec : errorCodes()) {
+                if (want == ec.code) {
+                    std::cout << ec.code << ": " << ec.title << "\n\n"
+                              << ec.explain << '\n';
+                    return 0;
+                }
+            }
+            std::cerr << "kardc: unknown error code `" << argv[i]
+                      << "`. Known codes:";
+            for (const auto& ec : errorCodes()) std::cerr << ' ' << ec.code;
+            std::cerr << '\n';
+            return 2;
         } else if (a == "-W" || a == "--warn") {
             warnEnabled = true;
         } else if (a == "--test") {
@@ -2365,6 +2457,7 @@ int main(int argc, char** argv) {
                          "       kardc --emit-llvm <file.kd> # print LLVM IR to stdout\n"
                          "       kardc --emit-c <file.kd>   # print C source (i64/bool subset) to stdout\n"
                          "       kardc -W <file.kd>         # lint: warn on unused vars + unreachable code\n"
+                         "       kardc --explain Exxxx      # explain a diagnostic error code\n"
                          "       kardc --no-cache ...       # bypass the AOT compile cache\n"
                          "       kardc --version            # print the toolchain version\n";
             return 0;

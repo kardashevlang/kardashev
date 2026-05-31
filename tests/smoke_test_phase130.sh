@@ -25,7 +25,7 @@ trap 'rm -rf "$TMP"' EXIT
 # user-relative line number, and that no 3-digit prelude-offset line leaks.
 expect_snippet() {
     local name="$1" out="$2" kind="$3" wantline="$4"
-    grep -q "^$kind error: " <<<"$out" || { echo "FAIL [$name]: no '$kind error:' header"; echo "$out"; exit 1; }
+    grep -qE "^$kind error(\\[E[0-9]+\\])?: " <<<"$out" || { echo "FAIL [$name]: no '$kind error:' header"; echo "$out"; exit 1; }
     grep -q -- '-->' <<<"$out" || { echo "FAIL [$name]: no '-->' location line"; echo "$out"; exit 1; }
     grep -qE '^ *[0-9]+ \| ' <<<"$out" || { echo "FAIL [$name]: no source gutter line"; echo "$out"; exit 1; }
     grep -qE '\^' <<<"$out" || { echo "FAIL [$name]: no caret"; echo "$out"; exit 1; }

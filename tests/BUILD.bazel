@@ -259,6 +259,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v24 Phase 133: error codes in diagnostics + `kardc --explain Exxxx`.
+sh_test(
+    name = "smoke_test_phase133",
+    srcs = ["smoke_test_phase133.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
 # crashed the compiler (void load/return); now compiles + runs.
 sh_test(
