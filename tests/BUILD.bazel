@@ -342,6 +342,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v28 Phase 156: monomorphization dedup + specialization + --mono-report.
+sh_test(
+    name = "smoke_test_phase156",
+    srcs = ["smoke_test_phase156.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v28 Phase 155: generic associated types (GATs).
 sh_test(
     name = "smoke_test_phase155",

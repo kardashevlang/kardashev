@@ -464,7 +464,13 @@ public:
                            : pb.buildPerModuleDefaultPipeline(lvl);
             mpm.run(*module_, mam);
         }
-        return {std::move(ctx_), std::move(module_), std::move(errors_)};
+        // v28 Phase 156: surface the monomorphized generic instances (each
+        // emitted once — codegen dedups) for `--mono-report`.
+        std::vector<std::string> mono(emittedInstances_.begin(),
+                                      emittedInstances_.end());
+        std::sort(mono.begin(), mono.end());
+        return {std::move(ctx_), std::move(module_), std::move(errors_),
+                std::move(mono)};
     }
 
 private:
