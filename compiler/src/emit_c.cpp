@@ -71,13 +71,29 @@ struct CEmitter {
     // strings, fn types, tuples, arrays) is outside this phase's subset; returns
     // "" and records an error so the caller refuses the program.
     std::string ctype(const TypeRef& t) {
-        if (t.isRef || t.isFn || t.isSlice || t.isArray || t.isTuple ||
-            t.isDyn || !t.assocName.empty()) {
+        // v29 Phase 159: a reference `&T` / `&mut T` -> a C pointer `<T>*`.
+        // (`&` and `&mut` both map to a non-const pointer — const-correctness
+        // isn't needed for exit-code-faithful lowering, and it keeps mutation
+        // through a `&mut` straightforward.) Slices are NOT plain references.
+        if (t.isRef && !t.isSlice) {
+            TypeRef inner = t;
+            inner.isRef = false;
+            inner.refIsMut = false;
+            std::string ci = ctype(inner);
+            return ci.empty() ? "" : ci + "*";
+        }
+        if (t.isFn || t.isSlice || t.isArray || t.isTuple || t.isDyn ||
+            !t.assocName.empty()) {
             err("type `" + (t.name.empty() ? std::string("<complex>") : t.name) +
-                "` (reference/array/tuple/fn/dyn/assoc) is outside the "
+                "` (slice/array/tuple/fn/dyn/assoc) is outside the "
                 "C-backend subset");
             return "";
         }
+        // v29 Phase 159: the unit type `()` (a no-`-> T` return, or an explicit
+        // `()`) lowers to int64_t — a unit-returning fn yields the block value 0,
+        // which the caller (an ExprStmt) discards. Keeps the uniform
+        // `return <block value>;` lowering for a void-like function.
+        if (t.name == "unit") return "int64_t";
         if (isScalarName(t.name)) return "int64_t";
         if (isStructName(t.name) || isEnumName(t.name)) {
             if (!t.typeArgs.empty()) {
@@ -133,9 +149,23 @@ struct CEmitter {
         }
         if (auto* mx = dynamic_cast<const MatchExpr*>(&e))
             return mx->arms.empty() ? "int64_t" : ctypeOfExpr(*mx->arms[0].body);
+        // v29 Phase 159: `&x` -> a pointer; `*r` -> the pointee.
+        if (auto* re = dynamic_cast<const RefExpr*>(&e))
+            return ctypeOfExpr(*re->operand) + "*";
+        if (auto* un = dynamic_cast<const UnaryExpr*>(&e)) {
+            if (un->op == UnaryOp::Deref) {
+                std::string t = ctypeOfExpr(*un->operand);
+                return (!t.empty() && t.back() == '*') ? t.substr(0, t.size() - 1)
+                                                       : "int64_t";
+            }
+            return "int64_t";
+        }
         if (auto* fe = dynamic_cast<const FieldExpr*>(&e)) {
             std::string objTy = ctypeOfExpr(*fe->object);
-            // objTy is "struct <Name>"; find the field's declared type.
+            // v29 Phase 159: auto-deref — `r.field` on a `&Struct` reads the
+            // pointee's field, so strip one pointer layer before the lookup.
+            while (!objTy.empty() && objTy.back() == '*')
+                objTy.pop_back();
             if (objTy.rfind("struct ", 0) == 0) {
                 const std::string sn = objTy.substr(7);
                 auto sit = structs_.find(sn);
@@ -181,8 +211,8 @@ struct CEmitter {
             case UnaryOp::Not: op = "!"; break;
             case UnaryOp::BitNot: op = "~"; break;
             case UnaryOp::Deref:
-                err("`*` (deref) is outside the C-backend subset");
-                return "0";
+                // v29 Phase 159: `*r` dereferences a C pointer.
+                return "(*(" + expr(*un->operand) + "))";
             }
             return std::string("(") + op + expr(*un->operand) + ")";
         }
@@ -203,9 +233,21 @@ struct CEmitter {
             }
             return s + " })";
         }
-        // v29 Phase 157: a field access `obj.field`.
-        if (auto* fe = dynamic_cast<const FieldExpr*>(&e))
-            return "(" + expr(*fe->object) + ")." + fe->fieldName;
+        // v29 Phase 157/159: a field access `obj.field`, auto-dereferencing if
+        // `obj` is a reference (`r.field` on a `&Struct` -> `(*r).field`).
+        if (auto* fe = dynamic_cast<const FieldExpr*>(&e)) {
+            std::string objTy = ctypeOfExpr(*fe->object);
+            std::string base = expr(*fe->object);
+            if (!objTy.empty() && objTy.back() == '*')
+                return "((*(" + base + "))." + fe->fieldName + ")";
+            return "((" + base + ")." + fe->fieldName + ")";
+        }
+        // v29 Phase 159: `&x` / `&mut x` -> a C address-of. For `&<temporary>`
+        // (a struct/enum literal) this is `&(compound literal)`, a pointer to a
+        // C99 block-scoped temporary — matching kardashev's statement-scoped
+        // ref-to-rvalue.
+        if (auto* re = dynamic_cast<const RefExpr*>(&e))
+            return "(&(" + expr(*re->operand) + "))";
         if (auto* call = dynamic_cast<const CallExpr*>(&e)) {
             // v29 Phase 158: a variant constructor with a payload (`Some(5)`) —
             // a compound literal `((struct E){ .tag = idx, .p0 = a, ... })`.
@@ -261,13 +303,21 @@ struct CEmitter {
     // the subset (nested ctor args, char/or/tuple/slice, guards) are refused.
     std::string matchExpr(const MatchExpr& mx) {
         std::string scrutCTy = ctypeOfExpr(*mx.scrutinee);
+        // v29 Phase 159: match-through-reference (`match o` with `o: &Enum`) —
+        // copy the pointee into a value and match it (sound for scalar payloads:
+        // a payload borrow `&i64` reads the same value as a copied i64).
+        bool refScrut = !scrutCTy.empty() && scrutCTy.back() == '*';
+        std::string valCTy =
+            refScrut ? scrutCTy.substr(0, scrutCTy.size() - 1) : scrutCTy;
+        std::string scrutE = refScrut ? ("(*(" + expr(*mx.scrutinee) + "))")
+                                      : expr(*mx.scrutinee);
         std::string resCTy =
             mx.arms.empty() ? "int64_t" : ctypeOfExpr(*mx.arms[0].body);
         int id = matchCounter_++;
         const std::string m = "__m" + std::to_string(id);
         const std::string r = "__r" + std::to_string(id);
-        std::string s = "({ " + scrutCTy + " " + m + " = (" +
-                        expr(*mx.scrutinee) + "); " + resCTy + " " + r + "; ";
+        std::string s = "({ " + valCTy + " " + m + " = (" + scrutE + "); " +
+                        resCTy + " " + r + "; ";
         bool first = true, hasCatchAll = false;
         for (const auto& arm : mx.arms) {
             std::string test, binds;

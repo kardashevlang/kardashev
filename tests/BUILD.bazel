@@ -342,6 +342,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v29 Phase 159: C backend references/borrows + &<temporary> (gated vs LLVM).
+sh_test(
+    name = "smoke_test_phase159",
+    srcs = ["smoke_test_phase159.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v29 Phase 158: C backend enums + match (differentially gated vs LLVM).
 sh_test(
     name = "smoke_test_phase158",
