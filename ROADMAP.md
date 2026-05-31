@@ -53,19 +53,25 @@ the roadmap below can close them in priority order.
 > phase green (JIT **and** AOT) → adversarial review → fix findings →
 > consolidating PR → tag/release.
 
-### v20 — toward a real bootstrap (the north star)
+### v20 — toward a real bootstrap (the north star) — *in progress*
 
 Move the self-hosted compiler from a toy toward real kardashev. Full
 kardashev-compiles-kardashev is several roadmaps out; v20 is the first concrete
 step past "toy":
 
+- ✅ **Phase 115 (done)** — emit a **real artifact** instead of running an
+  in-process stack VM. `examples/selfhost/llvmgen.kd` now lowers each `Expr` to
+  SSA-form **textual LLVM IR** (`add`/`mul`/`icmp`+`zext`/branch-free `select`)
+  and prints a complete module (`define i64 @f(...)` + a `main` calling it), so
+  `clang out.ll -o prog && ./prog` runs **natively** and the exit code is the
+  function's result. **Differential-gated**: the self-hosted compiler's result
+  must equal the host compiler's on the same function (pinned by
+  `tests/smoke_test_phase115.sh`). This is the step past "toy" — the self-hosted
+  compiler produces a real, compilable native artifact.
 - Extend the source language the in-kardashev compiler accepts past `i64`/`bool`
   — at least **structs and enums** (the shapes the real compiler is built from).
-- Emit a **real artifact** instead of running an in-process stack VM — e.g. a
-  textual LLVM-IR (or the host's bytecode), so the self-hosted compiler's output
-  is something you can compile/run, not just interpret.
-- A **differential gate**: the self-hosted compiler's result must match the host
-  compiler's on the shared subset, fuzzed like the existing JIT-vs-AOT checks.
+- Broaden the **differential gate** to a fuzzer over random valid functions
+  (like the existing JIT-vs-AOT differential fuzzers).
 
 ### v21 — prove it, and close the leaks
 

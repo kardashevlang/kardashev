@@ -1012,6 +1012,18 @@ sh_test(
     ],
 )
 
+# v20 Phase 115 (toward a real bootstrap): the self-hosted compiler emits REAL
+# LLVM IR (clang-compiled to native), differential-gated against the host.
+# (Skips cleanly if clang is unavailable in the test sandbox.)
+sh_test(
+    name = "smoke_test_phase115",
+    srcs = ["smoke_test_phase115.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:llvmgen.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

@@ -120,7 +120,7 @@ The north-star arc is **self-hosting**: v15–v17 build a complete compiler *in*
 | v18 | "hardening II" — review-followup fixes + a differential fuzzer |
 | v19 | "hardening III" — memory-safety + integer fuzzers, cleaner diagnostics |
 
-**Next (v20+) — and an honest take on where this stands vs production languages:** see **[ROADMAP.md](ROADMAP.md)**.
+**v20 — toward a real bootstrap (in progress):** the self-hosted compiler now emits **real LLVM IR** (`clang`-compiled to a native binary, differential-gated against the host) instead of interpreting a stack VM — the first step past "toy". **Next (v20+) — and an honest take on where this stands vs production languages:** see **[ROADMAP.md](ROADMAP.md)**.
 
 ## Why "kardashev"?
 
