@@ -18,6 +18,68 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.32.0] — Roadmap v32 "async & effects, matured (differentiator II)" (Phases 172-176)
+
+Theme: take the two features that most distinguish kardashev — its async runtime
+and its zero-cost effect system — from "they exist" to "they compose." Future
+combinators + a type-safe task API, async cancellation/timeouts, effect
+subtyping, and the research-frontier headline: user-defined **algebraic effects
+with handlers**. Every phase is differentially gated (JIT vs AOT) and the
+heap/leak-sensitive ones under `MALLOC_CHECK_`.
+
+### Added
+- **Future combinators + a type-safe task API** (Phase 172) — four
+  compiler-synthesized combinator futures: `future_map<T,U>(Future<T>,
+  fn(T)->U)` , `future_and_then<T,U>(Future<T>, fn(T)->Future<U>)` (monadic
+  bind), `future_join2<A,B>(Future<A>, Future<B>) -> Future<(A,B)>` (wait-all),
+  and `future_select<A,B>(…) -> Future<Either<A,B>>` (wait-any, drops the loser)
+  — plus a new prelude `enum Either<A,B> { Left, Right }`. The combinators thread
+  the continuation's effects to the call site via the existing effect-row var
+  (`future_map` of a pure closure is pure; of an `io` closure is `io`). And
+  **`JoinHandle<T>`**: `spawn` now returns a move-only, result-typed handle that
+  `join` consumes — so double-joining (a double free) is a compile error.
+- **A pre-existing codegen bug, fixed** (surfaced by Phase 172) — malloc sizes
+  were baked with LLVM's default DataLayout (i64 under-aligned to 4) while
+  StructGEP offsets lower against the host layout (i64 align 8), so a
+  `Poll<multi-payload-enum>` slot was under-allocated by 8 bytes — an 8-byte heap
+  overflow on `block_on` of such a future (also hit `block_on(async fn ->
+  Result/Option)`). The host DataLayout is now pinned before the codegen walk.
+- **async timeouts + cancellation** (Phase 173) — `timeout<T>(Future<T>, ms) ->
+  Future<Option<T>>` races a future against an internal `sleep_ms` timer
+  (`Some(v)` if it finishes first, `None` on timeout); `task_cancel<T>(
+  JoinHandle<T>)` retires + releases a spawned task (and consumes the handle, so
+  a cancelled task can't be joined). With `future_join2` these are the
+  structured-concurrency primitives.
+- **Effect subtyping** (Phase 175) — a function value that performs FEWER effects
+  is now usable where one with MORE effects is expected (subsumption): a pure
+  `fn()->R` coerces into a `fn()->R ! {io}` parameter. One-way and sound (an
+  actual that does more than expected is still rejected); the `! {e}` effect-row
+  threading of `vec_map`/`future_map` is unchanged.
+- **User-defined effects + effect HANDLERS — algebraic effects** (Phase 176, the
+  headline) — `effect E { fn op(a: A) -> R; … }` declares an effect and its
+  operations; `perform E::op(args)` invokes the dynamically-current handler and
+  RESUMES at the call site with its result; `handle { body } with E { op(p) =>
+  hbody, … }` installs handlers for the body's dynamic extent and DISCHARGES `E`
+  from the body's effect row (the way `catch` clears `panic`). Handler arms
+  desugar to by-reference-capturing closures, so multiple arms share live
+  handle-scope state — a `State` effect's `get`/`put` operate on one cell. This
+  is the **tail-resumptive / dynamically-scoped subset** (reader, state, logging,
+  dependency injection), implemented over a per-(effect,op) current-handler
+  global with save/restore. `effect`/`handle`/`with`/`perform` are CONTEXTUAL
+  keywords (a variable named `handle` still works).
+
+### Deferred / honest limitations
+- **Phase 174 (multi-threaded work-stealing executor + macOS `kqueue`)** is NOT
+  in this release. The async executor remains single-threaded (cooperative) with
+  an `epoll` reactor on Linux; a parallel work-stealing executor and a `kqueue`
+  reactor are substantial, separately-verifiable future work and are tracked in
+  ROADMAP.md.
+- **Algebraic effects** ship as the tail-resumptive subset only: no non-tail
+  resume, no multi-shot resume, no abort-without-unwind, and a `handle` body must
+  not `return` through the handle. `future_select`/`timeout`/`task_cancel` drop a
+  loser/cancelled task SHALLOWLY — a mid-flight async-fn loser leaks its nested
+  in-flight sub-frame (memory-safe; a recursive `Future`-drop is future work).
+
 ## [0.31.0] — Roadmap v31 "concurrency, hardened (differentiator I)" (Phases 167-171)
 
 Theme: take the concurrency story from "structural Send + a type-erased i64

@@ -255,6 +255,13 @@ std::string applyPrelude(const std::string& userSrc) {
     // through the existing enum/match codegen with zero new lowering.
     if (userSrc.find("enum SelectResult") == std::string::npos)
         prelude += "enum SelectResult<T> { Ready(i64, T), Closed(i64) }\n";
+    // v32 Phase 172: the Future `select` combinator's result — `Left(a)` if the
+    // first future won, `Right(b)` if the second did. A plain prelude enum so
+    // `match block_on(select(fa, fb)) { Left(a) => .., Right(b) => .. }` works
+    // through the existing enum/match codegen. (Distinct from the arity-1
+    // channel `SelectResult<T>` above — this is the canonical 2-type sum.)
+    if (userSrc.find("enum Either") == std::string::npos)
+        prelude += "enum Either<A, B> { Left(A), Right(B) }\n";
     // v31 Phase 169: the ergonomic atomics surface. `enum Ordering` + inherent
     // `impl AtomicI64 / AtomicBool` whose methods MATCH on the ordering and
     // dispatch to the statically-named builtins (atomic_i64_fetch_add_seqcst,
@@ -1871,6 +1878,8 @@ bool resolveModules(const std::string& srcRaw,
     for (auto& sd : pr.program.structs) out.structs.push_back(std::move(sd));
     for (auto& ed : pr.program.enums) out.enums.push_back(std::move(ed));
     for (auto& td : pr.program.traits) out.traits.push_back(std::move(td));
+    // v32 Phase 176: carry user-declared effects across the module merge.
+    for (auto& ed : pr.program.effects) out.effects.push_back(std::move(ed));
     for (auto& impl : pr.program.impls) out.impls.push_back(std::move(impl));
     // Phase 24: carry `extern "C"` declarations across the module merge too,
     // so a program (or an imported `mod`) can declare + call C functions.

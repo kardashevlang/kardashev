@@ -10,12 +10,18 @@ full numeric tower, async, and threads. It is well above the median hobby/studen
 compiler in breadth and test discipline. It is **not** a production language: it
 is pre-ecosystem, pre-performance-proven, and MVP-shaped in places.
 
-**Shipped: v1–v23** (Phases 0–129, through `v0.23.0`). The per-version themes are
+**Shipped: v1–v32** (Phases 0–176, through `v0.32.0`). The per-version themes are
 in the [README roadmap table](README.md#roadmap); every phase's detail is in
 [CHANGELOG.md](CHANGELOG.md). v15–v19 built a self-hosted *mini* compiler and a
 differential-fuzzing test surface; v20 took it to real LLVM IR; v21 added a
 benchmark suite and closed the measured leaks; v22 landed `||` and `&<temporary>`
-and reconciled the docs; v23 added a second backend (`kardc --emit-c`).
+and reconciled the docs; v23 added a second backend (`kardc --emit-c`); v24–v28
+finished diagnostics, the trait system, patterns/borrow-check, strings/UTF-8, and
+const-eval/generics; v29–v30 finished the C backend; v31 hardened concurrency;
+v32 matured async (Future combinators, `JoinHandle`, timeout/cancel) and the
+effect system (subtyping + user-defined **algebraic effects with handlers**) —
+**Phase 174** (a multi-threaded work-stealing executor + macOS `kqueue`) is the
+one v32 phase deferred to future work (the executor stays single-threaded).
 
 ## The honest gaps
 
@@ -198,16 +204,27 @@ change); scoped threads join-but-don't-borrow-capture (needs lifetimes).*
   (lifetime-bounded spawning).
 - **171** generic **OS-thread return** (`join<T>`, non-i64 results) + `Arc`/weak.
 
-### v32 — async & effects, matured (differentiator II)
+### v32 — async & effects, matured (differentiator II) — SHIPPED (`v0.32.0`), except 174
 *(Survey: no Future combinators, single-threaded executor, Linux-only async I/O,
 effect system "tracking only — no handlers/subtyping".)*
-- **172** **Future combinators** (`map`/`and_then`/`join`/`select`) + a task API.
-- **173** async **cancellation** + timeouts + structured concurrency.
-- **174** a **multi-threaded / configurable executor** (work-stealing) + macOS
-  async I/O (`kqueue`).
-- **175** **effect inference** completeness + **effect subtyping**.
-- **176** **user-defined effects + effect handlers** (algebraic effects — the
-  research frontier that most extends kardashev's signature feature).
+- **172** ✅ **Future combinators** (`future_map`/`future_and_then`/`future_join2`/
+  `future_select` over a new `Either<A,B>`) + a type-safe move-only `JoinHandle<T>`
+  task API. (Also fixed a latent codegen DataLayout heap-overflow bug.)
+- **173** ✅ (core) async **timeouts** (`timeout -> Option<T>`) + **cancellation**
+  (`task_cancel`); with `future_join2` these are the structured-concurrency
+  primitives. *(Deferred: a recursive `Future`-drop so cancelling/dropping a
+  mid-flight future frees its nested sub-frames; a full async `scope`.)*
+- **174** ⏳ DEFERRED — a **multi-threaded / configurable executor**
+  (work-stealing) + macOS async I/O (`kqueue`). The executor stays
+  single-threaded (cooperative, `epoll` reactor on Linux); the work-stealing
+  rewrite + a `kqueue` reactor are substantial, separately-verifiable future
+  work (the only v32 phase not in `v0.32.0`).
+- **175** ✅ **effect subtyping** (subsumption — a fewer-effect fn coerces where a
+  more-effect one is expected) + closure effect inference (already complete).
+- **176** ✅ **user-defined effects + effect handlers** (algebraic effects) — the
+  tail-resumptive / dynamically-scoped subset (`effect`/`perform`/`handle … with`,
+  resume-with-value, `State`/reader/logging). *(Deferred: non-tail + multi-shot
+  resume, abort-without-unwind.)*
 
 ### v33 — systems-grade: FFI, `unsafe` & `no_std`
 *(Critic: "incomplete FFI; no raw pointers; no inline asm/SIMD; no `no_std`".)*

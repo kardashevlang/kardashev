@@ -844,30 +844,147 @@ public:
             sch.declaredEffects.add("async");
             fnSchemas_["sleep_ms"] = std::move(sch);
         }
-        // Phase 18 built-in, generic: `spawn<T>(f: Future<T>) -> i64`.
+        // v32 Phase 172: `JoinHandle<T>` — a type-safe, move-only handle to a
+        // spawned task. Lowers to the same i64 task index as the old bare handle
+        // (codegen maps JoinHandle<T> -> i64, like Sender/Mutex), but carries
+        // the result type T statically (so `join` needs no binding-context
+        // inference and can't read the slot at the wrong width) and is NON-Copy
+        // (a plain struct, not in isCopyType): `join` consumes it by value, so
+        // double-joining the same handle (which would double-release the task
+        // slot) is a compile error. Like the old i64 handle, a JoinHandle that
+        // is dropped WITHOUT being joined leaks its task (no Drop glue — joining
+        // is the explicit reclaim); a recursive-drop story arrives in Phase 173.
+        TypePtr joinHandleVar = makeFreshVar();
+        TypePtr joinHandleInst = makeStruct("JoinHandle", {});
+        joinHandleInst->typeArgs = {joinHandleVar};
+        {
+            StructSchema sch;
+            sch.type = joinHandleInst;
+            sch.genericVars.push_back(joinHandleVar);
+            structSchemas_["JoinHandle"] = std::move(sch);
+        }
+        // Helper: a fresh `JoinHandle<X>` instance for a given element var.
+        auto mkJoinHandle = [&](const TypePtr& elem) -> TypePtr {
+            TypePtr h = makeStruct("JoinHandle", {});
+            h->typeArgs = {elem};
+            return h;
+        };
+        // Phase 18 / v32 Phase 172 built-in, generic:
+        //   `spawn<T>(f: Future<T>) -> JoinHandle<T>`.
         // Registers `f` as a concurrent task with the process-global executor
-        // and returns an i64 task handle. Synchronous (no `async` effect): it
+        // and returns a type-safe handle. Synchronous (no `async` effect): it
         // only enqueues; the task makes progress when the executor is driven
         // (by `block_on`/`join`). Codegen specializes per T so the handle's
         // result slot is sized for T (read back by `join<T>`).
         {
             TypePtr spawnVar = makeFreshVar();
             FnSchema sch;
-            sch.signature = makeFunction({makeFuture(spawnVar)}, makeInt());
+            sch.signature =
+                makeFunction({makeFuture(spawnVar)}, mkJoinHandle(spawnVar));
             sch.genericVars.push_back(spawnVar);
             fnSchemas_["spawn"] = std::move(sch);
         }
-        // Phase 18 built-in, generic: `join<T>(handle: i64) -> T`.
-        // Drives the executor until the task named by `handle` completes, then
-        // yields its result. Synchronous (it runs the executor, not suspends).
-        // T is inferred from the binding context; codegen reads the handle's
-        // result slot as T.
+        // Phase 18 / v32 Phase 172 built-in, generic:
+        //   `join<T>(h: JoinHandle<T>) -> T`.
+        // Drives the executor until the task named by `h` completes, then yields
+        // its result and releases the task. Synchronous (it runs the executor,
+        // not suspends). T comes from the handle's type (no binding-context
+        // guess); the handle is CONSUMED (move-only) so it can't be re-joined.
         {
             TypePtr joinVar = makeFreshVar();
             FnSchema sch;
-            sch.signature = makeFunction({makeInt()}, joinVar);
+            sch.signature = makeFunction({mkJoinHandle(joinVar)}, joinVar);
             sch.genericVars.push_back(joinVar);
             fnSchemas_["join"] = std::move(sch);
+        }
+        // v32 Phase 173 built-in, generic:
+        //   `task_cancel<T>(h: JoinHandle<T>)` — cancel a spawned task.
+        // Consumes the move-only handle (so the task can't then be join()'d),
+        // marks the executor task done, and releases its frame+slot (shallow —
+        // a still-suspended task leaks its nested sub-frame; recursive cancel is
+        // future work). Synchronous + effect-free like spawn/join (the async
+        // executor is single-threaded — no thread boundary). Returns unit.
+        {
+            TypePtr cancelVar = makeFreshVar();
+            FnSchema sch;
+            sch.signature = makeFunction({mkJoinHandle(cancelVar)}, makeUnit());
+            sch.genericVars.push_back(cancelVar);
+            fnSchemas_["task_cancel"] = std::move(sch);
+        }
+
+        // v32 Phase 172 built-in, generic: a Future COMBINATOR
+        //   `map<T, U>(f: Future<T>, g: fn(T) -> U ! {e}) -> Future<U>`.
+        // Builds a NEW future that, when polled, drives the inner future `f`
+        // to `Ready(x)`, then applies `g(x)` exactly once and becomes
+        // `Ready(g(x))`. `map` itself is synchronous (it only allocates the
+        // combinator frame); the effect-row var `e` carries the continuation
+        // `g`'s effects to map's call site. This is a conservative attribution:
+        // composing an effectful continuation is treated as performing it (the
+        // effect actually fires later, when the future is polled by
+        // `block_on`/`.await`). Like `thread_spawn`, the closure is stored in a
+        // heap frame and called AFTER `map` returns, so it must be `Fn` — a
+        // by-reference (FnMut) capture would dangle by poll time (enforced in
+        // checkCall). Codegen synthesizes a per-(T,U) leaf future (getOrEmitMap),
+        // mirroring `sleep_ms`/`spawn`; there is no AST body.
+        {
+            TypePtr mapT = makeFreshVar();
+            TypePtr mapU = makeFreshVar();
+            TypePtr mapRow = makeFreshVar();
+            TypePtr mapFn =
+                makeFunction({mapT}, mapU, /*effectLabels=*/{}, mapRow);
+            FnSchema sch;
+            sch.signature =
+                makeFunction({makeFuture(mapT), mapFn}, makeFuture(mapU));
+            sch.genericVars.push_back(mapT);
+            sch.genericVars.push_back(mapU);
+            sch.declaredEffects.add("e"); // row-var name (flows g's effects)
+            sch.effectRowVars.emplace_back("e", mapRow);
+            fnSchemas_["future_map"] = std::move(sch);
+        }
+
+        // v32 Phase 172 built-in, generic: the monadic Future combinator
+        //   `and_then<T, U>(f: Future<T>, g: fn(T) -> Future<U> ! {e})
+        //      -> Future<U>`.
+        // Like `map`, but the continuation `g` returns ANOTHER future, which
+        // `and_then` then drives to completion (futures' `flatMap` / monadic
+        // bind — the building block for sequencing async steps). Same effect
+        // attribution as `map` (the row var `e` carries `g`'s effects to the
+        // call site) and the same `Fn`-closure rule (the continuation is stored
+        // and called at poll time, after `and_then` returns). Codegen
+        // synthesizes a two-state leaf future (getOrEmitAndThen).
+        {
+            TypePtr atT = makeFreshVar();
+            TypePtr atU = makeFreshVar();
+            TypePtr atRow = makeFreshVar();
+            TypePtr atFn =
+                makeFunction({atT}, makeFuture(atU), /*effectLabels=*/{}, atRow);
+            FnSchema sch;
+            sch.signature =
+                makeFunction({makeFuture(atT), atFn}, makeFuture(atU));
+            sch.genericVars.push_back(atT);
+            sch.genericVars.push_back(atU);
+            sch.declaredEffects.add("e"); // row-var name (flows g's effects)
+            sch.effectRowVars.emplace_back("e", atRow);
+            fnSchemas_["future_and_then"] = std::move(sch);
+        }
+
+        // v32 Phase 172 built-in, generic: the structured "wait for all" Future
+        // combinator `join2<A, B>(fa: Future<A>, fb: Future<B>)
+        //   -> Future<(A, B)>`. Runs both futures concurrently and completes
+        // with both results as a tuple (vs `select`'s "wait for any"). Pure (it
+        // only allocates the combinator frame — no continuation, so no effect
+        // row). Codegen synthesizes a per-(A,B) leaf future (getOrEmitJoin2)
+        // that latches each sub-future's value as it completes.
+        {
+            TypePtr jA = makeFreshVar();
+            TypePtr jB = makeFreshVar();
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeFuture(jA), makeFuture(jB)},
+                makeFuture(makeTuple({jA, jB})));
+            sch.genericVars.push_back(jA);
+            sch.genericVars.push_back(jB);
+            fnSchemas_["future_join2"] = std::move(sch);
         }
 
         // Phase 19 built-in: OS threads on pthread.
@@ -1633,6 +1750,77 @@ public:
             fnSchemas_["weak_upgrade"] = std::move(sch);
         }
 
+        // v32 Phase 172: the "wait for any" Future combinator
+        //   `select<A, B>(fa: Future<A>, fb: Future<B>)
+        //      -> Future<Either<A, B>>`.
+        // Completes as soon as EITHER future is ready (`Left(a)` / `Right(b)`)
+        // and drops the loser. Registered here (after the enum loop) because
+        // the prelude enum `Either` is not yet in `enumSchemas_` at the early
+        // built-in registration site (same ordering constraint as
+        // `weak_upgrade`/`select2`). Pure (no continuation). Codegen
+        // synthesizes a per-(A,B) leaf future (getOrEmitSelect).
+        // Defensive (review #3): codegen's getOrEmitSelect hard-codes Either's
+        // shape — exactly 2 type params and variants `Left`/`Right`, whose
+        // payload slots it indexes by name. Only expose future_select if the
+        // in-scope `Either` actually has that shape; if a user shadowed it with
+        // a different-shaped `enum Either`, skip registration (future_select is
+        // then simply an unknown function — a clear error — rather than
+        // mis-indexing a payload at codegen time).
+        if (enumSchemas_.count("Either")) {
+            const EnumSchema& eitherSchema = enumSchemas_["Either"];
+            bool shapeOk = eitherSchema.genericVars.size() == 2 &&
+                           eitherSchema.type->enumVariants.size() == 2;
+            if (shapeOk) {
+                bool hasLeft = false, hasRight = false;
+                for (const auto& v : eitherSchema.type->enumVariants) {
+                    if (v.name == "Left") hasLeft = true;
+                    else if (v.name == "Right") hasRight = true;
+                }
+                shapeOk = hasLeft && hasRight;
+            }
+            if (shapeOk) {
+                TypePtr selA = makeFreshVar();
+                TypePtr selB = makeFreshVar();
+                std::unordered_map<int, TypePtr> subst;
+                subst[eitherSchema.genericVars[0]->varId] = selA;
+                subst[eitherSchema.genericVars[1]->varId] = selB;
+                TypePtr eitherInst = instantiate(eitherSchema.type, subst);
+                eitherInst->typeArgs = {selA, selB};
+                FnSchema sch;
+                sch.signature = makeFunction(
+                    {makeFuture(selA), makeFuture(selB)},
+                    makeFuture(eitherInst));
+                sch.genericVars.push_back(selA);
+                sch.genericVars.push_back(selB);
+                fnSchemas_["future_select"] = std::move(sch);
+            }
+        }
+
+        // v32 Phase 173: `timeout<T>(fut: Future<T>, ms: i64) -> Future<Option<T>>`
+        //   — race `fut` against a `sleep_ms(ms)` timer (built internally by
+        // codegen), completing `Some(v)` if fut wins or `None` on timeout. Pure
+        // construction (no async effect on `timeout` itself; the wait happens
+        // when the resulting future is polled). Registered after the enum loop
+        // because it returns the prelude `Option`. Codegen: getOrEmitTimeout.
+        if (enumSchemas_.count("Option")) {
+            const EnumSchema& optSchema = enumSchemas_["Option"];
+            TypePtr toVar = makeFreshVar();
+            TypePtr optInst;
+            if (!optSchema.genericVars.empty()) {
+                std::unordered_map<int, TypePtr> subst;
+                subst[optSchema.genericVars[0]->varId] = toVar;
+                optInst = instantiate(optSchema.type, subst);
+                optInst->typeArgs = {toVar};
+            } else {
+                optInst = optSchema.type;
+            }
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeFuture(toVar), makeInt()}, makeFuture(optInst));
+            sch.genericVars.push_back(toVar);
+            fnSchemas_["timeout"] = std::move(sch);
+        }
+
         // Pass 1c: register trait declarations. Each trait gets a global
         // entry with its method signatures, used later to validate impl
         // blocks and to type-check method calls through bounded generic
@@ -2072,6 +2260,29 @@ public:
                 continue;
             }
             constDecls_[cd.name] = &cd;
+        }
+
+        // v32 Phase 176: register user-declared effects BEFORE fn signatures,
+        // so an effect name is a valid concrete effect-row label on a fn that
+        // performs it (`fn work() ! { Logger }`). Op param/return types are
+        // resolved lazily at perform/handle sites.
+        for (const auto& ed : program.effects) {
+            if (userEffectNames_.count(ed.name) || isBuiltinEffect(ed.name)) {
+                error("effect redefined (or shadows a built-in effect): " +
+                          ed.name,
+                      ed.line, ed.column);
+                continue;
+            }
+            userEffectNames_.insert(ed.name);
+            for (const auto& op : ed.ops) {
+                if (effectOpDecls_[ed.name].count(op.name)) {
+                    error("effect operation redefined: " + ed.name +
+                              "::" + op.name,
+                          op.line, op.column);
+                    continue;
+                }
+                effectOpDecls_[ed.name][op.name] = &op;
+            }
         }
 
         // Pass 1b: register every fn signature so calls can see siblings
@@ -2780,6 +2991,14 @@ private:
     // effect pass via `collectEffects`. Absent => fall back to the callee's
     // statically declared effects (the pre-Phase-10a behavior).
     std::unordered_map<const ast::Expr*, EffectSet> exprEffects_;
+    // v32 Phase 176: user-declared effects. `userEffectNames_` makes an effect
+    // name a valid (concrete) effect-row label; `effectOpDecls_` maps
+    // effect -> op -> the AST op signature (param/return TypeRefs resolved
+    // lazily at perform/handle sites).
+    std::unordered_set<std::string> userEffectNames_;
+    std::unordered_map<std::string,
+                       std::unordered_map<std::string, const ast::EffectOp*>>
+        effectOpDecls_;
     // Phase 10a: name -> Var for the effect-row variables of the fn whose
     // body is currently being checked. Lets us map a resolved Type Var back
     // to the row-var name it stands for (so a still-polymorphic row var
@@ -2956,6 +3175,10 @@ private:
             }
             if (usedInEffect) rowVars.insert(g.name);
         }
+        // v32 Phase 176: a user-declared effect name is a CONCRETE label, never
+        // an (implicit) effect-row variable — even if it appears in a fn-type
+        // row. Keep it out of the row-var set.
+        for (const auto& en : userEffectNames_) rowVars.erase(en);
         return rowVars;
     }
 
@@ -3049,6 +3272,33 @@ private:
                     out.unionWith(sit->second.declaredEffects);
                 }
             }
+            return;
+        }
+        // v32 Phase 176: performing an effect op contributes the effect E (plus
+        // the arg effects and the op's own declared effects).
+        if (auto* pe = dynamic_cast<const ast::PerformExpr*>(&e)) {
+            for (const auto& a : pe->args) collectEffects(*a, out);
+            out.add(pe->effectName);
+            auto eff = effectOpDecls_.find(pe->effectName);
+            if (eff != effectOpDecls_.end()) {
+                auto op = eff->second.find(pe->opName);
+                if (op != eff->second.end() && op->second)
+                    for (const auto& l : op->second->effects.labels)
+                        out.add(l);
+            }
+            return;
+        }
+        // v32 Phase 176: `handle { body } with E { … }` DISCHARGES E — body's
+        // effects flow through MINUS E, plus each handler arm's body effects
+        // (the arm runs when the op is performed during the handle).
+        if (auto* he = dynamic_cast<const ast::HandleExpr*>(&e)) {
+            EffectSet bodyEff;
+            collectEffects(*he->body, bodyEff);
+            for (const auto& l : bodyEff.labels)
+                if (l != he->effectName) out.add(l);
+            for (const auto& arm : he->arms)
+                if (arm.handler && arm.handler->body)
+                    collectEffects(*arm.handler->body, out);
             return;
         }
         if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
@@ -3212,6 +3462,13 @@ private:
         EffectSet result;
         for (const auto& l : row.labels) {
             if (isBuiltinEffect(l)) {
+                result.add(l);
+                continue;
+            }
+            // v32 Phase 176: a user-declared effect name (`effect Logger {..}`)
+            // is a valid CONCRETE effect-row label — a fn that `perform`s it
+            // declares `! { Logger }`; a `handle … with Logger` discharges it.
+            if (userEffectNames_.count(l)) {
                 result.add(l);
                 continue;
             }
@@ -5140,6 +5397,12 @@ private:
         if (auto* cl = dynamic_cast<const ast::ClosureExpr*>(&e)) {
             return checkClosure(*cl);
         }
+        if (auto* pe = dynamic_cast<const ast::PerformExpr*>(&e)) {
+            return checkPerform(*pe);
+        }
+        if (auto* he = dynamic_cast<const ast::HandleExpr*>(&e)) {
+            return checkHandle(*he);
+        }
         if (auto* te = dynamic_cast<const ast::TryExpr*>(&e)) {
             return checkTry(*te);
         }
@@ -5421,6 +5684,44 @@ private:
         if (expIsRef && !e->refIsMut && a->kind == TypeKind::Ref &&
             a->refIsMut && unify(a->refInner, e->refInner)) {
             return true;
+        }
+        // v32 Phase 175: effect SUBTYPING (subsumption). A fn value that
+        // performs FEWER effects is usable where one with MORE effects is
+        // expected — calling it can only do at most what the expected signature
+        // permits — so a pure `fn()->R` coerces to a `fn()->R ! {io}` parameter.
+        // Unify the arg + return types as usual, then accept if the ACTUAL's
+        // effect labels are a SUBSET of the EXPECTED's (the extra effects the
+        // expected allows simply aren't performed). The reverse — an actual that
+        // does MORE than expected — falls through to the exact unify (rejected).
+        // We fire ONLY when the actual row is CLOSED and the expected has
+        // strictly more labels (or an open tail): an open ACTUAL tail, and the
+        // exact-match case, keep the symmetric unify so effect-row threading
+        // (e.g. the `! {e}` row var of vec_map / future_map) is unchanged.
+        if (e->kind == TypeKind::Function && a->kind == TypeKind::Function &&
+            e->closureBound < 0 && a->args.size() == e->args.size()) {
+            TypePtr aRv = a->effectRowVar ? resolve(a->effectRowVar) : nullptr;
+            TypePtr eRv = e->effectRowVar ? resolve(e->effectRowVar) : nullptr;
+            bool aOpen = aRv && aRv->kind == TypeKind::Var &&
+                         !aRv->effectRowSolved;
+            bool eOpen = eRv && eRv->kind == TypeKind::Var &&
+                         !eRv->effectRowSolved;
+            if (!aOpen) {
+                std::vector<std::string> al = resolveEffectRow(a);
+                std::vector<std::string> el = resolveEffectRow(e);
+                bool actualSubset = true;
+                for (const auto& l : al)
+                    if (std::find(el.begin(), el.end(), l) == el.end()) {
+                        actualSubset = false;
+                        break;
+                    }
+                if (actualSubset && (el.size() > al.size() || eOpen)) {
+                    bool ok = true;
+                    for (std::size_t i = 0; i < a->args.size() && ok; ++i)
+                        if (!unify(a->args[i], e->args[i])) ok = false;
+                    if (ok && !unify(a->ret, e->ret)) ok = false;
+                    if (ok) return true;
+                }
+            }
         }
         return unify(actual, expected);
     }
@@ -6942,6 +7243,107 @@ private:
         return "";
     }
 
+    // v32 Phase 176: `perform E::op(args)` — type-check against the declared op
+    // signature, contribute effect `E`, and yield the op's return type.
+    TypePtr checkPerform(const ast::PerformExpr& pe) {
+        auto eff = effectOpDecls_.find(pe.effectName);
+        if (eff == effectOpDecls_.end()) {
+            error("unknown effect `" + pe.effectName +
+                      "` (declare it with `effect " + pe.effectName + " { … }`)",
+                  pe.line, pe.column);
+            for (const auto& a : pe.args) checkExpr(*a);
+            return makeInt();
+        }
+        auto opIt = eff->second.find(pe.opName);
+        if (opIt == eff->second.end() || !opIt->second) {
+            error("effect `" + pe.effectName + "` has no operation `" +
+                      pe.opName + "`",
+                  pe.line, pe.column);
+            for (const auto& a : pe.args) checkExpr(*a);
+            return makeInt();
+        }
+        const ast::EffectOp& op = *opIt->second;
+        std::vector<TypePtr> paramTypes;
+        paramTypes.reserve(op.params.size());
+        for (const auto& p : op.params)
+            paramTypes.push_back(resolveTypeRef(p.type));
+        TypePtr ret = resolveTypeRef(op.returnType);
+        if (pe.args.size() != paramTypes.size())
+            error("`perform " + pe.effectName + "::" + pe.opName +
+                      "` expects " + std::to_string(paramTypes.size()) +
+                      " arg(s), got " + std::to_string(pe.args.size()),
+                  pe.line, pe.column);
+        std::size_t n = std::min(pe.args.size(), paramTypes.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            TypePtr at = checkExpr(*pe.args[i]);
+            if (!coerceOrUnify(*pe.args[i], at, paramTypes[i]))
+                error("argument " + std::to_string(i + 1) + " to `perform " +
+                          pe.effectName + "::" + pe.opName + "` has type " +
+                          typeToString(at) + ", expected " +
+                          typeToString(paramTypes[i]),
+                      pe.args[i]->line, pe.args[i]->column);
+        }
+        // Record this site's effect contribution (E + the op's own effects).
+        EffectSet contrib;
+        contrib.add(pe.effectName);
+        for (const auto& l : op.effects.labels) contrib.add(l);
+        exprEffects_[&pe] = std::move(contrib);
+        return ret;
+    }
+
+    // v32 Phase 176: `handle { body } with E { op(p) => hbody, … }`. Each arm is
+    // a closure desugared at parse time; check it against the op's signature
+    // (params + return). The handle's value is the body's value. (Effect E is
+    // discharged from the body in collectEffects, not here.)
+    TypePtr checkHandle(const ast::HandleExpr& he) {
+        auto eff = effectOpDecls_.find(he.effectName);
+        if (eff == effectOpDecls_.end()) {
+            error("unknown effect `" + he.effectName +
+                      "` in `handle … with`",
+                  he.line, he.column);
+        }
+        for (const auto& arm : he.arms) {
+            if (!arm.handler) continue;
+            const ast::EffectOp* op = nullptr;
+            if (eff != effectOpDecls_.end()) {
+                auto opIt = eff->second.find(arm.opName);
+                if (opIt != eff->second.end()) op = opIt->second;
+            }
+            if (!op) {
+                if (eff != effectOpDecls_.end())
+                    error("effect `" + he.effectName + "` has no operation `" +
+                              arm.opName + "`",
+                          arm.line, arm.column);
+                checkExpr(*arm.handler); // still check the body
+                continue;
+            }
+            std::vector<TypePtr> paramTypes;
+            paramTypes.reserve(op->params.size());
+            for (const auto& p : op->params)
+                paramTypes.push_back(resolveTypeRef(p.type));
+            TypePtr ret = resolveTypeRef(op->returnType);
+            if (arm.handler->params.size() != paramTypes.size())
+                error("handler for `" + he.effectName + "::" + arm.opName +
+                          "` takes " +
+                          std::to_string(arm.handler->params.size()) +
+                          " param(s), but the operation declares " +
+                          std::to_string(paramTypes.size()),
+                      arm.line, arm.column);
+            // Drive closure-param inference from the op's signature, then
+            // require the handler body's type to match the op's return type.
+            expectedArgType_ = makeFunction(paramTypes, ret);
+            TypePtr clTy = resolve(checkExpr(*arm.handler));
+            if (clTy->kind == TypeKind::Function &&
+                !unify(clTy->ret, ret))
+                error("handler for `" + he.effectName + "::" + arm.opName +
+                          "` returns " + typeToString(clTy->ret) +
+                          ", but the operation returns " + typeToString(ret),
+                      arm.line, arm.column);
+        }
+        // The handle expression evaluates to its body's value.
+        return checkExpr(*he.body);
+    }
+
     // Phase 10b: type-check a capturing closure `|params| body`. Determines
     // the captured free variables (recorded on the AST node for codegen),
     // checks the body in a scope holding ONLY the params + captures (so an
@@ -7111,7 +7513,10 @@ private:
             ast::ClosureCapture cap;
             cap.name = name;
             cap.type = t;
-            cap.byRef = mutated;
+            // v32 Phase 176: a handler-arm closure captures EVERY free var by
+            // reference (see ClosureExpr::forceCaptureByRef) so all arms share
+            // the live handle-scope state (e.g. a State effect's cell).
+            cap.byRef = mutated || cl.forceCaptureByRef;
             cl.captures.push_back(std::move(cap));
             captureTypes.emplace_back(name, t);
             captureMut.push_back(enclosingMut);
@@ -7730,6 +8135,59 @@ private:
                 resolve(typeArgs[0])->kind == TypeKind::Unit) {
                 error("Vec element type cannot be unit", call.line,
                       call.column);
+            }
+            // v32 Phase 172: a Future combinator's inner result type T becomes
+            // the closure's parameter type, and `unit` lowers to `void`, which
+            // cannot be a fn parameter. Reject a unit inner type (combine a
+            // non-unit future). T is typeArgs[0].
+            if ((call.callee == "future_map" || call.callee == "future_and_then") &&
+                !typeArgs.empty() &&
+                resolve(typeArgs[0])->kind == TypeKind::Unit) {
+                error("`" + call.callee +
+                          "`'s inner future result type cannot be unit (its "
+                          "value is handed to the closure)",
+                      call.line, call.column);
+            }
+            // v32 Phase 172: `join2` latches each sub-future's value into the
+            // result tuple, so neither result type may be unit (`void` has no
+            // storable value). A and B are typeArgs[0] / typeArgs[1].
+            if (call.callee == "future_join2" && typeArgs.size() >= 2 &&
+                (resolve(typeArgs[0])->kind == TypeKind::Unit ||
+                 resolve(typeArgs[1])->kind == TypeKind::Unit)) {
+                error("`future_join2` future result types cannot be unit (each value "
+                      "is latched into the result tuple)",
+                      call.line, call.column);
+            }
+            // v32 Phase 172: `select` carries the winning future's value in an
+            // `Either` payload, so neither result type may be unit (`void` has
+            // no storable payload). A and B are typeArgs[0] / typeArgs[1].
+            if (call.callee == "future_select" && typeArgs.size() >= 2 &&
+                (resolve(typeArgs[0])->kind == TypeKind::Unit ||
+                 resolve(typeArgs[1])->kind == TypeKind::Unit)) {
+                error("`future_select` future result types cannot be unit (the "
+                      "winner's value is carried in an `Either` payload)",
+                      call.line, call.column);
+            }
+            // v32 Phase 172: the closure handed to a Future combinator (`map` /
+            // `and_then`) is stored in the heap combinator frame and called
+            // LATER, when the future is polled — after this call has returned. A
+            // by-reference (FnMut) capture aliases the caller's stack frame,
+            // which is dead by poll time (use-after-free). Require a by-value
+            // (`Fn`) closure, exactly like the thread_spawn Send floor. The
+            // closure is arg[1] (arg[0] is the inner Future).
+            if ((call.callee == "future_map" || call.callee == "future_and_then") &&
+                call.args.size() > 1) {
+                std::string offending = closureByRefCaptureName(*call.args[1]);
+                if (!offending.empty()) {
+                    error("closure passed to `" + call.callee + "` captures `" +
+                              offending +
+                              "` by reference (FnMut), but a Future "
+                              "combinator's closure is stored and called later "
+                              "(when the future is polled), after this call "
+                              "returns — a by-ref capture would dangle. Capture "
+                              "it by value (`Fn`) instead",
+                          call.args[1]->line, call.args[1]->column);
+                }
             }
             if (!schema.genericVars.empty()) {
                 callInstantiations_[&call] = std::move(typeArgs);

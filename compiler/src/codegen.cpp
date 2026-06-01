@@ -85,7 +85,54 @@ public:
         structTypes_["HashSet"] = hm; // HashSet shares the HashMap layout
     }
 
+    // Phase 35 / v32 fix: pin the module to the HOST target's DataLayout. This
+    // MUST happen before any `getTypeAllocSize` is consulted during the codegen
+    // walk: those sizes are baked into malloc/alloca SIZE CONSTANTS at codegen
+    // time, whereas every StructGEP field OFFSET is lowered against the module's
+    // DataLayout at backend time. LLVM's default (pre-set) layout under-aligns
+    // i64 (4 vs the host's 8), so a `{ i1, Enum }` Poll slot or a `{ tag, p0,
+    // p1 }` enum is sized SMALLER than the offsets the backend later computes —
+    // an 8-byte heap under-allocation that overflows the next chunk (surfaced
+    // by `block_on` of a future whose result is a multi-payload enum, e.g.
+    // `Either`/`Result`). Setting the host layout up front makes the baked
+    // sizes and the lowered offsets agree. Idempotent.
+    bool hostDataLayoutSet_ = false;
+    void setHostDataLayout() {
+        // Idempotent: run() pins the layout up front; finish()'s (and any other)
+        // call is then a no-op — avoids redoing target lookup AND avoids leaking
+        // a second TargetMachine. createTargetMachine returns an OWNING raw
+        // pointer, so we delete it after copying out the DataLayout.
+        if (hostDataLayoutSet_) return;
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+        std::string tripleStr = llvm::sys::getDefaultTargetTriple();
+        std::string tErr;
+        if (const llvm::Target* tgt =
+                llvm::TargetRegistry::lookupTarget(tripleStr, tErr)) {
+            llvm::TargetOptions topts;
+#if LLVM_VERSION_MAJOR >= 21
+            llvm::Triple triple(tripleStr);
+            module_->setTargetTriple(triple);
+            auto* tm = tgt->createTargetMachine(triple, "generic", "", topts,
+                                                llvm::Reloc::PIC_);
+#else
+            module_->setTargetTriple(tripleStr);
+            auto* tm = tgt->createTargetMachine(tripleStr, "generic", "", topts,
+                                                llvm::Reloc::PIC_);
+#endif
+            if (tm) {
+                module_->setDataLayout(tm->createDataLayout());
+                delete tm; // caller owns the TargetMachine
+            }
+        }
+        hostDataLayoutSet_ = true;
+    }
+
     void run(const ast::Program& program) {
+        // v32 fix: establish the host DataLayout FIRST (before ensureCoreStruct
+        // Types / any getTypeAllocSize) so baked malloc sizes match the
+        // backend's GEP offsets. See setHostDataLayout.
+        setHostDataLayout();
         // v26 Phase 144: register type aliases so astTypeRefToConcrete resolves
         // an alias name to its target (matching the typechecker).
         for (const auto& [name, target] : program.typeAliases)
@@ -390,27 +437,11 @@ public:
         // offset — a silent miscompile at -O1+ that only surfaces when such a
         // value is read through a pointer (the keystone recursive-enum read).
         // Idempotent target init; the AOT/JIT paths set this again later.
-        llvm::InitializeNativeTarget();
-        llvm::InitializeNativeTargetAsmPrinter();
-        {
-            std::string tripleStr = llvm::sys::getDefaultTargetTriple();
-            std::string tErr;
-            if (const llvm::Target* tgt =
-                    llvm::TargetRegistry::lookupTarget(tripleStr, tErr)) {
-                llvm::TargetOptions topts;
-#if LLVM_VERSION_MAJOR >= 21
-                llvm::Triple triple(tripleStr);
-                module_->setTargetTriple(triple);
-                auto* tm = tgt->createTargetMachine(triple, "generic", "",
-                                                    topts, llvm::Reloc::PIC_);
-#else
-                module_->setTargetTriple(tripleStr);
-                auto* tm = tgt->createTargetMachine(tripleStr, "generic", "",
-                                                    topts, llvm::Reloc::PIC_);
-#endif
-                if (tm) module_->setDataLayout(tm->createDataLayout());
-            }
-        }
+        // NOTE: also called at the START of run() — see setHostDataLayout — so
+        // every `getTypeAllocSize`-derived malloc SIZE baked during the codegen
+        // walk uses the SAME host layout the backend lowers GEP offsets with.
+        // (This call stays for safety / debug-info-only paths.)
+        setHostDataLayout();
         // v19 Phase 114: if codegen already reported errors, the IR is expected
         // to be ill-formed — each error path returns a placeholder value and
         // keeps emitting, so downstream uses produce type-mismatched IR. Running
@@ -2307,6 +2338,21 @@ private:
         subst[schema.genericVars[0]->varId] = V;
         TypePtr inst = instantiate(schema.type, subst);
         inst->typeArgs = {V};
+        return inst;
+    }
+
+    // v32 Phase 172: Either<A, B> (the prelude enum `select` returns —
+    // Left(A) for the first future, Right(B) for the second).
+    TypePtr eitherType(const TypePtr& A, const TypePtr& B) {
+        auto eit = tc_.enums.find("Either");
+        if (eit == tc_.enums.end()) return nullptr;
+        const EnumSchema& schema = eit->second;
+        if (schema.genericVars.size() < 2) return schema.type;
+        std::unordered_map<int, TypePtr> subst;
+        subst[schema.genericVars[0]->varId] = A;
+        subst[schema.genericVars[1]->varId] = B;
+        TypePtr inst = instantiate(schema.type, subst);
+        inst->typeArgs = {A, B};
         return inst;
     }
 
@@ -6651,6 +6697,13 @@ private:
         auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
         auto* pollT = pollTypeFor(T);
         auto* valTy = mapKardashevType(T);
+        // v32 Phase 172: with `JoinHandle<T>`, `join`'s T now flows from the
+        // handle's type — so a unit-result task (`spawn(unit_async())`) reaches
+        // here with T = unit (valTy = void), whereas before the discarded result
+        // defaulted T to i64. A void fn can't `ret` a value or a null-value, and
+        // can't `load` its (void) slot — handle it explicitly: return void,
+        // still releasing the task.
+        bool isVoid = valTy->isVoidTy();
         auto* fnTy = llvm::FunctionType::get(valTy, {i64Ty}, false);
         auto* fn = llvm::Function::Create(
             fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
@@ -6665,7 +6718,8 @@ private:
         auto* badBB = llvm::BasicBlock::Create(ctx, "bad", fn);
         b.CreateCondBr(inRange, okBB, badBB);
         b.SetInsertPoint(badBB);
-        b.CreateRet(llvm::Constant::getNullValue(valTy));
+        if (isVoid) b.CreateRetVoid();
+        else b.CreateRet(llvm::Constant::getNullValue(valTy));
         b.SetInsertPoint(okBB);
         b.CreateCall(execDriveFn_, {h});
         auto* slot = b.CreateCall(execSlotFn_, {h}, "tslot");
@@ -6676,8 +6730,16 @@ private:
         auto* readBB = llvm::BasicBlock::Create(ctx, "read", fn);
         b.CreateCondBr(typeOk, readBB, typeBadBB);
         b.SetInsertPoint(typeBadBB);
-        b.CreateRet(llvm::Constant::getNullValue(valTy));
+        if (isVoid) b.CreateRetVoid();
+        else b.CreateRet(llvm::Constant::getNullValue(valTy));
         b.SetInsertPoint(readBB);
+        // v32: a unit-result task carries no value — release and return void.
+        if (isVoid) {
+            if (execReleaseFn_) b.CreateCall(execReleaseFn_, {h});
+            b.CreateRetVoid();
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
         auto* pslot = b.CreateLoad(
             i8PtrTy, b.CreateStructGEP(taskTy_, slot, TASK_SLOT, "sp"),
             "pslot");
@@ -6694,6 +6756,822 @@ private:
         // outside the frame/slot, so freeing after the load is safe.
         if (execReleaseFn_) b.CreateCall(execReleaseFn_, {h});
         b.CreateRet(val);
+        declaredFns_[mangled] = fn;
+        return fn;
+    }
+
+    // v32 Phase 173: `task_cancel<T>(h: JoinHandle<T>)` — cancel a spawned task.
+    // T-agnostic at the LLVM level (the handle is a bare i64 index), so a single
+    // shared `__kd_task_cancel(i64)` serves every T. It marks task[h] DONE (so
+    // __kd_exec_step stops polling it — step skips on TASK_DONE, NOT on a null
+    // frame, so the done flag is what actually retires it) and releases its
+    // frame + result slot. The release is SHALLOW (a bare free of the task's top
+    // frame): a still-suspended async-fn task leaks its nested in-flight
+    // sub-frame, the same documented limitation as future_select's loser-drop —
+    // recursive cancellation is future work. Out-of-range / already-released
+    // handles are a no-op (release is null-guarded). Consumes the (move-only)
+    // handle, so a cancelled task can't then be join()'d.
+    llvm::Function* getOrEmitTaskCancel() {
+        auto it = declaredFns_.find("__kd_task_cancel");
+        if (it != declaredFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* voidTy = llvm::Type::getVoidTy(ctx);
+        auto* fnTy = llvm::FunctionType::get(voidTy, {i64Ty}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::InternalLinkage, "__kd_task_cancel",
+            module_.get());
+        fn->getArg(0)->setName("h");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* doBB = llvm::BasicBlock::Create(ctx, "do", fn);
+        auto* retBB = llvm::BasicBlock::Create(ctx, "ret", fn);
+        llvm::IRBuilder<> b(entry);
+        auto* h = fn->getArg(0);
+        auto* count = b.CreateLoad(
+            i64Ty, b.CreateStructGEP(execTy_, execGlobal_, EXEC_COUNT, "cnt_p"),
+            "count");
+        b.CreateCondBr(b.CreateICmpULT(h, count, "in_range"), doBB, retBB);
+        b.SetInsertPoint(doBB);
+        auto* slot = b.CreateCall(execSlotFn_, {h}, "tslot");
+        // Mark done first (retire it from the round-robin) THEN release.
+        b.CreateStore(llvm::ConstantInt::get(i64Ty, 1),
+                      b.CreateStructGEP(taskTy_, slot, TASK_DONE, "done_p"));
+        if (execReleaseFn_) b.CreateCall(execReleaseFn_, {h});
+        b.CreateBr(retBB);
+        b.SetInsertPoint(retBB);
+        b.CreateRetVoid();
+        declaredFns_["__kd_task_cancel"] = fn;
+        return fn;
+    }
+
+    // v32 Phase 172: `map<T, U>(f: Future<T>, g: fn(T) -> U) -> Future<U>` — a
+    // Future COMBINATOR, synthesized per (T, U). The returned future's heap
+    // frame holds the inner future `f` plus the closure `g` (its `{ fn, env }`
+    // fat pointer split into two i8* fields). Its poll fn drives `f` once: on
+    // Pending it propagates Pending; on Ready(x) it frees f's frame, applies
+    // `y = g(x)`, frees g's heap capture env (the closure is consumed), and
+    // reports Ready(y). This composes the leaf-future template (`sleep_ms`),
+    // the sub-future poll idiom (`emitAwait`), and closure application
+    // (`emitCallValue`). Mangled `map__<T>__<U>` so emitCall routes here.
+    llvm::Function* getOrEmitMap(const TypePtr& T, const TypePtr& U) {
+        std::string mangled = "map__" + mangleType(T) + "__" + mangleType(U);
+        auto it = declaredFns_.find(mangled);
+        if (it != declaredFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* futureTy = structTypes_["Future"];
+        auto* pollTinner = pollTypeFor(T); // Poll<T> of the inner future
+        auto* pollUouter = pollTypeFor(U); // Poll<U> of our own out-param
+        auto* valT = mapKardashevType(T);
+        auto* valU = mapKardashevType(U);
+        // The closure's env-calling-convention type: `U (i8* env, T)`. T is
+        // guaranteed non-unit (typecheck rejects a unit inner type), so the
+        // arg is well-formed; U may be unit (-> void return).
+        auto* gCallTy = envCalleeType(makeFunction({T}, U));
+        std::string sfx = mangleType(T) + "__" + mangleType(U);
+
+        // frame { Future inner, i8* g_fn, i8* g_env }.
+        auto* frameTy = llvm::StructType::create(
+            ctx, {futureTy, i8PtrTy, i8PtrTy}, "kd.map_frame." + sfx);
+
+        // ---- void __kd_map_poll__T__U(i8* frame, kd.poll* out) ----
+        auto* pollFn = llvm::Function::Create(
+            pollFnTy_, llvm::Function::InternalLinkage,
+            "__kd_map_poll__" + sfx, module_.get());
+        pollFn->getArg(0)->setName("frame");
+        pollFn->getArg(1)->setName("out");
+        {
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", pollFn);
+            auto* readyBB = llvm::BasicBlock::Create(ctx, "ready", pollFn);
+            auto* pendBB = llvm::BasicBlock::Create(ctx, "pending", pollFn);
+            llvm::IRBuilder<> b(entry);
+            // Observe the poll (shared global counter, like sleep_ms).
+            auto* pc = b.CreateLoad(i64Ty, kdPollCount_, "pc");
+            b.CreateStore(
+                b.CreateAdd(pc, llvm::ConstantInt::get(i64Ty, 1)),
+                kdPollCount_);
+            auto* frame = pollFn->getArg(0);
+            auto* out = pollFn->getArg(1);
+            // Drive the inner future once (sub-future poll idiom).
+            auto* innerP = b.CreateStructGEP(frameTy, frame, 0, "inner_p");
+            auto* inner = b.CreateLoad(futureTy, innerP, "inner");
+            auto* subPoll = b.CreateExtractValue(inner, {0}, "inner.poll");
+            auto* subFrame = b.CreateExtractValue(inner, {1}, "inner.frame");
+            auto* subSlot = b.CreateAlloca(pollTinner, nullptr, "inner_poll");
+            b.CreateCall(pollFnTy_, subPoll, {subFrame, subSlot});
+            auto* rdy = b.CreateLoad(
+                i1Ty, b.CreateStructGEP(pollTinner, subSlot, 0, "in_rdy_p"),
+                "in_rdy");
+            b.CreateCondBr(rdy, readyBB, pendBB);
+
+            // PENDING: propagate Pending (only the ready flag is written).
+            b.SetInsertPoint(pendBB);
+            b.CreateStore(
+                llvm::ConstantInt::getFalse(ctx),
+                b.CreateStructGEP(pollUouter, out, 0, "out_rdy0"));
+            b.CreateRetVoid();
+
+            // READY: the inner future is complete and never polled again, so
+            // free its heap frame (a null frame makes the free a safe no-op).
+            b.SetInsertPoint(readyBB);
+            b.CreateCall(freeFn_, {subFrame});
+            auto* x = b.CreateLoad(
+                valT, b.CreateStructGEP(pollTinner, subSlot, 1, "xval_p"), "x");
+            // Apply g(x) through the closure's fat pointer (fn + env).
+            auto* gFn = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(frameTy, frame, 1, "gfn_p"), "g_fn");
+            auto* gEnv = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(frameTy, frame, 2, "genv_p"),
+                "g_env");
+            llvm::Value* y = b.CreateCall(
+                gCallTy, gFn, {gEnv, x},
+                gCallTy->getReturnType()->isVoidTy() ? "" : "map_g");
+            // The closure is consumed here (called exactly once); free its heap
+            // capture env. A top-level fn / no-capture closure has a null env,
+            // making the free a safe no-op.
+            b.CreateCall(freeFn_, {gEnv});
+            // Report Ready(y). A unit (`void`) result has no value to store —
+            // write the unit-as-zero placeholder into the i64 value slot to
+            // keep it well-defined (Poll<unit> uses the canonical i64 slot).
+            b.CreateStore(
+                llvm::ConstantInt::getTrue(ctx),
+                b.CreateStructGEP(pollUouter, out, 0, "out_rdy1"));
+            if (gCallTy->getReturnType()->isVoidTy()) {
+                b.CreateStore(
+                    llvm::ConstantInt::get(i64Ty, 0),
+                    b.CreateStructGEP(pollUouter, out, 1, "out_val_unit"));
+            } else {
+                b.CreateStore(
+                    y, b.CreateStructGEP(pollUouter, out, 1, "out_val"));
+            }
+            b.CreateRetVoid();
+            (void)valU;
+        }
+
+        // ---- Future map__T__U(Future f, { i8* fn, i8* env } g) ----
+        auto* fnTy =
+            llvm::FunctionType::get(futureTy, {futureTy, fnValTy_}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        fn->getArg(0)->setName("f");
+        fn->getArg(1)->setName("g");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        llvm::IRBuilder<> b(entry);
+        uint64_t sz = module_->getDataLayout().getTypeAllocSize(frameTy);
+        auto* frame = b.CreateCall(
+            mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "map_frame");
+        b.CreateStore(fn->getArg(0),
+                      b.CreateStructGEP(frameTy, frame, 0, "inner0"));
+        auto* gFn = b.CreateExtractValue(fn->getArg(1), {0}, "g.fn");
+        auto* gEnv = b.CreateExtractValue(fn->getArg(1), {1}, "g.env");
+        b.CreateStore(gFn, b.CreateStructGEP(frameTy, frame, 1, "gfn0"));
+        b.CreateStore(gEnv, b.CreateStructGEP(frameTy, frame, 2, "genv0"));
+        llvm::Value* futv = llvm::UndefValue::get(futureTy);
+        futv = b.CreateInsertValue(futv, pollFn, {0}, "fut.poll");
+        futv = b.CreateInsertValue(futv, frame, {1}, "fut.frame");
+        b.CreateRet(futv);
+        declaredFns_[mangled] = fn;
+        return fn;
+    }
+
+    // v32 Phase 172: `and_then<T, U>(f: Future<T>, g: fn(T) -> Future<U>)
+    //   -> Future<U>` — the monadic Future combinator (futures' `flatMap`),
+    // synthesized per (T, U). Unlike `map` (whose continuation returns a plain
+    // value), `and_then`'s continuation returns ANOTHER future, so the result
+    // is a TWO-STATE machine:
+    //   state 0: drive the inner future `f`; on Ready(x) apply `g(x)` to get a
+    //            second future `f2: Future<U>`, free f's frame + g's env, store
+    //            f2, advance to state 1, and fall straight through to poll it.
+    //   state 1: drive `f2`; on Ready(y) free f2's frame and report Ready(y).
+    // Pending in either state propagates Pending (the state field persists in
+    // the heap frame across polls). Mangled `and_then__<T>__<U>`.
+    llvm::Function* getOrEmitAndThen(const TypePtr& T, const TypePtr& U) {
+        std::string mangled =
+            "and_then__" + mangleType(T) + "__" + mangleType(U);
+        auto it = declaredFns_.find(mangled);
+        if (it != declaredFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* futureTy = structTypes_["Future"];
+        auto* pollTinner = pollTypeFor(T); // Poll<T> of the inner future
+        auto* pollUouter = pollTypeFor(U); // Poll<U> of f2 and of our out-param
+        auto* valT = mapKardashevType(T);
+        auto* valU = mapKardashevType(U);
+        // The continuation's env-calling-convention type: `Future (i8* env, T)`.
+        auto* gCallTy = envCalleeType(makeFunction({T}, makeFuture(U)));
+        std::string sfx = mangleType(T) + "__" + mangleType(U);
+
+        // frame { i64 state, Future inner, i8* g_fn, i8* g_env, Future f2 }.
+        auto* frameTy = llvm::StructType::create(
+            ctx, {i64Ty, futureTy, i8PtrTy, i8PtrTy, futureTy},
+            "kd.and_then_frame." + sfx);
+
+        // ---- void __kd_and_then_poll__T__U(i8* frame, kd.poll* out) ----
+        auto* pollFn = llvm::Function::Create(
+            pollFnTy_, llvm::Function::InternalLinkage,
+            "__kd_and_then_poll__" + sfx, module_.get());
+        pollFn->getArg(0)->setName("frame");
+        pollFn->getArg(1)->setName("out");
+        {
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", pollFn);
+            auto* s0BB = llvm::BasicBlock::Create(ctx, "state0", pollFn);
+            auto* s0RdyBB = llvm::BasicBlock::Create(ctx, "state0_ready", pollFn);
+            auto* s1BB = llvm::BasicBlock::Create(ctx, "state1", pollFn);
+            auto* s1RdyBB = llvm::BasicBlock::Create(ctx, "state1_ready", pollFn);
+            auto* pendBB = llvm::BasicBlock::Create(ctx, "pending", pollFn);
+            llvm::IRBuilder<> b(entry);
+            auto* pc = b.CreateLoad(i64Ty, kdPollCount_, "pc");
+            b.CreateStore(
+                b.CreateAdd(pc, llvm::ConstantInt::get(i64Ty, 1)),
+                kdPollCount_);
+            auto* frame = pollFn->getArg(0);
+            auto* out = pollFn->getArg(1);
+            auto* stateP = b.CreateStructGEP(frameTy, frame, 0, "state_p");
+            auto* state = b.CreateLoad(i64Ty, stateP, "state");
+            auto* inState0 = b.CreateICmpEQ(
+                state, llvm::ConstantInt::get(i64Ty, 0), "in_state0");
+            b.CreateCondBr(inState0, s0BB, s1BB);
+
+            // ---- state 0: drive the inner future f ----
+            b.SetInsertPoint(s0BB);
+            auto* innerP = b.CreateStructGEP(frameTy, frame, 1, "inner_p");
+            auto* inner = b.CreateLoad(futureTy, innerP, "inner");
+            auto* subPoll = b.CreateExtractValue(inner, {0}, "inner.poll");
+            auto* subFrame = b.CreateExtractValue(inner, {1}, "inner.frame");
+            auto* subSlot = b.CreateAlloca(pollTinner, nullptr, "inner_poll");
+            b.CreateCall(pollFnTy_, subPoll, {subFrame, subSlot});
+            auto* inRdy = b.CreateLoad(
+                i1Ty, b.CreateStructGEP(pollTinner, subSlot, 0, "in_rdy_p"),
+                "in_rdy");
+            b.CreateCondBr(inRdy, s0RdyBB, pendBB);
+
+            // state 0 Ready(x): free f's frame, apply g(x) -> f2, free g's env,
+            // store f2, advance to state 1, fall through to poll f2.
+            b.SetInsertPoint(s0RdyBB);
+            b.CreateCall(freeFn_, {subFrame});
+            auto* x = b.CreateLoad(
+                valT, b.CreateStructGEP(pollTinner, subSlot, 1, "xval_p"), "x");
+            auto* gFn = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(frameTy, frame, 2, "gfn_p"), "g_fn");
+            auto* gEnv = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(frameTy, frame, 3, "genv_p"),
+                "g_env");
+            auto* f2 = b.CreateCall(gCallTy, gFn, {gEnv, x}, "f2");
+            b.CreateCall(freeFn_, {gEnv}); // continuation consumed once
+            b.CreateStore(f2, b.CreateStructGEP(frameTy, frame, 4, "f2_p"));
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 1), stateP);
+            b.CreateBr(s1BB);
+
+            // ---- state 1: drive the second future f2 ----
+            b.SetInsertPoint(s1BB);
+            auto* f2P = b.CreateStructGEP(frameTy, frame, 4, "f2_p2");
+            auto* f2v = b.CreateLoad(futureTy, f2P, "f2v");
+            auto* f2Poll = b.CreateExtractValue(f2v, {0}, "f2.poll");
+            auto* f2Frame = b.CreateExtractValue(f2v, {1}, "f2.frame");
+            auto* f2Slot = b.CreateAlloca(pollUouter, nullptr, "f2_poll");
+            b.CreateCall(pollFnTy_, f2Poll, {f2Frame, f2Slot});
+            auto* f2Rdy = b.CreateLoad(
+                i1Ty, b.CreateStructGEP(pollUouter, f2Slot, 0, "f2_rdy_p"),
+                "f2_rdy");
+            b.CreateCondBr(f2Rdy, s1RdyBB, pendBB);
+
+            // state 1 Ready(y): free f2's frame, report Ready(y).
+            b.SetInsertPoint(s1RdyBB);
+            b.CreateCall(freeFn_, {f2Frame});
+            b.CreateStore(
+                llvm::ConstantInt::getTrue(ctx),
+                b.CreateStructGEP(pollUouter, out, 0, "out_rdy1"));
+            if (valU->isVoidTy()) {
+                b.CreateStore(
+                    llvm::ConstantInt::get(i64Ty, 0),
+                    b.CreateStructGEP(pollUouter, out, 1, "out_val_unit"));
+            } else {
+                auto* y = b.CreateLoad(
+                    valU, b.CreateStructGEP(pollUouter, f2Slot, 1, "yval_p"),
+                    "y");
+                b.CreateStore(
+                    y, b.CreateStructGEP(pollUouter, out, 1, "out_val"));
+            }
+            b.CreateRetVoid();
+
+            // ---- shared Pending: propagate Pending ----
+            b.SetInsertPoint(pendBB);
+            b.CreateStore(
+                llvm::ConstantInt::getFalse(ctx),
+                b.CreateStructGEP(pollUouter, out, 0, "out_rdy0"));
+            b.CreateRetVoid();
+        }
+
+        // ---- Future and_then__T__U(Future f, { i8* fn, i8* env } g) ----
+        auto* fnTy =
+            llvm::FunctionType::get(futureTy, {futureTy, fnValTy_}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        fn->getArg(0)->setName("f");
+        fn->getArg(1)->setName("g");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        llvm::IRBuilder<> b(entry);
+        uint64_t sz = module_->getDataLayout().getTypeAllocSize(frameTy);
+        auto* frame = b.CreateCall(
+            mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "and_then_frame");
+        b.CreateStore(llvm::ConstantInt::get(i64Ty, 0),
+                      b.CreateStructGEP(frameTy, frame, 0, "state0"));
+        b.CreateStore(fn->getArg(0),
+                      b.CreateStructGEP(frameTy, frame, 1, "inner0"));
+        auto* gFn = b.CreateExtractValue(fn->getArg(1), {0}, "g.fn");
+        auto* gEnv = b.CreateExtractValue(fn->getArg(1), {1}, "g.env");
+        b.CreateStore(gFn, b.CreateStructGEP(frameTy, frame, 2, "gfn0"));
+        b.CreateStore(gEnv, b.CreateStructGEP(frameTy, frame, 3, "genv0"));
+        llvm::Value* futv = llvm::UndefValue::get(futureTy);
+        futv = b.CreateInsertValue(futv, pollFn, {0}, "fut.poll");
+        futv = b.CreateInsertValue(futv, frame, {1}, "fut.frame");
+        b.CreateRet(futv);
+        declaredFns_[mangled] = fn;
+        return fn;
+    }
+
+    // v32 Phase 172: `join2<A, B>(fa: Future<A>, fb: Future<B>)
+    //   -> Future<(A, B)>` — run two futures CONCURRENTLY and complete with
+    // both results as a tuple. Synthesized per (A, B). Each poll drives
+    // whichever sub-future is not yet done; a sub-future's Ready value is
+    // latched in the frame and its frame freed, so each is polled only until
+    // its own completion. The combinator is Ready once BOTH are latched. This
+    // is the structured "wait for all" join (vs `select`'s "wait for any").
+    // Mangled `join2__<A>__<B>`.
+    llvm::Function* getOrEmitJoin2(const TypePtr& A, const TypePtr& B) {
+        std::string mangled = "join2__" + mangleType(A) + "__" + mangleType(B);
+        auto it = declaredFns_.find(mangled);
+        if (it != declaredFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* futureTy = structTypes_["Future"];
+        auto* pollA = pollTypeFor(A);
+        auto* pollB = pollTypeFor(B);
+        auto* valA = mapKardashevType(A);
+        auto* valB = mapKardashevType(B);
+        TypePtr tupleKd = makeTuple({A, B});
+        auto* tupleLLVM = mapKardashevType(tupleKd); // { A, B }
+        auto* pollOut = pollTypeFor(tupleKd);        // Poll<(A,B)>
+        std::string sfx = mangleType(A) + "__" + mangleType(B);
+
+        // frame { i64 a_done, A a_val, i64 b_done, B b_val, Future fa,
+        //         Future fb }.
+        auto* frameTy = llvm::StructType::create(
+            ctx, {i64Ty, valA, i64Ty, valB, futureTy, futureTy},
+            "kd.join2_frame." + sfx);
+        const unsigned F_ADONE = 0, F_AVAL = 1, F_BDONE = 2, F_BVAL = 3,
+                       F_FA = 4, F_FB = 5;
+
+        // ---- void __kd_join2_poll__A__B(i8* frame, kd.poll* out) ----
+        auto* pollFn = llvm::Function::Create(
+            pollFnTy_, llvm::Function::InternalLinkage,
+            "__kd_join2_poll__" + sfx, module_.get());
+        pollFn->getArg(0)->setName("frame");
+        pollFn->getArg(1)->setName("out");
+        {
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", pollFn);
+            auto* pollaBB = llvm::BasicBlock::Create(ctx, "poll_a", pollFn);
+            auto* aRdyBB = llvm::BasicBlock::Create(ctx, "a_ready", pollFn);
+            auto* afteraBB = llvm::BasicBlock::Create(ctx, "after_a", pollFn);
+            auto* pollbBB = llvm::BasicBlock::Create(ctx, "poll_b", pollFn);
+            auto* bRdyBB = llvm::BasicBlock::Create(ctx, "b_ready", pollFn);
+            auto* afterbBB = llvm::BasicBlock::Create(ctx, "after_b", pollFn);
+            auto* bothBB = llvm::BasicBlock::Create(ctx, "both", pollFn);
+            auto* pendBB = llvm::BasicBlock::Create(ctx, "pending", pollFn);
+            llvm::IRBuilder<> b(entry);
+            auto* pc = b.CreateLoad(i64Ty, kdPollCount_, "pc");
+            b.CreateStore(
+                b.CreateAdd(pc, llvm::ConstantInt::get(i64Ty, 1)),
+                kdPollCount_);
+            auto* frame = pollFn->getArg(0);
+            auto* out = pollFn->getArg(1);
+            auto* aDoneP = b.CreateStructGEP(frameTy, frame, F_ADONE, "adone_p");
+            auto* bDoneP = b.CreateStructGEP(frameTy, frame, F_BDONE, "bdone_p");
+            auto* aDone0 = b.CreateLoad(i64Ty, aDoneP, "a_done0");
+            b.CreateCondBr(
+                b.CreateICmpEQ(aDone0, llvm::ConstantInt::get(i64Ty, 0)),
+                pollaBB, afteraBB);
+
+            // poll fa (only while not done)
+            b.SetInsertPoint(pollaBB);
+            auto* fa = b.CreateLoad(
+                futureTy, b.CreateStructGEP(frameTy, frame, F_FA, "fa_p"), "fa");
+            auto* faPoll = b.CreateExtractValue(fa, {0}, "fa.poll");
+            auto* faFrame = b.CreateExtractValue(fa, {1}, "fa.frame");
+            auto* aSlot = b.CreateAlloca(pollA, nullptr, "a_poll");
+            b.CreateCall(pollFnTy_, faPoll, {faFrame, aSlot});
+            auto* aRdy = b.CreateLoad(
+                i1Ty, b.CreateStructGEP(pollA, aSlot, 0, "a_rdy_p"), "a_rdy");
+            b.CreateCondBr(aRdy, aRdyBB, afteraBB);
+            // fa Ready: free fa frame, latch a_val, mark a_done.
+            b.SetInsertPoint(aRdyBB);
+            b.CreateCall(freeFn_, {faFrame});
+            auto* aVal = b.CreateLoad(
+                valA, b.CreateStructGEP(pollA, aSlot, 1, "a_val_p"), "a_val");
+            b.CreateStore(aVal, b.CreateStructGEP(frameTy, frame, F_AVAL, "av"));
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 1), aDoneP);
+            b.CreateBr(afteraBB);
+
+            // after a: maybe poll fb
+            b.SetInsertPoint(afteraBB);
+            auto* bDone0 = b.CreateLoad(i64Ty, bDoneP, "b_done0");
+            b.CreateCondBr(
+                b.CreateICmpEQ(bDone0, llvm::ConstantInt::get(i64Ty, 0)),
+                pollbBB, afterbBB);
+            b.SetInsertPoint(pollbBB);
+            auto* fb = b.CreateLoad(
+                futureTy, b.CreateStructGEP(frameTy, frame, F_FB, "fb_p"), "fb");
+            auto* fbPoll = b.CreateExtractValue(fb, {0}, "fb.poll");
+            auto* fbFrame = b.CreateExtractValue(fb, {1}, "fb.frame");
+            auto* bSlot = b.CreateAlloca(pollB, nullptr, "b_poll");
+            b.CreateCall(pollFnTy_, fbPoll, {fbFrame, bSlot});
+            auto* bRdy = b.CreateLoad(
+                i1Ty, b.CreateStructGEP(pollB, bSlot, 0, "b_rdy_p"), "b_rdy");
+            b.CreateCondBr(bRdy, bRdyBB, afterbBB);
+            b.SetInsertPoint(bRdyBB);
+            b.CreateCall(freeFn_, {fbFrame});
+            auto* bVal = b.CreateLoad(
+                valB, b.CreateStructGEP(pollB, bSlot, 1, "b_val_p"), "b_val");
+            b.CreateStore(bVal, b.CreateStructGEP(frameTy, frame, F_BVAL, "bv"));
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 1), bDoneP);
+            b.CreateBr(afterbBB);
+
+            // after b: both done?
+            b.SetInsertPoint(afterbBB);
+            auto* aDone = b.CreateLoad(i64Ty, aDoneP, "a_done");
+            auto* bDone = b.CreateLoad(i64Ty, bDoneP, "b_done");
+            auto* one = llvm::ConstantInt::get(i64Ty, 1);
+            auto* both = b.CreateAnd(b.CreateICmpEQ(aDone, one),
+                                     b.CreateICmpEQ(bDone, one), "both");
+            b.CreateCondBr(both, bothBB, pendBB);
+
+            // both Ready: build the tuple (a_val, b_val), report Ready.
+            b.SetInsertPoint(bothBB);
+            auto* av = b.CreateLoad(
+                valA, b.CreateStructGEP(frameTy, frame, F_AVAL, "av_r"), "av_r");
+            auto* bv = b.CreateLoad(
+                valB, b.CreateStructGEP(frameTy, frame, F_BVAL, "bv_r"), "bv_r");
+            llvm::Value* tup = llvm::UndefValue::get(tupleLLVM);
+            tup = b.CreateInsertValue(tup, av, {0}, "tup.0");
+            tup = b.CreateInsertValue(tup, bv, {1}, "tup.1");
+            b.CreateStore(llvm::ConstantInt::getTrue(ctx),
+                          b.CreateStructGEP(pollOut, out, 0, "out_rdy1"));
+            b.CreateStore(tup, b.CreateStructGEP(pollOut, out, 1, "out_tup"));
+            b.CreateRetVoid();
+
+            // pending
+            b.SetInsertPoint(pendBB);
+            b.CreateStore(llvm::ConstantInt::getFalse(ctx),
+                          b.CreateStructGEP(pollOut, out, 0, "out_rdy0"));
+            b.CreateRetVoid();
+        }
+
+        // ---- Future join2__A__B(Future fa, Future fb) ----
+        auto* fnTy =
+            llvm::FunctionType::get(futureTy, {futureTy, futureTy}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        fn->getArg(0)->setName("fa");
+        fn->getArg(1)->setName("fb");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        llvm::IRBuilder<> b(entry);
+        uint64_t sz = module_->getDataLayout().getTypeAllocSize(frameTy);
+        auto* frame = b.CreateCall(
+            mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "join2_frame");
+        b.CreateStore(llvm::ConstantInt::get(i64Ty, 0),
+                      b.CreateStructGEP(frameTy, frame, F_ADONE, "adone0"));
+        b.CreateStore(llvm::ConstantInt::get(i64Ty, 0),
+                      b.CreateStructGEP(frameTy, frame, F_BDONE, "bdone0"));
+        b.CreateStore(fn->getArg(0),
+                      b.CreateStructGEP(frameTy, frame, F_FA, "fa0"));
+        b.CreateStore(fn->getArg(1),
+                      b.CreateStructGEP(frameTy, frame, F_FB, "fb0"));
+        llvm::Value* futv = llvm::UndefValue::get(futureTy);
+        futv = b.CreateInsertValue(futv, pollFn, {0}, "fut.poll");
+        futv = b.CreateInsertValue(futv, frame, {1}, "fut.frame");
+        b.CreateRet(futv);
+        declaredFns_[mangled] = fn;
+        return fn;
+    }
+
+    // v32 Phase 172: `select<A, B>(fa: Future<A>, fb: Future<B>)
+    //   -> Future<Either<A, B>>` — the "wait for ANY" Future combinator: poll
+    // both, complete as soon as EITHER is ready with `Left(a)` / `Right(b)`,
+    // and DROP the loser (free its heap frame — the first cut of async
+    // cancellation; Phase 173 builds structured cancellation on top). `fa` is
+    // checked first each poll, so it wins a same-poll tie (a documented, stable
+    // bias). Synthesized per (A, B). Mangled `select__<A>__<B>`.
+    //
+    // KNOWN LIMITATION (shallow cancellation; fixed in Phase 173): dropping the
+    // loser frees ONLY its top heap frame via a bare `free`. If the loser is an
+    // async-fn state machine that had already been polled to Pending, its frame
+    // holds a pointer to an in-flight sub-future frame (e.g. the `sleep_ms`
+    // frame from a suspended `.await`) that is NOT reachable from the top free
+    // — so that nested sub-frame LEAKS (memory-safe: no double-free / UAF; it is
+    // a one-shot leak of the cancelled branch's in-progress allocation). A loser
+    // dropped while still UNPOLLED (the winner was ready on the first poll) is
+    // leak-free. The proper fix is a type-erased recursive drop/cancel slot in
+    // the Future fat pointer so a dropped future frees its sub-frames; that
+    // lands with structured cancellation in Phase 173. map/and_then/join2 do not
+    // hit this — they always drive their inner futures to completion, whose own
+    // Ready paths free their sub-frames.
+    llvm::Function* getOrEmitSelect(const TypePtr& A, const TypePtr& B) {
+        std::string mangled = "select__" + mangleType(A) + "__" + mangleType(B);
+        auto it = declaredFns_.find(mangled);
+        if (it != declaredFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* futureTy = structTypes_["Future"];
+        auto* pollA = pollTypeFor(A);
+        auto* pollB = pollTypeFor(B);
+        auto* valA = mapKardashevType(A);
+        auto* valB = mapKardashevType(B);
+        TypePtr eitherKd = eitherType(A, B);
+        auto* eitherLlvm = mapKardashevType(eitherKd); // materializes layout
+        auto* pollOut = pollTypeFor(eitherKd);         // Poll<Either<A,B>>
+        std::string eMangled =
+            mangleStructInstance(eitherKd->enumName, eitherKd->typeArgs);
+        unsigned leftIdx = variantIndexInEnum(eitherKd, "Left");
+        unsigned rightIdx = variantIndexInEnum(eitherKd, "Right");
+        unsigned leftSlot = enumPayloadIndices_[eMangled][leftIdx][0];
+        unsigned rightSlot = enumPayloadIndices_[eMangled][rightIdx][0];
+        std::string sfx = mangleType(A) + "__" + mangleType(B);
+
+        // frame { Future fa, Future fb }.
+        auto* frameTy = llvm::StructType::create(
+            ctx, {futureTy, futureTy}, "kd.select_frame." + sfx);
+
+        // ---- void __kd_select_poll__A__B(i8* frame, kd.poll* out) ----
+        auto* pollFn = llvm::Function::Create(
+            pollFnTy_, llvm::Function::InternalLinkage,
+            "__kd_select_poll__" + sfx, module_.get());
+        pollFn->getArg(0)->setName("frame");
+        pollFn->getArg(1)->setName("out");
+        {
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", pollFn);
+            auto* aWinBB = llvm::BasicBlock::Create(ctx, "a_win", pollFn);
+            auto* tryBBB = llvm::BasicBlock::Create(ctx, "try_b", pollFn);
+            auto* bWinBB = llvm::BasicBlock::Create(ctx, "b_win", pollFn);
+            auto* pendBB = llvm::BasicBlock::Create(ctx, "pending", pollFn);
+            llvm::IRBuilder<> b(entry);
+            auto* pc = b.CreateLoad(i64Ty, kdPollCount_, "pc");
+            b.CreateStore(
+                b.CreateAdd(pc, llvm::ConstantInt::get(i64Ty, 1)),
+                kdPollCount_);
+            auto* frame = pollFn->getArg(0);
+            auto* out = pollFn->getArg(1);
+            auto* faP = b.CreateStructGEP(frameTy, frame, 0, "fa_p");
+            auto* fbP = b.CreateStructGEP(frameTy, frame, 1, "fb_p");
+
+            // poll fa first
+            auto* fa = b.CreateLoad(futureTy, faP, "fa");
+            auto* faPoll = b.CreateExtractValue(fa, {0}, "fa.poll");
+            auto* faFrame = b.CreateExtractValue(fa, {1}, "fa.frame");
+            auto* aSlot = b.CreateAlloca(pollA, nullptr, "a_poll");
+            b.CreateCall(pollFnTy_, faPoll, {faFrame, aSlot});
+            auto* aRdy = b.CreateLoad(
+                i1Ty, b.CreateStructGEP(pollA, aSlot, 0, "a_rdy_p"), "a_rdy");
+            b.CreateCondBr(aRdy, aWinBB, tryBBB);
+
+            // fa wins: Left(x). Read x, free BOTH frames (winner + dropped fb).
+            b.SetInsertPoint(aWinBB);
+            auto* x = b.CreateLoad(
+                valA, b.CreateStructGEP(pollA, aSlot, 1, "a_val_p"), "x");
+            b.CreateCall(freeFn_, {faFrame});
+            auto* fbLose = b.CreateLoad(futureTy, fbP, "fb_lose");
+            // Shallow drop of the loser — see KNOWN LIMITATION above: a
+            // mid-flight async-fn loser leaks its nested sub-frame (Phase 173).
+            b.CreateCall(freeFn_,
+                         {b.CreateExtractValue(fbLose, {1}, "fb_lose.frame")});
+            {
+                llvm::Value* e = llvm::UndefValue::get(eitherLlvm);
+                e = b.CreateInsertValue(
+                    e, llvm::ConstantInt::get(i32Ty, leftIdx), {0});
+                e = b.CreateInsertValue(e, x, {leftSlot}, "left");
+                b.CreateStore(llvm::ConstantInt::getTrue(ctx),
+                              b.CreateStructGEP(pollOut, out, 0, "out_rdyA"));
+                b.CreateStore(e,
+                              b.CreateStructGEP(pollOut, out, 1, "out_eitherA"));
+                b.CreateRetVoid();
+            }
+
+            // fa pending: poll fb
+            b.SetInsertPoint(tryBBB);
+            auto* fb = b.CreateLoad(futureTy, fbP, "fb");
+            auto* fbPoll = b.CreateExtractValue(fb, {0}, "fb.poll");
+            auto* fbFrame = b.CreateExtractValue(fb, {1}, "fb.frame");
+            auto* bSlot = b.CreateAlloca(pollB, nullptr, "b_poll");
+            b.CreateCall(pollFnTy_, fbPoll, {fbFrame, bSlot});
+            auto* bRdy = b.CreateLoad(
+                i1Ty, b.CreateStructGEP(pollB, bSlot, 0, "b_rdy_p"), "b_rdy");
+            b.CreateCondBr(bRdy, bWinBB, pendBB);
+
+            // fb wins: Right(y). Free BOTH frames (winner + dropped fa).
+            b.SetInsertPoint(bWinBB);
+            auto* y = b.CreateLoad(
+                valB, b.CreateStructGEP(pollB, bSlot, 1, "b_val_p"), "y");
+            b.CreateCall(freeFn_, {fbFrame});
+            auto* faLose = b.CreateLoad(futureTy, faP, "fa_lose");
+            // Shallow drop of the loser — see KNOWN LIMITATION above: a
+            // mid-flight async-fn loser leaks its nested sub-frame (Phase 173).
+            b.CreateCall(freeFn_,
+                         {b.CreateExtractValue(faLose, {1}, "fa_lose.frame")});
+            {
+                llvm::Value* e = llvm::UndefValue::get(eitherLlvm);
+                e = b.CreateInsertValue(
+                    e, llvm::ConstantInt::get(i32Ty, rightIdx), {0});
+                e = b.CreateInsertValue(e, y, {rightSlot}, "right");
+                b.CreateStore(llvm::ConstantInt::getTrue(ctx),
+                              b.CreateStructGEP(pollOut, out, 0, "out_rdyB"));
+                b.CreateStore(e,
+                              b.CreateStructGEP(pollOut, out, 1, "out_eitherB"));
+                b.CreateRetVoid();
+            }
+
+            // neither ready: Pending.
+            b.SetInsertPoint(pendBB);
+            b.CreateStore(llvm::ConstantInt::getFalse(ctx),
+                          b.CreateStructGEP(pollOut, out, 0, "out_rdy0"));
+            b.CreateRetVoid();
+        }
+
+        // ---- Future select__A__B(Future fa, Future fb) ----
+        auto* fnTy =
+            llvm::FunctionType::get(futureTy, {futureTy, futureTy}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        fn->getArg(0)->setName("fa");
+        fn->getArg(1)->setName("fb");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        llvm::IRBuilder<> b(entry);
+        uint64_t sz = module_->getDataLayout().getTypeAllocSize(frameTy);
+        auto* frame = b.CreateCall(
+            mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "select_frame");
+        b.CreateStore(fn->getArg(0),
+                      b.CreateStructGEP(frameTy, frame, 0, "fa0"));
+        b.CreateStore(fn->getArg(1),
+                      b.CreateStructGEP(frameTy, frame, 1, "fb0"));
+        llvm::Value* futv = llvm::UndefValue::get(futureTy);
+        futv = b.CreateInsertValue(futv, pollFn, {0}, "fut.poll");
+        futv = b.CreateInsertValue(futv, frame, {1}, "fut.frame");
+        b.CreateRet(futv);
+        declaredFns_[mangled] = fn;
+        return fn;
+    }
+
+    // v32 Phase 173: `timeout<T>(fut: Future<T>, ms: i64) -> Future<Option<T>>`
+    //   — race `fut` against an internal `sleep_ms(ms)` timer: complete
+    // `Some(v)` if fut finishes first, `None` if the timer fires first. Built on
+    // the select machinery (fut is checked first each poll, so a real result
+    // wins a same-poll tie) with the second arm hard-wired to a timer and the
+    // result narrowed to Option<T>. The constructor builds the timer itself, so
+    // `timeout`'s own signature carries no async effect. The loser is dropped
+    // shallowly (same KNOWN LIMITATION as future_select — a mid-flight async-fn
+    // loser leaks its nested sub-frame; recursive drop is the remaining 173
+    // work). Mangled `timeout__<T>`.
+    llvm::Function* getOrEmitTimeout(const TypePtr& T) {
+        std::string mangled = "timeout__" + mangleType(T);
+        auto it = declaredFns_.find(mangled);
+        if (it != declaredFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* futureTy = structTypes_["Future"];
+        auto* pollT = pollTypeFor(T);     // Poll<T> of the guarded future
+        auto* valT = mapKardashevType(T);
+        TypePtr optKd = optionType(T);
+        auto* optLlvm = mapKardashevType(optKd);  // materializes layout
+        auto* pollOut = pollTypeFor(optKd);       // Poll<Option<T>>
+        std::string optMangled =
+            mangleStructInstance(optKd->enumName, optKd->typeArgs);
+        unsigned someIdx = variantIndexInEnum(optKd, "Some");
+        unsigned noneIdx = variantIndexInEnum(optKd, "None");
+        unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+        std::string sfx = mangleType(T);
+
+        // frame { Future fut, Future timer }.
+        auto* frameTy = llvm::StructType::create(
+            ctx, {futureTy, futureTy}, "kd.timeout_frame." + sfx);
+
+        // ---- void __kd_timeout_poll__T(i8* frame, kd.poll* out) ----
+        auto* pollFn = llvm::Function::Create(
+            pollFnTy_, llvm::Function::InternalLinkage,
+            "__kd_timeout_poll__" + sfx, module_.get());
+        pollFn->getArg(0)->setName("frame");
+        pollFn->getArg(1)->setName("out");
+        {
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", pollFn);
+            auto* someBB = llvm::BasicBlock::Create(ctx, "got", pollFn);
+            auto* tryTimerBB = llvm::BasicBlock::Create(ctx, "try_timer", pollFn);
+            auto* noneBB = llvm::BasicBlock::Create(ctx, "timed_out", pollFn);
+            auto* pendBB = llvm::BasicBlock::Create(ctx, "pending", pollFn);
+            llvm::IRBuilder<> b(entry);
+            auto* pc = b.CreateLoad(i64Ty, kdPollCount_, "pc");
+            b.CreateStore(
+                b.CreateAdd(pc, llvm::ConstantInt::get(i64Ty, 1)),
+                kdPollCount_);
+            auto* frame = pollFn->getArg(0);
+            auto* out = pollFn->getArg(1);
+            auto* futP = b.CreateStructGEP(frameTy, frame, 0, "fut_p");
+            auto* timerP = b.CreateStructGEP(frameTy, frame, 1, "timer_p");
+
+            // poll the guarded future first
+            auto* fut = b.CreateLoad(futureTy, futP, "fut");
+            auto* futPoll = b.CreateExtractValue(fut, {0}, "fut.poll");
+            auto* futFrame = b.CreateExtractValue(fut, {1}, "fut.frame");
+            auto* fSlot = b.CreateAlloca(pollT, nullptr, "fut_poll");
+            b.CreateCall(pollFnTy_, futPoll, {futFrame, fSlot});
+            auto* fRdy = b.CreateLoad(
+                i1Ty, b.CreateStructGEP(pollT, fSlot, 0, "f_rdy_p"), "f_rdy");
+            b.CreateCondBr(fRdy, someBB, tryTimerBB);
+
+            // fut finished: Some(v). Read v, free fut frame + drop the timer.
+            b.SetInsertPoint(someBB);
+            auto* v = b.CreateLoad(
+                valT, b.CreateStructGEP(pollT, fSlot, 1, "f_val_p"), "v");
+            b.CreateCall(freeFn_, {futFrame});
+            auto* timerLose = b.CreateLoad(futureTy, timerP, "timer_lose");
+            b.CreateCall(
+                freeFn_,
+                {b.CreateExtractValue(timerLose, {1}, "timer_lose.frame")});
+            {
+                llvm::Value* o = llvm::UndefValue::get(optLlvm);
+                o = b.CreateInsertValue(
+                    o, llvm::ConstantInt::get(i32Ty, someIdx), {0});
+                o = b.CreateInsertValue(o, v, {someSlot}, "some");
+                b.CreateStore(llvm::ConstantInt::getTrue(ctx),
+                              b.CreateStructGEP(pollOut, out, 0, "out_rdyS"));
+                b.CreateStore(o,
+                              b.CreateStructGEP(pollOut, out, 1, "out_optS"));
+                b.CreateRetVoid();
+            }
+
+            // fut pending: poll the timer
+            b.SetInsertPoint(tryTimerBB);
+            auto* timer = b.CreateLoad(futureTy, timerP, "timer");
+            auto* tPoll = b.CreateExtractValue(timer, {0}, "timer.poll");
+            auto* tFrame = b.CreateExtractValue(timer, {1}, "timer.frame");
+            auto* tSlot = b.CreateAlloca(pollTy_, nullptr, "timer_poll");
+            b.CreateCall(pollFnTy_, tPoll, {tFrame, tSlot});
+            auto* tRdy = b.CreateLoad(
+                i1Ty, b.CreateStructGEP(pollTy_, tSlot, 0, "t_rdy_p"), "t_rdy");
+            b.CreateCondBr(tRdy, noneBB, pendBB);
+
+            // timer fired first: None. Free timer frame + DROP the guarded fut.
+            b.SetInsertPoint(noneBB);
+            b.CreateCall(freeFn_, {tFrame});
+            auto* futLose = b.CreateLoad(futureTy, futP, "fut_lose");
+            b.CreateCall(
+                freeFn_,
+                {b.CreateExtractValue(futLose, {1}, "fut_lose.frame")});
+            {
+                llvm::Value* o = llvm::UndefValue::get(optLlvm);
+                o = b.CreateInsertValue(
+                    o, llvm::ConstantInt::get(i32Ty, noneIdx), {0});
+                b.CreateStore(llvm::ConstantInt::getTrue(ctx),
+                              b.CreateStructGEP(pollOut, out, 0, "out_rdyN"));
+                b.CreateStore(o,
+                              b.CreateStructGEP(pollOut, out, 1, "out_optN"));
+                b.CreateRetVoid();
+            }
+
+            // neither ready: Pending.
+            b.SetInsertPoint(pendBB);
+            b.CreateStore(llvm::ConstantInt::getFalse(ctx),
+                          b.CreateStructGEP(pollOut, out, 0, "out_rdy0"));
+            b.CreateRetVoid();
+        }
+
+        // ---- Future timeout__T(Future fut, i64 ms) ----
+        auto* fnTy =
+            llvm::FunctionType::get(futureTy, {futureTy, i64Ty}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        fn->getArg(0)->setName("fut");
+        fn->getArg(1)->setName("ms");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        llvm::IRBuilder<> b(entry);
+        // Build the timer future = sleep_ms(ms).
+        auto* sleepFn = declaredFns_["sleep_ms"];
+        auto* timer = b.CreateCall(sleepFn, {fn->getArg(1)}, "timer");
+        uint64_t sz = module_->getDataLayout().getTypeAllocSize(frameTy);
+        auto* frame = b.CreateCall(
+            mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "timeout_frame");
+        b.CreateStore(fn->getArg(0),
+                      b.CreateStructGEP(frameTy, frame, 0, "fut0"));
+        b.CreateStore(timer, b.CreateStructGEP(frameTy, frame, 1, "timer0"));
+        llvm::Value* futv = llvm::UndefValue::get(futureTy);
+        futv = b.CreateInsertValue(futv, pollFn, {0}, "fut.poll");
+        futv = b.CreateInsertValue(futv, frame, {1}, "fut.frame");
+        b.CreateRet(futv);
         declaredFns_[mangled] = fn;
         return fn;
     }
@@ -7607,6 +8485,13 @@ private:
                 // channel block, PtrToInt'd) — they lower to i64 regardless of
                 // T, like the Mutex handle.
                 if (r->structName == "Sender" || r->structName == "Receiver")
+                    return llvm::Type::getInt64Ty(*ctx_);
+                // v32 Phase 172: `JoinHandle<T>` is a move-only i64 HANDLE (the
+                // executor task index) phantom-typed over the task's result T —
+                // spawn returns it, join consumes it. Lowers to i64 like the
+                // channel/Mutex handles, so getOrEmitSpawn/getOrEmitJoin keep
+                // their existing i64 ABI unchanged.
+                if (r->structName == "JoinHandle")
                     return llvm::Type::getInt64Ty(*ctx_);
                 // Phase 123 (v21): `Mutex<T>` is a Copy i64 HANDLE (PtrToInt of
                 // the heap `{ pthread_mutex_t, T value }` block) — phantom-typed
@@ -9345,6 +10230,11 @@ private:
                 r->structName == "Future" || r->structName == "Mutex" ||
                 r->structName == "RwLock")
                 return false;
+            // v32 Phase 172: a JoinHandle is a bare i64 task index. It is
+            // move-only (so it can't be double-joined) but owns no heap of its
+            // own — `join` reclaims the task; an un-joined handle leaks it, like
+            // the pre-172 raw-i64 handle. So it is explicitly NOT dropped.
+            if (r->structName == "JoinHandle") return false;
             std::string key = mangleStructInstance(r->structName, r->typeArgs);
             if (!seen.insert("S:" + key).second) return false;
             if (dropImpls_.count(r->structName)) return true;
@@ -10824,6 +11714,12 @@ private:
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
             return emitAwait(*ae);
         }
+        if (auto* pe = dynamic_cast<const ast::PerformExpr*>(&e)) {
+            return emitPerform(*pe);
+        }
+        if (auto* he = dynamic_cast<const ast::HandleExpr*>(&e)) {
+            return emitHandle(*he);
+        }
         errors_.push_back("codegen: unknown expression kind");
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
     }
@@ -11909,7 +12805,71 @@ private:
                 std::vector<llvm::Value*> args;
                 args.reserve(call.args.size());
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
-                return builder_->CreateCall(fn, args, "call_join");
+                // v32: a unit-result join returns void — a named call on a
+                // void value is invalid IR.
+                return builder_->CreateCall(
+                    fn, args,
+                    fn->getReturnType()->isVoidTy() ? "" : "call_join");
+            }
+            // v32 Phase 173: `task_cancel<T>(JoinHandle<T>)` — retire+release a
+            // task. T-agnostic codegen (the handle is an i64 index); returns
+            // void.
+            if (call.callee == "task_cancel" && !concreteTypeArgs.empty()) {
+                llvm::Function* fn = getOrEmitTaskCancel();
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "");
+            }
+            // v32 Phase 172: `map<T, U>(Future<T>, fn(T)->U) -> Future<U>` — a
+            // Future combinator synthesized per (T, U). concreteTypeArgs are
+            // [T, U] (the schema's two generic vars, in order).
+            if (call.callee == "future_map" && concreteTypeArgs.size() >= 2) {
+                llvm::Function* fn =
+                    getOrEmitMap(concreteTypeArgs[0], concreteTypeArgs[1]);
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_map");
+            }
+            // v32 Phase 172: `and_then<T, U>(Future<T>, fn(T)->Future<U>)
+            // -> Future<U>` — the monadic combinator, synthesized per (T, U).
+            if (call.callee == "future_and_then" && concreteTypeArgs.size() >= 2) {
+                llvm::Function* fn =
+                    getOrEmitAndThen(concreteTypeArgs[0], concreteTypeArgs[1]);
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_and_then");
+            }
+            // v32 Phase 172: `join2<A, B>(Future<A>, Future<B>)
+            // -> Future<(A, B)>` — "wait for all", synthesized per (A, B).
+            if (call.callee == "future_join2" && concreteTypeArgs.size() >= 2) {
+                llvm::Function* fn =
+                    getOrEmitJoin2(concreteTypeArgs[0], concreteTypeArgs[1]);
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_join2");
+            }
+            // v32 Phase 172: `select<A, B>(Future<A>, Future<B>)
+            // -> Future<Either<A, B>>` — "wait for any", synthesized per (A,B).
+            if (call.callee == "future_select" && concreteTypeArgs.size() >= 2) {
+                llvm::Function* fn =
+                    getOrEmitSelect(concreteTypeArgs[0], concreteTypeArgs[1]);
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_select");
+            }
+            // v32 Phase 173: `timeout<T>(Future<T>, i64) -> Future<Option<T>>`
+            // — race the future against an internal sleep_ms timer.
+            if (call.callee == "timeout" && !concreteTypeArgs.empty()) {
+                llvm::Function* fn = getOrEmitTimeout(concreteTypeArgs[0]);
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_timeout");
             }
             // Phase 17b/28: `hashmap_*<K,V>` are generic built-ins with no AST
             // body — synthesize a per-(key,value) specialization. typeArgs are
@@ -13087,6 +14047,101 @@ private:
     // captures are Copy scalars copied into the heap env, so there is no
     // dangling reference. (Freeing the env / FnMut / by-ref capture are
     // deferred; see the report.)
+    // v32 Phase 176: per-(effect, op) dynamically-scoped CURRENT-handler global,
+    // a `{ fn, env }` fat pointer (zero = no handler installed). `handle … with`
+    // save/sets it for the body's dynamic extent; `perform` reads the top one.
+    std::unordered_map<std::string, llvm::GlobalVariable*> effectHandlerGlobals_;
+    llvm::GlobalVariable* effectHandlerGlobal(const std::string& eff,
+                                              const std::string& op) {
+        std::string key = eff + "::" + op;
+        auto it = effectHandlerGlobals_.find(key);
+        if (it != effectHandlerGlobals_.end()) return it->second;
+        auto* g = new llvm::GlobalVariable(
+            *module_, fnValTy_, /*isConstant=*/false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantAggregateZero::get(fnValTy_),
+            "__handler_" + eff + "__" + op);
+        effectHandlerGlobals_[key] = g;
+        return g;
+    }
+
+    // v32 Phase 176: `perform E::op(args)` — call the dynamically-current
+    // handler for E::op. The handler is a `{ fn, env }` fat pointer; we rebuild
+    // its env-calling-convention type from the perform site's arg + result
+    // types (the handler was checked against exactly `fn(opParams) -> opRet`),
+    // null-guard it (an unhandled performed effect traps), and call it.
+    llvm::Value* emitPerform(const ast::PerformExpr& pe) {
+        auto& ctx = *ctx_;
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* g = effectHandlerGlobal(pe.effectName, pe.opName);
+        std::vector<TypePtr> argTys;
+        argTys.reserve(pe.args.size());
+        for (const auto& a : pe.args) {
+            TypePtr at = lookupExprType(*a);
+            argTys.push_back(at ? at : makeInt());
+        }
+        TypePtr retTy = lookupExprType(pe);
+        if (!retTy) retTy = makeInt();
+        auto* callTy = envCalleeType(makeFunction(argTys, retTy));
+        auto* h = builder_->CreateLoad(fnValTy_, g, "handler");
+        auto* fnPtr = builder_->CreateExtractValue(h, {0}, "h.fn");
+        auto* envPtr = builder_->CreateExtractValue(h, {1}, "h.env");
+        // Null-handler guard: an effect performed with no installed handler is a
+        // logic error (the dynamic handler stack is empty) — trap rather than
+        // call a null fn pointer.
+        auto* isNull = builder_->CreateICmpEQ(
+            fnPtr, llvm::ConstantPointerNull::get(i8PtrTy), "no_handler");
+        auto* trapBB = llvm::BasicBlock::Create(ctx, "unhandled", currentFn_);
+        auto* okBB = llvm::BasicBlock::Create(ctx, "handled", currentFn_);
+        builder_->CreateCondBr(isNull, trapBB, okBB);
+        builder_->SetInsertPoint(trapBB);
+        // Abort cleanly on an unhandled performed effect. Use libc `abort()`
+        // (declared on demand) rather than the `llvm.trap` intrinsic — the
+        // intrinsic-declaration helper was renamed across LLVM versions
+        // (getDeclaration -> getOrInsertDeclaration), and getOrInsertFunction is
+        // version-stable.
+        auto* abortTy = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(ctx), /*isVarArg=*/false);
+        llvm::FunctionCallee abortFn =
+            module_->getOrInsertFunction("abort", abortTy);
+        builder_->CreateCall(abortFn, {});
+        builder_->CreateUnreachable();
+        builder_->SetInsertPoint(okBB);
+        std::vector<llvm::Value*> args;
+        args.reserve(pe.args.size() + 1);
+        args.push_back(envPtr);
+        for (const auto& a : pe.args) args.push_back(emitConsume(*a));
+        const char* nm =
+            callTy->getReturnType()->isVoidTy() ? "" : "perform";
+        return builder_->CreateCall(callTy, fnPtr, args, nm);
+    }
+
+    // v32 Phase 176: `handle { body } with E { op(p) => hbody, … }`. Install each
+    // arm's handler closure into the per-op global (saving the previous value on
+    // the C stack), run the body, then restore. Dynamic scoping falls out of the
+    // save/restore: a `perform E::op` anywhere in the body's dynamic extent
+    // reads the global we just set. (Handler closure envs are heap-allocated and
+    // not freed here — a documented one-shot leak, like other closure envs; and
+    // a non-local exit out of `body` skips the restore — handle bodies should
+    // not `return` through the handle. Recursive cancellation / full
+    // continuation capture are out of scope — this is the tail-resumptive
+    // subset.)
+    llvm::Value* emitHandle(const ast::HandleExpr& he) {
+        std::vector<std::pair<llvm::GlobalVariable*, llvm::Value*>> saved;
+        saved.reserve(he.arms.size());
+        for (const auto& arm : he.arms) {
+            if (!arm.handler) continue;
+            auto* g = effectHandlerGlobal(he.effectName, arm.opName);
+            auto* old = builder_->CreateLoad(fnValTy_, g, "saved_handler");
+            saved.emplace_back(g, old);
+            llvm::Value* hv = emitExpr(*arm.handler); // the handler closure fnVal
+            builder_->CreateStore(hv, g);
+        }
+        llvm::Value* bodyVal = emitExpr(*he.body);
+        for (auto& [g, old] : saved) builder_->CreateStore(old, g);
+        return bodyVal;
+    }
+
     llvm::Value* emitClosure(const ast::ClosureExpr& cl) {
         auto& ctx = *ctx_;
         auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
