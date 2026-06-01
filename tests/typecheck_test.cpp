@@ -2354,6 +2354,86 @@ void test_thread_spawn_propagates_closure_io_effect() {
         "thread_spawn_propagates_closure_io_effect");
 }
 
+// v31 Phase 167: real Send/Sync MARKER traits + the marker oracle. A type with
+// no marker impl falls through to the structural rule (auto-derive); an
+// explicit `impl Send`/`impl !Send` overrides it; misuse is rejected.
+void test_marker_traits_send_sync() {
+    // The Send oracle is enforced at mutex_new (the cell must be Send). char is
+    // now Send (a Copy scalar); before the fix it fell through to NOT-Send and
+    // a Mutex<char> was wrongly rejected.
+    expectOk(
+        "fn main() -> i64 ! { alloc } {\n"
+        "  let m = mutex_new('a');\n"
+        "  0\n"
+        "}",
+        "marker_char_is_send");
+
+    // OPT-OUT: `impl !Send for W {}` removes a structurally-Send struct from
+    // Send, so storing it in a Mutex is rejected.
+    expectErr(
+        "trait Send { }\n"
+        "struct W { x: i64 }\n"
+        "impl !Send for W { }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "  let m = mutex_new(W { x: 1 });\n"
+        "  0\n"
+        "}",
+        "marker_optout_negative_impl");
+
+    // The same program without the opt-out compiles (structural Send).
+    expectOk(
+        "struct W { x: i64 }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "  let m = mutex_new(W { x: 1 });\n"
+        "  0\n"
+        "}",
+        "marker_optout_off_structural_send");
+
+    // OPT-IN OVERRIDE: a Holder structurally contains an Rc, so it is NOT Send
+    // by the structural rule — storing it in a Mutex is rejected...
+    expectErr(
+        "struct Holder { r: Rc<i64> }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "  let m = mutex_new(Holder { r: rc_new(7) });\n"
+        "  0\n"
+        "}",
+        "marker_optin_off_structural_not_send");
+
+    // ...but an explicit `impl Send for Holder {}` GRANTS Send (the audited
+    // override an opaque/handle type like Arc relies on), so it now compiles.
+    expectOk(
+        "trait Send { }\n"
+        "struct Holder { r: Rc<i64> }\n"
+        "impl Send for Holder { }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "  let m = mutex_new(Holder { r: rc_new(7) });\n"
+        "  0\n"
+        "}",
+        "marker_optin_grants_send");
+
+    // A negative impl is only allowed for the marker traits.
+    expectErr(
+        "struct W { x: i64 }\n"
+        "impl !Clone for W { }\n"
+        "fn main() -> i64 { 0 }",
+        "marker_negative_nonmarker_rejected");
+
+    // A marker trait must have no methods.
+    expectErr(
+        "trait Send { fn f(&self) -> i64; }\n"
+        "fn main() -> i64 { 0 }",
+        "marker_with_method_rejected");
+
+    // Conflicting positive + negative marker impls for the same type.
+    expectErr(
+        "trait Send { }\n"
+        "struct W { x: i64 }\n"
+        "impl Send for W { }\n"
+        "impl !Send for W { }\n"
+        "fn main() -> i64 { 0 }",
+        "marker_conflicting_impls_rejected");
+}
+
 void test_mutex_ops_typecheck_ok() {
     expectOk(
         "fn main() -> i64 ! { alloc, io } {\n"
@@ -3244,6 +3324,7 @@ int main() {
     test_thread_spawn_byvalue_closure_ok();
     test_thread_spawn_byref_capture_rejected();
     test_thread_spawn_propagates_closure_io_effect();
+    test_marker_traits_send_sync(); // v31 Phase 167
     test_mutex_ops_typecheck_ok();
     test_mutex_new_requires_alloc_effect();
     test_panic_carries_panic_effect_ok();
@@ -3331,6 +3412,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (311 cases)\n";
+    std::cout << "All typecheck tests passed (312 cases)\n";
     return 0;
 }

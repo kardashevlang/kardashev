@@ -239,6 +239,16 @@ std::string applyPrelude(const std::string& userSrc) {
     // remains the structural workhorse / fallback for types with no impl. (The
     // method is `x.clone()`; the intrinsic is the free call `clone(&x)` — they
     // coexist.) Guarded so a user-defined `Clone` wins.
+    // v31 Phase 167: `Send` and `Sync` are real DECLARABLE marker traits —
+    // zero methods, no vtable, no ABI. Membership is auto-derived structurally
+    // (a type with no explicit impl gets the structural answer in
+    // isSend/isSync), manually grantable (`impl Send for Opaque {}`), and
+    // opt-out-able (`impl !Send for T {}`). Declared early so user impls /
+    // negative impls can name them. Guarded so a user redefinition wins.
+    if (userSrc.find("trait Send") == std::string::npos)
+        prelude += "trait Send { }\n";
+    if (userSrc.find("trait Sync") == std::string::npos)
+        prelude += "trait Sync { }\n";
     if (userSrc.find("trait Clone") == std::string::npos) {
         prelude +=
             "trait Clone { fn clone(&self) -> Self ! { alloc }; }\n"

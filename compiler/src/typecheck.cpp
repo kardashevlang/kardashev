@@ -1423,6 +1423,14 @@ public:
                 }
                 uniqueMethods.push_back(m);
             }
+            // v31 Phase 167: Send/Sync are pure MARKER traits — no methods, no
+            // vtable, no runtime cost. Reject a user adding behaviour to them.
+            if ((td.name == "Send" || td.name == "Sync") &&
+                !uniqueMethods.empty()) {
+                error("the marker trait `" + td.name +
+                          "` must have no methods",
+                      td.line, td.column);
+            }
             traits_[td.name] = std::move(uniqueMethods);
             traitSupertraits_[td.name] = td.supertraits; // v25 Phase 136
         }
@@ -1434,7 +1442,10 @@ public:
         {
             std::unordered_set<std::string> implemented;
             for (const auto& impl : program.impls)
-                if (!impl.traitName.empty())
+                // v31 Phase 167: a negative marker impl does NOT implement the
+                // trait — it opts out — so it must not satisfy a supertrait
+                // bound (`trait Foo: Send` over a type with `impl !Send`).
+                if (!impl.traitName.empty() && !impl.isNegative)
                     implemented.insert(impl.forType.name + "/" + impl.traitName);
             for (const auto& impl : program.impls) {
                 if (impl.traitName.empty()) continue;
@@ -1474,6 +1485,11 @@ public:
             std::unordered_set<std::string> seenImplPairs;
             for (const auto& impl : program.impls) {
                 if (impl.traitName.empty()) continue;
+                // v31 Phase 167: marker (Send/Sync) impls — positive and
+                // negative — are governed by the dedicated marker-oracle pass
+                // below, which owns their conflict/duplicate diagnostics.
+                if (impl.traitName == "Send" || impl.traitName == "Sync")
+                    continue;
                 std::string key = impl.forType.name +
                                   spellArgs(impl.forType.typeArgs) + "/" +
                                   impl.traitName + spellArgs(impl.traitTypeArgs);
@@ -1486,6 +1502,49 @@ public:
             }
         }
 
+        // v31 Phase 167: build the Send/Sync marker oracle. A positive `impl
+        // Send for T {}` forces T: Send (the legible witness for an opaque /
+        // handle type whose structural answer is wrong — e.g. a future Arc); a
+        // negative `impl !Send for T {}` opts T out (the principled replacement
+        // for hand-coded special-cases). This is the SOLE authority on marker
+        // impls — they are skipped by the supertrait/coherence checks above so
+        // their conflict diagnostics live here. A type with no marker impl is
+        // unspecified and gets the structural auto-derive in isSend/isSync.
+        for (const auto& impl : program.impls) {
+            const bool isMarker =
+                impl.traitName == "Send" || impl.traitName == "Sync";
+            if (impl.isNegative && !isMarker) {
+                error("negative impls are only allowed for the marker traits "
+                      "`Send` and `Sync`",
+                      impl.line, impl.column);
+                continue;
+            }
+            if (!isMarker) continue;
+            if (!impl.methods.empty()) {
+                error("a marker impl of `" + impl.traitName +
+                          "` must have no methods",
+                      impl.line, impl.column);
+                continue;
+            }
+            const std::string& tyName = impl.forType.name;
+            int sign = impl.isNegative ? -1 : +1;
+            auto& slot = markerImpls_[tyName];
+            auto existing = slot.find(impl.traitName);
+            if (existing != slot.end()) {
+                if (existing->second != sign)
+                    error("conflicting `impl " + impl.traitName +
+                              "` and `impl !" + impl.traitName + "` for type '" +
+                              tyName + "'",
+                          impl.line, impl.column);
+                else
+                    error("duplicate impl of marker trait `" + impl.traitName +
+                              "` for type '" + tyName + "'",
+                          impl.line, impl.column);
+                continue;
+            }
+            slot[impl.traitName] = sign;
+        }
+
         // Pass 1d: register impl blocks. We resolve the implementing type
         // and validate that each impl method's signature matches the
         // trait's after substituting Self -> implementing type.
@@ -1494,6 +1553,11 @@ public:
         for (std::size_t implIdx = 0; implIdx < program.impls.size();
              ++implIdx) {
             const auto& impl = program.impls[implIdx];
+            // v31 Phase 167: a negative marker impl (`impl !Send for T {}`)
+            // provides nothing — it is an opt-out recorded in markerImpls_, not
+            // a real impl. Skip it here so it is neither validated against a
+            // trait signature nor registered as providing a method.
+            if (impl.isNegative) continue;
             // Phase 15: inherent impls (`impl Type { ... }`) carry an empty
             // trait name and have no trait signature to validate methods
             // against. Trait impls keep the Phase 3.3 path (lookup + match).
@@ -2288,6 +2352,14 @@ private:
     std::unordered_map<std::string, std::vector<std::string>> traitAssocTypes_;
     // v25 Phase 136: trait -> its supertrait names.
     std::unordered_map<std::string, std::vector<std::string>> traitSupertraits_;
+    // v31 Phase 167: explicit Send/Sync marker membership, keyed
+    // [typeName]["Send"|"Sync"] -> +1 (an `impl Send for T {}` forces true,
+    // for opaque/handle types) or -1 (an `impl !Send for T {}` opts out). A
+    // type with NO entry (the common case) falls through to the structural
+    // auto-derive in isSend/isSync. This is the single source of truth the
+    // marker oracle consults; populated once after coherence (Pass 1c/1d).
+    std::unordered_map<std::string, std::unordered_map<std::string, int>>
+        markerImpls_;
     // v26 Phase 144: top-level type aliases (name -> aliased TypeRef).
     std::unordered_map<std::string, ast::TypeRef> typeAliases_;
     // Phase 21b: per (implementing-type-name, trait-name), the concrete type
@@ -6560,6 +6632,22 @@ private:
         return "";
     }
 
+    // v31 Phase 167: the first BY-VALUE capture of a closure whose type is not
+    // `Send` (the value is moved into the spawned thread, so it must be Send).
+    // Today every by-value-capturable type (scalars, the Mutex / Sender
+    // handles) is already Send, so this is the explicit Send FLOOR at the spawn
+    // boundary rather than a new restriction — it becomes load-bearing when
+    // richer captures land (scoped threads). By-ref captures are handled
+    // separately (closureByRefCaptureName) and rejected outright.
+    std::string closureNonSendCaptureName(const ast::Expr& e) {
+        if (auto* cl = dynamic_cast<const ast::ClosureExpr*>(&e)) {
+            for (const auto& cap : cl->captures)
+                if (!cap.byRef && cap.type && !isSend(cap.type))
+                    return cap.name;
+        }
+        return "";
+    }
+
     // Phase 10b: type-check a capturing closure `|params| body`. Determines
     // the captured free variables (recorded on the AST node for codegen),
     // checks the body in a scope holding ONLY the params + captures (so an
@@ -7209,6 +7297,20 @@ private:
                               "Copy value, or share via a Mutex handle) instead",
                           call.args[0]->line, call.args[0]->column);
                 }
+                // v31 Phase 167: the Send FLOOR, made explicit at the spawn
+                // boundary — every by-value capture is moved into the thread,
+                // so its type must be `Send`. Goes through the marker oracle,
+                // so an `impl !Send for T {}` makes capturing a T into a thread
+                // a hard error (and an `impl Send for Opaque {}` permits it).
+                std::string nonSend = closureNonSendCaptureName(*call.args[0]);
+                if (!nonSend.empty()) {
+                    error("cannot move a non-`Send` value across a thread "
+                          "boundary: closure passed to `thread_spawn` captures "
+                          "`" + nonSend +
+                              "` by value, but its type is not `Send`. Only "
+                              "`Send` data may cross a thread boundary",
+                          call.args[0]->line, call.args[0]->column);
+                }
             }
             // Phase 77 (v13): the value sent on a channel crosses a thread
             // boundary, so its type must be `Send` (the value-safety half of
@@ -7733,6 +7835,16 @@ private:
     // closure / fn value (may capture by reference) are NOT Send. The MPSC
     // contract — only the Sender crosses, never the Receiver — and the
     // no-dangling-borrow guarantee both fall out of this.
+    // v31 Phase 167: the marker oracle. +1 if an `impl Send/Sync for T {}`
+    // grants membership, -1 if an `impl !Send/!Sync for T {}` opts out, 0 if
+    // unspecified (the type gets the structural auto-derive). Consulted at the
+    // TOP of the Struct/Enum arms of isSend/isSync so an explicit impl wins.
+    int markerStatus(const std::string& tyName, const char* marker) const {
+        auto it = markerImpls_.find(tyName);
+        if (it == markerImpls_.end()) return 0;
+        auto jt = it->second.find(marker);
+        return jt == it->second.end() ? 0 : jt->second;
+    }
     bool isSend(const TypePtr& t) {
         std::unordered_set<std::string> seen;
         return isSendImpl(t, seen);
@@ -7743,6 +7855,9 @@ private:
         case TypeKind::Int:
         case TypeKind::Float:
         case TypeKind::Bool:
+        case TypeKind::Char: // v27 Copy scalar — Send (was a latent gap: fell
+                             // through to default:false, wrongly rejecting
+                             // chan_send(char) / Mutex<char>).
         case TypeKind::Unit:
             return true;
         case TypeKind::Box:
@@ -7754,6 +7869,9 @@ private:
                 if (!isSendImpl(el, seen)) return false;
             return true;
         case TypeKind::Struct: {
+            // v31 Phase 167: an explicit `impl Send`/`impl !Send` overrides the
+            // structural rule (the principled hook for opaque/handle types).
+            if (int ms = markerStatus(r->structName, "Send")) return ms > 0;
             // String owns its bytes (Send); the channel Sender is Send. The
             // Receiver (single-consumer) and an Rc (non-atomic refcount) are NOT.
             if (r->structName == "String" || r->structName == "Sender")
@@ -7777,6 +7895,7 @@ private:
             return true;
         }
         case TypeKind::Enum: {
+            if (int ms = markerStatus(r->enumName, "Send")) return ms > 0;
             if (!seen.insert(r->enumName).second) return true;
             for (const auto& v : r->enumVariants)
                 for (const auto& p : v.payloadTypes)
@@ -7787,6 +7906,87 @@ private:
         // lifetime can't be proven to outlive the thread); a closure may
         // capture by reference; an unsolved Var / dyn is conservatively unsafe.
         case TypeKind::Ref:
+        case TypeKind::Function:
+        case TypeKind::Dyn:
+        case TypeKind::Var:
+        default:
+            return false;
+        }
+    }
+
+    // v31 Phase 167: `Sync` — a type is Sync iff it is safe to SHARE a `&T`
+    // across threads. Decided structurally, mirroring isSend, with the
+    // interior-mutability inversion for Mutex. Sync has no enforcement site in
+    // this MVP (a `&T` cannot yet cross a thread — by-ref captures are rejected
+    // outright at thread_spawn), so it carries no teeth until scoped threads
+    // (a later v31 phase) let a borrow cross a thread scope; it is defined now
+    // so that machinery can consult it. The marker oracle (`impl Sync` / `impl
+    // !Sync`) overrides the structural answer, exactly like Send.
+    bool isSync(const TypePtr& t) {
+        std::unordered_set<std::string> seen;
+        return isSyncImpl(t, seen);
+    }
+    bool isSyncImpl(const TypePtr& t, std::unordered_set<std::string>& seen) {
+        TypePtr r = resolve(t);
+        switch (r->kind) {
+        case TypeKind::Int:
+        case TypeKind::Float:
+        case TypeKind::Bool:
+        case TypeKind::Char:
+        case TypeKind::Unit:
+            return true;
+        case TypeKind::Box:
+            return isSyncImpl(r->refInner, seen);
+        // `&T` / `&mut T` is itself Sync iff the pointee is Sync (sharing the
+        // reference is sharing the data).
+        case TypeKind::Ref:
+            return isSyncImpl(r->refInner, seen);
+        case TypeKind::Array:
+            return isSyncImpl(r->arrayElem, seen);
+        case TypeKind::Tuple:
+            for (const auto& el : r->tupleElems)
+                if (!isSyncImpl(el, seen)) return false;
+            return true;
+        case TypeKind::Struct: {
+            if (int ms = markerStatus(r->structName, "Sync")) return ms > 0;
+            // String is immutable-once-shared (Sync). The Sender only appends
+            // under the channel's own mutex, so concurrent &Sender use is race
+            // free (Sync). The single-consumer Receiver and the non-atomic Rc
+            // are NOT Sync.
+            if (r->structName == "String" || r->structName == "Sender")
+                return true;
+            if (r->structName == "Receiver" || r->structName == "Rc")
+                return false;
+            // A Mutex<T> is Sync iff its cell T is SEND — the interior-
+            // mutability inversion: the lock serialises access, so a
+            // Send-but-not-Sync T becomes safely shareable behind a Mutex.
+            if (r->structName == "Mutex") {
+                for (const auto& a : r->typeArgs)
+                    if (!isSendImpl(a, seen)) return false;
+                return true;
+            }
+            if (r->structName == "Vec" || r->structName == "HashMap" ||
+                r->structName == "HashSet") {
+                for (const auto& a : r->typeArgs)
+                    if (!isSyncImpl(a, seen)) return false;
+                return true;
+            }
+            // A user struct is Sync iff every field is.
+            if (!seen.insert(r->structName).second) return true; // recursive
+            for (const auto& f : r->structFields)
+                if (!isSyncImpl(f.second, seen)) return false;
+            return true;
+        }
+        case TypeKind::Enum: {
+            if (int ms = markerStatus(r->enumName, "Sync")) return ms > 0;
+            if (!seen.insert(r->enumName).second) return true;
+            for (const auto& v : r->enumVariants)
+                for (const auto& p : v.payloadTypes)
+                    if (!isSyncImpl(p, seen)) return false;
+            return true;
+        }
+        // A closure (may hold by-ref captures), a dyn object, and an unsolved
+        // Var are conservatively NOT Sync.
         case TypeKind::Function:
         case TypeKind::Dyn:
         case TypeKind::Var:
