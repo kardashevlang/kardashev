@@ -57,6 +57,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <tuple>
 #include <string>
 #include <string_view>
 #include <unistd.h> // isatty
@@ -553,6 +554,26 @@ std::string applyPrelude(const std::string& userSrc) {
         prelude += "trait Mul { fn mul(self, rhs: Self) -> Self; }\n";
     if (userSrc.find("trait Div") == std::string::npos)
         prelude += "trait Div { fn div(self, rhs: Self) -> Self; }\n";
+    // v37 Phase (full operator surface): the rest of the homogeneous binary
+    // operator traits — `%` and the bitwise/shift family — mirror Add/Sub/Mul/
+    // Div exactly (by-value `self`+`rhs: Self` -> `Self`; primitives keep their
+    // built-in ops). Plus the UNARY operator traits Neg (`-x`) and Not (`!x`).
+    if (userSrc.find("trait Rem") == std::string::npos)
+        prelude += "trait Rem { fn rem(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait BitAnd") == std::string::npos)
+        prelude += "trait BitAnd { fn bitand(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait BitOr") == std::string::npos)
+        prelude += "trait BitOr { fn bitor(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait BitXor") == std::string::npos)
+        prelude += "trait BitXor { fn bitxor(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait Shl") == std::string::npos)
+        prelude += "trait Shl { fn shl(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait Shr") == std::string::npos)
+        prelude += "trait Shr { fn shr(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait Neg") == std::string::npos)
+        prelude += "trait Neg { fn neg(self) -> Self; }\n";
+    if (userSrc.find("trait Not") == std::string::npos)
+        prelude += "trait Not { fn not(self) -> Self; }\n";
     // Phase 43: runtime string escape decode/encode for JSON-style strings,
     // written in kardashev over str_push_byte / str_char_at. `\\uXXXX` decodes
     // the Latin-1 subset (cp < 256); higher code points become '?' (documented).
@@ -1586,6 +1607,19 @@ std::string applyPrelude(const std::string& userSrc) {
             "        vec_swap(v, i, j);\n"
             "    }\n"
             "}\n";
+    }
+    // v37 test framework: assertion macros (over the Phase 182 macro engine).
+    // A `test_*() -> i64` test returns 0 = ok, non-zero = FAILED (the runner
+    // convention), so a failed assertion `return`s a non-zero code — this
+    // reports the test FAILED without aborting the whole run (no panic-catch
+    // needed), and composes with `--filter` / `--format=json`. (assert! works
+    // in an i64-returning fn — the test convention; a panicking assert that
+    // works anywhere is future work, pending a panic-catching runner.)
+    if (userSrc.find("macro_rules! assert") == std::string::npos) {
+        prelude +=
+            "macro_rules! assert { ($c:expr) => { if $c { } else { return 1; } }; }\n"
+            "macro_rules! assert_eq { ($a:expr, $b:expr) => { if $a == $b { } else { return 1; } }; }\n"
+            "macro_rules! assert_ne { ($a:expr, $b:expr) => { if $a == $b { return 1; } else { } }; }\n";
     }
     return prelude + userSrc;
 }
@@ -3351,7 +3385,8 @@ bool isTestFn(const kardashev::ast::FnDecl& fn) {
 
 int runTests(const std::string& srcRaw, const std::string& srcDir,
              bool emitDebug, const std::string& sourceFile,
-             kardashev::OptLevel optLevel) {
+             kardashev::OptLevel optLevel, const std::string& filter = "",
+             bool jsonOut = false) {
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return 1;
     auto& program = *progOpt;
@@ -3373,12 +3408,22 @@ int runTests(const std::string& srcRaw, const std::string& srcDir,
     // don't start with `test_`, so they're naturally excluded.
     std::vector<std::string> testNames;
     for (const auto& fn : program.functions) {
-        if (isTestFn(fn)) testNames.push_back(fn.name);
+        // v37: `--filter <substr>` runs only tests whose name contains substr.
+        if (isTestFn(fn) &&
+            (filter.empty() || fn.name.find(filter) != std::string::npos))
+            testNames.push_back(fn.name);
     }
     if (testNames.empty()) {
-        std::cerr << "kardc: no `test_*() -> i64` functions found in "
-                  << sourceFile << '\n';
-        return 1;
+        if (jsonOut)
+            std::cout << "{\"tests\":[],\"passed\":0,\"failed\":0}\n";
+        else
+            std::cerr << "kardc: no matching `test_*() -> i64` functions in "
+                      << sourceFile
+                      << (filter.empty() ? "" : " (filter: " + filter + ")")
+                      << '\n';
+        // No matching tests: success under a filter (nothing failed), error
+        // when the file genuinely has none.
+        return filter.empty() ? 1 : 0;
     }
 
     auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile,
@@ -3405,34 +3450,51 @@ int runTests(const std::string& srcRaw, const std::string& srcDir,
         return 1;
     }
 
-    std::cout << "running " << testNames.size() << " test"
-              << (testNames.size() == 1 ? "" : "s") << '\n';
+    if (!jsonOut)
+        std::cout << "running " << testNames.size() << " test"
+                  << (testNames.size() == 1 ? "" : "s") << '\n';
     using TestFn = std::int64_t (*)();
     int passed = 0;
     int failed = 0;
+    // (name, rc, ok) — collected so we can emit either the cargo-style text
+    // report or a `--format=json` machine-readable one.
+    std::vector<std::tuple<std::string, std::int64_t, bool>> results;
     for (const auto& name : testNames) {
         auto symOrErr = jit->lookup(name);
         if (!symOrErr) {
-            // Should not happen (the fn typechecked + codegen'd), but treat a
-            // lookup failure as a hard failure rather than crashing.
-            std::cout << "test " << name << " ... FAILED (lookup error)\n";
             llvm::consumeError(symOrErr.takeError());
+            results.emplace_back(name, -1, false);
             ++failed;
+            if (!jsonOut)
+                std::cout << "test " << name << " ... FAILED (lookup error)\n";
             continue;
         }
         auto fn = symOrErr->toPtr<TestFn>();
         std::int64_t rc = fn();
-        if (rc == 0) {
-            std::cout << "test " << name << " ... ok\n";
-            ++passed;
-        } else {
-            std::cout << "test " << name << " ... FAILED (returned " << rc
-                      << ")\n";
-            ++failed;
+        bool ok = (rc == 0);
+        results.emplace_back(name, rc, ok);
+        if (ok) ++passed; else ++failed;
+        if (!jsonOut) {
+            if (ok) std::cout << "test " << name << " ... ok\n";
+            else std::cout << "test " << name << " ... FAILED (returned " << rc
+                           << ")\n";
         }
     }
-    std::cout << "test result: " << passed << " passed, " << failed
-              << " failed\n";
+    if (jsonOut) {
+        // Schema: {"tests":[{"name","result":"ok"|"failed","code"}],passed,failed}
+        std::cout << "{\"tests\":[";
+        for (std::size_t i = 0; i < results.size(); ++i) {
+            const auto& [name, rc, ok] = results[i];
+            if (i) std::cout << ",";
+            std::cout << "{\"name\":\"" << name << "\",\"result\":\""
+                      << (ok ? "ok" : "failed") << "\",\"code\":" << rc << "}";
+        }
+        std::cout << "],\"passed\":" << passed << ",\"failed\":" << failed
+                  << "}\n";
+    } else {
+        std::cout << "test result: " << passed << " passed, " << failed
+                  << " failed\n";
+    }
     return failed == 0 ? 0 : 1;
 }
 
@@ -3465,6 +3527,8 @@ int main(int argc, char** argv) {
     bool warnEnabled = false;
     // Phase 20a: `--test` discovers + JIT-runs `test_*() -> i64` fns.
     bool testMode = false;
+    std::string testFilter; // v37 --filter
+    bool testJson = false;  // v37 --format=json
     // Phase 20a: optimization level for the post-codegen LLVM pipeline.
     // Default O2 — byte-for-byte the historic behavior when no `-O` is passed.
     kardashev::OptLevel optLevel = kardashev::OptLevel::O2;
@@ -3511,6 +3575,10 @@ int main(int argc, char** argv) {
             warnEnabled = true;
         } else if (a == "--test") {
             testMode = true;
+        } else if (a == "--filter" && i + 1 < argc) {
+            testFilter = argv[++i]; // v37: run only tests whose name contains it
+        } else if (a == "--format=json") {
+            testJson = true; // v37: machine-readable test output
         } else if (a == "-O0") {
             optLevel = kardashev::OptLevel::O0;
         } else if (a == "-O1") {
@@ -3567,7 +3635,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         return runTests(*src, dirOf(inputPath), emitDebug, inputPath,
-                        optLevel);
+                        optLevel, testFilter, testJson);
     }
     if (emitIr) {
         if (inputPath.empty()) {

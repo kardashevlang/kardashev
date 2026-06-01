@@ -515,6 +515,27 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v37: full operator-trait surface (Rem/bitops + unary Neg/Not).
+sh_test(
+    name = "smoke_test_operator_overload2",
+    srcs = ["smoke_test_operator_overload2.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v37: real test framework (assert macros + --filter + --format=json).
+sh_test(
+    name = "smoke_test_testframework",
+    srcs = ["smoke_test_testframework.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v37: turbofish — explicit generic type args f::<T>(args).
+sh_test(
+    name = "smoke_test_turbofish",
+    srcs = ["smoke_test_turbofish.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

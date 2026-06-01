@@ -88,6 +88,13 @@ tooling, `[BP]` backends-perf, `[EC]` maturity-ecosystem. Each phase is tagged
 
 ### v37 — "Foundations & unblockers" — moves: TS, MS, CC, BP, TL, MP
 
+> **Status (`v0.37.0`, partial):** ✅ SHIPPED — full operator-trait surface
+> (Rem + bitops + unary Neg/Not), turbofish (`f::<T>(…)`), and the real test
+> framework (assert macros + `--filter` + `--format=json`). ⛔ DEFERRED to a
+> later v37.x batch — the sanitizer + TSan CI gates (need sanitizer-instrumented
+> codegen), the panic strategy, complete-borrow-check, the selectable
+> overflow-trap policy, and the benchmark-regression harness.
+
 The cheap, dependency-free wins that other phases stand on, **plus the two CI jobs
 that gate later concurrency and the panic policy that affects the ABI from here on.**
 No XL work; everything here is `parity` and independently testable.
