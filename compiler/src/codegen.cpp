@@ -2297,6 +2297,19 @@ private:
         return inst;
     }
 
+    // v31 Phase 170: SelectResult<T> (the prelude enum select2/3/4 returns).
+    TypePtr selectResultType(const TypePtr& V) {
+        auto eit = tc_.enums.find("SelectResult");
+        if (eit == tc_.enums.end()) return nullptr;
+        const EnumSchema& schema = eit->second;
+        if (schema.genericVars.empty()) return schema.type;
+        std::unordered_map<int, TypePtr> subst;
+        subst[schema.genericVars[0]->varId] = V;
+        TypePtr inst = instantiate(schema.type, subst);
+        inst->typeArgs = {V};
+        return inst;
+    }
+
     // Phase 17b: lazily emit a per-value-type specialization of the HashMap
     // runtime. On first call for a given V we emit all five mangled fns
     // (`__hm_raw_insert__<V>`, `hashmap_new__<V>`, `hashmap_insert__<V>`,
@@ -3529,6 +3542,111 @@ private:
             declaredFns_["thread_join"] = fn;
         }
 
+        // v31 Phase 170: scoped threads. A `Scope` is an i64 handle to a heap
+        // `{ i64* handles, i64 count, i64 cap }` block — a growable list of the
+        // thread handles spawned via scope_spawn. The Scope is move-only and
+        // its Drop calls scope_join_all (RAII join-before-scope-end): every
+        // spawned worker is joined before the scope binding goes out of scope.
+        auto* scopeBlkTy = llvm::StructType::create(
+            ctx, {i8PtrTy, i64Ty, i64Ty}, "kd.scope_blk");
+        // i64 scope_new()
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(i64Ty, {}, false),
+                llvm::Function::ExternalLinkage, "scope_new", module_.get());
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            uint64_t sz = module_->getDataLayout().getTypeAllocSize(scopeBlkTy);
+            auto* blk = b.CreateCall(
+                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "scope_blk");
+            b.CreateStore(llvm::ConstantPointerNull::get(i8PtrTy),
+                          b.CreateStructGEP(scopeBlkTy, blk, 0, "handles"));
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0),
+                          b.CreateStructGEP(scopeBlkTy, blk, 1, "count"));
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0),
+                          b.CreateStructGEP(scopeBlkTy, blk, 2, "cap"));
+            b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "h"));
+            declaredFns_["scope_new"] = fn;
+        }
+        // i64 scope_push(i64 scope, i64 threadHandle) — append, growing the
+        // handles array (realloc-doubling) when full.
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(i64Ty, {i64Ty, i64Ty}, false),
+                llvm::Function::ExternalLinkage, "scope_push", module_.get());
+            fn->getArg(0)->setName("scope");
+            fn->getArg(1)->setName("th");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* growBB = llvm::BasicBlock::Create(ctx, "grow", fn);
+            auto* afterBB = llvm::BasicBlock::Create(ctx, "after", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* countP = b.CreateStructGEP(scopeBlkTy, blk, 1, "countP");
+            auto* capP = b.CreateStructGEP(scopeBlkTy, blk, 2, "capP");
+            auto* handlesP = b.CreateStructGEP(scopeBlkTy, blk, 0, "handlesP");
+            auto* count = b.CreateLoad(i64Ty, countP, "count");
+            auto* cap = b.CreateLoad(i64Ty, capP, "cap");
+            b.CreateCondBr(b.CreateICmpEQ(count, cap, "full"), growBB, afterBB);
+            b.SetInsertPoint(growBB);
+            // newCap = cap == 0 ? 8 : cap * 2
+            auto* dbl = b.CreateMul(cap, llvm::ConstantInt::get(i64Ty, 2));
+            auto* newCap = b.CreateSelect(
+                b.CreateICmpEQ(cap, llvm::ConstantInt::get(i64Ty, 0)),
+                llvm::ConstantInt::get(i64Ty, 8), dbl, "newCap");
+            auto* bytes =
+                b.CreateMul(newCap, llvm::ConstantInt::get(i64Ty, 8), "bytes");
+            auto* oldH = b.CreateLoad(i8PtrTy, handlesP, "oldH");
+            auto* newH = b.CreateCall(reallocFn_, {oldH, bytes}, "newH");
+            b.CreateStore(newH, handlesP);
+            b.CreateStore(newCap, capP);
+            b.CreateBr(afterBB);
+            b.SetInsertPoint(afterBB);
+            auto* handles = b.CreateLoad(i8PtrTy, handlesP, "handles");
+            auto* slot = b.CreateGEP(i64Ty, handles, {count}, "slot");
+            b.CreateStore(fn->getArg(1), slot);
+            b.CreateStore(
+                b.CreateAdd(count, llvm::ConstantInt::get(i64Ty, 1)), countP);
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_["scope_push"] = fn;
+        }
+        // i64 scope_join_all(i64 scope) — join every recorded thread, then free
+        // the handles array + the scope block.
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(i64Ty, {i64Ty}, false),
+                llvm::Function::ExternalLinkage, "scope_join_all",
+                module_.get());
+            fn->getArg(0)->setName("scope");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* loopBB = llvm::BasicBlock::Create(ctx, "loop", fn);
+            auto* bodyBB = llvm::BasicBlock::Create(ctx, "body", fn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "done", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* count = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(scopeBlkTy, blk, 1, "countP"), "count");
+            auto* handles = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(scopeBlkTy, blk, 0, "handlesP"),
+                "handles");
+            auto* iA = b.CreateAlloca(i64Ty, nullptr, "i");
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0), iA);
+            b.CreateBr(loopBB);
+            b.SetInsertPoint(loopBB);
+            auto* i = b.CreateLoad(i64Ty, iA, "i");
+            b.CreateCondBr(b.CreateICmpSLT(i, count, "more"), bodyBB, doneBB);
+            b.SetInsertPoint(bodyBB);
+            auto* h = b.CreateLoad(
+                i64Ty, b.CreateGEP(i64Ty, handles, {i}, "hslot"), "h");
+            b.CreateCall(declaredFns_["thread_join"], {h});
+            b.CreateStore(b.CreateAdd(i, llvm::ConstantInt::get(i64Ty, 1)), iA);
+            b.CreateBr(loopBB);
+            b.SetInsertPoint(doneBB);
+            b.CreateCall(freeFn_, {handles}); // free(null) is a no-op
+            b.CreateCall(freeFn_, {blk});
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_["scope_join_all"] = fn;
+        }
+
         // mutex_new/get/set are GENERIC over the cell type T (Phase 123) — they
         // are emitted per-T by getOrEmitMutexOp (a per-T block `{[64 x i8], T}`),
         // not here. Only the T-agnostic lock/unlock (which touch the
@@ -4340,6 +4458,118 @@ private:
                 b.CreateRet(z64);
             else
                 b.CreateRetVoid();
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        // v31 Phase 170: select2/3/4 — poll the N receivers (each under its own
+        // block mutex) for a ready item; return Ready(idx, value) on the first
+        // hit, Closed(idx) if a drained-and-closed receiver is seen and none is
+        // ready, else nanosleep a fixed backoff and sweep again. Ready always
+        // wins over Closed within a sweep (Closed is only remembered, returned
+        // after the full sweep). Reuses chan_try_recv's exact pop sequence.
+        if (op == "select2" || op == "select3" || op == "select4") {
+            int N = op[6] - '0';
+            TypePtr srTy = selectResultType(T);
+            mapKardashevType(srTy);
+            const std::string srMangled =
+                mangleStructInstance(srTy->enumName, srTy->typeArgs);
+            auto* srLlvm = enumTypes_[srMangled];
+            unsigned readyIdx = variantIndexInEnum(srTy, "Ready");
+            unsigned closedIdx = variantIndexInEnum(srTy, "Closed");
+            unsigned readyIdxSlot = enumPayloadIndices_[srMangled][readyIdx][0];
+            unsigned readyValSlot = enumPayloadIndices_[srMangled][readyIdx][1];
+            unsigned closedIdxSlot =
+                enumPayloadIndices_[srMangled][closedIdx][0];
+            std::vector<llvm::Type*> argtys(N, i8PtrTy);
+            auto* fn = mkFn(llvm::FunctionType::get(srLlvm, argtys, false));
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* sweep = llvm::BasicBlock::Create(ctx, "sweep", fn);
+            llvm::IRBuilder<> b(entry);
+            std::vector<llvm::Value*> blks;
+            for (int i = 0; i < N; ++i) {
+                fn->getArg(i)->setName("r");
+                auto* h = b.CreateLoad(i64Ty, fn->getArg(i), "h");
+                blks.push_back(b.CreateIntToPtr(h, i8PtrTy, "blk"));
+            }
+            auto* closedSlotA = b.CreateAlloca(i64Ty, nullptr, "closedIdx");
+            b.CreateBr(sweep);
+            b.SetInsertPoint(sweep);
+            // -1 = "no closed receiver seen this sweep".
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, -1), closedSlotA);
+            for (int i = 0; i < N; ++i) {
+                auto* popBB = llvm::BasicBlock::Create(ctx, "pop", fn);
+                auto* nrBB = llvm::BasicBlock::Create(ctx, "notready", fn);
+                auto* clrBB = llvm::BasicBlock::Create(ctx, "cleartail", fn);
+                auto* afterBB = llvm::BasicBlock::Create(ctx, "after", fn);
+                auto* contBB = llvm::BasicBlock::Create(ctx, "cont", fn);
+                b.CreateCall(pthreadMutexLockFn_, {mtxOf(b, blks[i])});
+                auto* cntP = b.CreateStructGEP(chanBlkTy_, blks[i], 4, "cntP");
+                auto* cnt = b.CreateLoad(i64Ty, cntP, "cnt");
+                b.CreateCondBr(b.CreateICmpSGT(cnt, z64, "has"), popBB, nrBB);
+                // pop (verbatim chan_try_recv): load head/val/next, advance,
+                // dec, free, clear tail if drained; unlock; return Ready(i,val).
+                b.SetInsertPoint(popBB);
+                auto* headP = b.CreateStructGEP(chanBlkTy_, blks[i], 2, "headP");
+                auto* head = b.CreateLoad(i8PtrTy, headP, "head");
+                auto* val = b.CreateLoad(
+                    elemTy, b.CreateStructGEP(nodeTy, head, 0, "hval"), "val");
+                auto* next = b.CreateLoad(
+                    i8PtrTy, b.CreateStructGEP(nodeTy, head, 1, "hnext"),
+                    "next");
+                b.CreateStore(next, headP);
+                b.CreateStore(b.CreateSub(cnt, one64, "cntm1"), cntP);
+                b.CreateCall(freeFn_, {head});
+                b.CreateCondBr(b.CreateICmpEQ(next, nullp, "drained"), clrBB,
+                               afterBB);
+                b.SetInsertPoint(clrBB);
+                b.CreateStore(nullp,
+                              b.CreateStructGEP(chanBlkTy_, blks[i], 3, "tailP"));
+                b.CreateBr(afterBB);
+                b.SetInsertPoint(afterBB);
+                b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blks[i])});
+                llvm::Value* ready = llvm::UndefValue::get(srLlvm);
+                ready = b.CreateInsertValue(
+                    ready, llvm::ConstantInt::get(i32Ty, readyIdx), {0});
+                ready = b.CreateInsertValue(
+                    ready, llvm::ConstantInt::get(i64Ty, i), {readyIdxSlot});
+                ready = b.CreateInsertValue(ready, val, {readyValSlot}, "ready");
+                b.CreateRet(ready);
+                // not ready: note if closed+drained, unlock, continue.
+                b.SetInsertPoint(nrBB);
+                auto* closed = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(chanBlkTy_, blks[i], 5, "closedP"),
+                    "closed");
+                b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blks[i])});
+                auto* isClosed = b.CreateICmpNE(closed, z64, "isClosed");
+                auto* cur = b.CreateLoad(i64Ty, closedSlotA, "curClosed");
+                b.CreateStore(
+                    b.CreateSelect(isClosed,
+                                   llvm::ConstantInt::get(i64Ty, i), cur),
+                    closedSlotA);
+                b.CreateBr(contBB);
+                b.SetInsertPoint(contBB);
+            }
+            // sweep done with nothing ready: return Closed(idx) if any closed,
+            // else nanosleep 100us and sweep again.
+            auto* finalClosed = b.CreateLoad(i64Ty, closedSlotA, "finalClosed");
+            auto* retClosedBB = llvm::BasicBlock::Create(ctx, "retClosed", fn);
+            auto* sleepBB = llvm::BasicBlock::Create(ctx, "sleep", fn);
+            b.CreateCondBr(b.CreateICmpSGE(finalClosed, z64, "anyClosed"),
+                           retClosedBB, sleepBB);
+            b.SetInsertPoint(retClosedBB);
+            llvm::Value* closedV = llvm::UndefValue::get(srLlvm);
+            closedV = b.CreateInsertValue(
+                closedV, llvm::ConstantInt::get(i32Ty, closedIdx), {0});
+            closedV =
+                b.CreateInsertValue(closedV, finalClosed, {closedIdxSlot});
+            b.CreateRet(closedV);
+            b.SetInsertPoint(sleepBB);
+            auto* ts = b.CreateAlloca(timespecTy_, nullptr, "ts");
+            b.CreateStore(z64, b.CreateStructGEP(timespecTy_, ts, 0, "tsec"));
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 100000),
+                          b.CreateStructGEP(timespecTy_, ts, 1, "tnsec"));
+            b.CreateCall(nanosleepFn_, {ts, nullp});
+            b.CreateBr(sweep);
             declaredFns_[mangled] = fn;
             return fn;
         }
@@ -7257,6 +7487,10 @@ private:
                 if (r->structName == "AtomicI64" ||
                     r->structName == "AtomicBool")
                     return llvm::Type::getInt64Ty(*ctx_);
+                // v31 Phase 170: a `Scope` is an i64 handle to the heap scope
+                // block (move-only; its Drop joins all spawned threads).
+                if (r->structName == "Scope")
+                    return llvm::Type::getInt64Ty(*ctx_);
                 // Phase 78 (v13): `Rc<T>` is a pointer to a heap
                 // `{ i64 strong, T value }` refcount block.
                 if (r->structName == "Rc")
@@ -8947,6 +9181,9 @@ private:
                 r->structName == "RwLockReadGuard" ||
                 r->structName == "RwLockWriteGuard")
                 return true;
+            // v31 Phase 170: a Scope owns its spawned-thread handles — droppable
+            // (its Drop joins them all and frees the block).
+            if (r->structName == "Scope") return true;
             // Slice / Range / fn-value / future structs own no heap (Slice is
             // a borrow; Range/Future are plain scalars in the MVP). A `Mutex<T>`
             // and a `RwLock<T>` (v31 Phase 168) are Copy i64 handles whose
@@ -9170,6 +9407,16 @@ private:
             const char* unlockFn =
                 (r->structName == "MutexGuard") ? "mutex_unlock" : "rwlock_unlock";
             builder_->CreateCall(declaredFns_[unlockFn], {handle});
+            return;
+        }
+
+        // v31 Phase 170: a Scope drop joins all threads it spawned (RAII
+        // join-before-scope-end) and frees the scope block.
+        if (r->kind == TypeKind::Struct && r->structName == "Scope") {
+            ensureThreadRuntime();
+            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+            auto* handle = builder_->CreateLoad(i64Ty, valuePtr, "scope.handle");
+            builder_->CreateCall(declaredFns_["scope_join_all"], {handle});
             return;
         }
 
@@ -11211,8 +11458,30 @@ private:
             call.callee == "rwlock_read_guard" ||
             call.callee == "rwlock_write_guard" ||
             call.callee.rfind("atomic_", 0) == 0 ||
-            call.callee.rfind("fence_", 0) == 0) {
+            call.callee.rfind("fence_", 0) == 0 ||
+            call.callee == "scope_new" || call.callee == "scope_spawn") {
             ensureThreadRuntime();
+        }
+        // v31 Phase 170: scoped threads. These are NON-generic builtins (no type
+        // args), so they are dispatched HERE (before the generic-instantiation
+        // branch the channel/mutex ops use). scope_new() returns the scope
+        // handle; scope_spawn(&s, f) spawns f via the existing thread_spawn
+        // runtime and records the handle so the scope's Drop joins it.
+        if (call.callee == "scope_new") {
+            ensureThreadRuntime();
+            return builder_->CreateCall(declaredFns_["scope_new"], {},
+                                        "scope_new");
+        }
+        if (call.callee == "scope_spawn") {
+            ensureThreadRuntime();
+            auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
+            llvm::Value* scopeRef = emitConsume(*call.args[0]); // &Scope
+            auto* scopeH = builder_->CreateLoad(i64Ty, scopeRef, "scope.h");
+            llvm::Value* closure = emitConsume(*call.args[1]); // {fn,env}
+            auto* th = builder_->CreateCall(declaredFns_["thread_spawn"],
+                                            {closure}, "scoped_th");
+            builder_->CreateCall(declaredFns_["scope_push"], {scopeH, th});
+            return th;
         }
         // (Phase 77: the channel ops are GENERIC builtins — they route through
         // the generic dispatch to getOrEmitChannelOp, which ensures the channel
@@ -11304,7 +11573,9 @@ private:
             if ((call.callee == "channel" || call.callee == "chan_send" ||
                  call.callee == "chan_recv" || call.callee == "chan_close" ||
                  call.callee == "chan_try_recv" ||
-                 call.callee == "sender_clone") &&
+                 call.callee == "sender_clone" ||
+                 call.callee == "select2" || call.callee == "select3" ||
+                 call.callee == "select4") &&
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
                     getOrEmitChannelOp(call.callee, concreteTypeArgs[0]);

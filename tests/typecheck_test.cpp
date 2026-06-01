@@ -2532,6 +2532,40 @@ void test_atomics() {
         "atomic_store_requires_io");
 }
 
+// v31 Phase 170: scoped threads. (select needs the prelude SelectResult enum,
+// so it is covered by the smoke test; Scope/scope_* are prelude-free builtins.)
+void test_scoped_threads() {
+    // scope_new + scope_spawn typecheck; the worker captures a Copy/Send Mutex.
+    expectOk(
+        "fn work(c: Mutex<i64>) -> i64 ! { io } {\n"
+        "  mutex_lock(c); mutex_unlock(c); 0\n"
+        "}\n"
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let c = mutex_new(0);\n"
+        "  let s = scope_new();\n"
+        "  scope_spawn(&s, || work(c));\n"
+        "  0\n"
+        "}",
+        "scope_spawn_ok");
+    // A scope_spawn worker capturing a `let mut` BY REFERENCE is rejected.
+    expectErr(
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let s = scope_new();\n"
+        "  let mut n = 0;\n"
+        "  scope_spawn(&s, || { n = n + 1; n });\n"
+        "  0\n"
+        "}",
+        "scope_byref_rejected");
+    // A Scope is not Send/Copy — it cannot be moved into a thread.
+    expectErr(
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let s = scope_new();\n"
+        "  let t = thread_spawn(|| { let inner = s; 0 });\n"
+        "  thread_join(t)\n"
+        "}",
+        "scope_not_sendable");
+}
+
 void test_mutex_ops_typecheck_ok() {
     expectOk(
         "fn main() -> i64 ! { alloc, io } {\n"
@@ -3425,6 +3459,7 @@ int main() {
     test_marker_traits_send_sync(); // v31 Phase 167
     test_rwlock_and_guards();       // v31 Phase 168
     test_atomics();                 // v31 Phase 169
+    test_scoped_threads();          // v31 Phase 170
     test_mutex_ops_typecheck_ok();
     test_mutex_new_requires_alloc_effect();
     test_panic_carries_panic_effect_ok();
@@ -3512,6 +3547,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (314 cases)\n";
+    std::cout << "All typecheck tests passed (315 cases)\n";
     return 0;
 }

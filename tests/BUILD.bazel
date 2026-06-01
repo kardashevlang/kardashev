@@ -373,6 +373,16 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v31 Phase 170: channel select (multiplexed wait) + scoped threads (RAII
+# join-before-scope-end). Thread-based — flaky=True for the macOS arm64-JIT
+# teardown flake, like the other thread/executor tests.
+sh_test(
+    name = "smoke_test_phase170",
+    srcs = ["smoke_test_phase170.sh"],
+    data = ["//compiler:kardc"],
+    flaky = True,
+)
+
 # v30 Phase 165: C backend closures + fn values (differential + ASan).
 sh_test(
     name = "smoke_test_phase165",

@@ -249,6 +249,12 @@ std::string applyPrelude(const std::string& userSrc) {
         prelude += "trait Send { }\n";
     if (userSrc.find("trait Sync") == std::string::npos)
         prelude += "trait Sync { }\n";
+    // v31 Phase 170: channel `select` result. `Ready(idx, value)` — receiver
+    // `idx` fired with `value`; `Closed(idx)` — receiver `idx` is drained and
+    // closed. A plain prelude enum so `match select2(&a, &b) { ... }` works
+    // through the existing enum/match codegen with zero new lowering.
+    if (userSrc.find("enum SelectResult") == std::string::npos)
+        prelude += "enum SelectResult<T> { Ready(i64, T), Closed(i64) }\n";
     // v31 Phase 169: the ergonomic atomics surface. `enum Ordering` + inherent
     // `impl AtomicI64 / AtomicBool` whose methods MATCH on the ordering and
     // dispatch to the statically-named builtins (atomic_i64_fetch_add_seqcst,

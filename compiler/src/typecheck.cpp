@@ -877,6 +877,40 @@ public:
             sch.declaredEffects.add("io");
             fnSchemas_["thread_join"] = std::move(sch);
         }
+        // v31 Phase 170: scoped threads. `Scope` is a phantom move-only i64
+        // handle (NON-Copy, NON-Send) to a heap list of spawned thread handles;
+        // its Drop joins them all (RAII join-before-scope-end). scope_new()
+        // creates one; scope_spawn(&s, f) spawns f into the scope (so the
+        // scope's end is guaranteed to outlive — and join — the worker).
+        {
+            StructSchema sch;
+            sch.type = makeStruct("Scope", {}); // non-generic
+            structSchemas_["Scope"] = std::move(sch);
+        }
+        //   scope_new() -> Scope ! { alloc }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({}, makeStruct("Scope", {}));
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["scope_new"] = std::move(sch);
+        }
+        //   scope_spawn(s: &Scope, f: fn() -> i64 ! {e}) -> i64 ! {io,share,e}
+        // Mirrors thread_spawn's effect-polymorphic closure, with the closure's
+        // effects flowing through the row var.
+        {
+            TypePtr rowVar = makeFreshVar();
+            TypePtr fnParam = makeFunction({}, makeInt(),
+                                           /*effectLabels=*/{}, rowVar);
+            TypePtr scopeRef =
+                makeRef(makeStruct("Scope", {}), /*isMut=*/false);
+            FnSchema sch;
+            sch.signature = makeFunction({scopeRef, fnParam}, makeInt());
+            sch.declaredEffects.add("io");
+            sch.declaredEffects.add("share");
+            sch.declaredEffects.add("e");
+            sch.effectRowVars.emplace_back("e", rowVar);
+            fnSchemas_["scope_spawn"] = std::move(sch);
+        }
         // Phase 19 / 123 built-in: `Mutex<T>` — a lock guarding a cell of type
         // T. It is a PHANTOM-TYPED i64 HANDLE: the value is a bare i64 (PtrToInt
         // of a heap `{ pthread_mutex_t, T value }` block) so it stays Copy and
@@ -1483,6 +1517,36 @@ public:
                     sch.declaredEffects.add("share");
                     sch.genericVars.push_back(chanVar);
                     fnSchemas_["chan_try_recv"] = std::move(sch);
+                }
+                // v31 Phase 170: select2/3/4<T>(r0,..,rN-1: &Receiver<T>) ->
+                // SelectResult<T> ! { share } — block (poll-with-backoff) until
+                // one of N HOMOGENEOUS receivers is ready, returning
+                // Ready(idx, value) or Closed(idx). All receiver params share
+                // chanVar, so T is homogeneous by unification. A distinct
+                // fnSchema per arity (no variadic builtin path).
+                if (enumSchemas_.count("SelectResult")) {
+                    const EnumSchema& srSchema = enumSchemas_["SelectResult"];
+                    auto mkSelectResult = [&]() -> TypePtr {
+                        if (srSchema.genericVars.empty()) return srSchema.type;
+                        std::unordered_map<int, TypePtr> subst;
+                        subst[srSchema.genericVars[0]->varId] = chanVar;
+                        TypePtr t = instantiate(srSchema.type, subst);
+                        t->typeArgs = {chanVar};
+                        return t;
+                    };
+                    for (int n : {2, 3, 4}) {
+                        std::vector<TypePtr> params;
+                        for (int i = 0; i < n; ++i)
+                            params.push_back(
+                                makeRef(receiverT, /*isMut=*/false));
+                        FnSchema sch;
+                        sch.signature =
+                            makeFunction(std::move(params), mkSelectResult());
+                        sch.declaredEffects.add("share");
+                        sch.genericVars.push_back(chanVar);
+                        fnSchemas_["select" + std::to_string(n)] =
+                            std::move(sch);
+                    }
                 }
                 // chan_close<T>(s: Sender<T>) -> i64 ! { share } — takes the
                 // Sender BY VALUE (consumes it): the explicit "this producer is
@@ -7453,32 +7517,39 @@ private:
             // use-after-free once the spawning frame returns. By-VALUE captures
             // (i64 / bool / &T, incl. a Mutex i64 handle) are moved into the
             // thread and are fine. This is the enforced Send floor.
-            if (call.callee == "thread_spawn" && !call.args.empty()) {
+            // v31 Phase 170: scope_spawn carries the same Send-capture floor as
+            // thread_spawn — its closure is arg[1] (arg[0] is `&Scope`).
+            if ((call.callee == "thread_spawn" || call.callee == "scope_spawn") &&
+                call.args.size() >
+                    (call.callee == "scope_spawn" ? 1u : 0u)) {
+                size_t ci = call.callee == "scope_spawn" ? 1 : 0;
+                const char* which =
+                    call.callee == "scope_spawn" ? "scope_spawn" : "thread_spawn";
                 std::string offending =
-                    closureByRefCaptureName(*call.args[0]);
+                    closureByRefCaptureName(*call.args[ci]);
                 if (!offending.empty()) {
-                    error("cannot send a by-reference capture across a thread "
-                          "boundary: closure passed to `thread_spawn` captures "
-                          "`" + offending +
+                    error(std::string("cannot send a by-reference capture across "
+                          "a thread boundary: closure passed to `") + which +
+                              "` captures `" + offending +
                               "` by reference (FnMut), which would alias the "
                               "spawning frame's stack across threads (data race "
                               "+ use-after-free). Capture it by value (move a "
                               "Copy value, or share via a Mutex handle) instead",
-                          call.args[0]->line, call.args[0]->column);
+                          call.args[ci]->line, call.args[ci]->column);
                 }
                 // v31 Phase 167: the Send FLOOR, made explicit at the spawn
                 // boundary — every by-value capture is moved into the thread,
                 // so its type must be `Send`. Goes through the marker oracle,
                 // so an `impl !Send for T {}` makes capturing a T into a thread
                 // a hard error (and an `impl Send for Opaque {}` permits it).
-                std::string nonSend = closureNonSendCaptureName(*call.args[0]);
+                std::string nonSend = closureNonSendCaptureName(*call.args[ci]);
                 if (!nonSend.empty()) {
-                    error("cannot move a non-`Send` value across a thread "
-                          "boundary: closure passed to `thread_spawn` captures "
-                          "`" + nonSend +
+                    error(std::string("cannot move a non-`Send` value across a "
+                          "thread boundary: closure passed to `") + which +
+                              "` captures `" + nonSend +
                               "` by value, but its type is not `Send`. Only "
                               "`Send` data may cross a thread boundary",
-                          call.args[0]->line, call.args[0]->column);
+                          call.args[ci]->line, call.args[ci]->column);
                 }
             }
             // Phase 77 (v13): the value sent on a channel crosses a thread
@@ -8079,9 +8150,12 @@ private:
                 return false;
             // v31 Phase 168: a lock GUARD is bound to the locking thread — never
             // Send (it must be released by the thread that took the lock).
+            // v31 Phase 170: a `Scope` is bound to its defining thread (it joins
+            // on drop there) — never Send.
             if (r->structName == "MutexGuard" ||
                 r->structName == "RwLockReadGuard" ||
-                r->structName == "RwLockWriteGuard")
+                r->structName == "RwLockWriteGuard" ||
+                r->structName == "Scope")
                 return false;
             // Containers + the Mutex/RwLock handle carry their element(s)/cell in
             // typeArgs, not structFields. A `Mutex<T>`/`RwLock<T>` is Send iff
