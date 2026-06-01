@@ -4,6 +4,7 @@
 #include "kardashev/lexer.hpp"
 
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -16,7 +17,9 @@ public:
     // v24 Phase 134: filter `///` DocComment tokens out of the stream (so the
     // rest of the parser is untouched) into `docAt_`, keyed by the index of the
     // token that immediately follows the doc run. Decl parsers query it.
-    explicit Parser(std::vector<Token> tokens) {
+    explicit Parser(std::vector<Token> tokens,
+                    std::set<std::string> activeCfg = {})
+        : activeCfg_(std::move(activeCfg)) {
         std::string pending;
         for (auto& t : tokens) {
             if (t.kind == TokenKind::DocComment) {
@@ -34,14 +37,29 @@ public:
 
     ParseResult parseProgram() {
         ast::Program prog;
+        // v34 Phase 186: items gated by a false `#[cfg(...)]` are still parsed
+        // (so their tokens are consumed and the stream stays in sync) but are
+        // routed into this throwaway Program, so they never reach later passes
+        // — that is conditional compilation.
+        ast::Program cfgDiscard;
         while (!check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
             // v24 Phase 134: grab the doc comment attached to this decl's first
             // token; the decl parser (fn/struct/enum) consumes pendingDeclDoc_.
             pendingDeclDoc_ = takeDocAt(pos_);
-            // Phase 42: `#[derive(...)]` attributes precede a struct/enum; the
-            // parsed list is stashed and consumed by the next struct/enum decl.
+            // Phase 42 / v34 Phase 186: `#[derive(...)]` / `#[cfg(...)]`
+            // attributes precede the item. parseAttributes stashes derives and
+            // sets cfgDropNext_ when a `#[cfg(...)]` predicate is false.
+            cfgDropNext_ = false;
             if (check(TokenKind::Pound)) parseAttributes();
+            parseTopLevelItem(cfgDropNext_ ? cfgDiscard : prog);
+        }
+        return {std::move(prog), std::move(errors_)};
+    }
+
+    // Parse exactly one top-level item into `prog`. Callers pass a throwaway
+    // Program for an item disabled by a false `#[cfg(...)]` (v34 Phase 186).
+    void parseTopLevelItem(ast::Program& prog) {
             if (check(TokenKind::KwFn) ||
                 (peek().kind == TokenKind::Identifier &&
                  peek().lexeme == "async" &&
@@ -163,8 +181,6 @@ public:
                           std::string(tokenKindName(peek().kind)));
                 advance();
             }
-        }
-        return {std::move(prog), std::move(errors_)};
     }
 
 private:
@@ -185,6 +201,12 @@ private:
     }
     std::vector<ParseError> errors_;
     bool restrictStructLit_ = false;
+    // v34 Phase 186: the active conditional-compilation flags (`--cfg foo` /
+    // `--cfg key=val` from the driver). `cfgDropNext_` is set by
+    // parseAttributes when the item's `#[cfg(...)]` predicate is false, so the
+    // top-level loop routes that item into a throwaway Program.
+    std::set<std::string> activeCfg_;
+    bool cfgDropNext_ = false;
     // Phase 24: set by parseOptionalEffectRow when a `! { ... }` row was
     // actually present (even an empty `! { }`), so an extern decl can tell
     // "explicitly pure" (`! { }`) apart from "no row -> default io effect".
@@ -1590,6 +1612,15 @@ private:
                     }
                 }
                 expect(TokenKind::RParen, ")");
+            } else if (attr.lexeme == "cfg") {
+                // v34 Phase 186: `#[cfg(predicate)]` — conditional compilation.
+                // Evaluate the predicate against the active cfg set; if false,
+                // mark the following item to be discarded. Any number of
+                // `#[cfg]`s stack with AND semantics (one false drops the item).
+                expect(TokenKind::LParen, "(");
+                bool enabled = evalCfgPredicate();
+                expect(TokenKind::RParen, ")");
+                if (!enabled) cfgDropNext_ = true;
             } else {
                 while (!check(TokenKind::RBracket) &&
                        !check(TokenKind::EndOfInput))
@@ -1597,6 +1628,47 @@ private:
             }
             expect(TokenKind::RBracket, "]");
         }
+    }
+
+    // v34 Phase 186: evaluate one `#[cfg(...)]` predicate against activeCfg_.
+    // Grammar (recursive):
+    //   pred := `not` `(` pred `)`
+    //         | (`all` | `any`) `(` [ pred (`,` pred)* ] `)`
+    //         | IDENT `=` STRING            -- e.g. feature = "fast"
+    //         | IDENT                       -- a bare flag, e.g. linux
+    // A bare flag `foo` is active iff "foo" is in the set; `key = "val"` is
+    // active iff "key=val" is in the set. The active set is populated from the
+    // driver's `--cfg foo` / `--cfg key=val` options (see main.cpp).
+    bool evalCfgPredicate() {
+        Token id = expect(TokenKind::Identifier, "cfg predicate");
+        if (id.lexeme == "not") {
+            expect(TokenKind::LParen, "(");
+            bool v = evalCfgPredicate();
+            expect(TokenKind::RParen, ")");
+            return !v;
+        }
+        if (id.lexeme == "all" || id.lexeme == "any") {
+            bool isAll = id.lexeme == "all";
+            // `all()` is vacuously true; `any()` is vacuously false.
+            bool acc = isAll;
+            expect(TokenKind::LParen, "(");
+            if (!check(TokenKind::RParen)) {
+                while (true) {
+                    bool v = evalCfgPredicate();
+                    acc = isAll ? (acc && v) : (acc || v);
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::RParen)) break; // trailing comma
+                }
+            }
+            expect(TokenKind::RParen, ")");
+            return acc;
+        }
+        // `key = "value"` or a bare flag.
+        if (accept(TokenKind::Eq)) {
+            Token val = expect(TokenKind::StringLit, "cfg value string");
+            return activeCfg_.count(id.lexeme + "=" + val.lexeme) > 0;
+        }
+        return activeCfg_.count(id.lexeme) > 0;
     }
 
     ast::ImplDecl parseImplDecl() {
@@ -3150,6 +3222,15 @@ private:
 ParseResult parse(std::string_view source) {
     auto tokens = lex(source);
     Parser p(std::move(tokens));
+    return p.parseProgram();
+}
+
+// v34 Phase 186: parse with a set of active conditional-compilation flags.
+// Items whose `#[cfg(...)]` predicate is false are dropped during parsing.
+ParseResult parse(std::string_view source,
+                  const std::set<std::string>& activeCfg) {
+    auto tokens = lex(source);
+    Parser p(std::move(tokens), activeCfg);
     return p.parseProgram();
 }
 
