@@ -6697,6 +6697,13 @@ private:
         auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
         auto* pollT = pollTypeFor(T);
         auto* valTy = mapKardashevType(T);
+        // v32 Phase 172: with `JoinHandle<T>`, `join`'s T now flows from the
+        // handle's type — so a unit-result task (`spawn(unit_async())`) reaches
+        // here with T = unit (valTy = void), whereas before the discarded result
+        // defaulted T to i64. A void fn can't `ret` a value or a null-value, and
+        // can't `load` its (void) slot — handle it explicitly: return void,
+        // still releasing the task.
+        bool isVoid = valTy->isVoidTy();
         auto* fnTy = llvm::FunctionType::get(valTy, {i64Ty}, false);
         auto* fn = llvm::Function::Create(
             fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
@@ -6711,7 +6718,8 @@ private:
         auto* badBB = llvm::BasicBlock::Create(ctx, "bad", fn);
         b.CreateCondBr(inRange, okBB, badBB);
         b.SetInsertPoint(badBB);
-        b.CreateRet(llvm::Constant::getNullValue(valTy));
+        if (isVoid) b.CreateRetVoid();
+        else b.CreateRet(llvm::Constant::getNullValue(valTy));
         b.SetInsertPoint(okBB);
         b.CreateCall(execDriveFn_, {h});
         auto* slot = b.CreateCall(execSlotFn_, {h}, "tslot");
@@ -6722,8 +6730,16 @@ private:
         auto* readBB = llvm::BasicBlock::Create(ctx, "read", fn);
         b.CreateCondBr(typeOk, readBB, typeBadBB);
         b.SetInsertPoint(typeBadBB);
-        b.CreateRet(llvm::Constant::getNullValue(valTy));
+        if (isVoid) b.CreateRetVoid();
+        else b.CreateRet(llvm::Constant::getNullValue(valTy));
         b.SetInsertPoint(readBB);
+        // v32: a unit-result task carries no value — release and return void.
+        if (isVoid) {
+            if (execReleaseFn_) b.CreateCall(execReleaseFn_, {h});
+            b.CreateRetVoid();
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
         auto* pslot = b.CreateLoad(
             i8PtrTy, b.CreateStructGEP(taskTy_, slot, TASK_SLOT, "sp"),
             "pslot");
@@ -12789,7 +12805,11 @@ private:
                 std::vector<llvm::Value*> args;
                 args.reserve(call.args.size());
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
-                return builder_->CreateCall(fn, args, "call_join");
+                // v32: a unit-result join returns void — a named call on a
+                // void value is invalid IR.
+                return builder_->CreateCall(
+                    fn, args,
+                    fn->getReturnType()->isVoidTy() ? "" : "call_join");
             }
             // v32 Phase 173: `task_cancel<T>(JoinHandle<T>)` — retire+release a
             // task. T-agnostic codegen (the handle is an i64 index); returns
