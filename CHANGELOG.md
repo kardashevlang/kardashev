@@ -18,6 +18,48 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.33.0] — Roadmap v33 "systems-grade: FFI, `unsafe` & overflow control" (Phases 177-181)
+
+Theme: the systems-programmer escape hatch. Raw pointers + `unsafe`, a more
+mature C FFI surface, and explicit integer-overflow control. Every phase is
+differentially gated (JIT vs AOT); the FFI phase is verified against real
+libm/libc.
+
+### Added
+- **Raw pointers + `unsafe` blocks** (Phase 177) — `*const T` / `*mut T` raw
+  pointers (NOT borrow-checked, nullable, lowering to the same opaque pointer as
+  `&T`; a `&T` never unifies with a `*const T`) and `unsafe { … }` blocks. Create
+  a raw pointer from a reference (`&x as *const T`, safe), dereference-READ it
+  inside `unsafe` (a deref outside is a type error), and cast reference↔rawptr
+  (no-op) / rawptr↔integer-address (`ptrtoint` / `inttoptr`). `effect` / `handle`
+  / `with` / `perform` / `unsafe` are contextual keywords, so existing
+  identifiers (a task `handle`, …) keep working.
+- **FFI maturity — scalars + pointers** (Phase 178) — `extern "C"` signatures,
+  which were limited to i32/i64/bool/&String, now also accept f64 / f32 (C
+  double / float), the full integer width tower (i8..i64 / u8..u64), and (via
+  Phase 177) `*const T` / `*mut T` as a C pointer. This covers the bulk of real C
+  interop — libm math and the pointer-taking libc/buffer APIs — verified end to
+  end against real `sqrt`/`pow`/`memset`/`memcpy`/`abs`.
+- **Overflow-checked + wrapping arithmetic** (Phase 181) — the integer-overflow
+  policy is documented (the DEFAULT is 2's-complement WRAP, `-fwrapv`) and joined
+  by explicit opt-in operators: `checked_add/sub/mul/div(a, b) -> Option<i64>`
+  (`None` on signed overflow / div-by-zero / `INT_MIN / -1`) and
+  `wrapping_add/sub/mul(a, b) -> i64`. Overflow is detected with portable
+  sign-bit identities / a 128-bit widen-and-compare (no version-fragile
+  `*.with.overflow` intrinsics).
+
+### Deferred / honest limitations
+- **Phase 179 (`no_std` / freestanding + a pluggable allocator)** and **Phase
+  180 (inline asm + SIMD intrinsics)** are NOT in this release. A pluggable
+  global allocator means rerouting the core libc malloc/free/realloc path (a
+  risky change to every heap type), full `no_std` conflicts with the
+  libc-dependent prelude runtime (print/String/Vec), and inline asm / SIMD are
+  platform-specific and not portably verifiable here. Tracked in ROADMAP.md as
+  future systems work (alongside Phase 174's multi-threaded executor).
+- Raw-pointer WRITE (`*p = v`) needs deref-assignment (unsupported
+  language-wide); pointer ARITHMETIC; struct-by-value / callbacks / bindgen
+  across `extern "C"` (the harder FFI-maturity pieces) — all deferred.
+
 ## [0.32.0] — Roadmap v32 "async & effects, matured (differentiator II)" (Phases 172-176)
 
 Theme: take the two features that most distinguish kardashev — its async runtime
