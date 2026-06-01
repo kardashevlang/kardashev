@@ -1782,6 +1782,31 @@ public:
             }
         }
 
+        // v32 Phase 173: `timeout<T>(fut: Future<T>, ms: i64) -> Future<Option<T>>`
+        //   — race `fut` against a `sleep_ms(ms)` timer (built internally by
+        // codegen), completing `Some(v)` if fut wins or `None` on timeout. Pure
+        // construction (no async effect on `timeout` itself; the wait happens
+        // when the resulting future is polled). Registered after the enum loop
+        // because it returns the prelude `Option`. Codegen: getOrEmitTimeout.
+        if (enumSchemas_.count("Option")) {
+            const EnumSchema& optSchema = enumSchemas_["Option"];
+            TypePtr toVar = makeFreshVar();
+            TypePtr optInst;
+            if (!optSchema.genericVars.empty()) {
+                std::unordered_map<int, TypePtr> subst;
+                subst[optSchema.genericVars[0]->varId] = toVar;
+                optInst = instantiate(optSchema.type, subst);
+                optInst->typeArgs = {toVar};
+            } else {
+                optInst = optSchema.type;
+            }
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeFuture(toVar), makeInt()}, makeFuture(optInst));
+            sch.genericVars.push_back(toVar);
+            fnSchemas_["timeout"] = std::move(sch);
+        }
+
         // Pass 1c: register trait declarations. Each trait gets a global
         // entry with its method signatures, used later to validate impl
         // blocks and to type-check method calls through bounded generic

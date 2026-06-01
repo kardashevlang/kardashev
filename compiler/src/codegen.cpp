@@ -7366,6 +7366,156 @@ private:
         return fn;
     }
 
+    // v32 Phase 173: `timeout<T>(fut: Future<T>, ms: i64) -> Future<Option<T>>`
+    //   — race `fut` against an internal `sleep_ms(ms)` timer: complete
+    // `Some(v)` if fut finishes first, `None` if the timer fires first. Built on
+    // the select machinery (fut is checked first each poll, so a real result
+    // wins a same-poll tie) with the second arm hard-wired to a timer and the
+    // result narrowed to Option<T>. The constructor builds the timer itself, so
+    // `timeout`'s own signature carries no async effect. The loser is dropped
+    // shallowly (same KNOWN LIMITATION as future_select — a mid-flight async-fn
+    // loser leaks its nested sub-frame; recursive drop is the remaining 173
+    // work). Mangled `timeout__<T>`.
+    llvm::Function* getOrEmitTimeout(const TypePtr& T) {
+        std::string mangled = "timeout__" + mangleType(T);
+        auto it = declaredFns_.find(mangled);
+        if (it != declaredFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* futureTy = structTypes_["Future"];
+        auto* pollT = pollTypeFor(T);     // Poll<T> of the guarded future
+        auto* valT = mapKardashevType(T);
+        TypePtr optKd = optionType(T);
+        auto* optLlvm = mapKardashevType(optKd);  // materializes layout
+        auto* pollOut = pollTypeFor(optKd);       // Poll<Option<T>>
+        std::string optMangled =
+            mangleStructInstance(optKd->enumName, optKd->typeArgs);
+        unsigned someIdx = variantIndexInEnum(optKd, "Some");
+        unsigned noneIdx = variantIndexInEnum(optKd, "None");
+        unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+        std::string sfx = mangleType(T);
+
+        // frame { Future fut, Future timer }.
+        auto* frameTy = llvm::StructType::create(
+            ctx, {futureTy, futureTy}, "kd.timeout_frame." + sfx);
+
+        // ---- void __kd_timeout_poll__T(i8* frame, kd.poll* out) ----
+        auto* pollFn = llvm::Function::Create(
+            pollFnTy_, llvm::Function::InternalLinkage,
+            "__kd_timeout_poll__" + sfx, module_.get());
+        pollFn->getArg(0)->setName("frame");
+        pollFn->getArg(1)->setName("out");
+        {
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", pollFn);
+            auto* someBB = llvm::BasicBlock::Create(ctx, "got", pollFn);
+            auto* tryTimerBB = llvm::BasicBlock::Create(ctx, "try_timer", pollFn);
+            auto* noneBB = llvm::BasicBlock::Create(ctx, "timed_out", pollFn);
+            auto* pendBB = llvm::BasicBlock::Create(ctx, "pending", pollFn);
+            llvm::IRBuilder<> b(entry);
+            auto* pc = b.CreateLoad(i64Ty, kdPollCount_, "pc");
+            b.CreateStore(
+                b.CreateAdd(pc, llvm::ConstantInt::get(i64Ty, 1)),
+                kdPollCount_);
+            auto* frame = pollFn->getArg(0);
+            auto* out = pollFn->getArg(1);
+            auto* futP = b.CreateStructGEP(frameTy, frame, 0, "fut_p");
+            auto* timerP = b.CreateStructGEP(frameTy, frame, 1, "timer_p");
+
+            // poll the guarded future first
+            auto* fut = b.CreateLoad(futureTy, futP, "fut");
+            auto* futPoll = b.CreateExtractValue(fut, {0}, "fut.poll");
+            auto* futFrame = b.CreateExtractValue(fut, {1}, "fut.frame");
+            auto* fSlot = b.CreateAlloca(pollT, nullptr, "fut_poll");
+            b.CreateCall(pollFnTy_, futPoll, {futFrame, fSlot});
+            auto* fRdy = b.CreateLoad(
+                i1Ty, b.CreateStructGEP(pollT, fSlot, 0, "f_rdy_p"), "f_rdy");
+            b.CreateCondBr(fRdy, someBB, tryTimerBB);
+
+            // fut finished: Some(v). Read v, free fut frame + drop the timer.
+            b.SetInsertPoint(someBB);
+            auto* v = b.CreateLoad(
+                valT, b.CreateStructGEP(pollT, fSlot, 1, "f_val_p"), "v");
+            b.CreateCall(freeFn_, {futFrame});
+            auto* timerLose = b.CreateLoad(futureTy, timerP, "timer_lose");
+            b.CreateCall(
+                freeFn_,
+                {b.CreateExtractValue(timerLose, {1}, "timer_lose.frame")});
+            {
+                llvm::Value* o = llvm::UndefValue::get(optLlvm);
+                o = b.CreateInsertValue(
+                    o, llvm::ConstantInt::get(i32Ty, someIdx), {0});
+                o = b.CreateInsertValue(o, v, {someSlot}, "some");
+                b.CreateStore(llvm::ConstantInt::getTrue(ctx),
+                              b.CreateStructGEP(pollOut, out, 0, "out_rdyS"));
+                b.CreateStore(o,
+                              b.CreateStructGEP(pollOut, out, 1, "out_optS"));
+                b.CreateRetVoid();
+            }
+
+            // fut pending: poll the timer
+            b.SetInsertPoint(tryTimerBB);
+            auto* timer = b.CreateLoad(futureTy, timerP, "timer");
+            auto* tPoll = b.CreateExtractValue(timer, {0}, "timer.poll");
+            auto* tFrame = b.CreateExtractValue(timer, {1}, "timer.frame");
+            auto* tSlot = b.CreateAlloca(pollTy_, nullptr, "timer_poll");
+            b.CreateCall(pollFnTy_, tPoll, {tFrame, tSlot});
+            auto* tRdy = b.CreateLoad(
+                i1Ty, b.CreateStructGEP(pollTy_, tSlot, 0, "t_rdy_p"), "t_rdy");
+            b.CreateCondBr(tRdy, noneBB, pendBB);
+
+            // timer fired first: None. Free timer frame + DROP the guarded fut.
+            b.SetInsertPoint(noneBB);
+            b.CreateCall(freeFn_, {tFrame});
+            auto* futLose = b.CreateLoad(futureTy, futP, "fut_lose");
+            b.CreateCall(
+                freeFn_,
+                {b.CreateExtractValue(futLose, {1}, "fut_lose.frame")});
+            {
+                llvm::Value* o = llvm::UndefValue::get(optLlvm);
+                o = b.CreateInsertValue(
+                    o, llvm::ConstantInt::get(i32Ty, noneIdx), {0});
+                b.CreateStore(llvm::ConstantInt::getTrue(ctx),
+                              b.CreateStructGEP(pollOut, out, 0, "out_rdyN"));
+                b.CreateStore(o,
+                              b.CreateStructGEP(pollOut, out, 1, "out_optN"));
+                b.CreateRetVoid();
+            }
+
+            // neither ready: Pending.
+            b.SetInsertPoint(pendBB);
+            b.CreateStore(llvm::ConstantInt::getFalse(ctx),
+                          b.CreateStructGEP(pollOut, out, 0, "out_rdy0"));
+            b.CreateRetVoid();
+        }
+
+        // ---- Future timeout__T(Future fut, i64 ms) ----
+        auto* fnTy =
+            llvm::FunctionType::get(futureTy, {futureTy, i64Ty}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        fn->getArg(0)->setName("fut");
+        fn->getArg(1)->setName("ms");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        llvm::IRBuilder<> b(entry);
+        // Build the timer future = sleep_ms(ms).
+        auto* sleepFn = declaredFns_["sleep_ms"];
+        auto* timer = b.CreateCall(sleepFn, {fn->getArg(1)}, "timer");
+        uint64_t sz = module_->getDataLayout().getTypeAllocSize(frameTy);
+        auto* frame = b.CreateCall(
+            mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "timeout_frame");
+        b.CreateStore(fn->getArg(0),
+                      b.CreateStructGEP(frameTy, frame, 0, "fut0"));
+        b.CreateStore(timer, b.CreateStructGEP(frameTy, frame, 1, "timer0"));
+        llvm::Value* futv = llvm::UndefValue::get(futureTy);
+        futv = b.CreateInsertValue(futv, pollFn, {0}, "fut.poll");
+        futv = b.CreateInsertValue(futv, frame, {1}, "fut.frame");
+        b.CreateRet(futv);
+        declaredFns_[mangled] = fn;
+        return fn;
+    }
+
 #if defined(__linux__)
     // Phase 18 stretch (Linux/epoll): the fd-readiness primitives. A pipe
     // handle packs `(write_fd << 32) | read_fd`; the read end is set
@@ -12631,6 +12781,15 @@ private:
                 args.reserve(call.args.size());
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
                 return builder_->CreateCall(fn, args, "call_select");
+            }
+            // v32 Phase 173: `timeout<T>(Future<T>, i64) -> Future<Option<T>>`
+            // — race the future against an internal sleep_ms timer.
+            if (call.callee == "timeout" && !concreteTypeArgs.empty()) {
+                llvm::Function* fn = getOrEmitTimeout(concreteTypeArgs[0]);
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_timeout");
             }
             // Phase 17b/28: `hashmap_*<K,V>` are generic built-ins with no AST
             // body — synthesize a per-(key,value) specialization. typeArgs are

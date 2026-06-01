@@ -402,6 +402,14 @@ sh_test(
     flaky = True,
 )
 
+# v32 Phase 173: timeouts (timer-sensitive -> flaky), cancellation, structured concurrency.
+sh_test(
+    name = "smoke_test_phase173",
+    srcs = ["smoke_test_phase173.sh"],
+    data = ["//compiler:kardc"],
+    flaky = True,
+)
+
 # v30 Phase 165: C backend closures + fn values (differential + ASan).
 sh_test(
     name = "smoke_test_phase165",
