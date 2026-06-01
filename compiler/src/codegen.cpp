@@ -4653,6 +4653,149 @@ private:
             *ctx_, {llvm::Type::getInt64Ty(*ctx_), mapKardashevType(T)});
     }
 
+    // v31 Phase 171: the `{ i64 strong, i64 weak, T value }` layout of an
+    // Arc<T> block (the strong refs collectively hold ONE weak ref, so the
+    // block frees only when weak hits 0).
+    llvm::StructType* arcBlockType(const TypePtr& T) {
+        auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
+        return llvm::StructType::get(*ctx_,
+                                     {i64Ty, i64Ty, mapKardashevType(T)});
+    }
+    // v31 Phase 171: the per-T Arc<T>/Weak<T> ops, with ATOMIC refcounts (the
+    // first atomics-in-an-Arc lowering — clone Relaxed, drop Release + the
+    // last-strong Acquire fence, upgrade a CAS loop). Mirrors getOrEmitRcOp.
+    llvm::Function* getOrEmitArcOp(const std::string& op, const TypePtr& T) {
+        std::string suffix = mangleType(T);
+        std::string mangled = op + "__" + suffix;
+        if (auto it = declaredFns_.find(mangled); it != declaredFns_.end())
+            return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* one = llvm::ConstantInt::get(i64Ty, 1);
+        using AO = llvm::AtomicOrdering;
+        llvm::Type* elemTy = mapKardashevType(T);
+        auto* blkTy = arcBlockType(T);
+        auto* blkSzK = llvm::ConstantInt::get(
+            i64Ty, module_->getDataLayout().getTypeAllocSize(blkTy));
+        auto mk = [&](llvm::FunctionType* ty) {
+            return llvm::Function::Create(
+                ty, llvm::Function::ExternalLinkage, mangled, module_.get());
+        };
+        if (op == "arc_new") {
+            auto* fn = mk(llvm::FunctionType::get(i8PtrTy, {elemTy}, false));
+            fn->getArg(0)->setName("v");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateCall(mallocFn_, {blkSzK}, "arc_blk");
+            b.CreateStore(one, b.CreateStructGEP(blkTy, blk, 0, "strong"));
+            b.CreateStore(one, b.CreateStructGEP(blkTy, blk, 1, "weak"));
+            b.CreateStore(fn->getArg(0),
+                          b.CreateStructGEP(blkTy, blk, 2, "value"));
+            b.CreateRet(blk);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "arc_clone" || op == "arc_downgrade" || op == "weak_clone") {
+            // Bump the strong (clone) or weak (downgrade/weak_clone) count
+            // atomically; return the same block pointer.
+            auto* fn = mk(llvm::FunctionType::get(i8PtrTy, {i8PtrTy}, false));
+            fn->getArg(0)->setName("a");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            unsigned field = (op == "arc_clone") ? 0 : 1;
+            b.CreateAtomicRMW(llvm::AtomicRMWInst::Add,
+                              b.CreateStructGEP(blkTy, blk, field, "cntP"), one,
+                              llvm::MaybeAlign(8), AO::Monotonic);
+            b.CreateRet(blk);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "arc_get") {
+            auto* fn = mk(llvm::FunctionType::get(i8PtrTy, {i8PtrTy}, false));
+            fn->getArg(0)->setName("a");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            b.CreateRet(b.CreateStructGEP(blkTy, blk, 2, "valueP"));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "arc_strong_count" || op == "arc_weak_count") {
+            auto* fn = mk(llvm::FunctionType::get(i64Ty, {i8PtrTy}, false));
+            fn->getArg(0)->setName("a");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            unsigned field = (op == "arc_strong_count") ? 0 : 1;
+            auto* ld = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(blkTy, blk, field, "cntP"), "cnt");
+            ld->setAtomic(AO::Monotonic);
+            ld->setAlignment(llvm::Align(8));
+            b.CreateRet(ld);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "weak_upgrade") {
+            // CAS-loop on the strong count: bump only if non-zero. Returns
+            // Option<Arc<T>> (Some(blk) on success, None if strong hit 0).
+            TypePtr optTy = optionType(T); // Option<Arc<T>>: caller passes Arc T
+            // NOTE: T here is the Arc's element type; the Option is over
+            // Arc<T>. Build the Option<Arc<T>> LLVM type from the result.
+            // (Handled at the call site's expected type; here we build Some/None
+            // over the i8* block pointer, which IS the Arc<T> repr.)
+            TypePtr arcT = std::make_shared<Type>();
+            arcT->kind = TypeKind::Struct;
+            arcT->structName = "Arc";
+            arcT->typeArgs = {T};
+            TypePtr optArc = optionType(arcT);
+            mapKardashevType(optArc);
+            const std::string optMangled =
+                mangleStructInstance(optArc->enumName, optArc->typeArgs);
+            auto* optLlvm = enumTypes_[optMangled];
+            unsigned someIdx = variantIndexInEnum(optArc, "Some");
+            unsigned noneIdx = variantIndexInEnum(optArc, "None");
+            unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+            auto* fn = mk(llvm::FunctionType::get(optLlvm, {i8PtrTy}, false));
+            fn->getArg(0)->setName("w");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* loopBB = llvm::BasicBlock::Create(ctx, "cas", fn);
+            auto* okBB = llvm::BasicBlock::Create(ctx, "ok", fn);
+            auto* noneBB = llvm::BasicBlock::Create(ctx, "none", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            auto* strongP = b.CreateStructGEP(blkTy, blk, 0, "strongP");
+            b.CreateBr(loopBB);
+            b.SetInsertPoint(loopBB);
+            auto* cur = b.CreateLoad(i64Ty, strongP, "cur");
+            cur->setAtomic(AO::Monotonic);
+            cur->setAlignment(llvm::Align(8));
+            auto* isZero = b.CreateICmpEQ(cur, llvm::ConstantInt::get(i64Ty, 0));
+            auto* tryBB = llvm::BasicBlock::Create(ctx, "try", fn);
+            b.CreateCondBr(isZero, noneBB, tryBB);
+            b.SetInsertPoint(tryBB);
+            auto* cx = b.CreateAtomicCmpXchg(
+                strongP, cur, b.CreateAdd(cur, one), llvm::MaybeAlign(8),
+                AO::Acquire, AO::Monotonic);
+            b.CreateCondBr(b.CreateExtractValue(cx, {1}, "won"), okBB, loopBB);
+            b.SetInsertPoint(okBB);
+            llvm::Value* some = llvm::UndefValue::get(optLlvm);
+            some = b.CreateInsertValue(
+                some, llvm::ConstantInt::get(i32Ty, someIdx), {0});
+            some = b.CreateInsertValue(some, blk, {someSlot}, "some");
+            b.CreateRet(some);
+            b.SetInsertPoint(noneBB);
+            llvm::Value* none = llvm::UndefValue::get(optLlvm);
+            none = b.CreateInsertValue(
+                none, llvm::ConstantInt::get(i32Ty, noneIdx), {0}, "none");
+            b.CreateRet(none);
+            (void)i1Ty;
+            (void)optTy;
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        return nullptr;
+    }
+
     // --- Phase 23: real panic + unwinding (setjmp/longjmp + cleanup stack) ---
     //
     // Mechanism. Two process-global growable stacks live in IR:
@@ -7495,6 +7638,10 @@ private:
                 // `{ i64 strong, T value }` refcount block.
                 if (r->structName == "Rc")
                     return llvm::PointerType::get(*ctx_, 0);
+                // v31 Phase 171: `Arc<T>`/`Weak<T>` are pointers to a heap
+                // `{ i64 strong, i64 weak, T value }` atomic-refcount block.
+                if (r->structName == "Arc" || r->structName == "Weak")
+                    return llvm::PointerType::get(*ctx_, 0);
                 // Built-in single-layout generics: `Vec<T>`, `String`,
                 // `Slice`, `HashMap<V>` and `Future<T>` always lower to one
                 // hand-built struct regardless of their type arg(s). Vec keeps
@@ -9165,6 +9312,9 @@ private:
             // Phase 78 (v13): Rc<T> owns a refcount block — droppable (its drop
             // decrements + frees at zero).
             if (r->structName == "Rc") return true;
+            // v31 Phase 171: Arc<T>/Weak<T> own an atomic refcount block —
+            // droppable (atomic dec; value freed at strong==0, block at weak==0).
+            if (r->structName == "Arc" || r->structName == "Weak") return true;
             // Phase 81 (v13 review fix): Sender/Receiver are now refcounted
             // OWNERS of the channel block — droppable. A Sender drop decrements
             // the live-sender count (closing the channel at zero) and the
@@ -9389,6 +9539,65 @@ private:
             builder_->CreateCall(freeFn_, {blk});
             builder_->CreateBr(contBB);
             builder_->SetInsertPoint(contBB);
+            return;
+        }
+
+        // v31 Phase 171: Arc<T> / Weak<T> drop — ATOMIC refcount, the Rust
+        // pattern. Strong drop: atomic-Sub strong with Release; the LAST strong
+        // (old==1) acquire-fences, drops the value, then releases the strong
+        // refs' collective weak ref. The block frees only when weak hits 0.
+        // Weak drop: atomic-Sub weak; the last weak frees the block (the value
+        // was already dropped when strong hit 0).
+        if (r->kind == TypeKind::Struct &&
+            (r->structName == "Arc" || r->structName == "Weak") &&
+            !r->typeArgs.empty()) {
+            using AO = llvm::AtomicOrdering;
+            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+            auto* one = llvm::ConstantInt::get(i64Ty, 1);
+            TypePtr inner = resolveInInstance(r->typeArgs[0]);
+            auto* blkTy = arcBlockType(inner);
+            auto* blk = builder_->CreateLoad(i8PtrTy, valuePtr, "arc.ptr");
+            auto* curFn = builder_->GetInsertBlock()->getParent();
+            bool isArc = r->structName == "Arc";
+            auto* weakP = builder_->CreateStructGEP(blkTy, blk, 1, "arc.weakP");
+            // Decrement weak (and free at 0) — shared by the Weak path and the
+            // tail of the Arc strong-zero path.
+            auto emitWeakDec = [&]() {
+                auto* oldW = builder_->CreateAtomicRMW(
+                    llvm::AtomicRMWInst::Sub, weakP, one, llvm::MaybeAlign(8),
+                    AO::Release);
+                auto* wfreeBB = llvm::BasicBlock::Create(ctx, "arc.wfree", curFn);
+                auto* wcontBB = llvm::BasicBlock::Create(ctx, "arc.wcont", curFn);
+                builder_->CreateCondBr(builder_->CreateICmpEQ(oldW, one),
+                                       wfreeBB, wcontBB);
+                builder_->SetInsertPoint(wfreeBB);
+                builder_->CreateFence(AO::Acquire);
+                builder_->CreateCall(freeFn_, {blk});
+                builder_->CreateBr(wcontBB);
+                builder_->SetInsertPoint(wcontBB);
+            };
+            if (!isArc) {
+                emitWeakDec();
+                return;
+            }
+            auto* strongP =
+                builder_->CreateStructGEP(blkTy, blk, 0, "arc.strongP");
+            auto* oldS = builder_->CreateAtomicRMW(
+                llvm::AtomicRMWInst::Sub, strongP, one, llvm::MaybeAlign(8),
+                AO::Release);
+            auto* lastBB = llvm::BasicBlock::Create(ctx, "arc.last", curFn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "arc.done", curFn);
+            builder_->CreateCondBr(builder_->CreateICmpEQ(oldS, one), lastBB,
+                                   doneBB);
+            builder_->SetInsertPoint(lastBB);
+            builder_->CreateFence(AO::Acquire); // order value destruction after
+                                                // all other threads' accesses
+            if (isDroppable(inner))
+                emitDropGlue(builder_->CreateStructGEP(blkTy, blk, 2, "arc.val"),
+                             inner);
+            emitWeakDec(); // release the strong refs' collective weak ref
+            builder_->CreateBr(doneBB);
+            builder_->SetInsertPoint(doneBB);
             return;
         }
 
@@ -11612,6 +11821,31 @@ private:
                     fn, args,
                     fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
             }
+            // v31 Phase 171: the per-T Arc<T>/Weak<T> ops (atomic refcount).
+            if ((call.callee == "arc_new" || call.callee == "arc_clone" ||
+                 call.callee == "arc_get" ||
+                 call.callee == "arc_strong_count" ||
+                 call.callee == "arc_weak_count" ||
+                 call.callee == "arc_downgrade" ||
+                 call.callee == "weak_clone" ||
+                 call.callee == "weak_upgrade") &&
+                !concreteTypeArgs.empty()) {
+                TypePtr at = resolve(concreteTypeArgs[0]);
+                if (at->kind == TypeKind::Var) at = makeInt();
+                llvm::Function* fn = getOrEmitArcOp(call.callee, at);
+                if (!fn) {
+                    errors_.push_back("codegen: cannot specialize " +
+                                      call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(
+                    fn, args,
+                    fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
+            }
             // Phase 35: `clone<T>(&T) -> T` deep-copies via a per-type clone fn.
             // The argument is a `&T` borrow, so emitConsume yields the pointer
             // to the source value (no move of the borrowed-from local).
@@ -12935,6 +13169,22 @@ private:
                     capR->structName == "Sender" && !capR->typeArgs.empty()) {
                     llvm::Function* cloneFn = getOrEmitChannelOp(
                         "sender_clone", resolveInInstance(capR->typeArgs[0]));
+                    llvm::Value* h = builder_->CreateCall(cloneFn, {lit->second},
+                                                          "cap_clone_" + name);
+                    builder_->CreateStore(h, slot);
+                    continue;
+                }
+                // v31 Phase 171: capturing an Arc<T>/Weak<T> CLONES it (atomic
+                // count bump) — each thread gets its own counted handle, dropped
+                // by the worker it is moved into. The enclosing binding keeps
+                // its own handle (no flag-clear), dropped at its scope exit.
+                if (capR->kind == TypeKind::Struct &&
+                    (capR->structName == "Arc" || capR->structName == "Weak") &&
+                    !capR->typeArgs.empty()) {
+                    const char* cloneOp =
+                        capR->structName == "Arc" ? "arc_clone" : "weak_clone";
+                    llvm::Function* cloneFn = getOrEmitArcOp(
+                        cloneOp, resolveInInstance(capR->typeArgs[0]));
                     llvm::Value* h = builder_->CreateCall(cloneFn, {lit->second},
                                                           "cap_clone_" + name);
                     builder_->CreateStore(h, slot);

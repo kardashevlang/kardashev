@@ -2566,6 +2566,39 @@ void test_scoped_threads() {
         "scope_not_sendable");
 }
 
+// v31 Phase 171: Arc<T>/Weak<T>. (weak_upgrade returns Option<Arc<T>> and needs
+// the prelude Option enum, so it is covered by the smoke test; the other Arc
+// ops + the Send rules are prelude-free.)
+void test_arc() {
+    // An Arc is Send when T is Send+Sync -> capturable by value into a thread.
+    expectOk(
+        "fn work(a: Arc<i64>) -> i64 { arc_strong_count(&a) }\n"
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let a = arc_new(0);\n"
+        "  let t = thread_spawn(|| work(a));\n"
+        "  thread_join(t)\n"
+        "}",
+        "arc_is_send");
+    // An Rc is still NOT Send (the contrast).
+    expectErr(
+        "fn work(r: Rc<i64>) -> i64 { rc_strong_count(&r) }\n"
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let r = rc_new(0);\n"
+        "  let t = thread_spawn(|| work(r));\n"
+        "  thread_join(t)\n"
+        "}",
+        "rc_not_send");
+    // arc_new/clone/get/counts/downgrade typecheck.
+    expectOk(
+        "fn main() -> i64 ! { alloc } {\n"
+        "  let a = arc_new(5);\n"
+        "  let b = arc_clone(&a);\n"
+        "  let w = arc_downgrade(&a);\n"
+        "  arc_strong_count(&a) + arc_weak_count(&b)\n"
+        "}",
+        "arc_ops_ok");
+}
+
 void test_mutex_ops_typecheck_ok() {
     expectOk(
         "fn main() -> i64 ! { alloc, io } {\n"
@@ -3460,6 +3493,7 @@ int main() {
     test_rwlock_and_guards();       // v31 Phase 168
     test_atomics();                 // v31 Phase 169
     test_scoped_threads();          // v31 Phase 170
+    test_arc();                     // v31 Phase 171
     test_mutex_ops_typecheck_ok();
     test_mutex_new_requires_alloc_effect();
     test_panic_carries_panic_effect_ok();
@@ -3547,6 +3581,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (315 cases)\n";
+    std::cout << "All typecheck tests passed (316 cases)\n";
     return 0;
 }

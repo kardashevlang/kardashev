@@ -660,6 +660,50 @@ public:
             sch.genericVars.push_back(rcVar);
             fnSchemas_["rc_strong_count"] = std::move(sch);
         }
+
+        // v31 Phase 171: `Arc<T>` — an ATOMICALLY reference-counted shared owner
+        // (a pointer to a heap `{ i64 strong, i64 weak, T value }`), and its
+        // companion `Weak<T>` (a non-owning, upgradable handle). Unlike Rc,
+        // Arc's refcount is atomic, so it IS Send/Sync when T is (Send+Sync) —
+        // the answer to "share owned data across threads" without lifetimes.
+        // arc_new strong=1/weak=1 (all strong refs collectively hold one weak
+        // ref); the value is dropped when the last strong drops, the block freed
+        // when the last weak drops. Mirrors the Rc schema shape.
+        TypePtr arcVar = makeFreshVar();
+        TypePtr arcInst = makeStruct("Arc", {});
+        arcInst->typeArgs = {arcVar};
+        TypePtr weakInst = makeStruct("Weak", {});
+        weakInst->typeArgs = {arcVar};
+        {
+            StructSchema sch;
+            sch.type = arcInst;
+            sch.genericVars.push_back(arcVar);
+            structSchemas_["Arc"] = std::move(sch);
+        }
+        {
+            StructSchema sch;
+            sch.type = weakInst;
+            sch.genericVars.push_back(arcVar);
+            structSchemas_["Weak"] = std::move(sch);
+        }
+        auto regArc = [&](const std::string& nm, std::vector<TypePtr> params,
+                          TypePtr ret, bool alloc) {
+            FnSchema sch;
+            sch.signature = makeFunction(std::move(params), std::move(ret));
+            if (alloc) sch.declaredEffects.add("alloc");
+            sch.genericVars.push_back(arcVar);
+            fnSchemas_[nm] = std::move(sch);
+        };
+        regArc("arc_new", {arcVar}, arcInst, true);
+        regArc("arc_clone", {makeRef(arcInst, false)}, arcInst, false);
+        regArc("arc_get", {makeRef(arcInst, false)}, makeRef(arcVar, false),
+               false);
+        regArc("arc_strong_count", {makeRef(arcInst, false)}, makeInt(), false);
+        regArc("arc_weak_count", {makeRef(arcInst, false)}, makeInt(), false);
+        regArc("arc_downgrade", {makeRef(arcInst, false)}, weakInst, false);
+        regArc("weak_clone", {makeRef(weakInst, false)}, weakInst, false);
+        // weak_upgrade<T>(w: &Weak<T>) -> Option<Arc<T>> is registered AFTER the
+        // enum loop (Option is not yet in enumSchemas_ at this point).
         // hashset_new<T>() -> HashSet<T> ! { alloc }
         {
             FnSchema sch;
@@ -1561,6 +1605,32 @@ public:
                     fnSchemas_["chan_close"] = std::move(sch);
                 }
             }
+        }
+
+        // v31 Phase 171: weak_upgrade<T>(w: &Weak<T>) -> Option<Arc<T>>.
+        // Registered here (after the enum loop) because Option is not yet in
+        // enumSchemas_ at the Arc/Weak registration site above.
+        if (structSchemas_.count("Arc") && enumSchemas_.count("Option")) {
+            TypePtr wuVar = makeFreshVar();
+            TypePtr aInst = makeStruct("Arc", {});
+            aInst->typeArgs = {wuVar};
+            TypePtr wInst = makeStruct("Weak", {});
+            wInst->typeArgs = {wuVar};
+            const EnumSchema& optSchema = enumSchemas_["Option"];
+            TypePtr optArc;
+            if (!optSchema.genericVars.empty()) {
+                std::unordered_map<int, TypePtr> subst;
+                subst[optSchema.genericVars[0]->varId] = aInst;
+                optArc = instantiate(optSchema.type, subst);
+                optArc->typeArgs = {aInst};
+            } else {
+                optArc = optSchema.type;
+            }
+            FnSchema sch;
+            sch.signature = makeFunction({makeRef(wInst, false)}, optArc);
+            sch.declaredEffects.add("alloc");
+            sch.genericVars.push_back(wuVar);
+            fnSchemas_["weak_upgrade"] = std::move(sch);
         }
 
         // Pass 1c: register trait declarations. Each trait gets a global
@@ -6974,6 +7044,24 @@ private:
                           cl.line, cl.column);
                 }
             }
+            // v31 Phase 171: an `Arc<T>`/`Weak<T>` captured into a thread closure
+            // is CLONED (arc_clone/weak_clone — atomic count bump) so each
+            // thread gets its own counted handle. The clone lives in the closure
+            // env (which never drops captures), so it MUST be moved out into the
+            // worker by value to be dropped (count released) on that thread —
+            // else the refcount leaks. Same move-out rule as Sender.
+            if (rt->kind == TypeKind::Struct &&
+                (rt->structName == "Arc" || rt->structName == "Weak")) {
+                copyable = true;
+                if (!hasBareIdentUse(*cl.body, name)) {
+                    error("closure captures the `" + rt->structName + "` `" +
+                              name + "` but never moves it out (every use is `&" +
+                              name + "`), so its atomic refcount is never "
+                              "released. Move it into the spawned worker by value "
+                              "(e.g. `worker(.., " + name + ")`).",
+                          cl.line, cl.column);
+                }
+            }
             if (mutated) {
                 // FnMut: capture by reference. The mutation requires the
                 // enclosing binding be `let mut`.
@@ -7013,7 +7101,9 @@ private:
             // Phase 145: fold this capture into the closure-kind rank. A
             // mutated capture ⇒ FnMut; a captured `Sender` (moved out into the
             // worker, hence consumed after one call) ⇒ FnOnce.
-            if (rt->kind == TypeKind::Struct && rt->structName == "Sender")
+            if (rt->kind == TypeKind::Struct &&
+                (rt->structName == "Sender" || rt->structName == "Arc" ||
+                 rt->structName == "Weak"))
                 kindRank = std::max(kindRank, 2);
             else if (mutated)
                 kindRank = std::max(kindRank, 1);
@@ -8146,6 +8236,15 @@ private:
             // Send (and Sync). The legible POSITIVE witness opposite Rc.
             if (r->structName == "AtomicI64" || r->structName == "AtomicBool")
                 return true;
+            // v31 Phase 171: `Arc<T>`/`Weak<T>` are atomically refcounted, so
+            // (unlike Rc) they ARE Send when T is — specifically T: Send + Sync
+            // (the Rust bound: a shared owner can both move T to another thread
+            // and be aliased from several threads).
+            if (r->structName == "Arc" || r->structName == "Weak") {
+                for (const auto& a : r->typeArgs)
+                    if (!isSendImpl(a, seen) || !isSync(a)) return false;
+                return true;
+            }
             if (r->structName == "Receiver" || r->structName == "Rc")
                 return false;
             // v31 Phase 168: a lock GUARD is bound to the locking thread — never
@@ -8240,6 +8339,13 @@ private:
             // is race-free — that is their purpose).
             if (r->structName == "AtomicI64" || r->structName == "AtomicBool")
                 return true;
+            // v31 Phase 171: Arc<T>/Weak<T> are Sync iff T is Send + Sync.
+            if (r->structName == "Arc" || r->structName == "Weak") {
+                for (const auto& a : r->typeArgs)
+                    if (!isSendImpl(a, seen) || !isSyncImpl(a, seen))
+                        return false;
+                return true;
+            }
             if (r->structName == "Receiver" || r->structName == "Rc")
                 return false;
             // v31 Phase 168: a lock guard is thread-bound — not Sync.

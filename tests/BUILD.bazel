@@ -383,6 +383,15 @@ sh_test(
     flaky = True,
 )
 
+# v31 Phase 171: Arc<T> / Weak<T> (atomic-refcount shared ownership). Thread-
+# based stress -> flaky=True like the other thread tests.
+sh_test(
+    name = "smoke_test_phase171",
+    srcs = ["smoke_test_phase171.sh"],
+    data = ["//compiler:kardc"],
+    flaky = True,
+)
+
 # v30 Phase 165: C backend closures + fn values (differential + ASan).
 sh_test(
     name = "smoke_test_phase165",
