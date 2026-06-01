@@ -956,6 +956,100 @@ public:
             fnSchemas_["mutex_set"] = std::move(sch);
         }
 
+        // === v31 Phase 168: RwLock<T> + RAII lock guards ===
+        // `RwLock<T>` is a reader/writer lock — a Copy shareable i64 handle like
+        // Mutex (its heap block is `{ pthread_rwlock_t, T }`); Send iff T is.
+        // The three guard types (`MutexGuard<T>`, `RwLockReadGuard<T>`,
+        // `RwLockWriteGuard<T>`) are MOVE-ONLY RAII tokens whose Drop releases
+        // the held lock (the scoped-lock pattern, like C++ lock_guard /
+        // shared_lock / unique_lock). They carry T for type clarity; data is
+        // read/written through the lock's get/set while the guard holds it.
+        auto registerBuiltinGeneric = [&](const char* name) {
+            TypePtr v = makeFreshVar();
+            TypePtr inst = makeStruct(name, {});
+            inst->typeArgs = {v};
+            StructSchema sch;
+            sch.type = inst;
+            sch.genericVars.push_back(v);
+            structSchemas_[name] = std::move(sch);
+        };
+        registerBuiltinGeneric("RwLock");
+        registerBuiltinGeneric("MutexGuard");
+        registerBuiltinGeneric("RwLockReadGuard");
+        registerBuiltinGeneric("RwLockWriteGuard");
+        auto mkInst = [&](const char* name, const TypePtr& cell) {
+            TypePtr t = makeStruct(name, {});
+            t->typeArgs = {cell};
+            return t;
+        };
+        //   mutex_guard<T>(m: Mutex<T>) -> MutexGuard<T> ! { io }  (locks)
+        {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature =
+                makeFunction({mkMutex(c)}, mkInst("MutexGuard", c));
+            sch.genericVars.push_back(c);
+            sch.declaredEffects.add("io");
+            fnSchemas_["mutex_guard"] = std::move(sch);
+        }
+        //   rwlock_new<T>(v: T) -> RwLock<T> ! { alloc }
+        {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({c}, mkInst("RwLock", c));
+            sch.genericVars.push_back(c);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["rwlock_new"] = std::move(sch);
+        }
+        //   rwlock_read<T>(rw: RwLock<T>) -> i64 ! { io }   (acquire read lock)
+        //   rwlock_write<T>(rw: RwLock<T>) -> i64 ! { io }  (acquire write lock)
+        //   rwlock_unlock<T>(rw: RwLock<T>) -> i64 ! { io }
+        for (const char* op : {"rwlock_read", "rwlock_write", "rwlock_unlock"}) {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({mkInst("RwLock", c)}, makeInt());
+            sch.genericVars.push_back(c);
+            sch.declaredEffects.add("io");
+            fnSchemas_[op] = std::move(sch);
+        }
+        //   rwlock_get<T>(rw: RwLock<T>) -> T          (read under a read/wr lock)
+        {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({mkInst("RwLock", c)}, c);
+            sch.genericVars.push_back(c);
+            fnSchemas_["rwlock_get"] = std::move(sch);
+        }
+        //   rwlock_set<T>(rw: RwLock<T>, v: T) -> i64  (write under a write lock)
+        {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({mkInst("RwLock", c), c}, makeInt());
+            sch.genericVars.push_back(c);
+            sch.declaredEffects.add("io");
+            fnSchemas_["rwlock_set"] = std::move(sch);
+        }
+        //   rwlock_read_guard<T>(rw: RwLock<T>) -> RwLockReadGuard<T> ! { io }
+        {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature =
+                makeFunction({mkInst("RwLock", c)}, mkInst("RwLockReadGuard", c));
+            sch.genericVars.push_back(c);
+            sch.declaredEffects.add("io");
+            fnSchemas_["rwlock_read_guard"] = std::move(sch);
+        }
+        //   rwlock_write_guard<T>(rw: RwLock<T>) -> RwLockWriteGuard<T> ! { io }
+        {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({mkInst("RwLock", c)},
+                                         mkInst("RwLockWriteGuard", c));
+            sch.genericVars.push_back(c);
+            sch.declaredEffects.add("io");
+            fnSchemas_["rwlock_write_guard"] = std::move(sch);
+        }
+
         // Phase 23 built-in: real panic + unwinding.
         //
         //   panic(msg: String) -> i64 ! { panic }
@@ -7364,6 +7458,32 @@ private:
                           ln, col);
                 }
             }
+            // v31 Phase 168: the RwLock cell is gated exactly like the Mutex
+            // cell — a `RwLock<T>` is a shareable handle, so a non-Send / shared-
+            // handle cell would be smuggled across a thread boundary.
+            if (call.callee == "rwlock_new" && !typeArgs.empty()) {
+                TypePtr cell = resolve(typeArgs[0]);
+                size_t ln = call.args.empty() ? call.line : call.args[0]->line;
+                size_t col =
+                    call.args.empty() ? call.column : call.args[0]->column;
+                bool handleTy = cell->kind == TypeKind::Struct &&
+                                (cell->structName == "Rc" ||
+                                 cell->structName == "Sender" ||
+                                 cell->structName == "Receiver");
+                if (handleTy) {
+                    error("cannot store a `" + cell->structName +
+                              "` in a RwLock: it is a shared handle, not owned "
+                              "data — share it across threads via a channel "
+                              "instead of a RwLock cell",
+                          ln, col);
+                } else if (cell->kind != TypeKind::Var && !isSend(cell)) {
+                    error("cannot store a value of type " + typeToString(cell) +
+                              " in a RwLock: it is not `Send`, and the RwLock "
+                              "handle is shareable across threads. Store an owned "
+                              "Send value — not a borrow / Receiver / Rc",
+                          ln, col);
+                }
+            }
             // PR#20: reject a unit element type for the Vec builtins. The
             // codegen vec_* specialization sizes the element via DataLayout;
             // a zero-sized unit element makes the stride 0 and crashes the
@@ -7878,12 +7998,20 @@ private:
                 return true;
             if (r->structName == "Receiver" || r->structName == "Rc")
                 return false;
-            // Containers + the Mutex handle carry their element(s)/cell in
-            // typeArgs, not structFields. A `Mutex<T>` is Send iff its cell T is
-            // (the cell is also Send-gated at mutex_new, so this is belt-and-
-            // braces — sharing a Mutex<NonSend> across threads is rejected).
+            // v31 Phase 168: a lock GUARD is bound to the locking thread — never
+            // Send (it must be released by the thread that took the lock).
+            if (r->structName == "MutexGuard" ||
+                r->structName == "RwLockReadGuard" ||
+                r->structName == "RwLockWriteGuard")
+                return false;
+            // Containers + the Mutex/RwLock handle carry their element(s)/cell in
+            // typeArgs, not structFields. A `Mutex<T>`/`RwLock<T>` is Send iff
+            // its cell T is (the cell is also Send-gated at construction, so this
+            // is belt-and-braces — sharing a Mutex<NonSend> across threads is
+            // rejected).
             if (r->structName == "Vec" || r->structName == "HashMap" ||
-                r->structName == "HashSet" || r->structName == "Mutex") {
+                r->structName == "HashSet" || r->structName == "Mutex" ||
+                r->structName == "RwLock") {
                 for (const auto& a : r->typeArgs)
                     if (!isSendImpl(a, seen)) return false;
                 return true;
@@ -7957,10 +8085,15 @@ private:
                 return true;
             if (r->structName == "Receiver" || r->structName == "Rc")
                 return false;
-            // A Mutex<T> is Sync iff its cell T is SEND — the interior-
-            // mutability inversion: the lock serialises access, so a
-            // Send-but-not-Sync T becomes safely shareable behind a Mutex.
-            if (r->structName == "Mutex") {
+            // v31 Phase 168: a lock guard is thread-bound — not Sync.
+            if (r->structName == "MutexGuard" ||
+                r->structName == "RwLockReadGuard" ||
+                r->structName == "RwLockWriteGuard")
+                return false;
+            // A Mutex<T> / RwLock<T> is Sync iff its cell T is SEND — the
+            // interior-mutability inversion: the lock serialises access, so a
+            // Send-but-not-Sync T becomes safely shareable behind the lock.
+            if (r->structName == "Mutex" || r->structName == "RwLock") {
                 for (const auto& a : r->typeArgs)
                     if (!isSendImpl(a, seen)) return false;
                 return true;

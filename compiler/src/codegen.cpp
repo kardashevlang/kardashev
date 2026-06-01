@@ -834,12 +834,24 @@ private:
     llvm::Function* pthreadMutexInitFn_ = nullptr;   // pthread_mutex_init
     llvm::Function* pthreadMutexLockFn_ = nullptr;   // pthread_mutex_lock
     llvm::Function* pthreadMutexUnlockFn_ = nullptr; // pthread_mutex_unlock
+    // v31 Phase 168: pthread_rwlock_* externs backing RwLock<T> (a reader/writer
+    // lock, mirrors the Mutex block but over a pthread_rwlock_t at field 0).
+    llvm::Function* pthreadRwlockInitFn_ = nullptr;   // pthread_rwlock_init
+    llvm::Function* pthreadRwlockRdlockFn_ = nullptr;  // pthread_rwlock_rdlock
+    llvm::Function* pthreadRwlockWrlockFn_ = nullptr;  // pthread_rwlock_wrlock
+    llvm::Function* pthreadRwlockUnlockFn_ = nullptr;  // pthread_rwlock_unlock
     // The thread control block `{ i64 tid, i8* fn, i8* env, i64 result }` and
     // the Mutex block `{ [64 x i8] pthread_mutex_t storage, i64 value }`.
     // 64 bytes covers pthread_mutex_t on both Linux (40) and macOS (64); the
     // value cell is i64 (the MVP payload). Built once in declareThreadRuntime.
     llvm::StructType* threadBlkTy_ = nullptr;
     llvm::StructType* mutexBlkTy_ = nullptr;
+    // v31 Phase 168: the RwLock block `{ [200 x i8] pthread_rwlock_t, i64 }`.
+    // 200 bytes covers pthread_rwlock_t on glibc (56) and macOS (200, the
+    // binding limit) — a deliberate over-allocation (the lock lives on the heap;
+    // a too-small pad would corrupt the adjacent cell). Built in
+    // declareThreadRuntime; the per-T value layout lives in rwlockBlkTyFor.
+    llvm::StructType* rwlockBlkTy_ = nullptr;
     llvm::Function* threadTrampolineFn_ = nullptr; // __kd_thread_trampoline
 
     // --- Phase 76 (v13): typed MPSC channels (pthread mutex + condvar) ---
@@ -3404,6 +3416,22 @@ private:
         pthreadMutexUnlockFn_ = llvm::Function::Create(
             pmLockTy, llvm::Function::ExternalLinkage, "pthread_mutex_unlock",
             module_.get());
+        // v31 Phase 168: pthread_rwlock_* externs (POSIX, no platform guard).
+        //   int pthread_rwlock_init(pthread_rwlock_t*, const attr*)
+        pthreadRwlockInitFn_ = llvm::Function::Create(
+            llvm::FunctionType::get(i32Ty, {i8PtrTy, i8PtrTy}, false),
+            llvm::Function::ExternalLinkage, "pthread_rwlock_init",
+            module_.get());
+        //   int pthread_rwlock_rdlock/wrlock/unlock(pthread_rwlock_t*)
+        pthreadRwlockRdlockFn_ = llvm::Function::Create(
+            pmLockTy, llvm::Function::ExternalLinkage, "pthread_rwlock_rdlock",
+            module_.get());
+        pthreadRwlockWrlockFn_ = llvm::Function::Create(
+            pmLockTy, llvm::Function::ExternalLinkage, "pthread_rwlock_wrlock",
+            module_.get());
+        pthreadRwlockUnlockFn_ = llvm::Function::Create(
+            pmLockTy, llvm::Function::ExternalLinkage, "pthread_rwlock_unlock",
+            module_.get());
 
         // Control-block types.
         threadBlkTy_ = llvm::StructType::create(
@@ -3412,6 +3440,12 @@ private:
             llvm::Type::getInt8Ty(ctx), 64);
         mutexBlkTy_ = llvm::StructType::create(
             ctx, {mtxStorageTy, i64Ty}, "kd.mutex_blk");
+        // v31 Phase 168: the T-agnostic RwLock block (rwlock at field 0, used by
+        // the fixed rdlock/wrlock/unlock ops which only touch field 0).
+        auto* rwStorageTy = llvm::ArrayType::get(
+            llvm::Type::getInt8Ty(ctx), 200);
+        rwlockBlkTy_ = llvm::StructType::create(
+            ctx, {rwStorageTy, i64Ty}, "kd.rwlock_blk");
         // The closure's fn pointer has the env-calling-convention type for a
         // `fn() -> i64` value: i64(i8* env).
         auto* closureCallTy =
@@ -3518,6 +3552,28 @@ private:
         };
         emitMutexLockOp("mutex_lock", pthreadMutexLockFn_);
         emitMutexLockOp("mutex_unlock", pthreadMutexUnlockFn_);
+
+        // v31 Phase 168: T-agnostic RwLock lock/unlock (touch the
+        // pthread_rwlock_t at field 0 of the rwlock block). rdlock/wrlock/unlock
+        // each take the i64 handle and return 0 (composable). The guard-acquire
+        // builtins call rdlock/wrlock; a guard's Drop calls rwlock_unlock.
+        auto emitRwlockLockOp = [&](const char* name, llvm::Function* op) {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i64Ty}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, name, module_.get());
+            fn->getArg(0)->setName("h");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* rwPtr = b.CreateStructGEP(rwlockBlkTy_, blk, 0, "rw_ptr");
+            b.CreateCall(op, {rwPtr});
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_[name] = fn;
+        };
+        emitRwlockLockOp("rwlock_rdlock", pthreadRwlockRdlockFn_);
+        emitRwlockLockOp("rwlock_wrlock", pthreadRwlockWrlockFn_);
+        emitRwlockLockOp("rwlock_unlock", pthreadRwlockUnlockFn_);
         (void)voidTy;
     }
 
@@ -3616,6 +3672,98 @@ private:
             b.CreateStore(fn->getArg(1), valP);
             b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
             declaredFns_["mutex_set__mx_" + mangle] = fn;
+        }
+        auto it = declaredFns_.find(want);
+        return it != declaredFns_.end() ? it->second : nullptr;
+    }
+
+    // v31 Phase 168: the per-T `RwLock<T>` block `{ [200 x i8] pthread_rwlock_t,
+    // T value }`. Mirrors mutexBlkTyFor.
+    llvm::StructType* rwlockBlkTyFor(const TypePtr& T) {
+        auto& ctx = *ctx_;
+        std::string mangle = mangleType(T);
+        auto it = rwlockBlkTys_.find(mangle);
+        if (it != rwlockBlkTys_.end()) return it->second;
+        auto* rwStorageTy =
+            llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx), 200);
+        auto* valTy = mapKardashevType(T);
+        auto* blkTy = llvm::StructType::create(
+            ctx, {rwStorageTy, valTy}, "kd.rwlock_blk." + mangle);
+        rwlockBlkTys_[mangle] = blkTy;
+        return blkTy;
+    }
+    std::unordered_map<std::string, llvm::StructType*> rwlockBlkTys_;
+
+    // v31 Phase 168: per-T RwLock cell ops (new/get/set), mirroring
+    // getOrEmitMutexOp. rdlock/wrlock/unlock are T-agnostic (declareThreadRuntime).
+    llvm::Function* getOrEmitRwLockOp(const std::string& op, const TypePtr& T) {
+        ensureThreadRuntime();
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        std::string mangle = mangleType(T);
+        std::string want = op + "__rw_" + mangle;
+        if (auto it = declaredFns_.find(want); it != declaredFns_.end())
+            return it->second;
+        auto* blkTy = rwlockBlkTyFor(T);
+        auto* valTy = mapKardashevType(T);
+
+        // rwlock_new__rw_<T>(T v) -> i64 : malloc block, init rwlock (field 0),
+        // store v (field 1), return (i64)block.
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {valTy}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "rwlock_new__rw_" + mangle, module_.get());
+            fn->getArg(0)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            uint64_t sz = module_->getDataLayout().getTypeAllocSize(blkTy);
+            auto* blk = b.CreateCall(
+                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "rwlock_blk");
+            b.CreateCall(
+                pthreadRwlockInitFn_,
+                {b.CreateStructGEP(blkTy, blk, 0, "rw_ptr"),
+                 llvm::ConstantPointerNull::get(i8PtrTy)});
+            b.CreateStore(fn->getArg(0),
+                          b.CreateStructGEP(blkTy, blk, 1, "value_slot"));
+            b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "handle"));
+            declaredFns_["rwlock_new__rw_" + mangle] = fn;
+        }
+        // rwlock_get__rw_<T>(i64 h) -> T : read the cell BY VALUE (clone, like
+        // mutex_get, so a non-Copy T isn't aliased).
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(valTy, {i64Ty}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "rwlock_get__rw_" + mangle, module_.get());
+            fn->getArg(0)->setName("h");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* valP = b.CreateStructGEP(blkTy, blk, 1, "value_ptr");
+            b.CreateRet(b.CreateCall(getOrEmitCloneFn(T), {valP}, "value"));
+            declaredFns_["rwlock_get__rw_" + mangle] = fn;
+        }
+        // rwlock_set__rw_<T>(i64 h, T v) -> i64 : drop old cell, store v, ret 0.
+        {
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {i64Ty, valTy}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "rwlock_set__rw_" + mangle, module_.get());
+            fn->getArg(0)->setName("h");
+            fn->getArg(1)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* valP = b.CreateStructGEP(blkTy, blk, 1, "value_ptr");
+            b.CreateCall(getOrEmitDropThunk(T), {valP});
+            b.CreateStore(fn->getArg(1), valP);
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_["rwlock_set__rw_" + mangle] = fn;
         }
         auto it = declaredFns_.find(want);
         return it != declaredFns_.end() ? it->second : nullptr;
@@ -4718,6 +4866,16 @@ private:
             if (r->structName == "Mutex")
                 return builder_->CreateLoad(mapKardashevType(r), src,
                                             "clone.mutex");
+            // v31 Phase 168: RwLock<T> is a Copy i64 handle (bit-copy clone,
+            // like Mutex). The lock guards are move-only and not normally
+            // cloned, but bit-copy them too (rather than fall through to the
+            // empty-field loop that would return undef).
+            if (r->structName == "RwLock" ||
+                r->structName == "MutexGuard" ||
+                r->structName == "RwLockReadGuard" ||
+                r->structName == "RwLockWriteGuard")
+                return builder_->CreateLoad(mapKardashevType(r), src,
+                                            "clone.lock");
             // User struct: clone each field.
             llvm::Type* st = mapKardashevType(r);
             llvm::Value* agg = llvm::UndefValue::get(st);
@@ -6914,6 +7072,16 @@ private:
                 // threads). The per-T block layout lives in getOrEmitMutexOp.
                 if (r->structName == "Mutex")
                     return llvm::Type::getInt64Ty(*ctx_);
+                // v31 Phase 168: `RwLock<T>` is a Copy i64 handle (like Mutex);
+                // the three RAII lock guards (`MutexGuard<T>`,
+                // `RwLockReadGuard<T>`, `RwLockWriteGuard<T>`) are move-only i64
+                // handles carrying the locked block's pointer — their Drop
+                // releases the lock. All lower to a bare i64 regardless of T.
+                if (r->structName == "RwLock" ||
+                    r->structName == "MutexGuard" ||
+                    r->structName == "RwLockReadGuard" ||
+                    r->structName == "RwLockWriteGuard")
+                    return llvm::Type::getInt64Ty(*ctx_);
                 // Phase 78 (v13): `Rc<T>` is a pointer to a heap
                 // `{ i64 strong, T value }` refcount block.
                 if (r->structName == "Rc")
@@ -8596,13 +8764,24 @@ private:
             // an i64, so they lower as scalars, but they are no longer Copy.)
             if (r->structName == "Sender" || r->structName == "Receiver")
                 return true;
+            // v31 Phase 168: the three RAII lock guards are move-only OWNERS of
+            // a held lock — droppable: their Drop releases the lock (mutex_unlock
+            // / rwlock_unlock). The handle is an i64, so they lower as scalars,
+            // but they are no longer Copy.
+            if (r->structName == "MutexGuard" ||
+                r->structName == "RwLockReadGuard" ||
+                r->structName == "RwLockWriteGuard")
+                return true;
             // Slice / Range / fn-value / future structs own no heap (Slice is
             // a borrow; Range/Future are plain scalars in the MVP). A `Mutex<T>`
-            // is a Copy i64 handle whose lock+cell block is process-lifetime
-            // (never freed — like the pre-123 raw-i64 Mutex), so it is NOT
-            // dropped (the cell's final contents leak with the block, by design).
+            // and a `RwLock<T>` (v31 Phase 168) are Copy i64 handles whose
+            // lock+cell block is process-lifetime (never freed — like the
+            // pre-123 raw-i64 Mutex), so they are NOT dropped (the cell's final
+            // contents leak with the block, by design — owned free arrives with
+            // Arc<Mutex<T>>).
             if (r->structName == "Slice" || r->structName == "Range" ||
-                r->structName == "Future" || r->structName == "Mutex")
+                r->structName == "Future" || r->structName == "Mutex" ||
+                r->structName == "RwLock")
                 return false;
             std::string key = mangleStructInstance(r->structName, r->typeArgs);
             if (!seen.insert("S:" + key).second) return false;
@@ -8798,6 +8977,24 @@ private:
             builder_->CreateCall(freeFn_, {blk});
             builder_->CreateBr(contBB);
             builder_->SetInsertPoint(contBB);
+            return;
+        }
+
+        // v31 Phase 168: a lock GUARD drop releases the held lock. The storage
+        // holds the i64 lock-block handle; a MutexGuard routes to the T-agnostic
+        // mutex_unlock, a RwLock read/write guard to rwlock_unlock. The lock
+        // block itself is NOT freed here (the Mutex/RwLock owns it, and is a
+        // Copy process-lifetime handle) — only the lock is released.
+        if (r->kind == TypeKind::Struct &&
+            (r->structName == "MutexGuard" ||
+             r->structName == "RwLockReadGuard" ||
+             r->structName == "RwLockWriteGuard")) {
+            ensureThreadRuntime();
+            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+            auto* handle = builder_->CreateLoad(i64Ty, valuePtr, "guard.handle");
+            const char* unlockFn =
+                (r->structName == "MutexGuard") ? "mutex_unlock" : "rwlock_unlock";
+            builder_->CreateCall(declaredFns_[unlockFn], {handle});
             return;
         }
 
@@ -10832,7 +11029,12 @@ private:
         if (call.callee == "thread_spawn" || call.callee == "thread_join" ||
             call.callee == "mutex_new" || call.callee == "mutex_lock" ||
             call.callee == "mutex_unlock" || call.callee == "mutex_get" ||
-            call.callee == "mutex_set") {
+            call.callee == "mutex_set" || call.callee == "mutex_guard" ||
+            call.callee == "rwlock_new" || call.callee == "rwlock_read" ||
+            call.callee == "rwlock_write" || call.callee == "rwlock_unlock" ||
+            call.callee == "rwlock_get" || call.callee == "rwlock_set" ||
+            call.callee == "rwlock_read_guard" ||
+            call.callee == "rwlock_write_guard") {
             ensureThreadRuntime();
         }
         // (Phase 77: the channel ops are GENERIC builtins — they route through
@@ -11096,6 +11298,57 @@ private:
                 TypePtr mt = resolve(concreteTypeArgs[0]);
                 if (mt->kind == TypeKind::Var) mt = makeInt();
                 llvm::Function* fn = getOrEmitMutexOp(call.callee, mt);
+                if (!fn) {
+                    errors_.push_back(
+                        "codegen: cannot specialize " + call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
+            }
+            // v31 Phase 168: a lock-GUARD acquire — lock the handle, then yield
+            // it AS the guard value (a MutexGuard/RwLock*Guard is the same i64
+            // handle). The guard's scope-exit Drop releases the lock. The lock
+            // arg is a Copy handle, so emitConsume just loads it.
+            if (call.callee == "mutex_guard" ||
+                call.callee == "rwlock_read_guard" ||
+                call.callee == "rwlock_write_guard") {
+                ensureThreadRuntime();
+                llvm::Value* h = emitConsume(*call.args[0]);
+                const char* lockFn = call.callee == "mutex_guard"
+                                         ? "mutex_lock"
+                                         : call.callee == "rwlock_read_guard"
+                                               ? "rwlock_rdlock"
+                                               : "rwlock_wrlock";
+                builder_->CreateCall(declaredFns_[lockFn], {h});
+                return h; // the locked handle IS the guard
+            }
+            // v31 Phase 168: RwLock<T> — manual read/write/unlock are T-agnostic
+            // (field 0), like mutex_lock/unlock; get/set are per-T (like the
+            // mutex cell ops) over the `{ pthread_rwlock_t, T }` block.
+            if (call.callee == "rwlock_read" || call.callee == "rwlock_write" ||
+                call.callee == "rwlock_unlock") {
+                ensureThreadRuntime();
+                const char* fixed = call.callee == "rwlock_read"
+                                        ? "rwlock_rdlock"
+                                        : call.callee == "rwlock_write"
+                                              ? "rwlock_wrlock"
+                                              : "rwlock_unlock";
+                llvm::Function* fn = declaredFns_[fixed];
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
+            }
+            if ((call.callee == "rwlock_new" || call.callee == "rwlock_get" ||
+                 call.callee == "rwlock_set") &&
+                !concreteTypeArgs.empty()) {
+                TypePtr rt = resolve(concreteTypeArgs[0]);
+                if (rt->kind == TypeKind::Var) rt = makeInt();
+                llvm::Function* fn = getOrEmitRwLockOp(call.callee, rt);
                 if (!fn) {
                     errors_.push_back(
                         "codegen: cannot specialize " + call.callee);

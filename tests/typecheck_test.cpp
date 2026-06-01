@@ -2434,6 +2434,58 @@ void test_marker_traits_send_sync() {
         "marker_conflicting_impls_rejected");
 }
 
+// v31 Phase 168: RwLock<T> + RAII lock guards.
+void test_rwlock_and_guards() {
+    // RwLock<i64> manual API typechecks (read/write/get/set/unlock).
+    expectOk(
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let rw = rwlock_new(0);\n"
+        "  rwlock_write(rw);\n"
+        "  rwlock_set(rw, rwlock_get(rw) + 1);\n"
+        "  rwlock_unlock(rw);\n"
+        "  rwlock_read(rw);\n"
+        "  let v = rwlock_get(rw);\n"
+        "  rwlock_unlock(rw);\n"
+        "  v\n"
+        "}",
+        "rwlock_manual_ok");
+    // A Mutex RAII guard typechecks; data is accessed via the lock's get/set.
+    expectOk(
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let m = mutex_new(0);\n"
+        "  let g = mutex_guard(m);\n"
+        "  mutex_set(m, mutex_get(m) + 1);\n"
+        "  0\n"
+        "}",
+        "mutex_guard_ok");
+    // RwLock read/write guards typecheck.
+    expectOk(
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let rw = rwlock_new(0);\n"
+        "  let w = rwlock_write_guard(rw);\n"
+        "  rwlock_set(rw, 1);\n"
+        "  0\n"
+        "}",
+        "rwlock_write_guard_ok");
+    // The RwLock cell must be Send + owned (like a Mutex cell).
+    expectErr(
+        "fn main() -> i64 ! { alloc, share } {\n"
+        "  let rw = rwlock_new(rc_new(1));\n"
+        "  0\n"
+        "}",
+        "rwlock_rc_cell_rejected");
+    // A lock guard is thread-bound — it cannot cross into a spawned thread.
+    expectErr(
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let m = mutex_new(0);\n"
+        "  let g = mutex_guard(m);\n"
+        "  let t = thread_spawn(|| { let gg = g; 0 });\n"
+        "  thread_join(t);\n"
+        "  0\n"
+        "}",
+        "guard_not_sendable");
+}
+
 void test_mutex_ops_typecheck_ok() {
     expectOk(
         "fn main() -> i64 ! { alloc, io } {\n"
@@ -3325,6 +3377,7 @@ int main() {
     test_thread_spawn_byref_capture_rejected();
     test_thread_spawn_propagates_closure_io_effect();
     test_marker_traits_send_sync(); // v31 Phase 167
+    test_rwlock_and_guards();       // v31 Phase 168
     test_mutex_ops_typecheck_ok();
     test_mutex_new_requires_alloc_effect();
     test_panic_carries_panic_effect_ok();
@@ -3412,6 +3465,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (312 cases)\n";
+    std::cout << "All typecheck tests passed (313 cases)\n";
     return 0;
 }
