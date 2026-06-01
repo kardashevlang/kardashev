@@ -5610,6 +5610,44 @@ private:
             a->refIsMut && unify(a->refInner, e->refInner)) {
             return true;
         }
+        // v32 Phase 175: effect SUBTYPING (subsumption). A fn value that
+        // performs FEWER effects is usable where one with MORE effects is
+        // expected — calling it can only do at most what the expected signature
+        // permits — so a pure `fn()->R` coerces to a `fn()->R ! {io}` parameter.
+        // Unify the arg + return types as usual, then accept if the ACTUAL's
+        // effect labels are a SUBSET of the EXPECTED's (the extra effects the
+        // expected allows simply aren't performed). The reverse — an actual that
+        // does MORE than expected — falls through to the exact unify (rejected).
+        // We fire ONLY when the actual row is CLOSED and the expected has
+        // strictly more labels (or an open tail): an open ACTUAL tail, and the
+        // exact-match case, keep the symmetric unify so effect-row threading
+        // (e.g. the `! {e}` row var of vec_map / future_map) is unchanged.
+        if (e->kind == TypeKind::Function && a->kind == TypeKind::Function &&
+            e->closureBound < 0 && a->args.size() == e->args.size()) {
+            TypePtr aRv = a->effectRowVar ? resolve(a->effectRowVar) : nullptr;
+            TypePtr eRv = e->effectRowVar ? resolve(e->effectRowVar) : nullptr;
+            bool aOpen = aRv && aRv->kind == TypeKind::Var &&
+                         !aRv->effectRowSolved;
+            bool eOpen = eRv && eRv->kind == TypeKind::Var &&
+                         !eRv->effectRowSolved;
+            if (!aOpen) {
+                std::vector<std::string> al = resolveEffectRow(a);
+                std::vector<std::string> el = resolveEffectRow(e);
+                bool actualSubset = true;
+                for (const auto& l : al)
+                    if (std::find(el.begin(), el.end(), l) == el.end()) {
+                        actualSubset = false;
+                        break;
+                    }
+                if (actualSubset && (el.size() > al.size() || eOpen)) {
+                    bool ok = true;
+                    for (std::size_t i = 0; i < a->args.size() && ok; ++i)
+                        if (!unify(a->args[i], e->args[i])) ok = false;
+                    if (ok && !unify(a->ret, e->ret)) ok = false;
+                    if (ok) return true;
+                }
+            }
+        }
         return unify(actual, expected);
     }
 
