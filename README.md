@@ -90,7 +90,7 @@ Build with Bazel (`bazel build //... && bazel test //...`) on ubuntu or macOS, o
 
 ## Status
 
-All thirty-six roadmaps (**v1–v36**, Phases 0–196) have shipped and are merged to `main`, each green on a cleared clean build — 6 unit suites plus the full smoke / fuzz aggregate, **JIT and AOT**, on ubuntu + macOS CI. The full numbered roadmap is complete; what remains are the four XL [mega-arcs](ROADMAP.md) (a real self-hosting bootstrap, a package registry, more backends/platforms, and the spec→1.0 stability commitment). Current release: **[v0.36.0](https://github.com/kardashevlang/kardashev/releases/latest)**.
+All thirty-six numbered roadmaps (**v1–v36**, Phases 0–196) have shipped, and the **Road to 1.0 and Beyond** ([ROADMAP-1.0-AND-BEYOND.md](ROADMAP-1.0-AND-BEYOND.md)) is now underway — **v37 "Foundations & unblockers"** shipped its first batch (full operator-trait surface, turbofish, a real test framework). Each release is green on a cleared clean build — 6 unit suites plus the full smoke / fuzz aggregate, **JIT and AOT**, on ubuntu + macOS CI. Current release: **[v0.37.0](https://github.com/kardashevlang/kardashev/releases/latest)**.
 
 The north-star arc is **self-hosting**: v15–v17 build a complete compiler *in* kardashev — lexer → parser → type checker → code generator + VM, with `examples/selfhost/compile.kd` type-checking a whole function and then compiling + running its body. Dogfooding it found and fixed three real host-compiler bugs. v18–v19 added a differential fuzzer (random programs, `JIT == AOT == reference`) across the arithmetic, control-flow, memory-safety, and integer codegen paths.
 

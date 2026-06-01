@@ -18,6 +18,37 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.37.0] — Roadmap v37 "Foundations & unblockers" (post-1.0-roadmap, batch 1)
+
+First batch of the **Road to 1.0 and Beyond** (ROADMAP-1.0-AND-BEYOND.md) —
+the cheap, dependency-free wins other phases stand on. Each is real + tested
+(differential JIT vs AOT or runner-verified).
+
+### Added
+- **Full operator-trait surface** — operator overloading (Phase 184's
+  Add/Sub/Mul/Div) extended to the binary `%` (Rem) + bitwise/shift family
+  (BitAnd/BitOr/BitXor/Shl/Shr) and the UNARY operators Neg (`-x`) and Not
+  (`!x`). New unary-operator machinery (`unaryOpMethod`) mirrors the binary
+  path; primitives keep their built-in ops; a missing impl is a clear error.
+- **Turbofish** — explicit generic type arguments on calls (`id::<i64>(x)`,
+  `pair::<i64, bool>(a, b)`); the type checker binds the callee's generic
+  params positionally (constraining inference, which still works when
+  omitted). Too-many / conflicting args diagnose. Unblocks where-clauses /
+  GATs work where inference is insufficient.
+- **Real test framework** — `assert!` / `assert_eq!` / `assert_ne!` prelude
+  macros (over the Phase 182 macro engine), plus `kardc --test --filter
+  <substr>` and `--test --format=json`; exit 0 iff all pass.
+
+### Deferred / honest limitations
+- The remaining v37 items are NOT in this release: the **sanitizer + TSan CI
+  gates** need kardc to emit sanitizer-instrumented code (real codegen work,
+  not just CI YAML); the **panic strategy** (panic=unwind/abort + catch_unwind
+  + FFI unwind-boundary), **complete-borrow-check** (mut-2nd-arg / field
+  reborrows), a selectable **overflow-trap policy**, and the
+  **benchmark-regression harness** are each L/threading-heavy. Tracked in
+  ROADMAP-1.0-AND-BEYOND.md (v37). Operator Index/Deref/custom-Output also
+  remain (need lvalue/autoderef/assoc-type support).
+
 ## [0.36.0] — Roadmap v36 "tooling & compiler performance" (Phases 192, 194, 196)
 
 Theme: developer-facing tooling and a concrete codegen-performance win. Each
