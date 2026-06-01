@@ -14095,9 +14095,16 @@ private:
         auto* okBB = llvm::BasicBlock::Create(ctx, "handled", currentFn_);
         builder_->CreateCondBr(isNull, trapBB, okBB);
         builder_->SetInsertPoint(trapBB);
-        auto* trapFn = llvm::Intrinsic::getOrInsertDeclaration(
-            module_.get(), llvm::Intrinsic::trap);
-        builder_->CreateCall(trapFn, {});
+        // Abort cleanly on an unhandled performed effect. Use libc `abort()`
+        // (declared on demand) rather than the `llvm.trap` intrinsic — the
+        // intrinsic-declaration helper was renamed across LLVM versions
+        // (getDeclaration -> getOrInsertDeclaration), and getOrInsertFunction is
+        // version-stable.
+        auto* abortTy = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(ctx), /*isVarArg=*/false);
+        llvm::FunctionCallee abortFn =
+            module_->getOrInsertFunction("abort", abortTy);
+        builder_->CreateCall(abortFn, {});
         builder_->CreateUnreachable();
         builder_->SetInsertPoint(okBB);
         std::vector<llvm::Value*> args;
