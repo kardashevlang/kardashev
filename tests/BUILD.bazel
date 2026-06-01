@@ -466,6 +466,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v35 Phase 188: iterator-adaptor / reducer completeness + iter_collect.
+sh_test(
+    name = "smoke_test_phase188",
+    srcs = ["smoke_test_phase188.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 184: operator overloading (Add/Sub/Mul/Div via traits).
 sh_test(
     name = "smoke_test_phase184",

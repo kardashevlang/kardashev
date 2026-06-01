@@ -114,6 +114,15 @@ std::string applyPrelude(const std::string& userSrc) {
             " self.start = self.start + 1; Some(v) }\n"
             "        }\n"
             "    }\n"
+            "}\n"
+            // v35 Phase 188: drain ANY `Iterator<T>` into an owned Vec — the
+            // lazy-to-eager bridge. Injected with the trait (and suppressed
+            // together with it) so a user who redefines `Iterator` is unaffected.
+            "fn iter_collect<T, I: Iterator<T>>(it: &mut I) -> Vec<T> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut go = true;\n"
+            "    while go { match it.next() { Some(x) => { vec_push(&mut out, x); }, None => { go = false; } } }\n"
+            "    out\n"
             "}\n";
     }
     // Phase 28: the `Hash` and `Eq` traits with built-in impls for i64 and
@@ -831,6 +840,94 @@ std::string applyPrelude(const std::string& userSrc) {
             "        i = i + 1;\n"
             "    }\n"
             "    acc\n"
+            "}\n";
+    }
+    // v35 Phase 188: iterator-adaptor / reducer completeness. EAGER Vec-based
+    // adaptors (each returns a fresh owned Vec, cloning the elements it keeps)
+    // and reducers, plus a lazy `iter_collect` that drains ANY `Iterator<T>`
+    // into a Vec. (Honest: these are eager over a materialized Vec, not Rust's
+    // lazy adaptor structs — `iter_collect` is the bridge from the lazy
+    // `Iterator` trait; a fully lazy adaptor tower is future work.) Closure-
+    // taking reducers are effect-polymorphic in the predicate's row `e`.
+    if (userSrc.find("fn vec_take") == std::string::npos) {
+        prelude +=
+            "fn vec_take<T: Clone>(v: &Vec<T>, n: i64) -> Vec<T> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < n { if i < vec_len(v) { vec_push(&mut out, vec_get_ref(v, i).clone()); } else {} i = i + 1; }\n"
+            "    out\n"
+            "}\n"
+            "fn vec_skip<T: Clone>(v: &Vec<T>, n: i64) -> Vec<T> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = n;\n"
+            "    while i < vec_len(v) { vec_push(&mut out, vec_get_ref(v, i).clone()); i = i + 1; }\n"
+            "    out\n"
+            "}\n"
+            "fn vec_chain<T: Clone>(a: &Vec<T>, b: &Vec<T>) -> Vec<T> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(a) { vec_push(&mut out, vec_get_ref(a, i).clone()); i = i + 1; }\n"
+            "    let mut j = 0;\n"
+            "    while j < vec_len(b) { vec_push(&mut out, vec_get_ref(b, j).clone()); j = j + 1; }\n"
+            "    out\n"
+            "}\n"
+            "fn vec_zip<A: Clone, B: Clone>(a: &Vec<A>, b: &Vec<B>) -> Vec<(A, B)> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(a) {\n"
+            "        if i < vec_len(b) { vec_push(&mut out, (vec_get_ref(a, i).clone(), vec_get_ref(b, i).clone())); } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n"
+            "fn vec_enumerate<T: Clone>(v: &Vec<T>) -> Vec<(i64, T)> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(v) { vec_push(&mut out, (i, vec_get_ref(v, i).clone())); i = i + 1; }\n"
+            "    out\n"
+            "}\n"
+            "fn vec_sum(v: &Vec<i64>) -> i64 ! { alloc } {\n"
+            "    let mut s = 0;\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(v) { s = s + vec_get(v, i); i = i + 1; }\n"
+            "    s\n"
+            "}\n"
+            "fn vec_any<T, e>(v: &Vec<T>, pred: fn(&T) -> bool ! {e}) -> bool ! { alloc, e } {\n"
+            "    let mut i = 0;\n"
+            "    let mut found = false;\n"
+            "    while i < vec_len(v) { if pred(vec_get_ref(v, i)) { found = true; } else {} i = i + 1; }\n"
+            "    found\n"
+            "}\n"
+            "fn vec_all<T, e>(v: &Vec<T>, pred: fn(&T) -> bool ! {e}) -> bool ! { alloc, e } {\n"
+            "    let mut i = 0;\n"
+            "    let mut ok = true;\n"
+            "    while i < vec_len(v) { if pred(vec_get_ref(v, i)) {} else { ok = false; } i = i + 1; }\n"
+            "    ok\n"
+            "}\n"
+            "fn vec_find<T: Clone, e>(v: &Vec<T>, pred: fn(&T) -> bool ! {e}) -> Option<T> ! { alloc, e } {\n"
+            "    let mut i = 0;\n"
+            "    let mut idx = 0 - 1;\n"
+            "    while i < vec_len(v) {\n"
+            "        if idx < 0 { if pred(vec_get_ref(v, i)) { idx = i; } else {} } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    if idx < 0 { None } else { Some(vec_get_ref(v, idx).clone()) }\n"
+            "}\n"
+            "fn vec_min<T: Ord + Clone>(v: &Vec<T>) -> Option<T> ! { alloc } {\n"
+            "    if vec_len(v) == 0 { None } else {\n"
+            "        let mut best = 0;\n"
+            "        let mut i = 1;\n"
+            "        while i < vec_len(v) { if vec_get_ref(v, i).cmp(vec_get_ref(v, best)) < 0 { best = i; } else {} i = i + 1; }\n"
+            "        Some(vec_get_ref(v, best).clone())\n"
+            "    }\n"
+            "}\n"
+            "fn vec_max<T: Ord + Clone>(v: &Vec<T>) -> Option<T> ! { alloc } {\n"
+            "    if vec_len(v) == 0 { None } else {\n"
+            "        let mut best = 0;\n"
+            "        let mut i = 1;\n"
+            "        while i < vec_len(v) { if vec_get_ref(v, i).cmp(vec_get_ref(v, best)) > 0 { best = i; } else {} i = i + 1; }\n"
+            "        Some(vec_get_ref(v, best).clone())\n"
+            "    }\n"
             "}\n";
     }
     // v35 Phase 187: VecDeque<T> — a double-ended queue, O(1) AMORTIZED at both
