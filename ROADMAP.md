@@ -10,7 +10,7 @@ full numeric tower, async, and threads. It is well above the median hobby/studen
 compiler in breadth and test discipline. It is **not** a production language: it
 is pre-ecosystem, pre-performance-proven, and MVP-shaped in places.
 
-**Shipped: v1–v32** (Phases 0–176, through `v0.32.0`). The per-version themes are
+**Shipped: v1–v33** (Phases 0–181, through `v0.33.0`). The per-version themes are
 in the [README roadmap table](README.md#roadmap); every phase's detail is in
 [CHANGELOG.md](CHANGELOG.md). v15–v19 built a self-hosted *mini* compiler and a
 differential-fuzzing test surface; v20 took it to real LLVM IR; v21 added a
@@ -226,14 +226,26 @@ effect system "tracking only — no handlers/subtyping".)*
   resume-with-value, `State`/reader/logging). *(Deferred: non-tail + multi-shot
   resume, abort-without-unwind.)*
 
-### v33 — systems-grade: FFI, `unsafe` & `no_std`
+### v33 — systems-grade: FFI, `unsafe` & overflow control — SHIPPED (`v0.33.0`), except 179/180
 *(Critic: "incomplete FFI; no raw pointers; no inline asm/SIMD; no `no_std`".)*
-- **177** **raw pointers** + **`unsafe`** blocks (the systems escape hatch).
-- **178** **FFI maturity** — structs-by-value, callbacks, C-header **binding
-  generation** (`bindgen`-equivalent).
-- **179** **`no_std`** / freestanding + a pluggable **allocator** trait.
-- **180** **inline asm** + **SIMD** intrinsics (portable + target-specific).
-- **181** **overflow-checked** arithmetic + a documented integer-overflow policy.
+- **177** ✅ **raw pointers** (`*const T` / `*mut T`, not borrow-checked, opaque
+  ptr like `&T`) + **`unsafe { }`** blocks (deref-read, ref↔rawptr / rawptr↔int
+  casts; contextual keywords). *(Deferred: raw write `*p=v` — needs
+  deref-assign, unsupported language-wide; pointer arithmetic.)*
+- **178** ✅ **FFI maturity (scalars + pointers)** — `extern "C"` now takes
+  f64/f32, the full int-width tower, and `*const T`/`*mut T` (a C pointer);
+  verified vs real libm/libc. *(Deferred: struct-by-value [platform C ABI],
+  fn-pointer callbacks, C-header bindgen [needs a C parser].)*
+- **179** ⏳ DEFERRED — **`no_std`** / freestanding + a pluggable **allocator**.
+  A pluggable global allocator reroutes the core libc malloc/free/realloc path
+  (risky for every heap type) and full `no_std` conflicts with the
+  libc-dependent prelude runtime (print/String/Vec). Future systems work.
+- **180** ⏳ DEFERRED — **inline asm** + **SIMD** intrinsics. Platform-specific
+  and not portably verifiable in this environment (cf. Phase 174). Future work.
+- **181** ✅ **overflow-checked + wrapping arithmetic** — documented policy
+  (default 2's-complement wrap) + `checked_add/sub/mul/div -> Option<i64>` +
+  `wrapping_add/sub/mul`; portable overflow detection (no version-fragile
+  `*.with.overflow` intrinsics).
 
 ### v34 — metaprogramming
 *(Critic: "no macro system; no operator overloading; comptime limited".)*

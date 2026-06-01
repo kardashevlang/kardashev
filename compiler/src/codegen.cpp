@@ -8702,6 +8702,15 @@ private:
                 it != currentConstParamSubst_.end())
                 return makeConstValue(static_cast<long long>(it->second));
         }
+        // v33 Phase 177: a raw pointer `*const T` / `*mut T` — the raw-ptr flags
+        // live on the pointee node; resolve the pointee with them cleared, then
+        // wrap in a raw-pointer Type (lowers to the same opaque ptr as &T).
+        if (tr.isRawPtr) {
+            ast::TypeRef inner = tr;
+            inner.isRawPtr = false;
+            inner.rawPtrMut = false;
+            return makeRawPtr(astTypeRefToConcrete(inner), tr.rawPtrMut);
+        }
         // Phase 13b: slice type `&[T]`. Handle before the ref-peel (the `&`
         // is part of the slice spelling, not an extra Ref wrapper).
         if (tr.isSlice) {
@@ -11720,6 +11729,14 @@ private:
         if (auto* he = dynamic_cast<const ast::HandleExpr*>(&e)) {
             return emitHandle(*he);
         }
+        if (auto* ue = dynamic_cast<const ast::UnsafeExpr*>(&e)) {
+            // v33 Phase 177: `unsafe { … }` is a purely static marker — emit the
+            // body directly (its raw-ptr derefs / casts are ordinary loads /
+            // int↔ptr conversions at this point).
+            return ue->body ? emitExpr(*ue->body)
+                            : llvm::ConstantInt::get(
+                                  llvm::Type::getInt64Ty(*ctx_), 0);
+        }
         errors_.push_back("codegen: unknown expression kind");
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
     }
@@ -12163,6 +12180,21 @@ private:
         llvm::Type* dstLL = dstTy ? mapKardashevType(dstTy)
                                   : llvm::Type::getInt64Ty(*ctx_);
 
+        // v33 Phase 177: raw-pointer casts. A reference / raw pointer and a raw
+        // pointer are the SAME opaque LLVM pointer, so `&x as *const T` and
+        // `*const T as *mut U` are no-ops; an integer <-> raw pointer goes
+        // through inttoptr / ptrtoint.
+        bool srcRaw = srcTy && srcTy->kind == TypeKind::Ref && srcTy->isRawPtr;
+        bool dstRaw = dstTy && dstTy->kind == TypeKind::Ref && dstTy->isRawPtr;
+        bool srcRefAny = srcTy && srcTy->kind == TypeKind::Ref;
+        if (dstRaw) {
+            if (srcRefAny) return v; // ref/rawptr -> rawptr: same opaque ptr
+            return builder_->CreateIntToPtr(v, dstLL, "int2ptr"); // int -> rawptr
+        }
+        if (srcRaw) {
+            return builder_->CreatePtrToInt(v, dstLL, "ptr2int"); // rawptr -> int
+        }
+
         if (srcIsFloat && dstIsFloat) {
             // Phase 67: float -> float. Same width is a no-op; otherwise widen
             // (fpext, f32 -> f64) or narrow (fptrunc, f64 -> f32).
@@ -12485,6 +12517,83 @@ private:
         return agg;
     }
 
+    // v33 Phase 181: build an `Option<i64>` value — `Some(value)` when `isSome`
+    // is true, else `None`. Reuses the prelude Option layout (tag + payload
+    // slot from enumPayloadIndices_), selecting the two aggregates on `isSome`.
+    llvm::Value* buildOptionI64(llvm::Value* value, llvm::Value* isSome) {
+        auto& ctx = *ctx_;
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        TypePtr optKd = optionType(makeInt());
+        auto* optLlvm = mapKardashevType(optKd);
+        std::string optMangled =
+            mangleStructInstance(optKd->enumName, optKd->typeArgs);
+        unsigned someIdx = variantIndexInEnum(optKd, "Some");
+        unsigned noneIdx = variantIndexInEnum(optKd, "None");
+        unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+        llvm::Value* someV = llvm::UndefValue::get(optLlvm);
+        someV = builder_->CreateInsertValue(
+            someV, llvm::ConstantInt::get(i32Ty, someIdx), {0});
+        someV = builder_->CreateInsertValue(someV, value, {someSlot}, "some");
+        llvm::Value* noneV = llvm::UndefValue::get(optLlvm);
+        noneV = builder_->CreateInsertValue(
+            noneV, llvm::ConstantInt::get(i32Ty, noneIdx), {0}, "none");
+        return builder_->CreateSelect(isSome, someV, noneV, "opt");
+    }
+
+    // v33 Phase 181: emit a `checked_*` (-> Option<i64>) or `wrapping_*` (-> i64)
+    // integer-arithmetic builtin. Overflow is detected WITHOUT the
+    // `*.with.overflow` intrinsics (whose declaration helper was renamed across
+    // LLVM versions) — via the portable sign-bit identities for add/sub, a
+    // 128-bit widen-and-compare for mul, and the b==0 / INT_MIN/-1 guards for
+    // div. The default arithmetic policy stays 2's-complement wrap (`-fwrapv`).
+    llvm::Value* emitCheckedArith(const ast::CallExpr& call) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i128Ty = llvm::Type::getIntNTy(ctx, 128);
+        auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+        llvm::Value* a = emitConsume(*call.args[0]);
+        llvm::Value* b = emitConsume(*call.args[1]);
+        const std::string& op = call.callee;
+        if (op == "wrapping_add") return builder_->CreateAdd(a, b, "wadd");
+        if (op == "wrapping_sub") return builder_->CreateSub(a, b, "wsub");
+        if (op == "wrapping_mul") return builder_->CreateMul(a, b, "wmul");
+        llvm::Value* result;
+        llvm::Value* overflow; // true => the result doesn't fit => None
+        if (op == "checked_add") {
+            result = builder_->CreateAdd(a, b, "sum");
+            // signed-add overflow iff a,b share a sign that differs from sum's.
+            auto* t = builder_->CreateAnd(builder_->CreateXor(a, result),
+                                          builder_->CreateXor(b, result));
+            overflow = builder_->CreateICmpSLT(t, zero, "ovf");
+        } else if (op == "checked_sub") {
+            result = builder_->CreateSub(a, b, "diff");
+            auto* t = builder_->CreateAnd(builder_->CreateXor(a, b),
+                                          builder_->CreateXor(a, result));
+            overflow = builder_->CreateICmpSLT(t, zero, "ovf");
+        } else if (op == "checked_mul") {
+            auto* p = builder_->CreateMul(builder_->CreateSExt(a, i128Ty),
+                                          builder_->CreateSExt(b, i128Ty),
+                                          "p128");
+            result = builder_->CreateTrunc(p, i64Ty, "mul");
+            // overflow iff sign-extending the i64 result back != the i128 product.
+            overflow = builder_->CreateICmpNE(
+                p, builder_->CreateSExt(result, i128Ty), "ovf");
+        } else { // checked_div
+            auto* bzero = builder_->CreateICmpEQ(b, zero, "bzero");
+            auto* aMin = builder_->CreateICmpEQ(
+                a, llvm::ConstantInt::getSigned(i64Ty, INT64_MIN), "amin");
+            auto* bm1 = builder_->CreateICmpEQ(
+                b, llvm::ConstantInt::getSigned(i64Ty, -1), "bm1");
+            overflow =
+                builder_->CreateOr(bzero, builder_->CreateAnd(aMin, bm1), "ovf");
+            // Guard the divisor so the sdiv never traps on the None path.
+            auto* bSafe = builder_->CreateSelect(
+                overflow, llvm::ConstantInt::get(i64Ty, 1), b, "bsafe");
+            result = builder_->CreateSDiv(a, bSafe, "div");
+        }
+        return buildOptionI64(result, builder_->CreateNot(overflow, "is_some"));
+    }
+
     llvm::Value* emitCall(const ast::CallExpr& call) {
         // Phase 52: a GENERIC static call `T::method()` — resolve the bound Var
         // to the concrete type at THIS monomorphization, then call that type's
@@ -12527,6 +12636,13 @@ private:
             return builder_->CreateCall(
                 fn, args,
                 fn->getReturnType()->isVoidTy() ? "" : "call_gstatic");
+        }
+        // v33 Phase 181: overflow-checked + wrapping integer arithmetic builtins.
+        if (call.callee == "checked_add" || call.callee == "checked_sub" ||
+            call.callee == "checked_mul" || call.callee == "checked_div" ||
+            call.callee == "wrapping_add" || call.callee == "wrapping_sub" ||
+            call.callee == "wrapping_mul") {
+            return emitCheckedArith(call);
         }
         // Phase 48: a qualified static call `Type::method(args)` resolved by the
         // typechecker to a concrete impl method (an associated / no-self trait

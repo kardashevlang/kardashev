@@ -119,6 +119,17 @@ TypePtr makeRef(TypePtr inner, bool isMut) {
     return t;
 }
 
+// v33 Phase 177: a raw pointer reuses the Ref kind + refInner/refIsMut, flagged
+// `isRawPtr` (not borrow-checked, nullable, deref only in `unsafe`).
+TypePtr makeRawPtr(TypePtr inner, bool isMut) {
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Ref;
+    t->refInner = std::move(inner);
+    t->refIsMut = isMut;
+    t->isRawPtr = true;
+    return t;
+}
+
 TypePtr makeDyn(std::string traitName) {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Dyn;
@@ -263,7 +274,7 @@ TypePtr substConstLenRec(
     case TypeKind::Ref: {
         TypePtr inner = substConstLenRec(r->refInner, lengths, visiting);
         if (inner.get() == r->refInner.get()) return r;
-        return makeRef(inner, r->refIsMut);
+        return r->isRawPtr ? makeRawPtr(inner, r->refIsMut) : makeRef(inner, r->refIsMut);
     }
     case TypeKind::Box: {
         TypePtr inner = substConstLenRec(r->refInner, lengths, visiting);
@@ -371,7 +382,7 @@ TypePtr renameConstLenRec(const TypePtr& t,
     }
     case TypeKind::Ref:
         { TypePtr i = renameConstLenRec(r->refInner, rn, visiting);
-          return i.get() == r->refInner.get() ? r : makeRef(i, r->refIsMut); }
+          return i.get() == r->refInner.get() ? r : (r->isRawPtr ? makeRawPtr(i, r->refIsMut) : makeRef(i, r->refIsMut)); }
     case TypeKind::Box:
         { TypePtr i = renameConstLenRec(r->refInner, rn, visiting);
           return i.get() == r->refInner.get() ? r : makeBox(i); }
@@ -706,6 +717,10 @@ bool unify(const TypePtr& a, const TypePtr& b) {
     if (ra->kind == TypeKind::Ref) {
         // Phase 2.4b: `&T ~ &U` iff T ~ U and mutability matches. Phase
         // 2.4c may relax this to allow `&mut T` subtyping into `&T`.
+        // v33 Phase 177: a raw pointer (`*const`/`*mut`) and a reference never
+        // unify (a `*const T` is a distinct type from `&T`); two raw pointers
+        // unify only when const/mut matches (cross via an explicit `as` cast).
+        if (ra->isRawPtr != rb->isRawPtr) return false;
         if (ra->refIsMut != rb->refIsMut) return false;
         return unify(ra->refInner, rb->refInner);
     }
@@ -868,7 +883,7 @@ TypePtr instantiate(const TypePtr& t,
     case TypeKind::Ref: {
         TypePtr inner = instantiate(r->refInner, subst);
         if (inner.get() == r->refInner.get()) return r;
-        return makeRef(inner, r->refIsMut);
+        return r->isRawPtr ? makeRawPtr(inner, r->refIsMut) : makeRef(inner, r->refIsMut);
     }
     case TypeKind::Box: {
         TypePtr inner = instantiate(r->refInner, subst);
@@ -977,6 +992,9 @@ std::string typeToString(const TypePtr& t) {
         return s;
     }
     case TypeKind::Ref:
+        if (r->isRawPtr) // v33 Phase 177
+            return std::string(r->refIsMut ? "*mut " : "*const ") +
+                   typeToString(r->refInner);
         return std::string(r->refIsMut ? "&mut " : "&") +
                typeToString(r->refInner);
     case TypeKind::Dyn:

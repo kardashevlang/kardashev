@@ -11,6 +11,6 @@
 
 namespace kardashev {
 
-inline constexpr const char* kVersion = "0.32.0";
+inline constexpr const char* kVersion = "0.33.0";
 
 } // namespace kardashev

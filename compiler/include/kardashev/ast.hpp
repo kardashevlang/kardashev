@@ -508,6 +508,13 @@ struct TypeRef {
     std::vector<TypeRef> typeArgs;
     bool isRef = false;
     bool refIsMut = false;
+    // v33 Phase 177: a raw pointer `*const T` / `*mut T`. Unlike `&T`, a raw
+    // pointer is NOT borrow-checked, may be null, and may only be dereferenced
+    // inside an `unsafe` block. `name`/`typeArgs` describe the pointee (or
+    // `isRef`+raw can't both hold). `rawPtrMut` distinguishes `*mut` from
+    // `*const`. Lowers to the same opaque LLVM pointer as `&T`.
+    bool isRawPtr = false;
+    bool rawPtrMut = false;
     // Phase 21b: an associated-type projection `Base::Assoc`, e.g. `Self::Item`
     // inside an impl method or `C::Item` at a bounded call site. When
     // `assocName` is non-empty, `name` holds the base path segment (a type
@@ -677,6 +684,14 @@ struct ClosureExpr : Expr {
     // semantics for shared mutable handler state (a `State` effect's `get`/`put`
     // must see the same live cell, not per-arm by-value snapshots).
     bool forceCaptureByRef = false;
+};
+
+// v33 Phase 177: `unsafe { … }` — a block in which raw-pointer dereferences,
+// int↔pointer casts, and other unchecked operations are permitted. Value = the
+// inner block's value. A purely static marker (no runtime effect); the
+// typechecker tracks "inside unsafe" to gate the unchecked operations.
+struct UnsafeExpr : Expr {
+    std::unique_ptr<BlockExpr> body;
 };
 
 // v32 Phase 176: `perform E::op(args)` — invoke an effect operation. Dispatches

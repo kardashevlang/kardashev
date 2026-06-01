@@ -1821,6 +1821,38 @@ public:
             fnSchemas_["timeout"] = std::move(sch);
         }
 
+        // v33 Phase 181: overflow-checked + wrapping integer arithmetic. The
+        // default arithmetic policy is 2's-complement WRAP (kardc compiles AOT
+        // under `-fwrapv` and the JIT matches), documented in ROADMAP/CHANGELOG.
+        // These give explicit control: `checked_<op>(a, b) -> Option<i64>` is
+        // `None` on signed overflow (or div-by-zero / INT_MIN/-1), `Some(r)`
+        // otherwise; `wrapping_<op>(a, b) -> i64` is the explicit wrapping op.
+        // checked_* need the prelude `Option`, so register after the enum loop.
+        if (enumSchemas_.count("Option")) {
+            const EnumSchema& optSchema = enumSchemas_["Option"];
+            TypePtr optI64;
+            if (!optSchema.genericVars.empty()) {
+                std::unordered_map<int, TypePtr> subst;
+                subst[optSchema.genericVars[0]->varId] = makeInt();
+                optI64 = instantiate(optSchema.type, subst);
+                optI64->typeArgs = {makeInt()};
+            } else {
+                optI64 = optSchema.type;
+            }
+            for (const char* nm :
+                 {"checked_add", "checked_sub", "checked_mul", "checked_div"}) {
+                FnSchema sch;
+                sch.signature = makeFunction({makeInt(), makeInt()}, optI64);
+                fnSchemas_[nm] = std::move(sch);
+            }
+            for (const char* nm :
+                 {"wrapping_add", "wrapping_sub", "wrapping_mul"}) {
+                FnSchema sch;
+                sch.signature = makeFunction({makeInt(), makeInt()}, makeInt());
+                fnSchemas_[nm] = std::move(sch);
+            }
+        }
+
         // Pass 1c: register trait declarations. Each trait gets a global
         // entry with its method signatures, used later to validate impl
         // blocks and to type-check method calls through bounded generic
@@ -3060,6 +3092,9 @@ private:
     // consults it to adopt const-generic args it can't infer from a field
     // (`let s: Sel<true> = Sel { .. }`). null = no expectation.
     TypePtr currentExpectedType_ = nullptr;
+    // v33 Phase 177: nesting depth of enclosing `unsafe { … }` blocks (> 0 means
+    // raw-pointer derefs / int↔ptr casts are permitted at the current site).
+    int unsafeDepth_ = 0;
     // Phase 61: when checking a call argument that is a closure, the callee's
     // expected fn-typed parameter — so `checkClosure` can infer an unannotated
     // `|x|`'s param type before checking the body. Consumed (cleared) by
@@ -4079,9 +4114,10 @@ private:
         auto representable = [&](const TypePtr& ty) -> bool {
             TypePtr rr = resolve(ty);
             switch (rr->kind) {
-            case TypeKind::Int:
+            case TypeKind::Int:   // any width i8..i64 / u8..u64 (C char..long)
+            case TypeKind::Float: // v33 Phase 178: f64 -> C double, f32 -> float
             case TypeKind::Bool:
-            case TypeKind::Ref: // any &T / &mut T / &[T] -> C pointer
+            case TypeKind::Ref: // any &T / &mut T / &[T] / *const T / *mut T -> C pointer
                 return true;
             case TypeKind::Unit:
                 return isReturn; // void return is fine; a void *param* isn't
@@ -4097,7 +4133,8 @@ private:
         if (!representable(r)) {
             error("type `" + typeToString(r) + "` is not supported in an "
                   "`extern \"C\"` signature for '" + fnName +
-                  "' (allowed: i64, i32, bool, &T / &mut T / &[T] (C pointer), "
+                  "' (allowed: i8..i64 / u8..u64, f32 / f64, bool, "
+                  "&T / &mut T / &[T] / *const T / *mut T (C pointer), "
                   "String / &String (passes the data pointer)" +
                   std::string(isReturn ? ", or unit (void return)" : "") + ")",
                   tr.line, tr.column);
@@ -4235,6 +4272,15 @@ private:
             !tr.isTuple && !tr.isFn && tr.assocName.empty() &&
             tr.typeArgs.empty() && currentConstParams_.count(tr.name)) {
             return makeConstSymbol(tr.name);
+        }
+        // v33 Phase 177: a raw pointer `*const T` / `*mut T`. The raw-ptr flags
+        // live on the pointee's TypeRef node; resolve the pointee with them
+        // cleared, then wrap in a raw-pointer Type.
+        if (tr.isRawPtr) {
+            ast::TypeRef inner = tr;
+            inner.isRawPtr = false;
+            inner.rawPtrMut = false;
+            return makeRawPtr(resolveTypeRef(inner), tr.rawPtrMut);
         }
         // Phase 13b: slice type `&[T]`. The `&` is part of the slice spelling
         // (a slice is its own fat-pointer borrow), so handle it before the
@@ -5402,6 +5448,14 @@ private:
         }
         if (auto* he = dynamic_cast<const ast::HandleExpr*>(&e)) {
             return checkHandle(*he);
+        }
+        if (auto* ue = dynamic_cast<const ast::UnsafeExpr*>(&e)) {
+            // v33 Phase 177: `unsafe { … }` permits unchecked ops in the body;
+            // its value is the body's value.
+            unsafeDepth_++;
+            TypePtr t = ue->body ? checkExpr(*ue->body) : makeUnit();
+            unsafeDepth_--;
+            return t;
         }
         if (auto* te = dynamic_cast<const ast::TryExpr*>(&e)) {
             return checkTry(*te);
@@ -8346,6 +8400,26 @@ private:
             }
             return dst;
         }
+        // v33 Phase 177: raw-pointer `as` casts. The cast itself is SAFE (only a
+        // raw *dereference* needs `unsafe`): create a raw pointer from a
+        // reference (`&x as *const T`), reinterpret between raw pointers
+        // (`*const T as *mut U`), and convert a raw pointer <-> an integer
+        // address (`p as i64` / `addr as *mut T`).
+        bool srcRaw = src->kind == TypeKind::Ref && src->isRawPtr;
+        bool dstRaw = dst->kind == TypeKind::Ref && dst->isRawPtr;
+        if (srcRaw || dstRaw) {
+            bool srcRef = src->kind == TypeKind::Ref && !src->isRawPtr;
+            bool srcInt = src->kind == TypeKind::Int && !src->isConstValue;
+            bool dstInt = dst->kind == TypeKind::Int && !dst->isConstValue;
+            bool ok = (srcRef && dstRaw) || (srcRaw && dstRaw) ||
+                      (srcRaw && dstInt) || (srcInt && dstRaw);
+            if (!ok)
+                error("invalid raw-pointer `as` cast: " + typeToString(src) +
+                          " as " + typeToString(dst) +
+                          " (allowed: &T->*T, *T<->*U, *T<->int)",
+                      ce.line, ce.column);
+            return dst;
+        }
         if (!isNumeric(src) || !isNumeric(dst)) {
             error("`as` cast is only allowed between numeric types (integers "
                   "and f64), got " +
@@ -8392,7 +8466,15 @@ private:
         case ast::UnaryOp::Deref: {
             // Phase 34: `*r` reads the pointee of a `&T` / `&mut T` / Box<T>.
             TypePtr r = resolve(operand);
-            if (r->kind == TypeKind::Ref) return resolve(r->refInner);
+            if (r->kind == TypeKind::Ref) {
+                // v33 Phase 177: dereferencing a RAW pointer is unchecked — it
+                // requires an `unsafe` block (a `&T`/`&mut T` deref does not).
+                if (r->isRawPtr && unsafeDepth_ == 0)
+                    error("dereferencing a raw pointer (`*const`/`*mut`) "
+                          "requires an `unsafe` block",
+                          un.operand->line, un.operand->column);
+                return resolve(r->refInner);
+            }
             if (r->kind == TypeKind::Box) return resolve(r->refInner);
             error("unary `*` requires a reference or Box operand, got " +
                       typeToString(operand),
