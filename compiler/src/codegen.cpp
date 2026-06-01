@@ -3574,6 +3574,176 @@ private:
         emitRwlockLockOp("rwlock_rdlock", pthreadRwlockRdlockFn_);
         emitRwlockLockOp("rwlock_wrlock", pthreadRwlockWrlockFn_);
         emitRwlockLockOp("rwlock_unlock", pthreadRwlockUnlockFn_);
+
+        // === v31 Phase 169: atomics (inline LLVM atomicrmw/cmpxchg/load/store/
+        // fence — no pthread, no libcall; i64/i8 are lock-free at natural
+        // alignment on x86-64/arm64). The cell is a malloc'd, naturally-aligned
+        // slot; its PtrToInt is the Copy i64 handle (process-lifetime, like the
+        // mutex block). Each op's memory ordering is baked into its NAME so the
+        // LLVM AtomicOrdering is a compile-time constant. AtomicBool uses an i8
+        // cell (atomics need >= 1 addressable byte) with i1<->i8 bridging.
+        {
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+            using AO = llvm::AtomicOrdering;
+            auto ordOf = [](const std::string& o) -> AO {
+                if (o == "relaxed") return AO::Monotonic;
+                if (o == "acquire") return AO::Acquire;
+                if (o == "release") return AO::Release;
+                if (o == "acqrel") return AO::AcquireRelease;
+                return AO::SequentiallyConsistent; // seqcst
+            };
+            // cmpxchg failure ordering: never Release/AcqRel, never stronger
+            // than success (LLVM verifier rejects otherwise).
+            auto failOf = [](AO s) -> AO {
+                if (s == AO::Release) return AO::Monotonic;
+                if (s == AO::AcquireRelease) return AO::Acquire;
+                return s; // Monotonic / Acquire / SeqCst legal as-is
+            };
+            auto handlePtr = [&](llvm::IRBuilder<>& b, llvm::Function* fn) {
+                return b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "cell");
+            };
+            auto startFn = [&](const std::string& name, llvm::Type* ret,
+                               std::vector<llvm::Type*> args) {
+                auto* fn = llvm::Function::Create(
+                    llvm::FunctionType::get(ret, args, false),
+                    llvm::Function::ExternalLinkage, name, module_.get());
+                auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+                return std::make_pair(fn, entry);
+            };
+            // constructors: malloc the cell, plain-store the initial value
+            // (the handle isn't published to other threads until returned).
+            {
+                auto [fn, entry] = startFn("atomic_i64_new", i64Ty, {i64Ty});
+                llvm::IRBuilder<> b(entry);
+                auto* blk = b.CreateCall(
+                    mallocFn_, {llvm::ConstantInt::get(i64Ty, 8)}, "atom");
+                b.CreateAlignedStore(fn->getArg(0), blk, llvm::Align(8));
+                b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "h"));
+                declaredFns_["atomic_i64_new"] = fn;
+            }
+            {
+                auto [fn, entry] = startFn("atomic_bool_new", i64Ty, {i1Ty});
+                llvm::IRBuilder<> b(entry);
+                auto* blk = b.CreateCall(
+                    mallocFn_, {llvm::ConstantInt::get(i64Ty, 1)}, "atom");
+                b.CreateAlignedStore(b.CreateZExt(fn->getArg(0), i8Ty), blk,
+                                     llvm::Align(1));
+                b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "h"));
+                declaredFns_["atomic_bool_new"] = fn;
+            }
+            // load: atomic load of the cell, (trunc to i1 for bool).
+            auto emitLoad = [&](const std::string& name, llvm::Type* cellTy,
+                                llvm::Type* retTy, AO ord, unsigned al) {
+                auto [fn, entry] = startFn(name, retTy, {i64Ty});
+                llvm::IRBuilder<> b(entry);
+                auto* ld = b.CreateLoad(cellTy, handlePtr(b, fn), "aload");
+                ld->setAtomic(ord);
+                ld->setAlignment(llvm::Align(al));
+                llvm::Value* r = ld;
+                if (retTy == i1Ty) r = b.CreateTrunc(ld, i1Ty);
+                b.CreateRet(r);
+                declaredFns_[name] = fn;
+            };
+            // store: atomic store, ret 0.
+            auto emitStore = [&](const std::string& name, llvm::Type* cellTy,
+                                 llvm::Type* valTy, AO ord, unsigned al) {
+                auto [fn, entry] = startFn(name, i64Ty, {i64Ty, valTy});
+                llvm::IRBuilder<> b(entry);
+                llvm::Value* v = fn->getArg(1);
+                if (valTy == i1Ty) v = b.CreateZExt(v, cellTy);
+                auto* st = b.CreateStore(v, handlePtr(b, fn));
+                st->setAtomic(ord);
+                st->setAlignment(llvm::Align(al));
+                b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+                declaredFns_[name] = fn;
+            };
+            // rmw (i64 arithmetic + xchg): returns the OLD value.
+            auto emitRMW = [&](const std::string& name,
+                               llvm::AtomicRMWInst::BinOp op, AO ord) {
+                auto [fn, entry] = startFn(name, i64Ty, {i64Ty, i64Ty});
+                llvm::IRBuilder<> b(entry);
+                auto* old = b.CreateAtomicRMW(op, handlePtr(b, fn),
+                                              fn->getArg(1), llvm::MaybeAlign(8),
+                                              ord);
+                b.CreateRet(old);
+                declaredFns_[name] = fn;
+            };
+            // bool swap (xchg over i8): returns the OLD value as i1.
+            auto emitBoolSwap = [&](const std::string& name, AO ord) {
+                auto [fn, entry] = startFn(name, i1Ty, {i64Ty, i1Ty});
+                llvm::IRBuilder<> b(entry);
+                auto* old = b.CreateAtomicRMW(
+                    llvm::AtomicRMWInst::Xchg, handlePtr(b, fn),
+                    b.CreateZExt(fn->getArg(1), i8Ty), llvm::MaybeAlign(1), ord);
+                b.CreateRet(b.CreateTrunc(old, i1Ty));
+                declaredFns_[name] = fn;
+            };
+            // cmpxchg: returns the i1 success bit.
+            auto emitCmpxchg = [&](const std::string& name, llvm::Type* cellTy,
+                                   llvm::Type* valTy, AO ord, unsigned al) {
+                auto [fn, entry] =
+                    startFn(name, i1Ty, {i64Ty, valTy, valTy});
+                llvm::IRBuilder<> b(entry);
+                llvm::Value* exp = fn->getArg(1);
+                llvm::Value* nw = fn->getArg(2);
+                if (valTy == i1Ty) {
+                    exp = b.CreateZExt(exp, cellTy);
+                    nw = b.CreateZExt(nw, cellTy);
+                }
+                auto* cx = b.CreateAtomicCmpXchg(handlePtr(b, fn), exp, nw,
+                                                 llvm::MaybeAlign(al), ord,
+                                                 failOf(ord));
+                b.CreateRet(b.CreateExtractValue(cx, {1}, "ok"));
+                declaredFns_[name] = fn;
+            };
+            // fence: ret 0.
+            auto emitFence = [&](const std::string& name, AO ord) {
+                auto [fn, entry] = startFn(name, i64Ty, {});
+                llvm::IRBuilder<> b(entry);
+                b.CreateFence(ord);
+                b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+                declaredFns_[name] = fn;
+            };
+
+            for (const char* o : {"relaxed", "acquire", "seqcst"}) {
+                emitLoad(std::string("atomic_i64_load_") + o, i64Ty, i64Ty,
+                         ordOf(o), 8);
+                emitLoad(std::string("atomic_bool_load_") + o, i8Ty, i1Ty,
+                         ordOf(o), 1);
+            }
+            for (const char* o : {"relaxed", "release", "seqcst"}) {
+                emitStore(std::string("atomic_i64_store_") + o, i64Ty, i64Ty,
+                          ordOf(o), 8);
+                emitStore(std::string("atomic_bool_store_") + o, i8Ty, i1Ty,
+                          ordOf(o), 1);
+            }
+            struct RmwSpec {
+                const char* op;
+                llvm::AtomicRMWInst::BinOp binop;
+            };
+            const RmwSpec rmws[] = {
+                {"swap", llvm::AtomicRMWInst::Xchg},
+                {"fetch_add", llvm::AtomicRMWInst::Add},
+                {"fetch_sub", llvm::AtomicRMWInst::Sub},
+                {"fetch_and", llvm::AtomicRMWInst::And},
+                {"fetch_or", llvm::AtomicRMWInst::Or},
+                {"fetch_xor", llvm::AtomicRMWInst::Xor},
+            };
+            for (const auto& rs : rmws)
+                for (const char* o : {"relaxed", "acqrel", "seqcst"})
+                    emitRMW(std::string("atomic_i64_") + rs.op + "_" + o,
+                            rs.binop, ordOf(o));
+            for (const char* o : {"relaxed", "acqrel", "seqcst"}) {
+                emitCmpxchg(std::string("atomic_i64_cmpxchg_") + o, i64Ty, i64Ty,
+                            ordOf(o), 8);
+                emitBoolSwap(std::string("atomic_bool_swap_") + o, ordOf(o));
+                emitCmpxchg(std::string("atomic_bool_cmpxchg_") + o, i8Ty, i1Ty,
+                            ordOf(o), 1);
+            }
+            for (const char* o : {"acquire", "release", "acqrel", "seqcst"})
+                emitFence(std::string("fence_") + o, ordOf(o));
+        }
         (void)voidTy;
     }
 
@@ -7081,6 +7251,11 @@ private:
                     r->structName == "MutexGuard" ||
                     r->structName == "RwLockReadGuard" ||
                     r->structName == "RwLockWriteGuard")
+                    return llvm::Type::getInt64Ty(*ctx_);
+                // v31 Phase 169: `AtomicI64` / `AtomicBool` are Copy i64 handles
+                // (PtrToInt of a naturally-aligned heap cell) — bare i64 ABI.
+                if (r->structName == "AtomicI64" ||
+                    r->structName == "AtomicBool")
                     return llvm::Type::getInt64Ty(*ctx_);
                 // Phase 78 (v13): `Rc<T>` is a pointer to a heap
                 // `{ i64 strong, T value }` refcount block.
@@ -11034,7 +11209,9 @@ private:
             call.callee == "rwlock_write" || call.callee == "rwlock_unlock" ||
             call.callee == "rwlock_get" || call.callee == "rwlock_set" ||
             call.callee == "rwlock_read_guard" ||
-            call.callee == "rwlock_write_guard") {
+            call.callee == "rwlock_write_guard" ||
+            call.callee.rfind("atomic_", 0) == 0 ||
+            call.callee.rfind("fence_", 0) == 0) {
             ensureThreadRuntime();
         }
         // (Phase 77: the channel ops are GENERIC builtins — they route through

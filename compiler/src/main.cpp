@@ -249,6 +249,77 @@ std::string applyPrelude(const std::string& userSrc) {
         prelude += "trait Send { }\n";
     if (userSrc.find("trait Sync") == std::string::npos)
         prelude += "trait Sync { }\n";
+    // v31 Phase 169: the ergonomic atomics surface. `enum Ordering` + inherent
+    // `impl AtomicI64 / AtomicBool` whose methods MATCH on the ordering and
+    // dispatch to the statically-named builtins (atomic_i64_fetch_add_seqcst,
+    // …) — so the LLVM AtomicOrdering stays a compile-time constant even though
+    // the user passes a runtime `Ordering` value. `self` is the Copy i64 handle
+    // (passed by value). The builtins are the truth; this is sugar.
+    if (userSrc.find("enum Ordering") == std::string::npos)
+        prelude +=
+            "enum Ordering { Relaxed, Acquire, Release, AcqRel, SeqCst }\n";
+    if (userSrc.find("impl AtomicI64") == std::string::npos)
+        prelude +=
+            "impl AtomicI64 {\n"
+            "  fn new(v: i64) -> AtomicI64 ! { alloc } { atomic_i64_new(v) }\n"
+            "  fn load(&self, o: Ordering) -> i64 { match o {\n"
+            "    Relaxed => atomic_i64_load_relaxed(*self),\n"
+            "    Acquire => atomic_i64_load_acquire(*self),\n"
+            "    _ => atomic_i64_load_seqcst(*self) } }\n"
+            "  fn store(&self, v: i64, o: Ordering) -> i64 ! { io } { match o {\n"
+            "    Relaxed => atomic_i64_store_relaxed(*self, v),\n"
+            "    Release => atomic_i64_store_release(*self, v),\n"
+            "    _ => atomic_i64_store_seqcst(*self, v) } }\n"
+            "  fn swap(&self, v: i64, o: Ordering) -> i64 ! { io } { match o {\n"
+            "    Relaxed => atomic_i64_swap_relaxed(*self, v),\n"
+            "    AcqRel => atomic_i64_swap_acqrel(*self, v),\n"
+            "    _ => atomic_i64_swap_seqcst(*self, v) } }\n"
+            "  fn fetch_add(&self, v: i64, o: Ordering) -> i64 ! { io } { match o {\n"
+            "    Relaxed => atomic_i64_fetch_add_relaxed(*self, v),\n"
+            "    AcqRel => atomic_i64_fetch_add_acqrel(*self, v),\n"
+            "    _ => atomic_i64_fetch_add_seqcst(*self, v) } }\n"
+            "  fn fetch_sub(&self, v: i64, o: Ordering) -> i64 ! { io } { match o {\n"
+            "    Relaxed => atomic_i64_fetch_sub_relaxed(*self, v),\n"
+            "    AcqRel => atomic_i64_fetch_sub_acqrel(*self, v),\n"
+            "    _ => atomic_i64_fetch_sub_seqcst(*self, v) } }\n"
+            "  fn fetch_and(&self, v: i64, o: Ordering) -> i64 ! { io } { match o {\n"
+            "    Relaxed => atomic_i64_fetch_and_relaxed(*self, v),\n"
+            "    AcqRel => atomic_i64_fetch_and_acqrel(*self, v),\n"
+            "    _ => atomic_i64_fetch_and_seqcst(*self, v) } }\n"
+            "  fn fetch_or(&self, v: i64, o: Ordering) -> i64 ! { io } { match o {\n"
+            "    Relaxed => atomic_i64_fetch_or_relaxed(*self, v),\n"
+            "    AcqRel => atomic_i64_fetch_or_acqrel(*self, v),\n"
+            "    _ => atomic_i64_fetch_or_seqcst(*self, v) } }\n"
+            "  fn fetch_xor(&self, v: i64, o: Ordering) -> i64 ! { io } { match o {\n"
+            "    Relaxed => atomic_i64_fetch_xor_relaxed(*self, v),\n"
+            "    AcqRel => atomic_i64_fetch_xor_acqrel(*self, v),\n"
+            "    _ => atomic_i64_fetch_xor_seqcst(*self, v) } }\n"
+            "  fn compare_exchange(&self, expected: i64, new: i64, o: Ordering) -> bool ! { io } { match o {\n"
+            "    Relaxed => atomic_i64_cmpxchg_relaxed(*self, expected, new),\n"
+            "    AcqRel => atomic_i64_cmpxchg_acqrel(*self, expected, new),\n"
+            "    _ => atomic_i64_cmpxchg_seqcst(*self, expected, new) } }\n"
+            "}\n";
+    if (userSrc.find("impl AtomicBool") == std::string::npos)
+        prelude +=
+            "impl AtomicBool {\n"
+            "  fn new(v: bool) -> AtomicBool ! { alloc } { atomic_bool_new(v) }\n"
+            "  fn load(&self, o: Ordering) -> bool { match o {\n"
+            "    Relaxed => atomic_bool_load_relaxed(*self),\n"
+            "    Acquire => atomic_bool_load_acquire(*self),\n"
+            "    _ => atomic_bool_load_seqcst(*self) } }\n"
+            "  fn store(&self, v: bool, o: Ordering) -> i64 ! { io } { match o {\n"
+            "    Relaxed => atomic_bool_store_relaxed(*self, v),\n"
+            "    Release => atomic_bool_store_release(*self, v),\n"
+            "    _ => atomic_bool_store_seqcst(*self, v) } }\n"
+            "  fn swap(&self, v: bool, o: Ordering) -> bool ! { io } { match o {\n"
+            "    Relaxed => atomic_bool_swap_relaxed(*self, v),\n"
+            "    AcqRel => atomic_bool_swap_acqrel(*self, v),\n"
+            "    _ => atomic_bool_swap_seqcst(*self, v) } }\n"
+            "  fn compare_exchange(&self, expected: bool, new: bool, o: Ordering) -> bool ! { io } { match o {\n"
+            "    Relaxed => atomic_bool_cmpxchg_relaxed(*self, expected, new),\n"
+            "    AcqRel => atomic_bool_cmpxchg_acqrel(*self, expected, new),\n"
+            "    _ => atomic_bool_cmpxchg_seqcst(*self, expected, new) } }\n"
+            "}\n";
     if (userSrc.find("trait Clone") == std::string::npos) {
         prelude +=
             "trait Clone { fn clone(&self) -> Self ! { alloc }; }\n"

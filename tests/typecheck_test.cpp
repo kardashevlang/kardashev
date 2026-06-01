@@ -2486,6 +2486,52 @@ void test_rwlock_and_guards() {
         "guard_not_sendable");
 }
 
+// v31 Phase 169: atomics. (Unit tests run prelude-free, so they use the raw
+// name-suffixed builtins; the ergonomic Ordering/method layer is prelude sugar
+// covered by the smoke test.)
+void test_atomics() {
+    // Raw atomic builtins typecheck; fetch_add/store are io, load is pure.
+    expectOk(
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let a = atomic_i64_new(0);\n"
+        "  atomic_i64_fetch_add_seqcst(a, 1);\n"
+        "  atomic_i64_store_relaxed(a, 5);\n"
+        "  atomic_i64_load_acquire(a)\n"
+        "}",
+        "atomics_raw_ok");
+    // compare_exchange (cmpxchg) returns the bool success bit.
+    expectOk(
+        "fn main() -> bool ! { alloc, io } {\n"
+        "  let a = atomic_i64_new(0);\n"
+        "  atomic_i64_cmpxchg_seqcst(a, 0, 1)\n"
+        "}",
+        "atomics_cmpxchg_bool");
+    // AtomicBool ops typecheck.
+    expectOk(
+        "fn main() -> bool ! { alloc, io } {\n"
+        "  let b = atomic_bool_new(false);\n"
+        "  atomic_bool_store_release(b, true);\n"
+        "  atomic_bool_swap_acqrel(b, false)\n"
+        "}",
+        "atomics_bool_ok");
+    // An atomic handle is Send — capturable by value into a spawned thread.
+    expectOk(
+        "fn work(a: AtomicI64) -> i64 ! { io } {\n"
+        "  atomic_i64_fetch_add_seqcst(a, 1)\n"
+        "}\n"
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let a = atomic_i64_new(0);\n"
+        "  let t = thread_spawn(|| work(a));\n"
+        "  thread_join(t)\n"
+        "}",
+        "atomic_is_send_into_thread");
+    // An atomic store performs io — calling it from a pure fn is rejected.
+    expectErr(
+        "fn bad(a: AtomicI64) -> i64 { atomic_i64_store_seqcst(a, 1) }\n"
+        "fn main() -> i64 { 0 }",
+        "atomic_store_requires_io");
+}
+
 void test_mutex_ops_typecheck_ok() {
     expectOk(
         "fn main() -> i64 ! { alloc, io } {\n"
@@ -3378,6 +3424,7 @@ int main() {
     test_thread_spawn_propagates_closure_io_effect();
     test_marker_traits_send_sync(); // v31 Phase 167
     test_rwlock_and_guards();       // v31 Phase 168
+    test_atomics();                 // v31 Phase 169
     test_mutex_ops_typecheck_ok();
     test_mutex_new_requires_alloc_effect();
     test_panic_carries_panic_effect_ok();
@@ -3465,6 +3512,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (313 cases)\n";
+    std::cout << "All typecheck tests passed (314 cases)\n";
     return 0;
 }

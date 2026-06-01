@@ -1050,6 +1050,72 @@ public:
             fnSchemas_["rwlock_write_guard"] = std::move(sch);
         }
 
+        // === v31 Phase 169: atomics + CAS + memory orderings ===
+        // `AtomicI64` / `AtomicBool` are NON-generic phantom builtin structs —
+        // Copy i64 handles over a naturally-aligned heap cell (process-lifetime,
+        // like Mutex), and Send+Sync (the legible POSITIVE Send witness, the
+        // mirror of Rc's negative one). The ops are NAME-SUFFIXED by memory
+        // ordering (atomic_i64_fetch_add_seqcst, …) so the LLVM AtomicOrdering
+        // is a COMPILE-TIME constant — there is no turbofish and an enum arg is
+        // a runtime value. The ergonomic `enum Ordering` + `impl AtomicI64`
+        // surface (prelude) matches the ordering and dispatches to these.
+        for (const char* an : {"AtomicI64", "AtomicBool"}) {
+            StructSchema sch;
+            sch.type = makeStruct(an, {}); // non-generic — no genericVars
+            structSchemas_[an] = std::move(sch);
+        }
+        auto atomicTy = [&](const char* n) { return makeStruct(n, {}); };
+        auto regAtomic = [&](const std::string& nm, std::vector<TypePtr> params,
+                             TypePtr ret, bool io, bool alloc) {
+            FnSchema sch;
+            sch.signature = makeFunction(std::move(params), std::move(ret));
+            if (io) sch.declaredEffects.add("io");
+            if (alloc) sch.declaredEffects.add("alloc");
+            fnSchemas_[nm] = std::move(sch);
+        };
+        // constructors (allocate the cell)
+        regAtomic("atomic_i64_new", {makeInt()}, atomicTy("AtomicI64"), false,
+                  true);
+        regAtomic("atomic_bool_new", {makeBool()}, atomicTy("AtomicBool"),
+                  false, true);
+        // AtomicI64: load (pure) / store / swap / fetch_* / cmpxchg.
+        for (const char* o : {"relaxed", "acquire", "seqcst"})
+            regAtomic(std::string("atomic_i64_load_") + o,
+                      {atomicTy("AtomicI64")}, makeInt(), false, false);
+        for (const char* o : {"relaxed", "release", "seqcst"})
+            regAtomic(std::string("atomic_i64_store_") + o,
+                      {atomicTy("AtomicI64"), makeInt()}, makeInt(), true,
+                      false);
+        for (const char* op : {"swap", "fetch_add", "fetch_sub", "fetch_and",
+                               "fetch_or", "fetch_xor"})
+            for (const char* o : {"relaxed", "acqrel", "seqcst"})
+                regAtomic(std::string("atomic_i64_") + op + "_" + o,
+                          {atomicTy("AtomicI64"), makeInt()}, makeInt(), true,
+                          false);
+        for (const char* o : {"relaxed", "acqrel", "seqcst"})
+            regAtomic(std::string("atomic_i64_cmpxchg_") + o,
+                      {atomicTy("AtomicI64"), makeInt(), makeInt()}, makeBool(),
+                      true, false);
+        // AtomicBool: load (pure) / store / swap / cmpxchg (no arithmetic).
+        for (const char* o : {"relaxed", "acquire", "seqcst"})
+            regAtomic(std::string("atomic_bool_load_") + o,
+                      {atomicTy("AtomicBool")}, makeBool(), false, false);
+        for (const char* o : {"relaxed", "release", "seqcst"})
+            regAtomic(std::string("atomic_bool_store_") + o,
+                      {atomicTy("AtomicBool"), makeBool()}, makeInt(), true,
+                      false);
+        for (const char* o : {"relaxed", "acqrel", "seqcst"})
+            regAtomic(std::string("atomic_bool_swap_") + o,
+                      {atomicTy("AtomicBool"), makeBool()}, makeBool(), true,
+                      false);
+        for (const char* o : {"relaxed", "acqrel", "seqcst"})
+            regAtomic(std::string("atomic_bool_cmpxchg_") + o,
+                      {atomicTy("AtomicBool"), makeBool(), makeBool()},
+                      makeBool(), true, false);
+        // standalone fences
+        for (const char* o : {"acquire", "release", "acqrel", "seqcst"})
+            regAtomic(std::string("fence_") + o, {}, makeInt(), true, false);
+
         // Phase 23 built-in: real panic + unwinding.
         //
         //   panic(msg: String) -> i64 ! { panic }
@@ -6805,6 +6871,15 @@ private:
             // captured value can't smuggle a non-Send across the boundary.
             if (rt->kind == TypeKind::Struct && rt->structName == "Mutex")
                 copyable = true;
+            // v31 Phase 168/169: a `RwLock<T>` and the atomic handles
+            // (`AtomicI64`/`AtomicBool`) are Copy i64 handles over a
+            // process-lifetime block, exactly like Mutex — capturing by value
+            // copies the handle so N threads share the one lock / atomic cell.
+            // (RwLock<T>'s cell is Send-gated at rwlock_new; atomics are Send.)
+            if (rt->kind == TypeKind::Struct &&
+                (rt->structName == "RwLock" || rt->structName == "AtomicI64" ||
+                 rt->structName == "AtomicBool"))
+                copyable = true;
             // Phase 81 (v13 review fix): a channel `Sender<T>` is Send, so it
             // may be captured into a producer thread's closure. It is no longer
             // Copy — capturing it CLONES it (codegen emits sender_clone when
@@ -7996,6 +8071,10 @@ private:
             // Receiver (single-consumer) and an Rc (non-atomic refcount) are NOT.
             if (r->structName == "String" || r->structName == "Sender")
                 return true;
+            // v31 Phase 169: an atomic handle IS the safe-sharing primitive —
+            // Send (and Sync). The legible POSITIVE witness opposite Rc.
+            if (r->structName == "AtomicI64" || r->structName == "AtomicBool")
+                return true;
             if (r->structName == "Receiver" || r->structName == "Rc")
                 return false;
             // v31 Phase 168: a lock GUARD is bound to the locking thread — never
@@ -8082,6 +8161,10 @@ private:
             // free (Sync). The single-consumer Receiver and the non-atomic Rc
             // are NOT Sync.
             if (r->structName == "String" || r->structName == "Sender")
+                return true;
+            // v31 Phase 169: atomic handles are Sync (concurrent &Atomic access
+            // is race-free — that is their purpose).
+            if (r->structName == "AtomicI64" || r->structName == "AtomicBool")
                 return true;
             if (r->structName == "Receiver" || r->structName == "Rc")
                 return false;
