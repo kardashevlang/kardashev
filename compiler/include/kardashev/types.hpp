@@ -153,6 +153,11 @@ struct Type {
     // carries the pointee for a Box (Box and Ref never share one node).
     TypePtr refInner;
     bool refIsMut = false;
+    // v33 Phase 177: a RAW pointer `*const T` / `*mut T`. Reuses `TypeKind::Ref`
+    // + `refInner` (the pointee) + `refIsMut` (`*mut` vs `*const`), but is NOT
+    // borrow-checked, may be null, and is only dereferenceable inside `unsafe`.
+    // A `&T` and a `*const T` never unify. Lowers to the same opaque pointer.
+    bool isRawPtr = false;
 
     // Dyn (Phase 11): the trait name a `dyn Trait` object dispatches through.
     std::string dynTraitName;
@@ -214,6 +219,8 @@ TypePtr makeFreshVar();
 TypePtr makeStruct(std::string name, std::vector<std::pair<std::string, TypePtr>> fields);
 TypePtr makeEnum(std::string name, std::vector<EnumVariantType> variants);
 TypePtr makeRef(TypePtr inner, bool isMut);
+// v33 Phase 177: a raw pointer `*const T` (isMut=false) / `*mut T` (isMut=true).
+TypePtr makeRawPtr(TypePtr inner, bool isMut);
 // Phase 11: `dyn Trait` object type and `Box<T>` heap pointer.
 TypePtr makeDyn(std::string traitName);
 TypePtr makeBox(TypePtr inner);

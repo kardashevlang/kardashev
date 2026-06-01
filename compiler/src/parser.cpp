@@ -827,6 +827,34 @@ private:
     }
 
     ast::TypeRef parseTypeRef() {
+        // v33 Phase 177: raw pointer prefix `*const T` / `*mut T`. The pointee
+        // is parsed recursively; the raw-ptr flags are stamped on its TypeRef
+        // (mirroring how `&` flags the pointee node). A pointee that is itself a
+        // reference / raw pointer (`*const &T`, `*mut *const T`) is not supported
+        // yet (the flag-on-node form is single-level).
+        if (check(TokenKind::Star)) {
+            Token star = consume();
+            bool ptrMut = false;
+            if (check(TokenKind::KwConst)) {
+                consume();
+            } else if (check(TokenKind::Identifier) && peek().lexeme == "mut") {
+                consume();
+                ptrMut = true;
+            } else {
+                errorHere("expected `const` or `mut` after `*` in a raw pointer "
+                          "type (`*const T` / `*mut T`)");
+            }
+            ast::TypeRef pointee = parseTypeRef();
+            if (pointee.isRef || pointee.isRawPtr) {
+                errorHere("a raw pointer to a reference / raw pointer "
+                          "(`*const &T` / `*mut *const T`) is not supported yet");
+            }
+            pointee.isRawPtr = true;
+            pointee.rawPtrMut = ptrMut;
+            pointee.line = star.line;
+            pointee.column = star.column;
+            return pointee;
+        }
         // Reference prefix: `&` or `&mut` wraps the rest of the type.
         // Phase 2.4b: shared `&T`. Phase 2.4c: `&mut T`. Currently we
         // recognize `mut` by lexeme (not a keyword) so the AST is forward-
@@ -2010,11 +2038,37 @@ private:
             // leaves the operator for the precedence loop. (Casts are
             // numeric-only — typecheck rejects a non-numeric target — so a bare
             // scalar name covers every valid target.)
-            Token nameTok = expect(TokenKind::Identifier, "a type name after `as`");
             ast::TypeRef ty;
-            ty.name = nameTok.lexeme;
-            ty.line = nameTok.line;
-            ty.column = nameTok.column;
+            // v33 Phase 177: a raw-pointer cast target `as *const T` / `as *mut T`
+            // (a bare-name pointee — `as *mut Vec<i64>` is not supported in cast
+            // position because of the `<` shift/compare ambiguity above).
+            if (check(TokenKind::Star)) {
+                Token star = consume();
+                bool ptrMut = false;
+                if (check(TokenKind::KwConst)) {
+                    consume();
+                } else if (check(TokenKind::Identifier) &&
+                           peek().lexeme == "mut") {
+                    consume();
+                    ptrMut = true;
+                } else {
+                    errorHere("expected `const` or `mut` after `*` in a "
+                              "raw-pointer cast target");
+                }
+                Token nameTok = expect(TokenKind::Identifier,
+                                       "a type name after `*const`/`*mut`");
+                ty.name = nameTok.lexeme;
+                ty.line = star.line;
+                ty.column = star.column;
+                ty.isRawPtr = true;
+                ty.rawPtrMut = ptrMut;
+            } else {
+                Token nameTok =
+                    expect(TokenKind::Identifier, "a type name after `as`");
+                ty.name = nameTok.lexeme;
+                ty.line = nameTok.line;
+                ty.column = nameTok.column;
+            }
             auto ce = std::make_unique<ast::CastExpr>();
             ce->line = asTok.line;
             ce->column = asTok.column;
@@ -2386,6 +2440,18 @@ private:
         if (t.kind == TokenKind::Identifier && t.lexeme == "handle" &&
             peek(1).kind == TokenKind::LBrace && !restrictStructLit_) {
             return parseHandleExpr();
+        }
+        // v33 Phase 177: contextual `unsafe { … }` block — `unsafe` followed by
+        // `{` in a value position (NOT an if/while condition). A plain
+        // identifier `unsafe` is unaffected.
+        if (t.kind == TokenKind::Identifier && t.lexeme == "unsafe" &&
+            peek(1).kind == TokenKind::LBrace && !restrictStructLit_) {
+            Token kw = consume();
+            auto e = std::make_unique<ast::UnsafeExpr>();
+            e->line = kw.line;
+            e->column = kw.column;
+            e->body = parseBlockExpr();
+            return e;
         }
 
         if (t.kind == TokenKind::Identifier) {

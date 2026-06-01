@@ -8702,6 +8702,15 @@ private:
                 it != currentConstParamSubst_.end())
                 return makeConstValue(static_cast<long long>(it->second));
         }
+        // v33 Phase 177: a raw pointer `*const T` / `*mut T` — the raw-ptr flags
+        // live on the pointee node; resolve the pointee with them cleared, then
+        // wrap in a raw-pointer Type (lowers to the same opaque ptr as &T).
+        if (tr.isRawPtr) {
+            ast::TypeRef inner = tr;
+            inner.isRawPtr = false;
+            inner.rawPtrMut = false;
+            return makeRawPtr(astTypeRefToConcrete(inner), tr.rawPtrMut);
+        }
         // Phase 13b: slice type `&[T]`. Handle before the ref-peel (the `&`
         // is part of the slice spelling, not an extra Ref wrapper).
         if (tr.isSlice) {
@@ -11720,6 +11729,14 @@ private:
         if (auto* he = dynamic_cast<const ast::HandleExpr*>(&e)) {
             return emitHandle(*he);
         }
+        if (auto* ue = dynamic_cast<const ast::UnsafeExpr*>(&e)) {
+            // v33 Phase 177: `unsafe { … }` is a purely static marker — emit the
+            // body directly (its raw-ptr derefs / casts are ordinary loads /
+            // int↔ptr conversions at this point).
+            return ue->body ? emitExpr(*ue->body)
+                            : llvm::ConstantInt::get(
+                                  llvm::Type::getInt64Ty(*ctx_), 0);
+        }
         errors_.push_back("codegen: unknown expression kind");
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
     }
@@ -12162,6 +12179,21 @@ private:
         bool dstSigned = dstTy ? dstTy->intSigned : true;
         llvm::Type* dstLL = dstTy ? mapKardashevType(dstTy)
                                   : llvm::Type::getInt64Ty(*ctx_);
+
+        // v33 Phase 177: raw-pointer casts. A reference / raw pointer and a raw
+        // pointer are the SAME opaque LLVM pointer, so `&x as *const T` and
+        // `*const T as *mut U` are no-ops; an integer <-> raw pointer goes
+        // through inttoptr / ptrtoint.
+        bool srcRaw = srcTy && srcTy->kind == TypeKind::Ref && srcTy->isRawPtr;
+        bool dstRaw = dstTy && dstTy->kind == TypeKind::Ref && dstTy->isRawPtr;
+        bool srcRefAny = srcTy && srcTy->kind == TypeKind::Ref;
+        if (dstRaw) {
+            if (srcRefAny) return v; // ref/rawptr -> rawptr: same opaque ptr
+            return builder_->CreateIntToPtr(v, dstLL, "int2ptr"); // int -> rawptr
+        }
+        if (srcRaw) {
+            return builder_->CreatePtrToInt(v, dstLL, "ptr2int"); // rawptr -> int
+        }
 
         if (srcIsFloat && dstIsFloat) {
             // Phase 67: float -> float. Same width is a no-op; otherwise widen

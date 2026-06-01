@@ -3060,6 +3060,9 @@ private:
     // consults it to adopt const-generic args it can't infer from a field
     // (`let s: Sel<true> = Sel { .. }`). null = no expectation.
     TypePtr currentExpectedType_ = nullptr;
+    // v33 Phase 177: nesting depth of enclosing `unsafe { … }` blocks (> 0 means
+    // raw-pointer derefs / int↔ptr casts are permitted at the current site).
+    int unsafeDepth_ = 0;
     // Phase 61: when checking a call argument that is a closure, the callee's
     // expected fn-typed parameter — so `checkClosure` can infer an unannotated
     // `|x|`'s param type before checking the body. Consumed (cleared) by
@@ -4236,6 +4239,15 @@ private:
             tr.typeArgs.empty() && currentConstParams_.count(tr.name)) {
             return makeConstSymbol(tr.name);
         }
+        // v33 Phase 177: a raw pointer `*const T` / `*mut T`. The raw-ptr flags
+        // live on the pointee's TypeRef node; resolve the pointee with them
+        // cleared, then wrap in a raw-pointer Type.
+        if (tr.isRawPtr) {
+            ast::TypeRef inner = tr;
+            inner.isRawPtr = false;
+            inner.rawPtrMut = false;
+            return makeRawPtr(resolveTypeRef(inner), tr.rawPtrMut);
+        }
         // Phase 13b: slice type `&[T]`. The `&` is part of the slice spelling
         // (a slice is its own fat-pointer borrow), so handle it before the
         // generic ref-peel below, which would otherwise wrap it in an extra
@@ -5402,6 +5414,14 @@ private:
         }
         if (auto* he = dynamic_cast<const ast::HandleExpr*>(&e)) {
             return checkHandle(*he);
+        }
+        if (auto* ue = dynamic_cast<const ast::UnsafeExpr*>(&e)) {
+            // v33 Phase 177: `unsafe { … }` permits unchecked ops in the body;
+            // its value is the body's value.
+            unsafeDepth_++;
+            TypePtr t = ue->body ? checkExpr(*ue->body) : makeUnit();
+            unsafeDepth_--;
+            return t;
         }
         if (auto* te = dynamic_cast<const ast::TryExpr*>(&e)) {
             return checkTry(*te);
@@ -8346,6 +8366,26 @@ private:
             }
             return dst;
         }
+        // v33 Phase 177: raw-pointer `as` casts. The cast itself is SAFE (only a
+        // raw *dereference* needs `unsafe`): create a raw pointer from a
+        // reference (`&x as *const T`), reinterpret between raw pointers
+        // (`*const T as *mut U`), and convert a raw pointer <-> an integer
+        // address (`p as i64` / `addr as *mut T`).
+        bool srcRaw = src->kind == TypeKind::Ref && src->isRawPtr;
+        bool dstRaw = dst->kind == TypeKind::Ref && dst->isRawPtr;
+        if (srcRaw || dstRaw) {
+            bool srcRef = src->kind == TypeKind::Ref && !src->isRawPtr;
+            bool srcInt = src->kind == TypeKind::Int && !src->isConstValue;
+            bool dstInt = dst->kind == TypeKind::Int && !dst->isConstValue;
+            bool ok = (srcRef && dstRaw) || (srcRaw && dstRaw) ||
+                      (srcRaw && dstInt) || (srcInt && dstRaw);
+            if (!ok)
+                error("invalid raw-pointer `as` cast: " + typeToString(src) +
+                          " as " + typeToString(dst) +
+                          " (allowed: &T->*T, *T<->*U, *T<->int)",
+                      ce.line, ce.column);
+            return dst;
+        }
         if (!isNumeric(src) || !isNumeric(dst)) {
             error("`as` cast is only allowed between numeric types (integers "
                   "and f64), got " +
@@ -8392,7 +8432,15 @@ private:
         case ast::UnaryOp::Deref: {
             // Phase 34: `*r` reads the pointee of a `&T` / `&mut T` / Box<T>.
             TypePtr r = resolve(operand);
-            if (r->kind == TypeKind::Ref) return resolve(r->refInner);
+            if (r->kind == TypeKind::Ref) {
+                // v33 Phase 177: dereferencing a RAW pointer is unchecked — it
+                // requires an `unsafe` block (a `&T`/`&mut T` deref does not).
+                if (r->isRawPtr && unsafeDepth_ == 0)
+                    error("dereferencing a raw pointer (`*const`/`*mut`) "
+                          "requires an `unsafe` block",
+                          un.operand->line, un.operand->column);
+                return resolve(r->refInner);
+            }
             if (r->kind == TypeKind::Box) return resolve(r->refInner);
             error("unary `*` requires a reference or Box operand, got " +
                       typeToString(operand),
