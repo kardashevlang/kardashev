@@ -829,6 +829,12 @@ struct FnDecl {
     bool noAlloc = false;
     bool noPanic = false;
     bool noIo = false;
+    // v65 `#[codegen(param_regs)]` / `#[codegen(inline)]` — opt-in codegen
+    // hints (no default behavior change). param_regs SSAs Copy-scalar by-value
+    // params (skips the entry alloca); inline sets LLVM InlineHint (+ AlwaysInline
+    // for a small non-recursive fn at -O2).
+    bool paramRegs = false;
+    bool inlineHint = false;
     std::unique_ptr<BlockExpr> body;
     std::string doc; // v24 Phase 134: the leading `///` doc comment, if any
     std::size_t line = 1;

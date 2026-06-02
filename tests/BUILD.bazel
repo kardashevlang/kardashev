@@ -751,6 +751,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v65: codegen perf contracts — #[codegen(param_regs)] + #[codegen(inline)].
+sh_test(
+    name = "smoke_test_codegen_perf",
+    srcs = ["smoke_test_codegen_perf.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

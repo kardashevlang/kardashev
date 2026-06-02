@@ -602,6 +602,21 @@ New C runtime fns lowered from codegen, exactly like the existing file ops.
 
 ## v65 — Codegen perf: param-reg lowering + inline/opt hints (close the fib gap)
 
+> **Status:** ✅ SHIPPED v0.65.0. `#[codegen(param_regs)]` — a Copy-scalar
+> by-value param never address-taken (assigning to a param is already a type
+> error; the address-taken walk is conservative) is SSA-bound directly via
+> `paramRegValues_`, skipping the entry alloca (observable -O0: baseline fib has
+> 1 param alloca → annotated 0; parity at -O2 where mem2reg already SSAs;
+> excludes async). `#[codegen(inline)]` — InlineHint, + AlwaysInline for a small
+> non-recursive fn at -O2 (recursive keeps InlineHint only). Both parse with the
+> no_alloc/no_panic/no_io contracts. BLOCKING gate met (`smoke_test_codegen_perf.sh`:
+> fib(30)=832040 JIT==AOT, param_regs removes the -O0 param alloca + none at -O2,
+> inline attr emitted, `smoke_test_codegen_contracts.sh` stays green). PERF is
+> ADVISORY (measured `fib(32) -O2` annotated≈baseline — mem2reg makes param_regs
+> below-noise; the lever is inlining); **1.0× not guaranteed, closing is
+> incremental.** DEFERRED: bounds-check elision for non-literal indices,
+> `#[codegen(vectorized)]` + verification, whole-program LTO/PGO.
+
 **Theme:** Reduce the documented ~1.2× `fib` gap with opt-in codegen contracts
 gated by attributes (no default behavior change).
 
