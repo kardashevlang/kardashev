@@ -1270,6 +1270,103 @@ private:
     //     ... <tail> }
     // where the tail is `__fmtN` for `format!`, `println(&__fmtN)` for
     // `println!`, and `print_no_nl(&__fmtN)` for `print!`.
+    // v43 built-in helper macros, desugared at parse time to a literal:
+    //   stringify!(x + y) -> the source tokens as a String
+    //   concat!("a", 1, true) -> a single concatenated String literal
+    //   count!(a, b, c) -> the i64 argument count (3)
+    //   cfg!(predicate) -> a bool of the #[cfg]-predicate against --cfg flags
+    ast::ExprPtr parseBuiltinMacro(const Token& nameTok) {
+        consume(); // `!`
+        expect(TokenKind::LParen, "(");
+        if (nameTok.lexeme == "cfg") {
+            bool v = evalCfgPredicate();
+            expect(TokenKind::RParen, ")");
+            auto e = std::make_unique<ast::BoolLitExpr>();
+            e->value = v;
+            e->line = nameTok.line;
+            e->column = nameTok.column;
+            return e;
+        }
+        if (nameTok.lexeme == "count") {
+            int n = 0;
+            if (!check(TokenKind::RParen)) {
+                bool prev = restrictStructLit_;
+                restrictStructLit_ = false;
+                while (true) {
+                    parseExpr();
+                    ++n;
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::RParen)) break; // trailing comma
+                }
+                restrictStructLit_ = prev;
+            }
+            expect(TokenKind::RParen, ")");
+            auto e = std::make_unique<ast::IntLitExpr>();
+            e->value = n;
+            e->line = nameTok.line;
+            e->column = nameTok.column;
+            return e;
+        }
+        if (nameTok.lexeme == "stringify") {
+            // Reconstruct the source from the token lexemes (space-joined).
+            std::string out;
+            int depth = 1;
+            bool first = true;
+            while (!check(TokenKind::EndOfInput)) {
+                if (check(TokenKind::LParen)) ++depth;
+                else if (check(TokenKind::RParen)) {
+                    --depth;
+                    if (depth == 0) break;
+                }
+                Token t = consume();
+                if (!first) out += " ";
+                first = false;
+                out += t.lexeme;
+            }
+            expect(TokenKind::RParen, ")");
+            auto e = std::make_unique<ast::StringLitExpr>();
+            e->value = out;
+            e->line = nameTok.line;
+            e->column = nameTok.column;
+            return e;
+        }
+        // concat!: join literal arguments (string / int / bool / -int) into one
+        // compile-time String.
+        std::string out;
+        if (!check(TokenKind::RParen)) {
+            while (true) {
+                bool neg = false;
+                if (check(TokenKind::Minus)) {
+                    consume();
+                    neg = true;
+                }
+                Token t = consume();
+                if (t.kind == TokenKind::StringLit) {
+                    out += t.lexeme;
+                } else if (t.kind == TokenKind::Integer ||
+                           t.kind == TokenKind::Float) {
+                    out += (neg ? "-" : "") + t.lexeme;
+                } else if (t.kind == TokenKind::KwTrue) {
+                    out += "true";
+                } else if (t.kind == TokenKind::KwFalse) {
+                    out += "false";
+                } else {
+                    errorAt("concat! arguments must be literals (string / "
+                            "number / bool)",
+                            t.line, t.column);
+                }
+                if (!accept(TokenKind::Comma)) break;
+                if (check(TokenKind::RParen)) break; // trailing comma
+            }
+        }
+        expect(TokenKind::RParen, ")");
+        auto e = std::make_unique<ast::StringLitExpr>();
+        e->value = out;
+        e->line = nameTok.line;
+        e->column = nameTok.column;
+        return e;
+    }
+
     ast::ExprPtr parseFormatMacro(const Token& nameTok) {
         consume(); // `!`
         expect(TokenKind::LParen, "(");
@@ -3102,6 +3199,14 @@ private:
                 (first.lexeme == "format" || first.lexeme == "print" ||
                  first.lexeme == "println")) {
                 return parseFormatMacro(first);
+            }
+            // v43 built-in helper macros (compile-time, like format!):
+            //   stringify!(toks) -> "toks"; concat!(lits..) -> joined literal;
+            //   count!(args..) -> i64 arg count; cfg!(pred) -> bool.
+            if (check(TokenKind::Bang) && peek(1).kind == TokenKind::LParen &&
+                (first.lexeme == "stringify" || first.lexeme == "concat" ||
+                 first.lexeme == "count" || first.lexeme == "cfg")) {
+                return parseBuiltinMacro(first);
             }
             Token tok = first;
             Token prevSeg = first; // Phase 48: the segment just before `tok`

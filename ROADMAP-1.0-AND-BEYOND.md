@@ -258,6 +258,8 @@ replay surface).
 
 ### v43 — "Metaprogramming parity + stdlib regex + typed/multishot effects (AE 6 begins)" — moves: MP → 5, SL, AE → 6 (begins)
 
+> **Status (`v0.43.0`, partial):** ✅ SHIPPED — built-in helper macros (stringify!/concat!/count!/cfg!). ⛔ DEFERRED — macro hygiene, nested repetition, span diagnostics, full comptime, regex engine, typed-rows + multi-shot effects (AE 6/6).
+
 Hygiene, nested repetition, span diagnostics, built-in helper macros, comptime
 depth — the Rust-grade macro floor. Plus the **first async-effects 6/6 work** (typed
 rows end-to-end + multi-shot), which the v40 parity executor now supports. *This is
