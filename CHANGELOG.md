@@ -18,6 +18,29 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.58.0] — Ergonomics: `if let` / `while let`
+
+### Added
+- **`if let PAT = e { … } else { … }`** and **`while let PAT = e { … }`** —
+  pattern-binding conditionals, desugared at **parse time** to the existing
+  `match` lowering (no new typecheck or codegen):
+  - `if let PAT = e { A } else { B }` → `match e { PAT => A, _ => B }` (a missing
+    `else` is a unit else);
+  - `while let PAT = e { BODY }` → `loop { match e { PAT => BODY, _ => break } }`
+    (the scrutinee is re-evaluated each iteration; a non-match breaks the loop).
+
+CI-gated by `smoke_test_if_let.sh` (7 cases, JIT==AOT: some/none/no-else/binding-
+use for `if let`; drain / empty / accumulate for `while let`).
+
+### Deferred (honest)
+- **`let … else`** is **not** shipped. The desugar (a `match` whose `_` arm
+  diverges) is sound, but a diverging `else` block that ends in `panic(..)` types
+  as `()` rather than bottom — kardashev has no *never* type yet — so the else
+  arm fails to unify with the bound value; and a `_ => return` arm trips a
+  separate pre-existing effect-inference quirk with effect-polymorphic prelude
+  functions. Both need a never-type / divergence-typing pass first (the roadmap
+  flagged let-else as "the one non-trivial bit"). Tracked as a follow-on.
+
 ## [0.57.0] — Reference-returning functions (escape-gated)
 
 ### Added
