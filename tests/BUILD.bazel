@@ -758,6 +758,25 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v66: test infrastructure — borrow fuzzer + sanitizer sweep + property harness.
+sh_test(
+    name = "smoke_test_fuzz_borrow",
+    srcs = ["smoke_test_fuzz_borrow.sh"],
+    data = ["//compiler:kardc"],
+)
+
+sh_test(
+    name = "smoke_test_asan_ubsan_c_backend",
+    srcs = ["smoke_test_asan_ubsan_c_backend.sh"],
+    data = ["//compiler:kardc"],
+)
+
+sh_test(
+    name = "smoke_test_property_harness",
+    srcs = ["smoke_test_property_harness.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

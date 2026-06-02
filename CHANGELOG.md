@@ -18,6 +18,38 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.66.0] — Test infrastructure: borrow fuzzer + sanitizer sweep + property harness
+
+Three reusable, seeded, deterministic test rigs — **pure test infrastructure, no
+compiler changes** — that the prior soundness/codegen work earns.
+
+### Added
+- **`smoke_test_fuzz_borrow.sh`** — a borrow-checker differential fuzzer. A
+  seeded generator emits 120 programs from 14 hand-classified templates (shared
+  & mutable refs, reborrows, ref returns rooted in ref params, field/tuple access
+  through refs, match-through-`&T`, two-phase borrows, closure captures, plus the
+  UNSOUND duals: use-after-move, two `&mut`, `&mut` while `&` live, return-ref-to-
+  local, assign-to-immutable). Each carries a SOUND/UNSOUND **oracle**: every
+  sound program must compile, every unsound one must be rejected — zero false
+  pos/neg, with each unsound template's canonical instance hand-verified to be
+  rejected (no silent false-negative blessing a hole).
+- **`smoke_test_asan_ubsan_c_backend.sh`** — sweeps 12 in-subset C-backend
+  programs (`--emit-c`: struct / enum+match / ref / for / while / String / Vec /
+  closure / generic / recursion / bool) under `-fsanitize=address,undefined` and
+  asserts each is clean, then feeds the **same** flags 3 known-UB C programs
+  (heap overflow, use-after-free, signed overflow) and asserts each is caught —
+  proving the sanitizers are live. Skips gracefully without clang/ASan.
+- **`smoke_test_property_harness.sh`** — 16 prelude/stdlib invariants (Vec
+  push/len/get/sum/pop/reverse/swap/remove, String concat/repeat/contains/
+  starts/ends/index_of, Option `unwrap_or`, the lazy iterator tower, arithmetic
+  round-trip), each checked over 50 seeded random inputs, asserting **JIT == AOT**.
+
+### Deferred (honest)
+- TSan concurrency fuzzing; a 2000+-case grammar-conformance corpus; whole-program
+  type+effect interaction fuzzing. Also noted: `iter_collect` over a `Take<Range>`
+  hit a codegen "unsupported type" edge in the harness (worked via `.next()`
+  draining) — a v61 lazy-tower follow-on.
+
 ## [0.65.0] — Codegen perf: param-reg lowering + inline hints
 
 ### Added
