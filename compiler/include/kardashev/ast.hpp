@@ -808,6 +808,12 @@ struct FnDecl {
     // fns. Verified by a conservative call-graph analysis (sound: rejects
     // anything that *might* diverge).
     bool isTotal = false;
+    // v48 codegen-quality contracts: `#[codegen(no_alloc)]` / `no_panic` assert
+    // the fn performs no heap allocation / cannot panic — verified against its
+    // inferred effect set (a violation FAILS compilation).
+    bool noAlloc = false;
+    bool noPanic = false;
+    bool noIo = false;
     std::unique_ptr<BlockExpr> body;
     std::string doc; // v24 Phase 134: the leading `///` doc comment, if any
     std::size_t line = 1;

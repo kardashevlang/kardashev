@@ -3518,6 +3518,32 @@ private:
                       fn.line, fn.column);
             }
         }
+        // v48: codegen-quality contracts. `#[codegen(no_alloc)]` /
+        // `#[codegen(no_panic)]` are statically-verified guarantees about the
+        // emitted code, reusing the (transitively sound) effect set: if the fn
+        // — or anything it calls — performs the forbidden effect, compilation
+        // fails. This lets a hot path or a `no_std`/embedded fn promise it
+        // never touches the heap or the panic runtime, checked not hoped.
+        if (fn.noAlloc && inferred.contains("alloc")) {
+            error("function '" + fn.name +
+                      "' is `#[codegen(no_alloc)]` but performs heap "
+                      "allocation (effect `alloc`); remove the allocation or "
+                      "the contract",
+                  fn.line, fn.column);
+        }
+        if (fn.noPanic && inferred.contains("panic")) {
+            error("function '" + fn.name +
+                      "' is `#[codegen(no_panic)]` but can panic (effect "
+                      "`panic`); handle it with `catch`, prove it cannot "
+                      "panic, or remove the contract",
+                  fn.line, fn.column);
+        }
+        if (fn.noIo && inferred.contains("io")) {
+            error("function '" + fn.name +
+                      "' is `#[codegen(no_io)]` but performs I/O (effect "
+                      "`io`); remove the I/O or the contract",
+                  fn.line, fn.column);
+        }
     }
 
     EffectSet buildEffectSet(const ast::EffectRow& row,
