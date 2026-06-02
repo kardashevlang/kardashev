@@ -1625,6 +1625,24 @@ std::string applyPrelude(const std::string& userSrc) {
             "    }\n"
             "}\n";
     }
+    // v42 stdlib: `Duration` — a span of time in milliseconds, with
+    // operator-overloaded arithmetic (the v37 Add/Sub traits) + Ord comparison
+    // (the existing cmp trait) + conversions. Deterministic and unit-testable.
+    // (A real monotonic clock / `Instant::now` needs a `timespec` FFI and is
+    // deferred with the rest of v42's runtime surface — see ROADMAP.)
+    if (userSrc.find("struct Duration") == std::string::npos) {
+        prelude +=
+            "struct Duration { ms: i64 }\n"
+            "fn duration_from_millis(ms: i64) -> Duration { Duration { ms: ms } }\n"
+            "fn duration_from_secs(s: i64) -> Duration { Duration { ms: s * 1000 } }\n"
+            "fn duration_as_millis(d: &Duration) -> i64 { d.ms }\n"
+            "fn duration_as_secs(d: &Duration) -> i64 { d.ms / 1000 }\n"
+            "fn duration_zero() -> Duration { Duration { ms: 0 } }\n"
+            "impl Add for Duration { fn add(self, r: Duration) -> Duration { Duration { ms: self.ms + r.ms } } }\n"
+            "impl Sub for Duration { fn sub(self, r: Duration) -> Duration { Duration { ms: self.ms - r.ms } } }\n"
+            "impl Ord for Duration { fn cmp(&self, other: &Duration) -> i64 {\n"
+            "    if self.ms < other.ms { 0 - 1 } else { if self.ms > other.ms { 1 } else { 0 } } } }\n";
+    }
     // v37 test framework: assertion macros (over the Phase 182 macro engine).
     // A `test_*() -> i64` test returns 0 = ok, non-zero = FAILED (the runner
     // convention), so a failed assertion `return`s a non-zero code — this

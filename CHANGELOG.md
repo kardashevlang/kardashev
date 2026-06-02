@@ -18,6 +18,20 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.42.0] — Roadmap v42 "Stdlib depth I" (partial)
+
+### Added
+- **`Duration`** — a milliseconds time span with operator-overloaded arithmetic
+  (v37 Add/Sub traits), Ord comparison, and conversions
+  (from_millis/from_secs/as_millis/as_secs). Deterministic + unit-testable.
+
+### Deferred / honest limitations
+- The rest of "Stdlib depth I" remains (ROADMAP, v42): balanced-tree BTreeMap
+  (vs the current sorted-Vec), leak-free interior-Drop HashMap, lazy iterator
+  adaptors, buffered I/O + stdin/files/env (Phase 189), a real monotonic clock
+  (timespec FFI), networking, and the observability facade — each runtime-heavy
+  or needing global state / a clock FFI.
+
 ## [0.41.0] — Roadmap v41 "Memory safety, parity complete + unsafe surface" (partial)
 
 ### Added

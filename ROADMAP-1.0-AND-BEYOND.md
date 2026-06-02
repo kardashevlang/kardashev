@@ -233,6 +233,8 @@ model (the Miri-gate and proof are the 6/6 work in v47/v50).
 
 ### v42 — "Stdlib depth I: collections, iterators, I/O, time, observability" — moves: SL → 5 (in progress)
 
+> **Status (`v0.42.0`, partial):** ✅ SHIPPED — `Duration` (operator-overloaded time arithmetic). ⛔ DEFERRED — balanced BTreeMap, leak-free HashMap, lazy iterators, buffered I/O, monotonic clock, networking, observability facade.
+
 Real data structures, a deterministic-testable runtime surface, **and the
 observability facade** (`log`/`tracing`-class structured logging + spans + metrics),
 which "ship a product on it" requires. All parity-level; the beyond-stdlib work
