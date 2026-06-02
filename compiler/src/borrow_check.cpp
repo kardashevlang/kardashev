@@ -368,8 +368,16 @@ private:
     RootKind classifyRoot(const ast::Expr& e) {
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
             auto it = identDecl_.find(id);
-            if (it == identDecl_.end())
-                return RootKind::Global; // top-level const / unresolved => outlives
+            if (it == identDecl_.end()) {
+                // Not a local/parameter binding. A SCALAR `const` is promoted to
+                // a stable global by codegen (v53), so a reference to it outlives
+                // the call (Global). Anything else spelled `&ident` (an aggregate
+                // const re-materialized per use, a nullary enum variant `&Nil`)
+                // is a FRAME-LOCAL temporary — unsafe to return. The signal
+                // matches codegen's emitConstGlobal (tc_.constExprValues).
+                return tc_.constExprValues.count(id) ? RootKind::Global
+                                                     : RootKind::Temporary;
+            }
             Binding* b = lookupBindingByDeclPos(it->second);
             if (!b) return RootKind::Global;
             if (b->declPos < paramCount_)
