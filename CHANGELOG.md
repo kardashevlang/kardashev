@@ -18,6 +18,34 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.49.0] — Roadmap v49 "6/6 BEYOND III: compile-time reflection" (partial)
+
+### Added
+- **Compile-time reflection intrinsics** — `field_count!(S)`, `variant_count!(E)`,
+  `size_of!(T)` reflect to an `i64` constant, and `type_name!(T)` to a `String`,
+  all resolved at compile time against the program's static type information:
+  - `field_count!` / `variant_count!` are computed by the typechecker from the
+    resolved struct fields / enum variants (a wrong-kind type is rejected:
+    `field_count!` requires a struct, `variant_count!` an enum);
+  - `type_name!` yields the type's canonical display name;
+  - `size_of!` is computed in codegen from the lowered type's **real LLVM
+    DataLayout alloc size** (so `size_of!(i64)==8`, a `{i64,i64,i64}` struct
+    `==24` — alignment-correct, not an approximation).
+
+  Reflection results compose in ordinary expressions and are emitted as plain
+  constants (zero runtime cost). This is the tractable core of the v49
+  "typed AST-reflection API" — the unifying metaprogramming primitive. CI-gated
+  by `smoke_test_reflection.sh` (13 cases, **JIT==AOT** differential + negatives).
+
+### Deferred / honest limitations
+- The rest of v49's 6/6 work remains XL/research-grade (ROADMAP, v49): the full
+  field-iterating `TypeInfo` API (`for f in fields!(T)`), procedural macros as
+  in-language `meta fn`s (quote/unquote) that build on reflection, the
+  `--meta-audit` differential+soundness gate for all expansions, the
+  deterministic record-replay + exhaustive-interleaving concurrency
+  model-checker, the machine-checked memory model / verified scheduler, and
+  refinement/dependent-lite types via a bundled SMT solver.
+
 ## [0.48.0] — Roadmap v48 "6/6 BEYOND II: per-function codegen-quality contracts" (partial)
 
 ### Added

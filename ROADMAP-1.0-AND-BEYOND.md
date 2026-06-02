@@ -421,6 +421,8 @@ contracts + universal C reach); concurrency begins 6/6.
 
 ### v49 — "6/6 BEYOND III: concurrency verification, proc-macros, refinement types" — moves: CC → 6/6, MP → 6/6, TS, EC
 
+> **Status (`v0.49.0`, partial):** ✅ SHIPPED — compile-time reflection intrinsics: `field_count!(S)`/`variant_count!(E)`/`size_of!(T)` → `i64`, `type_name!(T)` → `String`, resolved against static type info (field/variant counts from the typechecker, wrong-kind rejected; `size_of!` from the real LLVM DataLayout alloc size). The tractable core of the v49 "typed AST-reflection API" unifying primitive; JIT==AOT-gated. ⛔ DEFERRED — full field-iterating `TypeInfo` API, proc-macros as `meta fn`s (quote/unquote) building on reflection, `--meta-audit` expansion soundness gate, record-replay + interleaving model-checker, machine-checked memory model / verified scheduler, refinement/dependent-lite types via bundled SMT (all XL/research-grade).
+
 The model-checking/verification differentiators and the unifying metaprogramming
 primitives.
 
