@@ -18,6 +18,38 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.54.0] — Soundness: store-into-out-parameter escape (escape-analysis trilogy complete)
+
+### Fixed (memory safety)
+- **A frame-local reference can no longer be stored into a place that outlives
+  the call.** The v0.52.0 escape analysis guarded function *returns*; storing a
+  local reference through a `&mut` out-parameter — `fn leak(out: &mut R) { let x =
+  7; out.p = &x; }` — was unchecked, and `out.p` dangled into the freed frame
+  after the call. The borrow checker now runs `checkStoreEscape` on every field /
+  index / deref assignment: if the target place roots in a **reference
+  parameter** (or a global) — i.e. it outlives this frame — and the stored value
+  contains a reference rooted in a local, a by-value parameter, or a temporary,
+  the store is **rejected** (`cannot store a reference … into a place that
+  outlives this function …`). A store into a **local** place is still fine (it
+  dies with the frame). Reuses the same `classifyRoot` / `escapesAggregateRef` /
+  per-binding-provenance machinery as the return check.
+  CI-gated by `smoke_test_field_ref_escape.sh` (6 reject incl. `&local`/`&temp`/
+  `&by-val-param`/`&local.field`/`&mut self`/nested-aggregate, + 4 accept). This
+  completes the escape-analysis trilogy: v0.52.0 (returns) → v0.53.0 (`&CONST`) →
+  v0.54.0 (stores).
+
+### Deferred (honest)
+- **Aggregate-const promotion** (the other half of the roadmap's v54 entry) is
+  *not* shipped here: promoting `&CONST_ARRAY` / `&CONST_STRUCT` to a stable
+  global requires a new AST-initializer → `llvm::Constant` const-lowering path
+  that does not exist yet, and the current behaviour is already **sound** —
+  in-scope use works, and *returning* an aggregate-const borrow is correctly
+  rejected (since v0.52.0). Promotion is a featureful addition, folded into a
+  later stdlib version rather than rushed here.
+- Stores into a longer-lived location other than a `&mut` parameter/global (e.g.
+  through a chain of local reborrows) remain conservatively unanalyzed; full
+  region inference is the deferred mega-track.
+
 ## [0.53.0] — Soundness + feature: `&CONST` promotion
 
 ### Fixed (memory safety) / Added
