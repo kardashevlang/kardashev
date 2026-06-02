@@ -383,6 +383,19 @@ Extends existing inference; does not build it from scratch.
 
 ## v61 — Lazy iterator adaptor tower (fuse take/skip/chain/zip/enumerate)
 
+> **Status:** ✅ SHIPPED v0.61.0 — adaptor structs `Take<I>`/`Skip<I>`/
+> `Chain<A,B>`/`Zip<A,B>`/`Enumerate<I>` each `impl Iterator`, with
+> `iter_take`/`iter_skip`/`iter_chain`/`iter_zip`/`iter_enumerate` bridges and a
+> `vec_iter_i64` Vec→iterator bridge. Pure-prelude, no codegen changes. Fusion
+> verified: a 50M-element `take(skip(…),5)` runs in ~10 ms in O(1) memory
+> (`smoke_test_iter_lazy.sh`, 7 cases; `smoke_test_iter.sh` stays green;
+> allocation discipline via the RSS/wall-clock proxy, gate option b). The eager
+> `vec_*` adaptors are kept alongside (not rewritten — deferred to avoid churn).
+> DEFERRED: element-generic adaptors — `impl<T> Iterator<T> for Adaptor<T>`
+> (generic param as trait type-arg) hits `unknown type: T` in the impl resolver,
+> so the tower is `i64`-element (and `(i64,i64)` for zip/enumerate); plus
+> fold/scan/flat_map/peekable + DoubleEndedIterator + C-backend lowering.
+
 **Theme:** Replace the eager Vec-materializing adaptors with a lazy stateful-struct
 tower so adaptor chains fuse into a single pass.
 

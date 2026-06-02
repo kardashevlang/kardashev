@@ -126,6 +126,104 @@ std::string applyPrelude(const std::string& userSrc) {
             "    out\n"
             "}\n";
     }
+    // v61: the LAZY iterator-adaptor tower. Unlike the eager `vec_*` adaptors
+    // (each materializes a fresh Vec), these are stateful adaptor structs that
+    // each `impl Iterator` and pull one element at a time from the wrapped
+    // iterator, so a chain like `iter_take(iter_skip(range, 20), 5)` fuses into
+    // a single pass with O(1) extra memory and no intermediate Vec — only a
+    // terminal `iter_collect` allocates. Element type is `i64` (and `(i64,i64)`
+    // for zip/enumerate): a fully element-generic tower needs `impl<T>
+    // Iterator<T> for Adaptor<T>` (a generic param as the trait's type argument),
+    // which the impl resolver does not yet support — see DEFERRALS in
+    // ROADMAP-v54-v66.md. Pure-prelude Kardashev over the existing generic
+    // monomorphization; no codegen changes. Suppressed together with the
+    // prelude `Iterator` (it builds on it) and if the user defines `iter_take`.
+    //
+    // BORROW NOTE: a `match self.x.next() { ... self.y.next() ... }` would hold
+    // `&mut self` across the arms and conflict with the sibling `next`; each
+    // adaptor binds the first pull to a `let` to release that borrow first.
+    if (userSrc.find("trait Iterator") == std::string::npos &&
+        userSrc.find("fn iter_take") == std::string::npos) {
+        prelude +=
+            // Take<I>: yield at most `rem` elements of `iter`, then stop.
+            "struct Take<I> { iter: I, rem: i64 }\n"
+            "impl<I: Iterator<i64>> Iterator<i64> for Take<I> {\n"
+            "    fn next(&mut self) -> Option<i64> ! { alloc } {\n"
+            "        if self.rem <= 0 { None }\n"
+            "        else { self.rem = self.rem - 1; self.iter.next() }\n"
+            "    }\n"
+            "}\n"
+            "fn iter_take<I: Iterator<i64>>(it: I, n: i64) -> Take<I>\n"
+            "    { Take { iter: it, rem: n } }\n"
+            // Skip<I>: drop the first `skip_cnt` elements, then pass through.
+            "struct Skip<I> { iter: I, skip_cnt: i64 }\n"
+            "impl<I: Iterator<i64>> Iterator<i64> for Skip<I> {\n"
+            "    fn next(&mut self) -> Option<i64> ! { alloc } {\n"
+            "        while self.skip_cnt > 0 {\n"
+            "            self.skip_cnt = self.skip_cnt - 1;\n"
+            "            let d = self.iter.next();\n"
+            "            match d { Some(x) => {}, None => { return None; } }\n"
+            "        }\n"
+            "        self.iter.next()\n"
+            "    }\n"
+            "}\n"
+            "fn iter_skip<I: Iterator<i64>>(it: I, n: i64) -> Skip<I>\n"
+            "    { Skip { iter: it, skip_cnt: n } }\n"
+            // Chain<A,B>: yield all of `a`, then all of `b`.
+            "struct Chain<A, B> { a: A, b: B, first: bool }\n"
+            "impl<A: Iterator<i64>, B: Iterator<i64>> Iterator<i64> for Chain<A, B> {\n"
+            "    fn next(&mut self) -> Option<i64> ! { alloc } {\n"
+            "        if self.first {\n"
+            "            let na = self.a.next();\n"
+            "            match na { Some(x) => Some(x),\n"
+            "                       None => { self.first = false; self.b.next() } }\n"
+            "        } else { self.b.next() }\n"
+            "    }\n"
+            "}\n"
+            "fn iter_chain<A: Iterator<i64>, B: Iterator<i64>>(a: A, b: B) -> Chain<A, B>\n"
+            "    { Chain { a: a, b: b, first: true } }\n"
+            // Zip<A,B>: pair elements; stops at the shorter iterator.
+            "struct Zip<A, B> { a: A, b: B }\n"
+            "impl<A: Iterator<i64>, B: Iterator<i64>> Iterator<(i64, i64)> for Zip<A, B> {\n"
+            "    fn next(&mut self) -> Option<(i64, i64)> ! { alloc } {\n"
+            "        let xa = self.a.next();\n"
+            "        match xa {\n"
+            "            Some(x) => { let yb = self.b.next();\n"
+            "                         match yb { Some(y) => Some((x, y)), None => None } },\n"
+            "            None => None\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+            "fn iter_zip<A: Iterator<i64>, B: Iterator<i64>>(a: A, b: B) -> Zip<A, B>\n"
+            "    { Zip { a: a, b: b } }\n"
+            // Enumerate<I>: pair each element with its 0-based index.
+            "struct Enumerate<I> { iter: I, idx: i64 }\n"
+            "impl<I: Iterator<i64>> Iterator<(i64, i64)> for Enumerate<I> {\n"
+            "    fn next(&mut self) -> Option<(i64, i64)> ! { alloc } {\n"
+            "        let nx = self.iter.next();\n"
+            "        match nx {\n"
+            "            Some(x) => { let i = self.idx; self.idx = self.idx + 1; Some((i, x)) },\n"
+            "            None => None\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+            "fn iter_enumerate<I: Iterator<i64>>(it: I) -> Enumerate<I>\n"
+            "    { Enumerate { iter: it, idx: 0 } }\n"
+            // VecIterI64: a Vec<i64> -> Iterator bridge so the lazy tower can
+            // consume Vecs (ranges already `impl Iterator`). i64-only for the
+            // same generic-impl reason as the adaptors above.
+            "struct VecIterI64 { v: Vec<i64>, pos: i64 }\n"
+            "impl Iterator<i64> for VecIterI64 {\n"
+            "    fn next(&mut self) -> Option<i64> ! { alloc } {\n"
+            "        if self.pos < vec_len(&self.v) {\n"
+            "            let x = vec_get(&self.v, self.pos);\n"
+            "            self.pos = self.pos + 1;\n"
+            "            Some(x)\n"
+            "        } else { None }\n"
+            "    }\n"
+            "}\n"
+            "fn vec_iter_i64(v: Vec<i64>) -> VecIterI64 { VecIterI64 { v: v, pos: 0 } }\n";
+    }
     // Phase 28: the `Hash` and `Eq` traits with built-in impls for i64 and
     // String, so user code can call `k.hash()` / `a.eq(&b)` and bound a
     // generic on them (`fn f<K: Hash + Eq>(...)`). The impl bodies forward to
