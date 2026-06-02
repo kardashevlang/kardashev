@@ -690,6 +690,20 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v60: effect-row-var / fn-typed-param name-collision soundness fix.
+sh_test(
+    name = "smoke_test_effect_param_collision",
+    srcs = ["smoke_test_effect_param_collision.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v60: type-inference depth regression suite (match arms, closures, nesting).
+sh_test(
+    name = "smoke_test_infer_depth",
+    srcs = ["smoke_test_infer_depth.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

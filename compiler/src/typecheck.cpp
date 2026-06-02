@@ -3044,6 +3044,16 @@ private:
     // effect pass via `collectEffects`. Absent => fall back to the callee's
     // statically declared effects (the pre-Phase-10a behavior).
     std::unordered_map<const ast::Expr*, EffectSet> exprEffects_;
+    // v60: CallExprs whose callee resolved to a LOCAL fn-typed binding (a
+    // by-value/by-ref param or a `let f = <fn-value>`) — i.e. INDIRECT calls.
+    // Their effect contribution comes solely from the fn value's type (recorded
+    // in `exprEffects_`, possibly empty for a still-free effect-row var). The
+    // later `collectEffects` pass must NOT fall back to a top-level `fnSchemas_`
+    // entry of the same name for these — a param named `f` shadows any global
+    // `fn f`, and attributing the global's effects to the enclosing fn was a
+    // soundness bug (e.g. the prelude `option_map(o, f)` mis-charged the effects
+    // of a user `fn f ! {io}` to `option_map`).
+    std::unordered_set<const ast::Expr*> indirectCallExprs_;
     // v34 Phase 184: an operator-overloaded binary op (`a + b` on a user type) ->
     // the mangled impl-method fn name codegen should call instead of LLVM arith.
     std::unordered_map<const ast::BinaryExpr*, std::string> binOpMethod_;
@@ -3292,7 +3302,12 @@ private:
             auto eit = exprEffects_.find(call);
             if (eit != exprEffects_.end()) {
                 out.unionWith(eit->second);
-            } else {
+            } else if (!indirectCallExprs_.count(call)) {
+                // v60: only a DIRECT call to a top-level fn may fall back to its
+                // statically declared effects. An indirect call through a local
+                // binding (see indirectCallExprs_) whose per-site set is empty
+                // is genuinely pure here — its callee name may collide with an
+                // unrelated top-level fn, which must NOT be consulted.
                 auto fnIt = fnSchemas_.find(call->callee);
                 if (fnIt != fnSchemas_.end() &&
                     fnIt->second.effectRowVars.empty()) {
@@ -8239,6 +8254,9 @@ private:
                 // names) for the effect pass: solved/concrete labels pass
                 // through; an unsolved row var that is one of the enclosing
                 // fn's effect-row vars contributes its name.
+                // v60: mark as indirect so collectEffects never falls back to a
+                // top-level fn of the same name as this local binding.
+                indirectCallExprs_.insert(&call);
                 recordCallEffectsFromFnType(call, r);
                 return r->ret;
             }

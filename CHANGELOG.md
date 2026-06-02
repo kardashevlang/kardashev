@@ -18,6 +18,43 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.60.0] — Type & effect checker depth
+
+### Fixed
+- **Effect-row-variable / fn-typed-param name collision (soundness).** An
+  effect-polymorphic higher-order **free** function whose fn-typed parameter
+  shares a name with a top-level function was mis-charged that function's
+  effects. The prelude `option_map(o, f: fn(i64)->i64 ! {e}) -> Option<i64> ! {e}`
+  calls its parameter `f`; if a program also defined `fn f ! {io}` (or any other
+  effect — `f`/`g` are extremely common names), the per-site effect set for the
+  indirect call to the *parameter* came out empty and `collectEffects` fell back
+  to the **top-level** `fn f`, so the program failed to compile with a spurious
+  *"function 'option_map' uses effect `io` but does not declare it"*. The fix
+  records such calls as **indirect** (callee resolved to a local binding) and
+  never consults a same-named top-level schema for them — a local binding shadows
+  any global. Effect propagation through the row var itself is unchanged (a pure
+  caller of `option_map` with an `io` mapper is still correctly rejected).
+  CI-gated by `smoke_test_effect_param_collision.sh` (5 accept JIT==AOT incl. a
+  user higher-order fn + the `option_map` polymorphism path, 1 reject).
+
+### Added
+- **Type-inference depth regression suite** (`smoke_test_infer_depth.sh`, 12
+  programs). The v60 roadmap entry targeted match-arm + nested-closure inference;
+  investigation found the HM engine already handles these comprehensively (arm
+  payloads, two-level enum nesting, closure params/returns, closures in
+  lets/HOFs/captures, generic mappers, tuple destructuring, if-as-value). Rather
+  than fabricate new inference code, this version **locks that behavior in** so a
+  future refactor cannot silently weaken it. Each program leans on inference for
+  a binding/param/return type that is never written down; differential JIT==AOT.
+
+### Deferred (honest)
+- **Never-type (`!`) / divergence typing.** A block whose tail is `panic(..)` /
+  `break` / `continue` is still typed by the tail expression's nominal type
+  (`panic` returns `i64`), not a bottom type that unifies with any branch. This
+  blocks `let x = if c { v } else { panic(..) }` when the branches differ and is
+  the remaining blocker for `let ... else { <diverge> }`. Tracked for a later
+  version; out of scope for the targeted checker-soundness fix here.
+
 ## [0.59.0] — Ergonomics: struct-update spread
 
 ### Added
