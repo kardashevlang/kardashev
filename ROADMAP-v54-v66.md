@@ -542,6 +542,21 @@ New C runtime fns lowered from codegen, exactly like the existing file ops.
 
 ## v64 — Diagnostics depth: more error codes, borrow codes, multi-char spans, value-printing asserts
 
+> **Status:** ✅ SHIPPED v0.64.0 (3 of 4 sub-features; spans → v64.x as planned).
+> Error-code table 8→20 with a deterministic most-specific-first classifier:
+> borrow/lifetime E0597/E0499/E0502/E0505, E0004 non-exhaustive, effect
+> E0710/E0711/E0712, E0720 codegen-contract, E0721 totality, E0080 const-eval
+> (+ classified the previously-uncoded let-binding mismatch as E0308); every code
+> has a curated `--explain`. Value-printing `assert_eq!`/`assert_ne!` (bind
+> temps, print left=/right= via a Display-bound reporter before returning).
+> `smoke_test_diagnostics.sh` (7 distinct-kind codes, --explain multi-line,
+> assert value-printing, no-cascade). REFINED the gate: struct- and scalar-
+> mismatch BOTH map to E0308 (rustc-aligned — all type mismatches share one
+> code); distinctness is demonstrated across error KINDS instead. DEFERRED to
+> v64.x: multi-character `^^^^` spans (the heaviest axis — needs endColumn on
+> every diagnostic + child-span propagation); cross-fn breadcrumbs; JSON
+> diagnostics; fix-it hints.
+
 **Theme:** Four cheap-but-high-leverage diagnostics improvements.
 
 **CORE**

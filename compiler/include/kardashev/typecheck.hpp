@@ -336,6 +336,10 @@ struct TypeCheckResult {
     // rand_global). Codegen emits that runtime (libc clock_gettime / getenv /
     // setenv / atoll + the global RNG state) only when set.
     bool usesRuntimeExtras = false;
+    // v64: true iff the program references `__assert_report` (the effect-free
+    // value-printing reporter behind assert_eq!/assert_ne!). Codegen emits that
+    // builtin (which declares snprintf/write) only when set.
+    bool usesAssertReport = false;
     bool ok() const { return errors.empty(); }
 
     // Special members declared out-of-line so the implicit dtor / move ops

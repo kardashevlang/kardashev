@@ -18,6 +18,31 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.64.0] — Diagnostics depth: more error codes + value-printing asserts
+
+### Added / Changed
+- **Expanded the error-code table** from 8 to 20 codes, and made `classifyError`
+  a **deterministic priority-ordered** classifier (table sorted most-specific
+  first). New codes: borrow/lifetime — `E0597` (does-not-live-long-enough /
+  dangling return), `E0499` (mut-borrow-twice), `E0502` (shared/mut conflict),
+  `E0505` (move out of borrowed); `E0004` (non-exhaustive match); effects —
+  `E0710` (effect not declared), `E0711` (effect escapes `main`), `E0712`
+  (unknown/duplicate effect); `E0720` (codegen-quality contract violated),
+  `E0721` (totality), `E0080` (const-eval failed). Also classified the
+  previously-uncoded `let`-binding type mismatch (now `E0308`).
+- **`kardc --explain Exxxx`** automatically covers every new code with a curated
+  multi-line explanation (it iterates the table).
+- **Value-printing asserts** — `assert_eq!` / `assert_ne!` now bind their
+  operands to temporaries (single evaluation) and, on failure, print the actual
+  `left=…`/`right=…` values via a `Display`-bound reporter **before** returning
+  the non-zero test code (previously they silently returned 1). Operands must be
+  `Display` (mirrors Rust's `Debug` requirement).
+
+### Deferred (honest)
+- **Multi-character spans** (`^^^^` underlines covering the full offending
+  subexpression) — the heaviest sub-feature; split to a later **v64.x**. Also:
+  cross-function breadcrumb context, structured JSON diagnostics, fix-it hints.
+
 ## [0.63.0] — Stdlib I/O depth: buffered reader + file metadata
 
 ### Added
