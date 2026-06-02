@@ -744,6 +744,13 @@ private:
     std::unordered_map<std::string, std::pair<llvm::Value*, llvm::Type*>>
         refLocals_;
 
+    // v65 `#[codegen(param_regs)]`: Copy-scalar by-value params SSA'd directly
+    // (no entry alloca). Maps the param name -> its SSA Argument value; consulted
+    // BEFORE `locals_` in the IdentExpr read/consume paths. Only populated for a
+    // param proven safe (scalar, never assigned, never address-taken — see
+    // paramRegSafe) so the value is read-only and never needs a stack address.
+    std::unordered_map<std::string, llvm::Value*> paramRegValues_;
+
     // --- Phase 16: deterministic Drop (RAII) ---
     // implementing-type base name -> mangled LLVM name of its `drop(&mut self)`
     // method. Populated in run() from `impl Drop for T` blocks.
@@ -9915,6 +9922,144 @@ private:
         return bb && bb->getTerminator() != nullptr;
     }
 
+    // v65: does `name`'s ADDRESS get taken anywhere in `e`? (`&name`/`&mut name`,
+    // or `name.method()` whose `&self` autorefs it.) Returns true ALSO for any
+    // expression node this walk doesn't recognize — so an unanalyzable body
+    // conservatively keeps the param's stack slot. Used by `paramRegSafe`: a
+    // Copy-scalar param whose address is never taken can be SSA'd (no alloca),
+    // since assigning to a param is already a type error (immutable place).
+    bool exprTakesAddr(const ast::Expr& e, const std::string& name) {
+        if (dynamic_cast<const ast::IntLitExpr*>(&e) ||
+            dynamic_cast<const ast::BoolLitExpr*>(&e) ||
+            dynamic_cast<const ast::CharLitExpr*>(&e) ||
+            dynamic_cast<const ast::FloatLitExpr*>(&e) ||
+            dynamic_cast<const ast::StringLitExpr*>(&e) ||
+            dynamic_cast<const ast::IdentExpr*>(&e))
+            return false; // a bare value-read never takes an address
+        if (auto* r = dynamic_cast<const ast::RefExpr*>(&e)) {
+            if (auto* id = dynamic_cast<const ast::IdentExpr*>(r->operand.get()))
+                if (id->name == name) return true; // &name / &mut name
+            return exprTakesAddr(*r->operand, name);
+        }
+        if (auto* m = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
+            if (auto* id =
+                    dynamic_cast<const ast::IdentExpr*>(m->receiver.get()))
+                if (id->name == name) return true; // name.method() autorefs &self
+            if (exprTakesAddr(*m->receiver, name)) return true;
+            for (auto& a : m->args)
+                if (exprTakesAddr(*a, name)) return true;
+            return false;
+        }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e))
+            return exprTakesAddr(*b->lhs, name) || exprTakesAddr(*b->rhs, name);
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e))
+            return exprTakesAddr(*u->operand, name);
+        if (auto* c = dynamic_cast<const ast::CastExpr*>(&e))
+            return exprTakesAddr(*c->operand, name);
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(&e)) {
+            for (auto& a : c->args)
+                if (exprTakesAddr(*a, name)) return true;
+            return false;
+        }
+        if (auto* c = dynamic_cast<const ast::CallValueExpr*>(&e)) {
+            if (exprTakesAddr(*c->callee, name)) return true;
+            for (auto& a : c->args)
+                if (exprTakesAddr(*a, name)) return true;
+            return false;
+        }
+        if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e))
+            return exprTakesAddr(*ie->cond, name) ||
+                   exprTakesAddr(*ie->thenBranch, name) ||
+                   exprTakesAddr(*ie->elseBranch, name);
+        if (auto* bl = dynamic_cast<const ast::BlockExpr*>(&e)) {
+            for (auto& s : bl->stmts)
+                if (stmtTakesAddr(*s, name)) return true;
+            return bl->tail ? exprTakesAddr(*bl->tail, name) : false;
+        }
+        if (auto* w = dynamic_cast<const ast::WhileExpr*>(&e))
+            return exprTakesAddr(*w->cond, name) ||
+                   exprTakesAddr(*w->body, name);
+        if (auto* l = dynamic_cast<const ast::LoopExpr*>(&e))
+            return exprTakesAddr(*l->body, name);
+        if (auto* me = dynamic_cast<const ast::MatchExpr*>(&e)) {
+            if (exprTakesAddr(*me->scrutinee, name)) return true;
+            for (auto& arm : me->arms)
+                if (arm.body && exprTakesAddr(*arm.body, name)) return true;
+            return false;
+        }
+        if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e))
+            return be->value ? exprTakesAddr(*be->value, name) : false;
+        if (dynamic_cast<const ast::ContinueExpr*>(&e)) return false;
+        // Any other node (struct/tuple/array literal, index, field access,
+        // closure, await, …): conservatively assume it might take the address.
+        return true;
+    }
+    bool stmtTakesAddr(const ast::Stmt& s, const std::string& name) {
+        if (auto* l = dynamic_cast<const ast::LetStmt*>(&s))
+            return l->value ? exprTakesAddr(*l->value, name) : false;
+        if (auto* es = dynamic_cast<const ast::ExprStmt*>(&s))
+            return exprTakesAddr(*es->expr, name);
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s))
+            return rs->value ? exprTakesAddr(*rs->value, name) : false;
+        if (auto* as = dynamic_cast<const ast::AssignStmt*>(&s))
+            return exprTakesAddr(*as->target, name) ||
+                   exprTakesAddr(*as->value, name);
+        return true; // unknown statement -> conservative
+    }
+    // A Copy-scalar by-value param is param_regs-safe iff its address is never
+    // taken in the body (assignment to it is already a type error).
+    bool paramRegSafe(const ast::FnDecl& fn, const std::string& name) {
+        if (!fn.body) return false;
+        for (auto& s : fn.body->stmts)
+            if (stmtTakesAddr(*s, name)) return false;
+        if (fn.body->tail && exprTakesAddr(*fn.body->tail, name)) return false;
+        return true;
+    }
+    // v65: does the fn call itself (directly) — used to keep AlwaysInline off a
+    // recursive `#[codegen(inline)]` fn (InlineHint still applies).
+    bool fnIsRecursive(const ast::FnDecl& fn) {
+        if (!fn.body) return false;
+        return exprCallsName(*fn.body, fn.name);
+    }
+    bool exprCallsName(const ast::Expr& e, const std::string& n) {
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(&e)) {
+            if (c->callee == n) return true;
+            for (auto& a : c->args)
+                if (exprCallsName(*a, n)) return true;
+            return false;
+        }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e))
+            return exprCallsName(*b->lhs, n) || exprCallsName(*b->rhs, n);
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e))
+            return exprCallsName(*u->operand, n);
+        if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e))
+            return exprCallsName(*ie->cond, n) ||
+                   exprCallsName(*ie->thenBranch, n) ||
+                   exprCallsName(*ie->elseBranch, n);
+        if (auto* bl = dynamic_cast<const ast::BlockExpr*>(&e)) {
+            for (auto& s : bl->stmts) {
+                if (auto* es = dynamic_cast<const ast::ExprStmt*>(s.get()))
+                    if (exprCallsName(*es->expr, n)) return true;
+                if (auto* l = dynamic_cast<const ast::LetStmt*>(s.get()))
+                    if (l->value && exprCallsName(*l->value, n)) return true;
+                if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s.get()))
+                    if (rs->value && exprCallsName(*rs->value, n)) return true;
+            }
+            return bl->tail ? exprCallsName(*bl->tail, n) : false;
+        }
+        if (auto* me = dynamic_cast<const ast::MatchExpr*>(&e)) {
+            if (exprCallsName(*me->scrutinee, n)) return true;
+            for (auto& arm : me->arms)
+                if (arm.body && exprCallsName(*arm.body, n)) return true;
+            return false;
+        }
+        if (auto* w = dynamic_cast<const ast::WhileExpr*>(&e))
+            return exprCallsName(*w->cond, n) || exprCallsName(*w->body, n);
+        if (auto* l = dynamic_cast<const ast::LoopExpr*>(&e))
+            return exprCallsName(*l->body, n);
+        return false;
+    }
+
     void emitFunction(const ast::FnDecl& fn,
                       const std::vector<TypePtr>& typeArgs) {
         // Phase 40: an impl method emits under its mangled base, so a queued
@@ -9954,6 +10099,16 @@ private:
         currentFnReturnType_ = astTypeRefToConcrete(fn.returnType);
         locals_.clear();
         localTypes_.clear();
+        paramRegValues_.clear();
+        // v65 `#[codegen(inline)]`: nudge the inliner. InlineHint is safe even
+        // for a recursive fn (the inliner won't loop forever); a SMALL,
+        // NON-recursive fn at -O2 also gets AlwaysInline so leaf helpers fold in.
+        if (fn.inlineHint) {
+            currentFn_->addFnAttr(llvm::Attribute::InlineHint);
+            if (optLevel_ != OptLevel::O0 && fn.body &&
+                fn.body->stmts.size() <= 6 && !fnIsRecursive(fn))
+                currentFn_->addFnAttr(llvm::Attribute::AlwaysInline);
+        }
         // Phase 16: reset Drop scope state and open the function-body scope
         // (params live here; the body block opens a nested scope inside).
         dropScopes_.clear();
@@ -9972,6 +10127,18 @@ private:
         unsigned i = 0;
         for (auto& arg : currentFn_->args()) {
             const std::string& name = fn.params[i].name;
+            // v65 `#[codegen(param_regs)]`: for a Copy-SCALAR by-value param that
+            // is never assigned and never address-taken in the body, bind the SSA
+            // argument directly and SKIP the entry alloca+store — observable at
+            // -O0 (at -O2 mem2reg already promotes it, so this is parity, not a
+            // new win). All uses of such a param are value-reads (Copy scalars
+            // are never moved; `&p` is excluded by the safety walk).
+            if (fn.paramRegs && !fn.isAsync && arg.getType()->isIntegerTy() &&
+                paramRegSafe(fn, name)) {
+                paramRegValues_[name] = &arg;
+                ++i;
+                continue;
+            }
             auto* alloca = builder_->CreateAlloca(arg.getType(), nullptr, name);
             builder_->CreateStore(&arg, alloca);
             locals_[name] = alloca;
@@ -12122,6 +12289,11 @@ private:
                         /*isSigned=*/true);
                 }
             }
+            // v65 `#[codegen(param_regs)]`: a Copy-scalar param SSA'd at entry
+            // (no alloca) reads as its argument value directly — no load.
+            if (auto pit = paramRegValues_.find(id->name);
+                pit != paramRegValues_.end())
+                return pit->second;
             // Phase 17a: a by-ref capture reads through the env pointer into
             // the enclosing variable's storage.
             if (auto rit = refLocals_.find(id->name); rit != refLocals_.end()) {

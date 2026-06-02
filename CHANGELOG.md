@@ -18,6 +18,32 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.65.0] — Codegen perf: param-reg lowering + inline hints
+
+### Added
+- **`#[codegen(param_regs)]`** — a Copy-**scalar** by-value parameter that is
+  never address-taken in the body is bound to its SSA argument directly, skipping
+  the entry `alloca`+`store`. Observable at `-O0` (baseline fib has 1 param
+  alloca, the annotated fib has 0); at `-O2` `mem2reg` already promotes it, so
+  this is parity there, not a new win. Safety: assigning to a param is already a
+  type error (immutable), and the address-taken walk is conservative (any
+  unanalyzable node keeps the alloca), so a param bound this way is read-only.
+  Excludes async fns (the SSA value wouldn't survive a suspension).
+- **`#[codegen(inline)]`** — sets LLVM `InlineHint`; a **small, non-recursive**
+  fn at `-O2` also gets `AlwaysInline` (a recursive fn keeps `InlineHint` only).
+- Both parse alongside `no_alloc`/`no_panic`/`no_io`; opt-in, no default change.
+
+### Performance (advisory)
+The documented ~1.2× **fib** gap is dominated by recursive call overhead. With
+`mem2reg` already SSA-ing param allocas at `-O2`, `param_regs` yields a
+below-noise change there (measured: `fib(32) -O2` annotated ≈ baseline); the
+real lever is inlining. **Closing the gap is incremental — 1.0× is not
+guaranteed.** (The 2.2× *loop* gap was already closed in v0.51.0.)
+
+### Deferred (honest)
+- Bounds-check elision for loop-invariant (non-literal) indices;
+  `#[codegen(vectorized)]` + verification; whole-program LTO/PGO.
+
 ## [0.64.0] — Diagnostics depth: more error codes + value-printing asserts
 
 ### Added / Changed

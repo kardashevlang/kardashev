@@ -1025,9 +1025,13 @@ private:
         decl.noAlloc = pendingNoAlloc_; // v48 `#[codegen(no_alloc)]`
         decl.noPanic = pendingNoPanic_; // v48 `#[codegen(no_panic)]`
         decl.noIo = pendingNoIo_;       // v48 `#[codegen(no_io)]`
+        decl.paramRegs = pendingParamRegs_; // v65 `#[codegen(param_regs)]`
+        decl.inlineHint = pendingInline_;   // v65 `#[codegen(inline)]`
         pendingNoAlloc_ = false;
         pendingNoPanic_ = false;
         pendingNoIo_ = false;
+        pendingParamRegs_ = false;
+        pendingInline_ = false;
         decl.line = fnTok.line;
         decl.column = fnTok.column;
 
@@ -2312,6 +2316,8 @@ private:
     bool pendingNoAlloc_ = false; // v48 `#[codegen(no_alloc)]` for the next fn
     bool pendingNoPanic_ = false; // v48 `#[codegen(no_panic)]` for the next fn
     bool pendingNoIo_ = false;    // v48 `#[codegen(no_io)]` for the next fn
+    bool pendingParamRegs_ = false; // v65 `#[codegen(param_regs)]`
+    bool pendingInline_ = false;    // v65 `#[codegen(inline)]`
     void parseAttributes() {
         while (check(TokenKind::Pound)) {
             consume(); // '#'
@@ -2349,7 +2355,9 @@ private:
                         if (c.lexeme == "no_alloc") pendingNoAlloc_ = true;
                         else if (c.lexeme == "no_panic") pendingNoPanic_ = true;
                         else if (c.lexeme == "no_io") pendingNoIo_ = true;
-                        // other contracts (vectorized, inlined) parsed + tolerated
+                        else if (c.lexeme == "param_regs") pendingParamRegs_ = true; // v65
+                        else if (c.lexeme == "inline") pendingInline_ = true;        // v65
+                        // other contracts (vectorized, …) parsed + tolerated
                         if (!accept(TokenKind::Comma)) break;
                         if (check(TokenKind::RParen)) break;
                     }
