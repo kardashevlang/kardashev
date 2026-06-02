@@ -18,6 +18,39 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.50.0] — Roadmap v50 "6/6 BEYOND IV: statically-verified exhaustive effect handling" (partial)
+
+### Added
+- **Statically-verified exhaustive effect handling** — a user-defined
+  (algebraic) effect must be discharged by a `handle … with E { … }` before it
+  reaches the program entry point `main`. Performing an effect with no installed
+  handler is undefined — at runtime it silently no-ops / returns garbage — and
+  was previously accepted. Now the compiler reuses the (transitively sound)
+  effect set: if `main`'s inferred effects still contain a **user** effect (a
+  builtin effect — `io`/`alloc`/`panic`/… — legitimately reaches `main`), that
+  effect escapes unhandled and the program is **rejected**, pinpointing the
+  operation (`effect \`E\` is performed but never handled before reaching
+  \`main\` (first performed as \`E::op\`)`). A `handle` that discharges the
+  effect makes the program compile and run. CI-gated by
+  `smoke_test_effect_exhaustive.sh` (accept: direct/callee/nested/deep-chain
+  handled, JIT==AOT; reject: direct/callee/partial/deep-chain escape; plus a
+  12-effect deep-nest robustness pair — all handled accepts, outermost-missing
+  rejects).
+
+  This closes a real soundness gap in the v32 algebraic-effects feature and is
+  the tractable core of the v50 type-system capstone.
+
+### Deferred / honest limitations
+- The rest of v50's 6/6 work is XL/research-grade and largely needs tooling this
+  environment cannot host (ROADMAP, v50): the mechanized soundness proof of the
+  exhaustive-handling property (and of progress/preservation, drop-soundness, HM,
+  NLL, effect-row subtyping) in a proof assistant checked in CI; effect
+  exhaustiveness for thread-entry and `#[test]` roots (only synchronous `main`
+  reachability is checked here); sub-100ms self-verifying incremental
+  compilation; the unified query-backed IDE server; in-tree record-replay
+  time-travel debugging; the mechanized test-linked spec; and the
+  differentially-verified reproducible self-hosting bootstrap.
+
 ## [0.49.0] — Roadmap v49 "6/6 BEYOND III: compile-time reflection" (partial)
 
 ### Added

@@ -444,6 +444,8 @@ expansion dual-backend-identical + soundness-gated). Type-system nears 6/6.
 
 ### v50 / 1.x — "6/6 BEYOND IV: the formal capstone" — moves: TS → 6/6, EC → 6/6, TL → 6/6
 
+> **Status (`v0.50.0`, partial):** ✅ SHIPPED — statically-verified exhaustive effect handling: a user-defined (algebraic) effect that reaches `main` unhandled is REJECTED at compile time (pinpointing the escaping operation), closing a real soundness gap in the v32 effect feature (an unhandled `perform` previously silently no-op'd at runtime). Reuses the transitively-sound effect set; builtin effects (io/alloc/panic) legitimately reach `main`; JIT==AOT-gated incl. a 12-effect deep-nest robustness pair. The tractable core of the v50 type-system capstone. ⛔ DEFERRED — the mechanized soundness proof (proof-assistant-checked in CI) of this and the other core invariants (progress/preservation, drop-soundness, HM, NLL, effect-row subtyping); thread-entry / `#[test]`-root effect exhaustiveness (only synchronous `main` reachability is checked); sub-100ms self-verifying incremental compilation; the unified query-backed IDE server; record-replay time-travel debugging; the mechanized test-linked spec; the differentially-verified reproducible self-hosting bootstrap (all XL/research-grade or environment-bound).
+
 The mechanized-soundness and provable-tooling capstones that complete every
 dimension and the maturity arc.
 
