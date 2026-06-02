@@ -171,6 +171,9 @@ which the JIT cannot resolve — documented at `codegen.cpp:4948–4956`).
 
 ## v57 — Overloadable `Index`/`IndexMut` + `Deref`/`DerefMut` for custom types
 
+> **Status:** ✅ SHIPPED v0.57.0 — RESCOPED. Index/Deref methods must return `&Self::Output`, but kardashev blanket-rejected ALL user `-> &T` returns (a rule predating the v52–v54 escape analysis). v0.57.0 ships the unblocking prerequisite: **reference-returning functions, gated by escape analysis** (a returned ref must root in a by-ref parameter / `&self` / global; local/temp rejected). This enables `&self.field` accessor methods. The Index/Deref *operator sugar* (assoc-type Output + `[]`/`*` dispatch) is the documented follow-on built on this.
+
+
 **Theme:** Smart-pointer & collection ergonomics — make `[]` and `*` dispatch to
 user traits, completing the operator surface alongside the already-shipped
 arithmetic/bit overloading (`Add`/`Sub`/… from v34 Phase 184).

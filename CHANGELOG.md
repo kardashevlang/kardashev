@@ -18,6 +18,35 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.57.0] — Reference-returning functions (escape-gated)
+
+### Added
+- **Functions may now return references (`-> &T`).** kardashev previously
+  blanket-rejected *every* user `-> &T` return ("cannot return a reference, no
+  lifetime system yet") — a rule (PR#25) that predated the v0.52.0–v0.54.0 escape
+  analysis. That analysis now precisely decides soundness, so the blanket rule is
+  lifted (both the free-function and impl-method sites): a returned reference
+  rooted in a **by-reference parameter, `&self`, or a global** outlives the call
+  and is accepted; one rooted in a **local, a by-value parameter, or a
+  temporary** is rejected by the borrow checker as a dangling reference. This
+  unblocks accessor / `&self.field` methods (`fn getx(&self) -> &i64 { &self.x }`)
+  and pass-through borrows (`fn id(r: &i64) -> &i64 { r }`). Raw-pointer returns
+  (`-> *mut T`, unsafe-gated, no lifetime obligation) are likewise permitted.
+
+CI-gated by `smoke_test_ref_returns.sh` (6 accept-and-run: param / `&self.field`
+/ `&param.field` / chained pass-through / method receiver; 4 reject: `&local`,
+`&temp`, `&by-value-param`, `&local.field`). Unit suites + the existing escape /
+borrow tests stay green.
+
+### Rescope note (honest)
+- The roadmap's v57 was **Index/Deref operator overloading**. Implementing it
+  revealed a hard prerequisite: `Index`/`Deref` methods return `&Self::Output`,
+  which the blanket `-> &T` rejection forbade. This release ships that
+  prerequisite (reference-returning functions) — a complete, sound capability on
+  its own. The Index/Deref **operator sugar** (associated-type `Output` + `[]` /
+  `*` dispatch through the existing operator-trait machinery, now expressible) is
+  the documented follow-on.
+
 ## [0.56.0] — Soundness under concurrency: thread-local effect handlers
 
 ### Fixed (concurrency)

@@ -3735,18 +3735,13 @@ private:
             scopes_.back()[p.name] = resolveTypeRef(p.type);
         }
         currentReturnType_ = resolveTypeRef(fn.returnType);
-        // PR#25: reject `-> &T` reference return types. kardashev has no
-        // lifetime system, so a returned reference can only ever borrow a
-        // parameter or a local — and the latter is a guaranteed
-        // use-after-free once the frame unwinds. Until lifetimes exist,
-        // functions must return owned values. (`&[T]` slices are a separate
-        // Struct kind and are not caught here.)
-        if (resolve(currentReturnType_)->kind == TypeKind::Ref) {
-            error("function '" + fn.name +
-                      "' cannot return a reference (no lifetime system yet); "
-                      "return an owned value instead",
-                  fn.returnType.line, fn.returnType.column);
-        }
+        // v57: `-> &T` reference returns are now PERMITTED — the borrow
+        // checker's escape analysis (v52–v54) precisely gates them: a returned
+        // reference rooted in a by-reference parameter (or a global) outlives the
+        // call and is accepted; one rooted in a local / by-value param / temporary
+        // is rejected as a dangling reference. This replaces the old blanket
+        // PR#25 rejection (which predated escape analysis) and unblocks methods
+        // that return `&self.field` (e.g. accessor / Index-style methods).
         TypePtr bodyType = checkBlock(*fn.body);
         if (fn.body->tail) {
             if (closureEscapesByRef(*fn.body->tail)) {
@@ -4784,16 +4779,10 @@ private:
             scopes_.back()[p.name] = resolveTypeRef(p.type);
         }
         currentReturnType_ = resolveTypeRef(fn.returnType);
-        // PR#25: reject `-> &T` reference return types (top-level fns). No
-        // lifetime system, so a returned reference borrows a param or a
-        // local — the latter being a guaranteed use-after-free. Slices
-        // (`&[T]`, a Struct kind) are not caught here.
-        if (resolve(currentReturnType_)->kind == TypeKind::Ref) {
-            error("function '" + fn.name +
-                      "' cannot return a reference (no lifetime system yet); "
-                      "return an owned value instead",
-                  fn.returnType.line, fn.returnType.column);
-        }
+        // v57: `-> &T` reference returns are now PERMITTED (top-level fns) — the
+        // borrow checker's escape analysis (v52–v54) gates them soundly (a
+        // returned ref must root in a by-reference parameter or a global, never a
+        // local / temporary). Replaces the old blanket PR#25 rejection.
 
         TypePtr bodyType = checkBlock(*fn.body);
         // If the block has a tail expression, it must match the declared
