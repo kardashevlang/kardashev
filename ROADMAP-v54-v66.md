@@ -660,6 +660,18 @@ Parse the new attribute alongside `no_alloc`/`no_panic` in `parser.cpp`.
 
 ## v66 — Test infrastructure: borrow-checker differential fuzzer + sanitizer sweep + property harness
 
+> **Status:** ✅ SHIPPED v0.66.0 — all three rigs, pure test infra (no compiler
+> changes). `smoke_test_fuzz_borrow.sh`: 120 seeded programs from 14
+> hand-classified templates, oracle-exact accept/reject (sound-accepted +
+> unsound-rejected both exercised; each unsound template's canonical instance
+> hand-verified rejected). `smoke_test_asan_ubsan_c_backend.sh`: 12 in-subset
+> `--emit-c` programs clean under -fsanitize=address,undefined + 3 known-UB
+> programs caught (graceful skip without clang/ASan). `smoke_test_property_harness.sh`:
+> 16 stdlib invariants × 50 seeded inputs, JIT==AOT. DEFERRED: TSan concurrency
+> fuzzing, 2000+-case grammar corpus, whole-program type+effect fuzzing; noted a
+> v61 follow-on (`iter_collect` over `Take<Range>` codegen edge — drained via
+> `.next()` instead). **This completes ROADMAP-v54-v66.**
+
 **Theme:** Harden correctness with three reusable test rigs — pure test infra (no
 compiler changes) that the prior soundness work earns.
 
