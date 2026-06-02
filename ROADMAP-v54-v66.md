@@ -320,6 +320,24 @@ Verified absent: `StructLitExpr` (`ast.hpp:274`) has no spread field; `Param`
 
 ## v60 — Inference depth: match-arm + nested-closure type inference
 
+> **Status:** ✅ SHIPPED v0.60.0 — *rescoped honestly.* Investigation found the
+> HM inference engine **already** handles match-arm payloads, nested enums, and
+> closure params/returns in every nested context probed (12-program
+> `smoke_test_infer_depth.sh` all green with no inference code added). So the
+> version (a) **locks that in** with the regression suite, and (b) spends its
+> real implementation budget on a **type/effect-checker soundness fix** surfaced
+> by the investigation: an effect-polymorphic higher-order free function (e.g.
+> the prelude `option_map(o, f: fn(i64)->i64 ! {e})`) was mis-charged the effects
+> of a *top-level* fn sharing its fn-typed parameter's name — `collectEffects`
+> fell back to a same-named `fnSchemas_` entry for what was really an indirect
+> call through a local binding, so merely defining `fn f ! {io}` broke
+> compilation. Fixed by tracking indirect-call sites (`indirectCallExprs_`) and
+> never consulting a same-named global for them; `smoke_test_effect_param_collision.sh`
+> pins it (incl. a negative proving effect propagation still works). The
+> never-type / divergence-typing gap (a `panic`-tail block isn't bottom-typed)
+> is documented as a deferral. The original ≥10/≥6 + ≥8/≥4 gates below describe
+> the inference matrix the engine satisfies; the shipped suite mirrors it.
+
 **Theme:** Propagate bidirectional type context where it currently stops,
 eliminating spurious annotation requirements.
 
