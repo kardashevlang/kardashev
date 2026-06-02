@@ -18,6 +18,51 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.51.0] — Performance: vectorization + codegen efficiency
+
+A codegen-efficiency pass (no language-surface change). Driven by an
+adversarially-verified multi-agent audit of the optimization pipeline, codegen
+IR quality, the prelude, and memory layout; every fix below was measured or
+correctness-gated, and over-rated audit findings were down-scoped honestly.
+
+### Fixed / improved
+- **Auto-vectorization now actually runs (the headline win).** The IR
+  optimization `PassBuilder` was constructed **without a `TargetMachine`**, so
+  the pipeline had a no-op `TargetTransformInfo` — the loop/SLP vectorizers and
+  cost models ran target-blind and declined every vectorization. The host
+  `TargetMachine` (created in `setHostDataLayout`) is now kept alive and passed
+  to `PassBuilder`, registering real TTI. The `loop` benchmark (a 200M-iteration
+  integer reduction) went from **2.2× C → 1.0× C (parity)**; emitted IR now
+  contains vectorized loop bodies (0 → 21 vector ops). CPU stays **generic** —
+  keeps the optimizer's layout identical to the backend's (guards the
+  recursive-enum-read miscompile) and the emitted object portable.
+- **Array indexing no longer spills the whole array.** `emitIndex` spilled the
+  entire array value (`load [N x T]` + alloca + store) on every element read of
+  any non-local array object; SROA does not undo this for large `N`, so an array
+  **field** (`g.cells[j]`) read in a loop copied the whole array per access. It
+  now takes the place address via `emitPlaceAddr` (used already for `a[i] = x`)
+  and GEPs directly; genuine rvalue arrays (`f()[i]`) still spill correctly.
+- **HashMap probe: modulo → bitwise AND.** The capacity is always 0 or a power
+  of two (starts at 8, doubles), so `h mod cap` is exactly `h & (cap-1)` — the
+  home-slot and all five probe-wrap sites now use a single AND instead of a
+  hardware `idiv` (~20–40 cyc, not pipelined). Bit-identical results; all
+  HashMap/HashSet smoke tests green.
+- **Prelude scans now early-exit.** `vec_contains`/`vec_index_of`/`vec_any`/
+  `vec_all`/`vec_find` and `str_index_of`/`str_starts_with`/`str_ends_with` were
+  scanning the whole input after the answer was decided; they now `break` (or use
+  a short-circuit loop guard) — O(n) → O(k) on an early hit. The `str_*`
+  boundary cases (prefix/suffix longer than the string) are preserved without an
+  out-of-bounds read and pinned by `smoke_test_prelude_earlyexit.sh`.
+
+### Deferred / honest limitations
+- Host-CPU/`-march=native` codegen (would unlock AVX-width vectors) is **not**
+  enabled: it requires folding the CPU+features into the content-addressed AOT
+  cache key (else an AVX object is served to an older CPU → SIGILL) and breaks
+  cross-machine artifact portability — a future opt-in `-Ctarget-cpu=native`.
+- Backend `CodeGenOptLevel` propagation to `emitObject` (a `-O0` compile-speed
+  win, negligible runtime effect) and the quadratic macro-expansion rewrite
+  (correctness-sensitive frame-stack refactor) are deferred.
+
 ## [0.50.0] — Roadmap v50 "6/6 BEYOND IV: statically-verified exhaustive effect handling" (partial)
 
 ### Added
