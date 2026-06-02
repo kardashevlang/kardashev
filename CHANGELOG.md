@@ -18,6 +18,50 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.52.0] — Soundness: escape analysis closes a dangling-reference UB
+
+### Fixed (memory safety)
+- **A returned value may no longer carry a reference into freed stack.** The
+  borrow checker rejected a top-level `-> &T` return but did **not** look inside
+  aggregates, so a function returning a struct/tuple/enum/array that contained a
+  reference to a **local** (e.g. `struct R { p: &i64 }  fn f() -> R { let x = 7;
+  R { p: &x } }`) compiled clean and read freed memory at runtime — a silent
+  dangling-reference UB in a language whose pitch is safety. The checker now runs
+  a sound, conservative **escape analysis**: a function whose return type
+  transitively contains a reference is rejected unless *every* contained
+  reference roots in a **by-reference parameter** (or a global) — which outlives
+  the call — never a local, a by-value parameter, or a temporary. It covers
+  references wrapped through structs, tuples, enum payloads, **arrays**, and
+  nested aggregates, and through `if` / `match` / `loop`-break / block-tail
+  control flow, direct `return`s and the function-body tail, **method receivers**
+  (`&self`), and **calls** (a `&local` nested in an aggregate argument or behind a
+  ref-typed local is caught). A per-binding *provenance* pass lets the common
+  `let r = <param-rooted>; … r` shape compile while still rejecting
+  `let r = &local; … r`.
+
+  Diagnostic: `cannot return a reference into a value that does not outlive this
+  function …`. CI-gated by `smoke_test_escape_analysis.sh` (9 reject + 6
+  accept-and-run). Built and validated against a multi-agent workflow: a 72-case
+  labelled corpus plus an adversarial pass of 18 attackers — every one of the 29
+  confirmed dangling-ref escapes it surfaced is now rejected, with no false
+  positive on the accept corpus.
+
+### Known limitations (documented honestly)
+- **Inter-procedural precision.** A multi-argument call whose result roots in one
+  ref argument but is passed *another* `&local` argument (e.g.
+  `pick(&local, real)` where `pick` returns its 2nd arg) is conservatively
+  rejected — sound, but a real lifetime system would accept it. Requires
+  inter-procedural lifetime analysis (deferred).
+- **Stores, not just returns.** Assigning a reference into a longer-lived
+  aggregate (`out.p = &local` through an out-parameter) is still unchecked — a
+  separate, narrower escape route (deferred).
+- **`&CONST` is separately unsound** (orthogonal to this fix): a top-level
+  `const` is an inlined immediate with no stable address, so `&C` yields a
+  dangling pointer regardless of escape analysis. Tracked as its own issue.
+- Slices/`Mutex`/atomics are ref-free Copy handles to this analysis (no `&T`
+  field), so a slice viewing a local buffer is out of scope here. Raw pointers
+  (`*const`/`*mut`) are `unsafe`-gated and carry no lifetime obligation.
+
 ## [0.51.0] — Performance: vectorization + codegen efficiency
 
 A codegen-efficiency pass (no language-surface change). Driven by an

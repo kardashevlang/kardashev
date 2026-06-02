@@ -131,8 +131,16 @@ passing it by value **moves** it (the source is then unusable). `Copy` scalars
 `[K-borrow]` `&T` (shared) and `&mut T` (exclusive) borrows are checked: no
 `&mut` aliasing, with two-phase borrows for `f(&mut v, g(&v))`. The current
 borrow checker is an NLL-lite position-counting analysis; full region inference
-is roadmapped. `[K-drop]` values are dropped (RAII) in reverse declaration order
-at scope exit; user `Drop` impls are not yet supported.
+is roadmapped. `[K-escape]` a function may not return a value that contains a
+reference rooted in this call frame: a returned reference (directly, or wrapped
+in a struct / tuple / enum / array, through `if`/`match`/`loop`/block control
+flow, a method receiver, or a call) must root in a by-reference parameter or a
+global, never a local, a by-value parameter, or a temporary. This is sound and
+conservative (no lifetime variables yet, so a return whose reference roots in
+*some* reference parameter is accepted; precise multi-parameter lifetimes and
+reference-stores into out-parameters are roadmapped). `[K-drop]` values are
+dropped (RAII) in reverse declaration order at scope exit; user `Drop` impls are
+not yet supported.
 
 `[K-mem-model]` There is no garbage collector. Heap memory (`Box`, `Vec`,
 `String`, `HashMap`, `Arc`) is freed deterministically at end of ownership. The
