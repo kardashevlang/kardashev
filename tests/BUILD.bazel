@@ -564,6 +564,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v42: Duration (operator-overloaded time arithmetic).
+sh_test(
+    name = "smoke_test_time",
+    srcs = ["smoke_test_time.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
