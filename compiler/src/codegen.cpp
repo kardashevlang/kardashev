@@ -11929,6 +11929,34 @@ private:
         return slot;
     }
 
+    // v53: `&CONST` promotion. A top-level scalar `const` is otherwise an
+    // inlined immediate with no address, so `&C` used to materialize a
+    // FRAME-LOCAL temporary (dangling if the borrow escaped the function). Emit
+    // (and dedup) a stable internal global holding the const's value instead, so
+    // `&C` has a genuine 'static address — readable and safely returnable. The
+    // signal (membership in tc_.constExprValues) matches the borrow checker's
+    // escape classifier, so promoted consts are exactly the ones it treats as
+    // outliving the call. Returns null if `id` is not a scalar const.
+    std::unordered_map<std::string, llvm::GlobalVariable*> constGlobals_;
+    llvm::Value* emitConstGlobal(const ast::IdentExpr& id) {
+        auto cvIt = tc_.constExprValues.find(&id);
+        if (cvIt == tc_.constExprValues.end()) return nullptr;
+        if (auto git = constGlobals_.find(id.name); git != constGlobals_.end())
+            return git->second;
+        llvm::Type* ty = llvm::Type::getInt64Ty(*ctx_);
+        if (TypePtr t = lookupExprType(id)) {
+            llvm::Type* mt = mapKardashevType(resolveInInstance(t));
+            if (mt && mt->isIntegerTy()) ty = mt;
+        }
+        auto* init = llvm::ConstantInt::get(
+            ty, static_cast<uint64_t>(cvIt->second.value), /*isSigned=*/true);
+        auto* g = new llvm::GlobalVariable(
+            *module_, ty, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage, init, "__kdconst_" + id.name);
+        constGlobals_[id.name] = g;
+        return g;
+    }
+
     llvm::Value* emitRef(const ast::RefExpr& re) {
         auto* id = dynamic_cast<const ast::IdentExpr*>(re.operand.get());
         if (!id) {
@@ -11947,10 +11975,15 @@ private:
             return rit->second.first;
         auto it = locals_.find(id->name);
         if (it == locals_.end()) {
-            // Phase 125: the ident is not a binding — it's a nullary enum
-            // variant (`&Nil`) or another value-producing name. Materialize it
-            // like any other `&<temporary>`. A genuinely undefined name was
-            // already rejected by the type checker, so emitExpr is safe here.
+            // v53: `&CONST` of a scalar const -> a stable internal global (so it
+            // can be read AND safely returned), not a frame-local temporary.
+            if (llvm::Value* g = emitConstGlobal(*id)) return g;
+            // Phase 125: otherwise the ident is a nullary enum variant (`&Nil`)
+            // or another value-producing name. Materialize it like any other
+            // `&<temporary>`. A genuinely undefined name was already rejected by
+            // the type checker, so emitExpr is safe here. (The borrow checker
+            // treats such a non-const `&<ident>` as a temporary that may not
+            // escape the function — see classifyRoot.)
             return emitRefToTemporary(*re.operand);
         }
         // The alloca's value is already a pointer to the binding's stack
