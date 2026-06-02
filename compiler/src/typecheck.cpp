@@ -3441,6 +3441,7 @@ private:
         }
         if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
             for (const auto& [_n, v] : sl->fields) collectEffects(*v, out);
+            if (sl->spread) collectEffects(*sl->spread, out); // v59
             return;
         }
         if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
@@ -3968,6 +3969,32 @@ private:
                           ", got " + typeToString(valT),
                       f.second->line, f.second->column);
             }
+        }
+        // v59: `S { x: 10, ..base }` — the base supplies every field not given
+        // explicitly, so missing fields are NOT an error. The base must be a
+        // value of the same struct, and (this version) the struct's fields must
+        // all be Copy (scalars / arrays / tuples) so the base can be safely
+        // copied and selectively overwritten with no move/drop obligation;
+        // move-field spread is deferred.
+        if (sl.spread) {
+            TypePtr spreadT = resolve(checkExpr(*sl.spread));
+            if (spreadT->kind != TypeKind::Struct ||
+                spreadT->structName != sl.structName) {
+                error("struct-update base after `..` must be a value of the same "
+                      "struct '" + sl.structName + "', got " +
+                          typeToString(spreadT),
+                      sl.spread->line, sl.spread->column);
+            } else {
+                bool allCopy = true;
+                for (const auto& df : instType->structFields)
+                    if (!isCopyAggregateElem(df.second)) { allCopy = false; break; }
+                if (!allCopy)
+                    error("struct-update spread `..base` currently requires a "
+                          "struct whose fields are all Copy (scalars / arrays / "
+                          "tuples); move-field spread is deferred",
+                          sl.spread->line, sl.spread->column);
+            }
+            return; // base covers the rest
         }
         for (const auto& df : instType->structFields) {
             if (!initialised.count(df.first)) {

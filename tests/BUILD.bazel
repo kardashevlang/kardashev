@@ -683,6 +683,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v59: struct-update spread `S { x: 10, ..base }` (Copy base).
+sh_test(
+    name = "smoke_test_struct_update",
+    srcs = ["smoke_test_struct_update.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

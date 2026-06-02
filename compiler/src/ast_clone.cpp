@@ -163,6 +163,7 @@ ExprPtr cloneExpr(const Expr& e) {
         n->structName = sl->structName;
         for (const auto& fld : sl->fields)
             n->fields.emplace_back(fld.first, cloneOpt(fld.second));
+        if (sl->spread) n->spread = cloneOpt(sl->spread); // v59 struct-update
         out = std::move(n);
     } else if (auto* fe = dynamic_cast<const FieldExpr*>(&e)) {
         auto n = std::make_unique<FieldExpr>();

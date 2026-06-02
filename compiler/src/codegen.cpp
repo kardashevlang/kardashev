@@ -11847,17 +11847,27 @@ private:
             // Phase 16: a field initializer consumes its value into the struct.
             values[name] = emitConsume(*expr);
         }
+        // v59 struct-update: `S { ..., ..base }`. The base is a Copy struct (the
+        // typechecker enforced all-Copy fields), so read it by value (a copy) and
+        // take each not-explicitly-given field from it via ExtractValue.
+        llvm::Value* spreadVal = sl.spread ? emitExpr(*sl.spread) : nullptr;
 
         const auto& fields = instTy->structFields;
         llvm::Value* agg = llvm::UndefValue::get(st);
         for (unsigned i = 0; i < fields.size(); ++i) {
             auto vIt = values.find(fields[i].first);
-            if (vIt == values.end()) {
+            llvm::Value* fv = nullptr;
+            if (vIt != values.end()) {
+                fv = vIt->second;
+            } else if (spreadVal) {
+                fv = builder_->CreateExtractValue(spreadVal, {i},
+                                                  "spread_" + fields[i].first);
+            } else {
                 errors_.push_back("codegen: missing field " + fields[i].first +
                                   " in literal of " + sl.structName);
                 continue;
             }
-            agg = builder_->CreateInsertValue(agg, vIt->second, {i},
+            agg = builder_->CreateInsertValue(agg, fv, {i},
                                               "fld_" + fields[i].first);
         }
         return agg;
