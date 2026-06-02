@@ -18,6 +18,25 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.46.0] — Roadmap v46 "Tooling + conformance + stability + security → 1.0 surface" (partial)
+
+### Added / fixed
+- **Parser DoS fix** — deeply-nested adversarial input (`(((…`, `[[[…`,
+  `Vec<Vec<…>>`, `&&&…`, `----…`, `!!!!…`) stack-overflowed the recursive-descent
+  parser; now bounded by a recursion-depth guard reporting a clean diagnostic.
+- **Compiler-hardening fuzzer** (`smoke_test_compiler_fuzz.sh`) — 266 adversarial
+  inputs (curated deep-nesting/malformed + random token soup) through the
+  front-end, asserting ZERO crashes (a signal exit fails CI).
+- **SECURITY.md** — coordinated security-response policy (private reporting,
+  ack/triage/fix SLA, embargo) + two-surface threat model.
+
+### Deferred / honest limitations
+- The rest of v46 remains (ROADMAP, v46): LSP semantic tokens / inlay hints /
+  code actions + workspace rename, the DWARF debugger (needs a gdb/lldb env) +
+  the `--emit-c -g` floor, doctests + hosted docs site, the conformance
+  pass-rate gate, the SemVer/MSRV stability checker, and the ≥100k-input nightly
+  fuzz_compiler.
+
 ## [0.45.0] — Roadmap v45 "Ecosystem foundation: registry, toolchain, spec" (partial)
 
 ### Added

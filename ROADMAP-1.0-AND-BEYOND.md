@@ -334,6 +334,8 @@ manager + MSRV + spec exists); tooling lays its incremental/IDE foundation.
 
 ### v46 — "Tooling depth + conformance + stability + security-response → the 1.0 surface" — moves: TL → 5/5, EC → 5
 
+> **Status (`v0.46.0`, partial):** ✅ SHIPPED — parser recursion-depth DoS fix + compiler-hardening fuzzer (266 inputs, zero crashes) + SECURITY.md. ⛔ DEFERRED — LSP semantic-tokens/inlay/code-actions + workspace rename, DWARF debugger (gdb env) + --emit-c -g, doctests + docs site, conformance pass-rate gate, SemVer/MSRV checker, 100k-input nightly fuzz.
+
 The IDE/test/debug surface and the conformance + stability + **security-response**
 machinery that 1.0 requires.
 
