@@ -2706,7 +2706,8 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
         return std::nullopt;
     }
     auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile,
-                                  optLevel);
+                                  optLevel, /*forJit=*/true); // v56: JIT path
+
     if (!cgr.ok()) {
         for (const auto& msg : cgr.errors) {
             std::cerr << "codegen error: " << msg << '\n';

@@ -49,13 +49,14 @@ class Codegen {
 public:
     explicit Codegen(const TypeCheckResult& tc, bool emitDebugInfo = false,
                      const std::string& sourceFile = "<kardashev>",
-                     OptLevel optLevel = OptLevel::O2)
+                     OptLevel optLevel = OptLevel::O2, bool forJit = false)
         : tc_(tc),
           ctx_(std::make_unique<llvm::LLVMContext>()),
           module_(std::make_unique<llvm::Module>("kardashev", *ctx_)),
           builder_(std::make_unique<llvm::IRBuilder<>>(*ctx_)),
           optLevel_(optLevel),
-          emitDebugInfo_(emitDebugInfo) {
+          emitDebugInfo_(emitDebugInfo),
+          forJit_(forJit) {
         if (emitDebugInfo_) initDebugInfo(sourceFile);
     }
 
@@ -531,6 +532,11 @@ private:
 
     // --- Phase 14a: DWARF debug info (only populated when emitDebugInfo_) ---
     bool emitDebugInfo_ = false;
+    // v56: true when this module is for the ORC JIT. Used to keep the per-thread
+    // effect-handler globals process-global under JIT (where a thread_local
+    // global lowers to __emutls_get_address, which the JIT cannot resolve — see
+    // the panic-stack note ~line 4949); AOT gets real thread-local handlers.
+    bool forJit_ = false;
     std::unique_ptr<llvm::DIBuilder> dib_;
     llvm::DICompileUnit* diCU_ = nullptr;
     llvm::DIFile* diFile_ = nullptr;
@@ -14359,6 +14365,14 @@ private:
             llvm::GlobalValue::InternalLinkage,
             llvm::ConstantAggregateZero::get(fnValTy_),
             "__handler_" + eff + "__" + op);
+        // v56: per-THREAD handler slot in AOT, so two threads installing
+        // different handlers for the same effect don't race a shared global.
+        // Kept process-global under JIT (TLS lowers to __emutls_get_address,
+        // which the ORC JIT can't resolve); JIT runs are single-threaded so no
+        // race in practice. The handle…with save/restore then mutates only the
+        // calling thread's slot.
+        if (!forJit_)
+            g->setThreadLocalMode(llvm::GlobalValue::GeneralDynamicTLSModel);
         effectHandlerGlobals_[key] = g;
         return g;
     }
@@ -14776,8 +14790,9 @@ CodegenResult codegen(const ast::Program& program,
                        const TypeCheckResult& tc,
                        bool emitDebugInfo,
                        const std::string& sourceFile,
-                       OptLevel optLevel) {
-    Codegen cg(tc, emitDebugInfo, sourceFile, optLevel);
+                       OptLevel optLevel,
+                       bool forJit) {
+    Codegen cg(tc, emitDebugInfo, sourceFile, optLevel, forJit);
     cg.run(program);
     return cg.finish();
 }

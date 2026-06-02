@@ -83,6 +83,7 @@ CodegenResult codegen(const ast::Program& program,
                        const TypeCheckResult& tc,
                        bool emitDebugInfo = false,
                        const std::string& sourceFile = "<kardashev>",
-                       OptLevel optLevel = OptLevel::O2);
+                       OptLevel optLevel = OptLevel::O2,
+                       bool forJit = false);
 
 } // namespace kardashev
