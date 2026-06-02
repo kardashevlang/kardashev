@@ -428,6 +428,62 @@ public:
             fnSchemas_["rand_global"] = std::move(sch);
         }
 
+        // --- v63: buffered line reading + file metadata. Low-level builtins on
+        // PRIMITIVE types only (i64 handles / &mut i64 out-params / &mut String)
+        // so they never need to name the prelude `BufReader` / `Metadata`
+        // structs; the prelude wraps them in those structs + Result/Option. ---
+        // buf_reader_open(path: &String, out_fp: &mut i64) -> i64 ! { io } :
+        // fopen; 0 + fills out_fp with the FILE* (as i64) on success, else the
+        // IoError category (1/2/4).
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false),
+                 makeRef(makeInt(), /*isMut=*/true)},
+                makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["buf_reader_open"] = std::move(sch);
+        }
+        // buf_getline(fp: i64, buf: &mut i64, cap: &mut i64, out: &mut String)
+        //   -> i64 ! { io, alloc } : getline over the persistent (buf,cap)
+        // scratch; 1 + fills `out` with the next line (trailing '\n' stripped),
+        // 0 at EOF. `buf`/`cap` start at 0/0 (getline allocates).
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeInt(), makeRef(makeInt(), /*isMut=*/true),
+                 makeRef(makeInt(), /*isMut=*/true),
+                 makeRef(stringTy, /*isMut=*/true)},
+                makeInt());
+            sch.declaredEffects.add("io");
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["buf_getline"] = std::move(sch);
+        }
+        // buf_close(fp: i64, buf: i64) -> i64 ! { io } : fclose + free the
+        // getline scratch (each guarded against null). Called from Drop.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt(), makeInt()}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["buf_close"] = std::move(sch);
+        }
+        // fs_stat_into(path: &String, out_size: &mut i64, out_mode: &mut i64,
+        //   out_mtime: &mut i64) -> i64 ! { io } : stat(); 0 + fills the three
+        // out-params, else the IoError category. The prelude derives is_dir /
+        // is_file from `mode` (S_IFMT bits) so no bool/struct field is touched
+        // from codegen.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false),
+                 makeRef(makeInt(), /*isMut=*/true),
+                 makeRef(makeInt(), /*isMut=*/true),
+                 makeRef(makeInt(), /*isMut=*/true)},
+                makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["fs_stat_into"] = std::move(sch);
+        }
+
         // Phase 5.z: vec_* are generic over T. Each call site infers T
         // from arg types; codegen lazily specializes the runtime per T.
         TypePtr vecFnGenericVar = makeFreshVar();
@@ -8144,7 +8200,10 @@ private:
         // codegen unit tests) free of that machinery.
         if (call.callee == "fs_read_into" || call.callee == "fs_write_raw" ||
             call.callee == "fs_exists" || call.callee == "arg_count" ||
-            call.callee == "arg_get") {
+            call.callee == "arg_get" ||
+            // v63: buffered reader + file metadata share the file-I/O runtime.
+            call.callee == "buf_reader_open" || call.callee == "buf_getline" ||
+            call.callee == "buf_close" || call.callee == "fs_stat_into") {
             usesFileIo_ = true;
         }
         // v62: same lazy-emit story for the runtime-extras builtins (clock /

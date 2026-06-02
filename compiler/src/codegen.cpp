@@ -2294,6 +2294,215 @@ private:
                 b.CreateRet(zeroI64);
                 declaredFns_["fs_write_raw"] = fn;
             }
+
+            // --- v63: buffered line reading + file metadata. Builtins on
+            // primitive types only (i64 handles / &mut i64 / &mut String); the
+            // prelude wraps them in BufReader / Metadata + Result/Option. ---
+            auto getlineFn = module_->getOrInsertFunction(
+                "getline", llvm::FunctionType::get(
+                               i64Ty, {i8PtrTy, i8PtrTy, i8PtrTy}, false));
+            auto statFn = module_->getOrInsertFunction(
+                "stat",
+                llvm::FunctionType::get(i32Ty, {i8PtrTy, i8PtrTy}, false));
+
+            // buf_reader_open(path: &String, out_fp: &mut i64) -> i64 : fopen;
+            // 0 + stores the FILE* (as i64) into out_fp, else the IoError cat.
+            {
+                auto* ft = llvm::FunctionType::get(i64Ty, {i8PtrTy, i8PtrTy},
+                                                   false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "buf_reader_open",
+                    module_.get());
+                auto* path = fn->getArg(0);
+                auto* outFp = fn->getArg(1);
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* okBB = llvm::BasicBlock::Create(ctx, "opened", fn);
+                auto* errBB = llvm::BasicBlock::Create(ctx, "openerr", fn);
+                llvm::IRBuilder<> b(e);
+                auto* cp = b.CreateCall(cstrFn, {path}, "cp");
+                auto* rb = b.CreateGlobalString("rb", "kd_bufr_rb", 0,
+                                                module_.get());
+                auto* f = b.CreateCall(fopenFn, {cp, rb}, "f");
+                b.CreateCall(freeFn_, {cp});
+                b.CreateCondBr(b.CreateICmpNE(f, nullPtr, "opened"), okBB,
+                               errBB);
+                b.SetInsertPoint(okBB);
+                b.CreateStore(b.CreatePtrToInt(f, i64Ty, "fpi"), outFp);
+                b.CreateRet(zeroI64);
+                b.SetInsertPoint(errBB);
+                auto* cp2 = b.CreateCall(cstrFn, {path}, "cp2");
+                auto* ex = b.CreateCall(accessFn, {cp2, i32_0}, "ex");
+                auto* rd = b.CreateCall(accessFn, {cp2, i32_4}, "rd");
+                b.CreateCall(freeFn_, {cp2});
+                auto* cat = b.CreateSelect(
+                    b.CreateICmpNE(ex, i32_0, "noexist"),
+                    llvm::ConstantInt::get(i64Ty, 1),
+                    b.CreateSelect(b.CreateICmpNE(rd, i32_0, "noread"),
+                                   llvm::ConstantInt::get(i64Ty, 2),
+                                   llvm::ConstantInt::get(i64Ty, 4), "c2"),
+                    "cat");
+                b.CreateRet(cat);
+                declaredFns_["buf_reader_open"] = fn;
+            }
+
+            // buf_getline(fp: i64, buf: &mut i64, cap: &mut i64,
+            //   out: &mut String) -> i64 : getline over the persistent (buf,cap)
+            // scratch; 1 + fills `out` with an OWNED copy of the next line
+            // ('\n' stripped), 0 at EOF. `buf`/`cap` (i64 slots) double as
+            // getline's `char**`/`size_t*` (8-byte each on LP64).
+            {
+                auto* ft = llvm::FunctionType::get(
+                    i64Ty, {i64Ty, i8PtrTy, i8PtrTy, i8PtrTy}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "buf_getline",
+                    module_.get());
+                auto* fp = fn->getArg(0);
+                auto* bufPtr = fn->getArg(1);
+                auto* capPtr = fn->getArg(2);
+                auto* out = fn->getArg(3);
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* lineBB = llvm::BasicBlock::Create(ctx, "line", fn);
+                auto* eofBB = llvm::BasicBlock::Create(ctx, "eof", fn);
+                auto* stripBB = llvm::BasicBlock::Create(ctx, "strip", fn);
+                auto* nostripBB = llvm::BasicBlock::Create(ctx, "nostrip", fn);
+                auto* copyBB = llvm::BasicBlock::Create(ctx, "copy", fn);
+                llvm::IRBuilder<> b(e);
+                auto* fpp = b.CreateIntToPtr(fp, i8PtrTy, "fpp");
+                auto* n = b.CreateCall(getlineFn, {bufPtr, capPtr, fpp}, "n");
+                b.CreateCondBr(b.CreateICmpSLT(n, zeroI64, "iseof"), eofBB,
+                               lineBB);
+                b.SetInsertPoint(eofBB);
+                b.CreateRet(zeroI64);
+                // line: strip a trailing '\n' (getline keeps it). buf holds a
+                // char* (the line); reload it from the slot.
+                b.SetInsertPoint(lineBB);
+                auto* data = b.CreateLoad(i8PtrTy, bufPtr, "data");
+                auto* lastIdx = b.CreateSub(n, one64, "lastidx");
+                auto* lastCh = b.CreateLoad(
+                    i8Ty, b.CreateGEP(i8Ty, data, lastIdx, "lastp"), "lastch");
+                b.CreateCondBr(
+                    b.CreateICmpEQ(lastCh, llvm::ConstantInt::get(i8Ty, 10),
+                                   "isnl"),
+                    stripBB, nostripBB);
+                b.SetInsertPoint(stripBB);
+                b.CreateBr(copyBB);
+                b.SetInsertPoint(nostripBB);
+                b.CreateBr(copyBB);
+                b.SetInsertPoint(copyBB);
+                auto* len = b.CreatePHI(i64Ty, 2, "len");
+                len->addIncoming(lastIdx, stripBB);
+                len->addIncoming(n, nostripBB);
+                // OWNED copy so the returned String survives the next getline.
+                auto* buf2 = b.CreateCall(mallocFn_, {len}, "buf2");
+                b.CreateCall(memcpyFn_, {buf2, data, len});
+                b.CreateStore(buf2, b.CreateStructGEP(strTy, out, 0, "od"));
+                b.CreateStore(len, b.CreateStructGEP(strTy, out, 1, "ol"));
+                b.CreateStore(len, b.CreateStructGEP(strTy, out, 2, "oc"));
+                b.CreateRet(one64);
+                declaredFns_["buf_getline"] = fn;
+            }
+
+            // buf_close(fp: i64, buf: i64) -> i64 : fclose + free the scratch,
+            // each guarded against a null handle.
+            {
+                auto* ft = llvm::FunctionType::get(i64Ty, {i64Ty, i64Ty},
+                                                   false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "buf_close",
+                    module_.get());
+                auto* fp = fn->getArg(0);
+                auto* buf = fn->getArg(1);
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* closeBB = llvm::BasicBlock::Create(ctx, "doclose", fn);
+                auto* afterCloseBB =
+                    llvm::BasicBlock::Create(ctx, "afterclose", fn);
+                auto* freeBB = llvm::BasicBlock::Create(ctx, "dofree", fn);
+                auto* doneBB = llvm::BasicBlock::Create(ctx, "done", fn);
+                llvm::IRBuilder<> b(e);
+                b.CreateCondBr(b.CreateICmpNE(fp, zeroI64, "hasfp"), closeBB,
+                               afterCloseBB);
+                b.SetInsertPoint(closeBB);
+                b.CreateCall(fcloseFn, {b.CreateIntToPtr(fp, i8PtrTy, "fpp")});
+                b.CreateBr(afterCloseBB);
+                b.SetInsertPoint(afterCloseBB);
+                b.CreateCondBr(b.CreateICmpNE(buf, zeroI64, "hasbuf"), freeBB,
+                               doneBB);
+                b.SetInsertPoint(freeBB);
+                b.CreateCall(freeFn_, {b.CreateIntToPtr(buf, i8PtrTy, "bp")});
+                b.CreateBr(doneBB);
+                b.SetInsertPoint(doneBB);
+                b.CreateRet(zeroI64);
+                declaredFns_["buf_close"] = fn;
+            }
+
+            // fs_stat_into(path, &mut size, &mut mode, &mut mtime) -> i64 :
+            // stat() into a generously-sized buffer, then read st_size /
+            // st_mode / st_mtime at PLATFORM byte offsets (the host that builds
+            // kardc == the target that runs the emitted binary, so #if matches
+            // the runtime libc). The size/is_dir/is_file gate runs on BOTH CI
+            // platforms, so a wrong offset surfaces as a red gate.
+            {
+#if defined(__APPLE__)
+                // Darwin `struct stat` (64-bit inode): st_mode u16 @4,
+                // st_mtimespec.tv_sec @48, st_size @96.
+                const int kOffMode = 4, kModeBits = 16, kOffMtime = 48,
+                          kOffSize = 96;
+#else
+                // glibc x86-64 `struct stat`: st_mode u32 @24,
+                // st_mtim.tv_sec @88, st_size @48.
+                const int kOffMode = 24, kModeBits = 32, kOffMtime = 88,
+                          kOffSize = 48;
+#endif
+                auto* ft = llvm::FunctionType::get(
+                    i64Ty, {i8PtrTy, i8PtrTy, i8PtrTy, i8PtrTy}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "fs_stat_into",
+                    module_.get());
+                auto* path = fn->getArg(0);
+                auto* outSize = fn->getArg(1);
+                auto* outMode = fn->getArg(2);
+                auto* outMtime = fn->getArg(3);
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* okBB = llvm::BasicBlock::Create(ctx, "statok", fn);
+                auto* errBB = llvm::BasicBlock::Create(ctx, "staterr", fn);
+                llvm::IRBuilder<> b(e);
+                // 256 bytes safely covers `struct stat` (144) on both targets.
+                auto* sbuf = b.CreateAlloca(
+                    i8Ty, llvm::ConstantInt::get(i64Ty, 256), "statbuf");
+                auto* cp = b.CreateCall(cstrFn, {path}, "cp");
+                auto* r = b.CreateCall(statFn, {cp, sbuf}, "r");
+                b.CreateCall(freeFn_, {cp});
+                b.CreateCondBr(b.CreateICmpEQ(r, i32_0, "statok"), okBB, errBB);
+                b.SetInsertPoint(errBB);
+                auto* cp2 = b.CreateCall(cstrFn, {path}, "cp2");
+                auto* ex = b.CreateCall(accessFn, {cp2, i32_0}, "ex");
+                b.CreateCall(freeFn_, {cp2});
+                b.CreateRet(b.CreateSelect(
+                    b.CreateICmpNE(ex, i32_0, "noexist"),
+                    llvm::ConstantInt::get(i64Ty, 1),
+                    llvm::ConstantInt::get(i64Ty, 4), "cat"));
+                b.SetInsertPoint(okBB);
+                auto* sizeP = b.CreateGEP(
+                    i8Ty, sbuf, llvm::ConstantInt::get(i64Ty, kOffSize), "szp");
+                b.CreateStore(b.CreateLoad(i64Ty, sizeP, "sz"), outSize);
+                auto* modeP = b.CreateGEP(
+                    i8Ty, sbuf, llvm::ConstantInt::get(i64Ty, kOffMode), "mdp");
+                llvm::Value* mode;
+                if (kModeBits == 16)
+                    mode = b.CreateZExt(
+                        b.CreateLoad(llvm::Type::getInt16Ty(ctx), modeP, "md16"),
+                        i64Ty, "md");
+                else
+                    mode = b.CreateZExt(
+                        b.CreateLoad(i32Ty, modeP, "md32"), i64Ty, "md");
+                b.CreateStore(mode, outMode);
+                auto* mtP = b.CreateGEP(
+                    i8Ty, sbuf, llvm::ConstantInt::get(i64Ty, kOffMtime),
+                    "mtp");
+                b.CreateStore(b.CreateLoad(i64Ty, mtP, "mt"), outMtime);
+                b.CreateRet(zeroI64);
+                declaredFns_["fs_stat_into"] = fn;
+            }
         }
 
         // --- v62: stdlib runtime extras — monotonic clock, env vars, seeded

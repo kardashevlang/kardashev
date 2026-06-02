@@ -832,6 +832,11 @@ std::string applyPrelude(const std::string& userSrc) {
     const bool wantsIo = userSrc.find("fs_read_to_string") != std::string::npos ||
                          userSrc.find("fs_write") != std::string::npos ||
                          userSrc.find("fs_exists") != std::string::npos ||
+                         // v63: buffered reader + metadata also return IoError.
+                         userSrc.find("buf_reader_new") != std::string::npos ||
+                         userSrc.find("fs_metadata") != std::string::npos ||
+                         userSrc.find("fs_is_dir") != std::string::npos ||
+                         userSrc.find("fs_is_file") != std::string::npos ||
                          userSrc.find("IoError") != std::string::npos;
     if (wantsIo && userSrc.find("enum IoError") == std::string::npos) {
         prelude +=
@@ -862,6 +867,58 @@ std::string applyPrelude(const std::string& userSrc) {
             " -> Result<i64, IoError> ! { io } {\n"
             "    let c = fs_write_raw(path, contents);\n"
             "    if c == 0 { Ok(0) } else { Err(io_error_cat(c)) }\n"
+            "}\n";
+    }
+    // v63: a buffered line reader. `BufReader` owns the FILE* (as i64) and the
+    // persistent getline scratch (buf,cap); Drop fclose()s + free()s them (so a
+    // dropped reader is LSan-clean). `buf_read_line` yields `\n`-stripped lines,
+    // `None` at EOF. Injected only when referenced; references Result/Option/
+    // IoError, so it follows the fs prelude block.
+    if (userSrc.find("buf_reader_new") != std::string::npos &&
+        userSrc.find("struct BufReader") == std::string::npos) {
+        prelude +=
+            "struct BufReader { fp: i64, buf: i64, cap: i64 }\n"
+            "impl Drop for BufReader { fn drop(&mut self) ! { io }"
+            " { buf_close(self.fp, self.buf); } }\n"
+            "fn buf_reader_new(path: &String) -> Result<BufReader, IoError>"
+            " ! { io, alloc } {\n"
+            "    let mut fp = 0;\n"
+            "    let c = buf_reader_open(path, &mut fp);\n"
+            "    if c == 0 { Ok(BufReader { fp: fp, buf: 0, cap: 0 }) }\n"
+            "    else { Err(io_error_cat(c)) }\n"
+            "}\n"
+            "fn buf_read_line(br: &mut BufReader) -> Option<String> ! { io, alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let r = buf_getline(br.fp, &mut br.buf, &mut br.cap, &mut out);\n"
+            "    if r == 1 { Some(out) } else { None }\n"
+            "}\n";
+    }
+    // v63: file metadata via a single stat(). The builtin returns size/mode/
+    // mtime as i64 out-params; the prelude derives is_dir/is_file from the
+    // S_IFMT bits (S_IFMT=0xF000=61440, S_IFDIR=0x4000=16384, S_IFREG=0x8000=
+    // 32768) so no bool/struct field is touched from codegen.
+    if ((userSrc.find("fs_metadata") != std::string::npos ||
+         userSrc.find("fs_is_dir") != std::string::npos ||
+         userSrc.find("fs_is_file") != std::string::npos) &&
+        userSrc.find("struct Metadata") == std::string::npos) {
+        prelude +=
+            "struct Metadata { size: i64, is_dir: bool, is_file: bool, mtime: i64 }\n"
+            "fn fs_metadata(path: &String) -> Result<Metadata, IoError> ! { io } {\n"
+            "    let mut size = 0;\n"
+            "    let mut mode = 0;\n"
+            "    let mut mtime = 0;\n"
+            "    let c = fs_stat_into(path, &mut size, &mut mode, &mut mtime);\n"
+            "    if c == 0 {\n"
+            "        let masked = mode & 61440;\n"
+            "        Ok(Metadata { size: size, is_dir: masked == 16384,"
+            " is_file: masked == 32768, mtime: mtime })\n"
+            "    } else { Err(io_error_cat(c)) }\n"
+            "}\n"
+            "fn fs_is_dir(path: &String) -> bool ! { io } {\n"
+            "    match fs_metadata(path) { Ok(m) => m.is_dir, Err(e) => false }\n"
+            "}\n"
+            "fn fs_is_file(path: &String) -> bool ! { io } {\n"
+            "    match fs_metadata(path) { Ok(m) => m.is_file, Err(e) => false }\n"
             "}\n";
     }
     if (userSrc.find("args") != std::string::npos &&

@@ -730,6 +730,19 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v63: stdlib I/O depth — buffered line reader + file metadata.
+sh_test(
+    name = "smoke_test_buf_reader",
+    srcs = ["smoke_test_buf_reader.sh"],
+    data = ["//compiler:kardc"],
+)
+
+sh_test(
+    name = "smoke_test_fs_metadata",
+    srcs = ["smoke_test_fs_metadata.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
