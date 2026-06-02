@@ -393,6 +393,8 @@ verified UB-free by tooling wired into the release gate). Type-system begins 6/6
 
 ### v48 — "6/6 BEYOND II: effect unification, fusing stdlib, perf contracts, deadlock-freedom" — moves: AE → 6/6, SL → 6, BP → 6/6, CC → 6 (begins)
 
+> **Status (`v0.48.0`, partial):** ✅ SHIPPED — per-function codegen-quality contracts `#[codegen(no_alloc, no_panic, no_io)]`, statically verified against the (transitively sound) effect set: a fn that — or whose callee — performs the forbidden effect FAILS compilation; contracts compose, run in normal `kardc`, CI-gated with negative tests that bite (incl. transitive-callee + catch-discharged-panic). ⛔ DEFERRED — `vectorized` contract (vector-IR inspection), async-as-effect-handler unification, fusing iterators, derive-serde + schema-evolution, machine-verified Big-O contracts, `--sim` deterministic replay, dual-bound perf gate, universal C reach (Windows/non-LLVM arch env), static deadlock-freedom (all XL/research-grade).
+
 The cross-dimension differentiators that depend on v47's safety base and v44's
 backend base.
 

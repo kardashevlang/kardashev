@@ -18,6 +18,34 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.48.0] — Roadmap v48 "6/6 BEYOND II: per-function codegen-quality contracts" (partial)
+
+### Added
+- **Per-function codegen-quality contracts** — `#[codegen(no_alloc)]`,
+  `#[codegen(no_panic)]`, and `#[codegen(no_io)]` are statically-verified
+  guarantees about the emitted code. A contract is checked against the function's
+  **transitively sound** effect set: if the function — or anything it calls —
+  performs the forbidden effect (`alloc` / `panic` / `io`), compilation **fails**
+  with a diagnostic naming the function and the violating effect. Contracts
+  compose on one fn (`#[codegen(no_alloc, no_panic, no_io)]`), run in normal
+  `kardc` (no special flag), and are CI-gated by `smoke_test_codegen_contracts.sh`
+  (each contract proven to bite by a negative test, including a transitive-callee
+  case; a `catch`-discharged panic correctly satisfies `no_panic`). This lets a
+  hot path or a `no_std`/embedded function promise it never touches the heap, the
+  panic runtime, or I/O — checked, not hoped. (A beyond-parity capability; the
+  acceptance gate for the v48 "per-function codegen-quality contracts" phase.)
+
+### Deferred / honest limitations
+- The rest of v48's 6/6 work remains XL/research-grade (ROADMAP, v48): the
+  `vectorized` codegen contract (needs vector-IR inspection post-lowering),
+  async-as-an-effect-handler runtime unification, zero-allocation fusing iterator
+  pipelines, derive-based serde + schema-evolution checking, machine-verified
+  Big-O collection contracts, the deterministic replayable (`--sim`) executor,
+  the always-on dual-bound perf-regression gate, universal C-backend reach across
+  Windows/non-LLVM arches, and static deadlock-freedom. The contracts shipped
+  here cover the three most useful effect-based guarantees and reuse the existing
+  (sound) effect system rather than approximating it.
+
 ## [0.47.0] — Roadmap v47 "6/6 BEYOND I: verified safety + totality" (partial)
 
 ### Added
