@@ -4082,6 +4082,13 @@ private:
         restrictStructLit_ = false;
         if (!check(TokenKind::RBrace)) {
             while (true) {
+                // v59: `..base` struct-update spread (must be the last element).
+                if (check(TokenKind::DotDot)) {
+                    consume(); // ..
+                    lit->spread = parseExpr();
+                    accept(TokenKind::Comma); // tolerate a trailing comma
+                    break;
+                }
                 Token fnameTok = expect(TokenKind::Identifier, "field name");
                 expect(TokenKind::Colon, ":");
                 auto value = parseExpr();

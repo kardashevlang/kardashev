@@ -681,6 +681,7 @@ private:
         }
         if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
             for (const auto& [_n, v] : sl->fields) prePass(*v);
+            if (sl->spread) prePass(*sl->spread); // v59 struct-update base
             return;
         }
         if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
@@ -1165,6 +1166,9 @@ private:
                 lastInSubtree = std::max(lastInSubtree,
                                            consume(*v, expectExpire));
             }
+            if (sl->spread) // v59: the struct-update base (Copy => read)
+                lastInSubtree = std::max(lastInSubtree,
+                                         consume(*sl->spread, expectExpire));
             return lastInSubtree;
         }
         if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {

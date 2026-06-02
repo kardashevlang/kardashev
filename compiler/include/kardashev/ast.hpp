@@ -274,6 +274,10 @@ struct CallValueExpr : Expr {
 struct StructLitExpr : Expr {
     std::string structName;
     std::vector<std::pair<std::string, ExprPtr>> fields;
+    // v59 struct-update syntax: `S { x: 10, ..base }`. `spread` is the base
+    // value; fields not given explicitly are taken from it. Null for an ordinary
+    // literal. (v59 requires a Copy base; move-base spread is deferred.)
+    ExprPtr spread;
 };
 
 struct FieldExpr : Expr {

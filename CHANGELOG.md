@@ -18,6 +18,29 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.59.0] — Ergonomics: struct-update spread
+
+### Added
+- **Struct-update syntax `S { x: 10, ..base }`** — fields not given explicitly are
+  taken from `base`. This version supports a **Copy base** (a struct whose fields
+  are all Copy — scalars / arrays / tuples): codegen byte-copies the base and
+  overwrites the explicit fields (the base is consumed, per kardashev's struct
+  move semantics). The base must be a value of the **same** struct. Implemented
+  via a new `StructLitExpr.spread` field threaded through the parser, typecheck
+  (`validateStructLitFields`: explicit fields ∪ base cover all; same-struct +
+  all-Copy checks), codegen (`emitStructLit`: `ExtractValue` the missing fields),
+  and the borrow/effects/clone walks.
+  CI-gated by `smoke_test_struct_update.sh` (4 accept JIT==AOT + 2 reject:
+  wrong-type base, move-field struct).
+
+### Deferred (honest)
+- **Move-field spread** (a base with heap fields) — needs partial-move-from-base
+  + drop of the overwritten base fields; rejected cleanly for now.
+- **Parameter destructuring** (`fn f(P { x, y }: P)`) — the roadmap's other half;
+  it touches the pervasive `Param` struct and fn-entry codegen (higher blast
+  radius). Struct-update spread is the self-contained, higher-leverage half;
+  param-destructure is a follow-on.
+
 ## [0.58.0] — Ergonomics: `if let` / `while let`
 
 ### Added
