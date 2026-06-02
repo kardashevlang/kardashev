@@ -18,6 +18,37 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.53.0] — Soundness + feature: `&CONST` promotion
+
+### Fixed (memory safety) / Added
+- **A borrowed scalar `const` is now a stable, returnable reference.** A
+  top-level `const` is an inlined immediate with no address, so `&C` used to
+  materialize a **frame-local temporary**: reading it in scope worked, but
+  *returning* it (wrapped in a struct/tuple/enum) read freed stack — a
+  dangling-reference UB orthogonal to, and missed by, the v0.52.0 escape
+  analysis (which classified `&const` as a safe global). Codegen now **promotes**
+  a borrowed scalar const to a deduplicated internal global, so `&C` is a genuine
+  `'static` address: it reads correctly in scope **and** can be safely returned
+  (e.g. `fn make() -> R { R { p: &C } }` now returns a live reference, not
+  garbage). The escape checker's "this reference outlives the call" signal is
+  keyed on the *same* condition (membership in the scalar-const set), so the two
+  agree exactly.
+- **Latent companion hole closed:** because the escape checker previously treated
+  *every* unresolved `&ident` as a safe global, returning `&<nullary-enum>`
+  (`&Nil`) or `&<aggregate-const>` — both frame-local temporaries — was also
+  wrongly accepted. The classifier now treats a non-(scalar-const) `&ident` as a
+  temporary, so those returns are correctly rejected with the
+  "does not outlive this function" diagnostic. In-scope use of such borrows still
+  works. CI-gated by `smoke_test_const_ref.sh` (6 accept-and-run + 2 reject).
+
+### Known limitations (documented)
+- **Aggregate consts are not promoted.** A borrowed array/struct/enum `const`
+  remains a frame-local temporary: it works in scope but cannot be returned
+  (rejected by the escape check, soundly). Promoting aggregate consts to globals
+  (materializing their initializer) is a follow-on.
+- Reference *stores* into out-parameters (`out.p = &local`) remain unchecked
+  (v0.52.0 limitation, unchanged).
+
 ## [0.52.0] — Soundness: escape analysis closes a dangling-reference UB
 
 ### Fixed (memory safety)
