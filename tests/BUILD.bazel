@@ -641,6 +641,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v54: store-escape — a frame-local ref may not be stored into an out-param field.
+sh_test(
+    name = "smoke_test_field_ref_escape",
+    srcs = ["smoke_test_field_ref_escape.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
