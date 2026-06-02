@@ -15,6 +15,9 @@ starting points, not exact post-edit coordinates.
 
 ## v54 — Soundness: reference-store-into-out-param escape + aggregate-const promotion
 
+> **Status:** ✅ SHIPPED v0.54.0 — out-param store escape (Part 1). Aggregate-const promotion (Part 2) deferred honestly (needs AST→llvm::Constant lowering; current behaviour already sound).
+
+
 **Theme:** Close the two open escape-analysis holes documented in
 `CHANGELOG.md` (v0.52.0 / v0.53.0 "Known limitations", lines 44–50).
 

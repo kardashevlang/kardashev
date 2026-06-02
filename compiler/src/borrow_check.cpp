@@ -573,6 +573,29 @@ private:
                   value.line, value.column);
     }
 
+    // v54: reject STORING a frame-local reference into a place that OUTLIVES
+    // this frame (a `&mut` out-parameter's field, or a global), which would
+    // leave a dangling reference after the function returns — the store-escape
+    // companion to checkReturnEscape. A bare-local target dies with the frame,
+    // so only field/index/deref targets rooted in a reference parameter (or a
+    // global) can outlive it.
+    void checkStoreEscape(const ast::Expr& target, const ast::Expr& value) {
+        if (dynamic_cast<const ast::IdentExpr*>(&target)) return; // the local itself
+        RootKind tgt = classifyRoot(target);
+        if (tgt != RootKind::RefParam && tgt != RootKind::Global)
+            return; // target dies with this frame — both sides drop together
+        TypePtr fieldTy = typeOf(target);
+        if (!fieldTy || !typeContainsRef(fieldTy)) return; // not storing a ref
+        if (escapesAggregateRef(value, fieldTy))
+            error("cannot store a reference to a local variable, a by-value "
+                  "parameter, or a temporary into a place that outlives this "
+                  "function (an out-parameter / `&mut` field): it would dangle "
+                  "after the function returns (kardashev has no lifetime system "
+                  "yet; store an owned value, or a reference borrowed from a "
+                  "reference parameter)",
+                  value.line, value.column);
+    }
+
     TypePtr typeOf(const ast::Expr& e) {
         auto it = tc_.exprTypes.find(&e);
         if (it == tc_.exprTypes.end()) return nullptr;
@@ -1554,6 +1577,7 @@ private:
                     // root). The old value is dropped in codegen's emitAssign.
                     p = std::max(p, consumePlace(*as->target, /*expectExpire=*/-1));
                 }
+                checkStoreEscape(*as->target, *as->value); // v54: out-param store
                 retireExpiredLoans(p);
                 last = std::max(last, p);
                 continue;
