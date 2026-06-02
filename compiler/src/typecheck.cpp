@@ -2777,6 +2777,7 @@ public:
             }
         }
         checkTotality(program); // v47: verify every `#[total]` fn terminates
+        checkExhaustiveEffects(program); // v50: no user effect escapes to main
         // Validate trait method signatures don't declare unknown effects
         // (the dispatching impl method's effects already get checked
         // above via its FnSchema; the trait sig's effects are advisory
@@ -3061,6 +3062,9 @@ private:
     std::unordered_map<std::string,
                        std::unordered_map<std::string, const ast::EffectOp*>>
         effectOpDecls_;
+    // v50: first perform site (program-wide) of each effect, for the
+    // exhaustive-effect-handling diagnostic (checkExhaustiveEffects).
+    std::unordered_map<std::string, const ast::PerformExpr*> firstPerform_;
     // Phase 10a: name -> Var for the effect-row variables of the fn whose
     // body is currently being checked. Lets us map a resolved Type Var back
     // to the row-var name it stands for (so a still-polymorphic row var
@@ -3350,6 +3354,10 @@ private:
         if (auto* pe = dynamic_cast<const ast::PerformExpr*>(&e)) {
             for (const auto& a : pe->args) collectEffects(*a, out);
             out.add(pe->effectName);
+            // v50: remember the first perform site of each effect, program-wide,
+            // so checkExhaustiveEffects can pinpoint the operation that escapes.
+            if (!firstPerform_.count(pe->effectName))
+                firstPerform_[pe->effectName] = pe;
             auto eff = effectOpDecls_.find(pe->effectName);
             if (eff != effectOpDecls_.end()) {
                 auto op = eff->second.find(pe->opName);
@@ -9621,6 +9629,43 @@ private:
     // it must be acyclic (no recursion). Anything that *might* diverge is
     // rejected; `for`-over-a-range is bounded and fine. (The full halting
     // oracle + a `div` effect row is the deferred 6/6 work.)
+    // v50: statically-verified exhaustive effect handling. A user-defined
+    // (algebraic) effect MUST be discharged by a `handle … with E { … }` before
+    // it reaches the program entry point `main` — performing an effect with no
+    // installed handler is undefined (it would silently no-op / return garbage at
+    // runtime). The effect system already propagates a user effect into the
+    // inferred effect set of every fn on the path to its perform site (and a
+    // `handle` removes it); so if `main`'s inferred set still contains a user
+    // effect, that effect escapes unhandled — reject it, pinpointing the op.
+    // (Builtin effects — io/alloc/panic/… — legitimately reach `main`.)
+    void checkExhaustiveEffects(const ast::Program& program) {
+        if (userEffectNames_.empty()) return; // zero cost when unused
+        for (const auto& fn : program.functions) {
+            if (fn.name != "main" || !fn.body) continue;
+            EffectSet inferred;
+            collectEffects(*fn.body, inferred);
+            for (const auto& l : inferred.labels) {
+                if (!userEffectNames_.count(l)) continue; // builtins ok at root
+                int line = fn.line, col = fn.column;
+                std::string opHint;
+                auto it = firstPerform_.find(l);
+                if (it != firstPerform_.end() && it->second) {
+                    line = it->second->line;
+                    col = it->second->column;
+                    opHint = " (first performed as `" + l +
+                             "::" + it->second->opName + "`)";
+                }
+                error("effect `" + l +
+                          "` is performed but never handled before reaching "
+                          "`main`" +
+                          opHint +
+                          "; wrap the work in `handle { … } with " + l +
+                          " { … }`",
+                      line, col);
+            }
+        }
+    }
+
     void checkTotality(const ast::Program& program) {
         bool anyTotal = false;
         for (const auto& fn : program.functions)
