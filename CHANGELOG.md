@@ -18,6 +18,23 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.45.0] — Roadmap v45 "Ecosystem foundation: registry, toolchain, spec" (partial)
+
+### Added
+- **Normative language spec** (`docs/SPEC.md`) — the EBNF grammar + load-bearing
+  normative clauses (effects, ownership/borrow/drop, panic, overflow, C ABI,
+  object-safety) with stable `[K-xxx]` ids, describing the language as `kardc`
+  accepts it today. Grounded by `smoke_test_grammar_conformance.sh` (20
+  well-formed programs compile, 8 ill-formed rejected). Honest: it corrected a
+  wrong assumption — match guards `pat if cond =>` are roadmapped, not yet
+  implemented (only or-patterns landed); the grammar reflects that.
+
+### Deferred / honest limitations
+- The rest of v45 is ecosystem infra this sandbox can't host/verify (ROADMAP,
+  v45): the hosted package registry + `kard publish`, the `kardup` toolchain
+  manager, the manifest resolver/lockfile + MSRV enforcement, the
+  >=2000-program EBNF-conformance generator, and the salsa-style query engine.
+
 ## [0.44.0] — Roadmap v44 "Backends & platforms: perf, cross, WASM, Windows" (partial)
 
 ### Added
