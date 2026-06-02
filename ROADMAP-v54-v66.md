@@ -74,6 +74,9 @@ starting points, not exact post-edit coordinates.
 
 ## v55 — Correctness: UTF-8-safe string casing (+ the genuinely-missing char API)
 
+> **Status:** ✅ SHIPPED v0.55.0 — UTF-8-safe casing (café→CAFÉ; char_to_upper/lower extended to Latin-1) + str_split_char/str_get_char/str_index_char + Drop as a built-in prelude trait. (vec_reverse already existed — not re-added.)
+
+
 **Theme:** Fix the documented UTF-8 corruption bug and add only the helpers that
 are actually absent — pure-prelude Kardashev, no codegen changes.
 

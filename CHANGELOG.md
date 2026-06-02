@@ -18,6 +18,37 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.55.0] — Correctness: UTF-8-safe string casing + char API + built-in `Drop`
+
+### Fixed (correctness)
+- **`str_to_upper` / `str_to_lower` are now UTF-8-safe.** They iterated by *byte*
+  and mapped only ASCII 97–122 / 65–90, so `str_to_upper("café")` left the `é`
+  un-cased. They now iterate by **char** (`str_char_width_at` +
+  `str_decode_char_at`), case-map the codepoint, and re-encode with the existing
+  `str_push_char` codec — `str_to_upper("café") == "CAFÉ"`. `char_to_upper` /
+  `char_to_lower` were extended from ASCII-only to the **Latin-1 Supplement**
+  (à–þ ↔ À–Þ via ±32, with the ÷/×/ÿ↔Ÿ exceptions). Full Unicode case folding
+  (Greek/Cyrillic/Latin-Extended, ß→SS) is deferred (needs a Unicode DB).
+
+### Added
+- **Char-indexed string helpers:** `str_split_char(&String, char)` (vs the
+  existing by-substring `str_split`), `str_get_char(&String, i)` → `char`,
+  `str_index_char(&String, char)` → `Option<i64>` (all char-boundary-correct).
+- **`Drop` is now a built-in prelude trait** — `impl Drop for T` resolves
+  *without* the user re-declaring `trait Drop` (it used to error "unknown trait
+  Drop"). The drop glue (user destructor first, then reverse-field drop) has
+  existed since Phase 16; this closes only the declaration gap. A user-declared
+  `trait Drop` still wins (guarded). Method effect row is `! { io }` (matching the
+  established convention); a drop needing other effects can declare its own trait.
+
+CI-gated by `smoke_test_utf8_casing.sh` (the `café` bug case + 8 Latin-1
+round-trips + the 3 helpers, JIT==AOT) and `smoke_test_builtin_drop.sh`. Existing
+`smoke_test_drop.sh` / `smoke_test_strings.sh` stay green.
+
+### Note
+- `vec_reverse` was already in the prelude (the roadmap draft wrongly listed it
+  as missing); not re-added.
+
 ## [0.54.0] — Soundness: store-into-out-parameter escape (escape-analysis trilogy complete)
 
 ### Fixed (memory safety)
