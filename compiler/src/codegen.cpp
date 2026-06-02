@@ -2296,6 +2296,210 @@ private:
             }
         }
 
+        // --- v62: stdlib runtime extras — monotonic clock, env vars, seeded
+        // process-global RNG. Emitted only when referenced (tc_.usesRuntimeExtras)
+        // so clock-/env-free programs (and the codegen unit tests) stay clean.
+        // Each is a thin libc wrapper (clock_gettime / getenv / setenv / atoll),
+        // declared idempotently via getOrInsertFunction; the prelude wraps these
+        // in Instant / Option<String>. The RNG lives in two internal globals
+        // (state + seeded flag), seeded lazily from KARDASHEV_SEED.
+        if (tc_.usesRuntimeExtras) {
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            auto* nullPtr = llvm::ConstantPointerNull::get(i8PtrTy);
+            auto* one64 = llvm::ConstantInt::get(i64Ty, 1);
+            auto getenvFn = module_->getOrInsertFunction(
+                "getenv", llvm::FunctionType::get(i8PtrTy, {i8PtrTy}, false));
+            auto setenvFn = module_->getOrInsertFunction(
+                "setenv", llvm::FunctionType::get(
+                              i32Ty, {i8PtrTy, i8PtrTy, i32Ty}, false));
+            auto atollFn = module_->getOrInsertFunction(
+                "atoll", llvm::FunctionType::get(i64Ty, {i8PtrTy}, false));
+            auto strlenFn = module_->getOrInsertFunction(
+                "strlen", llvm::FunctionType::get(i64Ty, {i8PtrTy}, false));
+            auto freeFn = module_->getOrInsertFunction(
+                "free", llvm::FunctionType::get(
+                            llvm::Type::getVoidTy(ctx), {i8PtrTy}, false));
+            auto clockFn = module_->getOrInsertFunction(
+                "clock_gettime",
+                llvm::FunctionType::get(i32Ty, {i32Ty, i8PtrTy}, false));
+
+            // __kd_cstr2(&String) -> i8* : malloc'd NUL-terminated copy (caller
+            // frees). A local twin of the usesFileIo block's __kd_cstr so this
+            // runtime is self-contained regardless of which blocks emit.
+            llvm::Function* cstr2;
+            {
+                auto* ft = llvm::FunctionType::get(i8PtrTy, {i8PtrTy}, false);
+                cstr2 = llvm::Function::Create(
+                    ft, llvm::Function::InternalLinkage, "__kd_cstr2",
+                    module_.get());
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", cstr2);
+                llvm::IRBuilder<> b(e);
+                auto* s = cstr2->getArg(0);
+                auto* data = b.CreateLoad(
+                    i8PtrTy, b.CreateStructGEP(strTy, s, 0, "dp"), "data");
+                auto* len = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(strTy, s, 1, "lp"), "len");
+                auto* buf = b.CreateCall(
+                    mallocFn_, {b.CreateAdd(len, one64, "len1")}, "cbuf");
+                b.CreateCall(memcpyFn_, {buf, data, len});
+                b.CreateStore(llvm::ConstantInt::get(i8Ty, 0),
+                              b.CreateGEP(i8Ty, buf, len, "nulp"));
+                b.CreateRet(buf);
+            }
+
+            // monotonic_millis() -> i64 : CLOCK_MONOTONIC seconds*1000 + ns/1e6.
+            {
+                auto* ft = llvm::FunctionType::get(i64Ty, {}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "monotonic_millis",
+                    module_.get());
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                llvm::IRBuilder<> b(e);
+                // `struct timespec` = two contiguous i64s on the LP64 targets.
+                auto* ts = b.CreateAlloca(
+                    i64Ty, llvm::ConstantInt::get(i64Ty, 2), "ts");
+                b.CreateCall(clockFn,
+                             {llvm::ConstantInt::get(i32Ty, kMonotonicClockId),
+                              ts});
+                auto* sec = b.CreateLoad(i64Ty, ts, "sec");
+                auto* nsec = b.CreateLoad(
+                    i64Ty, b.CreateGEP(i64Ty, ts, one64, "nsecp"), "nsec");
+                auto* ms = b.CreateAdd(
+                    b.CreateMul(sec, llvm::ConstantInt::get(i64Ty, 1000),
+                                "secms"),
+                    b.CreateSDiv(nsec,
+                                 llvm::ConstantInt::get(i64Ty, 1000000),
+                                 "nsms"),
+                    "ms");
+                b.CreateRet(ms);
+                declaredFns_["monotonic_millis"] = fn;
+            }
+
+            // env_var_into(name: &String, out: &mut String) -> i64 : getenv;
+            // on a hit, fills `out` with an OWNED copy and returns 1, else 0.
+            {
+                auto* ft = llvm::FunctionType::get(i64Ty, {i8PtrTy, i8PtrTy},
+                                                   false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "env_var_into",
+                    module_.get());
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* hitBB = llvm::BasicBlock::Create(ctx, "hit", fn);
+                auto* missBB = llvm::BasicBlock::Create(ctx, "miss", fn);
+                llvm::IRBuilder<> b(e);
+                auto* key = b.CreateCall(cstr2, {fn->getArg(0)}, "key");
+                auto* val = b.CreateCall(getenvFn, {key}, "val");
+                b.CreateCall(freeFn, {key});
+                b.CreateCondBr(b.CreateICmpNE(val, nullPtr, "found"), hitBB,
+                               missBB);
+                b.SetInsertPoint(hitBB);
+                auto* vlen = b.CreateCall(strlenFn, {val}, "vlen");
+                auto* buf = b.CreateCall(mallocFn_, {vlen}, "vbuf");
+                b.CreateCall(memcpyFn_, {buf, val, vlen});
+                auto* out = fn->getArg(1);
+                b.CreateStore(buf, b.CreateStructGEP(strTy, out, 0, "odp"));
+                b.CreateStore(vlen, b.CreateStructGEP(strTy, out, 1, "olp"));
+                b.CreateStore(vlen, b.CreateStructGEP(strTy, out, 2, "ocp"));
+                b.CreateRet(one64);
+                b.SetInsertPoint(missBB);
+                b.CreateRet(zeroI64);
+                declaredFns_["env_var_into"] = fn;
+            }
+
+            // env_var_set(name: &String, val: &String) -> i64 : setenv(...,1).
+            {
+                auto* ft = llvm::FunctionType::get(i64Ty, {i8PtrTy, i8PtrTy},
+                                                   false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "env_var_set",
+                    module_.get());
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                llvm::IRBuilder<> b(e);
+                auto* key = b.CreateCall(cstr2, {fn->getArg(0)}, "key");
+                auto* vstr = b.CreateCall(cstr2, {fn->getArg(1)}, "vstr");
+                // setenv copies name + value, so freeing after is safe.
+                auto* r = b.CreateCall(
+                    setenvFn, {key, vstr, llvm::ConstantInt::get(i32Ty, 1)},
+                    "r");
+                b.CreateCall(freeFn, {key});
+                b.CreateCall(freeFn, {vstr});
+                b.CreateRet(b.CreateSExt(r, i64Ty, "r64"));
+                declaredFns_["env_var_set"] = fn;
+            }
+
+            // The process-global RNG: state + a seeded flag, both internal (only
+            // these two functions touch them, so the optimizer sees every use).
+            auto* rngState = new llvm::GlobalVariable(
+                *module_, i64Ty, /*isConstant=*/false,
+                llvm::GlobalValue::InternalLinkage, zeroI64, "__kd_rng_state");
+            auto* rngSeeded = new llvm::GlobalVariable(
+                *module_, i64Ty, /*isConstant=*/false,
+                llvm::GlobalValue::InternalLinkage, zeroI64, "__kd_rng_seeded");
+            // 64-bit LCG (Knuth MMIX): state = state*MUL + INC (mod 2^64).
+            auto* lcgMul =
+                llvm::ConstantInt::get(i64Ty, 6364136223846793005ULL);
+            auto* lcgInc =
+                llvm::ConstantInt::get(i64Ty, 1442695040888963407ULL);
+            auto* defaultSeed =
+                llvm::ConstantInt::get(i64Ty, 88172645463325252ULL);
+
+            // rng_seed_global(seed: i64) -> i64 : set state, mark seeded.
+            {
+                auto* ft = llvm::FunctionType::get(i64Ty, {i64Ty}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "rng_seed_global",
+                    module_.get());
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                llvm::IRBuilder<> b(e);
+                b.CreateStore(fn->getArg(0), rngState);
+                b.CreateStore(one64, rngSeeded);
+                b.CreateRet(fn->getArg(0));
+                declaredFns_["rng_seed_global"] = fn;
+            }
+
+            // rand_global() -> i64 : lazily seed from KARDASHEV_SEED (else a
+            // fixed default) on first use, then step the LCG and return state.
+            {
+                auto* ft = llvm::FunctionType::get(i64Ty, {}, false);
+                auto* fn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "rand_global",
+                    module_.get());
+                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* seedBB = llvm::BasicBlock::Create(ctx, "seed", fn);
+                auto* envBB = llvm::BasicBlock::Create(ctx, "fromenv", fn);
+                auto* defBB = llvm::BasicBlock::Create(ctx, "default", fn);
+                auto* stepBB = llvm::BasicBlock::Create(ctx, "step", fn);
+                llvm::IRBuilder<> b(e);
+                auto* seeded = b.CreateLoad(i64Ty, rngSeeded, "seeded");
+                b.CreateCondBr(b.CreateICmpEQ(seeded, zeroI64, "unseeded"),
+                               seedBB, stepBB);
+                // seed: try getenv("KARDASHEV_SEED")
+                b.SetInsertPoint(seedBB);
+                auto* envName = b.CreateGlobalString(
+                    "KARDASHEV_SEED", "kd.seedenv", 0, module_.get());
+                auto* envVal = b.CreateCall(getenvFn, {envName}, "seedstr");
+                b.CreateCondBr(b.CreateICmpNE(envVal, nullPtr, "haveseed"),
+                               envBB, defBB);
+                b.SetInsertPoint(envBB);
+                auto* parsed = b.CreateCall(atollFn, {envVal}, "parsed");
+                b.CreateStore(parsed, rngState);
+                b.CreateStore(one64, rngSeeded);
+                b.CreateBr(stepBB);
+                b.SetInsertPoint(defBB);
+                b.CreateStore(defaultSeed, rngState);
+                b.CreateStore(one64, rngSeeded);
+                b.CreateBr(stepBB);
+                // step the LCG.
+                b.SetInsertPoint(stepBB);
+                auto* cur = b.CreateLoad(i64Ty, rngState, "cur");
+                auto* next = b.CreateAdd(b.CreateMul(cur, lcgMul, "mul"),
+                                         lcgInc, "next");
+                b.CreateStore(next, rngState);
+                b.CreateRet(next);
+                declaredFns_["rand_global"] = fn;
+            }
+        }
+
         // Phase 13b / 37: slice read ops (slice_len / slice_get / slice_get_ref)
         // are now GENERIC over the element type and synthesized per-T in
         // getOrEmitSliceOp (mirroring getOrEmitVecOp), dispatched from emitCall.

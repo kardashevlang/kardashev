@@ -18,6 +18,30 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.62.0] — Stdlib runtime: monotonic clock, env vars, seeded global RNG
+
+### Added
+- **Monotonic clock** — `struct Instant { ms: i64 }` + `instant_now()`,
+  `instant_elapsed_millis(&Instant)`, and `instant_duration_since(&Instant,
+  &Instant) -> Duration`, over a new `monotonic_millis()` builtin
+  (`clock_gettime(CLOCK_MONOTONIC)`, ms resolution).
+- **Environment variables** — `env_var(&String) -> Option<String>` (an **owned**
+  copy on a hit) over a `env_var_into` builtin (`getenv`), and
+  `env_var_set(&String, &String) -> i64` (`setenv`, overwrite).
+- **Seeded process-global RNG** — `rand_global() -> i64` over a 64-bit LCG in two
+  internal globals, **lazily seeded from `KARDASHEV_SEED`** (else a fixed
+  default) on first use; `rng_seed_global(seed)` to set it explicitly; and a
+  `--fuzz-seed N` CLI flag that exports `KARDASHEV_SEED` for the JIT run. The
+  same seed reproduces an identical sequence (JIT == AOT); a different seed
+  differs.
+- Each builtin is a thin libc wrapper lowered in codegen (idempotent
+  `getOrInsertFunction`), emitted **only** when referenced
+  (`usesRuntimeExtras`), so clock-/env-/RNG-free programs carry none of it.
+
+### Deferred (honest)
+- Process/subprocess control (spawn/exec); wall-clock/system-time formatting;
+  cryptographically-secure RNG. (Buffered I/O + file metadata → v63.)
+
 ## [0.61.0] — Lazy iterator adaptor tower
 
 ### Added

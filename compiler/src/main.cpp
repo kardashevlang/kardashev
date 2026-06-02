@@ -1806,6 +1806,35 @@ std::string applyPrelude(const std::string& userSrc) {
             "impl Ord for Duration { fn cmp(&self, other: &Duration) -> i64 {\n"
             "    if self.ms < other.ms { 0 - 1 } else { if self.ms > other.ms { 1 } else { 0 } } } }\n";
     }
+    // v62: a monotonic-clock `Instant` over the `monotonic_millis` builtin, with
+    // elapsed arithmetic reusing `Duration`. Injected ONLY when the user
+    // references the API (mirroring `fs_read_to_string`) so a clock-free program
+    // never pulls in the runtime-extras codegen; suppressed if the user defines
+    // their own `struct Instant`. References Duration, so it follows that block.
+    if ((userSrc.find("instant_now") != std::string::npos ||
+         userSrc.find("instant_elapsed_millis") != std::string::npos ||
+         userSrc.find("instant_duration_since") != std::string::npos) &&
+        userSrc.find("struct Instant") == std::string::npos) {
+        prelude +=
+            "struct Instant { ms: i64 }\n"
+            "fn instant_now() -> Instant ! { io } { Instant { ms: monotonic_millis() } }\n"
+            "fn instant_elapsed_millis(start: &Instant) -> i64 ! { io }"
+            " { monotonic_millis() - start.ms }\n"
+            "fn instant_duration_since(later: &Instant, earlier: &Instant) -> Duration"
+            " { Duration { ms: later.ms - earlier.ms } }\n";
+    }
+    // v62: `env_var` returns `Option<String>` over the `env_var_into` builtin
+    // (an OWNED copy on a hit). `env_var_set` is the setenv builtin directly.
+    // Injected only when referenced, suppressed if the user defines `fn env_var`.
+    if (userSrc.find("env_var") != std::string::npos &&
+        userSrc.find("fn env_var") == std::string::npos) {
+        prelude +=
+            "fn env_var(name: &String) -> Option<String> ! { io, alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let found = env_var_into(name, &mut out);\n"
+            "    if found == 1 { Some(out) } else { None }\n"
+            "}\n";
+    }
     // v37 test framework: assertion macros (over the Phase 182 macro engine).
     // A `test_*() -> i64` test returns 0 = ok, non-zero = FAILED (the runner
     // convention), so a failed assertion `return`s a non-zero code — this
@@ -3778,6 +3807,12 @@ int main(int argc, char** argv) {
             testFilter = argv[++i]; // v37: run only tests whose name contains it
         } else if (a == "--format=json") {
             testJson = true; // v37: machine-readable test output
+        } else if (a == "--fuzz-seed" && i + 1 < argc) {
+            // v62: seed the process-global RNG for this run by exporting
+            // KARDASHEV_SEED (which `rand_global` reads on first use). This
+            // affects the in-process JIT execution; a separately-run AOT binary
+            // reads KARDASHEV_SEED from its own environment.
+            setenv("KARDASHEV_SEED", argv[++i], 1);
         } else if (a == "-O0") {
             optLevel = kardashev::OptLevel::O0;
         } else if (a == "-O1") {

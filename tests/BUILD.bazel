@@ -711,6 +711,25 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v62: stdlib runtime — monotonic clock, env vars, seeded global RNG.
+sh_test(
+    name = "smoke_test_instant",
+    srcs = ["smoke_test_instant.sh"],
+    data = ["//compiler:kardc"],
+)
+
+sh_test(
+    name = "smoke_test_env",
+    srcs = ["smoke_test_env.sh"],
+    data = ["//compiler:kardc"],
+)
+
+sh_test(
+    name = "smoke_test_rng_seeding",
+    srcs = ["smoke_test_rng_seeding.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
