@@ -745,6 +745,20 @@ public:
 private:
     std::vector<Token> tokens_;
     std::size_t pos_ = 0;
+    // v46 compiler hardening: bound recursive-descent depth so adversarial
+    // deeply-nested input (`(((((…`, `[[[[…`, `Vec<Vec<…>>`) reports a clean
+    // error instead of stack-overflowing (a DoS / crash on bad input). Real
+    // programs nest expressions/types only a few dozen deep; 256 is far above
+    // that yet well under the call-stack limit.
+    int parseDepth_ = 0;
+    static constexpr int kMaxParseDepth = 256;
+    // RAII depth counter: `ok` is false once the limit is exceeded.
+    struct DepthGuard {
+        int& d;
+        bool ok;
+        DepthGuard(int& dd, int max) : d(dd) { ok = (++d <= max); }
+        ~DepthGuard() { --d; }
+    };
     // v24 Phase 134: doc comments, keyed by following-token index; and the doc
     // for the declaration currently being parsed (consumed by the decl parser).
     std::map<std::size_t, std::string> docAt_;
@@ -1505,6 +1519,18 @@ private:
     }
 
     ast::TypeRef parseTypeRef() {
+        // v46: depth guard — deeply-nested types (`Vec<Vec<…>>`, `&&&…`) report
+        // a clean error instead of stack-overflowing.
+        DepthGuard g(parseDepth_, kMaxParseDepth);
+        if (!g.ok) {
+            errorHere("type nests too deeply (parser recursion limit "
+                      "exceeded)");
+            ast::TypeRef tr;
+            tr.name = "i64";
+            tr.line = peek().line;
+            tr.column = peek().column;
+            return tr;
+        }
         // v33 Phase 177: raw pointer prefix `*const T` / `*mut T`. The pointee
         // is parsed recursively; the raw-ptr flags are stamped on its TypeRef
         // (mirroring how `&` flags the pointee node). A pointee that is itself a
@@ -2727,6 +2753,22 @@ private:
     }
 
     ast::ExprPtr parseExpr() {
+        // v46: depth guard — a too-deeply-nested expression is a clean error,
+        // not a stack-overflow crash.
+        DepthGuard g(parseDepth_, kMaxParseDepth);
+        if (!g.ok) {
+            errorHere("expression nests too deeply (parser recursion limit "
+                      "exceeded)");
+            // Skip to a likely statement/expr boundary so we don't spin.
+            while (!check(TokenKind::RParen) && !check(TokenKind::RBracket) &&
+                   !check(TokenKind::RBrace) && !check(TokenKind::Semi) &&
+                   !check(TokenKind::EndOfInput))
+                advance();
+            auto e = std::make_unique<ast::IntLitExpr>();
+            e->line = peek().line;
+            e->column = peek().column;
+            return e;
+        }
         auto lhs = parseExprPrec(1);
         // Phase 9: range operators bind looser than every binary operator,
         // so `a + 1 .. b * 2` parses the arithmetic on each side first.
@@ -2859,6 +2901,18 @@ private:
     // and the closure `|` are still handled by parsePrimary, so `-&x` and
     // `&-x` both flow through correctly.
     ast::ExprPtr parseUnary() {
+        // v46: depth guard — a long unary-prefix chain (`----…`, `!!!!…`,
+        // `****…`) recurses here without going through parseExpr, so it needs
+        // its own guard against a stack-overflow crash.
+        DepthGuard g(parseDepth_, kMaxParseDepth);
+        if (!g.ok) {
+            errorHere("unary-operator chain nests too deeply (parser "
+                      "recursion limit exceeded)");
+            auto e = std::make_unique<ast::IntLitExpr>();
+            e->line = peek().line;
+            e->column = peek().column;
+            return e;
+        }
         // Phase 34: a leading `*` is the deref operator (an infix `*` is
         // multiplication, handled in the precedence parser — position
         // disambiguates, the standard prefix/infix split).
