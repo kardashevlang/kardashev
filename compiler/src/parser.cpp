@@ -1020,6 +1020,8 @@ private:
         ast::FnDecl decl;
         decl.doc = pendingDeclDoc_; // v24 Phase 134
         decl.isAsync = isAsync;
+        decl.isTotal = pendingTotal_; // v47 `#[total]`
+        pendingTotal_ = false;
         decl.line = fnTok.line;
         decl.column = fnTok.column;
 
@@ -2278,6 +2280,7 @@ private:
     // pendingDerives_, which the next struct/enum decl consumes. Unknown
     // attributes are tolerated (skipped to the closing `]`).
     std::vector<std::string> pendingDerives_;
+    bool pendingTotal_ = false; // v47 `#[total]` for the next fn decl
     void parseAttributes() {
         while (check(TokenKind::Pound)) {
             consume(); // '#'
@@ -2303,6 +2306,8 @@ private:
                 bool enabled = evalCfgPredicate();
                 expect(TokenKind::RParen, ")");
                 if (!enabled) cfgDropNext_ = true;
+            } else if (attr.lexeme == "total") {
+                pendingTotal_ = true; // v47: the next fn asserts totality
             } else {
                 while (!check(TokenKind::RBracket) &&
                        !check(TokenKind::EndOfInput))

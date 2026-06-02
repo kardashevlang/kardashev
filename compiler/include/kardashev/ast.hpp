@@ -803,6 +803,11 @@ struct FnDecl {
     // contexts: a `const fn` is also a perfectly ordinary runtime fn (its
     // codegen path is unchanged), so calling it at runtime works as before.
     bool isConst = false;
+    // v47 totality: `#[total]` asserts the fn provably terminates — no
+    // `while`/`loop`, no recursion cycle, and it calls only other terminating
+    // fns. Verified by a conservative call-graph analysis (sound: rejects
+    // anything that *might* diverge).
+    bool isTotal = false;
     std::unique_ptr<BlockExpr> body;
     std::string doc; // v24 Phase 134: the leading `///` doc comment, if any
     std::size_t line = 1;

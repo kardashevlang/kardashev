@@ -375,6 +375,8 @@ and the security-response process become the published, gated contract.
 
 ### v47 — "6/6 BEYOND I: verified safety + totality" — moves: MS → 6, TS → 6 (begins)
 
+> **Status (`v0.47.0`, partial):** ✅ SHIPPED — totality via `#[total]` (sound conservative call-graph termination check: no loops + acyclic call graph incl. mutual recursion). ⛔ DEFERRED — `! { div }` effect row + halting oracle, Miri-style UB interpreter gating unsafe, continuous memory-safety fuzzing (research-grade).
+
 Now that parity + 1.0 are shipped, the differentiators begin. Safety first: the
 Miri-style UB gate and the totality effect.
 
