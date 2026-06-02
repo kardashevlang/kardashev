@@ -18,6 +18,24 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.47.0] — Roadmap v47 "6/6 BEYOND I: verified safety + totality" (partial)
+
+### Added
+- **Totality via `#[total]`** — a checked termination assertion. A sound
+  conservative call-graph analysis accepts a fn only if it (and every fn it
+  transitively calls) is loop-free and the reachable call graph is acyclic (no
+  recursion, incl. mutual). `for`-over-a-range is bounded and fine. A
+  non-terminating-or-recursive fn declared `#[total]` is rejected, naming the
+  cause. (A 6/6 beyond-parity capability — few production languages check
+  termination.)
+
+### Deferred / honest limitations
+- The rest of v47's 6/6 work remains research-grade (ROADMAP, v47): a first-class
+  `! { div }` divergence effect row + a halting oracle over fuzzed inputs, the
+  Miri-style UB interpreter gating `unsafe` in CI, and continuous adversarial
+  memory-safety fuzzing through a triple oracle. The current checker is
+  conservative (a terminating `while` is still rejected under `#[total]`).
+
 ## [0.46.0] — Roadmap v46 "Tooling + conformance + stability + security → 1.0 surface" (partial)
 
 ### Added / fixed
