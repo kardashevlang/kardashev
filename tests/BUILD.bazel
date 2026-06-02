@@ -613,6 +613,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v50: statically-verified exhaustive effect handling — no user effect escapes main.
+sh_test(
+    name = "smoke_test_effect_exhaustive",
+    srcs = ["smoke_test_effect_exhaustive.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
