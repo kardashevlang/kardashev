@@ -18,6 +18,35 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.56.0] — Soundness under concurrency: thread-local effect handlers
+
+### Fixed (concurrency)
+- **Two threads installing different handlers for the same effect no longer race
+  a shared global.** The per-`(effect,op)` current-handler slot
+  (`effectHandlerGlobal`) was a single process-global `InternalLinkage` global, so
+  concurrent `handle … with` installs on different threads clobbered each other.
+  The handler global is now **thread-local** (`GeneralDynamicTLSModel`) in AOT, so
+  each thread reads/writes its own handler slot; the existing `handle`
+  save/restore then mutates only the calling thread's storage.
+- **JIT keeps process-global handlers** — `thread_local` lowers to
+  `__emutls_get_address`, which the ORC JIT cannot resolve (same reason the panic
+  stacks are process-global). JIT runs are single-threaded, so there is no race in
+  practice. This is selected by a new `forJit` flag threaded from the driver into
+  `codegen()` (the JIT execution path sets it; AOT / `--emit-llvm` leave it false).
+  Single-thread effect behaviour is unchanged under both backends.
+
+CI-gated by `smoke_test_thread_local_handlers.sh` (**AOT-only**): two threads
+install different handlers for one effect and perform it 100 000× concurrently;
+each thread's sum proves it saw **only its own** handler (100000 / 200000),
+deterministic over 6 runs, MALLOC_CHECK-clean; the emitted IR shows the handler
+global is `thread_local`. Existing `smoke_test_phase176.sh` /
+`smoke_test_effect_exhaustive.sh` stay green (JIT + AOT).
+
+### Deferred (honest)
+- TSan CI gate (needs sanitizer-instrumented codegen). Multi-shot /
+  continuation-capturing handlers (handlers stay tail-resumptive). A JIT-mode
+  concurrent-handler path (TLS unavailable under ORC).
+
 ## [0.55.0] — Correctness: UTF-8-safe string casing + char API + built-in `Drop`
 
 ### Fixed (correctness)
