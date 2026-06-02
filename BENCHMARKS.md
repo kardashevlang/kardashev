@@ -21,16 +21,28 @@ Absolute times vary by machine; the **ratio to C** is the portable figure.
 
 | Workload  | What it stresses                    | kardashev | C (clang -O2) | ratio |
 |-----------|-------------------------------------|-----------|---------------|-------|
-| `fib`     | recursion + function-call overhead  | ~0.23 s   | ~0.23 s       | **1.00×** |
-| `collatz` | branches + signed `/` `%`           | ~0.37 s   | ~0.37 s       | **~1.01×** |
+| `fib`     | recursion + function-call overhead  | ~0.24 s   | ~0.24 s       | **~1.00×** |
+| `collatz` | branches + signed `/` `%`           | ~0.37 s   | ~0.38 s       | **~1.00×** |
 | `primes`  | nested loops + `%` (app-scale)      | ~0.015 s  | ~0.014 s      | **~1.07×** |
-| `loop`    | a tight integer-arithmetic loop     | ~0.11 s   | ~0.05 s       | **~2.2×** |
-| `matmul`  | 64×64 int matmul (correctness only) | ~2.5 s    | ~0.001 s      | *n/a*     |
+| `loop`    | a tight integer-arithmetic loop     | ~0.05 s   | ~0.05 s       | **~1.00×** |
+| `matmul`  | 64×64 int matmul (correctness only) | <0.01 s   | ~0.001 s      | *n/a*     |
 
 `fib(40)`, the Collatz step-count over `1..3,000,000`, prime-counting (trial
 division) under 200,000, a 200 M-iteration arithmetic loop, and a 64×64 integer
 matrix multiply. **All five produce the same result as the C reference**
 (correctness-gated in CI by `smoke_test_bench.sh`).
+
+**v51 vectorization update.** The `loop` benchmark — a 200 M-iteration tight
+integer reduction — was the one workload off parity at **2.2× C**. The cause was
+a compiler bug, not a language limitation: the IR optimization `PassBuilder` was
+built **without a `TargetMachine`**, so its `TargetTransformInfo` was a no-op and
+the loop/SLP vectorizers declined every loop. Registering the host
+`TargetMachine` (generic CPU, for portability + datalayout consistency) makes
+vectorization actually run — `loop` emits a vectorized body (0 → 21 vector ops)
+and drops to **~1.0× C (parity)**. With this fix **every** measured workload is
+at C parity (and the prior figures held). `matmul` (local flat arrays) is fast
+in both; it stays *correctness-only* because `clang -O2` constant-folds its fully
+deterministic result, which is not a fair runtime comparison.
 
 **v44 application-scale update.** `primes` is the headline new figure: on a real,
 non-trivial integer workload (not a micro-loop) kardashev runs at **~1.07× C —
