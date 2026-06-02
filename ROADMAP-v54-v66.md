@@ -232,6 +232,9 @@ new ABI, no new analysis.
 
 ## v58 — Ergonomics: if-let / while-let / let-else
 
+> **Status:** ✅ SHIPPED v0.58.0 (partial) — `if let` / `while let` desugar at parse time to `match` / `loop { match … _ => break }`. **let-else DEFERRED**: a diverging `panic` else block types as `()` not bottom (no never-type yet), so the else arm fails to unify, and a `_ => return` arm trips a pre-existing effect-inference quirk; both need a never-type / divergence-typing pass first.
+
+
 **Theme:** The three highest-leverage pattern-binding forms, all desugaring to
 existing match lowering (no new codegen).
 

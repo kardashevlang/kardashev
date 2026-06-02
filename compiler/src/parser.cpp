@@ -2679,6 +2679,13 @@ private:
         stmt->line = letTok.line;
         stmt->column = letTok.column;
         stmt->isMut = isMut;
+        // v58 note: `let PAT = e else { … }` (let-else) is DEFERRED. The desugar
+        // (a `match` whose else arm diverges) is sound, but a diverging block
+        // that ends in `panic(..)` types as `()` rather than bottom (kardashev
+        // has no never type yet), so the else arm fails to unify with the bound
+        // value; and a `_ => return` arm trips a separate pre-existing
+        // effect-inference quirk with effect-polymorphic prelude fns. Both need a
+        // never-type / divergence-typing pass first. if-let / while-let ship now.
         if (check(TokenKind::LParen)) {
             consume(); // (
             if (!check(TokenKind::RParen)) {
@@ -3544,8 +3551,56 @@ private:
         return cl;
     }
 
+    // v58: build `match scrut { pat => a, _ => b }` (the if-let desugaring).
+    ast::ExprPtr desugarMatch2(const Token& at, ast::ExprPtr scrut,
+                               ast::PatternPtr pat, ast::ExprPtr a,
+                               ast::ExprPtr b) {
+        auto me = std::make_unique<ast::MatchExpr>();
+        me->line = at.line;
+        me->column = at.column;
+        me->scrutinee = std::move(scrut);
+        ast::MatchArm arm1;
+        arm1.line = at.line;
+        arm1.column = at.column;
+        arm1.pattern = std::move(pat);
+        arm1.body = std::move(a);
+        ast::MatchArm arm2;
+        arm2.line = at.line;
+        arm2.column = at.column;
+        arm2.pattern = std::make_unique<ast::WildPat>();
+        arm2.body = std::move(b);
+        me->arms.push_back(std::move(arm1));
+        me->arms.push_back(std::move(arm2));
+        return me;
+    }
+
     ast::ExprPtr parseIfExpr() {
         Token ifTok = expect(TokenKind::KwIf, "if");
+        // v58: `if let PAT = scrut { then } else { else }` desugars at parse time
+        // to `match scrut { PAT => then, _ => else }` (reuses match lowering). A
+        // missing `else` yields a unit else block.
+        if (check(TokenKind::KwLet)) {
+            consume(); // let
+            auto pat = parsePattern();
+            expect(TokenKind::Eq, "= in `if let`");
+            bool sprev = restrictStructLit_;
+            restrictStructLit_ = true;
+            auto scrut = parseExpr();
+            restrictStructLit_ = sprev;
+            auto thenBlock = parseBlockExpr();
+            ast::ExprPtr elseExpr;
+            if (accept(TokenKind::KwElse)) {
+                elseExpr = check(TokenKind::KwIf) ? parseIfExpr()
+                                                  : parseBlockExpr();
+            } else {
+                auto eb = std::make_unique<ast::BlockExpr>();
+                eb->line = ifTok.line;
+                eb->column = ifTok.column;
+                elseExpr = std::move(eb);
+            }
+            return desugarMatch2(ifTok, std::move(scrut), std::move(pat),
+                                 std::move(thenBlock), std::move(elseExpr));
+        }
         bool prev = restrictStructLit_;
         restrictStructLit_ = true;
         auto cond = parseExpr();
@@ -3576,6 +3631,35 @@ private:
 
     ast::ExprPtr parseWhileExpr() {
         Token whileTok = expect(TokenKind::KwWhile, "while");
+        // v58: `while let PAT = scrut { body }` desugars to
+        // `loop { match scrut { PAT => body, _ => break } }` — scrut is
+        // re-evaluated each iteration; a non-match breaks the loop.
+        if (check(TokenKind::KwLet)) {
+            consume(); // let
+            auto pat = parsePattern();
+            expect(TokenKind::Eq, "= in `while let`");
+            bool sprev = restrictStructLit_;
+            restrictStructLit_ = true;
+            auto scrut = parseExpr();
+            restrictStructLit_ = sprev;
+            auto body = parseBlockExpr();
+            auto brk = std::make_unique<ast::BreakExpr>();
+            brk->line = whileTok.line;
+            brk->column = whileTok.column;
+            auto m = desugarMatch2(whileTok, std::move(scrut), std::move(pat),
+                                   std::move(body), std::move(brk));
+            auto loopBody = std::make_unique<ast::BlockExpr>();
+            loopBody->line = whileTok.line;
+            loopBody->column = whileTok.column;
+            auto es = std::make_unique<ast::ExprStmt>();
+            es->expr = std::move(m);
+            loopBody->stmts.push_back(std::move(es));
+            auto loop = std::make_unique<ast::LoopExpr>();
+            loop->line = whileTok.line;
+            loop->column = whileTok.column;
+            loop->body = std::move(loopBody);
+            return loop;
+        }
         // Restrict struct-literal parsing in the condition so the `{` that
         // opens the body isn't swallowed as a struct literal (same trick
         // as `if` / `match`).
