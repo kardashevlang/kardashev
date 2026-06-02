@@ -212,6 +212,8 @@ AE-6-begins at v43. (This corrects the earlier forward-dependency.)
 
 ### v41 — "Memory safety, parity complete + unsafe surface" — moves: MS → 5/5
 
+> **Status (`v0.41.0`, partial):** ✅ SHIPPED — deref-assignment (`*p=v` for `&mut`/`*mut`/Box) + `copy_nonoverlapping`. ⛔ DEFERRED — lifetime params + real region inference (XL NLL), leak-allowlist reduction / recursive Future-drop.
+
 Close the documented leaks, add real region inference to the borrow checker, and
 finish the unsafe escape hatch with a written aliasing contract. (The FFI raw-write
 + pointer-arith *across language boundaries* already landed in v39; this phase is

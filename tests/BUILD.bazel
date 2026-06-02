@@ -557,6 +557,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v41: deref-assignment (*p=v) + copy_nonoverlapping (in-language unsafe surface).
+sh_test(
+    name = "smoke_test_deref_assign",
+    srcs = ["smoke_test_deref_assign.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

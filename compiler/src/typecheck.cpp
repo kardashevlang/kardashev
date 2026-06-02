@@ -7941,6 +7941,42 @@ private:
                       call.line, call.column);
             return pt; // same raw-pointer type
         }
+        if (call.callee == "copy_nonoverlapping") {
+            // v41: copy_nonoverlapping(src: *const T, dst: *mut T, n: i64) — a
+            // memcpy of n ELEMENTS. Unsafe (the caller asserts non-overlap +
+            // validity). Both pointers must share the pointee type.
+            if (call.args.size() != 3) {
+                error("copy_nonoverlapping(src, dst, n) takes two raw pointers "
+                      "and an i64 count",
+                      call.line, call.column);
+                return makeUnit();
+            }
+            TypePtr st = resolve(checkExpr(*call.args[0]));
+            TypePtr dt = resolve(checkExpr(*call.args[1]));
+            TypePtr nt = checkExpr(*call.args[2]);
+            if (st->kind != TypeKind::Ref || !st->isRawPtr)
+                error("copy_nonoverlapping src must be a raw pointer, got " +
+                          typeToString(st),
+                      call.args[0]->line, call.args[0]->column);
+            if (dt->kind != TypeKind::Ref || !dt->isRawPtr || !dt->refIsMut)
+                error("copy_nonoverlapping dst must be a `*mut T`, got " +
+                          typeToString(dt),
+                      call.args[1]->line, call.args[1]->column);
+            if (st->kind == TypeKind::Ref && dt->kind == TypeKind::Ref &&
+                typeToString(resolve(st->refInner)) !=
+                    typeToString(resolve(dt->refInner)))
+                error("copy_nonoverlapping pointee types differ: " +
+                          typeToString(resolve(st->refInner)) + " vs " +
+                          typeToString(resolve(dt->refInner)),
+                      call.line, call.column);
+            if (!unify(nt, makeInt()))
+                error("copy_nonoverlapping count must be an i64",
+                      call.args[2]->line, call.args[2]->column);
+            if (unsafeDepth_ == 0)
+                error("copy_nonoverlapping requires an `unsafe` block",
+                      call.line, call.column);
+            return makeUnit();
+        }
         if (call.callee == "ptr_write") {
             if (call.args.size() != 2) {
                 error("ptr_write(p, v) takes a `*mut T` and a `T` value",
@@ -9499,6 +9535,41 @@ private:
     //     `&mut` reference (so `&mut self`'s fields are writable).
     // Types must unify.
     void checkAssign(const ast::AssignStmt& as) {
+        // v41 deref-assignment: `*p = v`. Writes through a `&mut T` (safe) or a
+        // `*mut T` raw pointer (requires `unsafe`). The pointee type must
+        // match the value. Retires the long-standing "deref-assign
+        // unsupported" gap (also enables `*guard = v` etc.).
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(as.target.get());
+            un && un->op == ast::UnaryOp::Deref) {
+            TypePtr pt = resolve(checkExpr(*un->operand));
+            TypePtr valT = checkExpr(*as.value);
+            if (pt->kind == TypeKind::Box) {
+                // `*box = v` mutates the heap cell (Box is an owning unique ptr).
+                if (!coerceOrUnify(*as.value, valT, resolve(pt->refInner)))
+                    error("assignment type mismatch: `*p` is " +
+                              typeToString(resolve(pt->refInner)) +
+                              ", value is " + typeToString(valT),
+                          as.line, as.column);
+                return;
+            }
+            if (pt->kind != TypeKind::Ref || !pt->refIsMut) {
+                error("cannot assign through `*` — the pointer is not mutable "
+                      "(need `&mut T` or `*mut T`), got " + typeToString(pt),
+                      as.target->line, as.target->column);
+                return;
+            }
+            if (pt->isRawPtr && unsafeDepth_ == 0)
+                error("writing through a raw pointer (`*p = v`) requires an "
+                      "`unsafe` block",
+                      as.target->line, as.target->column);
+            TypePtr pointee = resolve(pt->refInner);
+            if (!coerceOrUnify(*as.value, valT, pointee))
+                error("assignment type mismatch: `*p` is " +
+                          typeToString(pointee) + ", value is " +
+                          typeToString(valT),
+                      as.line, as.column);
+            return;
+        }
         TypePtr targetT = checkExpr(*as.target);
         TypePtr valT = checkExpr(*as.value);
         if (!isAssignablePlace(*as.target)) {
