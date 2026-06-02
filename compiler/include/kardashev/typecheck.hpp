@@ -220,6 +220,11 @@ struct TypeCheckResult {
     // Codegen reads this at an IdentExpr (and any const-folded expr) to emit
     // the literal directly.
     std::unordered_map<const ast::Expr*, ConstFolded> constExprValues;
+    // v49 compile-time reflection results, keyed by the ReflectExpr node:
+    // field_count!/variant_count! -> integer; type_name! -> string. size_of! is
+    // computed in codegen from the lowered type's DataLayout size.
+    std::unordered_map<const ast::Expr*, std::int64_t> reflectInts;
+    std::unordered_map<const ast::Expr*, std::string> reflectStrings;
     // Resolved struct schemas keyed by struct name. For monomorphic
     // structs the schema's `type` is the concrete struct Type and codegen
     // uses it directly; for generic structs codegen instantiates per

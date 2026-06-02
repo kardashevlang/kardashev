@@ -11550,6 +11550,28 @@ private:
         if (auto* sl = dynamic_cast<const ast::StringLitExpr*>(&e)) {
             return emitStringLit(*sl);
         }
+        // v49 compile-time reflection: emit the constant the typechecker resolved
+        // (field_count!/variant_count! -> i64, type_name! -> String), or compute
+        // size_of! here from the lowered type's real DataLayout alloc size.
+        if (auto* re = dynamic_cast<const ast::ReflectExpr*>(&e)) {
+            using K = ast::ReflectExpr::Kind;
+            auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
+            if (re->kind == K::TypeName) {
+                ast::StringLitExpr sl;
+                auto it = tc_.reflectStrings.find(re);
+                sl.value = it != tc_.reflectStrings.end() ? it->second : "";
+                return emitStringLit(sl);
+            }
+            if (re->kind == K::SizeOf) {
+                llvm::Type* ty = mapTypeRef(re->arg);
+                uint64_t sz = module_->getDataLayout().getTypeAllocSize(ty);
+                return llvm::ConstantInt::get(i64Ty, sz, /*isSigned=*/false);
+            }
+            auto it = tc_.reflectInts.find(re);
+            std::int64_t v = it != tc_.reflectInts.end() ? it->second : 0;
+            return llvm::ConstantInt::get(i64Ty, static_cast<uint64_t>(v),
+                                          /*isSigned=*/true);
+        }
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
             // Phase 25: a use of a top-level `const` resolves to a compile-time
             // literal — emit the folded value directly (no runtime load). A

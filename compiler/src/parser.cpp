@@ -1297,6 +1297,28 @@ private:
     //   concat!("a", 1, true) -> a single concatenated String literal
     //   count!(a, b, c) -> the i64 argument count (3)
     //   cfg!(predicate) -> a bool of the #[cfg]-predicate against --cfg flags
+    // v49: `field_count!(T)` / `variant_count!(T)` / `size_of!(T)` / `type_name!(T)`
+    // — a compile-time reflection intrinsic over a type. The argument is parsed as
+    // a TypeRef; the typechecker resolves it and computes the constant.
+    ast::ExprPtr parseReflectMacro(const Token& nameTok) {
+        consume(); // `!`
+        expect(TokenKind::LParen, "(");
+        auto e = std::make_unique<ast::ReflectExpr>();
+        if (nameTok.lexeme == "field_count")
+            e->kind = ast::ReflectExpr::Kind::FieldCount;
+        else if (nameTok.lexeme == "variant_count")
+            e->kind = ast::ReflectExpr::Kind::VariantCount;
+        else if (nameTok.lexeme == "size_of")
+            e->kind = ast::ReflectExpr::Kind::SizeOf;
+        else
+            e->kind = ast::ReflectExpr::Kind::TypeName;
+        e->arg = parseTypeRef();
+        expect(TokenKind::RParen, ")");
+        e->line = nameTok.line;
+        e->column = nameTok.column;
+        return e;
+    }
+
     ast::ExprPtr parseBuiltinMacro(const Token& nameTok) {
         consume(); // `!`
         expect(TokenKind::LParen, "(");
@@ -3291,6 +3313,14 @@ private:
                 (first.lexeme == "stringify" || first.lexeme == "concat" ||
                  first.lexeme == "count" || first.lexeme == "cfg")) {
                 return parseBuiltinMacro(first);
+            }
+            // v49 compile-time reflection macros — take a TYPE argument and
+            // reflect to a constant: field_count!/variant_count!/size_of! -> i64,
+            // type_name! -> String.
+            if (check(TokenKind::Bang) && peek(1).kind == TokenKind::LParen &&
+                (first.lexeme == "field_count" || first.lexeme == "variant_count" ||
+                 first.lexeme == "size_of" || first.lexeme == "type_name")) {
+                return parseReflectMacro(first);
             }
             Token tok = first;
             Token prevSeg = first; // Phase 48: the segment just before `tok`

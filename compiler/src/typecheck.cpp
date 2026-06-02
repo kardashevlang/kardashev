@@ -2793,6 +2793,8 @@ public:
         for (const auto& [exprPtr, cv] : constExprValues_) {
             result.constExprValues[exprPtr] = ConstFolded{cv.isBool, cv.i};
         }
+        result.reflectInts = std::move(reflectInts_);       // v49
+        result.reflectStrings = std::move(reflectStrings_); // v49
         result.structs = std::move(structSchemas_);
         result.enums = std::move(enumSchemas_);
         result.variantIndex = std::move(variantIndex_);
@@ -2871,6 +2873,11 @@ private:
     // TypeCheckResult so a `const` reaches the backend as an immediate, not a
     // runtime load. Keyed by the use-site Expr*.
     std::unordered_map<const ast::Expr*, ConstValue> constExprValues_;
+    // v49 reflection results (keyed by the ReflectExpr): integer reflections
+    // (field_count!/variant_count!) and string reflections (type_name!). size_of!
+    // is computed in codegen from the lowered type's DataLayout size.
+    std::unordered_map<const ast::Expr*, std::int64_t> reflectInts_;
+    std::unordered_map<const ast::Expr*, std::string> reflectStrings_;
     // `const fn` ASTs by name (registered alongside fnSchemas_), so the
     // evaluator can find + run a const fn body. A non-const fn is absent here
     // and calling it in a const context is a clear error.
@@ -5450,6 +5457,9 @@ private:
         }
         if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
             return checkCast(*ce);
+        }
+        if (auto* re = dynamic_cast<const ast::ReflectExpr*>(&e)) {
+            return checkReflect(*re);
         }
         if (dynamic_cast<const ast::StringLitExpr*>(&e)) {
             auto it = structSchemas_.find("String");
@@ -8762,6 +8772,40 @@ private:
     // only bridge across the non-coercive lattice — every other int-width or
     // int/float crossing is a type error. Casting from/to a non-numeric type
     // (a struct, bool, String, reference, ...) is rejected.
+    // v49: compile-time reflection. Resolve the argument type and compute the
+    // constant against its static type info. field_count!/variant_count! and
+    // type_name! are computed here; size_of! is deferred to codegen (where the
+    // real LLVM DataLayout gives the exact alloc size incl. alignment padding).
+    TypePtr checkReflect(const ast::ReflectExpr& re) {
+        TypePtr t = resolve(resolveTypeRef(re.arg));
+        using K = ast::ReflectExpr::Kind;
+        if (re.kind == K::TypeName) {
+            reflectStrings_[&re] = typeToString(t);
+            auto it = structSchemas_.find("String");
+            return it != structSchemas_.end() ? it->second.type
+                                              : makeStruct("String", {});
+        }
+        if (re.kind == K::FieldCount) {
+            if (t->kind != TypeKind::Struct)
+                error("field_count!(" + typeToString(t) +
+                          ") requires a struct type",
+                      re.line, re.column);
+            else
+                reflectInts_[&re] =
+                    static_cast<std::int64_t>(t->structFields.size());
+        } else if (re.kind == K::VariantCount) {
+            if (t->kind != TypeKind::Enum)
+                error("variant_count!(" + typeToString(t) +
+                          ") requires an enum type",
+                      re.line, re.column);
+            else
+                reflectInts_[&re] =
+                    static_cast<std::int64_t>(t->enumVariants.size());
+        }
+        // size_of!: codegen computes the exact value from the lowered type.
+        return makeInt();
+    }
+
     TypePtr checkCast(const ast::CastExpr& ce) {
         TypePtr src = resolve(checkExpr(*ce.operand));
         TypePtr dst = resolve(resolveTypeRef(ce.targetType));
