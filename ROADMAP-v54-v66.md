@@ -131,6 +131,9 @@ are actually absent — pure-prelude Kardashev, no codegen changes.
 
 ## v56 — Soundness under concurrency: thread-local effect handlers
 
+> **Status:** ✅ SHIPPED v0.56.0 — per-(effect,op) handler global is thread-local in AOT (no cross-thread handler race); JIT stays process-global (TLS↛emutls under ORC). Conditional via a new codegen `forJit` flag.
+
+
 **Theme:** Eliminate the documented handler-dispatch data race.
 
 **CORE**
