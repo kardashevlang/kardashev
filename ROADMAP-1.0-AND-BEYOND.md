@@ -311,6 +311,8 @@ universal-C-reach 6/6 work are in v48.)
 
 ### v45 — "The ecosystem foundation: registry, toolchain manager, spec, bootstrap begins" — moves: EC → 4
 
+> **Status (`v0.45.0`, partial):** ✅ SHIPPED — normative language spec (docs/SPEC.md, [K-xxx] clauses) + grammar conformance corpus. ⛔ DEFERRED — hosted registry + kard publish, kardup toolchain manager, manifest resolver/lockfile + MSRV, EBNF-conformance generator, salsa query engine (infra not hostable here).
+
 The big unblockers for maturity. Two Mega-arcs (B registry, D spec) open here; the
 bootstrap (A) begins its **frozen-target-subset** staged corpus (see §3 arc A —
 the fixpoint target is a frozen subset, not the moving full language).

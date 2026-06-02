@@ -578,6 +578,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v45: grammar conformance (curated corpus grounding docs/SPEC.md).
+sh_test(
+    name = "smoke_test_grammar_conformance",
+    srcs = ["smoke_test_grammar_conformance.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
