@@ -25,6 +25,11 @@ struct Binding {
     // (the callee can't escape the reference — kardashev fns can't return one),
     // so it stays usable afterwards. Mirrors Rust's implicit `&mut *r` reborrow.
     bool isMutRef = false;
+    // v52: this binding's own type resolves to a reference (`&T` or `&mut T`).
+    // For a PARAMETER this means it is a by-reference param whose referent
+    // outlives the call — so returning a reference rooted in it is sound. Set in
+    // newBinding from the resolved type.
+    bool isRefTyped = false;
     int sharedLoans = 0;
     bool mutLoanActive = false;
     // Phase 146 (two-phase borrows): when a `&mut place` is taken directly as a
@@ -131,6 +136,37 @@ bool isCopyType(const TypePtr& t) {
     return false;
 }
 
+// v52: does `t` transitively contain a (non-raw) `&T`/`&mut T`? Mirrors
+// isCopyType's structural walk. Used to gate the escape check to functions whose
+// return type can actually carry a reference out. Raw pointers (`*const`/`*mut`,
+// unsafe-gated, no lifetime obligation) and the Copy handle structs
+// (Slice/Mutex/RwLock/Atomic — their structFields carry no Ref) report false.
+bool typeContainsRef(const TypePtr& t) {
+    if (!t) return false;
+    TypePtr r = resolve(t);
+    switch (r->kind) {
+    case TypeKind::Ref:
+        return !r->isRawPtr;
+    case TypeKind::Struct:
+        for (const auto& f : r->structFields)
+            if (typeContainsRef(f.second)) return true;
+        return false;
+    case TypeKind::Enum:
+        for (const auto& v : r->enumVariants)
+            for (const auto& pt : v.payloadTypes)
+                if (typeContainsRef(pt)) return true;
+        return false;
+    case TypeKind::Tuple:
+        for (const auto& el : r->tupleElems)
+            if (typeContainsRef(el)) return true;
+        return false;
+    case TypeKind::Array:
+        return typeContainsRef(r->arrayElem);
+    default:
+        return false;
+    }
+}
+
 class BorrowChecker {
 public:
     BorrowChecker(const ast::Program& program, const TypeCheckResult& tc)
@@ -161,6 +197,26 @@ private:
     // Scope stack: each entry maps a name to its current declPos. On
     // scope exit we pop; loans hang on to their declPos independently.
     std::vector<std::unordered_map<std::string, int>> scopes_;
+    // v52 escape analysis (per-fn): how many leading declPos values are
+    // parameters (declPos < paramCount_ => a parameter; >= => a local), the
+    // resolved return type, and whether it transitively carries a reference (the
+    // gate — only then is the return-value escape walk run).
+    int paramCount_ = 0;
+    TypePtr returnType_;
+    bool returnContainsRef_ = false;
+    // v52: each IdentExpr -> its resolved declPos, recorded in Pass 1 (prePass)
+    // while lexical scopes are live. The escape check classifies a reference's
+    // root via this map so it works even after the scope stack has unwound
+    // (e.g. the function-body tail is checked after the body walk completes).
+    std::unordered_map<const ast::IdentExpr*, int> identDecl_;
+    // v52: per-local-binding escape provenance, computed at its `let` (Pass 2):
+    // true  => the binding's value contains a reference rooted in this frame
+    //          (a `let r = &local;` or `let a = R{p:&local};`) — unsafe to return;
+    // false => its references all root in a parameter / global (a `let r = param;`)
+    //          or it carries no reference — safe to return.
+    // Lets the escape check accept the common `let r = <param-rooted>; … r` shape
+    // instead of conservatively rejecting every returned local binding.
+    std::unordered_map<int, bool> bindingEscapes_;
 
     void error(std::string msg, std::size_t line, std::size_t col) {
         result_.errors.push_back({std::move(msg), line, col});
@@ -200,6 +256,7 @@ private:
         if (ty) {
             TypePtr r = resolve(ty);
             b.isMutRef = r->kind == TypeKind::Ref && r->refIsMut;
+            b.isRefTyped = r->kind == TypeKind::Ref && !r->isRawPtr; // v52
         }
         bindings_[dp] = std::move(b);
         return dp;
@@ -248,6 +305,266 @@ private:
         return t;
     }
 
+    // ===== v52: escape analysis (reject returning a frame-local reference) =====
+    // Closes a dangling-reference UB: a function returning an aggregate that
+    // contains `&local` (a struct/tuple/enum field) compiled clean and read
+    // freed memory. (Top-level `-> &T` is already rejected in typecheck.) The
+    // rule is sound + conservative: a returned value may carry a reference ONLY
+    // if every contained reference roots in a by-reference parameter (or a
+    // global) — which outlives the call — never a local, a by-value parameter,
+    // or a temporary materialized in this frame.
+    enum class RootKind { RefParam, Global, Local, ByValParam, Temporary };
+
+    // Resolve a fn's return type to a FULL Type (with struct fields / enum
+    // variants), preferring the typechecker's already-resolved signature.
+    TypePtr resolveReturnType(const ast::FnDecl& fn) {
+        auto it = tc_.fnSchemas.find(fn.name);
+        if (it != tc_.fnSchemas.end() && it->second.signature &&
+            it->second.signature->ret)
+            return it->second.signature->ret;
+        return resolveTypeRefFull(fn.returnType);
+    }
+
+    // Like paramTypeFromAst but resolves NAMED types to their full struct/enum
+    // Type (with fields/variants) via tc_, so typeContainsRef sees inside them.
+    TypePtr resolveTypeRefFull(const ast::TypeRef& tr) {
+        if (tr.isSlice) return makeSlice(makeInt());
+        if (tr.isArray) {
+            TypePtr elem = tr.typeArgs.empty()
+                               ? makeInt()
+                               : resolveTypeRefFull(tr.typeArgs[0]);
+            TypePtr arr = makeArray(elem, tr.arrayLen);
+            return tr.isRef ? makeRef(arr, tr.refIsMut) : arr;
+        }
+        if (tr.isTuple) {
+            std::vector<TypePtr> els;
+            els.reserve(tr.tupleElems.size());
+            for (const auto& el : tr.tupleElems)
+                els.push_back(resolveTypeRefFull(el));
+            TypePtr tup = makeTuple(std::move(els));
+            return tr.isRef ? makeRef(tup, tr.refIsMut) : tup;
+        }
+        if (tr.isRef) {
+            ast::TypeRef inner = tr;
+            inner.isRef = false;
+            inner.refIsMut = false;
+            return makeRef(resolveTypeRefFull(inner), tr.refIsMut);
+        }
+        if (tr.name == "i64") return makeInt();
+        if (tr.name == "bool") return makeBool();
+        if (tr.name == "char") return makeChar();
+        auto sit = tc_.structs.find(tr.name);
+        if (sit != tc_.structs.end() && sit->second.type) return sit->second.type;
+        auto eit = tc_.enums.find(tr.name);
+        if (eit != tc_.enums.end() && eit->second.type) return eit->second.type;
+        auto t = std::make_shared<Type>();
+        t->kind = TypeKind::Struct;
+        t->structName = tr.name;
+        return t;
+    }
+
+    // Where does a PLACE expression (operand of `&place`, or a ref-valued
+    // binding) ultimately root?
+    RootKind classifyRoot(const ast::Expr& e) {
+        if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
+            auto it = identDecl_.find(id);
+            if (it == identDecl_.end())
+                return RootKind::Global; // top-level const / unresolved => outlives
+            Binding* b = lookupBindingByDeclPos(it->second);
+            if (!b) return RootKind::Global;
+            if (b->declPos < paramCount_)
+                return b->isRefTyped ? RootKind::RefParam : RootKind::ByValParam;
+            // A LOCAL. If it is a reference binding proven (at its `let`) to root
+            // in a parameter/global, returning it is sound — treat as RefParam.
+            if (b->isRefTyped) {
+                auto pit = bindingEscapes_.find(b->declPos);
+                if (pit != bindingEscapes_.end() && !pit->second)
+                    return RootKind::RefParam;
+            }
+            return RootKind::Local;
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e))
+            return classifyRoot(*fe->object);
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
+            return classifyRoot(*ix->object);
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e))
+            return classifyRoot(*tf->object);
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e);
+            un && un->op == ast::UnaryOp::Deref) {
+            // `*r`: the place lives wherever r points — caller storage iff r is
+            // a ref-param (or global); a local ref we cannot trace => local.
+            RootKind k = classifyRoot(*un->operand);
+            return (k == RootKind::RefParam || k == RootKind::Global)
+                       ? RootKind::RefParam
+                       : RootKind::Local;
+        }
+        // Not a place (literal, constructor call, arithmetic, ...) => a
+        // temporary materialized in this frame.
+        return RootKind::Temporary;
+    }
+
+    static bool rootEscapes(RootKind k) {
+        return k == RootKind::Local || k == RootKind::ByValParam ||
+               k == RootKind::Temporary;
+    }
+
+    // True if `e`, producing a value of resolved type `ty`, contains a reference
+    // rooted in this frame (so returning it would dangle). Driven by the
+    // expected type so only ref-carrying components are inspected.
+    bool escapesAggregateRef(const ast::Expr& e, const TypePtr& ty) {
+        TypePtr r = ty ? resolve(ty) : nullptr;
+        if (!r || !typeContainsRef(r)) return false; // this slot carries no ref
+        // Peel control flow to the value-producing expression(s).
+        if (auto* be = dynamic_cast<const ast::BlockExpr*>(&e))
+            return be->tail ? escapesAggregateRef(*be->tail, r) : false;
+        if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e))
+            return escapesAggregateRef(*ie->thenBranch, r) ||
+                   (ie->elseBranch && escapesAggregateRef(*ie->elseBranch, r));
+        if (auto* me = dynamic_cast<const ast::MatchExpr*>(&e)) {
+            for (const auto& arm : me->arms)
+                if (arm.body && escapesAggregateRef(*arm.body, r)) return true;
+            return false;
+        }
+        if (auto* le = dynamic_cast<const ast::LoopExpr*>(&e))
+            // a `loop`'s value is whatever its `break <value>`s produce.
+            return le->body && breakValueEscapes(*le->body, r);
+        if (auto* re = dynamic_cast<const ast::RefExpr*>(&e))
+            return rootEscapes(classifyRoot(*re->operand));
+        if (r->kind == TypeKind::Array) {
+            if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
+                for (const auto& el : al->elements)
+                    if (escapesAggregateRef(*el, r->arrayElem)) return true;
+                return false;
+            }
+        }
+        if (r->kind == TypeKind::Struct) {
+            if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
+                for (const auto& fv : sl->fields)
+                    for (const auto& sf : r->structFields)
+                        if (sf.first == fv.first) {
+                            if (escapesAggregateRef(*fv.second, sf.second))
+                                return true;
+                            break;
+                        }
+                return false;
+            }
+        }
+        if (r->kind == TypeKind::Tuple) {
+            if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
+                for (std::size_t i = 0; i < tl->elements.size() &&
+                                        i < r->tupleElems.size();
+                     ++i)
+                    if (escapesAggregateRef(*tl->elements[i], r->tupleElems[i]))
+                        return true;
+                return false;
+            }
+        }
+        if (r->kind == TypeKind::Enum) {
+            if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+                for (const auto& v : r->enumVariants) {
+                    bool match =
+                        ce->callee == v.name ||
+                        (ce->callee.size() > v.name.size() &&
+                         ce->callee.compare(ce->callee.size() - v.name.size(),
+                                            v.name.size(), v.name) == 0);
+                    if (match) {
+                        for (std::size_t i = 0; i < ce->args.size() &&
+                                                i < v.payloadTypes.size();
+                             ++i)
+                            if (escapesAggregateRef(*ce->args[i],
+                                                    v.payloadTypes[i]))
+                                return true;
+                        return false;
+                    }
+                }
+            }
+        }
+        // A bare reference- or aggregate-valued binding returned directly.
+        if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
+            if (r->kind == TypeKind::Ref)
+                return rootEscapes(classifyRoot(*id));
+            // An aggregate binding: a parameter aggregate's refs root in the
+            // caller (ok); a LOCAL aggregate is safe iff its `let`-time
+            // provenance proved its refs root in a parameter/global (else its
+            // stored refs may dangle — reject).
+            auto it = identDecl_.find(id);
+            if (it == identDecl_.end()) return false; // global / unresolved
+            Binding* b = lookupBindingByDeclPos(it->second);
+            if (b && b->declPos < paramCount_) return false; // param aggregate
+            auto pit = bindingEscapes_.find(it->second);
+            if (pit != bindingEscapes_.end()) return pit->second;
+            return true; // unknown-provenance local aggregate: conservative
+        }
+        // `*r` yielding a reference (ref-of-ref deref) — classify the pointee.
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e);
+            un && un->op == ast::UnaryOp::Deref && r->kind == TypeKind::Ref)
+            return rootEscapes(classifyRoot(*un->operand));
+        // A call/method returning a ref-aggregate: a reference in the result
+        // ultimately roots in one of the arguments (the callee passed the same
+        // check, so its returned refs root in ITS parameters = OUR arguments).
+        // Recurse into every ref-carrying argument — this catches a `&local`
+        // nested inside an aggregate argument or behind a ref-typed local, not
+        // just a bare `&local`.
+        const std::vector<ast::ExprPtr>* args = nullptr;
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) args = &ce->args;
+        else if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
+            args = &mc->args;
+            // The receiver is borrowed as `&self`/`&mut self`; a returned ref
+            // rooted in self roots in the receiver's storage. If the receiver is
+            // a local / by-value param / temporary, the result may dangle.
+            if (mc->receiver && rootEscapes(classifyRoot(*mc->receiver)))
+                return true;
+        }
+        if (args) {
+            for (const auto& a : *args) {
+                TypePtr at = typeOf(*a);
+                if (at && typeContainsRef(at) && escapesAggregateRef(*a, at))
+                    return true;
+            }
+            return false;
+        }
+        // Unhandled ref-producing form: don't over-reject (documented). The
+        // adversarial corpus probes for any gap here.
+        return false;
+    }
+
+    // Scan a loop body (without entering nested loops) for `break <value>`
+    // expressions and report whether any break value would escape.
+    bool breakValueEscapes(const ast::Expr& e, const TypePtr& ty) {
+        if (auto* br = dynamic_cast<const ast::BreakExpr*>(&e))
+            return br->value && escapesAggregateRef(*br->value, ty);
+        if (auto* be = dynamic_cast<const ast::BlockExpr*>(&e)) {
+            for (const auto& s : be->stmts)
+                if (auto* es = dynamic_cast<const ast::ExprStmt*>(s.get()))
+                    if (es->expr && breakValueEscapes(*es->expr, ty)) return true;
+            return be->tail && breakValueEscapes(*be->tail, ty);
+        }
+        if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e))
+            return breakValueEscapes(*ie->thenBranch, ty) ||
+                   (ie->elseBranch && breakValueEscapes(*ie->elseBranch, ty));
+        if (auto* me = dynamic_cast<const ast::MatchExpr*>(&e)) {
+            for (const auto& arm : me->arms)
+                if (arm.body && breakValueEscapes(*arm.body, ty)) return true;
+            return false;
+        }
+        // Do NOT descend into nested LoopExpr/WhileExpr: their breaks belong to
+        // the inner loop, not this one.
+        return false;
+    }
+
+    // Run the escape check on a function-return value expression.
+    void checkReturnEscape(const ast::Expr& value) {
+        if (!returnContainsRef_) return;
+        if (escapesAggregateRef(value, returnType_))
+            error("cannot return a reference into a value that does not "
+                  "outlive this function: the returned value contains a "
+                  "reference to a local variable, a by-value parameter, or a "
+                  "temporary, which is dropped when the function returns "
+                  "(kardashev has no lifetime system yet; return an owned value "
+                  "— e.g. by cloning — or borrow from a reference parameter)",
+                  value.line, value.column);
+    }
+
     TypePtr typeOf(const ast::Expr& e) {
         auto it = tc_.exprTypes.find(&e);
         if (it == tc_.exprTypes.end()) return nullptr;
@@ -280,6 +597,7 @@ private:
             if (dp >= 0) {
                 auto& b = bindings_[dp];
                 b.lastUsePos = std::max(b.lastUsePos, myPos);
+                identDecl_[id] = dp; // v52: scope-stable ident -> declPos
             }
             return;
         }
@@ -478,6 +796,8 @@ private:
     void checkFn(const ast::FnDecl& fn) {
         scopes_.clear();
         bindings_.clear();
+        identDecl_.clear();      // v52
+        bindingEscapes_.clear(); // v52
         activeLoans_.clear();
         pos_ = 0;
         callArgDepth_ = 0; // Phase 146: two-phase reservation depth
@@ -514,7 +834,15 @@ private:
         // param count and the same walk order will reproduce identical
         // positions.
         pos_ = static_cast<int>(fn.params.size());
+        // v52 escape analysis: gate on whether the return type can carry a ref.
+        paramCount_ = static_cast<int>(fn.params.size());
+        returnType_ = resolveReturnType(fn);
+        returnContainsRef_ = typeContainsRef(returnType_);
         if (fn.body) consume(*fn.body, /*expectExpire=*/-1);
+        // Hook B: the function-body tail is a return in value position. Early
+        // `return` statements are checked at their site (Hook A in consume).
+        if (returnContainsRef_ && fn.body && fn.body->tail)
+            checkReturnEscape(*fn.body->tail);
     }
 
     // --- Pass 2: walk an expression. `consume` says "treat the result
@@ -1140,10 +1468,13 @@ private:
                 // the declPos that pass 1 assigned (one `pos_` tick per
                 // non-`_` name, mirroring prePassBlock's newBinding calls).
                 if (!let->tupleNames.empty()) {
+                    bool tupEsc = escapesAggregateRef(*let->value,
+                                                      typeOf(*let->value)); // v52
                     for (const auto& nm : let->tupleNames) {
                         if (nm == "_") continue;
                         int dp = pos_++;
                         scopes_.back()[nm] = dp;
+                        bindingEscapes_[dp] = tupEsc;
                     }
                     retireExpiredLoans(rhsEnd);
                     last = std::max(last, rhsEnd);
@@ -1151,6 +1482,11 @@ private:
                 }
                 int borrowerDp = pos_++;
                 scopes_.back()[let->name] = borrowerDp;
+                // v52: record whether this binding's value carries a frame-local
+                // reference, so a later `return r;` of a param-rooted binding is
+                // accepted (and a `let r = &local; … r` is still rejected).
+                bindingEscapes_[borrowerDp] =
+                    escapesAggregateRef(*let->value, typeOf(*let->value));
                 if (rhsStartsNamedBorrow) attachLoanToBorrower(borrowerDp);
                 retireExpiredLoans(rhsEnd);
                 last = std::max(last, rhsEnd);
@@ -1161,6 +1497,7 @@ private:
                     int p = consume(*ret->value, /*expectExpire=*/-1);
                     retireExpiredLoans(p);
                     last = std::max(last, p);
+                    checkReturnEscape(*ret->value); // v52: Hook A (early return)
                 }
                 continue;
             }
