@@ -18,6 +18,24 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.41.0] — Roadmap v41 "Memory safety, parity complete + unsafe surface" (partial)
+
+### Added
+- **Deref-assignment `*p = v`** — write through a `&mut T` (safe) or a `*mut T`
+  raw pointer (`unsafe`), plus `*box = v`. Retires the long-standing
+  "deref-assign unsupported language-wide" gap. Writing through `&T`, or a raw
+  `*p=v` outside `unsafe`, is a clear error.
+- **`copy_nonoverlapping(src: *const T, dst: *mut T, n: i64)`** — a memcpy of n
+  ELEMENTS between raw pointers (unsafe; pointee-type checked; element stride
+  from the host DataLayout).
+
+### Deferred / honest limitations
+- Lifetime params + **real region inference** (the XL NLL rearchitecture — the
+  sound NLL-lite position-counting check stays) and reducing the
+  intentional-leak allowlist to only the Arc/Rc-cycle fixtures (recursive
+  Future-drop) remain (ROADMAP-1.0-AND-BEYOND.md, v41). The Miri-gate + formal
+  proof are the 6/6 work (v47/v50).
+
 ## [0.40.0] — Roadmap v40 "Parallel executor & structured concurrency" (partial)
 
 The concurrency capstone. Its headline — the multi-threaded work-stealing
