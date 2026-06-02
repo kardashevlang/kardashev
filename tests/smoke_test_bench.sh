@@ -26,7 +26,7 @@ echo "Using kardc at: $KARDC ; bench at: $BENCH"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 TO="timeout 60"; command -v timeout >/dev/null 2>&1 || TO=""
 
-for w in fib loop collatz; do
+for w in fib loop collatz primes matmul; do
     "$KARDC" --no-cache -O2 -o "$TMP/${w}_k" "$BENCH/${w}.kd" >/dev/null 2>&1 || { echo "FAIL [bench/$w]: kardc -O2 build failed"; exit 1; }
     "$CLANG" -O2 "$BENCH/${w}.c" -o "$TMP/${w}_c" 2>/dev/null || { echo "FAIL [bench/$w]: clang build failed"; exit 1; }
     ko=$($TO "$TMP/${w}_k" 2>/dev/null) || { echo "FAIL [bench/$w]: kardashev binary failed/timed out"; exit 1; }
