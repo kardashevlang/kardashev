@@ -1,5 +1,5 @@
 # Benchmark sources, readable by //tests:smoke_test_bench (and bench/run.sh).
 exports_files(
-    ["fib.kd", "loop.kd", "collatz.kd", "fib.c", "loop.c", "collatz.c", "run.sh"],
+    ["fib.kd", "loop.kd", "collatz.kd", "primes.kd", "matmul.kd", "fib.c", "loop.c", "collatz.c", "primes.c", "matmul.c", "run.sh"],
     visibility = ["//visibility:public"],
 )

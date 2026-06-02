@@ -1,0 +1,14 @@
+// Application-scale: count primes < 200,000 by trial division (nested loops + mod).
+fn main() -> i64 ! { io } {
+    let n = 200000;
+    let mut count = 0;
+    let mut i = 2;
+    while i < n {
+        let mut is_prime = 1;
+        let mut d = 2;
+        while d * d <= i { if i % d == 0 { is_prime = 0; d = i + 1; } else { d = d + 1; } }
+        if is_prime == 1 { count = count + 1; } else {}
+        i = i + 1;
+    }
+    print(count); 0
+}

@@ -1633,6 +1633,10 @@ sh_test(
         "//bench:fib.c",
         "//bench:loop.c",
         "//bench:collatz.c",
+        "//bench:primes.kd",
+        "//bench:matmul.kd",
+        "//bench:primes.c",
+        "//bench:matmul.c",
     ],
 )
 
