@@ -97,6 +97,12 @@ public:
     // `Either`/`Result`). Setting the host layout up front makes the baked
     // sizes and the lowered offsets agree. Idempotent.
     bool hostDataLayoutSet_ = false;
+    // v51 perf: the host TargetMachine, created once in setHostDataLayout and
+    // KEPT ALIVE (not deleted) so the optimization pipeline can be given a real
+    // TargetTransformInfo — without it the loop/SLP vectorizers and cost models
+    // run target-blind and decline every vectorization (the ~2.2x tight-loop
+    // gap vs clang). It must outlive the PassBuilder run (TTI holds a reference).
+    std::unique_ptr<llvm::TargetMachine> hostTM_;
     void setHostDataLayout() {
         // Idempotent: run() pins the layout up front; finish()'s (and any other)
         // call is then a no-op — avoids redoing target lookup AND avoids leaking
@@ -122,7 +128,12 @@ public:
 #endif
             if (tm) {
                 module_->setDataLayout(tm->createDataLayout());
-                delete tm; // caller owns the TargetMachine
+                // v51 perf: keep the TargetMachine alive (was `delete tm;`) so
+                // finish()'s PassBuilder gets its TargetTransformInfo. Generic
+                // CPU is retained deliberately — it keeps the optimizer's layout
+                // identical to the AOT/JIT backend's (guards the recursive-enum
+                // read miscompile) and the emitted object portable.
+                hostTM_.reset(tm);
             }
         }
         hostDataLayoutSet_ = true;
@@ -472,7 +483,11 @@ public:
             // asserts on O0); the alloca-heavy bindings and the `print` /
             // trivial-wrapper calls survive un-inlined, so O0 IR is materially
             // larger / less optimized than O2 — which the smoke test asserts.
-            llvm::PassBuilder pb;
+            // v51 perf: pass the host TargetMachine so the pipeline registers a
+            // real TargetTransformInfo (TTI) — enables the loop/SLP vectorizers
+            // and target-accurate cost models (mem2reg/inline/GVN are unchanged).
+            // setHostDataLayout() ran first (top of run()), so hostTM_ is set.
+            llvm::PassBuilder pb(hostTM_.get());
             llvm::LoopAnalysisManager lam;
             llvm::FunctionAnalysisManager fam;
             llvm::CGSCCAnalysisManager cam;
@@ -2439,9 +2454,13 @@ private:
                              llvm::Value* cap) -> llvm::Value* {
             llvm::Value* h =
                 keyIsInt ? kVal : b.CreateCall(hashFn, {kSlot}, "kh");
-            auto* rem = b.CreateSRem(h, cap, "rem");
-            auto* plus = b.CreateAdd(rem, cap, "plus");
-            return b.CreateURem(plus, cap, "start");
+            // v51 perf: cap is always 0 or a power of two (starts at 8, doubles;
+            // cap==0 is guarded by the callers before probing), so the home slot
+            // `h mod cap` is exactly `h & (cap-1)` — a single AND instead of a
+            // hardware idiv (~20-40 cyc, not pipelined). The AND of the low bits
+            // is the correct non-negative index even for a negative signed hash.
+            auto* capM1 = b.CreateSub(cap, llvm::ConstantInt::get(cap->getType(), 1), "cap.m1");
+            return b.CreateAnd(h, capM1, "start");
         };
         // i1: does the stored key at `keyPtr` equal the probe key?
         auto emitEq = [&](llvm::IRBuilder<>& b, llvm::Value* kVal,
@@ -2539,7 +2558,9 @@ private:
             b.CreateBr(nextBB);
             b.SetInsertPoint(nextBB);
             auto* inc = b.CreateAdd(idx, one, "inc");
-            auto* wrapped = b.CreateURem(inc, cap, "wrap");
+            auto* wrapped = b.CreateAnd( // v51: cap is pow2 -> mod == & (cap-1)
+                inc, b.CreateSub(cap, llvm::ConstantInt::get(cap->getType(), 1)),
+                "wrap");
             b.CreateStore(wrapped, idxSlot);
             b.CreateBr(loopBB);
             declaredFns_["__hm_raw_insert__" + vMangle] = fn;
@@ -2782,7 +2803,9 @@ private:
 
             b.SetInsertPoint(stepBB);
             auto* inc = b.CreateAdd(idx, one, "inc");
-            auto* wrapped = b.CreateURem(inc, cap, "wrap");
+            auto* wrapped = b.CreateAnd( // v51: cap is pow2 -> mod == & (cap-1)
+                inc, b.CreateSub(cap, llvm::ConstantInt::get(cap->getType(), 1)),
+                "wrap");
             b.CreateStore(wrapped, idxSlot);
             b.CreateBr(loopBB);
             declaredFns_["hashmap_get__" + vMangle] = fn;
@@ -2866,8 +2889,8 @@ private:
                 dropConsumedKey(b, kSlot);
                 b.CreateRet(someAgg);
                 b.SetInsertPoint(stepBB);
-                b.CreateStore(b.CreateURem(b.CreateAdd(idx, one, "inc"), cap,
-                                           "wrap"),
+                b.CreateStore(b.CreateAnd(b.CreateAdd(idx, one, "inc"),
+                                          b.CreateSub(cap, one), "wrap"),
                               idxSlot);
                 b.CreateBr(loopBB);
                 declaredFns_["hashmap_get_ref__" + vMangle] = fn;
@@ -2965,7 +2988,8 @@ private:
 
                 b.SetInsertPoint(stepBB);
                 b.CreateStore(
-                    b.CreateURem(b.CreateAdd(i, one, "inc"), cap, "wrap"),
+                    b.CreateAnd(b.CreateAdd(i, one, "inc"),
+                                b.CreateSub(cap, one), "wrap"),
                     idxSlot);
                 b.CreateBr(findBB);
 
@@ -2989,8 +3013,8 @@ private:
                 // shift.hdr: advance j; stop at the first empty slot.
                 b.SetInsertPoint(shiftHdr);
                 auto* jPrev = b.CreateLoad(i64Ty, jSlot, "j.prev");
-                auto* j =
-                    b.CreateURem(b.CreateAdd(jPrev, one, "j.inc"), cap, "j.wrap");
+                auto* j = b.CreateAnd(b.CreateAdd(jPrev, one, "j.inc"),
+                                      b.CreateSub(cap, one), "j.wrap");
                 b.CreateStore(j, jSlot);
                 auto* ej = b.CreateGEP(entryTy, buckets, j, "ej");
                 auto* sj = b.CreateLoad(
@@ -12084,8 +12108,18 @@ private:
             auto* ptrTy = llvm::PointerType::get(*ctx_, 0);
             for (unsigned d = 1; d < refDepth; ++d)
                 arrPtr = builder_->CreateLoad(ptrTy, arrPtr, "deref");
+        } else if (llvm::Value* place = emitPlaceAddr(*ix.object)) {
+            // v51 perf: the object is an lvalue (a local, a struct/tuple field,
+            // a deref) — GEP straight into its storage. Avoids spilling the
+            // WHOLE array value (load [N x T] + alloca + store) on every element
+            // read, which SROA does not clean up for large N (e.g. an array
+            // FIELD `g.cells[j]` in a loop was copying the entire array per
+            // access). The local-array case already hit this address; this now
+            // also covers fields/derefs/tuple elements.
+            arrPtr = place;
         } else {
-            // Value array: spill to a temp slot so we can GEP+load by index.
+            // Genuine rvalue array (a call result, an array literal): no place
+            // address exists, so spill the value to a temp slot to GEP into it.
             llvm::Value* arrVal = emitExpr(*ix.object);
             arrPtr = entryAlloca(arrLlvm, "arr.idx.tmp");
             builder_->CreateStore(arrVal, arrPtr);
