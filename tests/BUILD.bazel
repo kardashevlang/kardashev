@@ -571,6 +571,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v43: built-in helper macros (stringify!/concat!/count!/cfg!).
+sh_test(
+    name = "smoke_test_builtin_macros",
+    srcs = ["smoke_test_builtin_macros.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
