@@ -585,6 +585,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v46: compiler-hardening fuzz (front-end crash-resistance on adversarial input).
+sh_test(
+    name = "smoke_test_compiler_fuzz",
+    srcs = ["smoke_test_compiler_fuzz.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
