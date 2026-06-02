@@ -592,6 +592,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v47: totality — #[total] checked termination assertion.
+sh_test(
+    name = "smoke_test_totality",
+    srcs = ["smoke_test_totality.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

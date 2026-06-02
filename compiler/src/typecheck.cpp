@@ -2,6 +2,7 @@
 #include "kardashev/typecheck.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <unordered_set>
 #include <utility>
 
@@ -2775,6 +2776,7 @@ public:
                 }
             }
         }
+        checkTotality(program); // v47: verify every `#[total]` fn terminates
         // Validate trait method signatures don't declare unknown effects
         // (the dispatching impl method's effects already get checked
         // above via its FnSchema; the trait sig's effects are advisory
@@ -3039,6 +3041,11 @@ private:
     std::unordered_map<const ast::BinaryExpr*, std::string> binOpMethod_;
     std::unordered_map<const ast::UnaryExpr*, std::string> unaryOpMethod_; // v37
     std::unordered_map<const ast::TryExpr*, std::string> tryFromConv_; // v35 P190
+    // v47 totality: when `totRec_` is non-null, the (reused) effect walker also
+    // records, for the fn being analyzed, whether it contains a `while`/`loop`
+    // and the names of the fns it calls — feeding the #[total] call-graph check.
+    std::vector<std::string>* totCalls_ = nullptr;
+    bool totSawLoop_ = false;
     // v32 Phase 176: user-declared effects. `userEffectNames_` makes an effect
     // name a valid (concrete) effect-row label; `effectOpDecls_` maps
     // effect -> op -> the AST op signature (param/return TypeRefs resolved
@@ -3158,7 +3165,8 @@ private:
     // declared in the fn's generic-parameter list (Phase 4.3).
     static bool isBuiltinEffect(const std::string& l) {
         return l == "alloc" || l == "io" || l == "panic" ||
-               l == "async" || l == "unwind" || l == "share";
+               l == "async" || l == "unwind" || l == "share" ||
+               l == "div"; // v47: divergence (may-not-terminate) effect
     }
 
     // Phase 10a classification: collect, from a signature, the names that
@@ -3261,6 +3269,7 @@ private:
             return;
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            if (totCalls_) totCalls_->push_back(call->callee); // v47 totality
             for (const auto& a : call->args) collectEffects(*a, out);
             // Phase 10a: prefer the per-call-site contribution recorded
             // during body-checking (it reflects instantiated effect-row
@@ -3382,11 +3391,13 @@ private:
             return;
         }
         if (auto* we = dynamic_cast<const ast::WhileExpr*>(&e)) {
+            if (totCalls_) totSawLoop_ = true; // v47 totality
             collectEffects(*we->cond, out);
             collectEffects(*we->body, out);
             return;
         }
         if (auto* le = dynamic_cast<const ast::LoopExpr*>(&e)) {
+            if (totCalls_) totSawLoop_ = true; // v47 totality
             collectEffects(*le->body, out);
             return;
         }
@@ -9534,6 +9545,78 @@ private:
     //   - a field-access chain `place.f` whose root is assignable OR a
     //     `&mut` reference (so `&mut self`'s fields are writable).
     // Types must unify.
+    // v47 totality: verify every `#[total]` fn provably terminates by a sound
+    // conservative call-graph analysis — it (and every fn it transitively
+    // calls) must contain no `while`/`loop`, and the call graph reachable from
+    // it must be acyclic (no recursion). Anything that *might* diverge is
+    // rejected; `for`-over-a-range is bounded and fine. (The full halting
+    // oracle + a `div` effect row is the deferred 6/6 work.)
+    void checkTotality(const ast::Program& program) {
+        bool anyTotal = false;
+        for (const auto& fn : program.functions)
+            if (fn.isTotal) { anyTotal = true; break; }
+        if (!anyTotal) return; // zero cost when the feature is unused
+
+        // Per-fn (hasLoop, callees), built by re-running the effect walker with
+        // recording on. Only over source fns (callees naming a builtin/prelude
+        // fn that isn't in this map are treated as terminating — sound for the
+        // pure stdlib helpers, which are loop-bounded; a recursive *user* fn is
+        // still caught because it appears in the map).
+        struct Info { bool hasLoop = false; std::vector<std::string> calls; };
+        std::unordered_map<std::string, Info> info;
+        auto analyze = [&](const ast::FnDecl& fn) {
+            Info in;
+            if (fn.body) {
+                std::vector<std::string> calls;
+                totCalls_ = &calls;
+                totSawLoop_ = false;
+                EffectSet sink;
+                collectEffects(*fn.body, sink);
+                totCalls_ = nullptr;
+                in.hasLoop = totSawLoop_;
+                in.calls = std::move(calls);
+            }
+            info[fn.name] = std::move(in);
+        };
+        for (const auto& fn : program.functions) analyze(fn);
+
+        // DFS from each `#[total]` fn; report the first reason it may diverge.
+        for (const auto& fn : program.functions) {
+            if (!fn.isTotal) continue;
+            std::unordered_set<std::string> onStack, visited;
+            std::string reason;
+            std::function<bool(const std::string&)> dfs =
+                [&](const std::string& name) -> bool {
+                auto it = info.find(name);
+                if (it == info.end()) return true; // builtin/prelude: assume total
+                if (onStack.count(name)) {
+                    reason = "it is recursive (`" + name +
+                             "` is reachable from itself)";
+                    return false;
+                }
+                if (visited.count(name)) return true;
+                visited.insert(name);
+                onStack.insert(name);
+                if (it->second.hasLoop) {
+                    reason = "`" + name +
+                             "` contains a `while`/`loop` (use a bounded `for` "
+                             "or remove `#[total]`)";
+                    onStack.erase(name);
+                    return false;
+                }
+                for (const auto& callee : it->second.calls)
+                    if (!dfs(callee)) { onStack.erase(name); return false; }
+                onStack.erase(name);
+                return true;
+            };
+            if (!dfs(fn.name))
+                error("function `" + fn.name +
+                          "` is declared `#[total]` but may not terminate: " +
+                          reason,
+                      fn.line, fn.column);
+        }
+    }
+
     void checkAssign(const ast::AssignStmt& as) {
         // v41 deref-assignment: `*p = v`. Writes through a `&mut T` (safe) or a
         // `*mut T` raw pointer (requires `unsafe`). The pointee type must
