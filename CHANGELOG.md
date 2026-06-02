@@ -18,6 +18,37 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.61.0] — Lazy iterator adaptor tower
+
+### Added
+- **Lazy iterator adaptors** `iter_take` / `iter_skip` / `iter_chain` /
+  `iter_zip` / `iter_enumerate`, backed by stateful adaptor **structs**
+  (`Take<I>`, `Skip<I>`, `Chain<A,B>`, `Zip<A,B>`, `Enumerate<I>`) that each
+  `impl Iterator` and pull **one element at a time** from the wrapped iterator.
+  A chain like `iter_take(iter_skip(range, 20), 5)` **fuses into a single pass**
+  with O(1) extra memory and no intermediate `Vec` — only a terminal
+  `iter_collect` allocates. A `take(skip(range(50_000_000), …), 5)` completes in
+  ~10 ms (an eager adaptor would materialize a ~400 MB Vec). Plus a
+  `vec_iter_i64` Vec→iterator bridge so `Vec<i64>`s feed the tower (ranges
+  already `impl Iterator`). Pure-prelude Kardashev over the existing generic
+  monomorphization — **no codegen changes**.
+  CI-gated by `smoke_test_iter_lazy.sh` (7 cases: take∘skip, zip, enumerate,
+  chain, vec-bridge, collect, and the 50M-range allocation-discipline proxy),
+  with `smoke_test_iter.sh` staying green.
+
+### Deferred (honest)
+- **Element-generic adaptors.** The tower's element type is `i64` (and
+  `(i64,i64)` for zip/enumerate). A fully element-generic tower needs
+  `impl<T> Iterator<T> for Adaptor<T>` — a generic parameter as the trait's
+  type argument — which the impl resolver rejects today (`unknown type: T`,
+  because the impl's generic params aren't in scope when the trait-ref's type
+  args resolve). Tracked for a later version.
+- **The eager `vec_take` / `vec_skip` / … remain** unchanged (direct Vec→Vec)
+  rather than being rewritten in terms of the lazy tower — the rewrite was
+  deferred to avoid churn; both coexist.
+- `fold` / `scan` / `flat_map` / `peekable` and `DoubleEndedIterator`; C-backend
+  lowering of the lazy tower (outside the emit-c subset).
+
 ## [0.60.0] — Type & effect checker depth
 
 ### Fixed

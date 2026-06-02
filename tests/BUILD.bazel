@@ -704,6 +704,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v61: lazy iterator adaptor tower (take/skip/chain/zip/enumerate fuse).
+sh_test(
+    name = "smoke_test_iter_lazy",
+    srcs = ["smoke_test_iter_lazy.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
