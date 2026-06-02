@@ -2709,6 +2709,57 @@ private:
             }
         }
 
+        // --- v64: __assert_report(left, right, eq) — the effect-free reporter
+        // behind value-printing assert_eq!/assert_ne!. Formats the actual values
+        // into a stack buffer (snprintf) and writes the diagnostic to stderr
+        // (fd 2) via POSIX write — like a panic message, so it carries no
+        // io/alloc effect and keeps assert-using test fns effect-free.
+        if (tc_.usesAssertReport) {
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            auto snprintfFn = module_->getOrInsertFunction(
+                "snprintf", llvm::FunctionType::get(
+                                i32Ty, {i8PtrTy, i64Ty, i8PtrTy}, /*var=*/true));
+            auto writeFn = module_->getOrInsertFunction(
+                "write", llvm::FunctionType::get(
+                             i64Ty, {i32Ty, i8PtrTy, i64Ty}, false));
+            auto* ft = llvm::FunctionType::get(i64Ty, {i64Ty, i64Ty, i64Ty},
+                                               false);
+            auto* fn = llvm::Function::Create(
+                ft, llvm::Function::ExternalLinkage, "__assert_report",
+                module_.get());
+            auto* left = fn->getArg(0);
+            auto* right = fn->getArg(1);
+            auto* eq = fn->getArg(2);
+            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(e);
+            auto* buf = b.CreateAlloca(i8Ty,
+                                       llvm::ConstantInt::get(i64Ty, 256), "ab");
+            auto* opEq = b.CreateGlobalString("==", "kd_assert_eq", 0,
+                                              module_.get());
+            auto* opNe = b.CreateGlobalString("!=", "kd_assert_ne", 0,
+                                              module_.get());
+            auto* op = b.CreateSelect(
+                b.CreateICmpNE(eq, llvm::ConstantInt::get(i64Ty, 0), "iseq"),
+                opEq, opNe, "op");
+            auto* fmt = b.CreateGlobalString(
+                "assertion failed: `(left %s right)`  left=%lld right=%lld\n",
+                "kd_assert_fmt", 0, module_.get());
+            auto* n = b.CreateCall(
+                snprintfFn,
+                {buf, llvm::ConstantInt::get(i64Ty, 256), fmt, op, left, right},
+                "n");
+            // snprintf returns the would-be length; clamp to 255 for the write.
+            auto* n64 = b.CreateSExt(n, i64Ty, "n64");
+            auto* clamped = b.CreateSelect(
+                b.CreateICmpSGT(n64, llvm::ConstantInt::get(i64Ty, 255),
+                                "toobig"),
+                llvm::ConstantInt::get(i64Ty, 255), n64, "len");
+            b.CreateCall(writeFn,
+                         {llvm::ConstantInt::get(i32Ty, 2), buf, clamped});
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_["__assert_report"] = fn;
+        }
+
         // Phase 13b / 37: slice read ops (slice_len / slice_get / slice_get_ref)
         // are now GENERIC over the element type and synthesized per-T in
         // getOrEmitSliceOp (mirroring getOrEmitVecOp), dispatched from emitCall.

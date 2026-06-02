@@ -1901,9 +1901,23 @@ std::string applyPrelude(const std::string& userSrc) {
     // works anywhere is future work, pending a panic-catching runner.)
     if (userSrc.find("macro_rules! assert") == std::string::npos) {
         prelude +=
+            // v64: value-printing asserts. assert_eq!/assert_ne! bind their
+            // operands to temporaries (single evaluation) and, on failure, print
+            // the actual `left=`/`right=` values to stderr via the effect-FREE
+            // `__assert_report` builtin BEFORE returning the non-zero test code —
+            // so a failing test names what it saw instead of silently returning
+            // 1. The reporter is a diagnostic write to fd 2 (like a panic
+            // message), so it carries NO `io`/`alloc` effect and keeps the
+            // effect-free `test_*() -> i64` convention intact. Operands are i64
+            // (the test framework asserts integer results); a `Display`-generic
+            // value-printing form would force the test fn to declare `! {io}`.
             "macro_rules! assert { ($c:expr) => { if $c { } else { return 1; } }; }\n"
-            "macro_rules! assert_eq { ($a:expr, $b:expr) => { if $a == $b { } else { return 1; } }; }\n"
-            "macro_rules! assert_ne { ($a:expr, $b:expr) => { if $a == $b { return 1; } else { } }; }\n";
+            "macro_rules! assert_eq { ($a:expr, $b:expr) => "
+            "{ { let la = $a; let lb = $b;"
+            " if la == lb { } else { __assert_report(la, lb, 1); return 1; } } }; }\n"
+            "macro_rules! assert_ne { ($a:expr, $b:expr) => "
+            "{ { let la = $a; let lb = $b;"
+            " if la == lb { __assert_report(la, lb, 0); return 1; } else { } } }; }\n";
     }
     return prelude + userSrc;
 }
@@ -2667,26 +2681,107 @@ struct ErrorCode {
     const char* explain;
 };
 const std::vector<ErrorCode>& errorCodes() {
+    // v64: the table is ORDERED most-specific-first — `classifyError` returns
+    // the first entry whose any-substring matches, so a specific code (a borrow
+    // / effect / const error) must precede the broad ones (`E0308` "mismatch",
+    // `E0001` "expected "). This is the deterministic priority classifier.
     static const std::vector<ErrorCode> table = {
-        {"E0001",
-         {"expected ", "unexpected "},
-         "syntax error",
-         "The parser reached a token it did not expect. Check for a missing\n"
-         "`;`, `}`, `)`, or `else`, or a keyword used as an identifier."},
-        {"E0308",
-         {"does not match", "same integer type", "expects bool", "arm body "
-          "type", " body type ", "operands", "mismatch"},
-         "mismatched types",
-         "An expression's type does not match the type required by its\n"
-         "context (a fn return type, an operator's operands, an `if`/`match`\n"
-         "arm, or a `let` annotation). kardashev does not implicitly convert\n"
-         "between types — cast explicitly with `as`, or fix the value."},
+        // --- const-evaluation (specific; some messages contain "expected") ---
+        {"E0080",
+         {"const evaluation exceeded", "const initializer has type",
+          "cannot infer const", "const generic argument must be",
+          "expected an i64 constant", "a `const` must be a scalar"},
+         "constant evaluation failed",
+         "A `const` / const-generic could not be evaluated at compile time:\n"
+         "the initializer's type is wrong, a const argument is out of range or\n"
+         "uninferred, or const recursion ran too deep. Fix the const expression\n"
+         "or annotate the const-generic argument explicitly."},
+        // --- ownership / borrow (v52–v54 escape analysis + NLL) ---
+        {"E0597",
+         {"cannot return a reference into a value",
+          "cannot store a reference to a local",
+          "into the dead stack frame", "does not live long enough"},
+         "borrowed value does not live long enough",
+         "A reference would outlive the data it points to — e.g. a returned\n"
+         "`&T` rooted in a local / by-value param / temporary, or such a\n"
+         "reference stored through a `&mut` out-parameter. Return an owned value,\n"
+         "or root the reference in a by-reference parameter or a global."},
+        {"E0499",
+         {"mutably more than once"},
+         "cannot borrow as mutable more than once",
+         "A place was borrowed `&mut` while another `&mut` of it is still live.\n"
+         "Exactly one active mutable borrow is allowed; end the first borrow\n"
+         "(let it go out of scope / finish its last use) before the second."},
+        {"E0502",
+         {"mutably while shared borrows are active",
+          "immutably while a mutable borrow is active", "cannot reborrow"},
+         "conflicting shared and mutable borrows",
+         "A `&mut` borrow conflicts with an active `&` borrow of the same place\n"
+         "(or vice-versa). Shared and mutable borrows cannot overlap; sequence\n"
+         "them so the conflicting borrow has ended before the other begins."},
+        {"E0505",
+         {"cannot move a non-Copy value out of a borrowed",
+          "cannot move a non-Copy value out of an array index",
+          "cannot move captured value out of a loop"},
+         "cannot move out of a borrowed / indexed place",
+         "Ownership cannot move out of a place behind a reference, an array\n"
+         "index, or a loop capture (it would leave the source invalid). Clone\n"
+         "the value (`.clone()`), or restructure so the move owns its source."},
         {"E0382",
-         {"moved value", "use of moved", "already moved"},
+         {"moved value", "use of moved", "already moved",
+          "use of partially-moved", "field access on moved",
+          "borrow of moved"},
          "use of a moved value",
          "A non-`Copy` value was used after ownership moved out of it (into a\n"
          "fn call, a `let`, or a struct/enum). Use the value before the move,\n"
          "clone it (`.clone()`), or borrow it (`&x`) instead of moving."},
+        // --- pattern / match ---
+        {"E0004",
+         {"non-exhaustive match"},
+         "non-exhaustive match",
+         "A `match` does not cover every possible value of the scrutinee. Add\n"
+         "the missing pattern(s) shown, or a wildcard `_ => …` arm."},
+        {"E0571",
+         {"outside of a loop", "outside a loop"},
+         "`break`/`continue` outside a loop",
+         "`break` and `continue` are only valid inside a `while`/`loop`/`for`\n"
+         "body. Move the control-flow expression inside a loop."},
+        // --- effects (kardashev-specific) ---
+        {"E0710",
+         {"uses effect", "but does not declare it"},
+         "effect not declared",
+         "A function performs an effect (`io`/`alloc`/`panic`/`async`/…, or a\n"
+         "user effect) that its `! { … }` row does not declare. Add the effect\n"
+         "to the signature, or discharge it (`catch` for `panic`, a `handle`\n"
+         "block for a user effect)."},
+        {"E0711",
+         {"must be handled", "escapes `main`", "unhandled effect",
+          "reaches `main`"},
+         "effect escapes `main` unhandled",
+         "A user-declared effect performed somewhere reaches `main` without a\n"
+         "`handle` block discharging it. Wrap the performing code in\n"
+         "`handle { … } with E { … }`, so no user effect escapes the program."},
+        {"E0712",
+         {"unknown effect", "effect redefined", "effect operation redefined"},
+         "unknown or duplicate effect",
+         "An effect label is not a built-in, a declared `effect`, or a fn-type\n"
+         "row variable — or an `effect`/operation was defined twice. Declare the\n"
+         "effect, fix the label, or remove the duplicate."},
+        // --- codegen-quality contracts (v48) + totality (v47) ---
+        {"E0720",
+         {"#[codegen(no_alloc)]", "#[codegen(no_panic)]", "#[codegen(no_io)]",
+          "#[codegen("},
+         "codegen-quality contract violated",
+         "A `#[codegen(no_alloc/no_panic/no_io)]` function — or something it\n"
+         "calls — performs the forbidden effect. Remove the operation from the\n"
+         "hot/embedded path, or drop the contract attribute."},
+        {"E0721",
+         {"may not terminate", "#[total]"},
+         "totality check failed",
+         "A `#[total]` function may not terminate (an unbounded loop or a\n"
+         "recursion the checker cannot prove bounded). Make termination evident,\n"
+         "or remove `#[total]`."},
+        // --- name resolution / members ---
         {"E0425",
          {"unknown identifier", "undefined", "cannot find"},
          "cannot find a name in scope",
@@ -2698,25 +2793,37 @@ const std::vector<ErrorCode>& errorCodes() {
          "no such field or method",
          "The field or method does not exist on this type. Check the name, and\n"
          "that the relevant `impl`/trait is in scope for a method call."},
-        {"E0571",
-         {"outside of a loop", "outside a loop"},
-         "`break`/`continue` outside a loop",
-         "`break` and `continue` are only valid inside a `while`/`loop`/`for`\n"
-         "body. Move the control-flow expression inside a loop."},
         {"E0277",
          {"does not implement", "trait bound", "is not satisfied", "no impl"},
          "trait bound not satisfied",
          "A generic was used at a type that does not implement a required\n"
          "trait. Add the missing `impl Trait for Type`, or add/relax the bound."},
         {"E0384",
-         {"cannot assign", "not mutable", "immutable", "non-mut"},
+         {"cannot assign", "not mutable", "is immutable", "non-mut"},
          "assignment to an immutable binding",
          "Assignment requires a `let mut` binding (or a `&mut` place).\n"
          "Declare the binding `let mut x = …;` to make it reassignable."},
+        // --- broad fallbacks (LAST) ---
+        {"E0308",
+         {"does not match", "same integer type", "expects bool", "arm body "
+          "type", " body type ", "operands", "mismatch", "annotated type",
+          "value has type", "has type "},
+         "mismatched types",
+         "An expression's type does not match the type required by its\n"
+         "context (a fn return type, an operator's operands, an `if`/`match`\n"
+         "arm, or a `let` annotation). kardashev does not implicitly convert\n"
+         "between types — cast explicitly with `as`, or fix the value."},
+        {"E0001",
+         {"expected ", "unexpected "},
+         "syntax error",
+         "The parser reached a token it did not expect. Check for a missing\n"
+         "`;`, `}`, `)`, or `else`, or a keyword used as an identifier."},
     };
     return table;
 }
 const ErrorCode* classifyError(const std::string& msg) {
+    // Priority-ordered: the table is sorted most-specific-first, so the first
+    // matching entry is the most precise classification (v64).
     for (const auto& ec : errorCodes())
         for (const char* m : ec.match)
             if (msg.find(m) != std::string::npos) return &ec;

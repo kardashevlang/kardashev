@@ -427,6 +427,16 @@ public:
             sch.signature = makeFunction({}, makeInt());
             fnSchemas_["rand_global"] = std::move(sch);
         }
+        // v64: __assert_report(left: i64, right: i64, eq: i64) -> i64 — the
+        // value-printing reporter behind assert_eq!/assert_ne!. A diagnostic
+        // write to stderr (fd 2), like a panic message, so it carries NO
+        // effect — keeping assert-using `test_*() -> i64` fns effect-free.
+        {
+            FnSchema sch;
+            sch.signature =
+                makeFunction({makeInt(), makeInt(), makeInt()}, makeInt());
+            fnSchemas_["__assert_report"] = std::move(sch);
+        }
 
         // --- v63: buffered line reading + file metadata. Low-level builtins on
         // PRIMITIVE types only (i64 handles / &mut i64 out-params / &mut String)
@@ -2908,6 +2918,7 @@ public:
         result.matchBindingTypes = std::move(matchBindingTypes_);
         result.usesFileIo = usesFileIo_;
         result.usesRuntimeExtras = usesRuntimeExtras_;
+        result.usesAssertReport = usesAssertReport_;
         result.fnSchemas = std::move(fnSchemas_);
         result.callInstantiations = std::move(callInstantiations_);
         result.staticCallMangled = std::move(staticCallMangled_);
@@ -3198,6 +3209,7 @@ private:
     // codegen emits that (libc-referencing) runtime only on demand.
     bool usesFileIo_ = false;
     bool usesRuntimeExtras_ = false; // v62: clock / env / global-RNG builtins
+    bool usesAssertReport_ = false;  // v64: value-printing assert reporter
     std::vector<TypeError> errors_;
     // Phase 13a: monotonic counter for fresh `for`-loop iterator slot names
     // (`__for_it_N`) when desugaring `for x in <Iterator>`.
@@ -8214,6 +8226,7 @@ private:
             call.callee == "rng_seed_global" || call.callee == "rand_global") {
             usesRuntimeExtras_ = true;
         }
+        if (call.callee == "__assert_report") usesAssertReport_ = true; // v64
         // Phase 48: a qualified static call `Type::method(args)` — an
         // associated (no-self) trait method such as `P::default()`. Resolve it
         // against the named type's impl rather than a value receiver. Only
