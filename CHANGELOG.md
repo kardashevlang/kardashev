@@ -18,6 +18,21 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.43.0] — Roadmap v43 "Metaprogramming parity + regex + typed/multishot effects" (partial)
+
+### Added
+- **Built-in helper macros** — `stringify!` (tokens -> String), `concat!`
+  (join literals -> String), `count!` (arg count -> i64), and `cfg!(pred)`
+  (-> bool of the #[cfg] predicate against `--cfg` flags). Parser-desugared at
+  compile time, like format!/println!.
+
+### Deferred / honest limitations
+- The rest of v43 remains (ROADMAP, v43): macro hygiene (gensym/syntax
+  contexts), nested repetition + metavar-after-repetition, span-accurate macro
+  diagnostics, full comptime (const trait dispatch / const collections), a
+  linear-time regex engine, and the async-effects 6/6 beyond work (typed effect
+  rows end-to-end + multi-shot resumptions).
+
 ## [0.42.0] — Roadmap v42 "Stdlib depth I" (partial)
 
 ### Added
