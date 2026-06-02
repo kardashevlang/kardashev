@@ -276,6 +276,9 @@ All three rewrite to `match` in typecheck and reuse the decision-tree compiler
 
 ## v59 — Ergonomics: struct-update spread + function-parameter destructuring
 
+> **Status:** ✅ SHIPPED v0.59.0 (partial) — struct-update spread `S { x: 10, ..base }` for a Copy base (all-Copy-field structs: base byte-copied, explicit fields overwritten; base consumed). Move-field spread + **parameter destructuring** DEFERRED (param-destructure touches the pervasive `Param` struct + fn-entry codegen — higher risk; struct-update spread is the self-contained, higher-leverage half).
+
+
 **Theme:** Two AST-level ergonomic features over existing struct/pattern
 machinery.
 
