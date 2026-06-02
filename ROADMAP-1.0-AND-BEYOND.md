@@ -286,6 +286,8 @@ v40.
 
 ### v44 — "Backends & platforms: perf, cross-compile, WASM, Windows, freestanding" — moves: BP → 5/5
 
+> **Status (`v0.44.0`, partial):** ✅ SHIPPED — application-scale benchmark suite (primes/matmul, output-gated vs C; ~1.07× C on primes). ⛔ DEFERRED — alloca-free-counter/signed-div codegen, LTO/PGO, cross-compile + per-target std, WASM/Windows/freestanding backends (need wasmtime/wine/qemu env).
+
 The "shippable everywhere" version. Closes the perf gap to **parity-level on
 applications**, adds cross-compilation **with a real per-target std story**, and
 lands the WASM + Windows + freestanding targets (Mega-arc C, §3).

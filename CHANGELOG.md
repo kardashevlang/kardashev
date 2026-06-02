@@ -18,6 +18,23 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.44.0] — Roadmap v44 "Backends & platforms: perf, cross, WASM, Windows" (partial)
+
+### Added
+- **Application-scale benchmark suite** — `primes` (trial division) + `matmul`
+  (64×64 flat-array int matmul) added to the output-gated bench harness (vs
+  `clang -O2`). Honest finding: kardashev is **~1.07× C on `primes`** (inside
+  the 1.1× parity target) and ~1.0× on `collatz`; the ~2.2× figure is specific
+  to the trivial `loop` micro-bench. `matmul` is correctness-only (clang
+  constant-folds the deterministic result). See BENCHMARKS.md.
+
+### Deferred / honest limitations
+- The rest of v44 remains (ROADMAP, v44): alloca-free-counter / signed-div
+  strength-reduction codegen, LTO/PGO, cross-compilation + per-target std, and
+  the **WASM / Windows / freestanding backends** — each needs a wasmtime / wine
+  / qemu environment to differentially verify, which this sandbox lacks. The
+  hard application-perf ≤1.1× CI gate needs a stable bench machine.
+
 ## [0.43.0] — Roadmap v43 "Metaprogramming parity + regex + typed/multishot effects" (partial)
 
 ### Added
