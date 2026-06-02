@@ -331,6 +331,11 @@ struct TypeCheckResult {
     // Codegen emits that runtime (which calls libc free/fopen) only when set,
     // so I/O-free programs stay free of it.
     bool usesFileIo = false;
+    // v62: true iff the program references a runtime-extras builtin
+    // (monotonic_millis / env_var_into / env_var_set / rng_seed_global /
+    // rand_global). Codegen emits that runtime (libc clock_gettime / getenv /
+    // setenv / atoll + the global RNG state) only when set.
+    bool usesRuntimeExtras = false;
     bool ok() const { return errors.empty(); }
 
     // Special members declared out-of-line so the implicit dtor / move ops

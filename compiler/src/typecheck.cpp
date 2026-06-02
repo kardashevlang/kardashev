@@ -379,6 +379,55 @@ public:
             fnSchemas_["arg_get"] = std::move(sch);
         }
 
+        // --- v62: stdlib runtime builtins (monotonic clock, env vars, global
+        // RNG). Each is a thin libc-wrapper lowered in codegen (gated on
+        // `usesRuntimeExtras`), wrapped by prelude Kardashev (Instant / env_var
+        // / Option). ---
+        // monotonic_millis() -> i64 ! { io } : CLOCK_MONOTONIC in milliseconds.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["monotonic_millis"] = std::move(sch);
+        }
+        // env_var_into(name: &String, out: &mut String) -> i64 ! { io, alloc } :
+        // 1 + fills `out` with an OWNED copy if the var is set, else 0.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false),
+                 makeRef(stringTy, /*isMut=*/true)},
+                makeInt());
+            sch.declaredEffects.add("io");
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["env_var_into"] = std::move(sch);
+        }
+        // env_var_set(name: &String, val: &String) -> i64 ! { io } : setenv,
+        // returns 0 on success (non-zero on failure).
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false),
+                 makeRef(stringTy, /*isMut=*/false)},
+                makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["env_var_set"] = std::move(sch);
+        }
+        // rng_seed_global(seed: i64) -> i64 : set the process-global RNG seed.
+        // rand_global() -> i64 : next value from the global LCG (lazily seeded
+        // from KARDASHEV_SEED, else a fixed default, on first use). Both are
+        // pure of io/alloc/panic — deterministic given the seed.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, makeInt());
+            fnSchemas_["rng_seed_global"] = std::move(sch);
+        }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({}, makeInt());
+            fnSchemas_["rand_global"] = std::move(sch);
+        }
+
         // Phase 5.z: vec_* are generic over T. Each call site infers T
         // from arg types; codegen lazily specializes the runtime per T.
         TypePtr vecFnGenericVar = makeFreshVar();
@@ -2802,6 +2851,7 @@ public:
         result.matchTrees = std::move(matchTrees_);
         result.matchBindingTypes = std::move(matchBindingTypes_);
         result.usesFileIo = usesFileIo_;
+        result.usesRuntimeExtras = usesRuntimeExtras_;
         result.fnSchemas = std::move(fnSchemas_);
         result.callInstantiations = std::move(callInstantiations_);
         result.staticCallMangled = std::move(staticCallMangled_);
@@ -3091,6 +3141,7 @@ private:
     // Phase 30: set when the program calls a file-I/O / CLI-args builtin, so
     // codegen emits that (libc-referencing) runtime only on demand.
     bool usesFileIo_ = false;
+    bool usesRuntimeExtras_ = false; // v62: clock / env / global-RNG builtins
     std::vector<TypeError> errors_;
     // Phase 13a: monotonic counter for fresh `for`-loop iterator slot names
     // (`__for_it_N`) when desugaring `for x in <Iterator>`.
@@ -8095,6 +8146,14 @@ private:
             call.callee == "fs_exists" || call.callee == "arg_count" ||
             call.callee == "arg_get") {
             usesFileIo_ = true;
+        }
+        // v62: same lazy-emit story for the runtime-extras builtins (clock /
+        // env / global RNG) — their codegen references libc clock_gettime /
+        // getenv / setenv / atoll, so emit it only when actually used.
+        if (call.callee == "monotonic_millis" ||
+            call.callee == "env_var_into" || call.callee == "env_var_set" ||
+            call.callee == "rng_seed_global" || call.callee == "rand_global") {
+            usesRuntimeExtras_ = true;
         }
         // Phase 48: a qualified static call `Type::method(args)` — an
         // associated (no-self) trait method such as `P::default()`. Resolve it

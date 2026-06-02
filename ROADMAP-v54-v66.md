@@ -433,6 +433,19 @@ generic monomorphization — no codegen changes.
 
 ## v62 — Stdlib runtime: monotonic clock, env vars, seeded global RNG
 
+> **Status:** ✅ SHIPPED v0.62.0 — all three landed as thin libc-wrapper builtins
+> (typecheck schemas + codegen lowering, emitted only when referenced via a new
+> `usesRuntimeExtras` gate so clock-/env-/RNG-free programs carry none of it):
+> `monotonic_millis` (→ `Instant`/`instant_now`/`instant_elapsed_millis`/
+> `instant_duration_since` reusing `Duration`); `env_var_into`/`env_var_set`
+> (→ `env_var -> Option<String>`, owned copy); `rand_global`/`rng_seed_global`
+> over a 64-bit LCG in two internal globals, lazily seeded from `KARDASHEV_SEED`
+> + a `--fuzz-seed` CLI flag. Gates met: `smoke_test_instant.sh` (monotonicity +
+> non-negative deltas), `smoke_test_env.sh` (Some/None/round-trip),
+> `smoke_test_rng_seeding.sh` (same seed reproduces 5-seq, different differs,
+> JIT==AOT, explicit-seed override, --fuzz-seed). DEFERRED: process/subprocess
+> control; wall-clock formatting; CSPRNG.
+
 **Theme:** Three small deterministic-when-seeded runtime capabilities, each a thin
 libc-wrapper builtin (typecheck registration + codegen lowering to a C runtime fn).
 
