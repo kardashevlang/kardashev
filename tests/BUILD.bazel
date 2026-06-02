@@ -606,6 +606,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v49: compile-time reflection — field_count!/variant_count!/size_of!/type_name!.
+sh_test(
+    name = "smoke_test_reflection",
+    srcs = ["smoke_test_reflection.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

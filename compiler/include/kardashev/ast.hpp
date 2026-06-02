@@ -614,6 +614,17 @@ struct CastExpr : Expr {
     TypeRef targetType;
 };
 
+// v49: compile-time reflection intrinsics — `field_count!(T)`, `variant_count!(T)`,
+// `size_of!(T)` reflect to an `i64` constant; `type_name!(T)` to a `String`. The
+// typechecker resolves the argument TypeRef and computes the result against the
+// static type information (struct fields / enum variants / scalar layout). Like
+// CastExpr, holds a TypeRef by value (defined after TypeRef).
+struct ReflectExpr : Expr {
+    enum class Kind { FieldCount, VariantCount, SizeOf, TypeName };
+    Kind kind = Kind::FieldCount;
+    TypeRef arg;
+};
+
 struct Param {
     std::string name;
     TypeRef type;

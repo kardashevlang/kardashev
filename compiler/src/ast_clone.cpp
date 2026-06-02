@@ -260,6 +260,11 @@ ExprPtr cloneExpr(const Expr& e) {
         n->operand = cloneOpt(ca->operand);
         n->targetType = ca->targetType; // TypeRef is value-copyable
         out = std::move(n);
+    } else if (auto* re = dynamic_cast<const ReflectExpr*>(&e)) {
+        auto n = std::make_unique<ReflectExpr>(); // v49 reflection (leaf node)
+        n->kind = re->kind;
+        n->arg = re->arg; // TypeRef is value-copyable
+        out = std::move(n);
     } else if (auto* cl = dynamic_cast<const ClosureExpr*>(&e)) {
         auto n = std::make_unique<ClosureExpr>();
         n->params = cl->params; // ClosureParam is value-copyable
