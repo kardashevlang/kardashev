@@ -260,6 +260,14 @@ std::string applyPrelude(const std::string& userSrc) {
         prelude += "trait Send { }\n";
     if (userSrc.find("trait Sync") == std::string::npos)
         prelude += "trait Sync { }\n";
+    // v55: `Drop` as a built-in trait so `impl Drop for T` resolves WITHOUT the
+    // user re-declaring it (the drop GLUE — user destructor first, then
+    // reverse-field drop + drop-flag machinery — has existed since Phase 16).
+    // Method effect row matches the established test convention (`! { io }`),
+    // permitting a printing destructor; a drop needing other effects can still
+    // declare its own `trait Drop`. Guarded, so a user declaration wins.
+    if (userSrc.find("trait Drop") == std::string::npos)
+        prelude += "trait Drop { fn drop(&mut self) ! { io }; }\n";
     // v31 Phase 170: channel `select` result. `Ready(idx, value)` — receiver
     // `idx` fired with `value`; `Closed(idx)` — receiver `idx` is drained and
     // closed. A plain prelude enum so `match select2(&a, &b) { ... }` works
@@ -1197,14 +1205,17 @@ std::string applyPrelude(const std::string& userSrc) {
     }
     if (userSrc.find("fn str_to_upper") == std::string::npos) {
         prelude +=
+            // v55: UTF-8-safe — iterate by CHAR (not byte) and case-map the
+            // codepoint, so `str_to_upper("café") == "CAFÉ"` (the old byte-wise
+            // ASCII-only version left non-ASCII letters un-cased).
             "fn str_to_upper(s: &String) -> String ! { alloc } {\n"
             "    let mut out = string_new();\n"
             "    let mut i = 0;\n"
             "    while i < str_len(s) {\n"
-            "        let c = str_char_at(s, i);\n"
-            "        let up = if c >= 97 && c <= 122 { c - 32 } else { c };\n"
-            "        str_push_byte(&mut out, up);\n"
-            "        i = i + 1;\n"
+            "        let w = str_char_width_at(s, i);\n"
+            "        let c = str_decode_char_at(s, i);\n"
+            "        str_push_char(&mut out, char_to_upper(c));\n"
+            "        i = i + w;\n"
             "    }\n"
             "    out\n"
             "}\n";
@@ -1215,14 +1226,65 @@ std::string applyPrelude(const std::string& userSrc) {
             "    let mut out = string_new();\n"
             "    let mut i = 0;\n"
             "    while i < str_len(s) {\n"
-            "        let c = str_char_at(s, i);\n"
-            "        let lo = if c >= 65 && c <= 90 { c + 32 } else { c };\n"
-            "        str_push_byte(&mut out, lo);\n"
-            "        i = i + 1;\n"
+            "        let w = str_char_width_at(s, i);\n"
+            "        let c = str_decode_char_at(s, i);\n"
+            "        str_push_char(&mut out, char_to_lower(c));\n"
+            "        i = i + w;\n"
             "    }\n"
             "    out\n"
             "}\n";
     }
+    // v55: genuinely-missing char-aware string/vec helpers (the by-byte
+    // str_split already exists; these are the char-indexed counterparts).
+    if (userSrc.find("fn str_split_char") == std::string::npos) {
+        prelude +=
+            "fn str_split_char(s: &String, sep: char) -> Vec<String> ! { alloc } {\n"
+            "    let mut parts = vec_new();\n"
+            "    let mut cur = string_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < str_len(s) {\n"
+            "        let w = str_char_width_at(s, i);\n"
+            "        let c = str_decode_char_at(s, i);\n"
+            "        if c == sep { vec_push(&mut parts, clone(&cur)); cur = string_new(); }\n"
+            "        else { str_push_char(&mut cur, c); }\n"
+            "        i = i + w;\n"
+            "    }\n"
+            "    vec_push(&mut parts, cur);\n"
+            "    parts\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_get_char") == std::string::npos) {
+        prelude +=
+            "fn str_get_char(s: &String, idx: i64) -> char {\n"
+            "    let mut i = 0;\n"
+            "    let mut k = 0;\n"
+            "    let mut result = '\\u{FFFD}';\n"
+            "    while i < str_len(s) {\n"
+            "        let w = str_char_width_at(s, i);\n"
+            "        if k == idx { result = str_decode_char_at(s, i); break; } else {}\n"
+            "        k = k + 1;\n"
+            "        i = i + w;\n"
+            "    }\n"
+            "    result\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_index_char") == std::string::npos) {
+        prelude +=
+            "fn str_index_char(s: &String, c: char) -> Option<i64> {\n"
+            "    let mut i = 0;\n"
+            "    let mut k = 0;\n"
+            "    let mut found: Option<i64> = None;\n"
+            "    while i < str_len(s) {\n"
+            "        let w = str_char_width_at(s, i);\n"
+            "        if str_decode_char_at(s, i) == c { found = Some(k); break; } else {}\n"
+            "        k = k + 1;\n"
+            "        i = i + w;\n"
+            "    }\n"
+            "    found\n"
+            "}\n";
+    }
+    // (vec_reverse already exists in the prelude — the roadmap critic's "missing"
+    // claim was wrong; not re-added.)
     if (userSrc.find("fn str_concat") == std::string::npos) {
         prelude +=
             "fn str_concat(a: &String, b: &String) -> String ! { alloc } {\n"
@@ -1415,16 +1477,27 @@ std::string applyPrelude(const std::string& userSrc) {
     }
     if (userSrc.find("fn char_to_upper") == std::string::npos) {
         prelude +=
+            // v55: ASCII + Latin-1 Supplement casing. à-þ (224-254, except ÷247)
+            // uppercase by -32; ÿ(255)->Ÿ(376). Full Unicode case folding
+            // (Greek/Cyrillic/Extended, ß->SS) is deferred (needs a Unicode DB).
             "fn char_to_upper(c: char) -> char {\n"
             "    let n = c as i64;\n"
-            "    if n >= 97 { if n <= 122 { char_from_u32(n - 32) } else { c } } else { c }\n"
+            "    if n >= 97 && n <= 122 { char_from_u32(n - 32) }\n"
+            "    else if n >= 224 && n <= 254 && n != 247 { char_from_u32(n - 32) }\n"
+            "    else if n == 255 { char_from_u32(376) }\n"
+            "    else { c }\n"
             "}\n";
     }
     if (userSrc.find("fn char_to_lower") == std::string::npos) {
         prelude +=
+            // v55: ASCII + Latin-1 Supplement. À-Þ (192-222, except ×215)
+            // lowercase by +32; Ÿ(376)->ÿ(255).
             "fn char_to_lower(c: char) -> char {\n"
             "    let n = c as i64;\n"
-            "    if n >= 65 { if n <= 90 { char_from_u32(n + 32) } else { c } } else { c }\n"
+            "    if n >= 65 && n <= 90 { char_from_u32(n + 32) }\n"
+            "    else if n >= 192 && n <= 222 && n != 215 { char_from_u32(n + 32) }\n"
+            "    else if n == 376 { char_from_u32(255) }\n"
+            "    else { c }\n"
             "}\n";
     }
     if (userSrc.find("fn str_join") == std::string::npos) {

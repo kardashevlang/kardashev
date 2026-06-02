@@ -648,6 +648,20 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v55: UTF-8-safe casing + char-indexed string helpers.
+sh_test(
+    name = "smoke_test_utf8_casing",
+    srcs = ["smoke_test_utf8_casing.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v55: Drop as a built-in prelude trait (impl Drop resolves without re-declaration).
+sh_test(
+    name = "smoke_test_builtin_drop",
+    srcs = ["smoke_test_builtin_drop.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
