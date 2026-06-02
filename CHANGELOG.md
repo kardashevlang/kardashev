@@ -18,6 +18,30 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.63.0] — Stdlib I/O depth: buffered reader + file metadata
+
+### Added
+- **Buffered line reading** — `struct BufReader` (owns a `FILE*` + persistent
+  `getline` scratch) with `buf_reader_new(&String) -> Result<BufReader, IoError>`
+  and `buf_read_line(&mut BufReader) -> Option<String>` (`\n`-stripped lines,
+  `None` at EOF). A `Drop` impl `fclose()`s the handle and `free()`s the scratch,
+  so a dropped reader is leak-free (verified RSS-flat over 100k open/read/drop
+  cycles). Built on a portable `getline`.
+- **File metadata** — `struct Metadata { size, is_dir, is_file, mtime }` +
+  `fs_metadata(&String) -> Result<Metadata, IoError>` over a single `stat()`,
+  plus `fs_is_dir` / `fs_is_file` wrappers. The builtin returns size/mode/mtime
+  as `i64` out-params (read at `#if`-guarded `struct stat` offsets — Linux and
+  Darwin); the prelude derives `is_dir`/`is_file` from the `S_IFMT` bits, so no
+  bool/struct field is touched from codegen.
+- Both reuse the existing `IoError`/`Result`/`io_error_cat` scaffolding; the
+  builtins operate on **primitive types only** (i64 handles / `&mut i64` /
+  `&mut String`) so they never name the prelude structs, and are emitted only
+  when referenced (the file-I/O runtime gate).
+
+### Deferred (honest)
+- `BufWriter`, seek/random-access, directory listing/walk, permissions/chmod,
+  symlink resolution, mtime-based incremental-build wiring.
+
 ## [0.62.0] — Stdlib runtime: monotonic clock, env vars, seeded global RNG
 
 ### Added

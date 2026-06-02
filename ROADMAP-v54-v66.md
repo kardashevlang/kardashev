@@ -487,6 +487,19 @@ All follow the proven `getOrInsertFunction` libc-wrapper pattern (as `fopen`).
 
 ## v63 — Stdlib I/O depth: buffered reader + file metadata
 
+> **Status:** ✅ SHIPPED v0.63.0 — `BufReader` (FILE* + persistent getline
+> scratch) with `buf_reader_new -> Result<BufReader, IoError>` /
+> `buf_read_line -> Option<String>` (\n-stripped, None at EOF) + a `Drop` that
+> fclose/frees (RSS-flat over 100k cycles); `fs_metadata -> Result<Metadata,
+> IoError>` over one `stat()` (size/mode/mtime read at #if-guarded Linux/Darwin
+> offsets; is_dir/is_file derived from S_IFMT in the prelude) + `fs_is_dir`/
+> `fs_is_file`. Builtins are primitive-typed only (i64 handles / &mut i64 /
+> &mut String) so they never name the prelude structs; reuse IoError/Result/
+> io_error_cat. Gates met: `smoke_test_buf_reader.sh` (3 lines+None, empty=None,
+> missing=Err, leak-flat), `smoke_test_fs_metadata.sh` (size 100/is_file/!is_dir,
+> dir, IoNotFound), JIT==AOT. DEFERRED: BufWriter, seek, dir walk, chmod,
+> symlinks, mtime-based incremental build.
+
 **Theme:** Two deterministic-with-temp-files file capabilities.
 
 **CORE**
