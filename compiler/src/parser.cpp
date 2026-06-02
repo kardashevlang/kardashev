@@ -1022,6 +1022,12 @@ private:
         decl.isAsync = isAsync;
         decl.isTotal = pendingTotal_; // v47 `#[total]`
         pendingTotal_ = false;
+        decl.noAlloc = pendingNoAlloc_; // v48 `#[codegen(no_alloc)]`
+        decl.noPanic = pendingNoPanic_; // v48 `#[codegen(no_panic)]`
+        decl.noIo = pendingNoIo_;       // v48 `#[codegen(no_io)]`
+        pendingNoAlloc_ = false;
+        pendingNoPanic_ = false;
+        pendingNoIo_ = false;
         decl.line = fnTok.line;
         decl.column = fnTok.column;
 
@@ -2281,6 +2287,9 @@ private:
     // attributes are tolerated (skipped to the closing `]`).
     std::vector<std::string> pendingDerives_;
     bool pendingTotal_ = false; // v47 `#[total]` for the next fn decl
+    bool pendingNoAlloc_ = false; // v48 `#[codegen(no_alloc)]` for the next fn
+    bool pendingNoPanic_ = false; // v48 `#[codegen(no_panic)]` for the next fn
+    bool pendingNoIo_ = false;    // v48 `#[codegen(no_io)]` for the next fn
     void parseAttributes() {
         while (check(TokenKind::Pound)) {
             consume(); // '#'
@@ -2308,6 +2317,22 @@ private:
                 if (!enabled) cfgDropNext_ = true;
             } else if (attr.lexeme == "total") {
                 pendingTotal_ = true; // v47: the next fn asserts totality
+            } else if (attr.lexeme == "codegen") {
+                // v48: `#[codegen(no_alloc, no_panic, ...)]` quality contracts.
+                expect(TokenKind::LParen, "(");
+                if (!check(TokenKind::RParen)) {
+                    while (true) {
+                        Token c = expect(TokenKind::Identifier,
+                                         "codegen contract name");
+                        if (c.lexeme == "no_alloc") pendingNoAlloc_ = true;
+                        else if (c.lexeme == "no_panic") pendingNoPanic_ = true;
+                        else if (c.lexeme == "no_io") pendingNoIo_ = true;
+                        // other contracts (vectorized, inlined) parsed + tolerated
+                        if (!accept(TokenKind::Comma)) break;
+                        if (check(TokenKind::RParen)) break;
+                    }
+                }
+                expect(TokenKind::RParen, ")");
             } else {
                 while (!check(TokenKind::RBracket) &&
                        !check(TokenKind::EndOfInput))
