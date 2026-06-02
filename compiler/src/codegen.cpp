@@ -12704,6 +12704,24 @@ private:
             builder_->CreateStore(v, p);
             return nullptr; // unit
         }
+        if (call.callee == "copy_nonoverlapping" && call.args.size() == 3) {
+            llvm::Value* s = emitExpr(*call.args[0]);
+            llvm::Value* d = emitExpr(*call.args[1]);
+            llvm::Value* n = emitExpr(*call.args[2]);
+            TypePtr st = lookupExprType(*call.args[0]);
+            if (st) st = resolveInInstance(st);
+            llvm::Type* elemLlvm = llvm::Type::getInt8Ty(*ctx_);
+            if (st && st->kind == TypeKind::Ref)
+                elemLlvm = mapKardashevType(resolveInInstance(st->refInner));
+            std::uint64_t elemSz =
+                module_->getDataLayout().getTypeAllocSize(elemLlvm);
+            llvm::Value* bytes = builder_->CreateMul(
+                n, llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), elemSz),
+                "cpbytes");
+            builder_->CreateMemCpy(d, llvm::MaybeAlign(), s, llvm::MaybeAlign(),
+                                   bytes);
+            return nullptr; // unit
+        }
         // Phase 48: a qualified static call `Type::method(args)` resolved by the
         // typechecker to a concrete impl method (an associated / no-self trait
         // method like `P::default()`). Emit a direct call to the mangled impl
