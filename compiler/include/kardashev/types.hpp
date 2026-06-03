@@ -134,6 +134,7 @@ struct Type {
     // Struct:
     std::string structName;
     std::vector<std::pair<std::string, TypePtr>> structFields;
+    bool reprC = false; // v88: declared `#[repr(C)]` (guaranteed layout, FFI-by-pointer)
 
     // Enum:
     std::string enumName;

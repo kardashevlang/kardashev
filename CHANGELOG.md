@@ -18,6 +18,45 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.88.0] — `#[repr(C)]` struct layout + struct FFI by pointer
+
+Builds on v87's sized-int FFI widths. A grounded survey proved that full struct
+**by-value** FFI is a verified miscompile risk (clang lowers `int sum(struct
+Point{int x,y})` to `i32 @sum(i64)` — register-classified, not an LLVM aggregate
+param), so it is honestly deferred to the by-value-ABI / WASM+Windows mega-arc.
+v88 ships the portable, fully real-C-tested cut.
+
+### Added
+- **`#[repr(C)]`** attribute on a struct — a guaranteed C layout (declaration
+  field order + host alignment via the already-set datalayout). Stored on
+  `StructDecl`/`Type` (`reprC`). `repr(packed)` / `repr(transparent)` /
+  `repr(align(N))` are **rejected**, not silently ignored.
+- **Struct FFI by pointer**: an `extern "C"` signature may pass/return a
+  `#[repr(C)]` struct as `&T` / `&mut T`. A pointer to a **non-repr(C)** user
+  struct is rejected (no layout guarantee); a struct **by value** is rejected
+  with an actionable "pass `&T`" message.
+- **signext/zeroext** on narrow (i8/i16) `extern "C"` params + returns (the v87
+  deferral) — a C `unsigned char` / `signed char` / `short` boundary is now
+  value-correct (255 stays 255, not −1).
+- **`kardc --emit-obj <file.o>`** — emit a native object (no link) so a build or
+  test can link it with a C object for real FFI interop.
+
+### Notes
+- Gate: `smoke_test_repr_c_ffi.sh` links a real clang-compiled C helper
+  (`int point_sum(const struct Point*)`, `point_scale`, narrow-int `low_byte`/
+  `neg_sc`) against `kardc --emit-obj` output — the kardc-built repr(C) struct is
+  read/written by C (exit 70), and narrow-int values round-trip correctly. Plus
+  IR-shape (`{ i32, i32 }`, by-pointer declaration, `zeroext`/`signext`) and three
+  negatives (non-repr(C) pointer, by-value, `repr(packed)`). Skips with pass if
+  clang is absent.
+
+### Deferred (honest, no stubs)
+- Struct **by-value** params + **`sret`** struct returns → the by-value-ABI /
+  WASM+Windows mega-arc (needs the per-platform System V eightbyte register
+  classifier, ~2000 lines). Rejected with a clear message, not stubbed.
+- `repr(packed)` / `repr(align(N))` / `repr(transparent)` → a future repr-family
+  follow-on (rejected now, so no silent misbehavior).
+
 ## [0.87.0] — Sized integers across all surfaces (Arc C begins)
 
 Opens Arc C (practical systems gaps). A ground-truth survey found sized integers

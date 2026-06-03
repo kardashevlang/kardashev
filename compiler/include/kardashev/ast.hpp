@@ -881,6 +881,7 @@ struct StructDecl {
     std::vector<Param> fields;
     std::vector<std::string> derives; // Phase 42: `#[derive(Clone, Eq, ...)]`
     bool isPub = false; // Phase 15: `pub struct` — parsed + stored.
+    bool reprC = false; // v88: `#[repr(C)]` — guaranteed C layout, FFI-by-pointer eligible
     std::string doc; // v24 Phase 134: the leading `///` doc comment, if any
     std::size_t line = 1;
     std::size_t column = 1;

@@ -1031,6 +1031,7 @@ private:
         pendingTotal_ = false;
         decl.allowMissingEffect = pendingAllowMissingEffect_; // v82
         pendingAllowMissingEffect_ = false;
+        pendingReprC_ = false; // v88: `#[repr(C)]` only applies to a struct
         decl.noAlloc = pendingNoAlloc_; // v48 `#[codegen(no_alloc)]`
         decl.noPanic = pendingNoPanic_; // v48 `#[codegen(no_panic)]`
         decl.noIo = pendingNoIo_;       // v48 `#[codegen(no_io)]`
@@ -1221,6 +1222,8 @@ private:
         decl.name = nameTok.lexeme;
         decl.derives = std::move(pendingDerives_); // Phase 42
         pendingDerives_.clear();
+        decl.reprC = pendingReprC_; // v88: `#[repr(C)]`
+        pendingReprC_ = false;
         decl.genericParams = parseOptionalGenericParams();
 
         expect(TokenKind::LBrace, "{");
@@ -1246,6 +1249,7 @@ private:
         decl.name = nameTok.lexeme;
         decl.derives = std::move(pendingDerives_); // Phase 42
         pendingDerives_.clear();
+        pendingReprC_ = false; // v88: `#[repr(C)]` only applies to a struct (enum repr is a follow-on)
         decl.genericParams = parseOptionalGenericParams();
 
         expect(TokenKind::LBrace, "{");
@@ -2499,6 +2503,7 @@ private:
     // pendingDerives_, which the next struct/enum decl consumes. Unknown
     // attributes are tolerated (skipped to the closing `]`).
     std::vector<std::string> pendingDerives_;
+    bool pendingReprC_ = false; // v88 `#[repr(C)]` for the next struct decl
     bool pendingTotal_ = false; // v47 `#[total]` for the next fn decl
     bool pendingAllowMissingEffect_ = false; // v82 `#[allow(missing_effect)]`
     bool pendingNoAlloc_ = false; // v48 `#[codegen(no_alloc)]` for the next fn
@@ -2531,6 +2536,18 @@ private:
                 bool enabled = evalCfgPredicate();
                 expect(TokenKind::RParen, ")");
                 if (!enabled) cfgDropNext_ = true;
+            } else if (attr.lexeme == "repr") {
+                // v88: `#[repr(C)]` — guaranteed C layout for the next struct
+                // (FFI-by-pointer eligible). `repr(packed)`/`repr(transparent)`/
+                // `repr(align(N))` change layout and are NOT yet supported, so
+                // they are rejected rather than silently ignored.
+                expect(TokenKind::LParen, "(");
+                Token r = expect(TokenKind::Identifier, "repr kind");
+                if (r.lexeme == "C") pendingReprC_ = true;
+                else errorAt("only `repr(C)` is supported (got `repr(" +
+                                 r.lexeme + ")`)",
+                             r.line, r.column);
+                expect(TokenKind::RParen, ")");
             } else if (attr.lexeme == "total") {
                 pendingTotal_ = true; // v47: the next fn asserts totality
             } else if (attr.lexeme == "allow") {

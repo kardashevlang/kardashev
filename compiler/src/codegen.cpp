@@ -9544,8 +9544,27 @@ private:
             fty, llvm::Function::ExternalLinkage, ef.name, module_.get());
         unsigned i = 0;
         for (auto& arg : f->args()) {
-            if (i < ef.params.size()) arg.setName(ef.params[i].name);
+            if (i < ef.params.size()) {
+                arg.setName(ef.params[i].name);
+                // v88 (the v87 deferral): a narrow C int param (`signed char`/
+                // `unsigned char`/`short`, < 32 bits) needs signext/zeroext so
+                // the high register bits agree with a clang-compiled callee.
+                // (i32/i64 get no attr — matches clang; the i32-sugar value is
+                // i64-in-kardashev, truncated at the call, not extended here.)
+                if (!isExternI32(ef.params[i].type)) {
+                    TypePtr at = resolve(astTypeRefToConcrete(ef.params[i].type));
+                    if (at->kind == TypeKind::Int && at->intWidth < 32)
+                        arg.addAttr(at->intSigned ? llvm::Attribute::SExt
+                                                  : llvm::Attribute::ZExt);
+                }
+            }
             ++i;
+        }
+        if (!isExternI32(ef.returnType)) {
+            TypePtr rt = resolve(astTypeRefToConcrete(ef.returnType));
+            if (rt->kind == TypeKind::Int && rt->intWidth < 32)
+                f->addRetAttr(rt->intSigned ? llvm::Attribute::SExt
+                                            : llvm::Attribute::ZExt);
         }
         declaredFns_[ef.name] = f;
     }

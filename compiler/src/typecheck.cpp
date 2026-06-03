@@ -1601,6 +1601,7 @@ public:
                     resolvedFields.emplace_back(f.name, resolveTypeRef(f.type));
                 }
                 it->second.type->structFields = std::move(resolvedFields);
+                it->second.type->reprC = sd.reprC; // v88: carry `#[repr(C)]` onto the Type
                 currentGenericEnv_ = nullptr;
                 currentConstParams_.clear();
             }
@@ -4427,8 +4428,18 @@ private:
             case TypeKind::Int:   // any width i8..i64 / u8..u64 (C char..long)
             case TypeKind::Float: // v33 Phase 178: f64 -> C double, f32 -> float
             case TypeKind::Bool:
-            case TypeKind::Ref: // any &T / &mut T / &[T] / *const T / *mut T -> C pointer
                 return true;
+            case TypeKind::Ref: {
+                // v88: a pointer to a USER struct only has a defined C layout if
+                // the struct is `#[repr(C)]`. Scalars / String / Slice / raw
+                // pointers are fine.
+                TypePtr inner = resolve(rr->refInner);
+                if (inner->kind == TypeKind::Struct &&
+                    inner->structName != "String" &&
+                    inner->structName != "Slice")
+                    return inner->reprC;
+                return true;
+            }
             case TypeKind::Unit:
                 return isReturn; // void return is fine; a void *param* isn't
             case TypeKind::Struct:
@@ -4441,13 +4452,34 @@ private:
             }
         };
         if (!representable(r)) {
-            error("type `" + typeToString(r) + "` is not supported in an "
-                  "`extern \"C\"` signature for '" + fnName +
-                  "' (allowed: i8..i64 / u8..u64, f32 / f64, bool, "
-                  "&T / &mut T / &[T] / *const T / *mut T (C pointer), "
-                  "String / &String (passes the data pointer)" +
-                  std::string(isReturn ? ", or unit (void return)" : "") + ")",
-                  tr.line, tr.column);
+            // v88: context-specific, actionable diagnostics.
+            if (r->kind == TypeKind::Struct && r->structName != "String" &&
+                r->structName != "Slice") {
+                error("struct `" + r->structName + "` cannot cross an "
+                      "`extern \"C\"` boundary BY VALUE (the System V by-value "
+                      "register ABI is not yet implemented); pass it by pointer "
+                      "as `&" + r->structName + "`" +
+                      std::string(r->reprC ? "" :
+                                  " and mark it `#[repr(C)]`"),
+                      tr.line, tr.column);
+            } else if (r->kind == TypeKind::Ref) {
+                TypePtr inner = resolve(r->refInner);
+                error("a pointer to struct `" + inner->structName +
+                      "` crossing an `extern \"C\"` boundary needs `#[repr(C)]` "
+                      "on `" + inner->structName +
+                      "` for a guaranteed C layout",
+                      tr.line, tr.column);
+            } else {
+                error("type `" + typeToString(r) + "` is not supported in an "
+                      "`extern \"C\"` signature for '" + fnName +
+                      "' (allowed: i8..i64 / u8..u64, f32 / f64, bool, "
+                      "&T / &mut T / &[T] / *const T / *mut T (C pointer; a "
+                      "`&UserStruct` needs `#[repr(C)]`), "
+                      "String / &String (passes the data pointer)" +
+                      std::string(isReturn ? ", or unit (void return)" : "") +
+                      ")",
+                      tr.line, tr.column);
+            }
         }
         return t;
     }
