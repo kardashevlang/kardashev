@@ -1603,6 +1603,99 @@ std::string applyPrelude(const std::string& userSrc) {
             "    ok\n"
             "}\n";
     }
+    // v71: string-formatting spec helpers, used by the format!/print!/println!
+    // desugaring for `{:w}` / `{:<w}` / `{:>w}` / `{:^w}` / `{:0w}` and the
+    // radix types `{:x}` / `{:X}` / `{:b}` / `{:o}`. Padding counts CHARS (not
+    // bytes) via str_char_count; radix conversion is built from the raw
+    // two's-complement bit pattern (using the v70 leading_zeros intrinsic), so
+    // negatives format like Rust (-1 -> all ones / "ffff…ffff").
+    // (These avoid a bare `if` statement — this language's `if` is an
+    // expression that requires an `else`; the while-loop guards handle the
+    // width<=len case without an early return.)
+    if (userSrc.find("fn str_pad_left") == std::string::npos) {
+        prelude +=
+            "fn str_pad_left(s: String, width: i64, fill: char) -> String ! { alloc } {\n"
+            "    let n = str_char_count(&s);\n"
+            "    let mut out = string_new();\n"
+            "    let mut k = width - n;\n"
+            "    while k > 0 { str_push_char(&mut out, fill); k = k - 1; }\n"
+            "    string_push_str(&mut out, s);\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_pad_right") == std::string::npos) {
+        prelude +=
+            "fn str_pad_right(s: String, width: i64, fill: char) -> String ! { alloc } {\n"
+            "    let n = str_char_count(&s);\n"
+            "    let mut out = string_new();\n"
+            "    string_push_str(&mut out, s);\n"
+            "    let mut k = width - n;\n"
+            "    while k > 0 { str_push_char(&mut out, fill); k = k - 1; }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_pad_center") == std::string::npos) {
+        prelude +=
+            "fn str_pad_center(s: String, width: i64, fill: char) -> String ! { alloc } {\n"
+            "    let n = str_char_count(&s);\n"
+            "    let total = width - n;\n"
+            "    let left = total / 2;\n"
+            "    let right = total - left;\n"
+            "    let mut out = string_new();\n"
+            "    let mut a = left;\n"
+            "    while a > 0 { str_push_char(&mut out, fill); a = a - 1; }\n"
+            "    string_push_str(&mut out, s);\n"
+            "    let mut b = right;\n"
+            "    while b > 0 { str_push_char(&mut out, fill); b = b - 1; }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn __fmt_digit") == std::string::npos) {
+        prelude +=
+            "fn __fmt_digit(d: i64, upper: bool) -> char {\n"
+            "    if d < 10 { ((48 + d) as char) }\n"
+            "    else if upper { ((55 + d) as char) }\n"
+            "    else { ((87 + d) as char) }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn __fmt_radix") == std::string::npos) {
+        prelude +=
+            "fn __fmt_radix(n: i64, bits: i64, upper: bool) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    if n == 0 {\n"
+            "        str_push_char(&mut out, '0');\n"
+            "    } else {\n"
+            "        let hi = 63 - leading_zeros(n);\n"
+            "        let mut pos = (hi / bits) * bits;\n"
+            "        while pos >= 0 {\n"
+            "            let avail = 64 - pos;\n"
+            "            let m = if avail < bits { avail } else { bits };\n"
+            "            let mask = (1 << m) - 1;\n"
+            "            let digit = (n >> pos) & mask;\n"
+            "            str_push_char(&mut out, __fmt_digit(digit, upper));\n"
+            "            pos = pos - bits;\n"
+            "        }\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn int_to_binary") == std::string::npos) {
+        prelude +=
+            "fn int_to_binary(n: i64) -> String ! { alloc } { __fmt_radix(n, 1, false) }\n";
+    }
+    if (userSrc.find("fn int_to_octal") == std::string::npos) {
+        prelude +=
+            "fn int_to_octal(n: i64) -> String ! { alloc } { __fmt_radix(n, 3, false) }\n";
+    }
+    if (userSrc.find("fn int_to_hex_lower") == std::string::npos) {
+        prelude +=
+            "fn int_to_hex_lower(n: i64) -> String ! { alloc } { __fmt_radix(n, 4, false) }\n";
+    }
+    if (userSrc.find("fn int_to_hex_upper") == std::string::npos) {
+        prelude +=
+            "fn int_to_hex_upper(n: i64) -> String ! { alloc } { __fmt_radix(n, 4, true) }\n";
+    }
+
     // v27 Phase 151: char classification + string encode helpers. The char
     // predicates / case mappings are ASCII-correct (full Unicode case folding +
     // the property tables are a documented future item, gated on shipping the

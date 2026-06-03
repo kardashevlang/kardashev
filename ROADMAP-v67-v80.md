@@ -138,6 +138,16 @@ overflow intrinsics) and bit intrinsics `popcount`/`leading_zeros`/
 
 ## v71 — string formatting specs (`{:width}`, alignment, fill, `{:x}`)
 
+**STATUS: ✅ SHIPPED (v0.71.0).** `parseFormatMacro` now parses a spec grammar
+after `:` — fill/align (`<` `>` `^`), the `0` zero-pad flag, width (counts
+chars), and radix types `{:x}`/`{:X}`/`{:b}`/`{:o}`. Lowers (pure parser +
+prelude, no codegen/typecheck changes) to `str_pad_left/right/center` +
+`int_to_binary/octal/hex_lower/hex_upper`. Radix is built from the
+two's-complement bit pattern (via v70 `leading_zeros`), so negatives match Rust
+exactly. Default align = right (numeric). Gate: `smoke_test_fmt_specs.sh` (11
+cases, JIT==AOT). **Deferred:** precision `{:.N}`, the `+` sign and `#` alt-form
+flags, named/positional args.
+
 > Replaces the dropped "sized integers" version (i8…u64 already first-class).
 > Deferred from v27.
 

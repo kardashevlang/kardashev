@@ -18,6 +18,35 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.71.0] — Format specs (`{:width}`, alignment, fill, radix)
+
+### Added
+- **Format specs** in `format!` / `print!` / `println!`:
+  - **width / fill / alignment** — `{:5}`, `{:<5}` (left), `{:>5}` (right),
+    `{:^5}` (center), a custom fill char (`{:*^7}`, `{:-^5}`), and the `0`
+    zero-pad flag (`{:05}`). Width counts **characters**, not bytes.
+  - **radix types** — `{:x}`, `{:X}`, `{:b}`, `{:o}`. Built from the raw
+    two's-complement bit pattern (via the v70 `leading_zeros` intrinsic), so
+    negatives format exactly like Rust (`{:x}` of `-1` → `ffffffffffffffff`,
+    `{:o}` of `-1` → `1777777777777777777777`).
+  - Specs compose: `{:08b}`, `{:08x}` zero-pad a radix conversion.
+- Implementation is **pure parser desugaring + prelude** — the `parseFormatMacro`
+  hole scanner now parses a small spec grammar and emits `str_pad_left/right/
+  center` + `int_to_binary/octal/hex_lower/hex_upper` calls (all new prelude
+  functions). No codegen or typecheck changes.
+
+### Notes
+- Default alignment (no `<`/`>`/`^`) is **right** (pad-left), matching the
+  common numeric case; strings left-align with an explicit `{:<w}`.
+- Unsupported specs (precision `.N`, sign `+`, unknown type chars,
+  named/positional `{0}`) are **rejected with a clear parse error**, never
+  silently mis-formatted.
+- Gate: `smoke_test_fmt_specs.sh` (11 cases, JIT==AOT).
+
+### Deferred (honest)
+- Precision `{:.N}` (float rounding / string truncation), the `+` sign flag,
+  the `#` alternate form (`0x`/`0b` prefixes), and named/positional arguments.
+
 ## [0.70.0] — Saturating arithmetic + bit-manipulation intrinsics
 
 ### Added
