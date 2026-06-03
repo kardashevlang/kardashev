@@ -1929,6 +1929,18 @@ sh_test(
     ],
 )
 
+# v85: the self-hosted compiler handles BY-REFERENCE values — `&T` -> opaque ptr,
+# `&e` -> alloca/store, field access through a &Struct -> load + extractvalue, and
+# returning a reference is rejected (no dangling). Differential-gated vs the host.
+sh_test(
+    name = "smoke_test_selfhost_refs",
+    srcs = ["smoke_test_selfhost_refs.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:structgen.kd",
+    ],
+)
+
 # v20 Phase 118: the self-hosted compiler handles ENUMS + match — tagged-pair
 # aggregates + a branch-free match select-chain, differential-gated vs the host.
 sh_test(

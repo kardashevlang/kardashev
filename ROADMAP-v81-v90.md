@@ -207,6 +207,8 @@ structs (Box).
 
 ### v85 — references & strings in compile.kd
 
+**STATUS: ✅ SHIPPED (v0.85.0) — scope split (refs landed; strings → v86).** `structgen.kd` now handles by-reference values: a new `&` lexer token (kind 23); a `&T` type carries tag `200 + base` (`ty_llvm` → opaque `ptr`); `&e` (`Expr::Ref`) materializes its operand into a stack slot (`alloca`/`store`) and yields the pointer; field access through a `&Struct` (tag ≥ 300) loads the aggregate then `extractvalue`s. The self-hosted checker **rejects returning a reference** (`rt ≥ 200`) — a returned `&local` would dangle; this single rule is **provably sufficient** in this subset (no ref fields, no ref-of-ref, no stored refs, so a borrow only flows downward into a call and dies at end of statement — no NLL needed). All-i64 structs stay **byte-identical** (`{ i64, i64 }`), so phase117/118 hold. **Gate:** `smoke_test_selfhost_refs.sh` — byte-identity guard + ref-IR-shape + 4 differential cases (ref-field-sum, ref-field-in-if, ref-three-field, ref-nested-struct) + negative return-ref rejection, each self-hosted exit == host exit. Tested via an in-fn `let r = &p` so `f` keeps `(i64,i64)` and the differential wrapper works — **no call-expression machinery needed**. **Scope split (honest):** read-only **strings are resequenced into v86**, not stubbed — they need two things `structgen` entirely lacks (call-expression parsing for `str_len(s)` and module-level global accumulation for `@.str`), both of which v86 builds anyway (loops + Vec + calls), so strings ride on v86 at roughly half the code.
+
 **Theme:** Reach completeness — `&T` parameters (survey Increment 3, the gate to
 everything) and read-only `String` (Increment 4).
 

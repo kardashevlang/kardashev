@@ -18,6 +18,44 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.85.0] — Self-hosting: by-reference values (`&T`)
+
+Continues the self-hosting completeness arc. The self-hosted LLVM-IR compiler
+(`examples/selfhost/structgen.kd`) gains by-reference values — the survey's
+"gate to everything" increment.
+
+### Added
+- **`&` lexer token** (kind 23) and an `Expr::Ref` node.
+- **Reference types**: a `&T` carries type-tag `200 + base` (so `&i64`=201,
+  `&Struct#idx`=300+idx); `ty_llvm` lowers any reference to an opaque `ptr` —
+  exactly what the host emits for `&T`.
+- **`&e` address-of**: materializes its operand into a stack slot
+  (`alloca` + `store`) and yields the pointer.
+- **Field access through a reference**: for a `&Struct` operand the backend
+  `load`s the aggregate, then `extractvalue`s the field.
+
+### Changed
+- The self-hosted type-checker **rejects returning a reference** (`rt >= 200`) — a
+  returned `&local` would dangle. This single rule is *provably sufficient* in
+  this subset (no ref fields, no ref-of-ref, no stored refs), so a borrow can only
+  flow downward into a call and die at end of statement — no NLL needed.
+
+### Notes
+- All-i64 structs stay **byte-identical** (`{ i64, i64 }`), so the phase117/118
+  demo greps still hold.
+- Gate: `smoke_test_selfhost_refs.sh` — byte-identity guard, ref-IR-shape, four
+  differential cases (ref-field-sum, ref-field-in-if, ref-three-field,
+  ref-nested-struct), and a negative return-ref rejection — each self-hosted exit
+  == host exit. Tested via an in-fn `let r = &p`, so the helper keeps an
+  `(i64, i64)` signature and the host differential wrapper works.
+
+### Deferred / resequenced (honest)
+- Read-only **strings** (the planned second half of v85) move to **v86**, not
+  stubbed: they need call-expression parsing (for `str_len(s)`) and module-level
+  global accumulation (for `@.str`) — both of which v86 builds anyway (loops +
+  Vec + calls), so strings ride on v86 at roughly half the code.
+- `&mut`, returned references, and NLL remain out of scope (by design).
+
 ## [0.84.0] — Self-hosting: heterogeneous struct fields + multi-payload enums
 
 Opens the self-hosting completeness arc (v84–v86). The self-hosted LLVM-IR
