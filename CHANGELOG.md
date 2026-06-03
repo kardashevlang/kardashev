@@ -18,6 +18,42 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.87.0] — Sized integers across all surfaces (Arc C begins)
+
+Opens Arc C (practical systems gaps). A ground-truth survey found sized integers
+(i8/i16/i32/i64, u8/u16/u32/u64) and f32 were **already runtime-first-class** in
+the LLVM backend (shipped in v11): distinct widths, signedness-correct
+arithmetic (`sdiv`/`udiv`, `ashr`/`lshr`, `slt`/`ult`), all casts, literal
+suffixes, and rejection of implicit widening. So v87 surfaces them across the
+boundaries that still assumed i64, and locks the semantics with a real gate.
+
+### Changed
+- **Extern `"C"` FFI boundary** (`cAbiType`): each sized int now maps to its real
+  C width (`u8` → `i8` = C `unsigned char`, `u32` → `i32` = C `unsigned int`, …)
+  instead of collapsing to a 64-bit word. (`i32` keeps its historical
+  i64-sugar; `abs(0 - 7) == 7` is preserved.) This is the **v88 repr(C)-by-value
+  prerequisite** — `extern "C" fn fw(a: u8, b: u16, c: u32, d: u64)` now declares
+  `i8 @fw(i8, i16, i32, i64)`.
+
+### Added
+- **`smoke_test_sized_runtime.sh`** — the end-to-end runtime differential gate
+  the v11 work never had: unsigned overflow-wrap, signed-vs-unsigned
+  division/remainder/shift/compare, cast round-trips (trunc/sext/zext/fp), a
+  sized struct field read at **-O2** (datalayout-before-opt guard), a sized array
+  element, f32 arithmetic, the FFI all-width declaration shape, a mixed-width
+  negative, and the C-backend's clean refusal — each JIT == AOT.
+
+### Deferred (honest, no stubs)
+- The **C backend** (`--emit-c`) continues to cleanly **refuse** sized ints:
+  faithful support would need a width-cast after *every* op, because C integer
+  promotion computes `uint8_t + uint8_t` in `int` and would silently diverge from
+  LLVM's wrap-at-width. Refusing is sound, not a stub.
+- **`print`/`print_f64` arg-widening** (so a sized int prints without `as i64`) →
+  v89 stdlib formatting. The sound idiom today is the explicit `print(x as i64)`.
+- **`signext`/`zeroext` narrow-arg ABI attributes** (need a real C-function test
+  harness to verify end-to-end) → v88 FFI hardening.
+- Per-element-type `Vec<u8>` runtime → later.
+
 ## [0.86.0] — Self-hosting: user function calls + read-only strings
 
 Continues the self-hosting completeness arc. The self-hosted LLVM-IR compiler
