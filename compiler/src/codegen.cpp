@@ -1065,6 +1065,21 @@ private:
                                             "kd.fnval");
     }
 
+    // v67: factor the repeated runtime-builtin skeleton (FunctionType::get +
+    // Function::Create(ExternalLinkage) + an "entry" block + declaredFns_
+    // registration) the v54-v66 audit flagged. Returns the fn with an empty
+    // "entry" block; the caller builds the body with an IRBuilder positioned
+    // there and names args as needed. Byte-identical IR to the inline form.
+    llvm::Function* makeRuntimeFn(const std::string& name, llvm::Type* ret,
+                                  llvm::ArrayRef<llvm::Type*> params) {
+        auto* ft = llvm::FunctionType::get(ret, params, /*isVarArg=*/false);
+        auto* fn = llvm::Function::Create(
+            ft, llvm::Function::ExternalLinkage, name, module_.get());
+        llvm::BasicBlock::Create(*ctx_, "entry", fn);
+        declaredFns_[name] = fn;
+        return fn;
+    }
+
     void declareBuiltins() {
         auto& ctx = *ctx_;
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
@@ -2565,12 +2580,8 @@ private:
 
             // monotonic_millis() -> i64 : CLOCK_MONOTONIC seconds*1000 + ns/1e6.
             {
-                auto* ft = llvm::FunctionType::get(i64Ty, {}, false);
-                auto* fn = llvm::Function::Create(
-                    ft, llvm::Function::ExternalLinkage, "monotonic_millis",
-                    module_.get());
-                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
-                llvm::IRBuilder<> b(e);
+                auto* fn = makeRuntimeFn("monotonic_millis", i64Ty, {}); // v67
+                llvm::IRBuilder<> b(&fn->getEntryBlock());
                 // `struct timespec` = two contiguous i64s on the LP64 targets.
                 auto* ts = b.CreateAlloca(
                     i64Ty, llvm::ConstantInt::get(i64Ty, 2), "ts");
@@ -2588,7 +2599,6 @@ private:
                                  "nsms"),
                     "ms");
                 b.CreateRet(ms);
-                declaredFns_["monotonic_millis"] = fn;
             }
 
             // env_var_into(name: &String, out: &mut String) -> i64 : getenv;
@@ -2661,16 +2671,11 @@ private:
 
             // rng_seed_global(seed: i64) -> i64 : set state, mark seeded.
             {
-                auto* ft = llvm::FunctionType::get(i64Ty, {i64Ty}, false);
-                auto* fn = llvm::Function::Create(
-                    ft, llvm::Function::ExternalLinkage, "rng_seed_global",
-                    module_.get());
-                auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
-                llvm::IRBuilder<> b(e);
+                auto* fn = makeRuntimeFn("rng_seed_global", i64Ty, {i64Ty}); // v67
+                llvm::IRBuilder<> b(&fn->getEntryBlock());
                 b.CreateStore(fn->getArg(0), rngState);
                 b.CreateStore(one64, rngSeeded);
                 b.CreateRet(fn->getArg(0));
-                declaredFns_["rng_seed_global"] = fn;
             }
 
             // rand_global() -> i64 : lazily seed from KARDASHEV_SEED (else a
@@ -2729,16 +2734,12 @@ private:
             auto writeFn = module_->getOrInsertFunction(
                 "write", llvm::FunctionType::get(
                              i64Ty, {i32Ty, i8PtrTy, i64Ty}, false));
-            auto* ft = llvm::FunctionType::get(i64Ty, {i64Ty, i64Ty, i64Ty},
-                                               false);
-            auto* fn = llvm::Function::Create(
-                ft, llvm::Function::ExternalLinkage, "__assert_report",
-                module_.get());
+            auto* fn = makeRuntimeFn("__assert_report", i64Ty,
+                                     {i64Ty, i64Ty, i64Ty}); // v67
             auto* left = fn->getArg(0);
             auto* right = fn->getArg(1);
             auto* eq = fn->getArg(2);
-            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
-            llvm::IRBuilder<> b(e);
+            llvm::IRBuilder<> b(&fn->getEntryBlock());
             auto* buf = b.CreateAlloca(i8Ty,
                                        llvm::ConstantInt::get(i64Ty, 256), "ab");
             auto* opEq = b.CreateGlobalString("==", "kd_assert_eq", 0,
@@ -2764,7 +2765,6 @@ private:
             b.CreateCall(writeFn,
                          {llvm::ConstantInt::get(i32Ty, 2), buf, clamped});
             b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
-            declaredFns_["__assert_report"] = fn;
         }
 
         // Phase 13b / 37: slice read ops (slice_len / slice_get / slice_get_ref)

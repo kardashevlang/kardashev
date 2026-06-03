@@ -18,6 +18,40 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.67.0] — Codebase optimization & efficiency (audit-driven)
+
+Opens the **ROADMAP-v67-v80** arc (workflow-designed + fact-checked: several
+first-draft versions were dropped/narrowed because their premise was already
+shipped). This version applies the v54–v66 adversarial audit's findings.
+
+### Changed (no behavior change)
+- Added a **`makeRuntimeFn(name, ret, params)`** helper in codegen.cpp that
+  factors the repeated runtime-builtin skeleton (`FunctionType::get` +
+  `Function::Create(ExternalLinkage)` + an `entry` block + `declaredFns_`
+  registration) the audit flagged as its top factoring opportunity, and routed
+  the representative single-block builtins (`monotonic_millis`,
+  `rng_seed_global`, `__assert_report`) through it. **Byte-identical IR** —
+  verified behavior-preserving by the existing builtin smoke tests + a new gate.
+- `smoke_test_loc_audit.sh` gate: asserts the helper is present and adopted
+  (≥4 sites) and that the converted builtins stay behavior-preserving
+  (instant/rng/assert, JIT==AOT) — so the boilerplate cannot silently re-grow.
+
+### Honest finding
+The 7-reviewer audit concluded the codebase is **already ~90% tight** — there is
+no egregious waste to cut, only ~6–10% factorable-but-largely-defensible
+boilerplate. Accordingly this is a focused, small optimization, not a large
+rewrite.
+
+### Deferred (honest, with rationale)
+- Routing the remaining multi-block builtins through `makeRuntimeFn` (mechanical
+  follow-on; ~20 LOC; each needs interleaved arg-naming edits).
+- A shared `tests/lib/harness.sh` for the per-script KARDC-finder/`diff_run`
+  preamble — **intentionally kept per-script**: each smoke test stays
+  self-contained / standalone-runnable, and a sourced lib adds Bazel-runfiles
+  path coupling that can't be validated outside the CI sandbox.
+- ROADMAP↔CHANGELOG narrative overlap is **intentional** (forward plan vs.
+  release notes — different audiences), not waste.
+
 ## [0.66.0] — Test infrastructure: borrow fuzzer + sanitizer sweep + property harness
 
 Three reusable, seeded, deterministic test rigs — **pure test infrastructure, no
