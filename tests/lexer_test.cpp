@@ -129,9 +129,19 @@ void test_fib_signature() {
 }
 
 void test_invalid_char() {
-    auto t = lex("a @ b");
+    // A backtick is still an invalid char. (v69: `@` is now the At token.)
+    auto t = lex("a ` b");
     ASSERT_KIND(t[0], TokenKind::Identifier);
     ASSERT_KIND(t[1], TokenKind::Invalid);
+    assert(t[1].lexeme == "`");
+    ASSERT_KIND(t[2], TokenKind::Identifier);
+}
+
+void test_at_token() {
+    // v69: `@` lexes as the At token (used by `name @ pattern` bindings).
+    auto t = lex("x @ y");
+    ASSERT_KIND(t[0], TokenKind::Identifier);
+    ASSERT_KIND(t[1], TokenKind::At);
     assert(t[1].lexeme == "@");
     ASSERT_KIND(t[2], TokenKind::Identifier);
 }
@@ -301,6 +311,7 @@ int main() {
     test_line_column_tracking();
     test_fib_signature();
     test_invalid_char();
+    test_at_token();
     test_struct_keyword();
     test_dot_token();
     test_struct_decl_and_member_access();
@@ -315,6 +326,6 @@ int main() {
     test_range_operators();
     test_bool_keywords();
     test_const_keyword();
-    std::cout << "All lexer tests passed (23 cases)\n";
+    std::cout << "All lexer tests passed (24 cases)\n";
     return 0;
 }

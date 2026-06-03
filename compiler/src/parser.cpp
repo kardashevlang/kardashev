@@ -3977,6 +3977,8 @@ private:
         auto pat = parsePattern();
         std::size_t line = pat ? pat->line : peek().line;
         std::size_t col = pat ? pat->column : peek().column;
+        // v69: a top-level integer range `lo..hi` rewrites to a guarded binding.
+        ast::ExprPtr rangeGuard = desugarRangePattern(pat);
         // v26 Phase 141: an or-pattern `p1 | p2 | …`. In pattern position the
         // `|` is unambiguous (no bitwise-or / closure here). Collect the
         // alternatives into an OrPat; the expandOrPatterns pass splits the arm.
@@ -3994,6 +3996,19 @@ private:
             pat = std::move(orp);
         }
         auto guard = parseOptionalGuard(); // v68: `pat if cond =>`
+        // v69: AND a range-pattern guard with any explicit `if` guard.
+        if (rangeGuard) {
+            if (guard) {
+                auto both = std::make_unique<ast::BinaryExpr>();
+                both->op = ast::BinOp::And;
+                both->line = line; both->column = col;
+                both->lhs = std::move(rangeGuard);
+                both->rhs = std::move(guard);
+                guard = std::move(both);
+            } else {
+                guard = std::move(rangeGuard);
+            }
+        }
         expect(TokenKind::FatArrow, "=>");
         auto body = parseExpr();
         ast::MatchArm arm;
@@ -4011,6 +4026,49 @@ private:
         if (!check(TokenKind::KwIf)) return nullptr;
         consume(); // `if`
         return parseExpr();
+    }
+
+    int rangePatCounter_ = 0;
+    // v69: a top-level integer range pattern `lo..hi` / `lo..=hi` in a match arm
+    // is sugar for a guarded binding: it binds the scrutinee to a fresh name and
+    // produces the guard `(v >= lo) && (v < hi)` (or `<= hi` when inclusive),
+    // reusing the v68 guard machinery (incl. fall-through + guard-aware
+    // exhaustiveness — a range arm doesn't cover, matching `_`-still-needed). If
+    // `pat` is a `lo` LitInt immediately followed by `..`/`..=`, this rewrites
+    // `pat` to a VarPat and returns the guard; otherwise returns null.
+    ast::ExprPtr desugarRangePattern(ast::PatternPtr& pat) {
+        auto* lit = dynamic_cast<ast::LitIntPat*>(pat.get());
+        if (!lit ||
+            (!check(TokenKind::DotDot) && !check(TokenKind::DotDotEq)))
+            return nullptr;
+        bool inclusive = check(TokenKind::DotDotEq);
+        consume(); // `..` / `..=`
+        std::int64_t lo = lit->value;
+        Token hiTok = expect(TokenKind::Integer,
+                             "upper bound integer of a range pattern");
+        std::int64_t hi = parseIntLitLexeme(hiTok, nullptr, nullptr);
+        std::size_t l = pat->line, c = pat->column;
+        std::string vn = "__rng" + std::to_string(rangePatCounter_++);
+        auto vp = std::make_unique<ast::VarPat>();
+        vp->name = vn; vp->line = l; vp->column = c;
+        pat = std::move(vp);
+        auto ident = [&] {
+            auto e = std::make_unique<ast::IdentExpr>();
+            e->name = vn; e->line = l; e->column = c; return e;
+        };
+        auto intl = [&](std::int64_t v) {
+            auto e = std::make_unique<ast::IntLitExpr>();
+            e->value = v; e->line = l; e->column = c; return e;
+        };
+        auto bin = [&](ast::BinOp op, ast::ExprPtr a, ast::ExprPtr b) {
+            auto e = std::make_unique<ast::BinaryExpr>();
+            e->op = op; e->lhs = std::move(a); e->rhs = std::move(b);
+            e->line = l; e->column = c; return e;
+        };
+        return bin(ast::BinOp::And,
+                   bin(ast::BinOp::Ge, ident(), intl(lo)),
+                   bin(inclusive ? ast::BinOp::Le : ast::BinOp::Lt, ident(),
+                       intl(hi)));
     }
 
     ast::PatternPtr parsePattern() {
@@ -4075,6 +4133,21 @@ private:
                     }
                 }
                 expect(TokenKind::RParen, ")");
+                return p;
+            }
+            // v69: `name @ subpattern` is reserved (the AST node + `@` token
+            // exist) but binding a whole value through decision-tree
+            // specialization is a focused follow-on — reject clearly rather
+            // than silently mis-bind. (Range patterns, the v69 headline, ship.)
+            if (check(TokenKind::At)) {
+                errorHere("`name @ pattern` bindings are not yet supported "
+                          "(planned follow-on); bind in the arm body instead");
+                consume(); // `@`
+                parsePattern(); // discard inner for error recovery
+                auto p = std::make_unique<ast::VarPat>();
+                p->line = tok.line;
+                p->column = tok.column;
+                p->name = tok.lexeme;
                 return p;
             }
             auto p = std::make_unique<ast::VarPat>();

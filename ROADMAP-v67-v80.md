@@ -86,6 +86,15 @@ uses the fresh-Var workaround).
 
 ## v69 — range patterns (`0..10 =>`) + `@`-bindings (`name @ pat`)
 
+**STATUS: ✅ SHIPPED (v0.69.0).** Integer range patterns `lo..hi` / `lo..=hi`
+land as **sugar over v68 guards** — a range arm binds the scrutinee to a fresh
+name and produces `(v >= lo) && (v < hi)` (or `<= hi`), reusing the suffix-tree
+fall-through + guard-aware non-exhaustiveness. They chain, combine with explicit
+`if` guards, and don't count toward coverage (range-only → E0004, needs `_`). The
+`@` token + `AtPat` node exist but **`@`-bindings are DEFERRED** (rejected with a
+clear message — bind in the arm body) along with nested/char ranges. Gate:
+`smoke_test_range_pat.sh` (6 cases, JIT==AOT).
+
 **CORE.** Add `RangePat{lo,hi,inclusive}` and `AtPat{name,inner}` to the pattern
 hierarchy (ast.hpp:118-169). Parse `0..10 =>`, `0..=9 =>`, `name @ pat`.
 Typecheck: RangePat requires an integer/char scrutinee with `lo<=hi`

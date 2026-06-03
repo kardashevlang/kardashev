@@ -791,6 +791,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v69: integer range patterns (lo..hi) in match arms.
+sh_test(
+    name = "smoke_test_range_pat",
+    srcs = ["smoke_test_range_pat.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
