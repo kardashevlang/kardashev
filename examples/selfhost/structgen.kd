@@ -17,6 +17,7 @@ enum Expr {
     If(Box<Expr>, Box<Expr>, Box<Expr>),
     SLit(i64, Vec<Box<Expr>>),          // struct literal: struct index, field values (decl order)
     Field(Box<Expr>, String),           // field access: object, field name
+    Ref(Box<Expr>),                     // address-of `&e` -> a reference (tag 200+base)
 }
 enum Stmt { Let(String, Box<Expr>) }
 struct Token { kind: i64, start: i64, len: i64, value: i64 }
@@ -40,7 +41,7 @@ fn is_space(b: i64) -> i64 {
 }
 
 // kind: 1 num, 2 ident, 3 '->', 10 '+', 11 '*', 12 '(', 13 ')', 14 '=', 15 ';',
-//       16 ':', 17 ',', 18 '{', 19 '}', 20 '<', 21 '==', 22 '.'
+//       16 ':', 17 ',', 18 '{', 19 '}', 20 '<', 21 '==', 22 '.', 23 '&'
 fn lex(src: &String) -> Vec<Token> ! { alloc } {
     let n = str_len(src);
     let mut toks = vec_new();
@@ -78,7 +79,7 @@ fn lex(src: &String) -> Vec<Token> ! { alloc } {
                     } else { if is_eq2 == 1 {
                         vec_push(&mut toks, Token { kind: 21, start: i, len: 2, value: 0 }); i = i + 2;
                     } else {
-                        let k = if b == 43 { 10 } else { if b == 42 { 11 } else { if b == 40 { 12 } else { if b == 41 { 13 } else { if b == 61 { 14 } else { if b == 59 { 15 } else { if b == 58 { 16 } else { if b == 44 { 17 } else { if b == 123 { 18 } else { if b == 125 { 19 } else { if b == 60 { 20 } else { if b == 46 { 22 } else { 0 - 1 } } } } } } } } } } } };
+                        let k = if b == 38 { 23 } else { if b == 43 { 10 } else { if b == 42 { 11 } else { if b == 40 { 12 } else { if b == 41 { 13 } else { if b == 61 { 14 } else { if b == 59 { 15 } else { if b == 58 { 16 } else { if b == 44 { 17 } else { if b == 123 { 18 } else { if b == 125 { 19 } else { if b == 60 { 20 } else { if b == 46 { 22 } else { 0 - 1 } } } } } } } } } } } } };
                         vec_push(&mut toks, Token { kind: k, start: i, len: 1, value: 0 });
                         i = i + 1;
                     } }
@@ -111,16 +112,26 @@ fn field_index(structs: &Vec<SDef>, si: i64, fname: &String) -> i64 ! { alloc } 
     while i < nf { let f = vec_get(&sd.fields, i); found = if str_eq(&f.name, fname) { i } else { found }; i = i + 1; }
     found
 }
-// Type tag for a type-name token: bool -> 2, a registered struct -> 100+idx, else i64 (1).
-fn ty_tag(src: &String, toks: &Vec<Token>, pos: &Pos, structs: &Vec<SDef>) -> i64 ! { alloc } {
+// Type tag for a type token: bool -> 2, a registered struct -> 100+idx, else i64 (1).
+// A leading `&` (kind 23) makes it a REFERENCE: tag 200 + base (so &i64=201,
+// &bool=202, &Struct#idx = 300+idx). Consumes the `&`, leaving the type-NAME token
+// for the caller's single post-increment.
+fn ty_tag(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> i64 ! { alloc } {
+    let is_ref = if peek_kind(toks, pos) == 23 { pos.i = pos.i + 1; 1 } else { 0 };   // consume '&'
     let txt = tok_text_at(src, toks, pos); let kw_bool = "bool";
-    if str_eq(&txt, &kw_bool) { 2 }
-    else { let si = struct_index(structs, &txt); if si >= 0 { 100 + si } else { 1 } }
+    let base = if str_eq(&txt, &kw_bool) { 2 }
+               else { let si = struct_index(structs, &txt); if si >= 0 { 100 + si } else { 1 } };
+    if is_ref == 1 { 200 + base } else { base }
 }
 
 fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> Box<Expr> ! { alloc } {
     let t = vec_get(toks, pos.i);
-    if t.kind == 1 { pos.i = pos.i + 1; parse_post(src, toks, pos, structs, Box::new(Num(t.value))) }
+    if t.kind == 23 {                               // `&e` address-of
+        pos.i = pos.i + 1;
+        let inner = parse_factor(src, toks, pos, structs);
+        parse_post(src, toks, pos, structs, Box::new(Ref(inner)))
+    }
+    else { if t.kind == 1 { pos.i = pos.i + 1; parse_post(src, toks, pos, structs, Box::new(Num(t.value))) }
     else { if t.kind == 2 {
         let txt = tok_text(src, &t); let kw_if = "if";
         if str_eq(&txt, &kw_if) {
@@ -161,7 +172,7 @@ fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SD
         let e = parse_expr(src, toks, pos, structs);
         pos.i = pos.i + 1;                              // ')'
         parse_post(src, toks, pos, structs, e)
-    } }
+    } } }
 }
 // Postfix field accesses: `.f .g ...`.
 fn parse_post(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>, base: Box<Expr>) -> Box<Expr> ! { alloc } {
@@ -307,10 +318,15 @@ fn type_of(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>) -> i64 ! {
         },
         Field(obj, fname) => {
             let to = type_of(&(**obj), env, structs);
-            if to >= 100 {
-                let fi = field_index(structs, to - 100, fname);
-                if fi >= 0 { let sd = vec_get(structs, to - 100); let f = vec_get(&sd.fields, fi); f.ty } else { 0 }
-            } else { 0 }
+            let base = if to >= 300 { to - 200 } else { to };   // auto-deref a &Struct
+            if base >= 100 { if base < 200 {
+                let fi = field_index(structs, base - 100, fname);
+                if fi >= 0 { let sd = vec_get(structs, base - 100); let f = vec_get(&sd.fields, fi); f.ty } else { 0 }
+            } else { 0 } } else { 0 }
+        },
+        Ref(inner) => {
+            let ti = type_of(&(**inner), env, structs);
+            if ti == 0 { 0 } else { if ti >= 200 { 0 } else { 200 + ti } }   // no &&x
         },
     }
 }
@@ -328,7 +344,11 @@ fn check_fn(f: &Fn, structs: &Vec<SDef>) -> i64 ! { alloc } {
         k = k + 1;
     }
     let rt = type_of(&(*f.body.result), &env, structs);
-    if bad == 1 { 0 } else { if rt == 0 { 0 } else { if rt == f.ret { 1 } else { 0 } } }
+    // Reject returning a reference (rt >= 200): a returned `&local` would dangle.
+    // In this subset (no ref fields, no ref-of-ref, no stored refs) a borrow can
+    // only flow downward into a call and die at end of statement, so this single
+    // rule is sufficient for soundness — no NLL needed.
+    if bad == 1 { 0 } else { if rt == 0 { 0 } else { if rt >= 200 { 0 } else { if rt == f.ret { 1 } else { 0 } } } }
 }
 
 // ---- LLVM-IR codegen with typed values ----
@@ -336,9 +356,11 @@ fn fresh(c: &mut Ctr) -> i64 { let r = c.n; c.n = c.n + 1; r }
 fn reg(n: i64) -> String ! { alloc } { let p = "%v"; let s = int_to_string(n); str_concat(&p, &s) }
 fn arg_name(i: i64) -> String ! { alloc } { let p = "%arg"; let s = int_to_string(i); str_concat(&p, &s) }
 fn app(buf: &mut String, s: String) ! { alloc } { string_push_str(buf, s); }
-// The LLVM type string for a type tag: i64/bool -> "i64", struct -> "{ i64, i64, ... }".
+// The LLVM type string for a type tag: i64/bool -> "i64", struct -> "{ i64, i64, ... }",
+// any reference (tag >= 200) -> "ptr" (opaque pointer, what the host emits for &T).
 fn ty_llvm(ty: i64, structs: &Vec<SDef>) -> String ! { alloc } {
-    if ty < 100 { let s = "i64"; clone(&s) }
+    if ty >= 200 { let p = "ptr"; clone(&p) }
+    else { if ty < 100 { let s = "i64"; clone(&s) }
     else {
         let sd = vec_get(structs, ty - 100);
         let nf = vec_len(&sd.fields);
@@ -352,7 +374,7 @@ fn ty_llvm(ty: i64, structs: &Vec<SDef>) -> String ! { alloc } {
         }
         let close = " }"; app(&mut out, clone(&close));
         out
-    }
+    } }
 }
 
 // Lower one expression; append instructions; return its value (operand + type).
@@ -420,14 +442,33 @@ fn lower(e: &Expr, oenv: &HashMap<String, String>, tenv: &HashMap<String, i64>, 
         },
         Field(obj, fname) => {
             let vo = lower(&(**obj), oenv, tenv, structs, c, buf);
-            let fi = field_index(structs, vo.ty - 100, fname);
-            let sd = vec_get(structs, vo.ty - 100);
+            // If the object is a &Struct (tag >= 300), its operand is a `ptr` — load
+            // the aggregate first, then extractvalue. A plain struct is unchanged.
+            let is_ref = if vo.ty >= 300 { 1 } else { 0 };
+            let base = if is_ref == 1 { vo.ty - 200 } else { vo.ty };
+            let sty = ty_llvm(base, structs);
+            let agg = if is_ref == 1 {
+                let ld = fresh(c);
+                app(buf, "  "); app(buf, reg(ld)); app(buf, " = load "); app(buf, clone(&sty)); app(buf, ", ptr "); app(buf, vo.op); app(buf, "\n");
+                reg(ld)
+            } else { vo.op };
+            let fi = field_index(structs, base - 100, fname);
+            let sd = vec_get(structs, base - 100);
             let f = vec_get(&sd.fields, fi);
-            let sty = ty_llvm(vo.ty, structs);
             let r = fresh(c);
             app(buf, "  "); app(buf, reg(r)); app(buf, " = extractvalue "); app(buf, sty); app(buf, " ");
-            app(buf, vo.op); app(buf, ", "); app(buf, int_to_string(fi)); app(buf, "\n");
+            app(buf, agg); app(buf, ", "); app(buf, int_to_string(fi)); app(buf, "\n");
             Val { op: reg(r), ty: f.ty }
+        },
+        Ref(inner) => {
+            // `&e`: materialize e into a stack slot and yield its pointer. Inline
+            // alloca is valid LLVM (unoptimized); the gate compares exit codes.
+            let vi = lower(&(**inner), oenv, tenv, structs, c, buf);
+            let ity = ty_llvm(vi.ty, structs);
+            let slot = fresh(c);
+            app(buf, "  "); app(buf, reg(slot)); app(buf, " = alloca "); app(buf, clone(&ity)); app(buf, "\n");
+            app(buf, "  store "); app(buf, ity); app(buf, " "); app(buf, vi.op); app(buf, ", ptr "); app(buf, reg(slot)); app(buf, "\n");
+            Val { op: reg(slot), ty: 200 + vi.ty }
         },
     }
 }
