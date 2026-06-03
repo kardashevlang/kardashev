@@ -91,6 +91,8 @@ Migration lint deferred to v82.
 
 ### v82 — Result + ownership become the error story; effect ergonomics shrink
 
+**STATUS: ✅ SHIPPED (v0.82.0).** `fn main() -> Result<T,E>` via a codegen i64 exit-code wrapper (Ok→0/Err→1; AOT exit code, JIT prints); `#[allow(missing_effect)]` attribute (FnDecl.allowMissingEffect, consulted in checkEffects, silences strict mode); `result_flatten`/`option_flatten` prelude combinators. v81's opt-in `?` already covers the no-row `?` audit. Gate: `smoke_test_result_main.sh`. C backend refuses a Result-main cleanly. **Deferred:** the `-W effect-unchecked` migration lint (needs inferred effects exposed) + custom Error-trait hierarchy/backtraces.
+
 **Theme:** With effects now optional, make `Result<T,E>` + `?` + ownership the
 *primary* error/resource story so users reach for effects only when they truly
 want effect typing. Centers the language where the mandate asks.

@@ -3711,7 +3711,10 @@ private:
         // sees the real effects). Only a fn that wrote an EXPLICIT row (incl.
         // `! { }`, an asserted-pure) must declare everything it performs. The
         // `--effects=strict` flag restores the old "absent row ⇒ pure" rule.
-        const bool enforceDeclared = fn.sawEffectRow || g_effectsStrict;
+        // v82: `#[allow(missing_effect)]` opts a fn out of the error entirely
+        // (even under strict mode) — a surgical migration escape hatch.
+        const bool enforceDeclared =
+            (fn.sawEffectRow || g_effectsStrict) && !fn.allowMissingEffect;
         if (enforceDeclared) {
             for (const auto& l : inferred.labels) {
                 if (!declared.contains(l)) {
