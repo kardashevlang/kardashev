@@ -18,6 +18,35 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.80.0] — Diagnostics depth (multi-char spans, fix-its, JSON)
+
+The final entry of the v67–v80 roadmap arc — diagnostics depth.
+
+### Added
+- **Multi-char span underlines**: a diagnostic now underlines the whole
+  offending token (`^~~~~`) instead of a single caret, by scanning the source
+  line from the caret column over an identifier/number/string run (operators /
+  punctuation keep a lone `^`).
+- **Inline fix-it `help:` lines**: common error codes carry a short, actionable
+  hint shown under the snippet — e.g. E0384 → "declare the binding as
+  `let mut …`", E0004 → "add the missing arms, or a catch-all `_ => …` arm",
+  E0001/E0308/E0425/E0711. (The long form remains under `kardc --explain`.)
+- **`--error-format=json`**: emits each diagnostic as a JSON object, one per line
+  (NDJSON), with `severity` / `kind` / `code` / `message` / `file` / `line` /
+  `column` / `endColumn` (half-open) / `help` — for IDE and CI tooling.
+
+### Notes
+- LSP **rename** across a file's references (the 4th item of the planned v80
+  surface) already shipped earlier (`smoke_test_lsp_edit`/`rich`) and is
+  unchanged here.
+- Gate: `smoke_test_diag_depth.sh` (12 checks: underline width, help lines, JSON
+  shape + `jq` field extraction, lone-caret for punctuation).
+
+### Deferred (honest)
+- AST-precise spans for type/borrow errors (the underline uses a source-line
+  token scan from the caret, which covers the common identifier/literal case);
+  cross-file LSP rename; LSP-protocol incremental edits.
+
 ## [0.79.0] — Generic Option/Result combinators
 
 ### Changed

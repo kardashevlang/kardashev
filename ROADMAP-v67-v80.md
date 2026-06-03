@@ -426,6 +426,19 @@ abstraction; effect-row subsumption/variance.
 
 ## v80 — diagnostics depth: multi-char spans + JSON output + fix-its + LSP rename
 
+**STATUS: ✅ SHIPPED (v0.80.0) — FINAL ROADMAP ENTRY.** (1) Multi-char span
+underlines: `renderDiagnostic` scans the source line from the caret over an
+identifier/number/string run and draws `^~~~~` (operators keep a lone `^`) — a
+render-time approach that needed no AST-span plumbing. (2) `--error-format=json`
+emits NDJSON diagnostics (severity/kind/code/message/file/line/column/endColumn/
+help). (3) Inline fix-it `help:` lines via a new `help` field on the error-code
+table (E0384/E0004/E0001/E0308/E0425/E0711). (4) LSP `rename` across a file's
+references already shipped (smoke_test_lsp_edit/rich) — unchanged. Codegen fix
+also: an unconstrained generic type var defaults to i64 (from v79). Gate:
+`smoke_test_diag_depth.sh` (12 checks incl. `jq` field extraction). **Deferred:**
+AST-precise spans for type/borrow errors (the token-scan covers the common case),
+cross-file LSP rename, LSP incremental edits.
+
 > Lands the v64.x-deferred spans.
 
 **CORE.** (1) Add `endLine`/`endColumn` to Parse/Type/Borrow errors and propagate

@@ -868,6 +868,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v80 (FINAL): diagnostics depth — multi-char span underlines, fix-it help
+# lines, and --error-format=json structured diagnostics.
+sh_test(
+    name = "smoke_test_diag_depth",
+    srcs = ["smoke_test_diag_depth.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
