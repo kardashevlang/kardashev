@@ -765,6 +765,13 @@ private:
     std::string pendingDeclDoc_;
     int structPatCounter_ = 0; // v26 Phase 142: fresh `__sp` names
     int fmtCounter_ = 0;       // v27 Phase 149: fresh `__fmt` names
+    // v76: parameter destructuring. A tuple-pattern param `(a, b): (T, U)` is
+    // desugared to a fresh synthetic param `__patN` plus a pending
+    // `let (a, b) = __patN;` that parseFnDecl / parseImplFnDecl prepends to the
+    // function body — reusing the existing tuple-destructuring `let` machinery.
+    int paramPatCounter_ = 0;
+    std::vector<std::pair<std::string, std::vector<std::string>>>
+        pendingParamDestructures_;
     std::string takeDocAt(std::size_t p) {
         auto it = docAt_.find(p);
         if (it == docAt_.end()) return "";
@@ -1044,6 +1051,7 @@ private:
         decl.genericParams = parseOptionalGenericParams();
 
         expect(TokenKind::LParen, "(");
+        pendingParamDestructures_.clear(); // v76
         if (!check(TokenKind::RParen)) {
             while (true) {
                 decl.params.push_back(parseParam());
@@ -1057,6 +1065,7 @@ private:
         // params we just parsed, so it behaves identically to the inline form.
         parseOptionalWhereClause(decl.genericParams);
         decl.body = parseBlockExpr();
+        injectParamDestructures(decl.body.get()); // v76
         return decl;
     }
 
@@ -1132,9 +1141,70 @@ private:
     }
 
     ast::Param parseParam() {
+        // v76: a tuple-pattern param `(a, b): (T, U)`. Parse the (flat) element
+        // bindings, give the param a fresh synthetic name, and queue a
+        // `let (a, b) = <synthetic>;` for the caller to prepend to the body.
+        // (Nested tuple / struct patterns are deferred — element binds must be a
+        // plain name or `_`.)
+        if (check(TokenKind::LParen)) {
+            consume(); // (
+            std::vector<std::string> names;
+            if (!check(TokenKind::RParen)) {
+                while (true) {
+                    if (check(TokenKind::Underscore)) {
+                        names.push_back("_");
+                        consume();
+                    } else {
+                        Token n = expect(TokenKind::Identifier,
+                                         "tuple element binding name");
+                        names.push_back(n.lexeme);
+                    }
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::RParen)) break; // trailing comma
+                }
+            }
+            expect(TokenKind::RParen, ")");
+            expect(TokenKind::Colon, ":");
+            ast::TypeRef ty = parseTypeRef();
+            std::string syn = "__pat" + std::to_string(paramPatCounter_++);
+            pendingParamDestructures_.push_back({syn, std::move(names)});
+            return {syn, std::move(ty)};
+        }
+        // v76: a wildcard param `_: T` — a fresh, unused binding.
+        if (check(TokenKind::Underscore)) {
+            consume();
+            expect(TokenKind::Colon, ":");
+            ast::TypeRef ty = parseTypeRef();
+            return {"__wild" + std::to_string(paramPatCounter_++), std::move(ty)};
+        }
         Token nameTok = expect(TokenKind::Identifier, "parameter name");
         expect(TokenKind::Colon, ":");
         return {nameTok.lexeme, parseTypeRef()};
+    }
+
+    // v76: prepend the queued `let <pattern> = <synthetic-param>;` bindings to a
+    // function body (a BlockExpr). Clears the queue. Called by the body-having
+    // declaration parsers after the body is parsed.
+    void injectParamDestructures(ast::BlockExpr* blk) {
+        if (pendingParamDestructures_.empty()) return;
+        if (!blk) {
+            pendingParamDestructures_.clear();
+            return;
+        }
+        std::vector<ast::StmtPtr> lets;
+        lets.reserve(pendingParamDestructures_.size());
+        for (auto& pd : pendingParamDestructures_) {
+            auto let = std::make_unique<ast::LetStmt>();
+            let->tupleNames = pd.second;
+            auto id = std::make_unique<ast::IdentExpr>();
+            id->name = pd.first;
+            let->value = std::move(id);
+            lets.push_back(std::move(let));
+        }
+        blk->stmts.insert(blk->stmts.begin(),
+                          std::make_move_iterator(lets.begin()),
+                          std::make_move_iterator(lets.end()));
+        pendingParamDestructures_.clear();
     }
 
     ast::StructDecl parseStructDecl() {
@@ -2648,6 +2718,7 @@ private:
         decl.name = nameTok.lexeme;
         decl.genericParams = parseOptionalGenericParams();
         expect(TokenKind::LParen, "(");
+        pendingParamDestructures_.clear(); // v76
         if (!check(TokenKind::RParen)) {
             while (true) {
                 decl.params.push_back(parseSelfOrParam());
@@ -2660,6 +2731,7 @@ private:
         // Phase 21b: `where` clause on an impl method, desugared as for free fns.
         parseOptionalWhereClause(decl.genericParams);
         decl.body = parseBlockExpr();
+        injectParamDestructures(decl.body.get()); // v76
         return decl;
     }
 

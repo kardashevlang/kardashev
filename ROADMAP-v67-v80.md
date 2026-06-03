@@ -295,6 +295,20 @@ generic Vec) stay refused.
 
 ## v76 — parameter destructuring (patterns in fn params)
 
+**STATUS: ✅ SHIPPED (v0.76.0).** Tuple-pattern params (`fn g((a, b): (i64,
+i64))`, incl. a `_` element + 3+-element tuples) and wildcard params (`_: T`) on
+free functions and impl methods. Implemented as a **pure parser desugar** (no
+type-check/codegen changes): a pattern param becomes a fresh synthetic param
+(`__patN` / `__wildN`) plus a `let (a, b) = __patN;` prepended to the body,
+reusing the existing tuple-destructuring `let`. Gate:
+`smoke_test_param_destructure.sh` (6 JIT==AOT + a C-backend refusal check). The C
+backend handles wildcard params but refuses tuple-pattern params cleanly (their
+desugar is a tuple-destructuring `let`, not yet supported there). **Deferred:**
+nested tuple patterns (`((a,b),c)`), struct-pattern params (`Point{x,y}`),
+`..rest`/slice/refutable param patterns, and C-backend tuple-destructuring.
+
+<details><summary>Original plan</summary>
+
 **CORE.** Add a `pattern` field to `Param` (ast.hpp:628); parse
 `fn f(Point{x,y}: Point)` and `fn g((a,b): (i64,i64))`. At fn entry
 (codegen.cpp:9505+) bind the param to a synthetic slot, then reuse the existing
@@ -307,6 +321,8 @@ work (JIT==AOT); the C-backend differential matches for the tuple case.
 
 **DEFERRALS.** `..rest` tuple params, slice-pattern params, refutable param
 patterns.
+
+</details>
 
 ---
 

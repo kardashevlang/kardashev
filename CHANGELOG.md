@@ -18,6 +18,30 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.76.0] — Parameter destructuring
+
+### Added
+- **Tuple-pattern parameters**: `fn dist((x, y): (i64, i64)) -> i64 { x + y }`
+  (also with a `_` element, e.g. `(a, _): (i64, i64)`), on free functions and
+  impl methods.
+- **Wildcard parameters**: `fn ignore(_: i64, y: i64) -> i64 { y }`.
+- Implemented as a **parser desugar** with zero type-check/codegen changes: a
+  pattern param becomes a fresh synthetic param (`__patN` / `__wildN`) plus a
+  `let (a, b) = __patN;` prepended to the function body, reusing the existing
+  tuple-destructuring `let`. Multiple pattern params and 3+-element tuples work.
+
+### Notes
+- Gate: `smoke_test_param_destructure.sh` (6 JIT==AOT cases incl. impl method +
+  3-tuple, + a C-backend refusal check).
+- The C backend (`--emit-c`) handles **wildcard** params (no destructuring), but
+  **refuses** tuple-pattern params cleanly (the desugar produces a
+  tuple-destructuring `let`, which the C backend doesn't yet support) — never
+  miscompiled.
+
+### Deferred (honest)
+- Nested tuple patterns in params (`((a, b), c)`), struct-pattern params
+  (`Point { x, y }`), and tuple-destructuring in the C backend.
+
 ## [0.75.0] — C backend: tuple types
 
 ### Added
