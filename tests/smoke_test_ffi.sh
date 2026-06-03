@@ -136,7 +136,7 @@ echo "JIT+AOT: i64-spelled (C long) abs(0-7) == 7"
 # Negative: a PURE fn calling an extern (which carries `io`) must be rejected.
 cat > "$TMP/pure_leak.kd" <<'EOF'
 extern "C" fn getpid() -> i32;
-fn leaky() -> i64 { getpid() }
+fn leaky() -> i64 ! { } { getpid() }
 fn main() -> i64 ! { io } { leaky() }
 EOF
 set +e

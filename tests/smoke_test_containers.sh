@@ -161,7 +161,7 @@ echo "PASS [combinators]: option/result map/unwrap_or/and_then + io effect compo
 # Negative: an io closure threaded through option_map from a PURE context is a
 # typecheck error mentioning the io effect.
 cat > "$TMP/combinators_bad.kd" <<'EOF'
-fn main() -> i64 {
+fn main() -> i64 ! { } {
     option_unwrap_or(option_map(Some(5), |x| print(x)), 0)
 }
 EOF

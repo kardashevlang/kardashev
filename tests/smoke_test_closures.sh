@@ -101,7 +101,7 @@ echo "Positive: io closure called from io context prints 105 (JIT + AOT)"
 # --- Effect propagation, negative: the same io closure called from a PURE
 # context must be a typecheck error mentioning the io effect.
 cat > "$TMP/eff_bad.kd" <<'EOF'
-fn main() -> i64 {
+fn main() -> i64 ! { } {
     let p = |x| print(x);
     p(5)
 }

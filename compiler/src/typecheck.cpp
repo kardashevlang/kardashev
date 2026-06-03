@@ -9,6 +9,13 @@
 #include "kardashev/pattern_match.hpp"
 
 namespace kardashev {
+
+// v81: effects are opt-in by default (a fn with no `! { }` row is unchecked).
+// `--effects=strict` (via setEffectsStrict) restores the old rule where an
+// absent row means "asserted pure". File-scoped so the TypeChecker reads it.
+static bool g_effectsStrict = false;
+void setEffectsStrict(bool strict) { g_effectsStrict = strict; }
+
 namespace {
 
 class TypeChecker {
@@ -3698,16 +3705,25 @@ private:
         EffectSet inferred;
         collectEffects(*fn.body, inferred);
         const EffectSet& declared = it->second.declaredEffects;
-        for (const auto& l : inferred.labels) {
-            if (!declared.contains(l)) {
-                error("function '" + fn.name +
-                          "' uses effect `" + l +
-                          "` but does not declare it; add `! { " + l +
-                          (declared.labels.empty()
-                               ? " }"
-                               : ", ... }") +
-                          "` to the signature",
-                      fn.line, fn.column);
+        // v81: effects are OPT-IN. A fn that wrote NO `! { ... }` row is left
+        // unchecked — it may perform any effect (the inferred set is still
+        // computed and propagated to callers, so an *annotated* caller still
+        // sees the real effects). Only a fn that wrote an EXPLICIT row (incl.
+        // `! { }`, an asserted-pure) must declare everything it performs. The
+        // `--effects=strict` flag restores the old "absent row ⇒ pure" rule.
+        const bool enforceDeclared = fn.sawEffectRow || g_effectsStrict;
+        if (enforceDeclared) {
+            for (const auto& l : inferred.labels) {
+                if (!declared.contains(l)) {
+                    error("function '" + fn.name +
+                              "' uses effect `" + l +
+                              "` but does not declare it; add `! { " + l +
+                              (declared.labels.empty()
+                                   ? " }"
+                                   : ", ... }") +
+                              "` to the signature",
+                          fn.line, fn.column);
+                }
             }
         }
         // v48: codegen-quality contracts. `#[codegen(no_alloc)]` /

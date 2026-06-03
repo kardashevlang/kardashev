@@ -68,7 +68,7 @@ echo "AOT print output matches"
 
 # Pure caller without `! { io }`: must be a typecheck error.
 cat > "$TMP/pure.kd" <<'EOF'
-fn main() -> i64 { print(42); 0 }
+fn main() -> i64 ! { } { print(42); 0 }
 EOF
 set +e
 ERR_OUT=$("$KARDC" "$TMP/pure.kd" 2>&1)

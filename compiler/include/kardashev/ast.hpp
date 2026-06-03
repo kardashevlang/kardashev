@@ -816,6 +816,11 @@ struct FnDecl {
     std::vector<Param> params;
     TypeRef returnType;
     EffectRow effects; // Phase 4: declared effect row; empty = pure
+    // v81: did the source actually WRITE a `! { ... }` row? Distinguishes an
+    // ABSENT row (no `!` — opt-in: effects unchecked, may perform anything) from
+    // an EXPLICIT row (incl. `! { }` — strictly checked, `! {}` = asserted pure).
+    // Set by the parser from `sawEffectRow_`.
+    bool sawEffectRow = false;
     bool isAsync = false; // `async fn` returns a Future and implicitly
                             // carries the `async` effect; codegen (Phase 12)
                             // splits it into a resumable poll fn over a frame.

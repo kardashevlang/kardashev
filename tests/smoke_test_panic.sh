@@ -364,7 +364,7 @@ echo "PASS [oob-uncaught]: an uncaught out-of-bounds index panics, prints the di
 # it; catch still propagates other effects.
 # ============================================================================
 cat > "$TMP/eff_undeclared.kd" <<'EOF'
-fn bad() -> i64 { panic("x"); 0 }
+fn bad() -> i64 ! { } { panic("x"); 0 }
 fn main() -> i64 { bad() }
 EOF
 set +e
@@ -394,7 +394,7 @@ echo "PASS [eff-catch-clears]: catch clears the panic effect (a catching fn need
 
 cat > "$TMP/eff_catch_propagates.kd" <<'EOF'
 fn ioFn() -> i64 ! { io } { print(1); 0 }
-fn main() -> i64 { let r = catch(ioFn, 0); r }
+fn main() -> i64 ! { } { let r = catch(ioFn, 0); r }
 EOF
 set +e
 PROP_OUT=$("$KARDC" "$TMP/eff_catch_propagates.kd" 2>&1)

@@ -369,4 +369,9 @@ struct TypeCheckResult {
 
 TypeCheckResult typecheck(const ast::Program& program);
 
+// v81: effects are opt-in (an absent `! { }` row is unchecked). Call with
+// `true` to restore strict mode (absent row ⇒ asserted pure), e.g. from a
+// `--effects=strict` CLI flag.
+void setEffectsStrict(bool strict);
+
 } // namespace kardashev

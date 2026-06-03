@@ -876,6 +876,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v81: effects are opt-in (absent `! {}` row = unchecked; explicit row checked).
+sh_test(
+    name = "smoke_test_effects_optin",
+    srcs = ["smoke_test_effects_optin.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

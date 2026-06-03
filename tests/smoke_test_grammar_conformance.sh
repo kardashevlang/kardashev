@@ -50,7 +50,7 @@ reject unknown_fn       'fn main() -> i64 { nonexistent_fn(1) }'
 reject type_mismatch    'fn main() -> i64 { let x: bool = 5; 0 }'
 reject not_obj_safe     'trait Mk { fn m(&self) -> Self; } struct S { x: i64 } impl Mk for S { fn m(&self) -> S { S { x: 1 } } } fn u(p: &dyn Mk) -> i64 { 0 } fn main() -> i64 { 0 }'
 reject raw_deref_safe   'fn main() -> i64 { let x = 5; let p = &x as *const i64; *p }'
-reject undeclared_effect 'fn main() -> i64 { print(1); 0 }'
+reject undeclared_effect 'fn main() -> i64 ! { } { print(1); 0 }'
 reject unterminated      'fn main() -> i64 { let x = (1 + ; 0 }'
 
 echo "grammar conformance: $ok accepted, $bad rejected"

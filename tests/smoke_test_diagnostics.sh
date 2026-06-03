@@ -24,7 +24,7 @@ want_code mismatch    E0308 'fn main() -> i64 ! { io } { let x: bool = 5; print(
 want_code immutable   E0384 'fn main() -> i64 { let x = 1; x = 2; 0 }'
 want_code moved       E0382 'struct W { n: i64 } fn main() -> i64 ! { alloc } { let w = W { n: 1 }; let a = w; let b = w; 0 }'
 want_code breakloop   E0571 'fn main() -> i64 { break; 0 }'
-want_code effect      E0710 'fn f() -> i64 ! { io } { 0 } fn g() -> i64 { f() } fn main() -> i64 { 0 }'
+want_code effect      E0710 'fn f() -> i64 ! { io } { 0 } fn g() -> i64 ! { } { f() } fn main() -> i64 { 0 }'
 want_code nonexh      E0004 'enum E { A, B } fn main() -> i64 { let e = E::A; match e { A => 0 } }'
 want_code dangling    E0597 'fn d() -> &i64 { let x = 5; &x } fn main() -> i64 { 0 }'
 

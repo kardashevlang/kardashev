@@ -18,6 +18,37 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.81.0] — Effects are opt-in
+
+Begins the v81–v90 "practical-systems-language" arc. The headline: effects are
+no longer mandatory — they become an **opt-in** discipline, centring the
+everyday language on `Result` + ownership.
+
+### Changed
+- A function with **no** `! { … }` effect row is now **unchecked**: it may
+  perform any effect (e.g. `fn greet() -> i64 { print(42) }` compiles).
+- A function with an **explicit** row (including `! { }`, an asserted-pure) is
+  still **strictly checked** — it must declare every effect it performs. This
+  keeps the change **fully backward-compatible**: all ~235 existing tests and
+  the ~192 prelude rows are explicit, so they behave exactly as before.
+- The inferred effect set is still computed and **propagated to callers**, so an
+  *annotated* caller of an un-annotated effectful fn still sees the real effects.
+
+### Notes
+- `--effects=strict` restores the pre-v81 rule (an absent row means
+  asserted-pure). `--effects=opt-in` is the default.
+- `#[codegen(no_alloc/no_panic/no_io)]` contracts and the user-defined-effect
+  exhaustiveness check (`perform E::op` reaching `main` unhandled) are
+  **unchanged** — they are soundness/codegen properties, not style rules.
+- Implementation: `FnDecl.sawEffectRow` (threaded from the parser's
+  `sawEffectRow_`); `checkEffects` gates the undeclared-effect loop on it.
+- Gate: `smoke_test_effects_optin.sh` (7 cases). The existing `smoke_test_effects*`
+  suite still passes unchanged.
+
+### Deferred (honest)
+- `#[allow(missing_effect)]` per-fn attribute and a migration lint (v82); the
+  broader Result-centric error ergonomics (v82) and effect-surface trim (v83).
+
 ## [0.80.0] — Diagnostics depth (multi-char spans, fix-its, JSON)
 
 The final entry of the v67–v80 roadmap arc — diagnostics depth.
