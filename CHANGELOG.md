@@ -18,6 +18,39 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.74.0] — Single-level dyn trait upcasting
+
+### Added
+- **dyn trait upcasting** (single-level): a `&dyn Sub` / `Box<dyn Sub>` is now
+  usable where a `&dyn Super` / `Box<dyn Super>` is expected, when `Super` is a
+  **direct supertrait** of `Sub` (`trait Sub: Super { … }`). The object's data
+  pointer is preserved, so the concrete impl is still dispatched correctly for
+  both super- and sub-trait methods.
+- Implementation: each subtrait's vtable now embeds one pointer slot per direct
+  supertrait (placed **after** the method slots, so existing dyn dispatch — which
+  only indexes the method slots — is unchanged). The upcast loads that pointer
+  and rebuilds the fat pointer. Type-check adds a coercion rule (`coerceOrUnify`)
+  that records the upcast; codegen swaps the vtable via `makeDynUpcast`.
+- Multi-level upcasting works by **chaining** single steps (`Cee → Bee → Aee`),
+  since each supertrait vtable likewise embeds its own supertrait pointers.
+
+### Notes
+- Gate: `smoke_test_dyn_upcast.sh` (6 cases incl. data-preservation across a
+  distinct impl, `Box<dyn>` upcast, two-step chain, plain-`dyn` regression, and
+  a rejected one-step grandparent), JIT==AOT.
+- A **direct** grandparent upcast in a single step (`&dyn Cee` → `&dyn Aee`
+  where `Aee` is not a *direct* supertrait of `Cee`) is rejected with a clear
+  type error — chain through the intermediate trait instead.
+
+### Deferred (honest)
+- **Turbofish on method calls** (`v.method::<T>()`) — the other half of the
+  planned v74 — is **deferred**: it would bind method-level generic parameters,
+  but those are not yet fully supported (trait-method `MethodSig` has no generic
+  params, and inherent generic methods `fn m<T>(&self)` currently fail at
+  codegen). Adding turbofish first requires completing generic-method codegen, a
+  separate arc; shipping turbofish alone would be a no-op veneer.
+- One-step transitive (non-direct) upcasting.
+
 ## [0.73.0] — Associated constants, completed (Rust-style access)
 
 ### Added

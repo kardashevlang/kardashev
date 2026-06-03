@@ -186,6 +186,13 @@ struct DynCoercion {
     std::string traitName;
     std::string concreteTypeName; // the impl's implementing type
     bool isBox = false;           // false => &dyn, true => Box<dyn>
+    // v74: a single-level dyn UPCAST `&dyn Sub` -> `&dyn Super`. When set,
+    // `traitName` is the target supertrait (Super) and `fromTraitName` is the
+    // source subtrait (Sub); `concreteTypeName` is empty (the concrete type is
+    // already erased). Codegen swaps the fat pointer's vtable for the
+    // super-vtable pointer embedded in the sub-vtable.
+    bool isUpcast = false;
+    std::string fromTraitName; // the subtrait (Sub), only when isUpcast
 };
 
 // Phase 21b: an unresolved associated-type projection `C::Item` where `C` is a
