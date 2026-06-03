@@ -176,6 +176,8 @@ docs).
 
 ### v84 — heterogeneous struct fields + multi-payload enums in compile.kd
 
+**STATUS: ✅ SHIPPED (v0.84.0).** (1) `structgen.kd` `SDef.fields` now stores per-field types (`Param{name,ty}`): `parse_structs` reads the type token via `ty_tag`, `ty_llvm` emits the real per-field LLVM type recursively (nested structs → `{ i64, { i64, i64 } }`), and `type_of`/`lower` for `SLit`/`Field` carry the field's declared type. (2) `enumgen.kd` variants now carry 1..N payloads: `EDef.variants: Vec<VDef{name,arity}>`, `ECon` holds `Vec<Box<Expr>>`, `Arm.binds: Vec<String>`; the enum layout widens to `{ i64 tag, i64 p0, …, i64 p<maxArity-1> }` (narrower variants leave trailing slots `undef`), with multi-`insertvalue`/`extractvalue` + positional bind. All-i64 structs and single-payload enums stay **byte-identical** (`{ i64, i64 }`), so the existing demo greps hold. **Gates:** extended `smoke_test_phase117.sh` (nested-struct + bool-field) and `smoke_test_phase118.sh` (2-payload, mixed-arity widest-second, 3-payload) — each self-hosted exit == host exit. **Exceeds plan** (3+ payloads tested, not just 2). **Deferred:** payloadless/nullary variants (`None` — needs paren-less match/construct syntax the toy parser lacks) and String/Vec fields (heap, v85+).
+
 **Theme:** Data completeness — the two lowest-risk, highest-ROI self-hosting
 unlocks (survey Increments 1 & 2).
 

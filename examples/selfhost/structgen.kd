@@ -23,7 +23,7 @@ struct Token { kind: i64, start: i64, len: i64, value: i64 }
 struct Pos { i: i64 }
 struct Param { name: String, ty: i64 }  // ty: 1 i64, 2 bool, 100+idx struct
 struct Block { lets: Vec<Stmt>, result: Box<Expr> }
-struct SDef { name: String, fields: Vec<String> }   // a struct: name + field names (all i64)
+struct SDef { name: String, fields: Vec<Param> }   // a struct: name + typed fields (i64/bool/nested-struct)
 struct Fn { name: String, params: Vec<Param>, ret: i64, body: Block }
 struct Ctr { n: i64 }
 // A lowered value: its LLVM operand text + its type tag.
@@ -108,7 +108,7 @@ fn field_index(structs: &Vec<SDef>, si: i64, fname: &String) -> i64 ! { alloc } 
     let sd = vec_get(structs, si);
     let nf = vec_len(&sd.fields);
     let mut i = 0; let mut found = 0 - 1;
-    while i < nf { let f = vec_get(&sd.fields, i); found = if str_eq(&f, fname) { i } else { found }; i = i + 1; }
+    while i < nf { let f = vec_get(&sd.fields, i); found = if str_eq(&f.name, fname) { i } else { found }; i = i + 1; }
     found
 }
 // Type tag for a type-name token: bool -> 2, a registered struct -> 100+idx, else i64 (1).
@@ -241,8 +241,8 @@ fn parse_structs(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Vec<SDef> ! 
                 if peek_kind(toks, pos) == 2 {
                     let fn2 = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
                     pos.i = pos.i + 1;                  // ':'
-                    pos.i = pos.i + 1;                  // type (i64)
-                    vec_push(&mut fields, fn2);
+                    let fty = ty_tag(src, toks, pos, &out); pos.i = pos.i + 1;   // field type (i64/bool/struct)
+                    vec_push(&mut fields, Param { name: fn2, ty: fty });
                     if peek_kind(toks, pos) == 17 { pos.i = pos.i + 1; } else { g2 = false; }
                 } else { g2 = false; }
             }
@@ -292,16 +292,25 @@ fn type_of(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>) -> i64 ! {
             if tc == 2 { if tt == te { if tt == 0 { 0 } else { tt } } else { 0 } } else { 0 }
         },
         SLit(si, vals) => {
-            // every field value must be i64; result type is the struct.
+            // each field value must match the field's declared type; result is the struct.
+            let sd = vec_get(structs, *si);
             let nv = vec_len(vals);
             let mut bad = 0;
             let mut i = 0;
-            while i < nv { let v = vec_get(vals, i); bad = if type_of(&(*v), env, structs) != 1 { 1 } else { bad }; i = i + 1; }
+            while i < nv {
+                let v = vec_get(vals, i);
+                let f = vec_get(&sd.fields, i);
+                bad = if type_of(&(*v), env, structs) != f.ty { 1 } else { bad };
+                i = i + 1;
+            }
             if bad == 1 { 0 } else { 100 + *si }
         },
         Field(obj, fname) => {
             let to = type_of(&(**obj), env, structs);
-            if to >= 100 { let fi = field_index(structs, to - 100, fname); if fi >= 0 { 1 } else { 0 } } else { 0 }
+            if to >= 100 {
+                let fi = field_index(structs, to - 100, fname);
+                if fi >= 0 { let sd = vec_get(structs, to - 100); let f = vec_get(&sd.fields, fi); f.ty } else { 0 }
+            } else { 0 }
         },
     }
 }
@@ -338,7 +347,7 @@ fn ty_llvm(ty: i64, structs: &Vec<SDef>) -> String ! { alloc } {
         let mut i = 0;
         while i < nf {
             if i > 0 { let sep = ", "; app(&mut out, clone(&sep)); } else { let e = ""; app(&mut out, clone(&e)); }
-            let t = "i64"; app(&mut out, clone(&t));
+            let fld = vec_get(&sd.fields, i); let t = ty_llvm(fld.ty, structs); app(&mut out, t);
             i = i + 1;
         }
         let close = " }"; app(&mut out, clone(&close));
@@ -392,15 +401,18 @@ fn lower(e: &Expr, oenv: &HashMap<String, String>, tenv: &HashMap<String, i64>, 
         SLit(si, vals) => {
             // build the aggregate with a chain of insertvalue over `undef`.
             let sty = ty_llvm(100 + *si, structs);
+            let sd = vec_get(structs, *si);
             let nv = vec_len(vals);
             let mut cur = "undef"; let mut curs = clone(&cur);
             let mut i = 0;
             while i < nv {
                 let fv = vec_get(vals, i);
                 let vv = lower(&(*fv), oenv, tenv, structs, c, buf);
+                let f = vec_get(&sd.fields, i);
+                let flt = ty_llvm(f.ty, structs);
                 let r = fresh(c);
                 app(buf, "  "); app(buf, reg(r)); app(buf, " = insertvalue "); app(buf, clone(&sty)); app(buf, " ");
-                app(buf, curs); app(buf, ", i64 "); app(buf, vv.op); app(buf, ", "); app(buf, int_to_string(i)); app(buf, "\n");
+                app(buf, curs); app(buf, ", "); app(buf, flt); app(buf, " "); app(buf, vv.op); app(buf, ", "); app(buf, int_to_string(i)); app(buf, "\n");
                 curs = reg(r);
                 i = i + 1;
             }
@@ -409,11 +421,13 @@ fn lower(e: &Expr, oenv: &HashMap<String, String>, tenv: &HashMap<String, i64>, 
         Field(obj, fname) => {
             let vo = lower(&(**obj), oenv, tenv, structs, c, buf);
             let fi = field_index(structs, vo.ty - 100, fname);
+            let sd = vec_get(structs, vo.ty - 100);
+            let f = vec_get(&sd.fields, fi);
             let sty = ty_llvm(vo.ty, structs);
             let r = fresh(c);
             app(buf, "  "); app(buf, reg(r)); app(buf, " = extractvalue "); app(buf, sty); app(buf, " ");
             app(buf, vo.op); app(buf, ", "); app(buf, int_to_string(fi)); app(buf, "\n");
-            Val { op: reg(r), ty: 1 }
+            Val { op: reg(r), ty: f.ty }
         },
     }
 }

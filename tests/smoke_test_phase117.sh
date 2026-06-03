@@ -57,6 +57,13 @@ diff_case "struct P { x: i64, y: i64 } fn f(a: i64, b: i64) -> i64 { let p = P {
 diff_case "struct Pair { p: i64, q: i64, r: i64 } fn f(a: i64, b: i64) -> i64 { let t = Pair { p: a, q: b, r: a * b } ; (t.p + t.q) + t.r }" 3 4 "three-field"
 diff_case "struct Pair { p: i64, q: i64, r: i64 } fn f(a: i64, b: i64) -> i64 { let t = Pair { p: a + 1, q: b * 2, r: a } ; if t.p == t.r { t.q } else { t.p * t.r } }" 5 3 "mixed"
 
+# v84: HETEROGENEOUS fields — a nested struct (`{ i64, { i64, i64 } }`) and a bool
+# field. The self-hosted compiler now records each field's type, emits per-field
+# LLVM types (recursive for nested aggregates), and reads them back at the right
+# type. The all-i64 structs above stay byte-identical (`{ i64, i64 }`).
+diff_case "struct Inner { a: i64, b: i64 } struct Outer { v: i64, inner: Inner } fn f(a: i64, b: i64) -> i64 { let o = Outer { v: a, inner: Inner { a: a + b, b: b } } ; o.inner.a + o.v }" 6 4 "nested-struct"
+diff_case "struct Flagged { n: i64, ok: bool } fn f(a: i64, b: i64) -> i64 { let g = Flagged { n: a * b, ok: a < b } ; if g.ok { g.n } else { 0 } }" 3 5 "bool-field"
+
 # A struct-RETURNING function (self-only — the host can't wrap a struct return in
 # an i64 main): the self-hosted compiler returns the aggregate and `main` extracts
 # field 0 as the exit code.

@@ -64,4 +64,18 @@ diff_case "$SEL" 9 3 "three-variant-C"
 NEST="enum P2 { L(i64), R(i64) } fn f(a: i64, b: i64) -> i64 { let r = match L(a) { L(x) => R(x) , R(y) => L(y) } ; match r { L(p) => p , R(q) => q + 1000 } }"
 diff_case "$NEST" 5 0 "match-returns-enum"
 
+# v84: MULTI-PAYLOAD variants. An enum's layout is `{ i64 tag, i64 p0, ..., i64
+# p<maxArity-1> }`; a variant carries 1..N payloads, and `match V(a, b, ...)` binds
+# each. Single-payload enums above stay byte-identical (`{ i64, i64 }`).
+PT="enum Pt { P(i64, i64), Z(i64) } fn f(a: i64, b: i64) -> i64 { let e = if a < b { P(a, b) } else { Z(a) } ; match e { P(x, y) => x + y , Z(w) => w } }"
+diff_case "$PT" 3 5 "two-payload-P"
+diff_case "$PT" 9 2 "one-payload-Z"
+# Widest variant SECOND -> narrower variant leaves trailing slots undef.
+WIDE="enum Q { S(i64), D(i64, i64) } fn f(a: i64, b: i64) -> i64 { let e = if a < b { D(a, b) } else { S(a) } ; match e { S(p) => p * 2 , D(x, y) => x * y } }"
+diff_case "$WIDE" 3 5 "wide-second-D"
+diff_case "$WIDE" 5 3 "wide-second-S"
+# Three payloads.
+TRI="enum Tri { T(i64, i64, i64), U(i64) } fn f(a: i64, b: i64) -> i64 { let e = T(a, b, a * b) ; match e { T(x, y, z) => (x + y) + z , U(w) => w } }"
+diff_case "$TRI" 3 4 "three-payload"
+
 echo "ALL PHASE 118 SMOKE TESTS PASSED"

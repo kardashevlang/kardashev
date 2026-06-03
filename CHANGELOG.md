@@ -18,6 +18,39 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.84.0] — Self-hosting: heterogeneous struct fields + multi-payload enums
+
+Opens the self-hosting completeness arc (v84–v86). The self-hosted LLVM-IR
+compilers (`examples/selfhost/structgen.kd`, `enumgen.kd`) lowered their data
+types as **all-i64**; they now carry real per-field / per-payload type
+information, the lowest-risk highest-ROI self-hosting unlock.
+
+### Added
+- **Heterogeneous struct fields** (`structgen.kd`): `SDef.fields` stores typed
+  fields (`Param{name, ty}`) instead of bare names. `parse_structs` reads the
+  field type token via `ty_tag`; `ty_llvm` emits each field's real LLVM type
+  recursively, so a nested struct lowers to `{ i64, { i64, i64 } }`; `type_of`
+  and `lower` (`SLit`/`Field`) carry the field's declared type. Bool and
+  nested-struct fields now compile.
+- **Multi-payload enum variants** (`enumgen.kd`): a variant carries `1..N`
+  payloads. `EDef.variants: Vec<VDef{name, arity}>`, `ECon` holds
+  `Vec<Box<Expr>>`, and `Arm.binds: Vec<String>`. The layout widens to
+  `{ i64 tag, i64 p0, …, i64 p<maxArity-1> }` (a narrower variant leaves trailing
+  slots `undef`), with multi-`insertvalue` construction, multi-`extractvalue`
+  destructuring, and positional binding in `match`.
+
+### Notes
+- All-i64 structs and single-payload enums stay **byte-identical** (`{ i64, i64 }`),
+  so the existing demo IR greps still hold.
+- Gates (extended, both differential self-hosted-exit == host-exit): `smoke_test_phase117.sh`
+  (nested-struct, bool-field) and `smoke_test_phase118.sh` (two-payload,
+  mixed-arity widest-second, three-payload). Exceeds the planned cap of 2 payloads.
+
+### Deferred (honest)
+- **Payloadless / nullary variants** (`None`) — they need paren-less
+  match/construct syntax the toy self-hosted parser does not yet have.
+- String / Vec struct fields (need the heap — v85+).
+
 ## [0.83.0] — Collapse the effect surface + docs
 
 Closes the effects-simplification arc (v81–v83): a smaller, clearer surface.
