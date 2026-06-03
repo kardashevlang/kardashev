@@ -18,6 +18,32 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.77.0] — Stdlib container convenience ops
+
+### Added
+- **Vec**: `vec_is_empty`, `vec_first` / `vec_last` (→ `Option<T>`),
+  `vec_clear`, `vec_truncate`, `vec_extend` (append another `Vec`).
+- **HashMap**: `hashmap_is_empty`, `hashmap_get_or` (value or a default),
+  `hashmap_clear`.
+- **HashSet**: `hashset_is_empty`, `hashset_clear`.
+- All are **pure-prelude** functions over the existing container intrinsics —
+  no codegen or type-check changes. Generic where the element/value type allows
+  (`vec_first<T: Clone>`, `hashmap_get_or<K: Hash+Eq+Clone, V: Clone>`).
+
+### Notes
+- The mutating ops (`*_clear`, `vec_truncate`) read the length into a **local
+  counter** rather than re-reading the `&mut` container in the `while`
+  condition — re-reading a `&mut` place while mutating it in the body trips the
+  borrow checker (E0499); `*_clear` for the maps iterates a **snapshot** of the
+  keys/items. `vec_extend` loops over the other (`&`) Vec.
+- Gate: `smoke_test_container_ops.sh` (5 JIT==AOT groups incl. a String-keyed
+  HashMap and an empty-Vec case).
+
+### Deferred (honest)
+- `vec_dedup` (in-place remove-while-iterate hits the same borrow limit),
+  `vec_sort` / `vec_binary_search` (need an intrinsic), and HashSet algebra
+  (`union` / `intersection` / `difference`).
+
 ## [0.76.0] — Parameter destructuring
 
 ### Added
