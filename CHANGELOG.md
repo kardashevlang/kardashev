@@ -18,6 +18,39 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.91.0] — Self-hosting: real control flow (mutable locals + `while`/`for` CFG)
+
+Opens the v91–v100 arc (practical systems + self-hosting completeness). The
+self-hosted LLVM-IR compiler (`examples/selfhost/structgen.kd`) was *branch-free*
+(every `if` → `select`, every binding immutable, one basic block). v91 rewrites
+it to be **block-terminator-aware** — the architectural unlock every later
+self-hosting increment (Vec, real lexers, the compiler's own phase loops) depends
+on.
+
+### Added (in the self-hosted emitter)
+- **Mutable locals**: `let mut x = e` lowers to `alloca` / `store`; a use `load`s;
+  `x = e` stores. Immutable `let` keeps the original SSA-value path verbatim, so
+  the v84–v86 gates stay **byte-identical**.
+- **`while` loops** as a real CFG: `loop.header` / `loop.body` / `loop.exit` basic
+  blocks with `br i1`, a "current-block-terminated" cursor enforcing exactly one
+  terminator per block.
+- **`for i in lo .. hi { … }`** — desugared in the self-hosted parser to the
+  `let mut` + `while` form. New lexer tokens `..` and `<=`.
+- **`break` / `continue`** → `br` to a loop-target stack (nested loops supported).
+- Self-hosted type-checking: a `let mut`'s type is fixed; assignments must match;
+  `break`/`continue` outside a loop is rejected.
+
+### Notes
+- Gate: `smoke_test_selfhost_loops.sh` — differential self == host on while-sum
+  (55), while/for factorial (120), break-early, continue-skip, an iterative-fib
+  mutable accumulator, nested loops, and a break-outside-loop negative;
+  phase115–118 + refs + calls stay byte-identical. Correctness-first: `alloca` +
+  `-O2` mem2reg reclaims the SSA (no hand-emitted `phi`).
+
+### Deferred (honest)
+- Labeled break, hand-emitted minimal `phi` networks, `match`-as-decision-tree
+  CFG (the `select`-chain stays). Self-hosted `Vec` → v92 (needs this foundation).
+
 ## [0.90.0] — Closing pass: read-only slices in the C backend + vectorization lock
 
 The final version of the v81–v90 arc. A grounded survey corrected two premises:
