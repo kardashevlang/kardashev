@@ -18,6 +18,29 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.75.0] — C backend: tuple types
+
+### Added
+- The `--emit-c` C-source backend now supports **tuples**: `(a, b)` literals,
+  `.N` field access, and tuples as fn **parameters**, **return types**, and
+  **locals** (including **nested** tuples like `((i64, i64), i64)` and tuples
+  behind a **reference** `&(i64, i64)`). A tuple `(T0, T1, …)` lowers to an
+  anonymous C struct `struct kdtup_<elems> { T0 _0; T1 _1; … };`; distinct
+  shapes are deduped and emitted in dependency order (nested before outer).
+- Differentially gated: every test program's LLVM-AOT exit code equals the
+  emitted-C exit code (`smoke_test_c_tuples.sh`, 6 positive + 4 refusal cases).
+
+### Notes
+- Tuple **elements** are restricted to scalars (`i64`/`bool`) and nested tuples
+  of those. Tuples in **struct fields / enum payloads / top-level consts**,
+  **tuple-destructuring `let`**, and tuples with **non-scalar elements**
+  (String/Vec/struct) are **refused with a clear error** — never miscompiled.
+
+### Deferred (honest)
+- Tuples in struct fields / enum payloads / consts (an emission-ordering item);
+  tuple destructuring in the C backend; tuples with heap-owning elements (need
+  Drop-aware lowering).
+
 ## [0.74.0] — Single-level dyn trait upcasting
 
 ### Added

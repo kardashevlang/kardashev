@@ -833,6 +833,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v75: C-backend tuple types (literals, .N access, params/returns/locals).
+sh_test(
+    name = "smoke_test_c_tuples",
+    srcs = ["smoke_test_c_tuples.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
