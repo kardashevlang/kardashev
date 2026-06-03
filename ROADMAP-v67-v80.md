@@ -363,6 +363,18 @@ API with in-place mutation deferred.
 
 ## v78 — lazy iterator adaptors: map / filter / fold / peekable
 
+**STATUS: ✅ SHIPPED (v0.78.0).** Extends the v61 lazy tower with `Map<I>`
+(`iter_map`), `Filter<I>` (`iter_filter`), the eager-drain `iter_fold`
+(effect-polymorphic accumulator), and `Peekable<I>` (`iter_peekable` + `peek()`).
+map/filter store the mapper/predicate as a struct fn-field (closures included);
+Peekable keeps its lookahead in scalar fields to dodge moving a non-Copy Option
+out of `self`. Chains fuse single-pass. Pure-prelude. Gate:
+`smoke_test_lazy_iter.sh` (6 JIT==AOT incl. map→filter→take fusion + capturing
+closure + peek/next). **Deferred:** element-generic adaptors (v61 resolver
+limit) — i64-specialized like the rest of the tower.
+
+<details><summary>Original plan</summary>
+
 **CORE.** Extend the v61 lazy tower (main.cpp:105-226) with fusing i64-element
 adaptors: `Map<I>` (`iter_map`), `Filter<I>` (`iter_filter`), an eager-drain
 `iter_fold`, and `Peekable<I>` (`iter_peekable` with `peek()`), each a prelude
@@ -374,6 +386,8 @@ source (JIT==AOT).
 
 **DEFERRALS.** Element-generic adaptors stay blocked by the
 `impl<T> Iterator<T> for Adaptor<T>` resolver limitation (v61 follow-on).
+
+</details>
 
 ---
 

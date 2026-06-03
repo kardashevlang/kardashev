@@ -854,6 +854,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v78: lazy iterator adaptors (Map / Filter / iter_fold / Peekable).
+sh_test(
+    name = "smoke_test_lazy_iter",
+    srcs = ["smoke_test_lazy_iter.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

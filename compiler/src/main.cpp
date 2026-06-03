@@ -222,7 +222,74 @@ std::string applyPrelude(const std::string& userSrc) {
             "        } else { None }\n"
             "    }\n"
             "}\n"
-            "fn vec_iter_i64(v: Vec<i64>) -> VecIterI64 { VecIterI64 { v: v, pos: 0 } }\n";
+            "fn vec_iter_i64(v: Vec<i64>) -> VecIterI64 { VecIterI64 { v: v, pos: 0 } }\n"
+            // v78: Map<I> — apply a (pure) `fn(i64)->i64` to each element on
+            // demand. The mapper is stored as a struct fn-field and called via
+            // `(self.f)(v)` (a closure may be stored too — same fat-pointer).
+            "struct Map<I> { iter: I, f: fn(i64) -> i64 }\n"
+            "impl<I: Iterator<i64>> Iterator<i64> for Map<I> {\n"
+            "    fn next(&mut self) -> Option<i64> ! { alloc } {\n"
+            "        let x = self.iter.next();\n"
+            "        match x { Some(v) => Some((self.f)(v)), None => None }\n"
+            "    }\n"
+            "}\n"
+            "fn iter_map<I: Iterator<i64>>(it: I, f: fn(i64) -> i64) -> Map<I>\n"
+            "    { Map { iter: it, f: f } }\n"
+            // v78: Filter<I> — yield only elements for which `pred` is true,
+            // pulling (and discarding) non-matches inside `next` until a match
+            // or the source is exhausted.
+            "struct Filter<I> { iter: I, pred: fn(i64) -> bool }\n"
+            "impl<I: Iterator<i64>> Iterator<i64> for Filter<I> {\n"
+            "    fn next(&mut self) -> Option<i64> ! { alloc } {\n"
+            "        let mut res: Option<i64> = None;\n"
+            "        let mut go = true;\n"
+            "        while go {\n"
+            "            let x = self.iter.next();\n"
+            "            match x {\n"
+            "                Some(v) => { if (self.pred)(v) { res = Some(v); go = false; } else {} },\n"
+            "                None => { go = false; }\n"
+            "            }\n"
+            "        }\n"
+            "        res\n"
+            "    }\n"
+            "}\n"
+            "fn iter_filter<I: Iterator<i64>>(it: I, pred: fn(i64) -> bool) -> Filter<I>\n"
+            "    { Filter { iter: it, pred: pred } }\n"
+            // v78: iter_fold — the eager (terminal) reduction. Walks `next()` to
+            // exhaustion, threading an accumulator of any type `A`. The folding
+            // fn is effect-polymorphic (`! { e }` propagated to the result).
+            "fn iter_fold<A, I: Iterator<i64>, e>(it: &mut I, init: A, f: fn(A, i64) -> A ! { e }) -> A ! { alloc, e } {\n"
+            "    let mut acc = init;\n"
+            "    let mut go = true;\n"
+            "    while go { match it.next() { Some(x) => { acc = f(acc, x); }, None => { go = false; } } }\n"
+            "    acc\n"
+            "}\n"
+            // v78: Peekable<I> — one element of lookahead. `peek()` returns the
+            // next element without consuming it; `next()` returns the cached
+            // element if present, else pulls fresh. The lookahead is stored as
+            // SCALAR fields (`peeked` / `has_val` / `pval`) rather than an
+            // `Option<i64>` field, to avoid moving a non-Copy enum out of `self`.
+            "struct Peekable<I> { iter: I, peeked: bool, has_val: bool, pval: i64 }\n"
+            "impl<I: Iterator<i64>> Peekable<I> {\n"
+            "    fn peek(&mut self) -> Option<i64> ! { alloc } {\n"
+            "        if self.peeked { } else {\n"
+            "            let v = self.iter.next();\n"
+            "            match v { Some(x) => { self.has_val = true; self.pval = x; }, None => { self.has_val = false; } }\n"
+            "            self.peeked = true;\n"
+            "        }\n"
+            "        if self.has_val { Some(self.pval) } else { None }\n"
+            "    }\n"
+            "}\n"
+            "impl<I: Iterator<i64>> Iterator<i64> for Peekable<I> {\n"
+            "    fn next(&mut self) -> Option<i64> ! { alloc } {\n"
+            "        if self.peeked {\n"
+            "            self.peeked = false;\n"
+            "            if self.has_val { self.has_val = false; Some(self.pval) } else { None }\n"
+            "        } else { self.iter.next() }\n"
+            "    }\n"
+            "}\n"
+            "fn iter_peekable<I: Iterator<i64>>(it: I) -> Peekable<I>\n"
+            "    { Peekable { iter: it, peeked: false, has_val: false, pval: 0 } }\n";
     }
     // Phase 28: the `Hash` and `Eq` traits with built-in impls for i64 and
     // String, so user code can call `k.hash()` / `a.eq(&b)` and bound a
