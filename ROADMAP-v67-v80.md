@@ -328,6 +328,19 @@ patterns.
 
 ## v77 — stdlib container ops (HashMap/HashSet/Vec)
 
+**STATUS: ✅ SHIPPED (v0.77.0).** A survey found Vec already had `contains` /
+`index_of` / `min` / `max` / `map` / `filter` / `fold` etc. and HashMap had
+`contains` / `values` / `entries`, so v77 added the genuinely-missing
+convenience ops (all **pure-prelude**, no codegen): Vec `is_empty` / `first` /
+`last` / `clear` / `truncate` / `extend`; HashMap `is_empty` / `get_or` /
+`clear`; HashSet `is_empty` / `clear`. Mutating ops hoist the length into a local
+counter / iterate a key/item snapshot to dodge the `&mut`-reborrow-in-`while`
+borrow limit. Gate: `smoke_test_container_ops.sh` (5 JIT==AOT groups).
+**Deferred:** `vec_dedup` (in-place remove-while-iterate hits the same borrow
+limit), `vec_binary_search` / `vec_sort` (need an intrinsic), HashSet algebra.
+
+<details><summary>Original plan</summary>
+
 > `hashmap_values` already exists (dropped from scope).
 
 **CORE.** Fill container-API gaps, **all prelude Kardashev** (no codegen): HashMap
@@ -343,6 +356,8 @@ present / reports absent (JIT==AOT).
 
 **DEFERRALS.** Exact `capacity` values are implementation-defined; a real Entry
 API with in-place mutation deferred.
+
+</details>
 
 ---
 

@@ -1129,6 +1129,35 @@ std::string applyPrelude(const std::string& userSrc) {
             "    }\n"
             "}\n";
     }
+    // v77: common Vec convenience ops, all pure-prelude over the existing Vec
+    // intrinsics. The mutating ones (clear/truncate) read the length into a
+    // LOCAL counter rather than re-reading the `&mut` param in the `while`
+    // condition — re-reading a `&mut` place while mutating it in the body trips
+    // the borrow checker (E0499). `extend` loops over the OTHER (`&`) vec.
+    if (userSrc.find("fn vec_is_empty") == std::string::npos) {
+        prelude +=
+            "fn vec_is_empty<T>(v: &Vec<T>) -> bool { vec_len(v) == 0 }\n"
+            "fn vec_first<T: Clone>(v: &Vec<T>) -> Option<T> ! { alloc } {\n"
+            "    if vec_len(v) == 0 { None } else { Some(vec_get_ref(v, 0).clone()) }\n"
+            "}\n"
+            "fn vec_last<T: Clone>(v: &Vec<T>) -> Option<T> ! { alloc } {\n"
+            "    let n = vec_len(v);\n"
+            "    if n == 0 { None } else { Some(vec_get_ref(v, n - 1).clone()) }\n"
+            "}\n"
+            "fn vec_clear<T>(v: &mut Vec<T>) ! { alloc } {\n"
+            "    let mut n = vec_len(v);\n"
+            "    while n > 0 { vec_pop(v); n = n - 1; }\n"
+            "}\n"
+            "fn vec_truncate<T>(v: &mut Vec<T>, len: i64) ! { alloc } {\n"
+            "    let mut n = vec_len(v);\n"
+            "    while n > len { vec_pop(v); n = n - 1; }\n"
+            "}\n"
+            "fn vec_extend<T: Clone>(v: &mut Vec<T>, other: &Vec<T>) ! { alloc } {\n"
+            "    let m = vec_len(other);\n"
+            "    let mut i = 0;\n"
+            "    while i < m { vec_push(v, vec_get_ref(other, i).clone()); i = i + 1; }\n"
+            "}\n";
+    }
     // v35 Phase 187: VecDeque<T> — a double-ended queue, O(1) AMORTIZED at both
     // ends, written in kardashev over two `Vec` stacks (`f` = front, `b` =
     // back). The deque order front->back is `f` read top->bottom followed by
@@ -1297,6 +1326,41 @@ std::string applyPrelude(const std::string& userSrc) {
             "        i = i + 1;\n"
             "    }\n"
             "    out\n"
+            "}\n";
+    }
+    // v77: HashMap / HashSet convenience ops (pure-prelude). `is_empty` is a
+    // length read; `get_or` returns a default when the key is absent; `clear`
+    // removes every entry by iterating a SEPARATE snapshot of the keys/items
+    // (so the `while` condition never re-reads the `&mut` map being mutated).
+    if (userSrc.find("fn hashmap_is_empty") == std::string::npos) {
+        prelude +=
+            "fn hashmap_is_empty<K: Hash + Eq + Clone, V>"
+            "(m: &HashMap<K, V>) -> bool ! { alloc } { hashmap_len(m) == 0 }\n"
+            "fn hashmap_get_or<K: Hash + Eq + Clone, V: Clone>"
+            "(m: &HashMap<K, V>, k: K, default: V) -> V ! { alloc } {\n"
+            "    match hashmap_get_ref(m, k) {\n"
+            "        Some(vref) => vref.clone(),\n"
+            "        None => default,\n"
+            "    }\n"
+            "}\n"
+            "fn hashmap_clear<K: Hash + Eq + Clone, V>"
+            "(m: &mut HashMap<K, V>) ! { alloc } {\n"
+            "    let ks = hashmap_keys(m);\n"
+            "    let n = vec_len(&ks);\n"
+            "    let mut i = 0;\n"
+            "    while i < n { hashmap_remove(m, vec_get_ref(&ks, i).clone()); i = i + 1; }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn hashset_is_empty") == std::string::npos) {
+        prelude +=
+            "fn hashset_is_empty<T: Hash + Eq + Clone>"
+            "(s: &HashSet<T>) -> bool ! { alloc } { hashset_len(s) == 0 }\n"
+            "fn hashset_clear<T: Hash + Eq + Clone>"
+            "(s: &mut HashSet<T>) ! { alloc } {\n"
+            "    let items = hashset_items(s);\n"
+            "    let n = vec_len(&items);\n"
+            "    let mut i = 0;\n"
+            "    while i < n { hashset_remove(s, vec_get_ref(&items, i).clone()); i = i + 1; }\n"
             "}\n";
     }
     // v12 Phase 72: string methods, written in kardashev over str_char_at /
