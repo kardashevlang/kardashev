@@ -1183,6 +1183,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v89: stack arrays [T; N] — C-backend parity (struct kdarr_<elem>_<N> wrapper,
+# bounds-checked index read/store, by-value param/return) + a triple-differential
+# gate (JIT == AOT == C backend) pinning the already-working LLVM array surface.
+sh_test(
+    name = "smoke_test_stack_array",
+    srcs = ["smoke_test_stack_array.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 25: compile-time constants + const evaluation — `const` items folded to
 # literals (verified in the IR), `const fn` evaluated in const contexts, a const
 # referencing another const, const-generic array lengths (`[i64; N]` /

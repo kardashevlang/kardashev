@@ -18,6 +18,31 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.89.0] — Stack arrays `[T; N]`: C-backend parity + differential gate
+
+A ground-truth survey confirmed fixed-size arrays `[T; N]` are **already fully
+runtime-first-class in the LLVM backend** (alloca-backed, const-generic `N`,
+bounds-checked indexing + OOB panic, by-value params/returns, in-place `a[i] = x`,
+array-of-struct, per-element Drop — all JIT==AOT). So v89 closes the one genuine
+gap and locks the surface with the first end-to-end differential gate.
+
+### Added
+- **C-backend array support** (`--emit-c`, previously refused all arrays): `[T; N]`
+  lowers to a first-class wrapper `struct kdarr_<elem>_<N> { <elem> data[N]; }`
+  (the v75 tuple pattern), with array literals (`[a, b, c]` / `[v; N]`),
+  **bounds-checked** `a[i]` reads and `a[i] = x` stores (panic + `exit 101` with
+  the same message as LLVM), and by-value param/return/copy.
+- **`smoke_test_stack_array.sh`** — a triple-differential gate (JIT == AOT ==
+  C backend): histogram, in-place bubble sort, array-of-struct, by-value
+  param+return, value-copy independence, OOB-panic parity, and the non-Copy
+  refusal.
+
+### Deferred (honest, no stubs)
+- Non-Copy array **elements** in the C backend (`[String; N]` / `[Vec<_>; N]`)
+  need C-backend per-element Drop glue — cleanly **refused** (LLVM keeps full
+  non-Copy arrays). Symbolic / side-effecting `[v; N]` repeat counts and nested
+  array-of-tuple in the C backend → v90 / follow-on.
+
 ## [0.88.0] — `#[repr(C)]` struct layout + struct FFI by pointer
 
 Builds on v87's sized-int FFI widths. A grounded survey proved that full struct

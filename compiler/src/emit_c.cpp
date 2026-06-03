@@ -56,6 +56,15 @@ struct CEmitter {
     // is registered before the outer one) so the typedefs emit in a valid order.
     std::set<std::string> tupleNames_;
     std::vector<std::pair<std::string, std::vector<std::string>>> tupleDefs_;
+    // v89: a fixed-size array `[T; N]` -> `struct kdarr_<elem>_<N> { <elem> data[N]; }`
+    // (the same first-class-value wrapper pattern as tuples). arrayDefs_ are in
+    // registration (dependency) order; the maps recover N / the element ctype at
+    // an index site. sawArray_ pulls in <stdio.h>/<stdlib.h> for the OOB panic.
+    std::set<std::string> arrayNames_;
+    std::vector<std::string> arrayDefs_;                       // full "struct kdarr_… { … };" lines
+    std::unordered_map<std::string, std::size_t> arrayLenByCType_;   // "struct kdarr_…" -> N
+    std::unordered_map<std::string, std::string> arrayElemByCType_;  // "struct kdarr_…" -> element ctype
+    bool sawArray_ = false;
     // v75: tuple typedefs are emitted just before the fn prototypes/bodies, so a
     // tuple may appear in a fn param/return/local but NOT in a struct field /
     // enum payload / top-level const (those are emitted earlier — refused
@@ -204,6 +213,59 @@ struct CEmitter {
         return registerTuple(elems);
     }
 
+    // v89: register an array shape `[elem; n]` as `struct kdarr_<elem>_<n>`,
+    // deduped, dependency-ordered. Returns its C type name "struct kdarr_…".
+    std::string registerArray(const std::string& elem, std::size_t n) {
+        std::string name = "kdarr_";
+        for (char ch : elem) {
+            bool alnum = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                         (ch >= '0' && ch <= '9');
+            name += alnum ? ch : '_';
+        }
+        name += "_" + std::to_string(n);
+        std::string cty = "struct " + name;
+        if (!arrayNames_.count(name)) {
+            arrayNames_.insert(name);
+            arrayDefs_.push_back(cty + " { " + elem + " data[" +
+                                 std::to_string(n) + "]; };");
+            arrayLenByCType_[cty] = n;
+            arrayElemByCType_[cty] = elem;
+        }
+        sawArray_ = true;
+        return cty;
+    }
+
+    // v89: the C type of `[T; N]` — wrapped in a struct so it stays a first-class
+    // C value (assignable, returnable, passable by value), exactly like a tuple.
+    // Element must be scalar / a user struct / a nested array (NOT String / Vec /
+    // fn-value — a non-Copy element would need C-backend array-element Drop glue,
+    // refused cleanly here and kept LLVM-only).
+    std::string arrayCType(const TypeRef& t) {
+        if (t.typeArgs.empty()) {
+            err("an array type with no element is outside the C-backend subset");
+            return "";
+        }
+        std::string elem = ctype(t.typeArgs[0]);
+        if (elem.empty()) return "";
+        if (elem == "struct kdstr" || elem == "struct kdvec" ||
+            elem.rfind("struct kdfn", 0) == 0) {
+            err("a C-backend array element of type `" + elem +
+                "` is outside the subset (scalar / user struct / nested array "
+                "only — String/Vec/fn-value array elements stay LLVM-only)");
+            return "";
+        }
+        return registerArray(elem, t.arrayLen);
+    }
+
+    // v89: the C bounds-check guard for an array index — panics with the same
+    // message + exit code (101) as the LLVM backend, so JIT/AOT/C-backend agree.
+    std::string kdArrBoundsCheck(const std::string& idxVar, std::size_t n) {
+        return "if ((uint64_t)" + idxVar + " >= " + std::to_string(n) +
+               "ULL) { fprintf(stderr, \"panic: index out of bounds: the len is " +
+               std::to_string(n) + " but the index is %lld\\n\", (long long)" +
+               idxVar + "); exit(101); }";
+    }
+
     std::string ctype(const TypeRef& t) {
         // v29 Phase 159: a reference `&T` / `&mut T` -> a C pointer `<T>*`.
         // (`&` and `&mut` both map to a non-const pointer — const-correctness
@@ -243,6 +305,7 @@ struct CEmitter {
         }
         // v75: a tuple `(T0, T1, …)` -> an anonymous C struct `struct kdtup_…`.
         if (t.isTuple && !t.isSlice && !t.isArray) return tupleCType(t);
+        if (t.isArray && !t.isSlice) return arrayCType(t); // v89: [T; N]
         if (t.isSlice || t.isArray || t.isDyn || !t.assocName.empty()) {
             err("type `" + (t.name.empty() ? std::string("<complex>") : t.name) +
                 "` (slice/array/dyn/assoc) is outside the "
@@ -354,6 +417,29 @@ struct CEmitter {
                     if (td.first == nm && tf->index < td.second.size())
                         return td.second[tf->index];
             }
+            return "int64_t";
+        }
+        // v89: an array literal `[a, b, c]` / `[v; N]` -> its `struct kdarr_…`.
+        if (auto* al = dynamic_cast<const ArrayLitExpr*>(&e)) {
+            std::string elem = al->elements.empty()
+                                   ? std::string("int64_t")
+                                   : ctypeOfExpr(*al->elements[0]);
+            std::size_t n;
+            if (al->repeatCount) {
+                auto* lit = dynamic_cast<const IntLitExpr*>(al->repeatCount.get());
+                if (!lit) return "int64_t"; // symbolic repeat count: out of subset (expr() reports)
+                n = static_cast<std::size_t>(lit->value);
+            } else {
+                n = al->elements.size();
+            }
+            return registerArray(elem, n);
+        }
+        // v89: `a[i]` -> the element type of the array's shape.
+        if (auto* ix = dynamic_cast<const IndexExpr*>(&e)) {
+            std::string objTy = ctypeOfExpr(*ix->object);
+            while (!objTy.empty() && objTy.back() == '*') objTy.pop_back();
+            auto it = arrayElemByCType_.find(objTy);
+            if (it != arrayElemByCType_.end()) return it->second;
             return "int64_t";
         }
         if (auto* id = dynamic_cast<const IdentExpr*>(&e)) {
@@ -536,6 +622,58 @@ struct CEmitter {
             if (!objTy.empty() && objTy.back() == '*')
                 return "((*(" + base + "))._" + idx + ")";
             return "((" + base + ")._" + idx + ")";
+        }
+        // v89: an array literal `[a, b, c]` / `[v; N]` -> a C compound literal
+        // into the kdarr wrapper struct (`.data = { … }`).
+        if (auto* al = dynamic_cast<const ArrayLitExpr*>(&e)) {
+            std::string cty = ctypeOfExpr(*al);
+            if (cty.rfind("struct kdarr_", 0) != 0) {
+                err("an array literal with a non-subset element or a symbolic "
+                    "`[v; N]` repeat count is outside the C-backend subset");
+                return "0";
+            }
+            if (al->repeatCount) {
+                auto* lit = dynamic_cast<const IntLitExpr*>(al->repeatCount.get());
+                std::size_t n = static_cast<std::size_t>(lit->value);
+                // The repeat value is emitted N times, so it must be side-effect
+                // free — a literal or a variable. Refuse anything else cleanly.
+                const Expr& v = *al->elements[0];
+                if (!dynamic_cast<const IntLitExpr*>(&v) &&
+                    !dynamic_cast<const BoolLitExpr*>(&v) &&
+                    !dynamic_cast<const IdentExpr*>(&v)) {
+                    err("a `[value; N]` array with a non-trivial repeated value "
+                        "is outside the C-backend subset (use a literal or a "
+                        "variable so it isn't evaluated N times)");
+                    return "0";
+                }
+                std::string ve = expr(v);
+                std::string s = "((" + cty + "){ .data = { ";
+                for (std::size_t i = 0; i < n; ++i) { if (i) s += ", "; s += ve; }
+                return s + " } })";
+            }
+            std::string s = "((" + cty + "){ .data = { ";
+            for (std::size_t i = 0; i < al->elements.size(); ++i) {
+                if (i) s += ", ";
+                s += expr(*al->elements[i]);
+            }
+            return s + " } })";
+        }
+        // v89: `a[i]` array READ — bounds-checked (panic + exit 101 on OOB, to
+        // match the LLVM backend) via a GNU statement-expression.
+        if (auto* ix = dynamic_cast<const IndexExpr*>(&e)) {
+            std::string objTy = ctypeOfExpr(*ix->object);
+            bool isPtr = !objTy.empty() && objTy.back() == '*';
+            while (!objTy.empty() && objTy.back() == '*') objTy.pop_back();
+            auto it = arrayLenByCType_.find(objTy);
+            if (it == arrayLenByCType_.end()) {
+                err("indexing a non-array value is outside the C-backend subset");
+                return "0";
+            }
+            std::string base = expr(*ix->object);
+            std::string acc = isPtr ? ("(*(" + base + "))") : ("(" + base + ")");
+            return "({ int64_t __ix = (int64_t)(" + expr(*ix->index) + "); " +
+                   kdArrBoundsCheck("__ix", it->second) + " " + acc +
+                   ".data[__ix]; })";
         }
         // v29 Phase 159: `&x` / `&mut x` -> a C address-of. For `&<temporary>`
         // (a struct/enum literal) this is `&(compound literal)`, a pointer to a
@@ -1133,10 +1271,27 @@ struct CEmitter {
             return expr(*es->expr) + ";";
         if (auto* as = dynamic_cast<const AssignStmt*>(&s)) {
             // v29 Phase 157: assignment to a variable OR a field place
-            // (`p.x = …`). Index/deref places stay outside the subset.
+            // (`p.x = …`).
             if (dynamic_cast<const IdentExpr*>(as->target.get()) ||
                 dynamic_cast<const FieldExpr*>(as->target.get()))
                 return expr(*as->target) + " = " + expr(*as->value) + ";";
+            // v89: `a[i] = x` array element store — bounds-checked, as a place.
+            if (auto* ix = dynamic_cast<const IndexExpr*>(as->target.get())) {
+                std::string objTy = ctypeOfExpr(*ix->object);
+                bool isPtr = !objTy.empty() && objTy.back() == '*';
+                while (!objTy.empty() && objTy.back() == '*') objTy.pop_back();
+                auto it = arrayLenByCType_.find(objTy);
+                if (it == arrayLenByCType_.end()) {
+                    err("assignment to a non-array index place is outside the "
+                        "C-backend subset");
+                    return ";";
+                }
+                std::string base = expr(*ix->object);
+                std::string acc = isPtr ? ("(*(" + base + "))") : ("(" + base + ")");
+                return "{ int64_t __ix = (int64_t)(" + expr(*ix->index) + "); " +
+                       kdArrBoundsCheck("__ix", it->second) + " " + acc +
+                       ".data[__ix] = (" + expr(*as->value) + "); }";
+            }
             err("assignment to a non-variable/field place is outside the "
                 "C-backend subset");
             return ";";
@@ -1605,6 +1760,16 @@ struct CEmitter {
             out << " };\n";
         }
         if (!tupleDefs_.empty()) out << "\n";
+
+        // v89: array wrapper typedefs `struct kdarr_<elem>_<N> { <elem> data[N]; }`
+        // (dependency-ordered; element types — scalars/structs — are already
+        // defined above). The bounds-check panic needs fprintf/exit; pull them in
+        // before the fn bodies (system headers are guarded, so a double-include
+        // with the String runtime is harmless). #include mid-file is legal C and
+        // already done by the String/Vec runtimes.
+        if (sawArray_) out << "#include <stdio.h>\n#include <stdlib.h>\n";
+        for (const auto& d : arrayDefs_) out << d << "\n";
+        if (!arrayDefs_.empty()) out << "\n";
 
         // v30 Phase 165: the kdfn<N> fat-pointer typedefs (before any use). Each
         // is `struct kdfnN { int64_t (*fn)(void*, N x int64_t); void* env; }`.

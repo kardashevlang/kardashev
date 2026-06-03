@@ -26,3 +26,7 @@ Makefile.local
 
 # mdBook output (docs site is built in CI; see .github/workflows/docs.yml)
 /book/
+
+# build artifacts (local Makefile.local copies)
+compiler/kard-lsp
+compiler/kardfmt
