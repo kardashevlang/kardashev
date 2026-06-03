@@ -89,8 +89,9 @@ fn main() -> i64 ! { io } { print(abs(0 - 5) as i64); 0 }
 '
 
 # 5. NEGATIVE: a struct passed BY VALUE across extern "C" is still rejected
-#    (documents the deferred struct-by-value ABI work).
-expect_err extern_struct_byvalue 'not supported' '
+#    (documents the deferred struct-by-value ABI work). v88 sharpened the message
+#    to "...BY VALUE...; pass it by pointer as `&P`" (the actionable form).
+expect_err extern_struct_byvalue 'by pointer' '
 struct P { x: i64, y: i64 }
 extern "C" fn takes(p: P) -> i64 ! { };
 fn main() -> i64 ! { io } { print(takes(P { x: 1, y: 2 })); 0 }
