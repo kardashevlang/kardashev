@@ -18,6 +18,48 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.86.0] — Self-hosting: user function calls + read-only strings
+
+Continues the self-hosting completeness arc. The self-hosted LLVM-IR compiler
+(`examples/selfhost/structgen.kd`) gains multi-function programs and string
+literals — and delivers the strings that v0.85.0 resequenced here.
+
+### Added
+- **User function calls.** A multi-fn registry: every top-level `fn` is parsed,
+  type-checked against the registry, and emitted. A new `Call(name, args)` AST
+  node lowers to `call <rty> @name(...)` using the *callee's* parameter types.
+  `find_entry` keeps the fn named `f` as the differential-gate entry so the host
+  wrapper (`fn main() { f(a, b) }`) still compiles.
+- **Read-only strings.** A `"..."` lexer token (kind 24) → `StrLit(start, len)`.
+  Each literal emits one private `@.str.<offset>` constant into a new module
+  **preamble** buffer (globals precede the function defines), and lowers to the
+  host's borrowed-String aggregate `{ ptr, i64, cap=0 }`. The `str_len(&s)`
+  builtin lowers to `getelementptr` field 1 + `load`.
+- A multi-function **capstone** differential program (calls + strings + struct +
+  ref).
+
+### Fixed
+- A latent `is_alpha` bug in the self-hosted lexer: the `_` (95) case was dead
+  code (95 fell into the `A`–`Z` branch and returned 0), so identifiers with
+  underscores never lexed. No prior test used underscores, so it never surfaced
+  until `str_len`.
+
+### Notes
+- All-i64 structs stay **byte-identical** (a callless/stringless program emits an
+  empty preamble, so output still begins `define`), so phase117/118 + v85-refs
+  hold.
+- Gate: `smoke_test_selfhost_calls.sh` — byte-identity guard, capstone IR-shape +
+  exit, seven differential cases (capstone ×2, one-arg, three-arg, nested calls,
+  `str_len` hello/empty), and two negatives (unknown callee, arity mismatch);
+  each self-hosted exit == host exit.
+
+### Deferred (honest, no stubs)
+- `while`/`for`-loop CFG + mutable locals + assignment, and scalar `Vec<i64>` +
+  growable strings, move into the **XL real-bootstrap mega-arc** — they require a
+  block-terminator/CFG rework plus an alloca-backed mutable-local model, an
+  architectural change to the branch-free emitter, and self-contained runtime
+  emission. v87–v90 remain the committed **Arc C — practical systems gaps**.
+
 ## [0.85.0] — Self-hosting: by-reference values (`&T`)
 
 Continues the self-hosting completeness arc. The self-hosted LLVM-IR compiler
