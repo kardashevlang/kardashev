@@ -1164,6 +1164,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v87: sized integers (i8–u64, f32) across all surfaces — the FFI all-width
+# boundary + an end-to-end runtime gate pinning the v11 sized-int semantics
+# (signed/unsigned div/shift/compare, wrap, casts, struct field @-O2), JIT==AOT.
+sh_test(
+    name = "smoke_test_sized_runtime",
+    srcs = ["smoke_test_sized_runtime.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 25: compile-time constants + const evaluation — `const` items folded to
 # literals (verified in the IR), `const fn` evaluated in const contexts, a const
 # referencing another const, const-generic array lengths (`[i64; N]` /

@@ -9487,7 +9487,13 @@ private:
         if (isExternI32(tr)) return llvm::Type::getInt32Ty(*ctx_);
         TypePtr r = resolve(astTypeRefToConcrete(tr));
         switch (r->kind) {
-            case TypeKind::Int:  return llvm::Type::getInt64Ty(*ctx_);
+            case TypeKind::Int:
+                // v87: a sized int maps to its REAL C width (u8 -> i8 = C
+                // `unsigned char`, u32 -> i32 = C `unsigned int`, …), not a
+                // collapsed i64. Signedness is a source-level property (LLVM has
+                // no unsigned types), carried by the kardashev type, not the ABI
+                // type. This is the v88 repr(C)-by-value prerequisite.
+                return llvm::Type::getIntNTy(*ctx_, r->intWidth);
             case TypeKind::Float: // Phase 67: f32 -> float, f64 -> double
                 return r->floatWidth == 32 ? llvm::Type::getFloatTy(*ctx_)
                                            : llvm::Type::getDoubleTy(*ctx_);
