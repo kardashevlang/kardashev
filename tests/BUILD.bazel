@@ -777,6 +777,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v67: codebase-optimization regression gate (makeRuntimeFn adoption + behavior).
+sh_test(
+    name = "smoke_test_loc_audit",
+    srcs = ["smoke_test_loc_audit.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
