@@ -1941,6 +1941,18 @@ sh_test(
     ],
 )
 
+# v86: the self-hosted compiler handles USER FUNCTION CALLS (multi-fn registry +
+# `call @name`) and READ-ONLY STRINGS (`@.str` module-preamble globals + str_len).
+# Differential-gated vs the host; byte-identity preserved for the all-i64 path.
+sh_test(
+    name = "smoke_test_selfhost_calls",
+    srcs = ["smoke_test_selfhost_calls.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:structgen.kd",
+    ],
+)
+
 # v20 Phase 118: the self-hosted compiler handles ENUMS + match — tagged-pair
 # aggregates + a branch-free match select-chain, differential-gated vs the host.
 sh_test(
