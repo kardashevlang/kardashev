@@ -812,6 +812,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v72: f64 transcendental math library (trig / exp / log / pow / hypot / ...).
+sh_test(
+    name = "smoke_test_f64_math",
+    srcs = ["smoke_test_f64_math.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

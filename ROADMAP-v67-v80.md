@@ -167,6 +167,16 @@ dynamic widths deferred.
 
 ## v72 — f64 transcendental math library
 
+**STATUS: ✅ SHIPPED (v0.72.0).** The f64 math set grows from 4 to 25 functions:
+trig (`sin/cos/tan/asin/acos/atan/atan2`), exp/log (`exp/exp2/ln/log2/log10`),
+`pow/cbrt/hypot`, and `copysign/fmod/min/max/trunc/round`. LLVM float
+intrinsics where portable (sin/cos/exp/log family, pow/copysign/min/max/trunc/
+round); libm externs for the rest (tan/asin/acos/atan/cbrt/atan2/hypot/fmod).
+Both resolve in the JIT (process symbol table) and AOT (`-lm`) — verified
+end-to-end. Gate: `smoke_test_f64_math.sh` (JIT==AOT, `as i64`-truncation for
+cross-libm stability). C backend refuses f64 (subset). **Deferred:** `sinh/cosh/
+tanh`, arbitrary precision, rounding-mode control, f16/bf16, `powi`.
+
 > Narrowed: `f32` runtime + sqrt/floor/ceil/abs already exist — verified.
 
 **CORE.** Extend f64 math to `sin/cos/tan/atan2/asin/acos/atan`,

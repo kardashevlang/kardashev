@@ -1957,6 +1957,75 @@ private:
         emitF64Math("f64_ceil", llvm::Intrinsic::ceil);
         emitF64Math("f64_abs", llvm::Intrinsic::fabs);
 
+        // --- v72: transcendental f64 math library ---
+        // More unary LLVM float intrinsics (exp/log/trig with intrinsics, plus
+        // trunc/round). These lower to libm calls (or hardware ops for
+        // trunc/round on SSE4.1) that resolve in both the JIT and the AOT link.
+        emitF64Math("f64_sin", llvm::Intrinsic::sin);
+        emitF64Math("f64_cos", llvm::Intrinsic::cos);
+        emitF64Math("f64_exp", llvm::Intrinsic::exp);
+        emitF64Math("f64_exp2", llvm::Intrinsic::exp2);
+        emitF64Math("f64_ln", llvm::Intrinsic::log);
+        emitF64Math("f64_log2", llvm::Intrinsic::log2);
+        emitF64Math("f64_log10", llvm::Intrinsic::log10);
+        emitF64Math("f64_trunc", llvm::Intrinsic::trunc);
+        emitF64Math("f64_round", llvm::Intrinsic::round);
+
+        // Unary libm externs (no portable LLVM intrinsic): the kardashev
+        // builtin's body just forwards to the C symbol, resolved by the
+        // process (JIT) / `-lm` (AOT).
+        auto emitF64Libm = [&](const char* name, const char* sym) {
+            auto* dblTy = llvm::Type::getDoubleTy(ctx);
+            auto* fnTy = llvm::FunctionType::get(dblTy, {dblTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, name, module_.get());
+            fn->getArg(0)->setName("x");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto callee = module_->getOrInsertFunction(sym, fnTy);
+            b.CreateRet(b.CreateCall(callee, {fn->getArg(0)}));
+            declaredFns_[name] = fn;
+        };
+        emitF64Libm("f64_tan", "tan");
+        emitF64Libm("f64_asin", "asin");
+        emitF64Libm("f64_acos", "acos");
+        emitF64Libm("f64_atan", "atan");
+        emitF64Libm("f64_cbrt", "cbrt");
+
+        // Binary f64 math: intrinsic-backed (pow/copysign/min/max) ...
+        auto emitF64MathBin = [&](const char* name, llvm::Intrinsic::ID id) {
+            auto* dblTy = llvm::Type::getDoubleTy(ctx);
+            auto* fnTy = llvm::FunctionType::get(dblTy, {dblTy, dblTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, name, module_.get());
+            fn->getArg(0)->setName("x");
+            fn->getArg(1)->setName("y");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            b.CreateRet(
+                b.CreateBinaryIntrinsic(id, fn->getArg(0), fn->getArg(1)));
+            declaredFns_[name] = fn;
+        };
+        emitF64MathBin("f64_pow", llvm::Intrinsic::pow);
+        emitF64MathBin("f64_copysign", llvm::Intrinsic::copysign);
+        emitF64MathBin("f64_min", llvm::Intrinsic::minnum);
+        emitF64MathBin("f64_max", llvm::Intrinsic::maxnum);
+
+        // ... and libm-extern-backed (atan2/hypot/fmod).
+        auto emitF64LibmBin = [&](const char* name, const char* sym) {
+            auto* dblTy = llvm::Type::getDoubleTy(ctx);
+            auto* fnTy = llvm::FunctionType::get(dblTy, {dblTy, dblTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, name, module_.get());
+            fn->getArg(0)->setName("x");
+            fn->getArg(1)->setName("y");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto callee = module_->getOrInsertFunction(sym, fnTy);
+            b.CreateRet(b.CreateCall(callee, {fn->getArg(0), fn->getArg(1)}));
+            declaredFns_[name] = fn;
+        };
+        emitF64LibmBin("f64_atan2", "atan2");
+        emitF64LibmBin("f64_hypot", "hypot");
+        emitF64LibmBin("f64_fmod", "fmod");
+
         // --- Phase 27: print_no_nl(s: &String) -> i64 (no trailing newline) ---
         {
             auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);

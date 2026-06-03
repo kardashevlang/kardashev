@@ -18,6 +18,30 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.72.0] — f64 transcendental math library
+
+### Added
+- A full **f64 math library** (the existing `f64_sqrt`/`floor`/`ceil`/`abs`
+  grow to 25 functions), all pure `(f64…) -> f64`:
+  - **trig**: `f64_sin`, `f64_cos`, `f64_tan`, `f64_asin`, `f64_acos`,
+    `f64_atan`, `f64_atan2`
+  - **exp / log**: `f64_exp`, `f64_exp2`, `f64_ln`, `f64_log2`, `f64_log10`
+  - **power / roots**: `f64_pow`, `f64_cbrt`, `f64_hypot`
+  - **misc**: `f64_copysign`, `f64_fmod`, `f64_min`, `f64_max`, `f64_trunc`,
+    `f64_round`
+- Functions with a portable LLVM float intrinsic (sin/cos/exp/log family,
+  pow/copysign/min/max/trunc/round) lower to that intrinsic; the rest
+  (tan/asin/acos/atan/cbrt/atan2/hypot/fmod) forward to the corresponding
+  **libm** symbol. Both resolve in the **JIT** (process symbol table) and the
+  **AOT** link (`-lm`, already present) — verified end-to-end.
+
+### Notes
+- Gate: `smoke_test_f64_math.sh` (5 value groups + 2 reject cases, JIT==AOT),
+  results checked via `as i64` truncation to stay stable across libm
+  implementations (Linux/macOS).
+- The C backend (`--emit-c`) refuses f64 (out of its i64/bool subset), so these
+  are JIT/AOT only — unchanged from prior f64 support.
+
 ## [0.71.0] — Format specs (`{:width}`, alignment, fill, radix)
 
 ### Added
