@@ -1192,6 +1192,18 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v90 (closing pass): read-only slices in the C backend (struct kdslice + bounds-
+# checked slice_len/get/get_ref, &v[a..b]) — JIT == AOT == C backend — plus a
+# vectorization regression lock (IR-grep for vector ops). Needs bench/loop.kd.
+sh_test(
+    name = "smoke_test_v90_close",
+    srcs = ["smoke_test_v90_close.sh"],
+    data = [
+        "//compiler:kardc",
+        "//bench:loop.kd",
+    ],
+)
+
 # Phase 25: compile-time constants + const evaluation — `const` items folded to
 # literals (verified in the IR), `const fn` evaluated in const contexts, a const
 # referencing another const, const-generic array lengths (`[i64; N]` /

@@ -154,12 +154,22 @@ struct CEmitter {
             "vec_pop", "vec_remove", "vec_insert", "vec_reverse", "vec_swap"};
         return b.count(n) > 0;
     }
+    // v90: read-only scalar slices (`&v[a..b]` over a Vec<i64>/<bool>). The C
+    // runtime mirrors LLVM's `{ ptr, len }` slice; mutation through a slice is not
+    // wired in ANY backend, so this is read-only (parity-preserving).
+    bool usesSlice_ = false;
+    bool sawSliceCall_ = false; // set by the pre-scan (slice builtin or SliceExpr)
+    static bool isSliceBuiltin(const std::string& n) {
+        static const std::set<std::string> b = {
+            "slice_len", "slice_get", "slice_get_ref"};
+        return b.count(n) > 0;
+    }
     // v30 Phase 163: the builtins for which the C backend emits a real runtime.
     // Currently the String + scalar-Vec sets; HashMap/HashSet etc. are added as
     // their C runtimes land. A call to anything not here (and not a user fn) is
     // refused (Phase 163 part 1).
     static bool isImplementedBuiltin(const std::string& n) {
-        return isStringBuiltin(n) || isVecBuiltin(n);
+        return isStringBuiltin(n) || isVecBuiltin(n) || isSliceBuiltin(n);
     }
 
     // v29 Phase 157: the C type of a kardashev TypeRef. Scalars -> int64_t, a
@@ -306,6 +316,20 @@ struct CEmitter {
         // v75: a tuple `(T0, T1, …)` -> an anonymous C struct `struct kdtup_…`.
         if (t.isTuple && !t.isSlice && !t.isArray) return tupleCType(t);
         if (t.isArray && !t.isSlice) return arrayCType(t); // v89: [T; N]
+        if (t.isSlice && t.assocName.empty()) { // v90: read-only scalar slice &[T]
+            std::string elem =
+                t.typeArgs.empty() ? std::string("int64_t") : ctype(t.typeArgs[0]);
+            if (elem != "int64_t") {
+                err("a slice `&[" + (t.typeArgs.empty() ? std::string("?")
+                                                        : t.typeArgs[0].name) +
+                    "]` with a non-scalar element is outside the C-backend subset "
+                    "(scalar &[i64] / &[bool] only)");
+                return "";
+            }
+            usesSlice_ = true;
+            std::string s = "struct kdslice";
+            return s;
+        }
         if (t.isSlice || t.isArray || t.isDyn || !t.assocName.empty()) {
             err("type `" + (t.name.empty() ? std::string("<complex>") : t.name) +
                 "` (slice/array/dyn/assoc) is outside the "
@@ -442,6 +466,11 @@ struct CEmitter {
             if (it != arrayElemByCType_.end()) return it->second;
             return "int64_t";
         }
+        // v90: `&v[a..b]` -> a read-only slice value `struct kdslice`.
+        if (dynamic_cast<const SliceExpr*>(&e)) {
+            usesSlice_ = true;
+            return "struct kdslice";
+        }
         if (auto* id = dynamic_cast<const IdentExpr*>(&e)) {
             // v29 Phase 158: a bare unit-variant constructor (`None`) is a value
             // of its enum type.
@@ -509,7 +538,8 @@ struct CEmitter {
             // v30 Phase 163: Vec-returning / Vec-element builtins.
             if (call->callee == "vec_new") { usesVec_ = true; return "struct kdvec"; }
             if (call->callee == "vec_get_ref") return "int64_t*";
-            // vec_get/pop/remove/len/push/insert/reverse/swap -> int64_t
+            if (call->callee == "slice_get_ref") return "int64_t*"; // v90
+            // vec_get/pop/remove/len/push/insert/reverse/swap / slice_get/len -> int64_t
             return "int64_t"; // a scalar builtin call
         }
         if (auto* iff = dynamic_cast<const IfExpr*>(&e))
@@ -674,6 +704,20 @@ struct CEmitter {
             return "({ int64_t __ix = (int64_t)(" + expr(*ix->index) + "); " +
                    kdArrBoundsCheck("__ix", it->second) + " " + acc +
                    ".data[__ix]; })";
+        }
+        // v90: `&v[a..b]` -> a read-only slice `{ ptr = &v.data[start], len = b-a }`.
+        // Bounds are evaluated once (statement-expr) to match LLVM. The Vec must be
+        // scalar-element (kdvec is int64_t-data); a `&Vec` operand auto-derefs.
+        if (auto* se = dynamic_cast<const SliceExpr*>(&e)) {
+            usesSlice_ = true;
+            std::string objTy = ctypeOfExpr(*se->operand);
+            bool isPtr = !objTy.empty() && objTy.back() == '*';
+            std::string base = expr(*se->operand);
+            std::string acc = isPtr ? ("(*(" + base + "))") : ("(" + base + ")");
+            return "({ int64_t __s = (int64_t)(" + expr(*se->start) +
+                   "); int64_t __e = (int64_t)(" + expr(*se->end) +
+                   "); (struct kdslice){ .ptr = &(" + acc +
+                   ".data[__s]), .len = __e - __s }; })";
         }
         // v29 Phase 159: `&x` / `&mut x` -> a C address-of. For `&<temporary>`
         // (a struct/enum literal) this is `&(compound literal)`, a pointer to a
@@ -1423,9 +1467,16 @@ struct CEmitter {
             // always recurse args (for the sawVecCall_ side-effect) before
             // returning the String result.
             if (isVecBuiltin(c->callee)) sawVecCall_ = true;
+            if (isSliceBuiltin(c->callee)) sawSliceCall_ = true; // v90
             bool found = isStringBuiltin(c->callee);
             for (auto& a : c->args) found |= exprUsesString(a.get());
             return found;
+        }
+        if (auto* se = dynamic_cast<const SliceExpr*>(e)) { // v90: `&v[a..b]`
+            sawSliceCall_ = true;
+            return exprUsesString(se->operand.get()) ||
+                   exprUsesString(se->start.get()) ||
+                   exprUsesString(se->end.get());
         }
         if (auto* b = dynamic_cast<const BinaryExpr*>(e))
             return exprUsesString(b->lhs.get()) || exprUsesString(b->rhs.get());
@@ -1503,6 +1554,23 @@ struct CEmitter {
     // (sawVecCall_ separately covers a vec builtin call in a body.)
     bool programUsesVec(const Program& program) {
         auto mentions = [](const TypeRef& t) { return t.name == "Vec"; };
+        for (const auto& c : program.consts)
+            if (mentions(c.type)) return true;
+        for (const auto& s : program.structs)
+            for (const auto& f : s.fields)
+                if (mentions(f.type)) return true;
+        for (const auto& fn : program.functions) {
+            if (mentions(fn.returnType)) return true;
+            for (const auto& p : fn.params)
+                if (mentions(p.type)) return true;
+        }
+        return false;
+    }
+
+    // v90: does any signature / field / const type mention a slice `&[T]`?
+    // (sawSliceCall_ separately covers a slice builtin or a `&v[a..b]` in a body.)
+    bool programUsesSlice(const Program& program) {
+        auto mentions = [](const TypeRef& t) { return t.isSlice; };
         for (const auto& c : program.consts)
             if (mentions(c.type)) return true;
         for (const auto& s : program.structs)
@@ -1632,6 +1700,23 @@ struct CEmitter {
         out << "\n";
     }
 
+    // v90: the read-only scalar-slice runtime — `struct kdslice { ptr, len }`
+    // mirrors the LLVM `{ i8*, i64 }` slice. Passed by value (a small fat ptr);
+    // get/get_ref are bounds-checked exactly like kd_vec_get/_ref (return 0 on
+    // OOB, matching the LLVM slice builtins' unchecked-but-clamped behavior).
+    void emitSliceRuntime() {
+        out << "struct kdslice { int64_t* ptr; int64_t len; };\n";
+        out <<
+"static int64_t kd_slice_len(struct kdslice s) { return s.len; }\n"
+"static int64_t kd_slice_get(struct kdslice s, int64_t i) {\n"
+"  if (i < 0 || i >= s.len || !s.ptr) return 0; return s.ptr[i];\n"
+"}\n"
+"static int64_t* kd_slice_get_ref(struct kdslice s, int64_t i) {\n"
+"  if (i < 0 || i >= s.len || !s.ptr) return 0; return &s.ptr[i];\n"
+"}\n";
+        out << "\n";
+    }
+
     void emitProgram(const Program& program) {
         // v29 Phase 157/158: structs + enums are in the subset; traits/impls/
         // extern/mod remain refused (later phases).
@@ -1671,6 +1756,8 @@ struct CEmitter {
         // (sawVecCall_, set during the pre-scan above) or a Vec<T> in a
         // signature / field / const type.
         if (sawVecCall_ || programUsesVec(program)) emitVecRuntime();
+        // v90: the read-only slice runtime (struct kdslice + kd_slice_*).
+        if (sawSliceCall_ || programUsesSlice(program)) emitSliceRuntime();
 
         // Top-level consts (a const may reference an earlier one, so keep order).
         for (const auto& c : program.consts) {
