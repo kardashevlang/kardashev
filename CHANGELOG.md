@@ -18,6 +18,28 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.70.0] — Saturating arithmetic + bit-manipulation intrinsics
+
+### Added
+- **Saturating integer arithmetic** on `i64`: `saturating_add`,
+  `saturating_sub`, `saturating_mul`. On signed overflow these **clamp** to
+  `i64::MIN` / `i64::MAX` in the correct direction (vs the v33 `checked_*` ops,
+  which return `Option<i64>`, and `wrapping_*`, which wrap). Lowered as the same
+  overflow detection followed by a `select` to the boundary.
+- **Bit-manipulation intrinsics** on `i64`, lowered to LLVM intrinsics:
+  - `count_ones` (popcount), `count_zeros` (`64 - popcount`),
+  - `leading_zeros` (ctlz), `trailing_zeros` (cttz) — both return `64` for an
+    all-zero input (non-poison form),
+  - `reverse_bytes` (bswap),
+  - `rotate_left(x, n)` / `rotate_right(x, n)` (funnel shift; `n` taken modulo
+    the 64-bit width, matching Rust).
+
+### Notes
+- All v70 builtins are JIT==AOT differentially gated
+  (`smoke_test_satbits.sh`, 7 cases).
+- The C backend (`--emit-c`) cleanly **refuses** these (out of its scalar
+  subset — no miscompile), consistent with the other intrinsic builtins.
+
 ## [0.69.0] — Integer range patterns (`0..10 =>`)
 
 ### Added

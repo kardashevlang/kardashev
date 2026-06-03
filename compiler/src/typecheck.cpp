@@ -1969,6 +1969,26 @@ public:
             }
         }
 
+        // v70: saturating arithmetic + bit-manipulation intrinsics on i64. All
+        // return a plain i64 (no Option needed), so they don't depend on the
+        // prelude enums. `saturating_<op>(a, b)` clamps to INT64_MIN/MAX on
+        // overflow; the unary bit ops give popcount / zero counts / byte-swap;
+        // `rotate_left/right(x, n)` rotate by n bits (modulo 64).
+        for (const char* nm :
+             {"saturating_add", "saturating_sub", "saturating_mul",
+              "rotate_left", "rotate_right"}) {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt(), makeInt()}, makeInt());
+            fnSchemas_[nm] = std::move(sch);
+        }
+        for (const char* nm :
+             {"count_ones", "count_zeros", "leading_zeros", "trailing_zeros",
+              "reverse_bytes"}) {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, makeInt());
+            fnSchemas_[nm] = std::move(sch);
+        }
+
         // Pass 1c: register trait declarations. Each trait gets a global
         // entry with its method signatures, used later to validate impl
         // blocks and to type-check method calls through bounded generic
