@@ -63,7 +63,7 @@ fn main() -> i64 ! { io } { let r = apply(4, f); print(r); 0 }'
 # still be REJECTED (the row var carries io to the caller) — proves the fix
 # did not blanket-suppress effect propagation.
 printf '%s' 'fn shout(x: i64) -> i64 ! { io } { print(x); x }
-fn pure_caller() -> i64 { let r = option_map(Some(1), shout); 0 }
+fn pure_caller() -> i64 ! { } { let r = option_map(Some(1), shout); 0 }
 fn main() -> i64 ! { io } { print(0); 0 }' > "$TMP/neg.kd"
 e=$("$KARDC" "$TMP/neg.kd" 2>&1 >/dev/null || true)
 echo "$e" | grep -qi "io" || { echo "FAIL[neg]: pure caller of io-mapper option_map should be rejected; got: $e"; exit 1; }

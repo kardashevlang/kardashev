@@ -1061,6 +1061,7 @@ private:
         expect(TokenKind::RParen, ")");
         decl.returnType = parseOptionalReturnType();
         decl.effects = parseOptionalEffectRow();
+        decl.sawEffectRow = sawEffectRow_; // v81: explicit `!` row vs absent
         // Phase 21b: a `where` clause desugars its constraints onto the generic
         // params we just parsed, so it behaves identically to the inline form.
         parseOptionalWhereClause(decl.genericParams);
@@ -2728,6 +2729,7 @@ private:
         expect(TokenKind::RParen, ")");
         decl.returnType = parseOptionalReturnType();
         decl.effects = parseOptionalEffectRow();
+        decl.sawEffectRow = sawEffectRow_; // v81: explicit `!` row vs absent
         // Phase 21b: `where` clause on an impl method, desugared as for free fns.
         parseOptionalWhereClause(decl.genericParams);
         decl.body = parseBlockExpr();

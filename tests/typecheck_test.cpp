@@ -1378,7 +1378,7 @@ void test_callee_io_caller_declares_io_ok() {
 
 void test_callee_io_caller_pure_errors() {
     expectErr("fn raw_read() -> i64 ! { io } { 42 }\n"
-              "fn main() -> i64 { raw_read() }",
+              "fn main() -> i64 ! { } { raw_read() }",  // v81: explicit-pure
               "callee_io_caller_pure_errors");
 }
 
@@ -1436,7 +1436,7 @@ void test_effect_poly_apply_io_ok() {
 void test_effect_poly_apply_io_leak_errors() {
     // Pure signature, but `e := {io}` leaks io through apply: must error.
     expectErr(std::string(kApplyPrelude) +
-                  "fn useIoBad() -> i64 { apply(ioInc) }",
+                  "fn useIoBad() -> i64 ! { } { apply(ioInc) }",  // v81: explicit-pure
               "effect_poly_apply_io_leak_errors");
 }
 
@@ -1459,7 +1459,7 @@ void test_concrete_fn_type_param_io_ok() {
 void test_concrete_fn_type_param_pure_body_errors() {
     // The fn-type param declares io, so calling it inside a pure-bodied
     // higher-order fn must error.
-    expectErr("fn callIt(f: fn(i64) -> i64 ! {io}) -> i64 { f(3) }\n"
+    expectErr("fn callIt(f: fn(i64) -> i64 ! {io}) -> i64 ! { } { f(3) }\n"  // v81
               "fn main() -> i64 { 0 }",
               "concrete_fn_type_param_pure_body_errors");
 }
@@ -1468,7 +1468,7 @@ void test_fn_value_preserves_effects_via_let() {
     // A first-class fn value bound with `let` keeps its declared effects:
     // calling it requires the caller to declare them.
     expectErr("fn ioInc(x: i64) -> i64 ! {io} { print(x); x + 1 }\n"
-              "fn main() -> i64 { let g = ioInc; g(5) }",
+              "fn main() -> i64 ! { } { let g = ioInc; g(5) }",  // v81
               "fn_value_preserves_effects_via_let_errors");
 }
 
@@ -1616,7 +1616,7 @@ void test_closure_io_effect_propagates_negative_errors() {
     // The same io closure called from a PURE context must be rejected: the
     // closure's `{io}` row flows to the indirect call site, which the pure
     // `main` cannot absorb. (Ties Phase 10a effect inference to 10b.)
-    expectErr("fn main() -> i64 { let p = |x| print(x); p(5) }",
+    expectErr("fn main() -> i64 ! { } { let p = |x| print(x); p(5) }",  // v81
               "closure_io_effect_propagates_negative_errors");
 }
 
@@ -1624,7 +1624,7 @@ void test_closure_io_effect_via_higher_order_negative_errors() {
     // An io closure passed to an effect-polymorphic `apply` makes that call
     // io; a pure caller must be rejected (row polymorphism + closures).
     expectErr("fn apply(f: fn(i64) -> i64 ! {e}) -> i64 ! {e} { f(10) }\n"
-              "fn main() -> i64 { apply(|x| print(x)) }",
+              "fn main() -> i64 ! { } { apply(|x| print(x)) }",  // v81
               "closure_io_effect_via_higher_order_negative_errors");
 }
 
@@ -1891,7 +1891,7 @@ void test_range_endpoints_must_be_int() {
 void test_loop_io_effect_propagates() {
     // A `print` inside a loop body must surface the io effect requirement.
     expectErrContains(
-        "fn f() -> i64 { let mut i = 0; while i < 1 { print(i); i = i + 1; } "
+        "fn f() -> i64 ! { } { let mut i = 0; while i < 1 { print(i); i = i + 1; } "
         "0 }",
         "io", "loop_io_effect_propagates");
 }
@@ -1988,7 +1988,7 @@ void test_fold_io_closure_negative() {
         " Some(x) => { acc = f(acc, x); }, None => { break; }, } }\n"
         "    acc\n"
         "}\n"
-        "fn main() -> i64 {\n"
+        "fn main() -> i64 ! { } {\n"
         "    fold(Countdown { n: 3 }, 0, |acc, x| { print(x); acc + x })\n"
         "}",
         "io", "fold_io_closure_negative");
@@ -2297,10 +2297,10 @@ void test_pure_trait_cannot_launder_spawn() {
     // — concurrent work can't be smuggled past a pure-looking interface.
     expectErrContains(
         "fn w() -> i64 { 1 }\n"
-        "trait Task { fn run(&self) -> i64; }\n"
+        "trait Task { fn run(&self) -> i64 ! { }; }\n"
         "struct S {}\n"
         "impl Task for S {\n"
-        "  fn run(&self) -> i64 { let h = thread_spawn(w); thread_join(h) }\n"
+        "  fn run(&self) -> i64 ! { } { let h = thread_spawn(w); thread_join(h) }\n"
         "}\n"
         "fn main() -> i64 { 0 }",
         "share",
@@ -2311,7 +2311,7 @@ void test_thread_spawn_requires_io_effect() {
     // `main` performs `io` via thread_spawn/thread_join but doesn't declare it.
     expectErr(
         "fn w() -> i64 { 7 }\n"
-        "fn main() -> i64 {\n"
+        "fn main() -> i64 ! { } {\n"
         "  let h = thread_spawn(w);\n"
         "  thread_join(h)\n"
         "}",
@@ -2527,7 +2527,7 @@ void test_atomics() {
         "atomic_is_send_into_thread");
     // An atomic store performs io — calling it from a pure fn is rejected.
     expectErr(
-        "fn bad(a: AtomicI64) -> i64 { atomic_i64_store_seqcst(a, 1) }\n"
+        "fn bad(a: AtomicI64) -> i64 ! { } { atomic_i64_store_seqcst(a, 1) }\n"
         "fn main() -> i64 { 0 }",
         "atomic_store_requires_io");
 }
@@ -2634,7 +2634,7 @@ void test_panic_carries_panic_effect_ok() {
 
 void test_panic_undeclared_effect_errors() {
     // Calling `panic` without declaring the `panic` effect is rejected.
-    expectErr("fn f() -> i64 { panic(\"x\"); 0 }",
+    expectErr("fn f() -> i64 ! { } { panic(\"x\"); 0 }",  // v81: explicit-pure
               "panic_undeclared_effect_errors");
 }
 
@@ -2643,7 +2643,7 @@ void test_panic_propagates_through_caller() {
     // itself declare `panic` (or catch it).
     expectErr(
         "fn boom() -> i64 ! { panic } { panic(\"x\"); 0 }\n"
-        "fn caller() -> i64 { boom() }",
+        "fn caller() -> i64 ! { } { boom() }",
         "panic_propagates_through_caller");
 }
 
@@ -2661,7 +2661,7 @@ void test_catch_still_propagates_io_effect() {
     // still propagate, so an undeclaring caller is rejected.
     expectErr(
         "fn ioFn() -> i64 ! { io } { print(1); 0 }\n"
-        "fn main() -> i64 { catch(ioFn, 0) }",
+        "fn main() -> i64 ! { } { catch(ioFn, 0) }",
         "catch_still_propagates_io_effect");
 }
 
@@ -2703,7 +2703,7 @@ void test_extern_ref_string_arg() {
 void test_extern_carries_io_pure_caller_rejected() {
     expectErrContains(
         "extern \"C\" fn getpid() -> i64;\n"
-        "fn pureFn() -> i64 { getpid() }\n"
+        "fn pureFn() -> i64 ! { } { getpid() }\n"  // v81: explicit-pure
         "fn main() -> i64 ! { io } { pureFn() }",
         "effect `io`", "extern_carries_io_pure_caller_rejected");
 }

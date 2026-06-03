@@ -38,8 +38,10 @@ encode() {
 
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
 INITED='{"jsonrpc":"2.0","method":"initialized","params":{}}'
-# Deliberate type error: `print(42)` from a fn without `! { io }`.
-SRC='fn main() -> i64 { print(42); 0 }'
+# Deliberate type error: `print(42)` from an explicitly-pure fn (`! { }`). v81
+# made effects opt-in, so a *no-row* fn doing io is fine — the diagnostic now
+# requires an explicit empty row (an asserted-pure that the io call violates).
+SRC='fn main() -> i64 ! { } { print(42); 0 }'
 # Escape source for JSON (no embedded quotes / newlines, fortunately).
 DIDOPEN=$(printf '{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/t.kd","languageId":"kardashev","version":1,"text":"%s"}}}' "$SRC")
 SHUT='{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}'

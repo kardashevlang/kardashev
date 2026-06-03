@@ -117,7 +117,7 @@ fn main() -> i64 ! { io } { print(perform Ghost::boo()); 0 }
 # 7. NEGATIVE: a fn that performs an effect without handling it must DECLARE it.
 expect_err undeclared_row 'effect `Logger`' '
 effect Logger { fn log(m: i64) -> i64; }
-fn work() -> i64 { perform Logger::log(1) }
+fn work() -> i64 ! { } { perform Logger::log(1) }
 fn main() -> i64 ! { io } { print(handle { work() } with Logger { log(m) => m }); 0 }
 '
 

@@ -132,7 +132,7 @@ cat > "$TMP/dyneffect.kd" <<'EOF'
 trait Speaker { fn speak(&self) -> i64 ! { io }; }
 struct Dog { n: i64 }
 impl Speaker for Dog { fn speak(&self) -> i64 ! { io } { let m = "woof"; println(&m); self.n } }
-fn run(s: &dyn Speaker) -> i64 { s.speak() }
+fn run(s: &dyn Speaker) -> i64 ! { } { s.speak() }
 fn main() -> i64 ! { io } { let d = Dog { n: 3 }; run(&d) }
 EOF
 rejects dyneffect "$TMP/dyneffect.kd" "io"

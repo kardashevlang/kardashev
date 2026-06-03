@@ -57,10 +57,10 @@ echo "PASS [share-ok]: thread_spawn under share-effect runs, JIT 42 + AOT 42"
 #     spawns is rejected (the subset rule: impl effects must be ⊆ the trait's).
 cat > "$TMP/launder.kd" <<'EOF'
 fn work() -> i64 { 1 }
-trait Task { fn run(&self) -> i64; }          // declared pure — no `share`
+trait Task { fn run(&self) -> i64 ! { }; }     // declared pure — no `share`
 struct Spawner {}
 impl Task for Spawner {
-    fn run(&self) -> i64 {
+    fn run(&self) -> i64 ! { } {
         let h = thread_spawn(work);            // spawns — super-effecting
         thread_join(h)
     }

@@ -76,7 +76,7 @@ echo "AOT: matches"
 cat > "$TMP/leak.kd" <<'EOF'
 fn apply(f: fn(i64) -> i64 ! {e}) -> i64 ! {e} { f(10) }
 fn ioInc(x: i64) -> i64 ! {io} { print(x); x + 1 }
-fn main() -> i64 { apply(ioInc) }
+fn main() -> i64 ! { } { apply(ioInc) }
 EOF
 set +e
 ERR_OUT=$("$KARDC" "$TMP/leak.kd" 2>&1)

@@ -4305,6 +4305,12 @@ int main(int argc, char** argv) {
             // v80: emit compiler diagnostics as JSON (one object per line) for
             // IDE / CI tooling, instead of the rich snippet.
             g_jsonDiagnostics = true;
+        } else if (a == "--effects=strict") {
+            // v81: restore the pre-opt-in rule (a fn with no `! { }` row must be
+            // pure). Default is opt-in — an absent row is unchecked.
+            kardashev::setEffectsStrict(true);
+        } else if (a == "--effects=opt-in") {
+            kardashev::setEffectsStrict(false); // the default; explicit no-op
         } else if (a == "--doc") {
             emitDoc = true;
         } else if (a == "--cfg" && i + 1 < argc) {
