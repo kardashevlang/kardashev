@@ -4288,6 +4288,8 @@ int main(int argc, char** argv) {
     bool monoReportFlag = false; // v28 Phase 156: --mono-report
     // v23 Phase 129: `--emit-c` prints portable C source (the second backend).
     bool emitC = false;
+    // v88: `--emit-obj <file.o>` emits a native object (no link) for FFI linking.
+    std::string emitObjPath;
     bool emitDoc = false; // v36 Phase 194: `--doc` Markdown API docs
     // v24 Phase 132: `-W` / `--warn` runs the (non-fatal) lint pass before the
     // normal compile/run.
@@ -4313,6 +4315,10 @@ int main(int argc, char** argv) {
             monoReportFlag = true;
         } else if (a == "--emit-c") {
             emitC = true;
+        } else if (a == "--emit-obj" && i + 1 < argc) {
+            // v88: emit a native .o (no link), so a test/build can link it with
+            // a C object for real FFI interop.
+            emitObjPath = argv[++i];
         } else if (a == "--error-format=json") {
             // v80: emit compiler diagnostics as JSON (one object per line) for
             // IDE / CI tooling, instead of the rich snippet.
@@ -4487,6 +4493,21 @@ int main(int argc, char** argv) {
             return 1;
         }
         return emitCSource(*src, dirOf(inputPath));
+    }
+    if (!emitObjPath.empty()) {
+        if (inputPath.empty()) {
+            std::cerr << "kardc: --emit-obj requires an input file\n";
+            return 2;
+        }
+        auto src = readFile(inputPath);
+        if (!src) {
+            std::cerr << "kardc: cannot open file: " << inputPath << '\n';
+            return 1;
+        }
+        return compileToObject(*src, dirOf(inputPath), emitDebug, inputPath,
+                               emitObjPath, optLevel)
+                   ? 0
+                   : 1;
     }
     if (emitDoc) {
         if (inputPath.empty()) {

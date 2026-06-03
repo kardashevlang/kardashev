@@ -2747,12 +2747,14 @@ void test_extern_wrong_arg_arity_rejected() {
 }
 
 void test_extern_unrepresentable_type_rejected() {
-    // A by-value user struct has no defined C ABI in an extern signature.
+    // v88: a by-value user struct has no portable C ABI in an extern signature
+    // (the System V by-value register ABI is the deferred mega-arc) — it is
+    // rejected with an actionable "pass it by pointer as `&T`" message.
     expectErrContains(
         "struct P { x: i64 }\n"
         "extern \"C\" fn f(p: P) -> i64;\n"
         "fn main() -> i64 { 0 }",
-        "not supported in an `extern", "extern_unrepresentable_type_rejected");
+        "by pointer", "extern_unrepresentable_type_rejected");
 }
 
 // --- Phase 25: const items, const fn, const-generic array lengths ----------

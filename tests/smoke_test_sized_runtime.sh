@@ -62,7 +62,8 @@ fn use_it() -> u8 { fw(1u8, 2u16, 3u32, 4u64) }
 fn main() -> i64 { use_it() as i64 }
 EOF
 "$KARDC" --emit-llvm "$TMP/ffi.kd" 2>/dev/null > "$TMP/ffi.ll"
-grep -aqF 'declare i8 @fw(i8, i16, i32, i64)' "$TMP/ffi.ll" || { echo "FAIL [ffi-widths]: extern not declared at real C widths"; grep -a 'declare.*@fw' "$TMP/ffi.ll"; exit 1; }
+# Real C widths i8/i16/i32/i64 (v88 also adds zeroext/signext on the i8/i16 params).
+grep -aqE 'declare( (zeroext|signext))? i8 @fw\(i8( (zeroext|signext))?, i16( (zeroext|signext))?, i32, i64\)' "$TMP/ffi.ll" || { echo "FAIL [ffi-widths]: extern not declared at real C widths"; grep -a 'declare.*@fw' "$TMP/ffi.ll"; exit 1; }
 echo "PASS [ffi-widths]: extern \"C\" maps sized ints to real C widths (i8/i16/i32/i64)"
 # i32 keeps its historical i64-sugar: abs(0 - 7) == 7.
 printf '%s' 'extern "C" fn abs(x: i32) -> i32; fn main() -> i64 { abs(0 - 7) }' > "$TMP/abs.kd"

@@ -1173,6 +1173,16 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v88: #[repr(C)] struct layout + struct FFI by pointer + signext/zeroext narrow
+# args. Links a real clang-compiled C helper (via `kardc --emit-obj`) to verify
+# the kardc-built struct layout matches C's, and that narrow-int boundaries are
+# value-correct. Skips with pass if clang is unavailable.
+sh_test(
+    name = "smoke_test_repr_c_ffi",
+    srcs = ["smoke_test_repr_c_ffi.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 25: compile-time constants + const evaluation — `const` items folded to
 # literals (verified in the IR), `const fn` evaluated in const contexts, a const
 # referencing another const, const-generic array lengths (`[i64; N]` /
