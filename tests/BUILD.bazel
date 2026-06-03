@@ -805,6 +805,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v71: format!/println! formatting specs (width/fill/align + radix types).
+sh_test(
+    name = "smoke_test_fmt_specs",
+    srcs = ["smoke_test_fmt_specs.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

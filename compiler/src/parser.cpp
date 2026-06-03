@@ -1415,6 +1415,68 @@ private:
         return e;
     }
 
+    // v71: a parsed format spec (the part after `:` in `{:spec}`). Pure data;
+    // the desugaring below maps it to to_string/fmt_debug/int_to_*/str_pad_*.
+    struct FmtSpec {
+        bool debug = false;   // `?`
+        char radix = 0;       // 'x' 'X' 'b' 'o', or 0
+        char fill = ' ';      // fill char for padding
+        char align = 0;       // '<' '>' '^', or 0 (default = pad-left/right-align)
+        long width = 0;       // 0 = no width
+    };
+    // Parse the spec text (after the `:`). Returns false in `ok` on anything
+    // unsupported (e.g. precision `.N`, an unknown type char) so the caller can
+    // emit a clear error rather than silently mis-format.
+    static FmtSpec parseFmtSpec(const std::string& s, bool& ok) {
+        FmtSpec sp;
+        ok = true;
+        std::size_t i = 0, n = s.size();
+        auto isAlign = [](char c) { return c == '<' || c == '>' || c == '^'; };
+        // [[fill] align]
+        if (n >= 2 && isAlign(s[1])) {
+            sp.fill = s[0];
+            sp.align = s[1];
+            i = 2;
+        } else if (n >= 1 && isAlign(s[0])) {
+            sp.align = s[0];
+            i = 1;
+        }
+        // sign (+/-) and `#` alt-form are accepted but ignored (documented).
+        if (i < n && (s[i] == '+' || s[i] == '-')) ++i;
+        if (i < n && s[i] == '#') ++i;
+        // `0` zero-pad flag (only when no explicit fill/align already given).
+        if (i < n && s[i] == '0') {
+            ++i;
+            if (sp.align == 0) {
+                sp.fill = '0';
+                sp.align = '>';
+            }
+        }
+        // width
+        bool hasW = false;
+        long w = 0;
+        while (i < n && s[i] >= '0' && s[i] <= '9') {
+            w = w * 10 + (s[i] - '0');
+            ++i;
+            hasW = true;
+        }
+        if (hasW) sp.width = w;
+        // precision `.N` is not supported yet.
+        if (i < n && s[i] == '.') {
+            ok = false;
+            return sp;
+        }
+        // type
+        if (i < n) {
+            char t = s[i++];
+            if (t == '?') sp.debug = true;
+            else if (t == 'x' || t == 'X' || t == 'b' || t == 'o') sp.radix = t;
+            else { ok = false; return sp; }
+        }
+        if (i != n) ok = false;
+        return sp;
+    }
+
     ast::ExprPtr parseFormatMacro(const Token& nameTok) {
         consume(); // `!`
         expect(TokenKind::LParen, "(");
@@ -1446,7 +1508,7 @@ private:
         // via Display (`to_string`); a `{:?}` hole via Debug (`fmt_debug`).
         std::vector<std::string> segs;
         segs.push_back("");
-        std::vector<bool> holeDebug; // per hole: true = `{:?}` (Debug)
+        std::vector<FmtSpec> holeSpecs; // per hole: parsed `{:spec}` (v71)
         std::size_t holeCount = 0;
         for (std::size_t i = 0; i < fmt.size(); ++i) {
             char c = fmt[i];
@@ -1454,22 +1516,40 @@ private:
                 if (i + 1 < fmt.size() && fmt[i + 1] == '{') {
                     segs.back().push_back('{');
                     ++i;
-                } else if (i + 1 < fmt.size() && fmt[i + 1] == '}') {
-                    ++i;
-                    ++holeCount;
-                    holeDebug.push_back(false);
-                    segs.push_back("");
-                } else if (i + 3 < fmt.size() && fmt[i + 1] == ':' &&
-                           fmt[i + 2] == '?' && fmt[i + 3] == '}') {
-                    // `{:?}` — Debug.
-                    i += 3;
-                    ++holeCount;
-                    holeDebug.push_back(true);
-                    segs.push_back("");
                 } else {
-                    errorAt("unsupported format placeholder (only `{}` and "
-                            "`{:?}` are supported)",
-                            fmtTok.line, fmtTok.column);
+                    // Scan to the closing `}`; the text between is the hole.
+                    std::size_t j = i + 1;
+                    while (j < fmt.size() && fmt[j] != '}') ++j;
+                    if (j >= fmt.size()) {
+                        errorAt("unclosed `{` in format string (use `{{` for a "
+                                "literal brace)",
+                                fmtTok.line, fmtTok.column);
+                        break;
+                    }
+                    std::string inner = fmt.substr(i + 1, j - i - 1);
+                    FmtSpec sp;
+                    if (inner.empty()) {
+                        // `{}` — Display.
+                    } else if (inner[0] == ':') {
+                        bool specOk = true;
+                        sp = parseFmtSpec(inner.substr(1), specOk);
+                        if (!specOk) {
+                            errorAt("unsupported format spec `{" + inner +
+                                        "}` (supported: fill/align `<` `>` `^`, "
+                                        "`0`, width, and type `?` `x` `X` `b` "
+                                        "`o`)",
+                                    fmtTok.line, fmtTok.column);
+                        }
+                    } else {
+                        errorAt("unsupported format placeholder `{" + inner +
+                                    "}` (named/positional arguments are not "
+                                    "supported)",
+                                fmtTok.line, fmtTok.column);
+                    }
+                    holeSpecs.push_back(sp);
+                    ++holeCount;
+                    segs.push_back("");
+                    i = j; // advance past the `}`
                 }
             } else if (c == '}') {
                 if (i + 1 < fmt.size() && fmt[i + 1] == '}') {
@@ -1525,12 +1605,46 @@ private:
                 pushSlot(std::move(lit));
             }
             if (i < args.size()) {
-                auto mc = std::make_unique<ast::MethodCallExpr>();
-                mc->methodName =
-                    (i < holeDebug.size() && holeDebug[i]) ? "fmt_debug"
-                                                           : "to_string";
-                mc->receiver = std::move(args[i]);
-                pushSlot(std::move(mc));
+                const FmtSpec& sp =
+                    (i < holeSpecs.size()) ? holeSpecs[i] : FmtSpec{};
+                ast::ExprPtr valueExpr;
+                if (sp.radix) {
+                    // `{:x}` / `{:X}` / `{:b}` / `{:o}` — radix conversion.
+                    const char* fn = (sp.radix == 'b')   ? "int_to_binary"
+                                     : (sp.radix == 'o') ? "int_to_octal"
+                                     : (sp.radix == 'X') ? "int_to_hex_upper"
+                                                         : "int_to_hex_lower";
+                    auto call = std::make_unique<ast::CallExpr>();
+                    call->callee = fn;
+                    call->args.push_back(std::move(args[i]));
+                    valueExpr = std::move(call);
+                } else {
+                    auto mc = std::make_unique<ast::MethodCallExpr>();
+                    mc->methodName = sp.debug ? "fmt_debug" : "to_string";
+                    mc->receiver = std::move(args[i]);
+                    valueExpr = std::move(mc);
+                }
+                if (sp.width > 0) {
+                    // Pad to width. Default (no explicit align) right-aligns
+                    // (pad-left), matching the common numeric case; strings can
+                    // left-align with `{:<w}` (documented).
+                    const char* padFn = (sp.align == '<')   ? "str_pad_right"
+                                        : (sp.align == '^') ? "str_pad_center"
+                                                            : "str_pad_left";
+                    auto call = std::make_unique<ast::CallExpr>();
+                    call->callee = padFn;
+                    call->args.push_back(std::move(valueExpr));
+                    auto w = std::make_unique<ast::IntLitExpr>();
+                    w->value = sp.width;
+                    call->args.push_back(std::move(w));
+                    auto fc = std::make_unique<ast::CharLitExpr>();
+                    fc->codepoint =
+                        static_cast<std::uint32_t>(
+                            static_cast<unsigned char>(sp.fill));
+                    call->args.push_back(std::move(fc));
+                    valueExpr = std::move(call);
+                }
+                pushSlot(std::move(valueExpr));
             }
         }
         if (nameTok.lexeme == "format") {
