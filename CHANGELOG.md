@@ -18,6 +18,37 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.78.0] — Lazy iterator adaptors (map / filter / fold / peekable)
+
+### Added
+- **`iter_map`** (`Map<I>`): applies a `fn(i64) -> i64` (or a capturing closure)
+  to each element on demand.
+- **`iter_filter`** (`Filter<I>`): yields only elements matching a
+  `fn(i64) -> bool`, pulling/discarding non-matches inside `next`.
+- **`iter_fold`**: the eager (terminal) reduction — walks the iterator to
+  exhaustion threading an accumulator of any type `A`, with an
+  **effect-polymorphic** folding fn (`! { e }` propagated to the result).
+- **`iter_peekable`** (`Peekable<I>`): one element of lookahead — `peek()`
+  returns the next element without consuming it; `next()` returns the cached
+  element if present, else pulls fresh.
+- All extend the v61 lazy `Iterator` tower (Take/Skip/Chain/Zip/Enumerate) and
+  fuse: `iter_take(iter_filter(iter_map(0..100, …), …), 3)` runs in a single
+  pass with O(1) extra memory; only a terminal `iter_collect` / `iter_fold`
+  consumes. Pure-prelude — no codegen or type-check changes.
+
+### Notes
+- The mapper / predicate is stored as a struct **fn-field** and invoked via
+  `(self.f)(v)` (a closure is stored as the same fat pointer). `Peekable` keeps
+  its lookahead in **scalar** fields (`peeked` / `has_val` / `pval`) to avoid
+  moving a non-Copy `Option` out of `self`.
+- Gate: `smoke_test_lazy_iter.sh` (6 JIT==AOT cases incl. map→filter→take
+  fusion, a capturing closure, and peek/next interleaving).
+
+### Deferred (honest)
+- **Element-generic** adaptors (`impl<T> Iterator<T> for Map<T, I>`) remain
+  blocked by the impl resolver's "unknown type: T" limit (a v61 deferral), so
+  these are `i64`-specialized like the rest of the tower.
+
 ## [0.77.0] — Stdlib container convenience ops
 
 ### Added
