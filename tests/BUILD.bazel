@@ -826,6 +826,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v74: single-level dyn trait upcasting (&dyn Sub -> &dyn Super).
+sh_test(
+    name = "smoke_test_dyn_upcast",
+    srcs = ["smoke_test_dyn_upcast.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

@@ -6086,12 +6086,30 @@ private:
                         return true;
                     }
                 }
-                // Already a trait object of the right trait: identity.
+                // Already a trait object: identity, or a single-level UPCAST
+                // to a direct supertrait (v74). `&dyn Sub` / `Box<dyn Sub>` is
+                // usable where `&dyn Super` is expected when Super is a direct
+                // supertrait of Sub; codegen swaps to the embedded super-vtable.
                 if (a->kind == e->kind) {
                     TypePtr ai = resolve(a->refInner);
-                    if (ai->kind == TypeKind::Dyn &&
-                        ai->dynTraitName == inner->dynTraitName) {
-                        return true;
+                    if (ai->kind == TypeKind::Dyn) {
+                        if (ai->dynTraitName == inner->dynTraitName) {
+                            return true; // identity
+                        }
+                        auto sit = traitSupertraits_.find(ai->dynTraitName);
+                        if (sit != traitSupertraits_.end()) {
+                            for (const auto& sup : sit->second) {
+                                if (sup == inner->dynTraitName) {
+                                    DynCoercion c;
+                                    c.isUpcast = true;
+                                    c.fromTraitName = ai->dynTraitName; // Sub
+                                    c.traitName = inner->dynTraitName;  // Super
+                                    c.isBox = expIsBox;
+                                    dynCoercions_[&srcExpr] = c;
+                                    return true;
+                                }
+                            }
+                        }
                     }
                 }
             }

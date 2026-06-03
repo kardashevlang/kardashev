@@ -228,6 +228,21 @@ in a default method works; a missing assoc const is rejected.
 
 ## v74 — dyn upcasting (single-level) + turbofish on methods
 
+**STATUS: ✅ SHIPPED (v0.74.0) — dyn upcast delivered; method turbofish deferred
+honestly.** Single-level `&dyn Sub` / `Box<dyn Sub>` → `&dyn Super` upcasting for
+a direct supertrait: each subtrait vtable embeds a pointer to each supertrait
+vtable *after* its method slots (existing dispatch only touches the method slots,
+so it's regression-safe); the upcast loads that pointer and rebuilds the fat
+pointer with the data pointer preserved. `coerceOrUnify` records the upcast,
+codegen swaps the vtable via `makeDynUpcast`. Multi-level works by chaining
+single steps. Gate: `smoke_test_dyn_upcast.sh` (6 cases, JIT==AOT). **Method
+turbofish DEFERRED:** it binds method-level generics, but those are incomplete
+(trait `MethodSig` has no generic params; inherent `fn m<T>(&self)` fails at
+codegen) — shipping turbofish first would be a no-op veneer, so it waits on a
+generic-methods arc. Also deferred: one-step transitive (non-direct) upcast.
+
+<details><summary>Original plan</summary>
+
 > Scoped (critic): single-level prefix-vtable upcast; method turbofish is the
 > easy half.
 
@@ -241,6 +256,8 @@ feeding the existing free-fn turbofish substitution path.
 **GATE.** `smoke_test_dyn_upcast.sh`: `let e: &dyn Eq = ord_ref;` dispatches the
 Eq method through the upcast; `v.collect::<i64>()`-style method turbofish resolves
 (JIT==AOT).
+
+</details>
 
 **DEFERRALS.** Multi-level upcast chains (A:B:C) only if prefix layout makes them
 free; else single-level + a documented note.

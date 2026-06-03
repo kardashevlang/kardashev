@@ -184,6 +184,9 @@ public:
             order.reserve(td.methods.size());
             for (const auto& m : td.methods) order.push_back(m.name);
             traitMethodOrder_[td.name] = std::move(order);
+            // v74: record direct supertraits so a subtrait's vtable can embed
+            // pointers to its supertrait vtables (for single-level dyn upcast).
+            traitSupertraits_[td.name] = td.supertraits;
         }
         // Impl methods register under their mangled name so the codegen
         // tables stay 1-to-1 with fnSchemas. Phase 3.3 has only
@@ -994,6 +997,11 @@ private:
     // Phase 11: traitName -> method names in declaration order (the vtable
     // slot order, matching ResolvedMethod::dynMethodSlot).
     std::unordered_map<std::string, std::vector<std::string>> traitMethodOrder_;
+    // v74: traitName -> direct supertrait names. A subtrait's vtable embeds one
+    // extra pointer slot per supertrait (after the method slots), pointing at
+    // the (supertrait, type) vtable, so `&dyn Sub` -> `&dyn Super` upcast is a
+    // pointer load + fat-pointer rebuild.
+    std::unordered_map<std::string, std::vector<std::string>> traitSupertraits_;
 
     // Phase 10b: monotonically-increasing id for generated closure / thunk
     // functions, so each gets a unique LLVM name.
@@ -12228,6 +12236,9 @@ private:
         // thin data pointer; we pair it with the impl's vtable global.
         auto cit = tc_.dynCoercions.find(&e);
         if (cit != tc_.dynCoercions.end()) {
+            if (cit->second.isUpcast) // v74: dyn Sub -> dyn Super
+                return makeDynUpcast(v, cit->second.fromTraitName,
+                                     cit->second.traitName);
             return makeDynPtr(v, cit->second.traitName,
                               cit->second.concreteTypeName);
         }
@@ -13290,12 +13301,22 @@ private:
         }
         const std::vector<std::string>& order = orderIt->second;
 
-        // The vtable struct type: N fn-pointer slots (opaque pointers).
-        std::vector<llvm::Type*> slotTys(order.size(), i8PtrTy);
+        // v74: a subtrait's vtable carries one extra pointer slot per direct
+        // supertrait, AFTER the N method slots. Existing dyn dispatch only GEPs
+        // into the first N slots, so appending is layout-safe; the upcast path
+        // loads slot N+k to recover the (supertrait_k, type) vtable.
+        std::vector<std::string> supers;
+        if (auto sIt = traitSupertraits_.find(traitName);
+            sIt != traitSupertraits_.end())
+            supers = sIt->second;
+
+        // The vtable struct type: N method slots + S supertrait-vtable slots
+        // (all opaque pointers).
+        std::vector<llvm::Type*> slotTys(order.size() + supers.size(), i8PtrTy);
         auto* vtTy = llvm::StructType::get(*ctx_, slotTys);
 
         std::vector<llvm::Constant*> slots;
-        slots.reserve(order.size());
+        slots.reserve(order.size() + supers.size());
         ast::TypeRef forTyRef;
         forTyRef.name = typeName;
         for (const auto& methodName : order) {
@@ -13311,6 +13332,13 @@ private:
             llvm::Function* thunk =
                 emitVtableThunk(traitName, typeName, methodName, implIt->second);
             slots.push_back(thunk);
+        }
+        // Append a pointer to each supertrait's vtable for this same concrete
+        // type (the type impls every supertrait — the typechecker enforces it).
+        for (const auto& sup : supers) {
+            llvm::GlobalVariable* svt = getOrEmitVtable(sup, typeName);
+            slots.push_back(svt ? static_cast<llvm::Constant*>(svt)
+                                : llvm::ConstantPointerNull::get(i8PtrTy));
         }
 
         auto* init = llvm::ConstantStruct::get(vtTy, slots);
@@ -13364,6 +13392,42 @@ private:
         llvm::Value* agg = llvm::UndefValue::get(dynPtrTy_);
         agg = builder_->CreateInsertValue(agg, dataPtr, {0}, "dyn.data");
         agg = builder_->CreateInsertValue(agg, vtPtr, {1}, "dyn.vtable");
+        return agg;
+    }
+
+    // v74: single-level dyn upcast `&dyn Sub` -> `&dyn Super`. `v` is the Sub
+    // fat pointer; keep its data pointer but swap the vtable for the Super
+    // vtable embedded in the Sub vtable at slot (nSubMethods + superIndex).
+    llvm::Value* makeDynUpcast(llvm::Value* v, const std::string& subTrait,
+                               const std::string& superTrait) {
+        auto* i8PtrTy = llvm::PointerType::get(*ctx_, 0);
+        if (v->getType()->isPointerTy())
+            v = builder_->CreateLoad(dynPtrTy_, v, "up.load");
+        llvm::Value* dataPtr = builder_->CreateExtractValue(v, {0}, "up.data");
+        llvm::Value* subVt = builder_->CreateExtractValue(v, {1}, "up.subvt");
+        unsigned base = 0;
+        if (auto it = traitMethodOrder_.find(subTrait);
+            it != traitMethodOrder_.end())
+            base = static_cast<unsigned>(it->second.size());
+        unsigned superIdx = 0;
+        if (auto it = traitSupertraits_.find(subTrait);
+            it != traitSupertraits_.end()) {
+            for (unsigned i = 0; i < it->second.size(); ++i)
+                if (it->second[i] == superTrait) {
+                    superIdx = i;
+                    break;
+                }
+        }
+        unsigned slot = base + superIdx;
+        std::vector<llvm::Type*> slotTys(slot + 1, i8PtrTy);
+        auto* vtTy = llvm::StructType::get(*ctx_, slotTys);
+        llvm::Value* slotPtr =
+            builder_->CreateStructGEP(vtTy, subVt, slot, "up.slot");
+        llvm::Value* superVt =
+            builder_->CreateLoad(i8PtrTy, slotPtr, "up.supervt");
+        llvm::Value* agg = llvm::UndefValue::get(dynPtrTy_);
+        agg = builder_->CreateInsertValue(agg, dataPtr, {0}, "up.fat.data");
+        agg = builder_->CreateInsertValue(agg, superVt, {1}, "up.fat.vt");
         return agg;
     }
 
