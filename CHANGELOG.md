@@ -18,6 +18,31 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.68.0] — Match guards (`pat if cond =>`)
+
+### Added
+- **Match guards**: an arm may carry a guard, `pat if cond => body`. The arm
+  fires only when the pattern matches **and** the guard (a `bool`, checked in the
+  arm's pattern-binding scope) is true; on guard-false, control **falls through
+  to the next arm** (not the wildcard). The guard's effects flow into the match.
+- Verified genuinely **missing** before this version (the parser rejected `if`
+  after a pattern) despite the v26/Phase-141 project record claiming guards —
+  this is the real implementation.
+- **Guard-aware exhaustiveness**: a guarded arm does **not** count toward
+  coverage, so `match n { x if x>5 => 1 }` is correctly non-exhaustive (E0004),
+  while `match o { Some(n) if n>5 => 1, Some(n) => 2, None => 3 }` is exhaustive.
+- Implemented via per-guarded-arm **suffix decision trees** (`compileDecisionTree`
+  gained a `firstArm` parameter): codegen tests the guard at the arm's leaf and,
+  on false, emits the decision tree of the remaining arms — chaining correctly
+  across multiple guards. Threaded through parser, typecheck, pattern_match,
+  codegen, and ast_clone.
+
+### Deferred (honest)
+- A **by-value** guarded arm that binds a **non-Copy** payload is rejected (the
+  suffix tree would re-extract it — a double-move); use `match &x` (borrows
+  re-extract safely) or move the check into the body. The C backend (`--emit-c`)
+  refuses guarded matches (outside its subset) rather than miscompiling.
+
 ## [0.67.0] — Codebase optimization & efficiency (audit-driven)
 
 Opens the **ROADMAP-v67-v80** arc (workflow-designed + fact-checked: several

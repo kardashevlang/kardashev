@@ -785,10 +785,14 @@ std::optional<Witness> checkExhaustiveness(
     const std::unordered_map<std::string, TypePtr>& /*enums*/,
     const std::unordered_map<std::string, std::pair<std::string, unsigned>>&
         variantIndex) {
-    // Build the one-column matrix of arm patterns.
+    // Build the one-column matrix of arm patterns. v68: a GUARDED arm does NOT
+    // count toward coverage (its guard may fail at runtime), so it is skipped
+    // here — e.g. `Some(n) if g => …` alone is non-exhaustive; the unguarded
+    // arms must still cover every value.
     Matrix P;
     P.reserve(arms.size());
     for (const auto& arm : arms) {
+        if (arm.guard) continue;
         Row r;
         r.push_back(view(*arm.pattern, variantIndex));
         P.push_back(std::move(r));
@@ -823,19 +827,23 @@ std::vector<unsigned> findRedundantArms(
         rows.push_back(rowFromArm(a, variantIndex));
     }
 
-    // M[0..i-1] is the matrix of all preceding arms. Arm i is redundant
-    // iff `useful(M, rows[i], cols)` is false.
+    // M[0..i-1] is the matrix of preceding arms. Arm i is redundant iff
+    // `useful(M, rows[i], cols)` is false. v68: a GUARDED preceding arm does
+    // not shadow later arms (its guard may fail), so it is excluded from M; a
+    // guarded arm i itself is never reported redundant (its guard could be the
+    // deciding factor), only checked against unguarded predecessors.
     for (std::size_t i = 0; i < rows.size(); ++i) {
         Matrix M;
         M.reserve(i);
         for (std::size_t j = 0; j < i; ++j) {
+            if (arms[j].guard) continue;
             M.push_back(rows[j]);
         }
         Row q = rows[i];
         ColumnTypes cols;
         cols.push_back(scrutineeType);
         UsefulResult r = useful(M, q, cols);
-        if (!r.useful) {
+        if (!r.useful && !arms[i].guard) {
             result.push_back(static_cast<unsigned>(i));
         }
     }
@@ -847,10 +855,15 @@ std::unique_ptr<DecisionTree> compileDecisionTree(
     const std::vector<ast::MatchArm>& arms,
     const std::unordered_map<std::string, TypePtr>& enums,
     const std::unordered_map<std::string, std::pair<std::string, unsigned>>&
-        variantIndex) {
+        variantIndex,
+    std::size_t firstArm) {
+    // v68: `firstArm` lets the caller build a SUFFIX tree over arms[firstArm..]
+    // (used for match-guard fall-through: when a guarded arm's guard is false,
+    // codegen emits the decision tree of the remaining arms). Leaf armIndex
+    // values stay ABSOLUTE so codegen indexes `me.arms` directly.
     DTMatrix P;
     P.reserve(arms.size());
-    for (std::size_t i = 0; i < arms.size(); ++i) {
+    for (std::size_t i = firstArm; i < arms.size(); ++i) {
         DTRow dr;
         dr.pats = rowFromArm(arms[i], variantIndex);
         dr.armIndex = static_cast<unsigned>(i);

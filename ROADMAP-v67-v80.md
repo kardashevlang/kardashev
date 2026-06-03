@@ -56,6 +56,16 @@ features. (Some doc dedup is cosmetic and can slip.)
 
 ## v68 — match guards (`pat if cond =>`)
 
+> **Status:** ✅ SHIPPED v0.68.0. `MatchArm.guard` + parser (`if` before `=>` on
+> all three arm paths) + typecheck (bool in binding scope; effect flows in) +
+> guard-aware exhaustiveness (guarded arm doesn't count → E0004 for guarded-only)
+> + codegen fall-through via per-guarded-arm **suffix decision trees**
+> (`compileDecisionTree(firstArm=i+1)`), chaining across multiple guards +
+> ast_clone. `smoke_test_match_guards.sh` (payload/bare/chained/binding/by-ref +
+> 3 rejects), JIT==AOT. DEFERRED: a by-value guarded arm binding a non-Copy
+> payload is rejected (suffix re-extraction would double-move — use `match &x`);
+> `--emit-c` refuses guarded matches (subset).
+
 **Theme:** Make guarded match arms actually work (verified missing today).
 
 **CORE.** Add a `guard` field to `MatchArm` (ast.hpp:299); parse `pat if cond

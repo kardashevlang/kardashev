@@ -3960,11 +3960,13 @@ private:
         if (check(TokenKind::LBracket)) {
             auto sp = parseSlicePat();
             std::size_t l = sp->line, c = sp->column;
+            auto guard = parseOptionalGuard(); // v68
             expect(TokenKind::FatArrow, "=>");
             ast::MatchArm arm;
             arm.line = l;
             arm.column = c;
             arm.pattern = std::move(sp);
+            arm.guard = std::move(guard);
             arm.body = parseExpr();
             return arm;
         }
@@ -3991,14 +3993,24 @@ private:
             }
             pat = std::move(orp);
         }
+        auto guard = parseOptionalGuard(); // v68: `pat if cond =>`
         expect(TokenKind::FatArrow, "=>");
         auto body = parseExpr();
         ast::MatchArm arm;
         arm.line = line;
         arm.column = col;
         arm.pattern = std::move(pat);
+        arm.guard = std::move(guard);
         arm.body = std::move(body);
         return arm;
+    }
+
+    // v68: parse an optional match-arm guard `if <cond>` (between the pattern
+    // and `=>`); returns null when absent. The condition is a full expression.
+    ast::ExprPtr parseOptionalGuard() {
+        if (!check(TokenKind::KwIf)) return nullptr;
+        consume(); // `if`
+        return parseExpr();
     }
 
     ast::PatternPtr parsePattern() {

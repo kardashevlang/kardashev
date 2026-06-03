@@ -90,11 +90,15 @@ struct DecisionTree {
 // Always returns a tree, even if exhaustiveness already failed — the tree
 // then bottoms out at Fail nodes for uncovered values. (The codegen layer
 // will emit `unreachable` for Fail.)
+// `firstArm` (v68): build a SUFFIX tree over arms[firstArm..] (for match-guard
+// fall-through); Leaf armIndex values remain absolute. Defaults to the whole
+// match.
 std::unique_ptr<DecisionTree> compileDecisionTree(
     const TypePtr& scrutineeType,
     const std::vector<ast::MatchArm>& arms,
     const std::unordered_map<std::string, TypePtr>& enums,
     const std::unordered_map<std::string, std::pair<std::string, unsigned>>&
-        variantIndex);
+        variantIndex,
+    std::size_t firstArm = 0);
 
 } // namespace kardashev::pattern_match
