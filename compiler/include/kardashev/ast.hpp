@@ -298,6 +298,7 @@ struct BlockExpr : Expr {
 
 struct MatchArm {
     PatternPtr pattern;
+    ExprPtr guard; // v68: `pat if cond =>` — null when the arm has no guard
     ExprPtr body;
     std::size_t line = 1;
     std::size_t column = 1;

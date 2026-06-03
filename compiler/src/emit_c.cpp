@@ -618,6 +618,15 @@ struct CEmitter {
     // value. A CtorPat binds its scalar payloads from `.p<i>`. Patterns outside
     // the subset (nested ctor args, char/or/tuple/slice, guards) are refused.
     std::string matchExpr(const MatchExpr& mx) {
+        // v68: a guarded arm (`pat if cond =>`) is outside the C-backend subset
+        // — refuse rather than silently drop the guard (which would miscompile).
+        for (const auto& arm : mx.arms) {
+            if (arm.guard) {
+                err("a match guard (`pat if cond =>`) is outside the C-backend "
+                    "subset");
+                return "0";
+            }
+        }
         std::string scrutCTy = ctypeOfExpr(*mx.scrutinee);
         // v29 Phase 159: match-through-reference (`match o` with `o: &Enum`) —
         // copy the pointee into a value and match it (sound for scalar payloads:

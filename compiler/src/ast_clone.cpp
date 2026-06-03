@@ -184,6 +184,7 @@ ExprPtr cloneExpr(const Expr& e) {
         for (const auto& arm : m->arms) {
             MatchArm a;
             a.pattern = clonePatOpt(arm.pattern);
+            a.guard = cloneOpt(arm.guard); // v68
             a.body = cloneOpt(arm.body);
             a.line = arm.line;
             a.column = arm.column;

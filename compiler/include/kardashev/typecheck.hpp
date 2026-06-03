@@ -320,6 +320,13 @@ struct TypeCheckResult {
     std::unordered_map<const ast::MatchExpr*,
                        std::unique_ptr<pattern_match::DecisionTree>>
         matchTrees;
+    // v68: per match, the SUFFIX decision tree for each guarded arm index — the
+    // tree of the arms AFTER it, used by codegen for guard fall-through (when a
+    // guarded arm's guard is false, control proceeds to the remaining arms).
+    std::unordered_map<const ast::MatchExpr*,
+                       std::unordered_map<unsigned,
+                           std::unique_ptr<pattern_match::DecisionTree>>>
+        matchSuffixTrees;
     // Phase 29: per match-arm, the resolved type of each pattern binding
     // (name -> type), keyed by the arm's address. Codegen uses this to drop a
     // droppable payload binding (e.g. the `s` in `Some(s)` where s: String) at

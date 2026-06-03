@@ -14176,6 +14176,26 @@ private:
                         }
                     }
                 }
+                // v68: a guarded arm tests its guard (in the binding scope set
+                // above). On true → the body; on false → the SUFFIX tree (the
+                // remaining arms), so control falls through to the next arm
+                // rather than to the wildcard. (Typecheck restricts a guarded
+                // by-value arm's bindings to Copy types, so the suffix tree can
+                // re-extract payloads from the scrutinee without a double-move.)
+                llvm::BasicBlock* guardElseBB = nullptr;
+                if (arm && arm->guard) {
+                    llvm::Value* g = emitExpr(*arm->guard);
+                    if (!g->getType()->isIntegerTy(1))
+                        g = builder_->CreateICmpNE(
+                            g, llvm::ConstantInt::get(g->getType(), 0),
+                            "guard.bool");
+                    auto* gBodyBB =
+                        llvm::BasicBlock::Create(*ctx_, "guard.body", currentFn_);
+                    guardElseBB =
+                        llvm::BasicBlock::Create(*ctx_, "guard.else", currentFn_);
+                    builder_->CreateCondBr(g, gBodyBB, guardElseBB);
+                    builder_->SetInsertPoint(gBodyBB);
+                }
                 if (dt.armIndex < me.arms.size()) {
                     llvm::Value* bodyVal = emitExpr(*me.arms[dt.armIndex].body);
                     if (!builder_->GetInsertBlock()->getTerminator()) {
@@ -14197,6 +14217,20 @@ private:
                     dropScopes_.pop_back();
                 }
                 locals_ = savedLocals;
+                if (guardElseBB) {
+                    builder_->SetInsertPoint(guardElseBB);
+                    const pattern_match::DecisionTree* suffix = nullptr;
+                    auto sit = tc_.matchSuffixTrees.find(&me);
+                    if (sit != tc_.matchSuffixTrees.end()) {
+                        auto ait = sit->second.find(dt.armIndex);
+                        if (ait != sit->second.end()) suffix = ait->second.get();
+                    }
+                    if (suffix)
+                        emitDecisionTree(*suffix, scrutinee, mergeBB, incoming,
+                                         me, refMatch, origPtr, enumLlvmTy);
+                    else
+                        builder_->CreateUnreachable();
+                }
                 return;
             }
             case DT::Switch: {

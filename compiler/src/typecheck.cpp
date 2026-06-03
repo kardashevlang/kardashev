@@ -2915,6 +2915,7 @@ public:
         result.enums = std::move(enumSchemas_);
         result.variantIndex = std::move(variantIndex_);
         result.matchTrees = std::move(matchTrees_);
+        result.matchSuffixTrees = std::move(matchSuffixTrees_);
         result.matchBindingTypes = std::move(matchBindingTypes_);
         result.usesFileIo = usesFileIo_;
         result.usesRuntimeExtras = usesRuntimeExtras_;
@@ -3200,6 +3201,11 @@ private:
     std::unordered_map<const ast::MatchExpr*,
                        std::unique_ptr<pattern_match::DecisionTree>>
         matchTrees_;
+    // v68: suffix trees for guarded arms (see TypeCheckResult.matchSuffixTrees).
+    std::unordered_map<const ast::MatchExpr*,
+                       std::unordered_map<unsigned,
+                           std::unique_ptr<pattern_match::DecisionTree>>>
+        matchSuffixTrees_;
     // Phase 29: per match-arm pattern-binding types (name -> type), for
     // codegen drop of droppable payload bindings.
     std::unordered_map<const ast::MatchArm*,
@@ -3584,7 +3590,10 @@ private:
         }
         if (auto* me = dynamic_cast<const ast::MatchExpr*>(&e)) {
             collectEffects(*me->scrutinee, out);
-            for (const auto& arm : me->arms) collectEffects(*arm.body, out);
+            for (const auto& arm : me->arms) {
+                if (arm.guard) collectEffects(*arm.guard, out); // v68
+                collectEffects(*arm.body, out);
+            }
             return;
         }
         if (auto* te = dynamic_cast<const ast::TryExpr*>(&e)) {
@@ -10058,6 +10067,33 @@ private:
                 // droppable payload binding at arm-scope exit.
                 matchBindingTypes_[&arm][kv.first] = kv.second;
             }
+            // v68: a guard `pat if cond =>` is a bool checked in the arm's
+            // pattern-binding scope (the bindings above are visible to it). Its
+            // effects flow into the match via the normal expr-effect collection.
+            if (arm.guard) {
+                TypePtr gt = checkExpr(*arm.guard);
+                if (!coerceOrUnify(*arm.guard, gt, makeBool()))
+                    error("match guard must be a `bool`, got " +
+                              typeToString(gt),
+                          arm.guard->line, arm.guard->column);
+                // v68 soundness: a guard's fall-through re-extracts the arm's
+                // payloads from the scrutinee for the remaining arms. For a
+                // by-value match that double-extracts a non-Copy payload (a
+                // double move). Restrict guarded by-value arms to Copy bindings;
+                // by-reference matches bind borrows, which re-extract safely.
+                if (!refMatch) {
+                    for (auto& kv : bindings) {
+                        if (!isCopyAggregateElem(kv.second)) {
+                            error("a match guard on a by-value arm that binds a "
+                                  "non-Copy value (`" + kv.first + "`) is not "
+                                  "yet supported; match by reference (`match "
+                                  "&x`) or move the check into the arm body",
+                                  arm.guard->line, arm.guard->column);
+                            break;
+                        }
+                    }
+                }
+            }
             TypePtr bodyT = checkExpr(*arm.body);
             popScope();
             if (!unified) {
@@ -10097,6 +10133,14 @@ private:
             // nodes), as long as arm patterns were well-typed.
             matchTrees_[&me] = pattern_match::compileDecisionTree(
                 patExpected, me.arms, enumsForPm, variantIndex_);
+            // v68: for each guarded arm, build the suffix tree (arms after it)
+            // that codegen jumps to when the guard is false.
+            for (unsigned i = 0; i < me.arms.size(); ++i) {
+                if (!me.arms[i].guard) continue;
+                matchSuffixTrees_[&me][i] = pattern_match::compileDecisionTree(
+                    patExpected, me.arms, enumsForPm, variantIndex_,
+                    /*firstArm=*/i + 1);
+            }
         }
         return unified;
     }
