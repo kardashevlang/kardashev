@@ -2763,6 +2763,9 @@ bool resolveModules(const std::string& srcRaw,
 // drops its item. (A file-scope global keeps the recursive resolveModules /
 // cache-key helpers from having to thread it through every call.)
 static std::set<std::string> g_activeCfg;
+// v80: `--error-format=json` emits each diagnostic as a JSON object (one per
+// line) instead of the rich snippet — for IDE / CI tooling.
+static bool g_jsonDiagnostics = false;
 
 // Read a file fully into a string. Empty optional on I/O failure.
 std::optional<std::string> readFile(const std::string& path) {
@@ -2961,6 +2964,11 @@ struct ErrorCode {
     std::vector<const char*> match; // any of these substrings => this code
     const char* title;
     const char* explain;
+    // v80: a short, actionable fix-it shown inline as a `help:` line under the
+    // diagnostic (the `explain` text is the long form for `--explain`). Empty =
+    // no inline hint. Default member initializer so existing table entries that
+    // omit it stay valid aggregate initializers.
+    const char* help = "";
 };
 const std::vector<ErrorCode>& errorCodes() {
     // v64: the table is ORDERED most-specific-first — `classifyError` returns
@@ -3022,7 +3030,8 @@ const std::vector<ErrorCode>& errorCodes() {
          {"non-exhaustive match"},
          "non-exhaustive match",
          "A `match` does not cover every possible value of the scrutinee. Add\n"
-         "the missing pattern(s) shown, or a wildcard `_ => …` arm."},
+         "the missing pattern(s) shown, or a wildcard `_ => …` arm.",
+         "add the missing arms, or a catch-all `_ => …` arm"},
         {"E0571",
          {"outside of a loop", "outside a loop"},
          "`break`/`continue` outside a loop",
@@ -3042,7 +3051,8 @@ const std::vector<ErrorCode>& errorCodes() {
          "effect escapes `main` unhandled",
          "A user-declared effect performed somewhere reaches `main` without a\n"
          "`handle` block discharging it. Wrap the performing code in\n"
-         "`handle { … } with E { … }`, so no user effect escapes the program."},
+         "`handle { … } with E { … }`, so no user effect escapes the program.",
+         "wrap the performing code in `handle { … } with E { … }`"},
         {"E0712",
          {"unknown effect", "effect redefined", "effect operation redefined"},
          "unknown or duplicate effect",
@@ -3069,7 +3079,8 @@ const std::vector<ErrorCode>& errorCodes() {
          "cannot find a name in scope",
          "A name was referenced that is not a binding, function, type, or\n"
          "const in scope. Check the spelling, the import (`mod`/`pub`), and\n"
-         "that the binding is declared before use in an enclosing scope."},
+         "that the binding is declared before use in an enclosing scope.",
+         "check the spelling, and that the name is declared/imported in scope"},
         {"E0599",
          {"no field", "no method", "field access on non", "non-struct"},
          "no such field or method",
@@ -3084,7 +3095,8 @@ const std::vector<ErrorCode>& errorCodes() {
          {"cannot assign", "not mutable", "is immutable", "non-mut"},
          "assignment to an immutable binding",
          "Assignment requires a `let mut` binding (or a `&mut` place).\n"
-         "Declare the binding `let mut x = …;` to make it reassignable."},
+         "Declare the binding `let mut x = …;` to make it reassignable.",
+         "declare the binding as `let mut …` to make it reassignable"},
         // --- broad fallbacks (LAST) ---
         {"E0308",
          {"does not match", "same integer type", "expects bool", "arm body "
@@ -3094,12 +3106,14 @@ const std::vector<ErrorCode>& errorCodes() {
          "An expression's type does not match the type required by its\n"
          "context (a fn return type, an operator's operands, an `if`/`match`\n"
          "arm, or a `let` annotation). kardashev does not implicitly convert\n"
-         "between types — cast explicitly with `as`, or fix the value."},
+         "between types — cast explicitly with `as`, or fix the value.",
+         "convert explicitly with `as`, or annotate a literal (e.g. `5i64`)"},
         {"E0001",
          {"expected ", "unexpected "},
          "syntax error",
          "The parser reached a token it did not expect. Check for a missing\n"
-         "`;`, `}`, `)`, or `else`, or a keyword used as an identifier."},
+         "`;`, `}`, `)`, or `else`, or a keyword used as an identifier.",
+         "check for a missing `;`, `}`, `)`, or `else` just before here"},
     };
     return table;
 }
@@ -3112,6 +3126,49 @@ const ErrorCode* classifyError(const std::string& msg) {
     return nullptr;
 }
 } // namespace
+
+// v80: the underline width for a caret. Scans the source line from the caret
+// column over a "token-like" run — an identifier/number (`[A-Za-z0-9_]+`) or a
+// double-quoted string — so the diagnostic underlines the whole offending token
+// (`^~~~`) instead of a single `^`. Falls back to width 1 for an operator /
+// punctuation / out-of-range column.
+static std::size_t diagSpanLen(const std::string& srcLine, std::size_t column) {
+    if (column == 0 || column > srcLine.size()) return 1;
+    const std::size_t i = column - 1; // 0-based start
+    const char c = srcLine[i];
+    auto ident = [](char ch) {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+               (ch >= '0' && ch <= '9') || ch == '_';
+    };
+    if (ident(c)) {
+        std::size_t j = i;
+        while (j < srcLine.size() && ident(srcLine[j])) ++j;
+        return j - i;
+    }
+    if (c == '"') {
+        std::size_t j = i + 1;
+        while (j < srcLine.size() && srcLine[j] != '"') ++j;
+        return (j < srcLine.size() ? j + 1 : srcLine.size()) - i;
+    }
+    return 1;
+}
+
+// v80: minimal JSON string escaper for `--error-format=json` diagnostics.
+static std::string jsonEscapeDiag(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"': o += "\\\""; break;
+            case '\\': o += "\\\\"; break;
+            case '\n': o += "\\n"; break;
+            case '\t': o += "\\t"; break;
+            case '\r': o += "\\r"; break;
+            default: o += c;
+        }
+    }
+    return o;
+}
 
 void renderDiagnostic(std::ostream& os, const char* kind,
                       const std::string& message, std::size_t line,
@@ -3127,19 +3184,39 @@ void renderDiagnostic(std::ostream& os, const char* kind,
     }
     // v24 Phase 133: append the error code (rustc-style `error[E0308]:`) when a
     // curated code matches. Warnings are not coded.
+    const ErrorCode* ec = nullptr;
     std::string label = kind;
     if (label.find("error") != std::string::npos) {
-        if (const ErrorCode* ec = classifyError(message))
-            label += std::string("[") + ec->code + "]";
+        ec = classifyError(message);
+        if (ec) label += std::string("[") + ec->code + "]";
     }
-    os << label << ": " << adjustMessagePositions(message, preludeLines)
-       << '\n';
+    const std::string adjMsg = adjustMessagePositions(message, preludeLines);
     const bool inUser = line > preludeLines;
     const std::size_t dispLine = inUser ? (line - preludeLines) : line;
     const std::string& snippetSrc = inUser ? userSource : full;
     const std::string where = inUser ? file : std::string("<prelude>");
-    os << " --> " << where << ':' << dispLine << ':' << column << '\n';
     const std::string srcLine = nthLine(snippetSrc, dispLine);
+    const std::size_t span = diagSpanLen(srcLine, column); // v80
+
+    // v80: `--error-format=json` — one JSON object per diagnostic (NDJSON).
+    // `endColumn` is the half-open end (one past the last underlined column).
+    if (g_jsonDiagnostics) {
+        os << "{\"severity\":\""
+           << (label.find("warning") != std::string::npos ? "warning" : "error")
+           << "\",\"kind\":\"" << jsonEscapeDiag(kind) << "\",\"code\":"
+           << (ec ? "\"" + std::string(ec->code) + "\"" : std::string("null"))
+           << ",\"message\":\"" << jsonEscapeDiag(adjMsg) << "\""
+           << ",\"file\":\"" << jsonEscapeDiag(where) << "\",\"line\":"
+           << dispLine << ",\"column\":" << column << ",\"endColumn\":"
+           << (column + span);
+        if (ec && ec->help && ec->help[0])
+            os << ",\"help\":\"" << jsonEscapeDiag(ec->help) << "\"";
+        os << "}\n";
+        return;
+    }
+
+    os << label << ": " << adjMsg << '\n';
+    os << " --> " << where << ':' << dispLine << ':' << column << '\n';
     if (srcLine.empty() && dispLine != 0) {
         // Out of range (e.g. a merged-module line) — header + location only.
         return;
@@ -3148,8 +3225,12 @@ void renderDiagnostic(std::ostream& os, const char* kind,
     const std::string pad(gutter.size(), ' ');
     os << pad << " |\n";
     os << gutter << " | " << srcLine << '\n';
+    // v80: underline the whole offending token (`^~~~`), not just a caret.
     os << pad << " | " << std::string(column > 0 ? column - 1 : 0, ' ')
-       << "^\n";
+       << "^" << std::string(span > 1 ? span - 1 : 0, '~') << "\n";
+    // v80: an inline fix-it hint for the classified error code.
+    if (ec && ec->help && ec->help[0])
+        os << pad << " = help: " << ec->help << '\n';
 }
 
 void reportParseErrors(const kardashev::ParseResult& r,
@@ -4220,6 +4301,10 @@ int main(int argc, char** argv) {
             monoReportFlag = true;
         } else if (a == "--emit-c") {
             emitC = true;
+        } else if (a == "--error-format=json") {
+            // v80: emit compiler diagnostics as JSON (one object per line) for
+            // IDE / CI tooling, instead of the rich snippet.
+            g_jsonDiagnostics = true;
         } else if (a == "--doc") {
             emitDoc = true;
         } else if (a == "--cfg" && i + 1 < argc) {
@@ -4283,6 +4368,7 @@ int main(int argc, char** argv) {
                          "       kardc --cfg NAME ...       # enable a #[cfg(NAME)] flag (also --cfg key=val)\n"
                          "       kardc -W <file.kd>         # lint: warn on unused vars + unreachable code\n"
                          "       kardc --explain Exxxx      # explain a diagnostic error code\n"
+                         "       kardc --error-format=json <file.kd>  # emit diagnostics as JSON (NDJSON)\n"
                          "       kardc --no-cache ...       # bypass the AOT compile cache\n"
                          "       kardc --version            # print the toolchain version\n";
             return 0;
