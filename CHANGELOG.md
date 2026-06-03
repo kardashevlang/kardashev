@@ -18,6 +18,38 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.90.0] — Closing pass: read-only slices in the C backend + vectorization lock
+
+The final version of the v81–v90 arc. A grounded survey corrected two premises:
+"mutable slices" don't exist in *any* backend (mutation-through-slice is rejected
+even in LLVM), and vectorization is *already* complete across JIT/AOT/`--emit-llvm`
+(not JIT-only). So v90 ships the honest, real, testable cuts.
+
+### Added
+- **Read-only slices in the C backend** (`--emit-c` previously refused all slices):
+  `&[T]` → `struct kdslice { int64_t* ptr; int64_t len; }` (mirrors the LLVM
+  `{ i8*, i64 }` slice), with bounds-checked `slice_len` / `slice_get` /
+  `slice_get_ref` and `&v[a..b]` creation over a scalar `Vec`. Scalar-element only
+  (`&[i64]` / `&[bool]`); a non-scalar slice (`&[String]`) is cleanly refused
+  (LLVM keeps it).
+- **`smoke_test_v90_close.sh`** — slice read / subrange / `get_ref` each
+  **JIT == AOT == C backend**, the non-scalar-slice C refusal, and a vectorization
+  regression lock (IR-grep for vector ops) so the v51 TargetTransformInfo fix can't
+  silently regress in a future PassBuilder refactor.
+
+### Notes
+- Vectorization was verified already-correct across all emit paths (16 vector ops
+  in `--emit-llvm bench/loop.kd`; 17 SIMD instructions in the AOT binary) — v90
+  *locks it in* rather than fixing it.
+
+### Deferred (honest, no stubs) — a documented v91 line
+- A user-replaceable **`GlobalAlloc`** allocator: L/XL (~63 hardcoded
+  malloc/realloc/free sites + free-glue routing) and not CI-safely-observable
+  without fragile LD_PRELOAD; the 63-site inventory is captured for v91.
+- Genuine **slice mutation** (`slice_set` / `slice_get_mut`) — exists in no backend
+  today (needs typecheck + borrow-check + both backends).
+- Slice-from-fixed-array in the C backend; the <5-LOC array-layout-helper trim.
+
 ## [0.89.0] — Stack arrays `[T; N]`: C-backend parity + differential gate
 
 A ground-truth survey confirmed fixed-size arrays `[T; N]` are **already fully
