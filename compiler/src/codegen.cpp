@@ -9168,6 +9168,15 @@ private:
                 // value's arg/ret types at the indirect call site. This
                 // subsumes the Phase 4.3 bare-fn-pointer representation.
                 return fnValTy_;
+            case TypeKind::Var:
+                // v79: an unconstrained generic type variable reaching codegen —
+                // inference left a type parameter free (e.g. the error type of a
+                // bare `Ok(5)`, or the element of a bare `None`, where nothing
+                // pins it). The value at that type is never actually
+                // materialized, so default the phantom type to the scalar `i64`
+                // monomorphization (matching the C backend's int64_t default and
+                // the pre-generic i64-concrete behavior) rather than failing.
+                return llvm::Type::getInt64Ty(*ctx_);
             default:
                 errors_.push_back("codegen: unsupported type for codegen");
                 return llvm::Type::getInt64Ty(*ctx_);

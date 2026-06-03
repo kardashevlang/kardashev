@@ -18,6 +18,37 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.79.0] — Generic Option/Result combinators
+
+### Changed
+- **Generalized** the previously `i64`-only combinators to be fully generic
+  (mirroring the already-generic `result_is_err`/`ok`/`err`/`map_err`):
+  `option_map`, `option_and_then`, `option_unwrap_or`, `option_is_some`,
+  `option_ok_or`, `result_map`, `result_unwrap_or`, `result_is_ok`. Existing
+  `i64` callers are unaffected (they instantiate at `i64`).
+
+### Added
+- New combinators, all pure-prelude `match` over the enum (closures
+  effect-polymorphic via `! { e }`):
+  - **Option**: `option_is_none`, `option_map_or`, `option_or`,
+    `option_or_else`, `option_ok_or_else`.
+  - **Result**: `result_and_then`, `result_unwrap_or_else`, `result_map_or`,
+    `result_or`, `result_or_else`.
+
+### Notes
+- The `?` operator (Result, with `From`-based error conversion) and the `Error`
+  trait already shipped in v0.50.0 (Phase 190); this version re-verifies them in
+  the gate.
+- Gate: `smoke_test_combinators.sh` (4 JIT==AOT groups: Option, Result,
+  type-changing `ok_or`/`result_ok`/`map_err`, and `?` + `Error`).
+
+### Deferred (honest)
+- The `?` operator for **Option** (the type-checker requires `Ok`/`Err`
+  variants — a focused typecheck+codegen follow-on). Calling a generic
+  combinator with a bare `None` / `Err(x)` whose other type parameter is
+  unconstrained needs a type annotation (a general generic-inference limit, not
+  specific to these combinators).
+
 ## [0.78.0] — Lazy iterator adaptors (map / filter / fold / peekable)
 
 ### Added

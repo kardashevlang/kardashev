@@ -861,6 +861,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v79: generic Option/Result combinators (+ ? operator + Error trait re-check).
+sh_test(
+    name = "smoke_test_combinators",
+    srcs = ["smoke_test_combinators.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

@@ -393,6 +393,20 @@ source (JIT==AOT).
 
 ## v79 — generic Result/Option combinators + `?` ergonomics + custom error trait
 
+**STATUS: ✅ SHIPPED (v0.79.0).** The i64-only `option_*` / `result_*`
+combinators are generalized to fully generic (mirroring the already-generic
+`result_is_err`/`ok`/`err`/`map_err`), and the vocabulary is rounded out:
+`option_is_none`/`map_or`/`or`/`or_else`/`ok_or_else` +
+`result_and_then`/`unwrap_or_else`/`map_or`/`or`/`or_else`. All pure-prelude
+`match`, closures effect-polymorphic. The `?` operator (Result, `From`-converting)
+and `Error` trait already shipped in v0.50.0 (Phase 190) and are re-verified in
+the gate. Gate: `smoke_test_combinators.sh` (4 JIT==AOT groups). **Deferred:** the
+`?` operator for Option (typecheck requires Ok/Err — focused follow-on); generic
+combinators called with a bare `None`/`Err` whose other type param is
+unconstrained need a type annotation (general inference limit).
+
+<details><summary>Original plan</summary>
+
 **CORE.** Make the combinator library generic (currently i64-monomorphic):
 generic `option_map<T,U>`/`option_and_then<T,U>`, `result_map<T,U,E>`/
 `result_map_err<T,E,F>`/`result_and_then<T,U,E>` (effect-polymorphic closures via
@@ -405,6 +419,8 @@ fallible steps and short-circuits on the first Err; `?` propagates (JIT==AOT).
 
 **DEFERRALS.** Multi-shot/continuation effect handlers; MonadError-style trait
 abstraction; effect-row subsumption/variance.
+
+</details>
 
 ---
 

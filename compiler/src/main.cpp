@@ -1006,9 +1006,11 @@ std::string applyPrelude(const std::string& userSrc) {
     // `io`). i64 payload is the accepted MVP. Each is guarded on its own
     // name so a user redefinition wins without a duplicate-decl error.
     if (userSrc.find("fn option_map") == std::string::npos) {
+        // v79: generalized from i64-only to `<T, U, e>` (mirrors the generic
+        // result_* combinators). Instantiates at i64 for existing callers.
         prelude +=
-            "fn option_map(o: Option<i64>, f: fn(i64) -> i64 ! {e})"
-            " -> Option<i64> ! {e} {\n"
+            "fn option_map<T, U, e>(o: Option<T>, f: fn(T) -> U ! {e})"
+            " -> Option<U> ! {e} {\n"
             "    match o { Some(x) => Some(f(x)), None => None }\n"
             "}\n";
     }
@@ -1927,30 +1929,36 @@ std::string applyPrelude(const std::string& userSrc) {
             "fn str_lines(s: &String) -> Vec<String> ! { alloc } { str_split(s, 10) }\n";
     }
     if (userSrc.find("fn option_unwrap_or") == std::string::npos) {
+        // v79: generalized to `<T>` (was i64-only).
         prelude +=
-            "fn option_unwrap_or(o: Option<i64>, default: i64) -> i64 {\n"
+            "fn option_unwrap_or<T>(o: Option<T>, default: T) -> T {\n"
             "    match o { Some(x) => x, None => default }\n"
             "}\n";
     }
     if (userSrc.find("fn option_and_then") == std::string::npos) {
+        // v79: generalized to `<T, U, e>` (was i64-only). The monadic bind.
         prelude +=
-            "fn option_and_then(o: Option<i64>,"
-            " f: fn(i64) -> Option<i64> ! {e}) -> Option<i64> ! {e} {\n"
+            "fn option_and_then<T, U, e>(o: Option<T>,"
+            " f: fn(T) -> Option<U> ! {e}) -> Option<U> ! {e} {\n"
             "    match o { Some(x) => f(x), None => None }\n"
             "}\n";
     }
     if (userSrc.find("fn result_map") == std::string::npos) {
+        // v79: generalized to `<T, U, V, e>` (was i64-only). The error type uses
+        // `V` (a prelude-reserved generic letter) — NOT `E`/`F`, which collide
+        // with user types named E/F ("generic parameter shadows an existing type").
         prelude +=
-            "fn result_map(r: Result<i64, i64>, f: fn(i64) -> i64 ! {e})"
-            " -> Result<i64, i64> ! {e} {\n"
-            "    match r { Ok(x) => Ok(f(x)), Err(e) => Err(e) }\n"
+            "fn result_map<T, U, V, e>(r: Result<T, V>, f: fn(T) -> U ! {e})"
+            " -> Result<U, V> ! {e} {\n"
+            "    match r { Ok(x) => Ok(f(x)), Err(er) => Err(er) }\n"
             "}\n";
     }
     if (userSrc.find("fn result_unwrap_or") == std::string::npos) {
+        // v79: generalized to `<T, U>` (was i64-only).
         prelude +=
-            "fn result_unwrap_or(r: Result<i64, i64>, default: i64)"
-            " -> i64 {\n"
-            "    match r { Ok(x) => x, Err(e) => default }\n"
+            "fn result_unwrap_or<T, U>(r: Result<T, U>, default: T)"
+            " -> T {\n"
+            "    match r { Ok(x) => x, Err(er) => default }\n"
             "}\n";
     }
     // v12 Phase 73: integer math helpers (concrete i64), and a few more
@@ -1977,21 +1985,31 @@ std::string applyPrelude(const std::string& userSrc) {
             "}\n";
     }
     if (userSrc.find("fn option_is_some") == std::string::npos) {
+        // v79: generalized to `<T>`; `option_is_none` added.
         prelude +=
-            "fn option_is_some(o: Option<i64>) -> bool {\n"
+            "fn option_is_some<T>(o: Option<T>) -> bool {\n"
             "    match o { Some(x) => true, None => false }\n"
+            "}\n"
+            "fn option_is_none<T>(o: Option<T>) -> bool {\n"
+            "    match o { Some(x) => false, None => true }\n"
             "}\n";
     }
     if (userSrc.find("fn option_ok_or") == std::string::npos) {
+        // v79: generalized to `<T, E>`; `option_ok_or_else` added (lazy err).
         prelude +=
-            "fn option_ok_or(o: Option<i64>, err: i64) -> Result<i64, i64> {\n"
+            "fn option_ok_or<T, U>(o: Option<T>, err: U) -> Result<T, U> {\n"
             "    match o { Some(x) => Ok(x), None => Err(err) }\n"
+            "}\n"
+            "fn option_ok_or_else<T, U, e>(o: Option<T>, f: fn() -> U ! {e})"
+            " -> Result<T, U> ! {e} {\n"
+            "    match o { Some(x) => Ok(x), None => Err(f()) }\n"
             "}\n";
     }
     if (userSrc.find("fn result_is_ok") == std::string::npos) {
+        // v79: generalized to `<T, E>`.
         prelude +=
-            "fn result_is_ok(r: Result<i64, i64>) -> bool {\n"
-            "    match r { Ok(x) => true, Err(e) => false }\n"
+            "fn result_is_ok<T, U>(r: Result<T, U>) -> bool {\n"
+            "    match r { Ok(x) => true, Err(er) => false }\n"
             "}\n";
     }
     // v35 Phase 190: the error-handling ecosystem. The `Error` trait (a
@@ -2032,6 +2050,46 @@ std::string applyPrelude(const std::string& userSrc) {
             "fn result_map_err<T, U, V, e>(r: Result<T, U>, f: fn(U) -> V ! {e})"
             " -> Result<T, V> ! {e} {\n"
             "    match r { Ok(x) => Ok(x), Err(er) => Err(f(er)) }\n"
+            "}\n";
+    }
+    // v79: the rest of the generic Option/Result combinator vocabulary, all
+    // pure-prelude `match` over the enum (closures effect-polymorphic via `e`).
+    if (userSrc.find("fn option_map_or") == std::string::npos) {
+        prelude +=
+            "fn option_map_or<T, U, e>(o: Option<T>, default: U, f: fn(T) -> U ! {e})"
+            " -> U ! {e} {\n"
+            "    match o { Some(x) => f(x), None => default }\n"
+            "}\n"
+            "fn option_or<T>(a: Option<T>, b: Option<T>) -> Option<T> {\n"
+            "    match a { Some(x) => Some(x), None => b }\n"
+            "}\n"
+            "fn option_or_else<T, e>(a: Option<T>, f: fn() -> Option<T> ! {e})"
+            " -> Option<T> ! {e} {\n"
+            "    match a { Some(x) => Some(x), None => f() }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn result_and_then") == std::string::npos) {
+        // Error-type generic params use the prelude-reserved letters T/U/V only
+        // (NOT E/F, which collide with user types named E/F).
+        prelude +=
+            "fn result_and_then<T, U, V, e>(r: Result<T, V>,"
+            " f: fn(T) -> Result<U, V> ! {e}) -> Result<U, V> ! {e} {\n"
+            "    match r { Ok(x) => f(x), Err(er) => Err(er) }\n"
+            "}\n"
+            "fn result_unwrap_or_else<T, U, e>(r: Result<T, U>, f: fn(U) -> T ! {e})"
+            " -> T ! {e} {\n"
+            "    match r { Ok(x) => x, Err(er) => f(er) }\n"
+            "}\n"
+            "fn result_map_or<T, U, V, e>(r: Result<T, V>, default: U,"
+            " f: fn(T) -> U ! {e}) -> U ! {e} {\n"
+            "    match r { Ok(x) => f(x), Err(er) => default }\n"
+            "}\n"
+            "fn result_or<T, U, V>(a: Result<T, U>, b: Result<T, V>) -> Result<T, V> {\n"
+            "    match a { Ok(x) => Ok(x), Err(er) => b }\n"
+            "}\n"
+            "fn result_or_else<T, U, V, e>(a: Result<T, U>,"
+            " f: fn(U) -> Result<T, V> ! {e}) -> Result<T, V> ! {e} {\n"
+            "    match a { Ok(x) => Ok(x), Err(er) => f(er) }\n"
             "}\n";
     }
     // v35 Phase 191: a seeded pseudo-random generator — a 64-bit linear
