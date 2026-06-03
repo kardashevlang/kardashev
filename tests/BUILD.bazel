@@ -819,6 +819,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v73: associated constants completed (bare Type::CONST + Self:: resolution).
+sh_test(
+    name = "smoke_test_assoc_const",
+    srcs = ["smoke_test_assoc_const.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

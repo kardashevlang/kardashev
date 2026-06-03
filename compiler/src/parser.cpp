@@ -3520,6 +3520,22 @@ private:
             if (!restrictStructLit_ && check(TokenKind::LBrace)) {
                 return parseStructLit(tok);
             }
+            // v73: a bare qualified path `Type::CONST` / `Self::CONST` (no call
+            // parens) — e.g. an associated constant used as a value. Desugar to
+            // a zero-arg call of the no-self associated item, retaining the
+            // qualifier (a plain IdentExpr would drop `Type::`, leaving an
+            // unresolved bare name). So `Type::CONST` ≡ `Type::CONST()`. Bare
+            // non-path identifiers (no `::`) are unaffected.
+            if (wasPath) {
+                auto call = std::make_unique<ast::CallExpr>();
+                call->line = tok.line;
+                call->column = tok.column;
+                call->callee = tok.lexeme;
+                call->wasPath = true;
+                call->pathQualifier = prevSeg.lexeme;
+                call->explicitTypeArgs = std::move(turbofishArgs);
+                return call;
+            }
             auto e = std::make_unique<ast::IdentExpr>();
             e->line = tok.line;
             e->column = tok.column;

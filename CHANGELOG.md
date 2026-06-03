@@ -18,6 +18,37 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.73.0] — Associated constants, completed (Rust-style access)
+
+### Added
+- **Bare-path associated-const access** `Type::CONST` (no parens). Trait
+  associated consts (`trait B { const MAX: i64; }` / `impl B for G { const MAX:
+  i64 = 42; }`) and the `Type::CONST()` call form already worked (v25); v73 adds
+  the Rust spelling `Type::CONST` as a value — previously the qualifier was
+  dropped and it errored as an unknown identifier.
+- **`Self`-qualified resolution** inside impl / default methods: `Self::CONST`,
+  `Self::CONST()`, and `Self::method()` (a sibling associated function) now
+  resolve through the concrete implementing type. The `Self` qualifier is mapped
+  to that type's name during type-checking; codegen is unchanged (it already
+  reads the resolved mangled target).
+- Bare-path access also flows through to generic `T::CONST` (bounded type param)
+  via the existing generic-static-call path.
+
+### Notes
+- Implemented in the parser (a bare `Type::seg` path now desugars to a zero-arg
+  call of the no-self associated item, keeping the qualifier) + a small
+  type-check `Self`→concrete-type mapping. `Type::CONST` ≡ `Type::CONST()`.
+- Gate: `smoke_test_assoc_const.sh` (5 cases incl. bool/f64 consts + enum-variant
+  regression, JIT==AOT).
+- **Already shipped (verified, no change needed):** associated consts in
+  traits/impls, impl coverage checking, and `where`-clauses on functions, impl
+  blocks, and impl methods all work today.
+
+### Deferred (honest)
+- `where`-clauses on **type aliases** — type aliases don't yet take generic
+  params (`type Alias<T> = …`), which that feature depends on; deferred as a
+  focused follow-on.
+
 ## [0.72.0] — f64 transcendental math library
 
 ### Added

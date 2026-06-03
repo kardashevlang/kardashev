@@ -8276,7 +8276,20 @@ private:
         // `callee`; otherwise this is an ordinary (flat-merged) module path and
         // falls through to the bare-name lookup below.
         if (!call.pathQualifier.empty()) {
-            auto tIt = methodImplLookup_.find(call.pathQualifier);
+            // v73: inside an impl/default method, `Self::CONST` / `Self::assoc`
+            // resolves through the concrete implementing type. Map the `Self`
+            // qualifier to that type's name before the impl lookup (codegen
+            // reads staticCallMangled_, so no codegen change is needed).
+            std::string effQual = call.pathQualifier;
+            if (effQual == "Self" && currentGenericEnv_) {
+                auto sit = currentGenericEnv_->find("Self");
+                if (sit != currentGenericEnv_->end()) {
+                    TypePtr st = resolve(sit->second);
+                    if (st->kind == TypeKind::Struct) effQual = st->structName;
+                    else if (st->kind == TypeKind::Enum) effQual = st->enumName;
+                }
+            }
+            auto tIt = methodImplLookup_.find(effQual);
             if (tIt != methodImplLookup_.end()) {
                 auto mIt = tIt->second.find(call.callee);
                 if (mIt != tIt->second.end() && mIt->second.second) {

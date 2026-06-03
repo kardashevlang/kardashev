@@ -194,6 +194,21 @@ libm externs routed through the v67 `createRuntimeFunction` helper.
 
 ## v73 — associated consts in traits + where-clauses on impls/type-aliases
 
+**STATUS: ✅ SHIPPED (v0.73.0) — scope adjusted after verification.** A survey
+found most of the originally-planned surface was *already implemented*:
+associated consts in traits/impls (parsed as no-self methods, v25 Phase 139),
+impl coverage checking, and `where`-clauses on functions / impl blocks / impl
+methods all work today. The genuine, valuable gap was **ergonomic access**, so
+v73 delivers that: bare-path `Type::CONST` (no parens, the Rust spelling — the
+parser previously dropped the qualifier) and `Self`-qualified resolution
+(`Self::CONST`, `Self::CONST()`, `Self::method()`) inside impl/default methods,
+mapped to the concrete type at type-check (codegen unchanged via
+`staticCallMangled_`). Gate: `smoke_test_assoc_const.sh` (5 cases, JIT==AOT).
+**Deferred (honest):** `where` on **type aliases** — blocked on generic type
+aliases (`type Alias<T> = …`), a focused follow-on.
+
+<details><summary>Original plan (mostly pre-existing)</summary>
+
 **CORE.** Add `AssocConstDecl{name,type,default?}` to `TraitDecl` and
 `AssocConstDef` to `ImplDecl`, mirroring the existing `AssocTypeDecl` machinery
 (ast.hpp:910). Parse `const NAME: T;` in traits / `const NAME: T = expr;` in
@@ -206,6 +221,8 @@ impls. Typecheck: every impl provides each non-defaulted assoc const; resolve
 in a default method works; a missing assoc const is rejected.
 
 **DEFERRALS.** const-generic-valued assoc consts; orphan-rule enforcement.
+
+</details>
 
 ---
 
