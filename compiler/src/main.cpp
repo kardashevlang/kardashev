@@ -4323,6 +4323,10 @@ int main(int argc, char** argv) {
             kardashev::setEffectsStrict(true);
         } else if (a == "--effects=opt-in") {
             kardashev::setEffectsStrict(false); // the default; explicit no-op
+        } else if (a == "--effects=extended") {
+            // v83: recognize the niche `share` / `div` extension effect labels
+            // in explicit rows (default: only the 5 core labels).
+            kardashev::setEffectsExtended(true);
         } else if (a == "--doc") {
             emitDoc = true;
         } else if (a == "--cfg" && i + 1 < argc) {
@@ -4336,6 +4340,32 @@ int main(int argc, char** argv) {
             std::string want = argv[++i];
             for (char& ch : want)
                 if (ch >= 'a' && ch <= 'z') ch = char(ch - 32);
+            // v83: `kardc --explain effects` — a consolidated guide to the
+            // (opt-in, v81+) effect system, replacing cross-referencing the
+            // scattered E0710/E0711/E0712 entries.
+            if (want == "EFFECTS") {
+                std::cout <<
+                    "effects: an OPTIONAL typed side-channel.\n\n"
+                    "Since v0.81.0 effects are OPT-IN. A function with no `! { … }`\n"
+                    "row is unchecked — it may perform any effect. Reach for an\n"
+                    "explicit row only to PROVE a property (purity / IO-free /\n"
+                    "non-allocating), most usefully with the `#[codegen(no_alloc/\n"
+                    "no_panic/no_io)]` contracts.\n\n"
+                    "For everyday error handling use `Result<T, E>` + the `?`\n"
+                    "operator + ownership — not effects. `fn main() -> Result<(), E>`\n"
+                    "exits non-zero on `Err`.\n\n"
+                    "Effect labels: `io`, `alloc`, `panic`, `async`, `unwind`,\n"
+                    "and `share` (the concurrency / thread-boundary effect). The\n"
+                    "niche `div` (may-not-terminate) label is recognized in an\n"
+                    "explicit row only under `--effects=extended`.\n\n"
+                    "Modes: `--effects=opt-in` (default), `--effects=strict`\n"
+                    "(an absent row asserts purity), `--effects=extended`.\n"
+                    "`#[allow(missing_effect)]` opts one fn out of strict mode.\n\n"
+                    "Related diagnostics: E0710 (undeclared effect), E0711 (a user\n"
+                    "effect escapes `main` unhandled — wrap in `handle { … } with`),\n"
+                    "E0712 (unknown / duplicate effect label).\n";
+                return 0;
+            }
             for (const auto& ec : errorCodes()) {
                 if (want == ec.code) {
                     std::cout << ec.code << ": " << ec.title << "\n\n"

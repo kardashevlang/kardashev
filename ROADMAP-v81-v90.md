@@ -127,6 +127,8 @@ async boundaries beyond what v32 already supports. No `try { }` block.
 
 ### v83 — collapse the effect surface to one opt-in feature set + docs
 
+**STATUS: ✅ SHIPPED (v0.83.0) — scope adjusted.** `div` demoted to an extension label behind `--effects=extended` (g_effectsExtended + isBuiltinEffect gate; 0 real uses); `docs/effects.md` rewritten around the v81 opt-in model + `--effects` modes; `kardc --explain effects` consolidated guide added. **Adjusted from plan:** `share` is KEPT as a recognized core-adjacent label (it is auto-inferred by thread/channel primitives and declared by ~15 unit + dozens of smoke tests; gating it needs inferred-filtering + edge-case row rewrites with no real simplification gain — the opt-in model already removes the *requirement*). The prelude row-trim pass is likewise deferred (churn-heavy, low value). Gate: `smoke_test_effects_surface.sh`.
+
 **Theme:** "Drastically simplify." Reduce the surface area users must learn:
 prune redundant built-in labels, unify the docs around opt-in, and make the
 *remaining* effect machinery a coherent single feature rather than scattered

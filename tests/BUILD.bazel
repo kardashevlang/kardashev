@@ -890,6 +890,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v83: collapse the effect surface (div gated behind --effects=extended;
+# --explain effects consolidated guide).
+sh_test(
+    name = "smoke_test_effects_surface",
+    srcs = ["smoke_test_effects_surface.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

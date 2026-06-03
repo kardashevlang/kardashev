@@ -374,4 +374,9 @@ TypeCheckResult typecheck(const ast::Program& program);
 // `--effects=strict` CLI flag.
 void setEffectsStrict(bool strict);
 
+// v83: enable the `share`/`div` extension effect labels in explicit `! { … }`
+// rows (off by default — the recognized surface is the 5 core labels). From a
+// `--effects=extended` CLI flag.
+void setEffectsExtended(bool ext);
+
 } // namespace kardashev
