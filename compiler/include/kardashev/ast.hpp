@@ -821,6 +821,10 @@ struct FnDecl {
     // an EXPLICIT row (incl. `! { }` — strictly checked, `! {}` = asserted pure).
     // Set by the parser from `sawEffectRow_`.
     bool sawEffectRow = false;
+    // v82: `#[allow(missing_effect)]` — suppress the undeclared-effect error for
+    // this fn even under `--effects=strict` (a surgical opt-out so a codebase
+    // can run strict mode with a few exceptions).
+    bool allowMissingEffect = false;
     bool isAsync = false; // `async fn` returns a Future and implicitly
                             // carries the `async` effect; codegen (Phase 12)
                             // splits it into a resumable poll fn over a frame.

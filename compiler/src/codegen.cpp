@@ -431,7 +431,34 @@ public:
         return false;
     }
 
+    // v82: if the entry `main` returns a `Result` (lowered as a `{ i32 tag, … }`
+    // struct), rename it and synthesize an i64-returning `main` that exits 0 on
+    // `Ok` (tag 0) and 1 on `Err`. Done in IR (not by decoding a struct return
+    // through an `int64_t(*)()` pointer, which is ABI-fragile) so both the JIT
+    // (looks up `main`, calls it as i64) and AOT (`addCMainWrapper` wraps the
+    // i64) see a plain integer entry. The validation in main.cpp permits a
+    // `Result`-returning entry; emit_c refuses one.
+    void wrapResultMain() {
+        auto* m = module_->getFunction("main");
+        if (!m || m->isDeclaration() || m->arg_size() != 0) return;
+        if (!m->getReturnType()->isStructTy()) return; // only a Result-shaped main
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        m->setName("__kd_main_result");
+        auto* fnTy = llvm::FunctionType::get(i64Ty, {}, false);
+        auto* wrap = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, "main", module_.get());
+        llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", wrap));
+        llvm::Value* res = b.CreateCall(m, {}, "mainres");
+        llvm::Value* tag = b.CreateExtractValue(res, {0}, "tag");
+        llvm::Value* isErr = b.CreateICmpNE(
+            tag, llvm::ConstantInt::get(tag->getType(), 0), "iserr");
+        b.CreateRet(b.CreateSelect(isErr, llvm::ConstantInt::get(i64Ty, 1),
+                                   llvm::ConstantInt::get(i64Ty, 0), "exit"));
+    }
+
     CodegenResult finish() {
+        wrapResultMain(); // v82: main() -> Result becomes an i64 exit-code entry
         // Phase 14a: finalize DWARF before verification. The module flags tell
         // LLVM the metadata is debug-info v3 and to emit DWARF v4; finalize()
         // resolves the DIBuilder's temporary nodes. Order matters: the

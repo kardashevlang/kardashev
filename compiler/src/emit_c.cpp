@@ -1545,7 +1545,17 @@ struct CEmitter {
             currentGenericParams_ = savedG;
             if (sig.empty()) return;
             protos += sig + ";\n";
-            if (fn.name == "main") hasMain = true;
+            if (fn.name == "main") {
+                hasMain = true;
+                // v82: a `main() -> Result<…>` entry is supported by the LLVM
+                // backend (an i64 exit-code wrapper) but not the C backend yet —
+                // refuse cleanly rather than emit `(int)kd_main()` on a struct.
+                if (fn.returnType.name == "Result") {
+                    err("a `main() -> Result<…>` entry is outside the C-backend "
+                        "subset (use the LLVM/JIT/AOT backend)");
+                    return;
+                }
+            }
         }
 
         // v30 Phase 165: emit user-fn definitions into a BUFFER first — emitting

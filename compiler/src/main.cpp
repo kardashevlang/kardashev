@@ -2090,6 +2090,14 @@ std::string applyPrelude(const std::string& userSrc) {
             "fn result_or_else<T, U, V, e>(a: Result<T, U>,"
             " f: fn(U) -> Result<T, V> ! {e}) -> Result<T, V> ! {e} {\n"
             "    match a { Ok(x) => Ok(x), Err(er) => f(er) }\n"
+            "}\n"
+            // v82: flatten a nested Result / Option (the monadic join) — common
+            // when a combinator returns a Result/Option of one.
+            "fn result_flatten<T, U>(r: Result<Result<T, U>, U>) -> Result<T, U> {\n"
+            "    match r { Ok(inner) => inner, Err(er) => Err(er) }\n"
+            "}\n"
+            "fn option_flatten<T>(o: Option<Option<T>>) -> Option<T> {\n"
+            "    match o { Some(inner) => inner, None => None }\n"
             "}\n";
     }
     // v35 Phase 191: a seeded pseudo-random generator — a 64-bit linear
@@ -3340,13 +3348,17 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
     bool entryOk = false;
     for (const auto& fn : program.functions) {
         if (fn.name != entry) continue;
+        // v82: also accept `fn main() -> Result<T, E>` — codegen synthesizes an
+        // i64 exit-code wrapper (Ok => 0, Err => 1) named `main`.
         entryOk = fn.params.empty() && (fn.returnType.name == "i64" ||
-                                        fn.returnType.name == "bool");
+                                        fn.returnType.name == "bool" ||
+                                        fn.returnType.name == "Result");
         break;
     }
     if (!entryOk) {
         std::cerr << "kardc: entry `" << entry << "` must have signature `fn "
-                  << entry << "() -> i64` (or `-> bool`) for JIT execution\n";
+                  << entry << "() -> i64` (or `-> bool` / `-> Result<T, E>`) "
+                     "for JIT execution\n";
         return std::nullopt;
     }
     auto tcr = kardashev::typecheck(program);

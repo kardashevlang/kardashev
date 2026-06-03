@@ -18,6 +18,37 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.82.0] — Result + ownership as the error story
+
+Continues the opt-in-effects arc by making `Result` + `?` + ownership the
+*primary* error/resource story.
+
+### Added
+- **`fn main() -> Result<T, E>`** entrypoint. Codegen synthesizes an i64
+  exit-code wrapper (`Ok` → 0, `Err` → 1) as the real `main`; the AOT binary
+  uses it as the process exit code, the JIT prints it. Done in IR (not by
+  decoding a struct return through an `int64_t(*)()` pointer), so both backends
+  see a plain integer entry. Combined with v81's opt-in `?`, this gives the
+  idiomatic `let v = step()?; Ok(v)` top-level error flow.
+- **`#[allow(missing_effect)]`** attribute — suppresses the undeclared-effect
+  error for one fn even under `--effects=strict`, so a codebase can run strict
+  mode with surgical opt-outs (`FnDecl.allowMissingEffect`, consulted in
+  `checkEffects`).
+- **`result_flatten`** (`Result<Result<T,U>,U> → Result<T,U>`) and
+  **`option_flatten`** (`Option<Option<T>> → Option<T>`) — the monadic join,
+  rounding out the (already large, v79) combinator vocabulary.
+
+### Notes
+- `?` already works in a no-row `Result`-returning fn (v81 opt-in) — verified.
+- Gate: `smoke_test_result_main.sh` (main→Result exit codes, `#[allow]` under
+  strict, flatten combinators).
+- The C backend (`--emit-c`) refuses a `main() -> Result` entry cleanly (LLVM
+  backend only).
+
+### Deferred (honest)
+- A `-W effect-unchecked` migration lint (needs the typechecker to expose
+  inferred effects) and a custom `Error` trait hierarchy / backtraces.
+
 ## [0.81.0] — Effects are opt-in
 
 Begins the v81–v90 "practical-systems-language" arc. The headline: effects are

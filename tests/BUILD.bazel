@@ -883,6 +883,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v82: main() -> Result + #[allow(missing_effect)] + result/option_flatten.
+sh_test(
+    name = "smoke_test_result_main",
+    srcs = ["smoke_test_result_main.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

@@ -1029,6 +1029,8 @@ private:
         decl.isAsync = isAsync;
         decl.isTotal = pendingTotal_; // v47 `#[total]`
         pendingTotal_ = false;
+        decl.allowMissingEffect = pendingAllowMissingEffect_; // v82
+        pendingAllowMissingEffect_ = false;
         decl.noAlloc = pendingNoAlloc_; // v48 `#[codegen(no_alloc)]`
         decl.noPanic = pendingNoPanic_; // v48 `#[codegen(no_panic)]`
         decl.noIo = pendingNoIo_;       // v48 `#[codegen(no_io)]`
@@ -2498,6 +2500,7 @@ private:
     // attributes are tolerated (skipped to the closing `]`).
     std::vector<std::string> pendingDerives_;
     bool pendingTotal_ = false; // v47 `#[total]` for the next fn decl
+    bool pendingAllowMissingEffect_ = false; // v82 `#[allow(missing_effect)]`
     bool pendingNoAlloc_ = false; // v48 `#[codegen(no_alloc)]` for the next fn
     bool pendingNoPanic_ = false; // v48 `#[codegen(no_panic)]` for the next fn
     bool pendingNoIo_ = false;    // v48 `#[codegen(no_io)]` for the next fn
@@ -2530,6 +2533,21 @@ private:
                 if (!enabled) cfgDropNext_ = true;
             } else if (attr.lexeme == "total") {
                 pendingTotal_ = true; // v47: the next fn asserts totality
+            } else if (attr.lexeme == "allow") {
+                // v82: `#[allow(missing_effect)]` — suppress the strict-mode
+                // undeclared-effect error for the next fn. Other allow(...) lints
+                // are parsed + tolerated (forward-compatible).
+                expect(TokenKind::LParen, "(");
+                if (!check(TokenKind::RParen)) {
+                    while (true) {
+                        Token a = expect(TokenKind::Identifier, "lint name");
+                        if (a.lexeme == "missing_effect")
+                            pendingAllowMissingEffect_ = true;
+                        if (!accept(TokenKind::Comma)) break;
+                        if (check(TokenKind::RParen)) break;
+                    }
+                }
+                expect(TokenKind::RParen, ")");
             } else if (attr.lexeme == "codegen") {
                 // v48: `#[codegen(no_alloc, no_panic, ...)]` quality contracts.
                 expect(TokenKind::LParen, "(");
