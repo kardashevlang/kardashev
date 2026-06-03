@@ -82,6 +82,7 @@ enum class TokenKind {
     FatArrow, // =>
     DotDot,   // .. — Phase 9 exclusive range
     DotDotEq, // ..= — Phase 9 inclusive range
+    At,       // @ — v69 pattern `name @ subpattern` binding
     Question, // ? — Phase 3.4 try operator
     Ampersand, // & — Phase 2.4b shared borrow / reference type
     Bang, // ! — Phase 4 effect-row introducer (the `!=` two-char form has

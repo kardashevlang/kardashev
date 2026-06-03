@@ -427,6 +427,7 @@ std::vector<Token> lex(std::string_view source) {
         case ':': push1(TokenKind::Colon, startCol); continue;
         case '.': push1(TokenKind::Dot, startCol); continue;
         case '?': push1(TokenKind::Question, startCol); continue;
+        case '@': push1(TokenKind::At, startCol); continue; // v69 `name @ pat`
         case '&': push1(TokenKind::Ampersand, startCol); continue;
         case '!': push1(TokenKind::Bang, startCol); continue;
         case '|': push1(TokenKind::Pipe, startCol); continue;
@@ -509,6 +510,7 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::Colon: return "Colon";
     case TokenKind::Dot: return "Dot";
     case TokenKind::Question: return "Question";
+    case TokenKind::At: return "At";
     case TokenKind::Ampersand: return "Ampersand";
     case TokenKind::Bang: return "Bang";
     case TokenKind::Dollar: return "Dollar";

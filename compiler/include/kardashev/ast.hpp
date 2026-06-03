@@ -168,6 +168,15 @@ struct SlicePat : Pattern {
     bool hasRest = false;
 };
 
+// v69: an @-binding `name @ subpattern` — binds `name` to the whole matched
+// value AND matches `inner` against it (so both the binding and the inner
+// pattern's own bindings are in scope). Lowered in the decision tree by binding
+// `name` at the current occurrence, then matching `inner`.
+struct AtPat : Pattern {
+    std::string name;
+    PatternPtr inner;
+};
+
 // --- Expressions ---
 
 // Forward decl: TypeRef is defined in the "Top-level" section below, but

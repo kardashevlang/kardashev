@@ -18,6 +18,26 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.69.0] — Integer range patterns (`0..10 =>`)
+
+### Added
+- **Range patterns** in match arms: `lo..hi =>` (exclusive) and `lo..=hi =>`
+  (inclusive), for integer scrutinees. Implemented as **sugar over v68 guards** —
+  a range arm binds the scrutinee to a fresh name and produces the guard
+  `(v >= lo) && (v < hi)` (or `<= hi`), reusing the suffix-tree fall-through and
+  guard-aware exhaustiveness. So range arms chain correctly (`0..10 / 10..20 /
+  _`), combine with explicit `if` guards, and a range arm does **not** count
+  toward coverage — a range-only match is non-exhaustive (E0004), needing a `_`.
+- New `@` token (lexer) for the reserved `name @ pattern` syntax.
+
+### Deferred (honest)
+- **`@`-bindings** (`name @ pattern`): the `@` token + AST node exist, but
+  binding a whole value through decision-tree specialization is a focused
+  follow-on — for now `name @ pattern` is **rejected with a clear message**
+  (bind in the arm body instead) rather than mis-bound.
+- Nested range patterns (`Some(0..10)`) and char ranges; range patterns don't
+  participate in integer-domain exhaustiveness (a full-range still needs `_`).
+
 ## [0.68.0] — Match guards (`pat if cond =>`)
 
 ### Added
