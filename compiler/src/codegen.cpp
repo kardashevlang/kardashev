@@ -13375,6 +13375,88 @@ private:
         return buildOptionI64(result, builder_->CreateNot(overflow, "is_some"));
     }
 
+    // v70: saturating integer arithmetic on i64. Same overflow detection as the
+    // checked_* path, but instead of an Option we CLAMP to INT64_MIN/MAX in the
+    // overflow direction (so the result is always a plain i64).
+    llvm::Value* emitSaturatingArith(const ast::CallExpr& call) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i128Ty = llvm::Type::getIntNTy(ctx, 128);
+        auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+        auto* maxI64 = llvm::ConstantInt::getSigned(i64Ty, INT64_MAX);
+        auto* minI64 = llvm::ConstantInt::getSigned(i64Ty, INT64_MIN);
+        llvm::Value* a = emitConsume(*call.args[0]);
+        llvm::Value* b = emitConsume(*call.args[1]);
+        const std::string& op = call.callee;
+        llvm::Value* result;
+        llvm::Value* overflow;
+        llvm::Value* clamp; // value substituted when overflow is true
+        if (op == "saturating_add") {
+            result = builder_->CreateAdd(a, b, "sum");
+            auto* t = builder_->CreateAnd(builder_->CreateXor(a, result),
+                                          builder_->CreateXor(b, result));
+            overflow = builder_->CreateICmpSLT(t, zero, "ovf");
+            // On add overflow a and b share a sign: a>=0 => +overflow => MAX.
+            auto* aNonNeg = builder_->CreateICmpSGE(a, zero, "anonneg");
+            clamp = builder_->CreateSelect(aNonNeg, maxI64, minI64, "clamp");
+        } else if (op == "saturating_sub") {
+            result = builder_->CreateSub(a, b, "diff");
+            auto* t = builder_->CreateAnd(builder_->CreateXor(a, b),
+                                          builder_->CreateXor(a, result));
+            overflow = builder_->CreateICmpSLT(t, zero, "ovf");
+            // On sub overflow a>=0 (b<0) => +overflow => MAX, else MIN.
+            auto* aNonNeg = builder_->CreateICmpSGE(a, zero, "anonneg");
+            clamp = builder_->CreateSelect(aNonNeg, maxI64, minI64, "clamp");
+        } else { // saturating_mul
+            auto* p = builder_->CreateMul(builder_->CreateSExt(a, i128Ty),
+                                          builder_->CreateSExt(b, i128Ty),
+                                          "p128");
+            result = builder_->CreateTrunc(p, i64Ty, "mul");
+            overflow = builder_->CreateICmpNE(
+                p, builder_->CreateSExt(result, i128Ty), "ovf");
+            // Clamp direction = sign of the TRUE (128-bit) product.
+            auto* pNeg = builder_->CreateICmpSLT(
+                p, llvm::ConstantInt::get(i128Ty, 0), "pneg");
+            clamp = builder_->CreateSelect(pNeg, minI64, maxI64, "clamp");
+        }
+        return builder_->CreateSelect(overflow, clamp, result, "sat");
+    }
+
+    // v70: bit-manipulation intrinsics on i64, lowered to LLVM intrinsics.
+    // count_zeros = 64 - popcount; leading/trailing_zeros use the non-poison
+    // form (return 64 for an all-zero input, matching Rust). rotate_*/ uses the
+    // funnel-shift intrinsics with the value funneled against itself (the shift
+    // amount is taken modulo the bit width, as Rust's rotate does).
+    llvm::Value* emitBitIntrinsic(const ast::CallExpr& call) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i1False = llvm::ConstantInt::getFalse(ctx);
+        const std::string& op = call.callee;
+        llvm::Value* x = emitConsume(*call.args[0]);
+        if (op == "count_ones")
+            return builder_->CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, x);
+        if (op == "count_zeros") {
+            auto* ones =
+                builder_->CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, x);
+            return builder_->CreateSub(llvm::ConstantInt::get(i64Ty, 64), ones,
+                                       "czeros");
+        }
+        if (op == "leading_zeros")
+            return builder_->CreateIntrinsic(llvm::Intrinsic::ctlz, {i64Ty},
+                                             {x, i1False});
+        if (op == "trailing_zeros")
+            return builder_->CreateIntrinsic(llvm::Intrinsic::cttz, {i64Ty},
+                                             {x, i1False});
+        if (op == "reverse_bytes")
+            return builder_->CreateUnaryIntrinsic(llvm::Intrinsic::bswap, x);
+        // rotate_left / rotate_right — binary funnel shift of x against itself.
+        llvm::Value* amt = emitConsume(*call.args[1]);
+        llvm::Intrinsic::ID id = (op == "rotate_left")
+                                     ? llvm::Intrinsic::fshl
+                                     : llvm::Intrinsic::fshr;
+        return builder_->CreateIntrinsic(id, {i64Ty}, {x, x, amt});
+    }
+
     llvm::Value* emitCall(const ast::CallExpr& call) {
         // Phase 52: a GENERIC static call `T::method()` — resolve the bound Var
         // to the concrete type at THIS monomorphization, then call that type's
@@ -13424,6 +13506,20 @@ private:
             call.callee == "wrapping_add" || call.callee == "wrapping_sub" ||
             call.callee == "wrapping_mul") {
             return emitCheckedArith(call);
+        }
+        // v70: saturating integer arithmetic (clamp to INT64_MIN/MAX).
+        if (call.callee == "saturating_add" ||
+            call.callee == "saturating_sub" ||
+            call.callee == "saturating_mul") {
+            return emitSaturatingArith(call);
+        }
+        // v70: bit-manipulation intrinsics on i64.
+        if (call.callee == "count_ones" || call.callee == "count_zeros" ||
+            call.callee == "leading_zeros" ||
+            call.callee == "trailing_zeros" ||
+            call.callee == "reverse_bytes" || call.callee == "rotate_left" ||
+            call.callee == "rotate_right") {
+            return emitBitIntrinsic(call);
         }
         // v39 raw-pointer arithmetic / write. `ptr_offset` is a GEP by element
         // over the pointee LLVM type (advances by n elements); `ptr_write`

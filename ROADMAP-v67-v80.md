@@ -112,6 +112,15 @@ binds all three (JIT==AOT).
 
 ## v70 — saturating arithmetic + integer bit intrinsics
 
+**STATUS: ✅ SHIPPED (v0.70.0).** `saturating_add/sub/mul` clamp to
+`i64::MIN/MAX` (overflow detection reused from the v33 `checked_*` path, then a
+`select` to the boundary). Bit intrinsics `count_ones`/`count_zeros`/
+`leading_zeros`/`trailing_zeros`/`reverse_bytes`/`rotate_left`/`rotate_right`
+lower to LLVM `ctpop`/`ctlz`/`cttz`/`bswap`/`fshl`/`fshr`. Names chosen to match
+Rust (`count_ones`, `reverse_bytes`) rather than the LLVM intrinsic spelling.
+Gate: `smoke_test_satbits.sh` (7 cases, JIT==AOT); C backend refuses (out of
+subset). **Deferred:** sized-int (i8…u32) variants stay i64-only.
+
 > Narrowed: `checked_*` and `wrapping_*` already exist (v33 Phase 181) — verified.
 
 **CORE.** Add `saturating_add/sub/mul_i64` (clamp to i64 MIN/MAX via the existing

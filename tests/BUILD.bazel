@@ -798,6 +798,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v70: saturating arithmetic + bit-manipulation intrinsics on i64.
+sh_test(
+    name = "smoke_test_satbits",
+    srcs = ["smoke_test_satbits.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
