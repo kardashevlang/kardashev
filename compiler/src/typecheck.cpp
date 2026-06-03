@@ -274,10 +274,23 @@ public:
             fnSchemas_["str_parse_f64"] = std::move(sch);
         }
         // v12 Phase 73: f64 math (f64 -> f64), pure. sqrt / floor / ceil / abs.
+        // v72 extends this with the transcendental library: trig, exp/log, and
+        // the binary ops pow/atan2/hypot/copysign/fmod/min/max.
         for (const char* nm :
-             {"f64_sqrt", "f64_floor", "f64_ceil", "f64_abs"}) {
+             {"f64_sqrt", "f64_floor", "f64_ceil", "f64_abs", "f64_sin",
+              "f64_cos", "f64_tan", "f64_asin", "f64_acos", "f64_atan",
+              "f64_exp", "f64_exp2", "f64_ln", "f64_log2", "f64_log10",
+              "f64_cbrt", "f64_trunc", "f64_round"}) {
             FnSchema sch;
             sch.signature = makeFunction({makeFloat()}, makeFloat());
+            fnSchemas_[nm] = std::move(sch);
+        }
+        // v72: binary f64 math, (f64, f64) -> f64, pure.
+        for (const char* nm :
+             {"f64_pow", "f64_atan2", "f64_hypot", "f64_copysign", "f64_fmod",
+              "f64_min", "f64_max"}) {
+            FnSchema sch;
+            sch.signature = makeFunction({makeFloat(), makeFloat()}, makeFloat());
             fnSchemas_[nm] = std::move(sch);
         }
         // print_no_nl(s: &String) -> i64 ! { io } — writes s with NO trailing
