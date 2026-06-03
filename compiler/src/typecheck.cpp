@@ -15,6 +15,10 @@ namespace kardashev {
 // absent row means "asserted pure". File-scoped so the TypeChecker reads it.
 static bool g_effectsStrict = false;
 void setEffectsStrict(bool strict) { g_effectsStrict = strict; }
+// v83: `--effects=extended` recognizes the niche `share`/`div` extension labels
+// in explicit rows (off by default — the core surface is the 5 labels).
+static bool g_effectsExtended = false;
+void setEffectsExtended(bool ext) { g_effectsExtended = ext; }
 
 namespace {
 
@@ -3350,9 +3354,16 @@ private:
     // Anything else in an `! { ... }` row must match a row-variable name
     // declared in the fn's generic-parameter list (Phase 4.3).
     static bool isBuiltinEffect(const std::string& l) {
-        return l == "alloc" || l == "io" || l == "panic" ||
-               l == "async" || l == "unwind" || l == "share" ||
-               l == "div"; // v47: divergence (may-not-terminate) effect
+        // v83: the recognized surface is the 5 core labels + `share` (the
+        // concurrency / thread-boundary effect, auto-inferred by thread/channel
+        // primitives and widely declared). `div` (divergence / may-not-
+        // terminate) is a niche EXTENDED label — recognized in an explicit
+        // `! { ... }` row only under `--effects=extended`.
+        if (l == "alloc" || l == "io" || l == "panic" || l == "async" ||
+            l == "unwind" || l == "share")
+            return true;
+        if (l == "div" && g_effectsExtended) return true;
+        return false;
     }
 
     // Phase 10a classification: collect, from a signature, the names that
@@ -3704,6 +3715,16 @@ private:
         if (it == fnSchemas_.end() || !fn.body) return;
         EffectSet inferred;
         collectEffects(*fn.body, inferred);
+        // v83: when NOT --effects=extended, the niche `div` extension label is
+        // filtered out of the inferred set (it is never auto-inferred today, so
+        // this is a no-op safeguard against an explicit-row `div` leaking into a
+        // caller's inferred set). `share` stays a recognized core-adjacent label.
+        if (!g_effectsExtended) {
+            EffectSet filtered;
+            for (const auto& l : inferred.labels)
+                if (l != "div") filtered.add(l);
+            inferred = std::move(filtered);
+        }
         const EffectSet& declared = it->second.declaredEffects;
         // v81: effects are OPT-IN. A fn that wrote NO `! { ... }` row is left
         // unchecked — it may perform any effect (the inferred set is still

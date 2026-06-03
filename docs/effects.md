@@ -1,13 +1,54 @@
 # Effects System
 
-kardashev's signature feature is **lightweight effect labels in the
-type system**: every function declares the side effects it can produce
-as part of its signature, and the compiler tracks them across the call
-graph. There are no handlers or continuations (unlike Koka) — effects
-are pure type-system information with **zero runtime cost**. The
-emitted LLVM IR is byte-for-byte identical whether a function declares
-`! { io, alloc }` or omits the row entirely; the row exists only to be
-checked.
+kardashev's effect labels are an **optional, lightweight typed side-channel**.
+Since **v0.81.0 they are OPT-IN**: write a `! { … }` row only when you want the
+compiler to *prove* a property about a function. For everyday error handling and
+resource management, reach for **`Result` + `?` + ownership**, not effects.
+
+- A function with **no** effect row is **unchecked** — it may perform any
+  effect. (`fn greet() -> i64 { print(42) }` compiles.)
+- A function with an **explicit** row (including `! { }`, an *asserted-pure*) is
+  **strictly checked** — it must declare every effect it performs, and the
+  compiler tracks the row across the call graph. The inferred effect set is
+  always computed and propagated to callers, so an *annotated* caller still sees
+  an un-annotated callee's real effects.
+
+Effects are pure type-system information with **zero runtime cost** — the emitted
+LLVM IR is byte-for-byte identical whether a row is present or not. There are no
+handlers or continuations for the built-in effects (user-defined
+`effect`/`perform`/`handle` is a separate, advanced feature).
+
+## When to use a row
+
+- To **guarantee purity / IO-freedom / non-allocation** — most usefully with the
+  `#[codegen(no_alloc)]` / `#[codegen(no_panic)]` / `#[codegen(no_io)]`
+  contracts, which fail compilation if violated.
+- To document and enforce a public API's effect surface.
+
+## Error handling: use Result, not effects
+
+```rust
+fn read(ok: bool) -> Result<i64, MyErr> { if ok { Ok(10) } else { Err(MyErr::Bad) } }
+fn run() -> Result<i64, MyErr> { let v = read(true)?; Ok(v + 5) }   // `?` propagates Err
+fn main() -> Result<(), MyErr> { run()?; Ok(()) }                   // Err -> non-zero exit
+```
+
+## Modes
+
+| flag | meaning |
+|------|---------|
+| `--effects=opt-in` | **default** — an absent row is unchecked |
+| `--effects=strict` | an absent row asserts purity (the pre-v0.81 rule) |
+| `--effects=extended` | also recognize the niche `div` label in explicit rows |
+
+`#[allow(missing_effect)]` opts one function out of the strict-mode check. Run
+`kardc --explain effects` for the consolidated summary.
+
+## Labels
+
+The recognized labels are `io`, `alloc`, `panic`, `async`, `unwind`, and `share`
+(the concurrency / thread-boundary effect, auto-inferred by `thread_spawn` /
+channel ops). `div` (may-not-terminate) is gated behind `--effects=extended`.
 
 ## Syntax
 
@@ -15,8 +56,9 @@ An effect row attaches after a function's return type, introduced by
 `!`:
 
 ```rust
-fn read_cfg() -> i64 ! { io, alloc } { ... }
-fn add(a: i64, b: i64) -> i64 { a + b }   // pure — no row
+fn read_cfg() -> i64 ! { io, alloc } { ... }       // explicit: strictly checked
+fn add(a: i64, b: i64) -> i64 { a + b }            // no row: unchecked (here, pure)
+fn pure_add(a: i64, b: i64) -> i64 ! { } { a + b } // `! { }`: asserted pure
 ```
 
 The grammar is `! '{' label (',' label)* ','? '}'`. An empty row

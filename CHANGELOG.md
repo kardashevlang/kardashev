@@ -18,6 +18,38 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.83.0] — Collapse the effect surface + docs
+
+Closes the effects-simplification arc (v81–v83): a smaller, clearer surface.
+
+### Changed
+- The niche **`div`** (may-not-terminate) effect label is now an **extension**
+  label — recognized in an explicit `! { … }` row only under
+  `--effects=extended` (it had zero real uses). The default recognized surface
+  is `io` / `alloc` / `panic` / `async` / `unwind` / `share`.
+- **`share`** (the concurrency / thread-boundary effect) stays a recognized
+  core-adjacent label — it is auto-inferred by `thread_spawn` / channel ops and
+  widely declared, so gating it would be churn without simplification.
+- **`docs/effects.md`** rewritten around the v81 opt-in model: effects are an
+  optional typed side-channel; use `Result` + `?` + ownership for everyday
+  errors; reach for a row to *prove* purity / IO-freedom (esp. with
+  `#[codegen(no_*)]`). Documents the `--effects=opt-in|strict|extended` modes.
+
+### Added
+- **`kardc --explain effects`** — a single consolidated guide to the effect
+  system (opt-in model, modes, when to use rows, Result-for-errors), replacing
+  cross-referencing the scattered E0710 / E0711 / E0712 entries.
+
+### Notes
+- Gate: `smoke_test_effects_surface.sh` (`! { div }` rejected by default /
+  accepted under `--effects=extended`; share concurrency still type-checks;
+  `--explain effects` prints the guide). Full `make test` green.
+
+### Deferred (honest)
+- Gating `share` (load-bearing for concurrency inference + Send/Sync tests) and
+  a prelude effect-row trim pass — both are churn-heavy with little real
+  simplification gain; the opt-in model (v81) already removes the *requirement*.
+
 ## [0.82.0] — Result + ownership as the error story
 
 Continues the opt-in-effects arc by making `Result` + `?` + ownership the
