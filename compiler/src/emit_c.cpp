@@ -50,6 +50,17 @@ struct CEmitter {
     std::string closureDefs_;           // hoisted __cl_/__clenv_ definitions
     std::set<int> fnArities_;            // kdfn<N> fat-pointer types needed
     std::set<std::string> fnThunks_;     // top-level fns used as values
+    // v75: tuple typedefs. A tuple `(T0, T1, …)` lowers to an anonymous C
+    // struct `struct kdtup_<elems> { Te0 _0; Te1 _1; … };`. Distinct shapes are
+    // deduped by name; tupleDefs_ keeps them in dependency order (a nested tuple
+    // is registered before the outer one) so the typedefs emit in a valid order.
+    std::set<std::string> tupleNames_;
+    std::vector<std::pair<std::string, std::vector<std::string>>> tupleDefs_;
+    // v75: tuple typedefs are emitted just before the fn prototypes/bodies, so a
+    // tuple may appear in a fn param/return/local but NOT in a struct field /
+    // enum payload / top-level const (those are emitted earlier — refused
+    // cleanly while this flag is false).
+    bool tupleOk_ = false;
     bool sawClosureOrFnVal_ = false;     // set by the pre-scan
     bool inReturnPos_ = false;           // emitting a fn-value return position
     // v30 Phase 166 (generics): the generic-param names of the fn currently
@@ -146,6 +157,53 @@ struct CEmitter {
     // user struct -> `struct <Name>`. Anything else (refs, generics, enums,
     // strings, fn types, tuples, arrays) is outside this phase's subset; returns
     // "" and records an error so the caller refuses the program.
+    // v75: register a tuple shape (by its element C types) and return its C
+    // type name `struct kdtup_<sanitized-elems>`. Idempotent (deduped by name);
+    // the caller must have already produced the element ctypes (so a nested
+    // tuple is registered before this outer one — dependency order).
+    std::string registerTuple(const std::vector<std::string>& elems) {
+        std::string name = "kdtup";
+        for (const auto& c : elems) {
+            name += "_";
+            for (char ch : c) {
+                bool alnum = (ch >= 'a' && ch <= 'z') ||
+                             (ch >= 'A' && ch <= 'Z') ||
+                             (ch >= '0' && ch <= '9');
+                name += alnum ? ch : '_';
+            }
+        }
+        if (!tupleNames_.count(name)) {
+            tupleNames_.insert(name);
+            tupleDefs_.push_back({name, elems});
+        }
+        return "struct " + name;
+    }
+
+    // v75: the C type of a tuple TypeRef. Elements must be scalar (int64_t) or a
+    // nested supported tuple — other element types (String/Vec/struct/ref) would
+    // need Drop-aware handling and are refused cleanly for now.
+    std::string tupleCType(const TypeRef& t) {
+        if (!tupleOk_) {
+            err("a tuple type in a struct field / enum payload / top-level "
+                "const is outside the C-backend subset (tuples are supported "
+                "in fn params, returns, and locals)");
+            return "";
+        }
+        std::vector<std::string> elems;
+        for (const auto& et : t.tupleElems) {
+            std::string ec = ctype(et);
+            if (ec.empty()) return "";
+            if (ec != "int64_t" && ec.rfind("struct kdtup_", 0) != 0) {
+                err("a tuple with a non-scalar element (only i64/bool and "
+                    "nested tuples of those are supported) is outside the "
+                    "C-backend subset");
+                return "";
+            }
+            elems.push_back(ec);
+        }
+        return registerTuple(elems);
+    }
+
     std::string ctype(const TypeRef& t) {
         // v29 Phase 159: a reference `&T` / `&mut T` -> a C pointer `<T>*`.
         // (`&` and `&mut` both map to a non-const pointer — const-correctness
@@ -183,10 +241,11 @@ struct CEmitter {
             sawClosureOrFnVal_ = true;
             return "struct kdfn" + std::to_string(arity);
         }
-        if (t.isSlice || t.isArray || t.isTuple || t.isDyn ||
-            !t.assocName.empty()) {
+        // v75: a tuple `(T0, T1, …)` -> an anonymous C struct `struct kdtup_…`.
+        if (t.isTuple && !t.isSlice && !t.isArray) return tupleCType(t);
+        if (t.isSlice || t.isArray || t.isDyn || !t.assocName.empty()) {
             err("type `" + (t.name.empty() ? std::string("<complex>") : t.name) +
-                "` (slice/array/tuple/dyn/assoc) is outside the "
+                "` (slice/array/dyn/assoc) is outside the "
                 "C-backend subset");
             return "";
         }
@@ -274,6 +333,29 @@ struct CEmitter {
         }
         if (auto* sl = dynamic_cast<const StructLitExpr*>(&e))
             return "struct " + sl->structName;
+        // v75: a tuple literal `(a, b)` -> its `struct kdtup_…` type.
+        if (auto* tl = dynamic_cast<const TupleLitExpr*>(&e)) {
+            std::vector<std::string> elems;
+            for (auto& el : tl->elements) {
+                std::string ec = ctypeOfExpr(*el);
+                if (ec != "int64_t" && ec.rfind("struct kdtup_", 0) != 0)
+                    return "int64_t"; // out of subset; expr() reports it
+                elems.push_back(ec);
+            }
+            return registerTuple(elems);
+        }
+        // v75: `t.N` -> the C type of the N-th element of the tuple's shape.
+        if (auto* tf = dynamic_cast<const TupleFieldExpr*>(&e)) {
+            std::string objTy = ctypeOfExpr(*tf->object);
+            while (!objTy.empty() && objTy.back() == '*') objTy.pop_back();
+            if (objTy.rfind("struct kdtup_", 0) == 0) {
+                std::string nm = objTy.substr(7); // drop "struct "
+                for (const auto& td : tupleDefs_)
+                    if (td.first == nm && tf->index < td.second.size())
+                        return td.second[tf->index];
+            }
+            return "int64_t";
+        }
         if (auto* id = dynamic_cast<const IdentExpr*>(&e)) {
             // v29 Phase 158: a bare unit-variant constructor (`None`) is a value
             // of its enum type.
@@ -424,6 +506,36 @@ struct CEmitter {
             if (!objTy.empty() && objTy.back() == '*')
                 return "((*(" + base + "))." + fe->fieldName + ")";
             return "((" + base + ")." + fe->fieldName + ")";
+        }
+        // v75: a tuple literal `(a, b)` -> a C compound literal with positional
+        // fields `._0`, `._1`, … of the registered tuple struct.
+        if (auto* tl = dynamic_cast<const TupleLitExpr*>(&e)) {
+            if (!tupleOk_) {
+                err("a tuple value in a top-level const is outside the "
+                    "C-backend subset (tuples are supported in fn bodies)");
+                return "0";
+            }
+            std::string cty = ctypeOfExpr(*tl);
+            if (cty.rfind("struct kdtup_", 0) != 0) {
+                err("a tuple with a non-scalar element is outside the "
+                    "C-backend subset");
+                return "0";
+            }
+            std::string s = "((" + cty + "){ ";
+            for (std::size_t i = 0; i < tl->elements.size(); ++i) {
+                if (i) s += ", ";
+                s += "._" + std::to_string(i) + " = " + expr(*tl->elements[i]);
+            }
+            return s + " })";
+        }
+        // v75: `t.N` tuple field access (auto-deref through a `&tuple`).
+        if (auto* tf = dynamic_cast<const TupleFieldExpr*>(&e)) {
+            std::string objTy = ctypeOfExpr(*tf->object);
+            std::string base = expr(*tf->object);
+            std::string idx = std::to_string(tf->index);
+            if (!objTy.empty() && objTy.back() == '*')
+                return "((*(" + base + "))._" + idx + ")";
+            return "((" + base + ")._" + idx + ")";
         }
         // v29 Phase 159: `&x` / `&mut x` -> a C address-of. For `&<temporary>`
         // (a struct/enum literal) this is `&(compound literal)`, a pointer to a
@@ -1414,6 +1526,11 @@ struct CEmitter {
         }
         if (!program.consts.empty()) out << "\n";
 
+        // v75: from here on, tuples are permitted (their typedefs are emitted
+        // below, before the prototypes/definitions). Struct/enum/const emission
+        // above ran with tupleOk_ == false, so a tuple there was refused.
+        tupleOk_ = true;
+
         // Forward prototypes first — kardashev allows calling a fn defined later
         // (forward references + mutual recursion).
         std::string protos;
@@ -1468,6 +1585,16 @@ struct CEmitter {
             defs += sig + " {\n  return " + bodyC + ";\n}\n\n";
             if (!ok()) return;
         }
+
+        // v75: tuple typedefs (before the prototypes/definitions that use them).
+        // tupleDefs_ is in dependency order — a nested tuple precedes its outer.
+        for (const auto& td : tupleDefs_) {
+            out << "struct " << td.first << " {";
+            for (std::size_t i = 0; i < td.second.size(); ++i)
+                out << " " << td.second[i] << " _" << i << ";";
+            out << " };\n";
+        }
+        if (!tupleDefs_.empty()) out << "\n";
 
         // v30 Phase 165: the kdfn<N> fat-pointer typedefs (before any use). Each
         // is `struct kdfnN { int64_t (*fn)(void*, N x int64_t); void* env; }`.

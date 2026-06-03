@@ -266,6 +266,17 @@ free; else single-level + a documented note.
 
 ## v75 — C-backend: tuple types
 
+**STATUS: ✅ SHIPPED (v0.75.0).** The C backend lowers `(T0, T1, …)` to an
+anonymous C struct `struct kdtup_<elems> { T0 _0; T1 _1; … }` (deduped, emitted
+in dependency order — nested before outer). Tuple literals → C compound
+literals; `t.N` → `._N` (auto-deref through `&tuple`); tuples work as fn params,
+returns, and locals, including nested tuples and tuples behind a reference.
+Differentially gated LLVM-AOT==emitted-C (`smoke_test_c_tuples.sh`, 6 positive +
+4 refusal cases). **Deferred (honest):** elements restricted to scalar/nested-
+tuple; tuples in struct fields / enum payloads / consts (emission-ordering),
+tuple-destructuring `let`, and heap-owning elements (need Drop-aware lowering)
+are all refused cleanly.
+
 > Swapped before param-destructuring (v76) so v76's C-backend test has tuples.
 
 **CORE.** Lift the C-backend's categorical tuple refusal (emit_c.cpp:186). Lower
