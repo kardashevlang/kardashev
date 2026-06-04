@@ -2026,6 +2026,17 @@ sh_test(
     ],
 )
 
+# v94: self-hosted monomorphic generics (single type-param T, specialize-per-
+# concrete-type, dedup by mangled name). Differential self == host.
+sh_test(
+    name = "smoke_test_selfhost_generics",
+    srcs = ["smoke_test_selfhost_generics.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:structgen.kd",
+    ],
+)
+
 # v20 Phase 118: the self-hosted compiler handles ENUMS + match — tagged-pair
 # aggregates + a branch-free match select-chain, differential-gated vs the host.
 sh_test(

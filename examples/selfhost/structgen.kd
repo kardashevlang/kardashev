@@ -33,10 +33,18 @@ enum Stmt {
 }
 struct Token { kind: i64, start: i64, len: i64, value: i64 }
 struct Pos { i: i64 }
-struct Param { name: String, ty: i64 }  // ty: 1 i64, 2 bool, 100+idx struct
+struct Param { name: String, ty: i64 }  // ty: 1 i64, 2 bool, 100+idx struct, -1 the generic param T
 struct Block { lets: Vec<Stmt>, result: Box<Expr> }
-struct SDef { name: String, fields: Vec<Param> }   // a struct: name + typed fields (i64/bool/nested-struct)
-struct Fn { name: String, params: Vec<Param>, ret: i64, body: Block }
+// v94: `gp` = generic-param count (0 = monomorphic; 1 = exactly one type-param `T`).
+// A generic decl's `T` type positions carry tag -1 (the unbound param); the
+// monomorphizer substitutes a concrete tag and emits one specialized copy per
+// concrete type used at a call/struct-literal site (dedup by mangled name).
+struct SDef { name: String, gp: i64, fields: Vec<Param> }   // a struct: name + generic-param count + typed fields
+struct Fn { name: String, gp: i64, params: Vec<Param>, ret: i64, body: Block }
+// v94: one requested monomorphization instance — the generic decl's index in its
+// registry (`gi` into fns / `si` into structs; the other is -1) + the concrete
+// tag bound to `T`, and the mangled instance name.
+struct MonoReq { gi: i64, si: i64, tag: i64, mname: String }
 struct Ctr { n: i64 }
 // A lowered value: its LLVM operand text + its type tag.
 struct Val { op: String, ty: i64 }
@@ -165,12 +173,24 @@ fn field_index(structs: &Vec<SDef>, si: i64, fname: &String) -> i64 ! { alloc } 
 // A leading `&` (kind 23) makes it a REFERENCE: tag 200 + base (so &i64=201,
 // &bool=202, &Struct#idx = 300+idx). Consumes the `&`, leaving the type-NAME token
 // for the caller's single post-increment.
-fn ty_tag(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> i64 ! { alloc } {
+// v94: `gp_in_scope` = 1 while parsing a `fn …<T>` / `struct …<T>` decl; then a
+// bare `T` type token resolves to the unbound-param tag -1 (so `&T` -> 199).
+fn ty_tag(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>, gp_in_scope: i64) -> i64 ! { alloc } {
     let is_ref = if peek_kind(toks, pos) == 23 { pos.i = pos.i + 1; 1 } else { 0 };   // consume '&'
-    let txt = tok_text_at(src, toks, pos); let kw_bool = "bool"; let kw_str = "String"; let kw_vec = "Vec";
-    let base = if str_eq(&txt, &kw_bool) { 2 }
-               else { if str_eq(&txt, &kw_str) { 3 }
-               else { if str_eq(&txt, &kw_vec) {
+    let txt = tok_text_at(src, toks, pos); let kw_bool = "bool"; let kw_str = "String"; let kw_vec = "Vec"; let kw_T = "T";
+    let base = if gp_in_scope == 1 { if str_eq(&txt, &kw_T) { 0 - 1 }   // the generic param T
+               else { ty_tag_base(src, toks, pos, structs, &txt) } }
+               else { ty_tag_base(src, toks, pos, structs, &txt) };
+    if is_ref == 1 { 200 + base } else { base }
+}
+// The non-generic base-type resolver (factored out so the `T` check above can
+// short-circuit before it). Same logic as before: bool->2, String->3, Vec<..>->4
+// (consuming the angle-bracket args), a registered struct->100+idx, else i64 (1).
+fn ty_tag_base(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>, txt: &String) -> i64 ! { alloc } {
+    let kw_bool = "bool"; let kw_str = "String"; let kw_vec = "Vec";
+    let base = if str_eq(txt, &kw_bool) { 2 }
+               else { if str_eq(txt, &kw_str) { 3 }
+               else { if str_eq(txt, &kw_vec) {
                    // `Vec < i64 >` — consume the angle-bracket args. The caller does
                    // ONE post-increment past the "Vec" name token; here we skip the
                    // `<` (kind 20), the `i64` element ident, and whatever single token
@@ -181,8 +201,40 @@ fn ty_tag(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -
                    pos.i = pos.i + 1;   // '>'   (kind -1; skipped blindly)
                    4
                }
-               else { let si = struct_index(structs, &txt); if si >= 0 { 100 + si } else { 1 } } } };
-    if is_ref == 1 { 200 + base } else { base }
+               else { let si = struct_index(structs, txt); if si >= 0 { 100 + si } else { 1 } } } };
+    base
+}
+
+// ---- v94 monomorphization helpers ----
+// Substitute the generic param `T` (tag -1, or `&T` tag 199) with the concrete tag
+// `tcur` that `T` is bound to for the current instance. Non-generic tags pass
+// through unchanged, so this is a no-op for every monomorphic decl (Risk R0).
+fn subst_ty(ty: i64, tcur: i64) -> i64 {
+    if ty == 0 - 1 { tcur }                  // bare T -> the bound concrete tag
+    else { if ty == 199 { 200 + tcur }       // &T -> &(concrete)
+    else { ty } }
+}
+// The mangled name of a generic instance: `name__<tag-name>` (mirrors the host's
+// per-type instance naming, e.g. `id__i64`, `Pair__i64`, `id__Box` for a struct).
+// `tag_name` keeps it a legal LLVM identifier.
+fn tag_name(tag: i64, structs: &Vec<SDef>) -> String ! { alloc } {
+    if tag == 1 { let s = "i64"; clone(&s) }
+    else { if tag == 2 { let s = "bool"; clone(&s) }
+    else { if tag == 3 { let s = "String"; clone(&s) }
+    else { if tag == 4 { let s = "Vec"; clone(&s) }
+    else { if tag >= 100 { if tag < 200 {
+        let sd = vec_get(structs, tag - 100); clone(&sd.name)
+    } else { let p = "ref"; let s = int_to_string(tag); str_concat(&p, &s) } }
+    else { let p = "t"; let s = int_to_string(tag); str_concat(&p, &s) } } } } }
+}
+fn mangle(name: &String, tag: i64, structs: &Vec<SDef>) -> String ! { alloc } {
+    let sep = "__"; let a = str_concat(name, &sep); let tn = tag_name(tag, structs); str_concat(&a, &tn)
+}
+// Find a pending mono-instance request by its mangled name, or -1.
+fn mono_index(reqs: &Vec<MonoReq>, mname: &String) -> i64 ! { alloc } {
+    let n = vec_len(reqs); let mut i = 0; let mut found = 0 - 1;
+    while i < n { let r = vec_get(reqs, i); found = if str_eq(&r.mname, mname) { i } else { found }; i = i + 1; }
+    found
 }
 
 fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> Box<Expr> ! { alloc } {
@@ -456,6 +508,16 @@ fn parse_structs(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Vec<SDef> ! 
         if at_kw(src, toks, pos, &kw_struct) == 1 {
             pos.i = pos.i + 1;                          // 'struct'
             let name = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
+            // v94: optional `<T>` generic-param list (one type-param). The lexer has
+            // no `>` token ('>' lexes as kind -1) — mirror the Vec<i64> skip: consume
+            // `<` (kind 20), the `T` ident, and the closing `>` (skipped blindly).
+            let mut gp = 0;
+            if peek_kind(toks, pos) == 20 {
+                pos.i = pos.i + 1;                      // '<'
+                pos.i = pos.i + 1;                      // 'T'
+                pos.i = pos.i + 1;                      // '>'  (kind -1; skipped blindly)
+                gp = 1;
+            } else { let z = 0; }
             pos.i = pos.i + 1;                          // '{'
             let mut fields = vec_new();
             let mut g2 = true;
@@ -463,13 +525,13 @@ fn parse_structs(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Vec<SDef> ! 
                 if peek_kind(toks, pos) == 2 {
                     let fn2 = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
                     pos.i = pos.i + 1;                  // ':'
-                    let fty = ty_tag(src, toks, pos, &out); pos.i = pos.i + 1;   // field type (i64/bool/struct)
+                    let fty = ty_tag(src, toks, pos, &out, gp); pos.i = pos.i + 1;   // field type (i64/bool/struct/T)
                     vec_push(&mut fields, Param { name: fn2, ty: fty });
                     if peek_kind(toks, pos) == 17 { pos.i = pos.i + 1; } else { g2 = false; }
                 } else { g2 = false; }
             }
             pos.i = pos.i + 1;                          // '}'
-            vec_push(&mut out, SDef { name: name, fields: fields });
+            vec_push(&mut out, SDef { name: name, gp: gp, fields: fields });
         } else { go = false; }
     }
     out
@@ -477,6 +539,15 @@ fn parse_structs(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Vec<SDef> ! 
 fn parse_fn(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> Fn ! { alloc } {
     pos.i = pos.i + 1;                                  // 'fn'
     let name = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
+    // v94: optional `<T>` after the fn name — one type-param. Same `<`/`T`/`>` skip
+    // as parse_structs (the `>` lexes as kind -1, consumed blindly).
+    let mut gp = 0;
+    if peek_kind(toks, pos) == 20 {
+        pos.i = pos.i + 1;                              // '<'
+        pos.i = pos.i + 1;                              // 'T'
+        pos.i = pos.i + 1;                              // '>'  (kind -1; skipped blindly)
+        gp = 1;
+    } else { let z = 0; }
     pos.i = pos.i + 1;                                  // '('
     let mut params = vec_new();
     let mut go = true;
@@ -484,18 +555,18 @@ fn parse_fn(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>)
         if peek_kind(toks, pos) == 2 {
             let pn = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
             pos.i = pos.i + 1;                          // ':'
-            let pty = ty_tag(src, toks, pos, structs); pos.i = pos.i + 1;
+            let pty = ty_tag(src, toks, pos, structs, gp); pos.i = pos.i + 1;
             vec_push(&mut params, Param { name: pn, ty: pty });
             if peek_kind(toks, pos) == 17 { pos.i = pos.i + 1; } else { go = false; }
         } else { go = false; }
     }
     pos.i = pos.i + 1;                                  // ')'
     pos.i = pos.i + 1;                                  // '->'
-    let ret = ty_tag(src, toks, pos, structs); pos.i = pos.i + 1;
+    let ret = ty_tag(src, toks, pos, structs, gp); pos.i = pos.i + 1;
     pos.i = pos.i + 1;                                  // '{'
     let body = parse_block(src, toks, pos, structs);
     pos.i = pos.i + 1;                                  // '}' (fn body close) — needed to parse the next fn
-    Fn { name: name, params: params, ret: ret, body: body }
+    Fn { name: name, gp: gp, params: params, ret: ret, body: body }
 }
 
 // ---- type checker (i64 / bool / struct) ----
@@ -516,17 +587,28 @@ fn type_of(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<
         },
         SLit(si, vals) => {
             // each field value must match the field's declared type; result is the struct.
+            // v94: a generic struct (gp==1) infers `T` from the first generic field
+            // value, then RESOLVES to its specialized instance (registered earlier by
+            // the monomorphizer). The result type is the INSTANCE index so a later
+            // `p.a` reads the concrete field type. Field checks use substituted types.
             let sd = vec_get(structs, *si);
             let nv = vec_len(vals);
+            let tcur = if sd.gp == 1 { infer_struct_tcur(vals, &sd.fields, env, structs, fns) } else { 0 };
             let mut bad = 0;
             let mut i = 0;
             while i < nv {
                 let v = vec_get(vals, i);
                 let f = vec_get(&sd.fields, i);
-                bad = if type_of(&(*v), env, structs, fns) != f.ty { 1 } else { bad };
+                let want = if sd.gp == 1 { subst_ty(f.ty, tcur) } else { f.ty };
+                bad = if type_of(&(*v), env, structs, fns) != want { 1 } else { bad };
                 i = i + 1;
             }
-            if bad == 1 { 0 } else { 100 + *si }
+            if sd.gp == 1 {
+                let mn = mangle(&sd.name, tcur, structs); let inst = struct_index(structs, &mn);
+                if bad == 1 { 0 } else { if inst >= 0 { 100 + inst } else { 0 } }
+            } else {
+                if bad == 1 { 0 } else { 100 + *si }
+            }
         },
         Field(obj, fname) => {
             let to = type_of(&(**obj), env, structs, fns);
@@ -596,19 +678,203 @@ fn type_of(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<
                     let g = vec_get(fns, gi);
                     let np = vec_len(&g.params); let na = vec_len(args);
                     if np != na { 0 } else {
+                        // v94: a generic callee (gp==1) infers `T` from the first
+                        // generic-typed argument, then checks args against the
+                        // SUBSTITUTED param types and returns the substituted ret.
+                        let tcur = if g.gp == 1 { infer_tcur(args, &g.params, env, structs, fns) } else { 0 };
                         let mut bad = 0; let mut i = 0;
                         while i < na {
                             let av = vec_get(args, i); let pm = vec_get(&g.params, i);
-                            bad = if type_of(&(*av), env, structs, fns) != pm.ty { 1 } else { bad };
+                            let want = if g.gp == 1 { subst_ty(pm.ty, tcur) } else { pm.ty };
+                            bad = if type_of(&(*av), env, structs, fns) != want { 1 } else { bad };
                             i = i + 1;
                         }
-                        if bad == 1 { 0 } else { g.ret }
+                        let rt = if g.gp == 1 { subst_ty(g.ret, tcur) } else { g.ret };
+                        if bad == 1 { 0 } else { rt }
                     }
                 }
             } } } } } } } }
         },
     }
 }
+// v94: infer the concrete tag bound to `T` for a generic call — the type of the
+// first argument whose declared param type is `T` (-1) or `&T` (199). 0 = could
+// not infer (no generic-typed param), which surfaces as a type error upstream.
+fn infer_tcur(args: &Vec<Box<Expr>>, params: &Vec<Param>, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<Fn>) -> i64 ! { alloc } {
+    let np = vec_len(params); let mut i = 0; let mut found = 0;
+    while i < np {
+        let pm = vec_get(params, i);
+        if found == 0 {
+            if pm.ty == 0 - 1 { let a = vec_get(args, i); found = type_of(&(*a), env, structs, fns); }
+            else { if pm.ty == 199 { let a = vec_get(args, i); let t = type_of(&(*a), env, structs, fns); found = if t >= 200 { t - 200 } else { 0 }; }
+            else { let z = 0; } }
+        } else { let z = 0; }
+        i = i + 1;
+    }
+    found
+}
+// v94: infer `T` for a generic struct literal — the type of the first field value
+// whose declared field type is `T` (-1) or `&T` (199).
+fn infer_struct_tcur(vals: &Vec<Box<Expr>>, fields: &Vec<Param>, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<Fn>) -> i64 ! { alloc } {
+    let nf = vec_len(fields); let mut i = 0; let mut found = 0;
+    while i < nf {
+        let f = vec_get(fields, i);
+        if found == 0 {
+            if f.ty == 0 - 1 { let v = vec_get(vals, i); found = type_of(&(*v), env, structs, fns); }
+            else { if f.ty == 199 { let v = vec_get(vals, i); let t = type_of(&(*v), env, structs, fns); found = if t >= 200 { t - 200 } else { 0 }; }
+            else { let z = 0; } }
+        } else { let z = 0; }
+        i = i + 1;
+    }
+    found
+}
+// v94: build the specialized SDef for a generic struct at concrete tag `tcur` —
+// mangled name, `gp=0`, every `T` field type substituted. Codegen/typecheck then
+// treat it as an ordinary concrete struct (`Field`/`ty_llvm` read its fields).
+fn specialize_struct(sd: &SDef, tcur: i64, structs: &Vec<SDef>) -> SDef ! { alloc } {
+    let mn = mangle(&sd.name, tcur, structs);
+    let nf = vec_len(&sd.fields);
+    let mut nfields = vec_new();
+    let mut i = 0;
+    while i < nf {
+        let f = vec_get(&sd.fields, i);
+        vec_push(&mut nfields, Param { name: clone(&f.name), ty: subst_ty(f.ty, tcur) });
+        i = i + 1;
+    }
+    SDef { name: mn, gp: 0, fields: nfields }
+}
+// Scan one expr for generic struct literals; for each, infer `T` and register its
+// specialized instance into `structs` if not already present (dedup by mangled
+// name). `env` is the using-fn's binding environment (param/let types).
+fn mono_structs_expr(e: &Expr, env: &HashMap<String, i64>, structs: &mut Vec<SDef>, fns: &Vec<Fn>) ! { alloc } {
+    match e {
+        Num(_) => { let z = 0; },
+        Var(_) => { let z = 0; },
+        Bin(_, a, b) => { mono_structs_expr(&(**a), env, structs, fns); mono_structs_expr(&(**b), env, structs, fns); },
+        If(c, t, e2) => { mono_structs_expr(&(**c), env, structs, fns); mono_structs_expr(&(**t), env, structs, fns); mono_structs_expr(&(**e2), env, structs, fns); },
+        SLit(si, vals) => {
+            // recurse into field values first (nested literals)
+            let nv = vec_len(vals); let mut i = 0;
+            while i < nv { let v = vec_get(vals, i); mono_structs_expr(&(*v), env, structs, fns); i = i + 1; }
+            let sd = vec_get(structs, *si);
+            if sd.gp == 1 {
+                let tcur = infer_struct_tcur(vals, &sd.fields, env, structs, fns);
+                if tcur != 0 {
+                    let mn = mangle(&sd.name, tcur, structs);
+                    if struct_index(structs, &mn) < 0 {
+                        let inst = specialize_struct(&sd, tcur, structs);
+                        vec_push(structs, inst);
+                    } else { let z = 0; }
+                } else { let z = 0; }
+            } else { let z = 0; }
+        },
+        Field(obj, _) => { mono_structs_expr(&(**obj), env, structs, fns); },
+        Ref(inner) => { mono_structs_expr(&(**inner), env, structs, fns); },
+        Call(_, args) => { let na = vec_len(args); let mut i = 0; while i < na { let a = vec_get(args, i); mono_structs_expr(&(*a), env, structs, fns); i = i + 1; } },
+        StrLit(_, _) => { let z = 0; },
+    }
+}
+fn mono_structs_stmts(stmts: &Vec<Stmt>, env: &mut HashMap<String, i64>, structs: &mut Vec<SDef>, fns: &Vec<Fn>) ! { alloc } {
+    let nl = vec_len(stmts); let mut k = 0;
+    while k < nl {
+        let s = vec_get(stmts, k);
+        match s {
+            Let(name, e) => { mono_structs_expr(&(*e), env, structs, fns); let t = type_of(&(*e), env, structs, fns); hashmap_insert(env, name, t); },
+            LetMut(name, e) => { mono_structs_expr(&(*e), env, structs, fns); let t = type_of(&(*e), env, structs, fns); hashmap_insert(env, name, t); },
+            Assign(_, e) => { mono_structs_expr(&(*e), env, structs, fns); },
+            While(cond, body) => { mono_structs_expr(&(*cond), env, structs, fns); mono_structs_stmts(&body, env, structs, fns); },
+            IfS(cond, then_b, else_b) => { mono_structs_expr(&(*cond), env, structs, fns); mono_structs_stmts(&then_b, env, structs, fns); mono_structs_stmts(&else_b, env, structs, fns); },
+            Break => { let z = 0; },
+            Continue => { let z = 0; },
+            ExprStmt(e) => { mono_structs_expr(&(*e), env, structs, fns); },
+        }
+        k = k + 1;
+    }
+}
+// Register every generic-struct instance used by NON-GENERIC fns. (Generic fns are
+// skipped here — their bodies are monomorphized when each fn instance is emitted.)
+fn mono_structs_all(fns: &Vec<Fn>, structs: &mut Vec<SDef>) ! { alloc } {
+    let nf = vec_len(fns); let mut i = 0;
+    while i < nf {
+        let g = vec_get(fns, i);
+        if g.gp == 0 {
+            let mut env = hashmap_new();
+            let np = vec_len(&g.params); let mut p = 0;
+            while p < np { let pm = vec_get(&g.params, p); hashmap_insert(&mut env, clone(&pm.name), pm.ty); p = p + 1; }
+            mono_structs_stmts(&g.body.lets, &mut env, structs, fns);
+            mono_structs_expr(&(*g.body.result), &env, structs, fns);
+        } else { let z = 0; }
+        i = i + 1;
+    }
+}
+// ---- v94 generic-fn instance collection (mirrors the host's emittedInstances_) ----
+// Scan one expr for calls to a generic fn; for each, infer `T` and append a
+// MonoReq (deduped by mangled name) to `reqs`. `env` is the using-fn's env.
+fn mono_fns_expr(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<Fn>, reqs: &mut Vec<MonoReq>) ! { alloc } {
+    match e {
+        Num(_) => { let z = 0; },
+        Var(_) => { let z = 0; },
+        Bin(_, a, b) => { mono_fns_expr(&(**a), env, structs, fns, reqs); mono_fns_expr(&(**b), env, structs, fns, reqs); },
+        If(c, t, e2) => { mono_fns_expr(&(**c), env, structs, fns, reqs); mono_fns_expr(&(**t), env, structs, fns, reqs); mono_fns_expr(&(**e2), env, structs, fns, reqs); },
+        SLit(_, vals) => { let nv = vec_len(vals); let mut i = 0; while i < nv { let v = vec_get(vals, i); mono_fns_expr(&(*v), env, structs, fns, reqs); i = i + 1; } },
+        Field(obj, _) => { mono_fns_expr(&(**obj), env, structs, fns, reqs); },
+        Ref(inner) => { mono_fns_expr(&(**inner), env, structs, fns, reqs); },
+        Call(name, args) => {
+            let na = vec_len(args); let mut i = 0;
+            while i < na { let a = vec_get(args, i); mono_fns_expr(&(*a), env, structs, fns, reqs); i = i + 1; }
+            let gi = fn_index(fns, name);
+            if gi >= 0 {
+                let g = vec_get(fns, gi);
+                if g.gp == 1 {
+                    let tcur = infer_tcur(args, &g.params, env, structs, fns);
+                    if tcur != 0 {
+                        let mn = mangle(name, tcur, structs);
+                        let exists = mono_index(reqs, &mn);
+                        if exists < 0 { vec_push(reqs, MonoReq { gi: gi, si: 0 - 1, tag: tcur, mname: mn }); } else { let z = 0; }
+                    } else { let z = 0; }
+                } else { let z = 0; }
+            } else { let z = 0; }
+        },
+        StrLit(_, _) => { let z = 0; },
+    }
+}
+fn mono_fns_stmts(stmts: &Vec<Stmt>, env: &mut HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<Fn>, reqs: &mut Vec<MonoReq>) ! { alloc } {
+    let nl = vec_len(stmts); let mut k = 0;
+    while k < nl {
+        let s = vec_get(stmts, k);
+        match s {
+            Let(name, e) => { mono_fns_expr(&(*e), env, structs, fns, reqs); let t = type_of(&(*e), env, structs, fns); hashmap_insert(env, name, t); },
+            LetMut(name, e) => { mono_fns_expr(&(*e), env, structs, fns, reqs); let t = type_of(&(*e), env, structs, fns); hashmap_insert(env, name, t); },
+            Assign(_, e) => { mono_fns_expr(&(*e), env, structs, fns, reqs); },
+            While(cond, body) => { mono_fns_expr(&(*cond), env, structs, fns, reqs); mono_fns_stmts(&body, env, structs, fns, reqs); },
+            IfS(cond, then_b, else_b) => { mono_fns_expr(&(*cond), env, structs, fns, reqs); mono_fns_stmts(&then_b, env, structs, fns, reqs); mono_fns_stmts(&else_b, env, structs, fns, reqs); },
+            Break => { let z = 0; },
+            Continue => { let z = 0; },
+            ExprStmt(e) => { mono_fns_expr(&(*e), env, structs, fns, reqs); },
+        }
+        k = k + 1;
+    }
+}
+// Collect every generic-fn instance requested by NON-GENERIC fns, deduped by
+// mangled name. (Generic fns calling other generics — nested instantiation — is a
+// documented v94 deferral; we scan only the concrete fns.)
+fn mono_fns_all(fns: &Vec<Fn>, structs: &Vec<SDef>) -> Vec<MonoReq> ! { alloc } {
+    let mut reqs = vec_new();
+    let nf = vec_len(fns); let mut i = 0;
+    while i < nf {
+        let g = vec_get(fns, i);
+        if g.gp == 0 {
+            let mut env = hashmap_new();
+            let np = vec_len(&g.params); let mut p = 0;
+            while p < np { let pm = vec_get(&g.params, p); hashmap_insert(&mut env, clone(&pm.name), pm.ty); p = p + 1; }
+            mono_fns_stmts(&g.body.lets, &mut env, structs, fns, &mut reqs);
+            mono_fns_expr(&(*g.body.result), &env, structs, fns, &mut reqs);
+        } else { let z = 0; }
+        i = i + 1;
+    }
+    reqs
+}
+
 // Type-check a statement list. Returns 1 if anything is ill-typed. `loop_depth`
 // counts enclosing loops (break/continue outside any loop is an error).
 fn check_stmts(stmts: &Vec<Stmt>, env: &mut HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<Fn>, loop_depth: i64) -> i64 ! { alloc } {
@@ -748,24 +1014,38 @@ fn lower(e: &Expr, oenv: &HashMap<String, String>, tenv: &HashMap<String, i64>, 
             Val { op: reg(r), ty: vt.ty }
         },
         SLit(si, vals) => {
-            // build the aggregate with a chain of insertvalue over `undef`.
-            let sty = ty_llvm(100 + *si, structs);
-            let sd = vec_get(structs, *si);
+            // v94: a generic struct (gp==1) resolves to its specialized INSTANCE
+            // (registered by the monomorphizer). We lower field values first, infer
+            // `T` from the first generic field's lowered type, then build the
+            // aggregate at the instance's index/type. Monomorphic structs use *si
+            // directly and stay byte-identical (Risk R0).
+            let sd0 = vec_get(structs, *si);
             let nv = vec_len(vals);
+            // lower all field values once (need their concrete types to infer T)
+            let mut ops = vec_new(); let mut tys = vec_new();
+            let mut li = 0;
+            while li < nv { let fv = vec_get(vals, li); let vv = lower(&(*fv), oenv, tenv, menv, structs, fns, c, buf); vec_push(&mut ops, vv.op); vec_push(&mut tys, vv.ty); li = li + 1; }
+            // resolve the effective struct index (generic -> instance)
+            let eff_si = if sd0.gp == 1 {
+                let mut tcur = 0; let mut fi2 = 0;
+                while fi2 < nv { let f = vec_get(&sd0.fields, fi2); if tcur == 0 { if f.ty == 0 - 1 { tcur = vec_get(&tys, fi2); } else { if f.ty == 199 { let t = vec_get(&tys, fi2); tcur = if t >= 200 { t - 200 } else { 0 }; } else { let z = 0; } } } else { let z = 0; } fi2 = fi2 + 1; }
+                let mn = mangle(&sd0.name, tcur, structs); struct_index(structs, &mn)
+            } else { *si };
+            let sty = ty_llvm(100 + eff_si, structs);
+            let sd = vec_get(structs, eff_si);
             let mut cur = "undef"; let mut curs = clone(&cur);
             let mut i = 0;
             while i < nv {
-                let fv = vec_get(vals, i);
-                let vv = lower(&(*fv), oenv, tenv, menv, structs, fns, c, buf);
                 let f = vec_get(&sd.fields, i);
                 let flt = ty_llvm(f.ty, structs);
+                let opi = vec_get(&ops, i);
                 let r = fresh(c);
                 app(buf, "  "); app(buf, reg(r)); app(buf, " = insertvalue "); app(buf, clone(&sty)); app(buf, " ");
-                app(buf, curs); app(buf, ", "); app(buf, flt); app(buf, " "); app(buf, vv.op); app(buf, ", "); app(buf, int_to_string(i)); app(buf, "\n");
+                app(buf, curs); app(buf, ", "); app(buf, flt); app(buf, " "); app(buf, opi); app(buf, ", "); app(buf, int_to_string(i)); app(buf, "\n");
                 curs = reg(r);
                 i = i + 1;
             }
-            Val { op: curs, ty: 100 + *si }
+            Val { op: curs, ty: 100 + eff_si }
         },
         Field(obj, fname) => {
             let vo = lower(&(**obj), oenv, tenv, menv, structs, fns, c, buf);
@@ -907,22 +1187,33 @@ fn lower(e: &Expr, oenv: &HashMap<String, String>, tenv: &HashMap<String, i64>, 
                 // using the CALLEE's param types so a &String arg prints `ptr`, etc.
                 let gi = fn_index(fns, name);
                 let g = vec_get(fns, gi);
-                let rty = ty_llvm(g.ret, structs);
                 let na = vec_len(args);
-                let mut ops = vec_new();
+                let mut ops = vec_new(); let mut atys = vec_new();
                 let mut i = 0;
-                while i < na { let a = vec_get(args, i); let va = lower(&(*a), oenv, tenv, menv, structs, fns, c, buf); vec_push(&mut ops, va.op); i = i + 1; }
+                while i < na { let a = vec_get(args, i); let va = lower(&(*a), oenv, tenv, menv, structs, fns, c, buf); vec_push(&mut ops, va.op); vec_push(&mut atys, va.ty); i = i + 1; }
+                // v94: a generic callee (gp==1) is dispatched to its MANGLED instance
+                // (`name__<tag>`); `T` is inferred from the first generic-typed arg's
+                // lowered type and param/ret types are substituted. Monomorphic calls
+                // keep the existing path verbatim (Risk R0).
+                let tcur = if g.gp == 1 {
+                    let mut tc = 0; let mut pi = 0;
+                    while pi < na { let pm = vec_get(&g.params, pi); if tc == 0 { if pm.ty == 0 - 1 { tc = vec_get(&atys, pi); } else { if pm.ty == 199 { let t = vec_get(&atys, pi); tc = if t >= 200 { t - 200 } else { 0 }; } else { let z = 0; } } } else { let z = 0; } pi = pi + 1; }
+                    tc
+                } else { 0 };
+                let cname = if g.gp == 1 { mangle(name, tcur, structs) } else { clone(name) };
+                let rtag = if g.gp == 1 { subst_ty(g.ret, tcur) } else { g.ret };
+                let rty = ty_llvm(rtag, structs);
                 let r = fresh(c);
-                app(buf, "  "); app(buf, reg(r)); app(buf, " = call "); app(buf, clone(&rty)); app(buf, " @"); app(buf, clone(name)); app(buf, "(");
+                app(buf, "  "); app(buf, reg(r)); app(buf, " = call "); app(buf, clone(&rty)); app(buf, " @"); app(buf, cname); app(buf, "(");
                 let mut j = 0;
                 while j < na {
                     if j > 0 { let sep = ", "; app(buf, clone(&sep)); } else { let e = ""; app(buf, clone(&e)); }
-                    let pm = vec_get(&g.params, j); let pty = ty_llvm(pm.ty, structs); let opj = vec_get(&ops, j);
+                    let pm = vec_get(&g.params, j); let ptag = if g.gp == 1 { subst_ty(pm.ty, tcur) } else { pm.ty }; let pty = ty_llvm(ptag, structs); let opj = vec_get(&ops, j);
                     app(buf, pty); app(buf, " "); app(buf, opj);
                     j = j + 1;
                 }
                 app(buf, ")\n");
-                Val { op: reg(r), ty: g.ret }
+                Val { op: reg(r), ty: rtag }
             } } } } } } } }
         },
     }
@@ -1207,9 +1498,19 @@ fn lower_stmt(s: &Stmt, oenv: &mut HashMap<String, String>, tenv: &mut HashMap<S
     }
 }
 
+// Emit one fn DEFINITION. v94: `tcur` is the concrete tag bound to `T` (0 for a
+// monomorphic fn — then subst_ty is a no-op and the override name is empty, so the
+// output is byte-identical), and `mname` overrides the emitted symbol name for a
+// generic instance (e.g. `id__i64`). The body is the SHARED generic AST; type
+// resolution happens through the SUBSTITUTED param/ret tags (no AST clone needed).
 fn emit_fn(f: &Fn, structs: &Vec<SDef>, fns: &Vec<Fn>, buf: &mut String) ! { alloc } {
-    let rty = ty_llvm(f.ret, structs);
-    app(buf, "define "); app(buf, clone(&rty)); app(buf, " @"); app(buf, clone(&f.name)); app(buf, "(");
+    let empty = ""; emit_fn_inst(f, 0, &empty, structs, fns, buf);
+}
+fn emit_fn_inst(f: &Fn, tcur: i64, mname: &String, structs: &Vec<SDef>, fns: &Vec<Fn>, buf: &mut String) ! { alloc } {
+    let ret_tag = subst_ty(f.ret, tcur);
+    let rty = ty_llvm(ret_tag, structs);
+    let sym = if str_len(mname) > 0 { clone(mname) } else { clone(&f.name) };
+    app(buf, "define "); app(buf, clone(&rty)); app(buf, " @"); app(buf, sym); app(buf, "(");
     let np = vec_len(&f.params);
     let mut oenv = hashmap_new();
     let mut tenv = hashmap_new();
@@ -1218,11 +1519,12 @@ fn emit_fn(f: &Fn, structs: &Vec<SDef>, fns: &Vec<Fn>, buf: &mut String) ! { all
     while i < np {
         if i > 0 { app(buf, ", "); } else { app(buf, ""); }
         let p = vec_get(&f.params, i);
-        let pty = ty_llvm(p.ty, structs);
+        let p_tag = subst_ty(p.ty, tcur);
+        let pty = ty_llvm(p_tag, structs);
         let an = arg_name(i);
         app(buf, clone(&pty)); app(buf, " "); app(buf, clone(&an));
         hashmap_insert(&mut oenv, clone(&p.name), an);
-        hashmap_insert(&mut tenv, clone(&p.name), p.ty);
+        hashmap_insert(&mut tenv, clone(&p.name), p_tag);
         i = i + 1;
     }
     app(buf, ") {\nentry:\n");
@@ -1248,7 +1550,7 @@ fn emit_fn(f: &Fn, structs: &Vec<SDef>, fns: &Vec<Fn>, buf: &mut String) ! { all
     // entirely when f itself returns an owned-heap type (3/4): returning a Vec /
     // owned String transfers ownership to the caller and is a documented v92
     // deferral (Risk R3) — never freed here to avoid a use-after-free.
-    let escapes = if f.ret == 3 { 1 } else { if f.ret == 4 { 1 } else { 0 } };
+    let escapes = if ret_tag == 3 { 1 } else { if ret_tag == 4 { 1 } else { 0 } };
     if escapes == 0 {
         let no = vec_len(&cg.owned); let mut oi = 0;
         while oi < no {
@@ -1284,7 +1586,7 @@ fn main() -> i64 ! { io, alloc } {
     if arg_count() > 1 { src = arg_get(1); } else { src = clone(&demo); }
     let toks = lex(&src);
     let mut pos = Pos { i: 0 };
-    let structs = parse_structs(&src, &toks, &mut pos);
+    let mut structs = parse_structs(&src, &toks, &mut pos);
     // Parse ALL top-level fns into a registry (user calls need every callee).
     let mut fns = vec_new();
     let kw_fn = "fn";
@@ -1294,6 +1596,11 @@ fn main() -> i64 ! { io, alloc } {
         if is_fn == 1 { let g = parse_fn(&src, &toks, &mut pos, &structs); vec_push(&mut fns, g); }
         else { more = false; }
     }
+    // v94: monomorphize generic STRUCTS first — register one specialized SDef per
+    // (generic-struct, concrete-T) used by a non-generic fn, so the typechecker /
+    // codegen below resolve a generic struct literal to its concrete instance. This
+    // is a no-op when no struct is generic (every existing gate stays byte-identical).
+    mono_structs_all(&fns, &mut structs);
     let nf = vec_len(&fns);
     // Type-check every fn against the registry.
     let mut bad = 0; let mut ci = 0;
@@ -1313,10 +1620,21 @@ fn main() -> i64 ! { io, alloc } {
         // every prior (no-Vec) program's preamble stays byte-for-byte identical.
         let wv = fns_use_rt(&fns, 1); let ws = fns_use_rt(&fns, 2);
         emit_runtime_decls(&mut pre, wv, ws);
-        // Emit every fn.
+        // Emit every NON-GENERIC fn. (A generic fn declaration emits NOTHING on its
+        // own — only its monomorphized instances are emitted, below.)
         let mut out = string_new();
         let mut ej = 0;
-        while ej < nf { let g = vec_get(&fns, ej); emit_fn(&g, &structs, &fns, &mut out); ej = ej + 1; }
+        while ej < nf { let g = vec_get(&fns, ej); if g.gp == 0 { emit_fn(&g, &structs, &fns, &mut out); } else { let z = 0; } ej = ej + 1; }
+        // v94: emit each requested generic-fn INSTANCE once (dedup by mangled name),
+        // substituting the concrete tag for `T`. Mirrors the host's emittedInstances_.
+        let reqs = mono_fns_all(&fns, &structs);
+        let nr = vec_len(&reqs); let mut ri = 0;
+        while ri < nr {
+            let rq = vec_get(&reqs, ri);
+            let gf = vec_get(&fns, rq.gi);
+            emit_fn_inst(&gf, rq.tag, &rq.mname, &structs, &fns, &mut out);
+            ri = ri + 1;
+        }
         let mut args = vec_new();
         let np = vec_len(&f.params);
         let mut i = 0;
