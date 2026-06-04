@@ -12111,8 +12111,18 @@ private:
     // then stores. For field chains rooted at an aggregate-by-value local
     // we round-trip through the alloca (load/insert/store handled by the
     // GEP-on-alloca path).
+    // v100: store `v` into a place `slot`; if the place is a packed-struct field
+    // (possibly misaligned), emit an `align 1` store — never an over-aligned one.
+    void storeToPlace(llvm::Value* v, llvm::Value* slot, bool packed) {
+        auto* st = builder_->CreateStore(v, slot);
+        if (packed) st->setAlignment(llvm::Align(1));
+    }
+
     void emitAssign(const ast::AssignStmt& as) {
         llvm::Value* slot = emitPlaceAddr(*as.target);
+        // v100: snapshot packedness NOW — emitExpr(value) below may re-enter
+        // emitPlaceAddr and clobber lastPlacePacked_.
+        bool packed = lastPlacePacked_;
         if (!slot) {
             errors_.push_back("codegen: unsupported assignment target");
             return;
@@ -12129,7 +12139,7 @@ private:
             DropLocal* d = findDropLocal(id->name);
             if (d) {
                 emitDropLocalGuarded(*d);
-                builder_->CreateStore(v, slot);
+                storeToPlace(v, slot, packed);
                 builder_->CreateStore(llvm::ConstantInt::getTrue(*ctx_),
                                       d->flag);
                 // Phase 100: the fresh struct's fields are all live again.
@@ -12157,7 +12167,7 @@ private:
                         for (const auto& [fidx, fflag] : d->fieldFlags) {
                             if (fidx != i) continue;
                             emitGuardedDropAtPlace(slot, fty, fflag);
-                            builder_->CreateStore(v, slot);
+                            storeToPlace(v, slot, packed);
                             builder_->CreateStore(
                                 llvm::ConstantInt::getTrue(*ctx_), fflag);
                             return;
@@ -12167,7 +12177,7 @@ private:
                 }
             }
         }
-        builder_->CreateStore(v, slot);
+        storeToPlace(v, slot, packed);
     }
 
     // v17 Phase 107: drop the value at an arbitrary place `place` of type `ty`,
@@ -12227,7 +12237,16 @@ private:
 
     // Compute an address (pointer) for an assignable place. Returns null
     // if the target shape isn't supported.
+    // v100 codegen audit: set true by emitPlaceAddr when the place it returns is
+    // a FIELD of a `#[repr(packed)]` struct (a possibly-misaligned address). A
+    // store through such a place MUST be `align 1` — an over-aligned store is
+    // IR-level UB (SIGBUS on strict-alignment targets, miscompiled by LLVM's
+    // alignment passes). Snapshot it immediately after the emitPlaceAddr call
+    // (before any re-entrant emitPlaceAddr can clobber it).
+    bool lastPlacePacked_ = false;
+
     llvm::Value* emitPlaceAddr(const ast::Expr& e) {
+        lastPlacePacked_ = false; // reset every call; only a packed field sets it
         // Phase 51: the address of a deref place `*inner` IS the pointer value
         // `inner` (it points at the dereferenced location). So `&*e` / `&**e`
         // is just `e` evaluated to its pointer — closing the `&*` ergonomics
@@ -12257,6 +12276,9 @@ private:
             llvm::Type* structLlvm = mapKardashevType(st);
             for (unsigned i = 0; i < st->structFields.size(); ++i) {
                 if (st->structFields[i].first == fe->fieldName) {
+                    // v100: a field of a packed struct is possibly misaligned —
+                    // flag it so the caller emits an `align 1` store.
+                    lastPlacePacked_ = st->reprPacked;
                     return builder_->CreateStructGEP(
                         structLlvm, baseAddr, i, "fld_addr_" + fe->fieldName);
                 }

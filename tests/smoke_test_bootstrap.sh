@@ -74,6 +74,7 @@ echo "PASS [determinism]: default demo byte-identical across 3 runs"
 
 # --- (B) the corpus — one in-subset program per shipped self-hosting feature ---
 corpus_case "fn f(a: i64, b: i64) -> i64 { a + b * 2 }" 3 4 "arith"
+corpus_case "fn f(a: i64, b: i64) -> i64 { a - b }" 9 3 "subtract"                                                                              # v100 (was silently dropped pre-v100)
 corpus_case "struct Widget { x: i64, y: i64 } fn f(a: i64, b: i64) -> i64 { let w = Widget { x: a, y: b } ; w.x + w.y }" 3 4 "struct"            # v84
 corpus_case "struct Widget { v: i64 } fn rd(w: &Widget) -> i64 { w.v } fn f(a: i64, b: i64) -> i64 { let wi = Widget { v: a + b } ; rd(&wi) }" 3 4 "ref"  # v85 (&Struct)
 corpus_case "fn g(x: i64) -> i64 { x * x } fn f(a: i64, b: i64) -> i64 { g(a) + g(b) }" 3 4 "call"                                               # v86
@@ -86,7 +87,7 @@ corpus_case "struct Widget { v: i64 } trait Thing { fn dbl(&self) -> i64 ; fn on
 
 # The covered set must be non-trivial (and grows as the subset grows: v98 had only
 # the per-feature gates; v99 is the first to assert them TOGETHER as a stable corpus).
-[[ "$COVERED" -ge 10 ]] || { echo "FAIL [coverage]: corpus too small ($COVERED < 10)"; exit 1; }
+[[ "$COVERED" -ge 11 ]] || { echo "FAIL [coverage]: corpus too small ($COVERED < 11)"; exit 1; }
 echo "PASS [coverage]: $COVERED in-subset programs deterministic + self == host"
 echo "NOTE: full-tree self-compile (structgen compiling examples/selfhost/*.kd) is"
 echo "      out of subset — tracked file-by-file in docs/bootstrap-status.md."

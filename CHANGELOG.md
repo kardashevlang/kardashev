@@ -18,6 +18,53 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.100.0] — Arc close: codegen audit (2 real bugs fixed) + the 1.0 ledger
+
+The final version of the v91–v100 arc. A 4-agent adversarial audit of every
+lowering path the arc touched **found real bugs the per-feature gates missed** —
+exactly the point of the audit — and v100 fixes them, hardens the bootstrap
+candidate, and ships the honest 1.0-readiness ledger.
+
+### Fixed
+- **Packed-field misaligned write (host codegen).** A write to a misaligned field
+  of a `#[repr(packed)]` struct emitted an over-aligned `store … align 8` to a
+  1-aligned address — IR-level UB (latent on x86-64, **SIGBUS** on strict-alignment
+  targets, exploitable by LLVM's alignment passes). Now codegen flags a
+  packed-field place (`lastPlacePacked_` in `emitPlaceAddr`) and emits `align 1` at
+  the three `emitAssign` store sites. The read path was already correct.
+  *(Known limitation, matches Rust: a store through a `*mut T` taken from a packed
+  field still loses packedness — UB in Rust too; not claimed fixed.)*
+- **Binary `-` silently dropped (self-hosted emitter).** `examples/selfhost/structgen.kd`
+  had no `-` token, so `a - b` returned `a` (a silent wrong answer). Fixed at 4
+  sites: lexer (kind 28), `parse_sum`, `type_of` (arithmetic result), codegen
+  (`sub i64`).
+
+### Added
+- **`docs/road-to-1.0.md`** — the measured 1.0-readiness ledger (perf / tooling /
+  stdlib / platform / self-hosting), each row tagged shipped/measured-gap/mega-arc
+  and **cross-checked against a named in-tree test**. No blanket "1.0-ready" claim.
+- **`ROADMAP-v91-v100.md` → "v101 and beyond"** — the forward stub naming the XL
+  mega-arcs (full bootstrap, register-ABI struct-by-value FFI, WASM/Windows
+  backends, package registry, mechanized-spec capstone) with honest sizing.
+- **`tests/smoke_test_packed_write.sh`** — packed write `align 1`, non-packed
+  control `align 8`, runtime round-trip, + a `&mut [u32]` `align 4` audit-lock.
+- **`tests/smoke_test_v100_close.sh`** — composes the packed-write fix + the
+  hardened bootstrap corpus + the v99 effects gate + the v95 perf lock + the v97
+  repr-packed lock + the v90 vector lock + a ledger doc-vs-reality cross-check.
+
+### Changed
+- `docs/bootstrap-status.md` gains a "Known self/host divergences" section (the 2
+  fixes + 2 honest deferrals). `tests/smoke_test_bootstrap.sh` corpus grows to 11
+  (adds the now-correct `-`).
+
+### Deferred (honest)
+- The audit's other two self/host divergences: `for`+`continue` (infinite loop —
+  needs a continue-targeted latch / `ForRange` variant; deferred rather than risk
+  a new-Stmt-variant change in the consolidation version) and effect-enforcement /
+  generic-struct-param parse in the subset. Recorded per-case in
+  `docs/bootstrap-status.md`.
+- The road to 1.0 itself — the XL mega-arcs, sized in the v101+ stub.
+
 ## [0.99.0] — Self-hosting: effect rows + an honest bootstrap candidate + ledger
 
 The self-hosted compiler gains opt-in **effect rows**, and the arc gets its honest
