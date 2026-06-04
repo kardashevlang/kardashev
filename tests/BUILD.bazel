@@ -720,6 +720,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v101: ELEMENT-GENERIC iterator adaptors — the g* tower (gvec_iter/gtake/gskip/
+# gmap/gfilter) over any element type (i64/struct/String), nested chains, with a
+# use-gated/byte-identity lock on the frozen i64 tower.
+sh_test(
+    name = "smoke_test_iter_generic",
+    srcs = ["smoke_test_iter_generic.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v62: stdlib runtime — monotonic clock, env vars, seeded global RNG.
 sh_test(
     name = "smoke_test_instant",

@@ -132,10 +132,11 @@ std::string applyPrelude(const std::string& userSrc) {
     // iterator, so a chain like `iter_take(iter_skip(range, 20), 5)` fuses into
     // a single pass with O(1) extra memory and no intermediate Vec — only a
     // terminal `iter_collect` allocates. Element type is `i64` (and `(i64,i64)`
-    // for zip/enumerate): a fully element-generic tower needs `impl<T>
-    // Iterator<T> for Adaptor<T>` (a generic param as the trait's type argument),
-    // which the impl resolver does not yet support — see DEFERRALS in
-    // ROADMAP-v54-v66.md. Pure-prelude Kardashev over the existing generic
+    // for zip/enumerate). v101 added a parallel ELEMENT-GENERIC `g*` tower (below,
+    // `GTake`/`GSkip`/`GMap`/`GFilter`/`GVecIter`) — `impl<I: Iterator<T>, T>
+    // Iterator<T> for GTake<I,T>` now resolves via the v101
+    // `bindTraitParamsForImpl` fix; this i64 tower is kept FROZEN for byte-identity
+    // (its struct mangles are locked). Pure-prelude Kardashev over the existing generic
     // monomorphization; no codegen changes. Suppressed together with the
     // prelude `Iterator` (it builds on it) and if the user defines `iter_take`.
     //
@@ -290,6 +291,101 @@ std::string applyPrelude(const std::string& userSrc) {
             "}\n"
             "fn iter_peekable<I: Iterator<i64>>(it: I) -> Peekable<I>\n"
             "    { Peekable { iter: it, peeked: false, has_val: false, pval: 0 } }\n";
+    }
+    // v101: the ELEMENT-GENERIC iterator adaptor tower. The i64 tower above is
+    // FROZEN (its struct mangles `Take__Range` etc. are byte-identity-locked, and
+    // adding an element type-param would rename them). This parallel `g*` tower
+    // carries the element type as a struct param so
+    // `impl<I: Iterator<T>, T> Iterator<T> for GTake<I, T>` resolves `T` from the
+    // trait type-arg (enabled by the v101 `bindTraitParamsForImpl` fix — seeding
+    // impl params referenced by a trait arg). It fuses lazily like the i64 tower
+    // but works over ANY element type (i64, structs, owned String), drained by the
+    // already-generic `iter_collect`. Monomorphize-on-use: an unused g* tower
+    // emits no IR, so every existing program's IR stays byte-identical. Suppressed
+    // with the prelude `Iterator` and if the user defines `fn gtake`.
+    //
+    // SCOPE (honest): the LINEAR adaptors (source/take/skip/map/filter) ship —
+    // their element type is a direct struct type-arg, so `iter_collect`'s `Vec<T>`
+    // resolves. `zip`/`enumerate` produce a COMPUTED pair element (`TwoTup<T,U>`)
+    // that is only in the impl's trait arg, not a struct param — draining that via
+    // `iter_collect` needs associated-output inference through the bound (the same
+    // gap as constructor element-inference), so element-generic zip/enumerate are
+    // DEFERRED; the i64 `iter_zip`/`iter_enumerate` remain.
+    if (userSrc.find("trait Iterator") == std::string::npos &&
+        userSrc.find("fn gtake") == std::string::npos) {
+        prelude +=
+            // GVecIter<T>: a Vec<T> -> Iterator<T> bridge for any element type
+            // (vec_get clones a non-Copy element, so String/struct elements work).
+            "struct GVecIter<T> { v: Vec<T>, pos: i64 }\n"
+            "impl<T> Iterator<T> for GVecIter<T> {\n"
+            "    fn next(&mut self) -> Option<T> ! { alloc } {\n"
+            "        if self.pos < vec_len(&self.v) {\n"
+            "            let x = vec_get(&self.v, self.pos);\n"
+            "            self.pos = self.pos + 1; Some(x)\n"
+            "        } else { None }\n"
+            "    }\n"
+            "}\n"
+            "fn gvec_iter<T>(v: Vec<T>) -> GVecIter<T> { GVecIter { v: v, pos: 0 } }\n"
+            // GTake<I,T>: yield at most `rem` elements, then stop.
+            "struct GTake<I, T> { iter: I, rem: i64 }\n"
+            "impl<I: Iterator<T>, T> Iterator<T> for GTake<I, T> {\n"
+            "    fn next(&mut self) -> Option<T> ! { alloc } {\n"
+            "        if self.rem <= 0 { None }\n"
+            "        else { self.rem = self.rem - 1; self.iter.next() }\n"
+            "    }\n"
+            "}\n"
+            "fn gtake<I: Iterator<T>, T>(it: I, n: i64) -> GTake<I, T>\n"
+            "    { GTake { iter: it, rem: n } }\n"
+            // GSkip<I,T>: drop the first `skip_cnt` elements, then pass through.
+            "struct GSkip<I, T> { iter: I, skip_cnt: i64 }\n"
+            "impl<I: Iterator<T>, T> Iterator<T> for GSkip<I, T> {\n"
+            "    fn next(&mut self) -> Option<T> ! { alloc } {\n"
+            "        while self.skip_cnt > 0 {\n"
+            "            self.skip_cnt = self.skip_cnt - 1;\n"
+            "            let d = self.iter.next();\n"
+            "            match d { Some(x) => {}, None => { return None; } }\n"
+            "        }\n"
+            "        self.iter.next()\n"
+            "    }\n"
+            "}\n"
+            "fn gskip<I: Iterator<T>, T>(it: I, n: i64) -> GSkip<I, T>\n"
+            "    { GSkip { iter: it, skip_cnt: n } }\n"
+            // GMap<I,T,U>: apply `fn(&T)->U` to each element on demand (changes the
+            // element type T -> U; the multi-param generic impl resolves both). The
+            // mapper takes `&T` (not `T` by value) so a struct/String element
+            // passes uniformly by pointer — a by-value struct through the fn-value
+            // fat-pointer ABI would mismatch the indirect-call signature.
+            "struct GMap<I, T, U> { iter: I, f: fn(&T) -> U }\n"
+            "impl<I: Iterator<T>, T, U> Iterator<U> for GMap<I, T, U> {\n"
+            "    fn next(&mut self) -> Option<U> ! { alloc } {\n"
+            "        let x = self.iter.next();\n"
+            "        match x { Some(v) => Some((self.f)(&v)), None => None }\n"
+            "    }\n"
+            "}\n"
+            "fn gmap<I: Iterator<T>, T, U>(it: I, f: fn(&T) -> U) -> GMap<I, T, U>\n"
+            "    { GMap { iter: it, f: f } }\n"
+            // GFilter<I,T>: yield only elements for which `pred` is true. The
+            // predicate takes `&T` (not `T` by value) so a non-Copy element is
+            // not consumed by the test; the result is bound to a `let` to release
+            // the borrow before re-yielding `Some(v)`.
+            "struct GFilter<I, T> { iter: I, pred: fn(&T) -> bool }\n"
+            "impl<I: Iterator<T>, T> Iterator<T> for GFilter<I, T> {\n"
+            "    fn next(&mut self) -> Option<T> ! { alloc } {\n"
+            "        let mut res: Option<T> = None;\n"
+            "        let mut go = true;\n"
+            "        while go {\n"
+            "            let x = self.iter.next();\n"
+            "            match x {\n"
+            "                Some(v) => { let keep = (self.pred)(&v);"
+            " if keep { res = Some(v); go = false; } else {} },\n"
+            "                None => { go = false; }\n"
+            "            }\n"
+            "        }\n"
+            "        res\n"
+            "    }\n"
+            "}\n"
+            "fn gfilter<I: Iterator<T>, T>(it: I, pred: fn(&T) -> bool) -> GFilter<I, T>\n"
+            "    { GFilter { iter: it, pred: pred } }\n";
     }
     // Phase 28: the `Hash` and `Eq` traits with built-in impls for i64 and
     // String, so user code can call `k.hash()` / `a.eq(&b)` and bound a
