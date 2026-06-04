@@ -408,7 +408,24 @@ std::string applyPrelude(const std::string& userSrc) {
             "impl Hash for bool"
             " { fn hash(&self) -> i64 { if *self { 1 } else { 0 } } }\n"
             "impl Hash for f64"
-            " { fn hash(&self) -> i64 { let v = float_to_int(*self); hash_i64(&v) } }\n";
+            " { fn hash(&self) -> i64 { let v = float_to_int(*self); hash_i64(&v) } }\n"
+            // v105: Hash for Option<T> / Result<T,E> — generic blanket impls
+            // (verified post-v101 resolver). Mixes a per-variant seed with the
+            // payload hash via the derive convention (seed 527+ordinal, fold
+            // payload *31), so a value's hash agrees with a #[derive(Hash)] on an
+            // equivalent user enum — which is what makes `#[derive(Eq,Hash)]` over
+            // an Option/Result field resolve. (Value-level + as a Vec/Box element;
+            // these types as HashMap *keys* are a separate codegen item, deferred.)
+            "impl<T: Hash> Hash for Option<T> {\n"
+            "  fn hash(&self) -> i64 {\n"
+            "    match self { Some(x) => 527 + x.hash() * 31, None => 17 }\n"
+            "  }\n"
+            "}\n"
+            "impl<T: Hash, E: Hash> Hash for Result<T, E> {\n"
+            "  fn hash(&self) -> i64 {\n"
+            "    match self { Ok(x) => 527 + x.hash() * 31, Err(x) => 528 + x.hash() * 31 }\n"
+            "  }\n"
+            "}\n";
     }
     if (userSrc.find("trait Eq") == std::string::npos) {
         prelude +=
@@ -433,7 +450,32 @@ std::string applyPrelude(const std::string& userSrc) {
             " { fn eq(&self, other: &bool) -> bool"
             " { if *self { *other } else { !*other } } }\n"
             "impl Eq for f64"
-            " { fn eq(&self, other: &f64) -> bool { *self == *other } }\n";
+            " { fn eq(&self, other: &f64) -> bool { *self == *other } }\n"
+            // v105: Eq for Option<T> / Result<T,E> — generic blanket impls
+            // (verified post-v101 resolver). Structural, recursing into the
+            // payload's Eq via bare-variant match arms. Makes Option/Result usable
+            // in `==`, as Vec/Box elements, and as #[derive(Eq,Hash)] struct
+            // fields. (These types as HashMap *keys* are a separate codegen item,
+            // deferred — see ROADMAP v105.)
+            // The eq bodies declare `! { alloc }` (matching the trait) because a
+            // recursive `x.eq(y)` over a generic `T: Eq` may allocate — required
+            // so the impls type-check under `--effects=strict` too.
+            "impl<T: Eq> Eq for Option<T> {\n"
+            "  fn eq(&self, other: &Option<T>) -> bool ! { alloc } {\n"
+            "    match self {\n"
+            "      Some(x) => match other { Some(y) => x.eq(y), None => false },\n"
+            "      None => match other { Some(y) => false, None => true },\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+            "impl<T: Eq, E: Eq> Eq for Result<T, E> {\n"
+            "  fn eq(&self, other: &Result<T, E>) -> bool ! { alloc } {\n"
+            "    match self {\n"
+            "      Ok(x) => match other { Ok(y) => x.eq(y), Err(e) => false },\n"
+            "      Err(x) => match other { Ok(y) => false, Err(e) => x.eq(e) },\n"
+            "    }\n"
+            "  }\n"
+            "}\n";
     }
     // Phase 37: the `Display` trait — `to_string(&self) -> String` — with
     // built-in impls for the scalar/heap primitives, so a generic can be

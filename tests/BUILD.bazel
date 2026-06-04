@@ -729,6 +729,14 @@ sh_test(
 # deterministic, sortedness/found-index oracle).
 # v104: slice utilities — slice_to_vec / slice_iter / slice_chunks / slice_windows
 # / slice_contains / slice_index_of (zero-copy Vec<&[T]> views; iter rides v101).
+# v105: generic Eq/Hash for Option/Result + #[derive(Eq,Hash)] over Option fields
+# (composite HashMap keys via nominal derive'd structs).
+sh_test(
+    name = "smoke_test_composite_eq_hash",
+    srcs = ["smoke_test_composite_eq_hash.sh"],
+    data = ["//compiler:kardc"],
+)
+
 sh_test(
     name = "smoke_test_slice_methods",
     srcs = ["smoke_test_slice_methods.sh"],
