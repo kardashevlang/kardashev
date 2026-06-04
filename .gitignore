@@ -30,3 +30,6 @@ Makefile.local
 # build artifacts (local Makefile.local copies)
 compiler/kard-lsp
 compiler/kardfmt
+
+# Claude Code worktrees / local agent state
+.claude/

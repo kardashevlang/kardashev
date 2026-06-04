@@ -2055,6 +2055,18 @@ sh_test(
     ],
 )
 
+# v98: self-hosted STATIC (monomorphized) trait dispatch — `trait`/`impl` parse into
+# mangled `Struct_method` Fns; `recv.method(args)` resolves statically to a direct
+# `call @Struct_method(ptr recv, args)` (no vtable). Differential self == host.
+sh_test(
+    name = "smoke_test_selfhost_traits",
+    srcs = ["smoke_test_selfhost_traits.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:structgen.kd",
+    ],
+)
+
 # v95: permanent perf-regression gate over bench/*.kd. Deterministic structural
 # IR-greps (fib 0-allocas, loop 0-allocas + vectorized) BLOCK; a generous best-of-5
 # wall-time check is advisory/skippable (never flakes CI).
