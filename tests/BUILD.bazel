@@ -43,6 +43,22 @@ sh_test(
     data = ["//compiler:kard-lsp"],
 )
 
+# v110 (ARC D, FINAL): the LSP textDocument/codeAction quick-fix — offers an `impl`
+# skeleton insert for an unsatisfied trait-bound diagnostic.
+sh_test(
+    name = "smoke_test_lsp_codeaction",
+    srcs = ["smoke_test_lsp_codeaction.sh"],
+    data = ["//compiler:kard-lsp"],
+)
+
+# v110 (ARC D, FINAL): trait-bound-satisfaction diagnostics — a missing impl now emits
+# a clear E0277 naming the bound + the fix + candidate types.
+sh_test(
+    name = "smoke_test_bound_diag",
+    srcs = ["smoke_test_bound_diag.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 20b: LSP find-all-references + rename, driven over stdio JSON-RPC.
 sh_test(
     name = "smoke_test_lsp_edit",

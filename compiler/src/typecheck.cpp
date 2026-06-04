@@ -6558,17 +6558,48 @@ private:
                   mc.line, mc.column);
             return makeFreshVar();
         }
+        // v110: a clearer trait-BOUND diagnostic. When method resolution fails for
+        // a concrete type, name the trait the method comes from (`X: Trait` is not
+        // satisfied), suggest the missing `impl`, and list the types that DO provide
+        // the method — so a forgotten `impl` is actionable instead of cryptic.
+        auto boundHelp = [&](const std::string& method) -> std::string {
+            std::string trait;
+            for (const auto& [tname, sigs] : traits_) {
+                for (const auto& s : sigs)
+                    if (s.name == method) { trait = tname; break; }
+                if (!trait.empty()) break;
+            }
+            std::vector<std::string> haveIt;
+            for (const auto& [tn, methods] : methodImplLookup_)
+                if (methods.count(method)) haveIt.push_back(tn);
+            std::sort(haveIt.begin(), haveIt.end());
+            std::string out;
+            if (!trait.empty())
+                out += ": the trait bound `" + typeName + ": " + trait +
+                       "` is not satisfied — add `impl " + trait + " for " +
+                       typeName + "`";
+            if (!haveIt.empty()) {
+                out += (trait.empty() ? "; " : " (");
+                out += "types with an `" + method + "` impl: ";
+                for (std::size_t i = 0; i < haveIt.size(); ++i) {
+                    if (i) out += ", ";
+                    out += haveIt[i];
+                }
+                if (!trait.empty()) out += ")";
+            }
+            return out;
+        };
         auto typeIt = methodImplLookup_.find(typeName);
         if (typeIt == methodImplLookup_.end()) {
             error("no impl for type '" + typeName + "' (method '" +
-                      mc.methodName + "')",
+                      mc.methodName + "')" + boundHelp(mc.methodName),
                   mc.line, mc.column);
             return makeFreshVar();
         }
         auto methodIt = typeIt->second.find(mc.methodName);
         if (methodIt == typeIt->second.end()) {
             error("no impl provides method '" + mc.methodName +
-                      "' for type '" + typeName + "'",
+                      "' for type '" + typeName + "'" + boundHelp(mc.methodName),
                   mc.line, mc.column);
             return makeFreshVar();
         }
