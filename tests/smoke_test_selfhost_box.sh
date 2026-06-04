@@ -76,9 +76,17 @@ diff_case() {  # $1 source, $2 a, $3 b, $4 label
     "$KARDC" --no-cache -o "$TMP/h" "$TMP/h.kd" >/dev/null 2>&1 || { echo "FAIL [v108-box/$4]: host rejected program"; exit 1; }
     "$TMP/h" >/dev/null 2>&1; local r_host=$?
     [[ "$r_self" -eq "$r_host" ]] || { echo "FAIL [v108-box/$4]: self=$r_self != host=$r_host"; exit 1; }
-    # ASan (best-effort: only assert if the ASan build succeeds)
+    # ASan (best-effort: only assert if the ASan build succeeds). LeakSanitizer
+    # (detect_leaks) is Linux-only — passing it on macOS aborts ASan (Abort trap: 6),
+    # so enable leak detection only on Linux; macOS still catches UAF/double-free with
+    # plain ASan (and the Box is freed once at exit, so there is nothing to leak anyway).
     if "$CLANG" -fsanitize=address "$TMP/s.ll" -o "$TMP/sa" 2>/dev/null; then
-        ASAN_OPTIONS=detect_leaks=1 "$TMP/sa" >/dev/null 2>&1; local r_asan=$?
+        local r_asan
+        if [[ "$(uname -s)" == "Linux" ]]; then
+            ASAN_OPTIONS=detect_leaks=1 "$TMP/sa" >/dev/null 2>&1; r_asan=$?
+        else
+            "$TMP/sa" >/dev/null 2>&1; r_asan=$?
+        fi
         [[ "$r_asan" -eq "$r_host" ]] || { echo "FAIL [v108-box/$4]: ASan exit $r_asan != $r_host (leak/UAF/double-free)"; exit 1; }
         echo "PASS [$4]: self == host == ASan == $r_self"
     else
