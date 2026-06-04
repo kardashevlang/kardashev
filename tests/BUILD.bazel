@@ -2037,6 +2037,20 @@ sh_test(
     ],
 )
 
+# v95: permanent perf-regression gate over bench/*.kd. Deterministic structural
+# IR-greps (fib 0-allocas, loop 0-allocas + vectorized) BLOCK; a generous best-of-5
+# wall-time check is advisory/skippable (never flakes CI).
+sh_test(
+    name = "smoke_test_perf_regression",
+    srcs = ["smoke_test_perf_regression.sh"],
+    data = [
+        "//compiler:kardc",
+        "//bench:fib.kd",
+        "//bench:loop.kd",
+        "//bench:fib.c",
+    ],
+)
+
 # v20 Phase 118: the self-hosted compiler handles ENUMS + match — tagged-pair
 # aggregates + a branch-free match select-chain, differential-gated vs the host.
 sh_test(
