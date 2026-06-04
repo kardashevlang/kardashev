@@ -3928,11 +3928,42 @@ private:
         return env;
     }
 
+    // v101: does a TypeRef mention `name` anywhere in its name / type-args
+    // (recursively)? Used to decide whether to seed an impl's own generic
+    // params into the env below — we ONLY seed params actually referenced by a
+    // trait type-arg, so an i64-pinned impl (`impl<I: Iterator<i64>>
+    // Iterator<i64> for Take<I>`, trait arg `i64`) seeds NOTHING and stays
+    // byte-identical (no fresh-Var counter shift). An element-generic impl
+    // (`impl<I: Iterator<T>, T> Iterator<T> for GTake<I,T>`, trait arg `T`)
+    // seeds `T` so the header resolves instead of erroring `unknown type: T`.
+    static bool typeRefMentions(const ast::TypeRef& tr, const std::string& nm) {
+        if (tr.name == nm) return true;
+        for (const auto& a : tr.typeArgs)
+            if (typeRefMentions(a, nm)) return true;
+        for (const auto& a : tr.assocTypeArgs)
+            if (typeRefMentions(a, nm)) return true;
+        return false;
+    }
+
     void bindTraitParamsForImpl(const ast::ImplDecl& impl, GenericEnv& env) {
         if (impl.traitName.empty()) return;
         auto pit = traitGenericParams_.find(impl.traitName);
         if (pit == traitGenericParams_.end()) return;
         const std::vector<std::string>& names = pit->second;
+        // v101: seed the impl's OWN generic params that a trait type-arg
+        // references (e.g. the `T` in `... Iterator<T> for GTake<I,T>`) so the
+        // arg resolves to that param's Var rather than erroring `unknown type`.
+        // Restricted to *referenced* params and *unseeded* names (don't clobber
+        // a pre-bound Self) so the i64 tower allocates no fresh Vars => its IR
+        // is byte-identical. Other callers (Pass-1d targEnv, schema build)
+        // already have these in scope; the Pass-1d assocEnv did not.
+        for (const auto& gp : impl.genericParams) {
+            if (gp.isConst || env.count(gp.name)) continue;
+            bool referenced = false;
+            for (const auto& ta : impl.traitTypeArgs)
+                if (typeRefMentions(ta, gp.name)) { referenced = true; break; }
+            if (referenced) env[gp.name] = makeFreshVar();
+        }
         const GenericEnv* saved = currentGenericEnv_;
         currentGenericEnv_ = &env; // so trait-args can see Self
         for (std::size_t i = 0;

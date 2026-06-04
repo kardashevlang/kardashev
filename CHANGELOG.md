@@ -18,6 +18,42 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.101.0] — Element-generic iterator adaptors
+
+Opens the **ROADMAP-v101-v110** "production depth" arc. The lazy iterator adaptor
+tower (v61/v78) was `i64`-only because a generic impl could not bind a generic
+param as the trait's type-arg. Ground-truth probing corrected the roadmap premise
+(the "nested-adaptor PHI crash" was a red herring — no codegen change was needed):
+the real block was a typecheck error `unknown type: T` on the impl header.
+
+### Added
+- **Generic-impl resolution fix** (`bindTraitParamsForImpl`): an impl's own
+  generic params that a trait type-arg references (the `T` in
+  `impl<I: Iterator<T>, T> Iterator<T> for GTake<I,T>`) are now seeded into the
+  resolution env. Restricted to *referenced* params so the `i64` tower (trait arg
+  `i64`, no param names) allocates **zero** fresh Vars and stays **byte-identical**
+  (a naive fix shifts the global Var-ID counter and renames phantom-mangled
+  symbols → IR drift; verified avoided by an empty `--emit-llvm` diff).
+- **An element-generic prelude adaptor tower** under `g*` names — `gvec_iter`,
+  `gtake`, `gskip`, `gmap`, `gfilter` — that fuses lazily over **any** element type
+  (i64, structs, owned `String`), nests arbitrarily deep, and drains via the
+  already-generic `iter_collect`. `gmap` takes `fn(&T)->U` (by reference) so a
+  struct/String element passes by pointer (the by-value fat-pointer ABI would
+  mismatch the indirect call). The existing i64 `iter_*` tower is **frozen** (its
+  struct mangles are byte-identity-locked; the generic tower is a sibling).
+- **`tests/smoke_test_iter_generic.sh`** — i64/struct/String chains JIT==AOT, a
+  3-deep nested struct chain (IR-grep: `%Option__Pair` + distinct
+  `%GTake__GFilter__…` instantiations, no PHI crash), and a use-gated lock (an
+  i64-only program emits no `g*` symbols — the tower is monomorphize-on-use).
+
+### Deferred (honest)
+- **Unannotated** element inference (`let t = gtake(...)`) — the annotated forms
+  (`let t: GTake<…> = …`, `let o: Vec<Pair> = iter_collect(…)`) work and are the
+  supported idiom; bound-driven inference is a follow-on version.
+- **Element-generic `zip`/`enumerate`** — their element is a *computed* pair
+  (`TwoTup<T,U>`) only in the impl trait-arg, so `iter_collect` cannot infer it
+  without bound-output inference; the i64 `iter_zip`/`iter_enumerate` remain.
+
 ## [0.100.0] — Arc close: codegen audit (2 real bugs fixed) + the 1.0 ledger
 
 The final version of the v91–v100 arc. A 4-agent adversarial audit of every
