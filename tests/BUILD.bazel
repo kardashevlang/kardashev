@@ -725,6 +725,14 @@ sh_test(
 # use-gated/byte-identity lock on the frozen i64 tower.
 # v102: recursive container Debug ({:?}) — blanket impls for Vec/Option/Result/
 # BTreeMap/BTreeSet/HashMap/VecDeque, + #[derive(Debug)] over container fields.
+# v103: sort/search — quicksort + sort_by + binary_search + partition (seeded RNG,
+# deterministic, sortedness/found-index oracle).
+sh_test(
+    name = "smoke_test_sort_search",
+    srcs = ["smoke_test_sort_search.sh"],
+    data = ["//compiler:kardc"],
+)
+
 sh_test(
     name = "smoke_test_debug_recursive",
     srcs = ["smoke_test_debug_recursive.sh"],
