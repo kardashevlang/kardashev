@@ -501,6 +501,85 @@ std::string applyPrelude(const std::string& userSrc) {
             "    string_push_str(&mut out, str_escape(self));\n"
             "    str_push_byte(&mut out, 34);\n"
             "    out\n"
+            "} }\n"
+            // v102: recursive container Debug. Blanket impls over the element's
+            // own `fmt_debug` (resolved via the v101 generic-impl fix). `[`=91
+            // `]`=93 `{`=123 `}`=125 `)`=41, mirroring the scalar impls' byte
+            // pushes. These make `println!("{:?}", v)` work over real data
+            // structures, and `#[derive(Debug)]` fields of these types resolve.
+            "impl<T: Debug> Debug for Vec<T> { fn fmt_debug(&self) -> String ! { alloc } {\n"
+            "    let mut out = string_new(); str_push_byte(&mut out, 91);\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(self) {\n"
+            "        if i > 0 { string_push_str(&mut out, \", \"); } else {}\n"
+            "        string_push_str(&mut out, vec_get_ref(self, i).fmt_debug()); i = i + 1;\n"
+            "    }\n"
+            "    str_push_byte(&mut out, 93); out\n"
+            "} }\n"
+            "impl<T: Debug> Debug for Option<T> { fn fmt_debug(&self) -> String ! { alloc } {\n"
+            "    match self {\n"
+            "        Some(x) => { let mut o = string_new(); string_push_str(&mut o, \"Some(\"); string_push_str(&mut o, x.fmt_debug()); str_push_byte(&mut o, 41); o },\n"
+            "        None => { let mut o = string_new(); string_push_str(&mut o, \"None\"); o },\n"
+            "    }\n"
+            "} }\n"
+            "impl<T: Debug, E: Debug> Debug for Result<T, E> { fn fmt_debug(&self) -> String ! { alloc } {\n"
+            "    match self {\n"
+            "        Ok(x) => { let mut o = string_new(); string_push_str(&mut o, \"Ok(\"); string_push_str(&mut o, x.fmt_debug()); str_push_byte(&mut o, 41); o },\n"
+            "        Err(e) => { let mut o = string_new(); string_push_str(&mut o, \"Err(\"); string_push_str(&mut o, e.fmt_debug()); str_push_byte(&mut o, 41); o },\n"
+            "    }\n"
+            "} }\n"
+            // BTreeMap/BTreeSet: ORDERED iteration via direct field reads (no
+            // `K: Ord`/`Clone` bound needed — pure index walk over the sorted
+            // backing vecs). Deterministic `{k: v, ...}` / `{a, b, ...}`.
+            "impl<K: Debug, V: Debug> Debug for BTreeMap<K, V> { fn fmt_debug(&self) -> String ! { alloc } {\n"
+            "    let mut out = string_new(); str_push_byte(&mut out, 123); let mut i = 0;\n"
+            "    while i < vec_len(&self.keys) {\n"
+            "        if i > 0 { string_push_str(&mut out, \", \"); } else {}\n"
+            "        string_push_str(&mut out, vec_get_ref(&self.keys, i).fmt_debug());\n"
+            "        string_push_str(&mut out, \": \");\n"
+            "        string_push_str(&mut out, vec_get_ref(&self.vals, i).fmt_debug()); i = i + 1;\n"
+            "    }\n"
+            "    str_push_byte(&mut out, 125); out\n"
+            "} }\n"
+            "impl<T: Debug> Debug for BTreeSet<T> { fn fmt_debug(&self) -> String ! { alloc } {\n"
+            "    let mut out = string_new(); str_push_byte(&mut out, 123); let mut i = 0;\n"
+            "    while i < vec_len(&self.items) {\n"
+            "        if i > 0 { string_push_str(&mut out, \", \"); } else {}\n"
+            "        string_push_str(&mut out, vec_get_ref(&self.items, i).fmt_debug()); i = i + 1;\n"
+            "    }\n"
+            "    str_push_byte(&mut out, 125); out\n"
+            "} }\n"
+            // HashMap: bucket order is NOT deterministic (gate tests single-entry
+            // only). Bounds K: Hash + Eq + Clone + Debug are mandatory (Hash+Eq to
+            // be a key type; Clone because hashmap_get_ref takes the key by value).
+            "impl<K: Hash + Eq + Clone + Debug, V: Debug> Debug for HashMap<K, V> { fn fmt_debug(&self) -> String ! { alloc } {\n"
+            "    let mut out = string_new(); str_push_byte(&mut out, 123);\n"
+            "    let ks = hashmap_keys(self); let mut i = 0;\n"
+            "    while i < vec_len(&ks) {\n"
+            "        if i > 0 { string_push_str(&mut out, \", \"); } else {}\n"
+            "        let kref = vec_get_ref(&ks, i);\n"
+            "        string_push_str(&mut out, kref.fmt_debug()); string_push_str(&mut out, \": \");\n"
+            "        match hashmap_get_ref(self, kref.clone()) { Some(vref) => { string_push_str(&mut out, vref.fmt_debug()); }, None => {}, }\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    str_push_byte(&mut out, 125); out\n"
+            "} }\n"
+            // VecDeque<T>: front->back order = the front segment `f` read in
+            // REVERSE (push_front appends to f) then the back segment `b` forward.
+            "impl<T: Debug> Debug for VecDeque<T> { fn fmt_debug(&self) -> String ! { alloc } {\n"
+            "    let mut out = string_new(); str_push_byte(&mut out, 91);\n"
+            "    let mut first = true;\n"
+            "    let mut i = vec_len(&self.f);\n"
+            "    while i > 0 { i = i - 1;\n"
+            "        if first { first = false; } else { string_push_str(&mut out, \", \"); }\n"
+            "        string_push_str(&mut out, vec_get_ref(&self.f, i).fmt_debug());\n"
+            "    }\n"
+            "    let mut j = 0;\n"
+            "    while j < vec_len(&self.b) {\n"
+            "        if first { first = false; } else { string_push_str(&mut out, \", \"); }\n"
+            "        string_push_str(&mut out, vec_get_ref(&self.b, j).fmt_debug()); j = j + 1;\n"
+            "    }\n"
+            "    str_push_byte(&mut out, 93); out\n"
             "} }\n";
     }
     // Phase 41: the `Clone` trait — `clone(&self) -> Self` — a DEEP copy that

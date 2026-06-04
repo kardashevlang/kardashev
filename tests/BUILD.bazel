@@ -723,6 +723,14 @@ sh_test(
 # v101: ELEMENT-GENERIC iterator adaptors — the g* tower (gvec_iter/gtake/gskip/
 # gmap/gfilter) over any element type (i64/struct/String), nested chains, with a
 # use-gated/byte-identity lock on the frozen i64 tower.
+# v102: recursive container Debug ({:?}) — blanket impls for Vec/Option/Result/
+# BTreeMap/BTreeSet/HashMap/VecDeque, + #[derive(Debug)] over container fields.
+sh_test(
+    name = "smoke_test_debug_recursive",
+    srcs = ["smoke_test_debug_recursive.sh"],
+    data = ["//compiler:kardc"],
+)
+
 sh_test(
     name = "smoke_test_iter_generic",
     srcs = ["smoke_test_iter_generic.sh"],
