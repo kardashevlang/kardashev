@@ -2162,6 +2162,18 @@ sh_test(
     ],
 )
 
+# v108: self-hosted Box<i64> heap indirection — the self-hosted compiler lowers
+# `Box::new(e)` (malloc 8 + store) and `*b` (load), freed once at fn exit. Differential
+# self == host + AddressSanitizer-clean; byte-identical for no-Box programs (R0).
+sh_test(
+    name = "smoke_test_selfhost_box",
+    srcs = ["smoke_test_selfhost_box.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:structgen.kd",
+    ],
+)
+
 # v99: self-hosted opt-in effect rows (`! { alloc }` / `! { io }`) parse + propagate
 # in the subset; codegen-inert (byte-identical to a row-free fn). Differential self==host.
 sh_test(
