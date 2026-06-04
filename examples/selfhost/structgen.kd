@@ -41,7 +41,11 @@ struct Block { lets: Vec<Stmt>, result: Box<Expr> }
 // monomorphizer substitutes a concrete tag and emits one specialized copy per
 // concrete type used at a call/struct-literal site (dedup by mangled name).
 struct SDef { name: String, gp: i64, fields: Vec<Param> }   // a struct: name + generic-param count + typed fields
-struct Fn { name: String, gp: i64, params: Vec<Param>, ret: i64, body: Block }
+// v99: `effects` = the parsed opt-in effect row as a bitset (1 = alloc, 2 = io,
+// 0 = no row / pure). Recorded + propagated through the registry; codegen ignores
+// it (effects are opt-in metadata, unenforced — so emitted IR is byte-identical
+// to a row-free fn), mirroring the host's v81 opt-in default.
+struct Fn { name: String, gp: i64, params: Vec<Param>, ret: i64, body: Block, effects: i64 }
 // v94: one requested monomorphization instance — the generic decl's index in its
 // registry (`gi` into fns / `si` into structs; the other is -1) + the concrete
 // tag bound to `T`, and the mangled instance name.
@@ -124,7 +128,7 @@ fn lex(src: &String) -> Vec<Token> ! { alloc } {
                         vec_push(&mut toks, Token { kind: 24, start: s0, len: j - s0, value: 0 });   // span = inner bytes
                         i = j + 1;                                              // skip closing quote
                     } else {
-                        let k = if b == 38 { 23 } else { if b == 43 { 10 } else { if b == 42 { 11 } else { if b == 40 { 12 } else { if b == 41 { 13 } else { if b == 61 { 14 } else { if b == 59 { 15 } else { if b == 58 { 16 } else { if b == 44 { 17 } else { if b == 123 { 18 } else { if b == 125 { 19 } else { if b == 60 { 20 } else { if b == 46 { 22 } else { 0 - 1 } } } } } } } } } } } } };
+                        let k = if b == 38 { 23 } else { if b == 43 { 10 } else { if b == 42 { 11 } else { if b == 40 { 12 } else { if b == 41 { 13 } else { if b == 61 { 14 } else { if b == 59 { 15 } else { if b == 58 { 16 } else { if b == 44 { 17 } else { if b == 123 { 18 } else { if b == 125 { 19 } else { if b == 60 { 20 } else { if b == 46 { 22 } else { if b == 33 { 27 } else { 0 - 1 } } } } } } } } } } } } } };  // v99: 33 '!' (effect-row marker)
                         vec_push(&mut toks, Token { kind: k, start: i, len: 1, value: 0 });
                         i = i + 1;
                     } } } } }
@@ -555,6 +559,31 @@ fn parse_structs(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Vec<SDef> ! 
     }
     out
 }
+// v99: consume an OPTIONAL opt-in effect row `! { name, ... }` that may appear
+// after a fn's return type (before the body `{`). Returns the row as a bitset
+// (1 = alloc, 2 = io; unknown labels are ignored — opt-in is permissive). When
+// no `!` is present, returns 0 and consumes nothing (so a row-free fn parses
+// EXACTLY as before — byte-identical IR). Mirrors the host's opt-in effects.
+fn parse_effects(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> i64 ! { alloc } {
+    let mut bits = 0;
+    if peek_kind(toks, pos) == 27 {                        // '!'
+        pos.i = pos.i + 1;                                 // '!'
+        pos.i = pos.i + 1;                                 // '{'
+        let nm_alloc = "alloc"; let nm_io = "io";
+        let mut g = true;
+        while g {
+            if peek_kind(toks, pos) == 19 { g = false; }   // '}' ends the row
+            else {
+                if peek_kind(toks, pos) == 2 {             // an effect-name ident
+                    let nm = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
+                    bits = if str_eq(&nm, &nm_alloc) { bits + 1 } else { if str_eq(&nm, &nm_io) { bits + 2 } else { bits } };
+                } else { pos.i = pos.i + 1; }              // ',' or other separator
+            }
+        }
+        pos.i = pos.i + 1;                                 // '}'
+    } else { let z = 0; }
+    bits
+}
 fn parse_fn(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> Fn ! { alloc } {
     pos.i = pos.i + 1;                                  // 'fn'
     let name = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
@@ -582,10 +611,11 @@ fn parse_fn(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>)
     pos.i = pos.i + 1;                                  // ')'
     pos.i = pos.i + 1;                                  // '->'
     let ret = ty_tag(src, toks, pos, structs, gp); pos.i = pos.i + 1;
+    let eff = parse_effects(src, toks, pos);            // v99: optional `! { ... }`
     pos.i = pos.i + 1;                                  // '{'
     let body = parse_block(src, toks, pos, structs);
     pos.i = pos.i + 1;                                  // '}' (fn body close) — needed to parse the next fn
-    Fn { name: name, gp: gp, params: params, ret: ret, body: body }
+    Fn { name: name, gp: gp, params: params, ret: ret, body: body, effects: eff }
 }
 
 // ---- v98 static trait dispatch ----
@@ -642,11 +672,12 @@ fn parse_impl_method(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &V
     pos.i = pos.i + 1;                                  // ')'
     pos.i = pos.i + 1;                                  // '->'
     let ret = ty_tag(src, toks, pos, structs, 0); pos.i = pos.i + 1;
+    let eff = parse_effects(src, toks, pos);            // v99: optional `! { ... }`
     pos.i = pos.i + 1;                                  // '{'
     let body = parse_block(src, toks, pos, structs);
     pos.i = pos.i + 1;                                  // '}' (method body close)
     let sep = "_"; let a = str_concat(sname, &sep); let mangled = str_concat(&a, &mname);
-    vec_push(out, Fn { name: mangled, gp: 0, params: params, ret: ret, body: body });
+    vec_push(out, Fn { name: mangled, gp: 0, params: params, ret: ret, body: body, effects: eff });
 }
 // Parse all leading `impl NAME for Widget { fn m(&self, ...) -> R { .. } ... }`
 // blocks, pushing each method into `fns` under its `Widget_method` mangled name.
