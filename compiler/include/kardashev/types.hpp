@@ -154,6 +154,13 @@ struct Type {
     // carries the pointee for a Box (Box and Ref never share one node).
     TypePtr refInner;
     bool refIsMut = false;
+    // v93: only meaningful on a `structName=="Slice"` node; `true` == `&mut [T]`,
+    // `false` == `&[T]`. IGNORED BY unify (so `&mut [T]` freely coerces to
+    // `&[T]`); the mutation-permission check reads it at the `slice_set` /
+    // `slice_get_mut` argument site (typecheck). It is COPIED at every Struct
+    // rebuild site in types.cpp (substitute / instantiate / const-len) — if a
+    // rebuild drops it, a `&mut [T]` silently degrades to `&[T]`.
+    bool sliceIsMut = false;
     // v33 Phase 177: a RAW pointer `*const T` / `*mut T`. Reuses `TypeKind::Ref`
     // + `refInner` (the pointee) + `refIsMut` (`*mut` vs `*const`), but is NOT
     // borrow-checked, may be null, and is only dereferenceable inside `unsafe`.
@@ -228,6 +235,8 @@ TypePtr makeBox(TypePtr inner);
 // Phase 13b: a slice `&[T]` — modeled as the built-in single-layout struct
 // `Slice` with `typeArgs[0]` = element type.
 TypePtr makeSlice(TypePtr elem);
+// v93: a mutable slice `&mut [T]` (sliceIsMut=true) vs shared `&[T]` (false).
+TypePtr makeSlice(TypePtr elem, bool isMut);
 // Phase 17b: a `Future<T>` — the built-in poll/frame pair carrying its result
 // type in `typeArgs[0]`. Codegen lowers every Future to one `{ i8* poll, i8*
 // frame }` layout; the result type only affects the per-T `Poll<T>` and the

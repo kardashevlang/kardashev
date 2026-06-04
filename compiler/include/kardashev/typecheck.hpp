@@ -116,6 +116,11 @@ struct FnSchema {
     // returning T and a wrapper that constructs Future{state, T}.
     bool isAsync = false;
     TypePtr asyncInnerType;
+    // v93: a variadic `extern "C"` fn whose signature ends in `...`
+    // (`extern "C" fn printf(fmt: &String, ...) -> i32`). The arity check
+    // requires `>= signature.args.size()` actual args; each trailing arg is
+    // typechecked freely and passed through with C default-argument promotion.
+    bool isVarArg = false;
 };
 
 // Schema of a generic struct. For monomorphic structs, `genericVars` is

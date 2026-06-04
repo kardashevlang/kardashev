@@ -976,6 +976,18 @@ private:
         expect(TokenKind::LParen, "(");
         if (!check(TokenKind::RParen)) {
             while (true) {
+                // v93: a trailing `...` marks the fn variadic (C `printf`-style).
+                // It must come last and after at least one fixed parameter.
+                if (check(TokenKind::DotDotDot)) {
+                    Token dots = consume();
+                    if (ef.params.empty()) {
+                        errorAt("a variadic `extern \"C\"` fn needs at least one "
+                                "fixed parameter before `...`",
+                                dots.line, dots.column);
+                    }
+                    ef.isVarArg = true;
+                    break;
+                }
                 ef.params.push_back(parseParam());
                 if (!accept(TokenKind::Comma)) break;
             }
@@ -3389,7 +3401,10 @@ private:
             // SliceExpr; the leading `&` is part of the slice syntax (a slice
             // is itself a borrow), so absorb it and hand back the SliceExpr
             // directly rather than wrapping it in a RefExpr.
-            if (dynamic_cast<ast::SliceExpr*>(inner.get())) {
+            if (auto* se = dynamic_cast<ast::SliceExpr*>(inner.get())) {
+                // v93: thread the `&mut` into the slice so `&mut v[a..b]` /
+                // `&mut arr[a..b]` produces a mutable (write-capable) slice.
+                se->isMut = isMut;
                 return inner;
             }
             auto re = std::make_unique<ast::RefExpr>();

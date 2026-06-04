@@ -935,6 +935,31 @@ public:
             sch.genericVars.push_back(sliceFnVar);
             fnSchemas_["slice_get_ref"] = std::move(sch);
         }
+        // v93: the two WRITE builtins. Both take a MUTABLE slice `&mut [T]`
+        // (sliceFnMutInst carries sliceIsMut=true). unify ignores sliceIsMut,
+        // so the soundness gate (rejecting a shared `&[T]` here) is an explicit
+        // check at the call site below — see the `slice_set`/`slice_get_mut`
+        // first-arg mutability check.
+        TypePtr sliceFnMutInst = makeSlice(sliceFnVar, /*isMut=*/true);
+        // slice_get_mut<T>(s: &mut [T], i: i64) -> &mut T — a mutable borrow.
+        // LLVM lowering is byte-identical to slice_get_ref; the `&mut` is
+        // type-system-only and enables `*slice_get_mut(s,i) = v` via the
+        // existing deref-assign path.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({sliceFnMutInst, makeInt()},
+                                         makeRef(sliceFnVar, /*isMut=*/true));
+            sch.genericVars.push_back(sliceFnVar);
+            fnSchemas_["slice_get_mut"] = std::move(sch);
+        }
+        // slice_set<T>(s: &mut [T], i: i64, v: T) -> () — a GEP + store.
+        {
+            FnSchema sch;
+            sch.signature =
+                makeFunction({sliceFnMutInst, makeInt(), sliceFnVar}, makeUnit());
+            sch.genericVars.push_back(sliceFnVar);
+            fnSchemas_["slice_set"] = std::move(sch);
+        }
 
         // Phase 12 built-in: `yield_now(v: i64) -> Future<i64> ! { async }`.
         // The leaf suspending primitive (stays monomorphic i64). Its Future
@@ -4539,6 +4564,7 @@ private:
             // Extern fns are reachable by bare name (no module path); mark pub
             // so a path-qualified call (rare) doesn't trip the visibility check.
             schema.isPub = true;
+            schema.isVarArg = ef.isVarArg; // v93: carry the `...` marker
             fnSchemas_[ef.name] = std::move(schema);
         }
     }
@@ -4631,7 +4657,7 @@ private:
         if (tr.isSlice) {
             TypePtr elem =
                 tr.typeArgs.empty() ? makeInt() : resolveTypeRef(tr.typeArgs[0]);
-            return makeSlice(elem);
+            return makeSlice(elem, tr.refIsMut); // v93: &mut [T] keeps its mutability
         }
         // Phase 22: a fixed-size array type `[T; N]`. The `&` (a reference to
         // an array) is handled by the generic ref-peel below — but since we
@@ -8619,7 +8645,19 @@ private:
                 }
             }
             TypePtr instSig = instantiate(schema.signature, subst);
-            if (instSig->args.size() != call.args.size()) {
+            // v93: a variadic extern (`printf(fmt, ...)`) requires AT LEAST the
+            // fixed arity; the extra trailing args are typechecked freely below
+            // (loop over [n, call.args.size())) and passed through with C
+            // default-argument promotion at codegen.
+            if (schema.isVarArg) {
+                if (call.args.size() < instSig->args.size()) {
+                    error("variadic function '" + call.callee +
+                              "' expects at least " +
+                              std::to_string(instSig->args.size()) +
+                              " arg(s), got " + std::to_string(call.args.size()),
+                          call.line, call.column);
+                }
+            } else if (instSig->args.size() != call.args.size()) {
                 error("function '" + call.callee + "' expects " +
                           std::to_string(instSig->args.size()) +
                           " arg(s), got " + std::to_string(call.args.size()),
@@ -8717,6 +8755,14 @@ private:
                 }
             }
 
+            // v93: soundness gate for the slice WRITE builtins. unify ignores
+            // sliceIsMut (so `&mut [T]` freely coerces to `&[T]`), which means a
+            // shared `&[T]` would otherwise silently satisfy the `&mut [T]`
+            // first parameter of slice_set/slice_get_mut. Reject it here by
+            // inspecting the *resolved* first-arg type before unification clears
+            // any distinction. The first arg of these builtins is the slice.
+            bool isSliceWrite =
+                (call.callee == "slice_set" || call.callee == "slice_get_mut");
             for (std::size_t i = 0; i < n; ++i) {
                 TypePtr argType;
                 if (fnHasConst) {
@@ -8730,6 +8776,17 @@ private:
                     expectedArgType_ = resolve(instSig->args[i]);
                     argType = checkExpr(*call.args[i]);
                     expectedArgType_ = nullptr;
+                }
+                if (isSliceWrite && i == 0) {
+                    TypePtr a = resolve(argType);
+                    if (a->kind == TypeKind::Struct &&
+                        a->structName == "Slice" && !a->sliceIsMut) {
+                        error("'" + call.callee +
+                                  "' requires a `&mut [T]` slice, but this slice "
+                                  "is shared (`&[T]`); construct it with "
+                                  "`&mut <vec-or-array>[a..b]`",
+                              call.args[0]->line, call.args[0]->column);
+                    }
                 }
                 // Phase 11: a `&Concrete`/`Box<Concrete>` arg coerces into a
                 // `&dyn Trait`/`Box<dyn Trait>` parameter.
@@ -9486,14 +9543,19 @@ private:
     // (a runtime view, like vec_get); codegen trusts a <= b <= len.
     TypePtr checkSlice(const ast::SliceExpr& se) {
         TypePtr opTy = resolve(checkExpr(*se.operand));
-        // Peel a borrow: `&v` and `v` both slice the same Vec.
+        // Peel a borrow: `&v` and `v` both slice the same Vec / array.
         if (opTy->kind == TypeKind::Ref) opTy = resolve(opTy->refInner);
         TypePtr elem;
         if (opTy->kind == TypeKind::Struct && opTy->structName == "Vec" &&
             !opTy->typeArgs.empty()) {
             elem = opTy->typeArgs[0];
+        } else if (opTy->kind == TypeKind::Array && opTy->arrayElem) {
+            // v93: slice a fixed-size array `[T; N]` — `&arr[a..b]` /
+            // `&mut arr[a..b]`. The slice borrows into the array's storage.
+            elem = opTy->arrayElem;
         } else {
-            error("slice operand must be a Vec, got " + typeToString(opTy),
+            error("slice operand must be a Vec or array, got " +
+                      typeToString(opTy),
                   se.operand->line, se.operand->column);
             elem = makeInt();
         }
@@ -9507,7 +9569,10 @@ private:
             error("slice end must be i64, got " + typeToString(en),
                   se.end->line, se.end->column);
         }
-        return makeSlice(elem);
+        // v93: `&mut v[a..b]` yields a write-capable `&mut [T]` (sliceIsMut);
+        // `&v[a..b]` a shared `&[T]`. The slice_set/slice_get_mut soundness
+        // gate reads sliceIsMut at the call site.
+        return makeSlice(elem, se.isMut);
     }
 
     // Phase 22: is `t` a Copy value type allowed as an array/tuple element in

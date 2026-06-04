@@ -154,14 +154,17 @@ struct CEmitter {
             "vec_pop", "vec_remove", "vec_insert", "vec_reverse", "vec_swap"};
         return b.count(n) > 0;
     }
-    // v90: read-only scalar slices (`&v[a..b]` over a Vec<i64>/<bool>). The C
-    // runtime mirrors LLVM's `{ ptr, len }` slice; mutation through a slice is not
-    // wired in ANY backend, so this is read-only (parity-preserving).
+    // v90: scalar slices (`&v[a..b]` over a Vec<i64>/<bool>). The C runtime
+    // mirrors LLVM's `{ ptr, len }` slice. v93 adds WRITE access through a
+    // `&mut [T]` slice (slice_set / slice_get_mut) and slice-from-fixed-array
+    // (`&arr[a..b]`); the `kdslice.ptr` is a non-const `int64_t*` so a store is
+    // a direct assignment. Non-scalar element types remain unsupported.
     bool usesSlice_ = false;
     bool sawSliceCall_ = false; // set by the pre-scan (slice builtin or SliceExpr)
     static bool isSliceBuiltin(const std::string& n) {
         static const std::set<std::string> b = {
-            "slice_len", "slice_get", "slice_get_ref"};
+            "slice_len", "slice_get", "slice_get_ref",
+            "slice_get_mut", "slice_set"}; // v93: write builtins
         return b.count(n) > 0;
     }
     // v30 Phase 163: the builtins for which the C backend emits a real runtime.
@@ -539,7 +542,9 @@ struct CEmitter {
             if (call->callee == "vec_new") { usesVec_ = true; return "struct kdvec"; }
             if (call->callee == "vec_get_ref") return "int64_t*";
             if (call->callee == "slice_get_ref") return "int64_t*"; // v90
-            // vec_get/pop/remove/len/push/insert/reverse/swap / slice_get/len -> int64_t
+            if (call->callee == "slice_get_mut") return "int64_t*"; // v93
+            // vec_get/pop/remove/len/push/insert/reverse/swap / slice_get/len /
+            // slice_set (void, statement) -> int64_t
             return "int64_t"; // a scalar builtin call
         }
         if (auto* iff = dynamic_cast<const IfExpr*>(&e))
@@ -1700,10 +1705,12 @@ struct CEmitter {
         out << "\n";
     }
 
-    // v90: the read-only scalar-slice runtime — `struct kdslice { ptr, len }`
-    // mirrors the LLVM `{ i8*, i64 }` slice. Passed by value (a small fat ptr);
+    // v90/v93: the scalar-slice runtime — `struct kdslice { ptr, len }` mirrors
+    // the LLVM `{ i8*, i64 }` slice. Passed by value (a small fat ptr);
     // get/get_ref are bounds-checked exactly like kd_vec_get/_ref (return 0 on
     // OOB, matching the LLVM slice builtins' unchecked-but-clamped behavior).
+    // v93: get_mut returns the element address (= get_ref) and set stores
+    // through `kdslice.ptr` (a non-const int64_t*), bounds-checked.
     void emitSliceRuntime() {
         out << "struct kdslice { int64_t* ptr; int64_t len; };\n";
         out <<
@@ -1713,6 +1720,12 @@ struct CEmitter {
 "}\n"
 "static int64_t* kd_slice_get_ref(struct kdslice s, int64_t i) {\n"
 "  if (i < 0 || i >= s.len || !s.ptr) return 0; return &s.ptr[i];\n"
+"}\n"
+"static int64_t* kd_slice_get_mut(struct kdslice s, int64_t i) {\n"
+"  if (i < 0 || i >= s.len || !s.ptr) return 0; return &s.ptr[i];\n"
+"}\n"
+"static void kd_slice_set(struct kdslice s, int64_t i, int64_t v) {\n"
+"  if (i >= 0 && i < s.len && s.ptr) s.ptr[i] = v;\n"
 "}\n";
         out << "\n";
     }

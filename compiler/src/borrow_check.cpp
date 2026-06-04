@@ -1689,7 +1689,36 @@ private:
                               std::to_string(b->moveLine) + ":" +
                               std::to_string(b->moveCol) + ")",
                           id->line, id->column);
-                } else if (b->mutLoanActive) {
+                } else if (se.isMut) {
+                    // v93: `&mut v[a..b]` takes a MUTABLE loan on the backing —
+                    // exactly the `&mut place` exclusivity rules (one active
+                    // `&mut`, no aliasing `&` read live across the write). The
+                    // two-phase reservation (v26) lets the legit nested-read-
+                    // deeper idiom through while rejecting same-depth aliasing.
+                    if (b->sharedLoans > 0) {
+                        error("cannot borrow `" + id->name +
+                                  "` mutably while shared borrows are active",
+                              se.line, se.column);
+                    } else if (b->mutLoanActive) {
+                        error("cannot borrow `" + id->name +
+                                  "` mutably more than once at a time",
+                              se.line, se.column);
+                    } else {
+                        b->mutLoanActive = true;
+                        if (callArgDepth_ > 0) {
+                            b->mutLoanTwoPhase = true;
+                            b->mutLoanDepth = callArgDepth_;
+                        }
+                    }
+                    Loan loan;
+                    loan.borrowedDeclPos = b->declPos;
+                    loan.borrowerDeclPos = -1;
+                    loan.isMut = true;
+                    loan.expirePos = myPos;
+                    loan.line = se.line;
+                    loan.column = se.column;
+                    activeLoans_.push_back(loan);
+                } else if (b->mutLoanActive && !sharedAllowedUnderReservedMut(b)) {
                     error("cannot borrow `" + id->name +
                               "` immutably while a mutable borrow is active",
                           se.line, se.column);

@@ -18,6 +18,41 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.93.0] — Write-capable `&mut [T]` slices + variadic-C FFI + C-backend slice-from-array
+
+The highest-leverage practical-systems gap: mutation-through-slice existed in no
+backend. v93 makes `&mut [T]` write-capable end-to-end and folds in two adjacent
+FFI / C-backend unlocks.
+
+### Added
+- **`slice_set(&mut [T], i, v)`** and **`slice_get_mut(&mut [T], i) -> &mut T`** —
+  in-place writes through a slice (LLVM: `slice_set` = GEP + `store`,
+  `slice_get_mut` = the `slice_get_ref` GEP; the existing deref-assign means
+  `*slice_get_mut(s, i) = v` worked with no new code). C backend lowers the same
+  over `struct kdslice`.
+- `&mut [T]` as a distinct write-capable slice (a `Type.sliceIsMut` flag, checked
+  at the write-builtin call site so a shared `&[T]` is rejected — `unify` ignores
+  it, giving the `&mut [T] → &[T]` coercion for free).
+- **`&mut v[a..b]` / `&mut arr[a..b]`** construction, and **slice-from-array**
+  (`&arr[a..b]` over a stack `[T; N]`) in the type-checker, LLVM, and C backend
+  (the v89/v90 deferral).
+- **Variadic-C FFI**: `extern "C" fn printf(fmt: &String, ...) -> i32` — a `...`
+  marker + `isVarArg` `FunctionType` with C default-argument promotion on the
+  trailing args.
+
+### Notes
+- Gate: `smoke_test_slice_mut.sh` — in-place sort over `&mut [i64]` / `slice_set`
+  fill / array-slice read+write / `&mut[T]→&[T]` each **JIT == AOT == C**;
+  `*slice_get_mut = v` + variadic `printf` JIT == AOT; and two soundness negatives
+  (E0502 aliasing read across `slice_set`; `slice_set` on a shared `&[T]`).
+- Borrow-check reuses the v26 two-phase + v89/v90 array/slice exclusivity rules.
+
+### Deferred (honest)
+- Variadic + `*slice_get_mut = v` deref-assign in the C backend (`--emit-c`
+  refuses extern fns / non-variable assignment places — LLVM/JIT/AOT full).
+  Non-scalar `&mut [String]` in C (LLVM full). Mutable-slice *iteration*
+  (`for x in &mut s`) → v94. Register-ABI struct-by-value FFI → XL mega-arc.
+
 ## [0.92.0] — Self-hosting: growable `Vec<i64>` + owned strings
 
 Builds on v91's CFG. The self-hosted LLVM-IR compiler

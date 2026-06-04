@@ -1183,6 +1183,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v93: write-capable &mut [T] slices (slice_set/slice_get_mut), variadic-C FFI,
+# and C-backend slice-from-array. In-place sort JIT==AOT==C; E0502 alias negative.
+sh_test(
+    name = "smoke_test_slice_mut",
+    srcs = ["smoke_test_slice_mut.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v89: stack arrays [T; N] — C-backend parity (struct kdarr_<elem>_<N> wrapper,
 # bounds-checked index read/store, by-value param/return) + a triple-differential
 # gate (JIT == AOT == C backend) pinning the already-working LLVM array surface.

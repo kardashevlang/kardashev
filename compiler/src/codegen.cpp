@@ -8482,7 +8482,11 @@ private:
             declaredFns_[mangled] = fn;
             return fn;
         }
-        if (op == "slice_get_ref") {
+        if (op == "slice_get_ref" || op == "slice_get_mut") {
+            // v93: slice_get_mut is byte-identical to slice_get_ref — both
+            // return the element's address (i8*). The `&mut` vs `&` distinction
+            // is purely type-system; the deref-assign path `*p = v` does the
+            // store. (Same mangle keeps a per-T fn each.)
             auto* fnTy =
                 llvm::FunctionType::get(i8PtrTy, {sliceTy, i64Ty}, false);
             auto* fn = llvm::Function::Create(
@@ -8492,6 +8496,26 @@ private:
             llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
             auto* data = b.CreateExtractValue(fn->getArg(0), {0}, "data");
             b.CreateRet(b.CreateGEP(elemLlvmTy, data, fn->getArg(1), "elem_ptr"));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "slice_set") {
+            // v93: slice_set(s: &mut [T], i, v) -> () — GEP into the slice's
+            // backing storage and STORE the value (a write, no clone: the slice
+            // borrows mutably, the caller transfers `v` in). Returns void.
+            auto* voidTy = llvm::Type::getVoidTy(ctx);
+            auto* fnTy = llvm::FunctionType::get(
+                voidTy, {sliceTy, i64Ty, elemLlvmTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("i");
+            fn->getArg(2)->setName("v");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* data = b.CreateExtractValue(fn->getArg(0), {0}, "data");
+            auto* ep = b.CreateGEP(elemLlvmTy, data, fn->getArg(1), "elem_ptr");
+            b.CreateStore(fn->getArg(2), ep);
+            b.CreateRetVoid();
             declaredFns_[mangled] = fn;
             return fn;
         }
@@ -9525,7 +9549,9 @@ private:
         std::vector<llvm::Type*> argTs;
         argTs.reserve(ef.params.size());
         for (const auto& p : ef.params) argTs.push_back(cAbiType(p.type));
-        auto* fty = llvm::FunctionType::get(retT, argTs, /*isVarArg=*/false);
+        // v93: a `...`-terminated extern is a C-variadic FunctionType so the
+        // call verifier accepts extra args (e.g. `printf(fmt, x, y)`).
+        auto* fty = llvm::FunctionType::get(retT, argTs, /*isVarArg=*/ef.isVarArg);
         if (auto* existing = module_->getFunction(ef.name)) {
             // Reuse a matching existing declaration (e.g. an internal extern).
             if (existing->getFunctionType() == fty) {
@@ -9639,10 +9665,47 @@ private:
             // Scalars (i64 -> C long, bool -> i1) pass through unchanged.
             args.push_back(v);
         }
-        // Extra args beyond the declared arity (shouldn't happen — typecheck
-        // enforces arity) are still evaluated for their side effects.
+        // v93: trailing args of a VARIADIC extern (`printf(fmt, x, y)`) are
+        // passed through with C default-argument promotion (System V varargs
+        // ABI): f32 -> double (FPExt), an integer narrower than i32 -> i32,
+        // bool -> i32. i64 / double / pointers pass straight through. A
+        // String / slice value or `&String`/`&Slice` becomes its data pointer
+        // (so `%s` sees the bytes, mirroring the fixed-param coercion above).
         for (std::size_t i = n; i < call.args.size(); ++i) {
-            (void)emitConsume(*call.args[i]);
+            llvm::Value* v = emitConsume(*call.args[i]);
+            if (!v) continue;
+            // Aggregate (String / Slice) value -> data pointer (field 0).
+            if (v->getType()->isStructTy()) {
+                TypePtr at = lookupExprType(*call.args[i]);
+                if (at) at = resolveInInstance(at);
+                if (at && at->kind == TypeKind::Struct &&
+                    (at->structName == "String" || at->structName == "Slice")) {
+                    v = builder_->CreateExtractValue(v, {0}, "ffi.var.data");
+                }
+            }
+            llvm::Type* vt = v->getType();
+            if (vt->isFloatTy()) {
+                // C promotes a float vararg to double.
+                v = builder_->CreateFPExt(
+                    v, llvm::Type::getDoubleTy(*ctx_), "ffi.var.fpext");
+            } else if (vt->isIntegerTy()) {
+                unsigned bits = vt->getIntegerBitWidth();
+                if (bits < 32) {
+                    // Promote a narrow int / bool to C int (i32). Sign-extend a
+                    // genuine signed int; zero-extend bool (i1) / unsigned.
+                    TypePtr at = lookupExprType(*call.args[i]);
+                    if (at) at = resolveInInstance(at);
+                    bool signedExt =
+                        at && at->kind == TypeKind::Int && at->intSigned;
+                    v = signedExt
+                            ? builder_->CreateSExt(
+                                  v, llvm::Type::getInt32Ty(*ctx_), "ffi.var.sext")
+                            : builder_->CreateZExt(
+                                  v, llvm::Type::getInt32Ty(*ctx_),
+                                  "ffi.var.zext");
+                }
+            }
+            args.push_back(v);
         }
         bool retVoid = fn->getReturnType()->isVoidTy();
         llvm::Value* ret =
@@ -12808,7 +12871,45 @@ private:
         }
         llvm::Type* elemLlvm = mapKardashevType(elemTy);
 
-        if (opTy && opTy->kind == TypeKind::Ref) {
+        // v93: determine whether the operand is an array `[T; N]` (or a
+        // `&[T; N]`) vs a Vec / `&Vec`. An array's data lives directly in its
+        // storage (no `{ptr,len,cap}` header), so its data pointer is the
+        // address of element 0 — obtained via emitPlaceAddr / ref-deref, then
+        // GEP'd to element `start` below (uniform with the Vec path).
+        TypePtr peeled = opTy;
+        unsigned arrRefDepth = 0;
+        while (peeled && peeled->kind == TypeKind::Ref) {
+            peeled = resolveInInstance(peeled->refInner);
+            ++arrRefDepth;
+        }
+        bool isArrayOperand = peeled && peeled->kind == TypeKind::Array;
+
+        if (isArrayOperand) {
+            llvm::Type* arrLlvm = mapKardashevType(peeled);
+            llvm::Value* arrPtr = nullptr;
+            if (arrRefDepth > 0) {
+                // &[T; N]: the reference value is a pointer to the array.
+                arrPtr = emitExpr(*se.operand);
+                auto* ptrTy = llvm::PointerType::get(ctx, 0);
+                for (unsigned d = 1; d < arrRefDepth; ++d)
+                    arrPtr = builder_->CreateLoad(ptrTy, arrPtr, "deref");
+            } else if (llvm::Value* place = emitPlaceAddr(*se.operand)) {
+                // A local / field / deref array lvalue — GEP straight into it
+                // (so `&mut arr[a..b]` aliases the real storage and writes
+                // through it land in `arr`).
+                arrPtr = place;
+            } else {
+                // Genuine rvalue array (a call result / literal): spill it.
+                llvm::Value* arrVal = emitExpr(*se.operand);
+                arrPtr = entryAlloca(arrLlvm, "arr.slice.tmp");
+                builder_->CreateStore(arrVal, arrPtr);
+            }
+            // Element-0 pointer = &arr[0] = GEP [0, 0].
+            llvm::Value* zero =
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), 0);
+            dataPtr = builder_->CreateInBoundsGEP(arrLlvm, arrPtr, {zero, zero},
+                                                  "arr_data");
+        } else if (opTy && opTy->kind == TypeKind::Ref) {
             // &Vec: emitExpr gives a pointer to the Vec; load its data field.
             llvm::Value* vecPtr = emitExpr(*se.operand);
             auto* dp = builder_->CreateStructGEP(vecTy, vecPtr, 0, "vec_data_p");
@@ -13976,8 +14077,11 @@ private:
                 return builder_->CreateCall(fn, {srcPtr}, "call_clone");
             }
             // Phase 37: `slice_*<T>` over the element type T (stride sizeof(T)).
+            // v93: slice_get_mut / slice_set route here too (write builtins).
             if ((call.callee == "slice_len" || call.callee == "slice_get" ||
-                 call.callee == "slice_get_ref") &&
+                 call.callee == "slice_get_ref" ||
+                 call.callee == "slice_get_mut" ||
+                 call.callee == "slice_set") &&
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
                     getOrEmitSliceOp(call.callee, concreteTypeArgs[0]);

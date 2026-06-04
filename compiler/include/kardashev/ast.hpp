@@ -337,9 +337,13 @@ struct RefExpr : Expr {
 // slice value is itself a borrow, so no extra RefExpr wraps it). Element
 // type is the Vec's T (MVP exercises i64).
 struct SliceExpr : Expr {
-    ExprPtr operand; // the Vec expression
+    ExprPtr operand; // the Vec (or, v93, fixed-array) expression
     ExprPtr start;   // i64 lower bound (inclusive)
     ExprPtr end;     // i64 upper bound (exclusive)
+    // v93: `&mut v[a..b]` (true) vs `&v[a..b]` (false). The parser's `&`-prefix
+    // branch threads this in; typecheck produces a `&mut [T]` (sliceIsMut) slice
+    // so the slice_set/slice_get_mut soundness gate accepts it.
+    bool isMut = false;
 };
 
 // Phase 22: an array literal `[a, b, c]`. All elements must share one type T;
@@ -1073,6 +1077,10 @@ struct ExternFn {
     std::string abi;       // the ABI string between `extern` and `fn`; only "C"
     EffectRow effects;     // declared effect row; default {io} applied by the
     bool hasExplicitEffects = false; // typechecker when this stays false
+    // v93: a trailing `, ...` makes this a variadic C fn (`printf(fmt, ...)`).
+    // Requires >= 1 fixed param. The LLVM extern FunctionType is isVarArg;
+    // the call passes trailing args through with C default-argument promotion.
+    bool isVarArg = false;
     std::size_t line = 1;
     std::size_t column = 1;
 };
