@@ -18,6 +18,32 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.102.0] — Recursive container `Debug` (`{:?}`)
+
+`Debug` had impls only for scalars + `String`, so `println!("{:?}", v)` over a
+`Vec`/`HashMap`/`Option`/… was impossible. v102 adds recursive container `Debug`.
+Live probing confirmed the v101 generic-impl resolver makes every blanket impl
+Just Work, so this is a **prelude-only** change (no codegen).
+
+### Added (prelude blanket impls over each element's `fmt_debug`)
+- `Vec<T>` → `[a, b, c]`; `Option<T>` → `Some(x)`/`None`; `Result<T,E>` →
+  `Ok(x)`/`Err(e)`.
+- `BTreeMap<K,V>` → `{k: v, …}` and `BTreeSet<T>` → `{a, …}` — **ordered /
+  deterministic** (direct index walks; no `K: Ord`/`Clone` bound).
+- `HashMap<K: Hash+Eq+Clone+Debug, V: Debug>` (bounds mandatory; bucket order is
+  non-deterministic so only single-entry is gated) and `VecDeque<T>`.
+- String elements are quoted + escaped (reusing v27 `str_escape`). `Box<T>` Debug
+  works via deref. All under the `trait Debug` opt-out gate (no collision/bloat).
+- **The headline DX win:** `#[derive(Debug)]` over a struct/enum with
+  `Vec`/`Option`/… fields now recurses (`Widget { id: 7, tags: ["a", "b"],
+  parent: Some(3) }`).
+- **`tests/smoke_test_debug_recursive.sh`** — deterministic JIT==AOT over all of
+  the above + a scalar-derive regression lock.
+
+### Deferred (honest)
+- Tuple `Debug` and `&[T]` slice Debug → v104; format-spec dispatch
+  (`{:x}`/`{:04d}`) → its own version; `{:#?}` pretty-printing → a follow-on.
+
 ## [0.101.0] — Element-generic iterator adaptors
 
 Opens the **ROADMAP-v101-v110** "production depth" arc. The lazy iterator adaptor
