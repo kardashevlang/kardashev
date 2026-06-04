@@ -135,6 +135,7 @@ struct Type {
     std::string structName;
     std::vector<std::pair<std::string, TypePtr>> structFields;
     bool reprC = false; // v88: declared `#[repr(C)]` (guaranteed layout, FFI-by-pointer)
+    bool reprPacked = false; // v97: declared `#[repr(packed)]` (no inter-field padding)
 
     // Enum:
     std::string enumName;

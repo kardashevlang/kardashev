@@ -18,6 +18,59 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.97.0] — Binary-format systems: repr(packed) + endianness + volatile
+
+The "parse-a-packet-header / touch-a-device-register / read-a-binary-file"
+version. Ground-truth probing corrected the plan: **raw pointers and enforced
+`unsafe` blocks already exist** (so volatile is cheap and must be `unsafe`-gated),
+and **`reverse_bytes` was hardcoded to i64** (so endianness on sized ints needed
+width-aware lowering, not a bswap alias).
+
+### Added
+- **`#[repr(packed)]`** — a struct with no inter-field padding (LLVM packed
+  struct), mirroring the v88 `#[repr(C)]` infrastructure end-to-end. `size_of!`
+  shrinks to the sum of field sizes; unaligned field load/store stay correct.
+  (`{u8, u64}` is 9 bytes, not 16; a `{u8, u64, u8}` header round-trips JIT==AOT.)
+- **Width-aware endianness intrinsics** — `swap_bytes`, `to_le`, `to_be`,
+  `from_le`, `from_be`, typed `T -> T` (preserving the argument's width and
+  signedness). Lowered via `llvm.bswap` at the argument's *actual* width
+  (`swap_bytes(0x1122u16) == 0x2211`, not the i64-bswap bug), with target
+  endianness read from the module DataLayout. `reverse_bytes` stays as the v70
+  i64 alias.
+- **`volatile_load(p: *const/*mut T) -> T`** and **`volatile_store(p: *mut T, v)`**
+  — `setVolatile(true)` (the optimizer may not elide, reorder, or duplicate the
+  access), with the load width taken from the typechecked pointee. **Requires an
+  `unsafe` block** (reusing the existing `unsafeDepth_` enforcement, exactly like
+  `ptr_write`). The `--emit-llvm` IR shows `load volatile` / `store volatile`.
+- **`smoke_test_repr_packed.sh`** — packed no-padding `size_of!` + byte
+  round-trip; the width-aware `swap_bytes` case (which fails with the old i64
+  bswap); `to_le`/`to_be`/`from_le`/`from_be` round-trips at u16/u32/u64; volatile
+  round-trip + the `unsafe`-rejection + a target-independent `volatile`-keyword IR
+  grep; three C-backend refusals; and `repr(transparent)` still rejected.
+
+### Changed
+- `#[repr(packed)]` is no longer rejected at parse (the v88 message was "only
+  `repr(C)` is supported" → now "only `repr(C)` and `repr(packed)` are
+  supported"). `smoke_test_repr_c_ffi.sh`'s `neg-repr-packed` case was repointed
+  to `repr(transparent)` (still rejected) + a positive `repr(packed)`-compiles
+  case.
+- The C backend (`--emit-c`) **refuses** packed structs (layout-sensitive) and
+  the endianness/volatile builtins (no in-subset C runtime) — never a silent
+  miscompile.
+
+### Deferred (honest)
+- **Bit-fields** (`field: uN : W`) — a genuine **L** feature (a parallel
+  single-backing-integer struct representation special-cased across struct-literal
+  emit, the three field-access/lvalue paths, field-assign read-modify-write,
+  struct-body declaration and `size_of!`, plus a borrow ban on `&`-of-a-sub-byte
+  field). `#[repr(packed)]` already covers byte-granular packet/register access;
+  bit-fields are the sub-byte refinement. Designed; in-source note at
+  `parser.cpp` `parseParam`; tracked in ROADMAP-v91-v100. Not rushed (no
+  half-feature).
+- `#[repr(transparent)]` / `#[repr(align(N))]` (the rest of the repr family);
+  big-endian *target* codegen (the bswap branch is correct but untested with no
+  big-endian backend).
+
 ## [0.96.0] — Coherence: a stable E0119 + generalized negative impls
 
 Ground-truth probing found **three of the four planned CORE items were already

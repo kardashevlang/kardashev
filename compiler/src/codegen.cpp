@@ -8980,7 +8980,9 @@ private:
             for (const auto& [_fname, fty] : schema.type->structFields) {
                 elems.push_back(mapKardashevType(fty));
             }
-            structTypes_[name]->setBody(elems);
+            // v97: `#[repr(packed)]` → an LLVM packed struct (no inter-field
+            // padding); field GEP/load/store already respect packing.
+            structTypes_[name]->setBody(elems, /*isPacked=*/schema.type->reprPacked);
         }
     }
 
@@ -9046,7 +9048,14 @@ private:
         for (const auto& [_fname, fty] : r->structFields) {
             elems.push_back(mapKardashevType(fty));
         }
-        st->setBody(elems);
+        // v97: a `#[repr(packed)]` generic struct keeps its packed layout in
+        // every instantiation. Resolve the flag authoritatively from the base
+        // schema (the instance Type may not have carried it through).
+        bool packed = r->reprPacked;
+        auto bi = tc_.structs.find(base);
+        if (bi != tc_.structs.end() && bi->second.type)
+            packed = packed || bi->second.type->reprPacked;
+        st->setBody(elems, /*isPacked=*/packed);
         return st;
     }
 
@@ -13752,6 +13761,30 @@ private:
         return builder_->CreateIntrinsic(id, {i64Ty}, {x, x, amt});
     }
 
+    // v97: WIDTH-AWARE endianness intrinsics. The byte-swap runs at the
+    // argument's actual integer width (NOT a fixed i64) — a u16/u32 swap must
+    // be bswap.i16/i32, else swapping a value zero-extended to i64 corrupts it.
+    // `swap_bytes` always swaps; `to_le`/`from_le` are identity on a little-
+    // endian target and a swap on big-endian; `to_be`/`from_be` are the
+    // inverse. Endianness comes from the module DataLayout (the single source
+    // of truth — the host target layout is already set before codegen).
+    llvm::Value* emitEndianIntrinsic(const ast::CallExpr& call) {
+        const std::string& op = call.callee;
+        llvm::Value* x = emitConsume(*call.args[0]);
+        bool little = module_->getDataLayout().isLittleEndian();
+        bool wantSwap;
+        if (op == "swap_bytes") wantSwap = true;
+        else if (op == "to_le" || op == "from_le") wantSwap = !little;
+        else /* to_be / from_be */ wantSwap = little;
+        if (!wantSwap) return x;
+        // bswap is defined only for integer widths that are a multiple of 16;
+        // for an 8-bit value a byte-swap is the identity.
+        if (auto* it = llvm::dyn_cast<llvm::IntegerType>(x->getType()))
+            if (it->getBitWidth() < 16 || (it->getBitWidth() % 16) != 0)
+                return x;
+        return builder_->CreateUnaryIntrinsic(llvm::Intrinsic::bswap, x);
+    }
+
     llvm::Value* emitCall(const ast::CallExpr& call) {
         // Phase 52: a GENERIC static call `T::method()` — resolve the bound Var
         // to the concrete type at THIS monomorphization, then call that type's
@@ -13816,6 +13849,13 @@ private:
             call.callee == "rotate_right") {
             return emitBitIntrinsic(call);
         }
+        // v97: width-aware endianness intrinsics (distinct from the i64-fixed
+        // reverse_bytes above — these preserve the argument's int width).
+        if (call.callee == "swap_bytes" || call.callee == "to_le" ||
+            call.callee == "to_be" || call.callee == "from_le" ||
+            call.callee == "from_be") {
+            return emitEndianIntrinsic(call);
+        }
         // v39 raw-pointer arithmetic / write. `ptr_offset` is a GEP by element
         // over the pointee LLVM type (advances by n elements); `ptr_write`
         // stores into the pointee. Both operate on opaque raw pointers; the
@@ -13834,6 +13874,27 @@ private:
             llvm::Value* p = emitExpr(*call.args[0]);
             llvm::Value* v = emitConsume(*call.args[1]);
             builder_->CreateStore(v, p);
+            return nullptr; // unit
+        }
+        // v97: volatile raw-pointer access (MMIO). `setVolatile(true)` is the
+        // whole semantics — LLVM must not elide/reorder/duplicate the access.
+        // The load type comes from the typechecked pointee (not assumed i64).
+        if (call.callee == "volatile_load" && call.args.size() == 1) {
+            llvm::Value* p = emitExpr(*call.args[0]);
+            TypePtr pt = lookupExprType(*call.args[0]);
+            if (pt) pt = resolveInInstance(pt);
+            llvm::Type* ety = llvm::Type::getInt64Ty(*ctx_);
+            if (pt && pt->kind == TypeKind::Ref)
+                ety = mapKardashevType(resolveInInstance(pt->refInner));
+            auto* ld = builder_->CreateLoad(ety, p, "vload");
+            ld->setVolatile(true);
+            return ld;
+        }
+        if (call.callee == "volatile_store" && call.args.size() == 2) {
+            llvm::Value* p = emitExpr(*call.args[0]);
+            llvm::Value* v = emitConsume(*call.args[1]);
+            auto* st = builder_->CreateStore(v, p);
+            st->setVolatile(true);
             return nullptr; // unit
         }
         if (call.callee == "copy_nonoverlapping" && call.args.size() == 3) {

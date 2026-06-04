@@ -1627,6 +1627,7 @@ public:
                 }
                 it->second.type->structFields = std::move(resolvedFields);
                 it->second.type->reprC = sd.reprC; // v88: carry `#[repr(C)]` onto the Type
+                it->second.type->reprPacked = sd.reprPacked; // v97: carry `#[repr(packed)]`
                 currentGenericEnv_ = nullptr;
                 currentConstParams_.clear();
             }
@@ -8414,6 +8415,76 @@ private:
                 error("ptr_write (raw-pointer write) requires an `unsafe` block",
                       call.line, call.column);
             return makeUnit();
+        }
+        // v97: `volatile_load(p: *const/*mut T) -> T` — a volatile read of a raw
+        // pointer (e.g. an MMIO register; the optimizer may not elide/reorder
+        // it). Modeled on the raw-deref read; requires `unsafe` like ptr_write.
+        if (call.callee == "volatile_load") {
+            if (call.args.size() != 1) {
+                error("volatile_load(p) takes a `*const T` / `*mut T`",
+                      call.line, call.column);
+                return makeUnit();
+            }
+            TypePtr pt = resolve(checkExpr(*call.args[0]));
+            if (pt->kind != TypeKind::Ref || !pt->isRawPtr) {
+                error("volatile_load expects a raw pointer (`*const T` / "
+                      "`*mut T`), got " + typeToString(pt),
+                      call.args[0]->line, call.args[0]->column);
+                return makeUnit();
+            }
+            if (unsafeDepth_ == 0)
+                error("volatile_load (raw-pointer read) requires an `unsafe` "
+                      "block",
+                      call.line, call.column);
+            return resolve(pt->refInner);
+        }
+        // v97: `volatile_store(p: *mut T, v: T)` — a volatile write of a raw
+        // pointer. Modeled on ptr_write exactly (incl. the `unsafe` gate).
+        if (call.callee == "volatile_store") {
+            if (call.args.size() != 2) {
+                error("volatile_store(p, v) takes a `*mut T` and a `T` value",
+                      call.line, call.column);
+                return makeUnit();
+            }
+            TypePtr pt = resolve(checkExpr(*call.args[0]));
+            TypePtr vt = checkExpr(*call.args[1]);
+            if (pt->kind != TypeKind::Ref || !pt->isRawPtr || !pt->refIsMut) {
+                error("volatile_store expects a `*mut T` first argument, got " +
+                          typeToString(pt),
+                      call.args[0]->line, call.args[0]->column);
+                return makeUnit();
+            }
+            if (!coerceOrUnify(*call.args[1], vt, resolve(pt->refInner)))
+                error("volatile_store value type " + typeToString(vt) +
+                          " does not match the pointee type " +
+                          typeToString(resolve(pt->refInner)),
+                      call.args[1]->line, call.args[1]->column);
+            if (unsafeDepth_ == 0)
+                error("volatile_store (raw-pointer write) requires an `unsafe` "
+                      "block",
+                      call.line, call.column);
+            return makeUnit();
+        }
+        // v97: endianness intrinsics — WIDTH-PRESERVING over the same int type.
+        // `swap_bytes`/`to_le`/`to_be`/`from_le`/`from_be` : (x: iN/uN) -> iN/uN.
+        // (Unlike the v70 `reverse_bytes`, which is fixed to i64; a fixed
+        // makeInt schema would widen a u16/u32 arg and corrupt the byte swap.)
+        if (call.callee == "swap_bytes" || call.callee == "to_le" ||
+            call.callee == "to_be" || call.callee == "from_le" ||
+            call.callee == "from_be") {
+            if (call.args.size() != 1) {
+                error(call.callee + "(x) takes one integer argument",
+                      call.line, call.column);
+                return makeInt();
+            }
+            TypePtr at = resolve(checkExpr(*call.args[0]));
+            if (at->kind != TypeKind::Int) {
+                error(call.callee + " expects an integer argument, got " +
+                          typeToString(at),
+                      call.args[0]->line, call.args[0]->column);
+                return makeInt();
+            }
+            return at; // result keeps the argument's width + signedness
         }
         // Phase 30: note any use of a file-I/O / CLI-args builtin so codegen
         // emits that runtime (which references libc free/fopen) ONLY for
