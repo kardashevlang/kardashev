@@ -2006,6 +2006,18 @@ sh_test(
     ],
 )
 
+# v92: the self-hosted compiler emits a growable scalar Vec<i64> + owned strings
+# (kdvec/kdstr runtime + libc declares into its own preamble, only when used) with
+# Drop-free-at-exit. Differential self == host; immutable/no-Vec path byte-identical.
+sh_test(
+    name = "smoke_test_selfhost_vec",
+    srcs = ["smoke_test_selfhost_vec.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:structgen.kd",
+    ],
+)
+
 # v20 Phase 118: the self-hosted compiler handles ENUMS + match — tagged-pair
 # aggregates + a branch-free match select-chain, differential-gated vs the host.
 sh_test(

@@ -18,6 +18,36 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.92.0] — Self-hosting: growable `Vec<i64>` + owned strings
+
+Builds on v91's CFG. The self-hosted LLVM-IR compiler
+(`examples/selfhost/structgen.kd`) gains the one heap data structure every
+compiler phase needs — a growable `Vec<i64>` and owned (heap-allocated) strings —
+emitted into its **self-contained** IR (clang links libc).
+
+### Added (in the self-hosted emitter)
+- **`Vec<i64>`** (type-tag 4 → `{ ptr, i64, i64 }`): `vec_new` / `vec_push` /
+  `vec_get` / `vec_len` / `vec_set`, plus **growable `str_concat`** (owned
+  `cap > 0` strings reusing the String layout).
+- A **use-gated runtime preamble**: libc `declare`s (`malloc`/`realloc`/`free`/
+  `memcpy`) + LLVM `define`s for `@kdvec_*` / `@kdstr_*`, emitted **only when a
+  Vec/owned-String is actually used** — so the v84–v91 gates stay byte-identical.
+- **Drop-free-at-exit** for non-escaping owned locals (one `free` at the function
+  exit block — enabled by v91's real exit block).
+- Two enabling fixes: `&mut <mutable-local>` now passes the local's actual
+  `alloca` slot (not a load+re-alloca copy), and a new `ExprStmt` so a bare
+  `vec_push(...);` statement parses.
+
+### Notes
+- Gate: `smoke_test_selfhost_vec.sh` — differential self == host on vec build+sum,
+  `for`-push + `vec_len`, growable `str_concat`, a tokenizer capstone, grow
+  boundaries, negatives, and a 100k-push `MALLOC_CHECK_=3` + RSS-flat leak check.
+
+### Deferred (honest)
+- `vec_set` is self-only-tested (no host counterpart). String drop-on-*reassign*
+  leaks the prior buffer (bounded, freed at exit; true drop needs liveness).
+  `Vec<T>` for non-scalar `T`, nested `Vec`, `HashMap` → v94+ (need generics).
+
 ## [0.91.0] — Self-hosting: real control flow (mutable locals + `while`/`for` CFG)
 
 Opens the v91–v100 arc (practical systems + self-hosting completeness). The
