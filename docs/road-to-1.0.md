@@ -38,7 +38,7 @@ mechanized-spec capstone (the last mega-arc).*
   + endianness + volatile (v87/v88/v97, `tests/smoke_test_repr_packed.sh`);
   traits/generics/effects/patterns (v25–v50).
 - **measured-gap:** iterator adaptors are i64-only — making them element-generic
-  hits a PHI-type crash on nested adaptors (documented in `ROADMAP-v91-v100.md`,
+  hits a PHI-type crash on nested adaptors (documented in `../roadmap/ROADMAP-v91-v100.md`,
   v94 PART 2 deferral).
 - **mega-arc:** `HashMap` is host-only (the `--emit-c` backend cleanly refuses it,
   needs a keyed-hash runtime); a user-replaceable `GlobalAlloc`.
@@ -78,7 +78,7 @@ mechanized-spec capstone (the last mega-arc).*
 ## What stands between here and 1.0 (the entry criteria)
 
 The remaining work is the four XL mega-arcs (sized + sequenced in
-`ROADMAP-v91-v100.md` → "v101 and beyond"): full self-hosting bootstrap;
+`../roadmap/ROADMAP-v91-v100.md` → "v101 and beyond"): full self-hosting bootstrap;
 register-ABI struct-by-value FFI; WASM + Windows backends; a hosted package
 registry — and the **1.0 capstone**, a mechanized spec (normative grammar +
 type/ownership/effect rules) cross-checked against the implementation. Each is
