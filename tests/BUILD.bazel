@@ -286,6 +286,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v96: coherence E0119 stable code + generalized negative impls
+# (`impl !Tr for X {}` opts X out of a blanket). Runs binaries to lock
+# concrete-beats-blanket + derives against false-positive regressions.
+sh_test(
+    name = "smoke_test_coherence",
+    srcs = ["smoke_test_coherence.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v25 Phase 139: associated consts (const N: T in trait/impl, read Type::N()).
 sh_test(
     name = "smoke_test_phase139",

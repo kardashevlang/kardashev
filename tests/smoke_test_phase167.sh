@@ -184,13 +184,15 @@ echo "PASS [char-send-fixed]: char is Send — chan_send(char) + Mutex<char> com
 # ---------------------------------------------------------------------------
 # 6. NEW — misuse rejections.
 # ---------------------------------------------------------------------------
-# 6a. a negative impl is only allowed for the marker traits.
-cat > "$TMP/neg_nonmarker.kd" <<'EOF'
+# 6a. v96: the marker-only restriction on negative impls was lifted (a negative
+#     impl now opts a type out of any trait's blanket), but the trait must still
+#     be declared — a negative impl of an UNKNOWN trait is rejected.
+cat > "$TMP/neg_unknown.kd" <<'EOF'
 struct W { x: i64 }
-impl !Clone for W { }
+impl !Bogus for W { }
 fn main() -> i64 { 0 }
 EOF
-expect_reject "$TMP/neg_nonmarker.kd" "negative impls are only allowed" "neg-impl-nonmarker"
+expect_reject "$TMP/neg_unknown.kd" "unknown trait" "neg-impl-unknown-trait"
 
 # 6b. a marker trait must have no methods.
 cat > "$TMP/marker_method.kd" <<'EOF'

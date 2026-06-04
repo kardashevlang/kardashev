@@ -18,6 +18,61 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.96.0] — Coherence: a stable E0119 + generalized negative impls
+
+Ground-truth probing found **three of the four planned CORE items were already
+met** by the shipped compiler — overlapping blanket impls were already rejected,
+concrete-beats-blanket already dispatched to the concrete impl, and a duplicate
+concrete impl was already a clean error. v96 therefore re-scopes to the genuine
+gaps: a **stable error code** on the existing coherence diagnostic, and
+**generalizing negative impls** beyond `Send`/`Sync`.
+
+### Added
+- **`E0119`** — a stable error code (with `kardc --explain E0119`) for the
+  conflicting-trait-implementation / coherence diagnostics that previously had
+  none. Classifies the `conflicting implementations`, `conflicting \`impl\``,
+  `duplicate impl of marker`, and `duplicate negative impl` messages; ordered
+  ahead of the broad `E0308` fallback.
+- **Generalized negative impls** — `impl !Tr for X {}` now works for **any
+  declared trait**, not just the `Send`/`Sync` markers (lifting the v31
+  restriction). A negative impl opts `X` out of a blanket `impl<T> Tr for T`:
+  the existing `expandBlanketImpls` `impld` set already seeds `"X/Tr"` from the
+  negative impl, so the blanket never synthesizes `impl Tr for X`, and a later
+  `X{}.tr_method()` fails to resolve. The trait must be declared and the impl
+  method-less (the latter enforced at parse time).
+- **`smoke_test_coherence.sh`** — an 11-case gate. A true overlap errors (now
+  `E0119`); **concrete-beats-blanket compiles and the binary exits 111 not 222**
+  (the #1 false-positive guard, dispatch asserted by running the binary); the
+  blanket applies without the opt-out (exit 7); `impl !Greet for H {}` makes
+  `H{}.g()` fail to resolve; `impl Tr` + `impl !Tr` and a duplicate `!Tr`
+  conflict; a negative impl of an unknown trait / with a method body is rejected;
+  **`#[derive(Clone)]` over a `Vec` field deep-copies (exit 7) and
+  `#[derive(Debug)]` formats (exit 0)** — the highest-risk derive regression,
+  locked by running the binaries; and `--explain E0119` prints.
+
+### Changed
+- The coherence pass tracks positive and negative impls in separate sets so a
+  positive `impl Tr` plus a negative `impl !Tr` for the same type (in either
+  order), and a duplicate `!Tr`, are reported as `E0119` conflicts — while a
+  negative impl never falsely reads as a second positive.
+- The negative-impl gate accepts any declared trait (was: hard error "negative
+  impls are only allowed for the marker traits `Send` and `Sync`"). The two
+  tests that asserted the old message (`typecheck_test.cpp`,
+  `smoke_test_phase167.sh`) were repointed to the unknown-trait rejection.
+
+### Deferred (honest)
+- **Orphan rule** — documented in-source as deliberately **not enforced**: it has
+  no soundness value in a single-crate language (every impl shares one prelude; a
+  foreign-trait+foreign-type impl can only conflict — already caught — or be a
+  benign extension), so enforcing it would forbid working code while catching
+  nothing new. Revisit at the package-ecosystem mega-arc.
+- **Call-site bound-satisfaction checking** — an unsatisfied generic bound still
+  surfaces as `E0277 no impl provides method` at the resolution site rather than a
+  dedicated "T does not implement Tr" message; a proper checker needs a full
+  bound-satisfaction subsystem (its own version).
+- RFC-1023 covered-types lattice, `default fn` specialization, cross-crate
+  coherence, assoc-type-projection disjointness — all pre-deferred; none regressed.
+
 ## [0.95.0] — Codegen perf: a permanent perf-regression gate (parity is already at 1.00× C)
 
 A ground-truth measurement found the roadmap's "~1.2× fib gap" was **stale**:
