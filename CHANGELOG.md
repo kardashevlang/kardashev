@@ -18,6 +18,35 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.94.0] — Self-hosting: monomorphic generics (`fn id<T>`, `struct Pair<T>`)
+
+The self-hosted LLVM-IR compiler (`examples/selfhost/structgen.kd`) gains the
+feature the *real* compiler uses pervasively — type parameters — via
+**monomorphic specialization** (one specialized copy per concrete type at a call
+site, deduped by mangled name, mirroring the host's `emittedInstances_`).
+
+### Added (in the self-hosted emitter)
+- **Single type-parameter generics**: `fn id<T>(x: T) -> T`, `struct Pair<T> { a: T, b: T }`
+  — `<T>` parsing, tag `-1` for the unbound `T`, a monomorphization registry,
+  `mangle` / `specialize_*` helpers, and `Call`/`SLit` routing to the
+  per-concrete-type instance (`T` inferred from the first generic-typed argument).
+- Use-gated so non-generic programs emit **byte-identical** IR (the prior gates).
+
+### Notes
+- Gate: `smoke_test_selfhost_generics.sh` — differential self == host on a generic
+  fn specialized at i64 + at a struct, a generic struct build+sum, a generic call
+  in a loop, two-types-dedup, and an ill-typed-generic-call negative.
+
+### Deferred (honest, evidence-based)
+- **Element-generic host iterator adaptors** (the planned second half): empirically
+  the typecheck fix is a one-liner that unblocks a *single-level* element-generic
+  impl, but **nested adaptors** (`Take<I>` over `Iterator<T>`) crash codegen with a
+  PHI type mismatch (`T` unresolved through the transitive bound — real L work),
+  and even the one-liner risks the 10+ shipped i64-adaptor tests. The i64 tower
+  stays as-is; element-generic iterators move to a later line.
+- Generic trait dispatch (vtables) → v98; const-generics / multi-param `<A,B>` in
+  the self-hosted subset.
+
 ## [0.93.0] — Write-capable `&mut [T]` slices + variadic-C FFI + C-backend slice-from-array
 
 The highest-leverage practical-systems gap: mutation-through-slice existed in no
