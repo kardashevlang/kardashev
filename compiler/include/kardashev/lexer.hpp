@@ -80,8 +80,9 @@ enum class TokenKind {
     Eq,
     Arrow, // ->
     FatArrow, // =>
-    DotDot,   // .. — Phase 9 exclusive range
-    DotDotEq, // ..= — Phase 9 inclusive range
+    DotDot,    // .. — Phase 9 exclusive range
+    DotDotEq,  // ..= — Phase 9 inclusive range
+    DotDotDot, // ... — v93 C-variadic marker in an `extern "C"` signature
     At,       // @ — v69 pattern `name @ subpattern` binding
     Question, // ? — Phase 3.4 try operator
     Ampersand, // & — Phase 2.4b shared borrow / reference type

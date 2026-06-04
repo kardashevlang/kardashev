@@ -352,8 +352,13 @@ std::vector<Token> lex(std::string_view source) {
         // Two-char operators.
         char n = (i + 1 < source.size()) ? source[i + 1] : '\0';
         char n2 = (i + 2 < source.size()) ? source[i + 2] : '\0';
-        // Phase 9: range operators. `..=` (inclusive) must be tried before
-        // `..` (exclusive) so the longer match wins.
+        // Phase 9: range operators. `...` (v93 C-variadic) and `..=`
+        // (inclusive) must both be tried before `..` (exclusive) so the
+        // longer match wins.
+        if (c == '.' && n == '.' && n2 == '.') {
+            push3(TokenKind::DotDotDot, startCol);
+            continue;
+        }
         if (c == '.' && n == '.' && n2 == '=') {
             push3(TokenKind::DotDotEq, startCol);
             continue;
@@ -498,6 +503,7 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::FatArrow: return "FatArrow";
     case TokenKind::DotDot: return "DotDot";
     case TokenKind::DotDotEq: return "DotDotEq";
+    case TokenKind::DotDotDot: return "DotDotDot";
     case TokenKind::LParen: return "LParen";
     case TokenKind::RParen: return "RParen";
     case TokenKind::LBrace: return "LBrace";

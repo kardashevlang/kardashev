@@ -156,6 +156,14 @@ TypePtr makeSlice(TypePtr elem) {
     return t;
 }
 
+TypePtr makeSlice(TypePtr elem, bool isMut) {
+    // v93: same layout as the shared slice; the only difference is the
+    // type-system-only `sliceIsMut` flag distinguishing `&mut [T]` from `&[T]`.
+    auto t = makeSlice(std::move(elem));
+    t->sliceIsMut = isMut;
+    return t;
+}
+
 TypePtr makeArray(TypePtr elem, std::size_t len) {
     // Phase 22: `[T; N]` — a value-type fixed-size array. Element in
     // `arrayElem`, length in `arrayLen`. Lowers to `[N x <T>]`.
@@ -240,6 +248,7 @@ TypePtr substConstLenRec(
         if (!changed) return r;
         TypePtr res = makeStruct(r->structName, std::move(nf));
         res->typeArgs = std::move(na);
+        res->sliceIsMut = r->sliceIsMut; // v93: preserve &mut [T] across const-len subst
         return res;
     }
     case TypeKind::Enum: {
@@ -378,6 +387,7 @@ TypePtr renameConstLenRec(const TypePtr& t,
         if (!changed) return r;
         TypePtr res = makeStruct(r->structName, std::move(nf));
         res->typeArgs = std::move(na);
+        res->sliceIsMut = r->sliceIsMut; // v93: preserve &mut [T] across const-len rename
         return res;
     }
     case TypeKind::Ref:
@@ -494,8 +504,10 @@ TypePtr instantiateGeneric(const TypePtr& schemaType,
     // Guarantee a fresh node before stamping typeArgs (an all-const generic
     // with no symbolic length leaves `inst` aliasing the shared schema).
     if (inst.get() == schemaType.get()) {
+        bool wasSliceMut = inst->sliceIsMut; // v93
         inst = isStruct ? makeStruct(inst->structName, inst->structFields)
                         : makeEnum(inst->enumName, inst->enumVariants);
+        inst->sliceIsMut = wasSliceMut; // v93: preserve &mut [T] on fresh node
     }
     inst->typeArgs = std::move(typeArgs);
     return inst;
@@ -851,6 +863,7 @@ TypePtr instantiate(const TypePtr& t,
         if (!changed) return r;
         TypePtr res = makeStruct(r->structName, std::move(newFields));
         res->typeArgs = std::move(newTypeArgs);
+        res->sliceIsMut = r->sliceIsMut; // v93: preserve &mut [T] across instantiate()
         return res;
     }
     case TypeKind::Enum: {
