@@ -23,6 +23,8 @@ enum Expr {
     MethodCall(Box<Expr>, String, Vec<Box<Expr>>),  // v98: recv.method(args) — STATIC (monomorphized) trait dispatch
     ECon(i64, Vec<Box<Expr>>),                       // v107: enum constructor `Just(x)` / `Nope` — variant tag (Just=0, Nope=1) + payload args (1 for Just, 0 for Nope)
     Match(Box<Expr>, String, Box<Expr>, Box<Expr>),  // v107: `match o { Just(b) => jbody, Nope => nbody }` — scrutinee, Just-binder, Just-body, Nope-body
+    BoxNew(Box<Expr>),                               // v108: `Box::new(e)` — heap-allocate an i64 (malloc 8 + store); value is a ptr (tag 600)
+    Deref(Box<Expr>),                                // v108: `*b` prefix deref — load the i64 a Box<i64> points to
 }
 enum Stmt {
     Let(String, Box<Expr>),             // immutable SSA binding (unchanged)
@@ -116,6 +118,9 @@ fn lex(src: &String) -> Vec<Token> ! { alloc } {
                     let is_le = if b == 60 {                                  // '<=' token
                         if i + 1 < n { if str_char_at(src, i + 1) == 61 { 1 } else { 0 } } else { 0 }
                     } else { 0 };
+                    let is_cc = if b == 58 {                                   // v108: '::' path separator (Box::new)
+                        if i + 1 < n { if str_char_at(src, i + 1) == 58 { 1 } else { 0 } } else { 0 }
+                    } else { 0 };
                     if is_arrow == 1 {
                         vec_push(&mut toks, Token { kind: 3, start: i, len: 2, value: 0 }); i = i + 2;
                     } else { if is_eq2 == 1 {
@@ -124,6 +129,8 @@ fn lex(src: &String) -> Vec<Token> ! { alloc } {
                         vec_push(&mut toks, Token { kind: 25, start: i, len: 2, value: 0 }); i = i + 2;
                     } else { if is_le == 1 {
                         vec_push(&mut toks, Token { kind: 26, start: i, len: 2, value: 0 }); i = i + 2;
+                    } else { if is_cc == 1 {
+                        vec_push(&mut toks, Token { kind: 29, start: i, len: 2, value: 0 }); i = i + 2;   // v108: '::' (Box::new)
                     } else { if b == 34 {
                         let s0 = i + 1; let mut j = s0; let mut gstr = true;   // "..." string literal
                         while gstr { if j >= n { gstr = false; } else { if str_char_at(src, j) == 34 { gstr = false; } else { j = j + 1; } } }
@@ -133,7 +140,7 @@ fn lex(src: &String) -> Vec<Token> ! { alloc } {
                         let k = if b == 38 { 23 } else { if b == 43 { 10 } else { if b == 42 { 11 } else { if b == 40 { 12 } else { if b == 41 { 13 } else { if b == 61 { 14 } else { if b == 59 { 15 } else { if b == 58 { 16 } else { if b == 44 { 17 } else { if b == 123 { 18 } else { if b == 125 { 19 } else { if b == 60 { 20 } else { if b == 46 { 22 } else { if b == 33 { 27 } else { if b == 45 { 28 } else { 0 - 1 } } } } } } } } } } } } } } };  // v99: 33 '!'; v100: 45 '-' (subtraction)
                         vec_push(&mut toks, Token { kind: k, start: i, len: 1, value: 0 });
                         i = i + 1;
-                    } } } } }
+                    } } } } } }
                 }
             }
         }
@@ -265,6 +272,11 @@ fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SD
         let inner = parse_factor(src, toks, pos, structs);
         parse_post(src, toks, pos, structs, Box::new(Ref(inner)))
     }
+    else { if t.kind == 11 {                        // v108: prefix `*b` deref (kind 11 = '*' at a factor START; infix multiply is handled in parse_term after a left operand)
+        pos.i = pos.i + 1;
+        let di = parse_factor(src, toks, pos, structs);
+        parse_post(src, toks, pos, structs, Box::new(Deref(di)))
+    }
     else { if t.kind == 24 {                        // "..." string literal
         pos.i = pos.i + 1;
         parse_post(src, toks, pos, structs, Box::new(StrLit(t.start, t.len)))
@@ -338,14 +350,22 @@ fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SD
         let e = parse_expr(src, toks, pos, structs);
         pos.i = pos.i + 1;                              // ')'
         parse_post(src, toks, pos, structs, e)
-    } } } }
+    } } } } }
 }
 // `name(...)` -> a Call (user fn or the str_len builtin); bare `name` -> a Var.
 fn parse_call_or_var(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>, name: String) -> Box<Expr> ! { alloc } {
-    // v107: recognize the fixed Opt enum constructors by name (as the str_len/vec_*
-    // builtins are recognized) — `Just(x)` (tag 0, one payload) and `Nope` (tag 1).
-    let kw_just = "Just"; let kw_nope = "Nope";
-    if str_eq(&name, &kw_just) {
+    // v107/v108: recognize the fixed builtins by name (as str_len/vec_* are) — the Opt
+    // constructors `Just(x)`/`Nope`, and `Box::new(x)`. (parse_factor already consumed
+    // the name token, so pos is AT the next token: `::` for Box, `(` for Just.)
+    let kw_just = "Just"; let kw_nope = "Nope"; let kw_box = "Box";
+    if str_eq(&name, &kw_box) {
+        pos.i = pos.i + 1;                          // '::' (kind 29)
+        pos.i = pos.i + 1;                          // 'new' ident
+        pos.i = pos.i + 1;                          // '('
+        let bi = parse_expr(src, toks, pos, structs);
+        pos.i = pos.i + 1;                          // ')'
+        parse_post(src, toks, pos, structs, Box::new(BoxNew(bi)))
+    } else { if str_eq(&name, &kw_just) {
         pos.i = pos.i + 1;                          // '('
         let ja = parse_expr(src, toks, pos, structs);
         pos.i = pos.i + 1;                          // ')'
@@ -370,7 +390,7 @@ fn parse_call_or_var(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &V
         pos.i = pos.i + 1;                          // ')'
         parse_post(src, toks, pos, structs, Box::new(Call(name, args)))
     } else { parse_post(src, toks, pos, structs, Box::new(Var(name))) }
-    } }
+    } } }
 }
 // Postfix field accesses: `.f .g ...`.
 fn parse_post(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>, base: Box<Expr>) -> Box<Expr> ! { alloc } {
@@ -962,6 +982,14 @@ fn type_of(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<
                 if tj == 0 { 0 } else { if tn == 0 { 0 } else { if tj == tn { if tj >= 200 { 0 } else { tj } } else { 0 } } }
             } else { 0 }
         },
+        BoxNew(inner) => {
+            // v108: `Box::new(e)` where e: i64 -> Box<i64> (tag 600). Non-i64 payload is a type error.
+            if type_of(&(**inner), env, structs, fns) == 1 { 600 } else { 0 }
+        },
+        Deref(inner) => {
+            // v108: `*b` where b: Box<i64> (tag 600) -> i64. Deref of a non-Box is a type error.
+            if type_of(&(**inner), env, structs, fns) == 600 { 1 } else { 0 }
+        },
     }
 }
 // v94: infer the concrete tag bound to `T` for a generic call — the type of the
@@ -1042,6 +1070,8 @@ fn mono_structs_expr(e: &Expr, env: &HashMap<String, i64>, structs: &mut Vec<SDe
         MethodCall(recv, _, args) => { mono_structs_expr(&(**recv), env, structs, fns); let na = vec_len(args); let mut i = 0; while i < na { let a = vec_get(args, i); mono_structs_expr(&(*a), env, structs, fns); i = i + 1; } },
         ECon(_, eargs) => { let na = vec_len(eargs); let mut i = 0; while i < na { let a = vec_get(eargs, i); mono_structs_expr(&(*a), env, structs, fns); i = i + 1; } },
         Match(scrut, _, jbody, nbody) => { mono_structs_expr(&(**scrut), env, structs, fns); mono_structs_expr(&(**jbody), env, structs, fns); mono_structs_expr(&(**nbody), env, structs, fns); },
+        BoxNew(inner) => { mono_structs_expr(&(**inner), env, structs, fns); },
+        Deref(inner) => { mono_structs_expr(&(**inner), env, structs, fns); },
     }
 }
 fn mono_structs_stmts(stmts: &Vec<Stmt>, env: &mut HashMap<String, i64>, structs: &mut Vec<SDef>, fns: &Vec<Fn>) ! { alloc } {
@@ -1115,6 +1145,8 @@ fn mono_fns_expr(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns:
         },
         ECon(_, eargs) => { let na = vec_len(eargs); let mut i = 0; while i < na { let a = vec_get(eargs, i); mono_fns_expr(&(*a), env, structs, fns, reqs); i = i + 1; } },
         Match(scrut, _, jbody, nbody) => { mono_fns_expr(&(**scrut), env, structs, fns, reqs); mono_fns_expr(&(**jbody), env, structs, fns, reqs); mono_fns_expr(&(**nbody), env, structs, fns, reqs); },
+        BoxNew(inner) => { mono_fns_expr(&(**inner), env, structs, fns, reqs); },
+        Deref(inner) => { mono_fns_expr(&(**inner), env, structs, fns, reqs); },
     }
 }
 fn mono_fns_stmts(stmts: &Vec<Stmt>, env: &mut HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<Fn>, reqs: &mut Vec<MonoReq>) ! { alloc } {
@@ -1580,6 +1612,22 @@ fn lower(e: &Expr, oenv: &HashMap<String, String>, tenv: &HashMap<String, i64>, 
             app(buf, "  "); app(buf, reg(r)); app(buf, " = select i1 "); app(buf, reg(ci)); app(buf, ", "); app(buf, clone(&bt)); app(buf, " "); app(buf, vj.op); app(buf, ", "); app(buf, bt); app(buf, " "); app(buf, vn.op); app(buf, "\n");
             Val { op: reg(r), ty: vj.ty }
         },
+        BoxNew(inner) => {
+            // v108: heap-box an i64 — malloc 8 bytes, store the value, yield the ptr (tag 600).
+            // Mirrors the malloc in the kdstr/kdvec runtime; freed once at fn exit (see Drop).
+            let vi = lower(&(**inner), oenv, tenv, menv, structs, fns, c, buf);
+            let p = fresh(c);
+            app(buf, "  "); app(buf, reg(p)); app(buf, " = call ptr @malloc(i64 8)\n");
+            app(buf, "  store i64 "); app(buf, vi.op); app(buf, ", ptr "); app(buf, reg(p)); app(buf, "\n");
+            Val { op: reg(p), ty: 600 }
+        },
+        Deref(inner) => {
+            // v108: `*b` — load the i64 the Box<i64> points to (like a mutable-Var / Field load).
+            let vi = lower(&(**inner), oenv, tenv, menv, structs, fns, c, buf);
+            let r = fresh(c);
+            app(buf, "  "); app(buf, reg(r)); app(buf, " = load i64, ptr "); app(buf, vi.op); app(buf, "\n");
+            Val { op: reg(r), ty: 1 }
+        },
     }
 }
 
@@ -1605,6 +1653,8 @@ fn collect_strs(e: &Expr, src: &String, pre: &mut String) ! { alloc } {
         MethodCall(recv, _, args) => { collect_strs(&(**recv), src, pre); let na = vec_len(args); let mut i = 0; while i < na { let a = vec_get(args, i); collect_strs(&(*a), src, pre); i = i + 1; } },
         ECon(_, eargs) => { let na = vec_len(eargs); let mut i = 0; while i < na { let a = vec_get(eargs, i); collect_strs(&(*a), src, pre); i = i + 1; } },
         Match(scrut, _, jbody, nbody) => { collect_strs(&(**scrut), src, pre); collect_strs(&(**jbody), src, pre); collect_strs(&(**nbody), src, pre); },
+        BoxNew(inner) => { collect_strs(&(**inner), src, pre); },
+        Deref(inner) => { collect_strs(&(**inner), src, pre); },
     }
 }
 fn collect_strs_stmts(stmts: &Vec<Stmt>, src: &String, pre: &mut String) ! { alloc } {
@@ -1662,6 +1712,8 @@ fn expr_uses_rt(e: &Expr, kind: i64) -> i64 ! { alloc } {
         },
         ECon(_, eargs) => { let na = vec_len(eargs); let mut i = 0; let mut f = 0; while i < na { let a = vec_get(eargs, i); f = if expr_uses_rt(&(*a), kind) == 1 { 1 } else { f }; i = i + 1; } f },
         Match(scrut, _, jbody, nbody) => { if expr_uses_rt(&(**scrut), kind) == 1 { 1 } else { if expr_uses_rt(&(**jbody), kind) == 1 { 1 } else { expr_uses_rt(&(**nbody), kind) } } },
+        BoxNew(inner) => { if kind == 3 { 1 } else { expr_uses_rt(&(**inner), kind) } },   // v108: kind 3 = Box (needs malloc/free libc decls)
+        Deref(inner) => { expr_uses_rt(&(**inner), kind) },
     }
 }
 fn stmts_use_rt(stmts: &Vec<Stmt>, kind: i64) -> i64 ! { alloc } {
@@ -1698,8 +1750,12 @@ fn fns_use_rt(fns: &Vec<Fn>, kind: i64) -> i64 ! { alloc } {
 // program actually uses them. clang links libc by default, so malloc/realloc/free/
 // memcpy resolve standalone (no kardashev runtime linked). Emitting nothing when
 // unused keeps the v84-v91 gate outputs byte-for-byte identical (Risk R0).
-fn emit_runtime_decls(pre: &mut String, want_vec: i64, want_str: i64) ! { alloc } {
-    let any = if want_vec == 1 { 1 } else { if want_str == 1 { 1 } else { 0 } };
+fn emit_runtime_decls(pre: &mut String, want_vec: i64, want_str: i64, want_box: i64) ! { alloc } {
+    // v108: a Box-using program needs the libc malloc/free declares (emitted by the
+    // `any` block below) even when it uses no Vec/String — so want_box joins `any`.
+    // The kdvec_*/kdstr_* DEFINES stay gated on want_vec/want_str (a box-only program
+    // emits only the libc declares), keeping every prior gate byte-identical (R0).
+    let any = if want_vec == 1 { 1 } else { if want_str == 1 { 1 } else { if want_box == 1 { 1 } else { 0 } } };
     if any == 1 {
     // libc declarations (shared by Vec + String runtime).
     app(pre, "declare ptr @malloc(i64)\n");
@@ -1753,6 +1809,8 @@ fn is_str_concat(e: &Expr) -> i64 ! { alloc } {
         MethodCall(_, _, _) => 0,
         ECon(_, _) => 0,
         Match(_, _, _, _) => 0,
+        BoxNew(_) => 0,
+        Deref(_) => 0,
     }
 }
 
@@ -1788,7 +1846,9 @@ fn lower_stmt(s: &Stmt, oenv: &mut HashMap<String, String>, tenv: &mut HashMap<S
             // cap-gated at runtime, so an initially-borrowed `let mut s = ""` that is
             // later reassigned a str_concat is also tracked at that assign below.)
             if v.ty == 4 { vec_push(&mut cg.owned, reg(slot)); vec_push(&mut cg.owned_ty, 4); }
-            else { if v.ty == 3 { if is_str_concat(&(**e)) == 1 { vec_push(&mut cg.owned, reg(slot)); vec_push(&mut cg.owned_ty, 3); } else { let z = 0; } } else { let z = 0; } }
+            else { if v.ty == 3 { if is_str_concat(&(**e)) == 1 { vec_push(&mut cg.owned, reg(slot)); vec_push(&mut cg.owned_ty, 3); } else { let z = 0; } }
+            else { if v.ty == 600 { vec_push(&mut cg.owned, reg(slot)); vec_push(&mut cg.owned_ty, 600); }   // v108: a `let mut` Box<i64> owns heap — free its ptr once at fn exit
+            else { let z = 0; } } }
         },
         Assign(name, e) => {
             let v = lower(&(**e), oenv, tenv, menv, structs, fns, c, buf);
@@ -1934,7 +1994,13 @@ fn emit_fn_inst(f: &Fn, tcur: i64, mname: &String, structs: &Vec<SDef>, fns: &Ve
         while oi < no {
             let slot = vec_get(&cg.owned, oi); let oty = vec_get(&cg.owned_ty, oi);
             if oty == 4 { app(buf, "  call void @kdvec_drop_i64(ptr "); app(buf, slot); app(buf, ")\n"); }
-            else { app(buf, "  call void @kdstr_drop(ptr "); app(buf, slot); app(buf, ")\n"); }
+            else { if oty == 600 {
+                // v108: free a Box<i64> — load the heap ptr from its slot, then @free it.
+                let bp = fresh(&mut c);
+                app(buf, "  "); app(buf, reg(bp)); app(buf, " = load ptr, ptr "); app(buf, slot); app(buf, "\n");
+                app(buf, "  call void @free(ptr "); app(buf, reg(bp)); app(buf, ")\n");
+            }
+            else { app(buf, "  call void @kdstr_drop(ptr "); app(buf, slot); app(buf, ")\n"); } }
             oi = oi + 1;
         }
     } else { let z = 0; }
@@ -2005,8 +2071,8 @@ fn main() -> i64 ! { io, alloc } {
         // v92: emit the Vec<i64> / growable-String runtime (libc declares + the
         // kdvec_*/kdstr_* defines) ONLY when the program actually uses them, so
         // every prior (no-Vec) program's preamble stays byte-for-byte identical.
-        let wv = fns_use_rt(&fns, 1); let ws = fns_use_rt(&fns, 2);
-        emit_runtime_decls(&mut pre, wv, ws);
+        let wv = fns_use_rt(&fns, 1); let ws = fns_use_rt(&fns, 2); let wb = fns_use_rt(&fns, 3);
+        emit_runtime_decls(&mut pre, wv, ws, wb);
         // Emit every NON-GENERIC fn. (A generic fn declaration emits NOTHING on its
         // own — only its monomorphized instances are emitted, below.)
         let mut out = string_new();

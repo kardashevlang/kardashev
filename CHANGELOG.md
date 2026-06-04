@@ -18,6 +18,33 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.108.0] — Self-hosted Box heap indirection (closes ARC C)
+
+The self-hosted LLVM-IR compiler (`examples/selfhost/structgen.kd`) gains a real
+`Box<i64>` — heap indirection, the next bootstrap rung after enums/match. Research
+workflow `w8pn39kbb` probed the live host; implemented + verified in-session
+(self == host **and** AddressSanitizer-clean).
+
+### Added
+- **`::` token** in the lexer (byte 58 twice → kind 29) — structgen had none.
+- **`Box::new(e)`** recognized by name in the parser (like `vec_new`/`Just`),
+  lowering to `call ptr @malloc(i64 8)` + `store i64 <e>`; value is a `ptr` (tag 600).
+- **prefix-`*` deref** in `parse_factor` (kind 11 at a factor start — distinct from
+  infix multiply), lowering to `load i64, ptr`.
+- **Drop**: a `let mut` Box is freed once at the single fn exit (`load ptr` + `call
+  void @free`) — sound (no early return; `check_fn` rejects a return tag ≥ 200, so a
+  Box can never escape). A `want_box` runtime-family flag emits the libc malloc/free
+  declares for a Box-only program (prior gates stay byte-identical).
+- **`tests/smoke_test_selfhost_box.sh`** — differential self == host + ASan-clean gate
+  (10 checks: R0 byte-identity, malloc/store/load/free IR shape, 2-malloc/2-free
+  balance, box-in-helper-fn, `Box::new(bool)` + `*<i64>` negatives).
+
+### Deferred (honest)
+- `Box<i64>` only (no Box of struct/String/bool/generic-`T`); read-only deref (host has
+  no deref-assign); no returning a Box / no Box-typed params (a Box stays a within-fn
+  `let mut` local); no nested Box-of-Box; only the FINAL value of a reassigned `let mut`
+  box is freed; a plain immutable `let p = Box::new(..)` lowers but isn't freed (no slot).
+
 ## [0.107.0] — Self-hosted enum + match (opens ARC C)
 
 The self-hosted LLVM-IR compiler (`examples/selfhost/structgen.kd`) gains a real
