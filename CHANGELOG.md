@@ -18,6 +18,32 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.105.0] — Generic Eq/Hash for Option/Result (opens ARC B)
+
+Prelude-only blanket impls (verified post-v101 resolver).
+
+### Added
+- **`impl<T: Eq> Eq for Option<T>`** / **`impl<T: Hash> Hash for Option<T>`** and
+  the **`Result<T,E>`** pair. Structural eq; derive-convention hash (per-variant
+  seed `527+ordinal`, fold payload `*31`) so equal values hash equal.
+- This makes Option/Result usable in `==`, as `Vec`/`Box` elements, and — the
+  headline — **`#[derive(Eq, Hash)]` on a struct with an `Option`/`Result` field
+  now resolves**, so that concrete struct keys a `HashMap` (verified round-trip
+  across distinct allocations — eq+hash commute end-to-end).
+- **`tests/smoke_test_composite_eq_hash.sh`** — JIT==AOT: Option/Result eq,
+  hash-commute, derive'd-struct-with-Option-field HashMap key, Option Vec membership.
+
+### Deferred (honest, probe-confirmed)
+- **Tuple `Eq`/`Hash`** — a tuple is not a registrable impl head
+  (`impl Eq for (T,U)` → "impl for unsupported type"); the composite-key path is a
+  nominal `#[derive(Eq,Hash)]` struct, **not** `HashMap<(K1,K2),V>`.
+- **A generic type *directly* as a HashMap/HashSet key** (`HashSet<Option<T>>`,
+  `HashMap<Pair<T>,V>`) — blocked at codegen (the eager-emit pass skips
+  monomorphized generic-impl methods, so the key machinery's bare-name hash/eq
+  lookup misses); a codegen-dispatch fix, its own version. Concrete derive'd
+  struct keys work.
+- `char` Eq/Hash (no `char_to_int` builtin); `Ord`/`cmp` for these; arity > 4.
+
 ## [0.104.0] — Slice utilities (closes ARC A: stdlib depth)
 
 Prelude-only. Slices were first-class but had only scalar get/len/set builtins.
