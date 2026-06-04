@@ -18,6 +18,29 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.104.0] — Slice utilities (closes ARC A: stdlib depth)
+
+Prelude-only. Slices were first-class but had only scalar get/len/set builtins.
+
+### Added
+- **`slice_to_vec<T: Clone>(s: &[T]) -> Vec<T>`** — owned deep-copy (i64 + struct/
+  String).
+- **`SliceIter<T> { s: &[T], pos }` + `slice_iter`** — a borrowing `Iterator<T>`
+  holding `&[T]` directly, chains into the v101 `g*` adaptor tower
+  (`slice_iter(&v[1..4]).gmap(...).collect()`).
+- **`slice_chunks` / `slice_windows`** → `Vec<&[T]>` zero-copy views. They take
+  `&Vec<T>` (not `&[T]`): re-slicing a `&[T]` is rejected, and the views must root
+  in a ref-param to stay sound (the escape checker doesn't track refs nested in a
+  `Vec`, so `Vec<&[local]>` would be UB).
+- **`slice_contains` / `slice_index_of`** `<T: Eq>` — linear search.
+- **`tests/smoke_test_slice_methods.sh`** — JIT==AOT (no `--emit-c` leg): to_vec
+  independence, iter chaining the v101 tower, chunks `[3,3,3,1]`, windows,
+  contains/index_of, non-Copy String to_vec.
+
+### Deferred (honest)
+- Mutable-slice iteration (`for x in &mut s`), `split_at`/`first`/`last` wrappers,
+  slice utilities in `--emit-c` (non-scalar `Vec<&[T]>`), `chunks_exact`/`rchunks`.
+
 ## [0.103.0] — Sort/search: quicksort + binary_search + partition
 
 Prelude-only stdlib algorithms. The only sort was an O(n²) insertion sort.
