@@ -9,6 +9,7 @@
 #   kard run                 # run the ./kard.toml project's entry point (JIT)
 #   kard run   <file.kd>     # JIT-run main()
 #   kard test  <file.kd>     # discover + run `test_*() -> i64` fns (0 = pass)
+#   kard bench <file.kd>     # discover + run `bench_*() -> i64` fns (times each)
 #   kard fmt   <file.kd>     # print canonically-formatted source to stdout
 #   kard fmt --check <file.kd>
 #                            # exit non-zero if the file is not formatted (CI)
@@ -380,7 +381,7 @@ prepare_project() {
 }
 
 usage() {
-    sed -n '2,21p' "$0" | sed 's/^# *//'
+    sed -n '2,22p' "$0" | sed 's/^# *//'
 }
 
 cmd=${1:-help}
@@ -417,6 +418,14 @@ case "$cmd" in
         fi
         # Pass all args through so `-O0` etc. reach kardc alongside --test.
         exec "$KARDC_BIN" --test "$@"
+        ;;
+    bench)
+        if [[ $# -eq 0 ]]; then
+            echo "kard bench: missing file" >&2
+            exit 2
+        fi
+        # v109: discover + run bench_* fns; pass args through (--filter, -O*, …).
+        exec "$KARDC_BIN" --bench "$@"
         ;;
     fmt)
         if [[ $# -eq 0 ]]; then

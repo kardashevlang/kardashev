@@ -538,6 +538,26 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v109 (ARC D): the expect!/expect_eq!/expect_ne! PANIC-form asserts (abort exit 101
+# with a Debug-formatted left/right message, usable anywhere; built on panic+format!
+# +Eq+Debug), additive to the existing effect-free return-1 test asserts.
+sh_test(
+    name = "smoke_test_assert_v109",
+    srcs = ["smoke_test_assert_v109.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v109 (ARC D): the `kard bench` / `kardc --bench` harness — discover + time bench_*
+# fns; the gate asserts result/structure, never wall-time.
+sh_test(
+    name = "smoke_test_kard_bench",
+    srcs = ["smoke_test_kard_bench.sh"],
+    data = [
+        "//compiler:kardc",
+        "//:kard",
+    ],
+)
+
 # v37: turbofish — explicit generic type args f::<T>(args).
 sh_test(
     name = "smoke_test_turbofish",

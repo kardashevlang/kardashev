@@ -18,6 +18,36 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.109.0] — expect_* panic asserts + kard bench (opens ARC D)
+
+Scope corrected by live probing (research workflow `wg1nxd1fu`):
+`assert!`/`assert_eq!`/`assert_ne!` already exist (the v37 effect-free `test_*`
+convention — a failed assert `return`s 1). v109 adds two additive capabilities
+without regressing that convention.
+
+### Added
+- **`expect!` / `expect_eq!` / `expect_ne!`** — the Rust-semantics PANIC form of
+  assert, usable anywhere (not just `test_*`). On failure they
+  `panic(format!("…  left: {:?}\n right: {:?}", l, r))` — aborting with **exit 101**
+  and a Debug-formatted message. Built on the existing `panic` + `format!` + the `Eq`
+  trait's `.eq()` + `{:?}` Debug, so they generalize to any `T: Eq + Debug` (i64, bool,
+  String, Option, Result, …). The panic form forces the caller to declare
+  `! { alloc, panic }` — which is why the effect-free return-1 asserts stay the test default.
+- **`kard bench` / `kardc --bench`** — discovers `bench_*() -> i64` fns (mirroring
+  `--test`), JIT-runs each, times it in the C++ host with `std::chrono`, and prints
+  `bench <name> ... <ms> ms (result=<r>)`; `--filter` narrows. The bench returns a
+  deterministic checksum so gates assert the result, never wall-time. A `kard bench`
+  wrapper case + `--help`/usage lines added.
+- **`tests/smoke_test_assert_v109.sh`** (5 checks incl. the return-1 regression guard,
+  JIT+AOT abort, String operands) and **`tests/smoke_test_kard_bench.sh`** (5 checks:
+  discovery + result correctness, count, no-bench→error, `--filter`, wrapper).
+
+### Deferred (honest)
+- The effect-free return-1 reporter stays i64-only (use `expect_*` or `assert!(a.eq(&b))`
+  for non-i64 in tests); a panic-catching test runner; advisory wall-time regression
+  thresholds + statistical sampling (needs a sub-ms timer); `--format=json` for bench;
+  non-i64 bench return types.
+
 ## [0.108.0] — Self-hosted Box heap indirection (closes ARC C)
 
 The self-hosted LLVM-IR compiler (`examples/selfhost/structgen.kd`) gains a real
