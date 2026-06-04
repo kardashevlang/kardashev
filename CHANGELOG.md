@@ -18,6 +18,30 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.103.0] — Sort/search: quicksort + binary_search + partition
+
+Prelude-only stdlib algorithms. The only sort was an O(n²) insertion sort.
+
+### Added / Changed
+- **`sort<T: Ord>`** upgraded in place from insertion sort to **quicksort**
+  (median-of-three pivot + insertion-sort cutoff ≤12) — **same signature + `! {}`
+  effect row** (a recursive `qsort` helper over the effect-free `vec_swap`/
+  `vec_get_ref`). Median-of-three bounds depth to O(log n) on sorted/reverse
+  adversarial input. Drops O(n²) → O(n log n) average.
+- **`sort_by<T>(v, cmp: Fn(&T,&T)->i64)`** — caller-comparator quicksort,
+  *iterative* (a closure is move-only so it can't recurse), `! { alloc }`.
+- **`binary_search<T: Ord>` / `binary_search_by<T>`** → `Option<i64>`, `! {}`.
+- **`partition<T>(v, pred: Fn(&T)->bool) -> i64`** — in-place, returns the pivot
+  index (count satisfying), `! {}`.
+- **`tests/smoke_test_sort_search.sh`** — deterministic seeded-RNG gate (1000-elem
+  sortedness oracle, adversarial sorted/reverse complete+correct, binary_search
+  present/absent, sort_by, partition, non-Copy String sort).
+
+### Note
+- Quicksort is **not stable** (the old insertion sort was). Every in-tree sort
+  consumer uses a *total* comparator, so observable order is unchanged; a
+  `sort_stable` merge-sort variant is a documented follow-on if ever needed.
+
 ## [0.102.0] — Recursive container `Debug` (`{:?}`)
 
 `Debug` had impls only for scalars + `String`, so `println!("{:?}", v)` over a
