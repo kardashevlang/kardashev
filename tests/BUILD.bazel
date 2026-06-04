@@ -731,6 +731,14 @@ sh_test(
 # / slice_contains / slice_index_of (zero-copy Vec<&[T]> views; iter rides v101).
 # v105: generic Eq/Hash for Option/Result + #[derive(Eq,Hash)] over Option fields
 # (composite HashMap keys via nominal derive'd structs).
+# v106: tail-call lowering + monotone bounds-check elision, LOCKED (no codegen
+# change; the default -O2 build already does it — a permanent IR-grep + runtime gate).
+sh_test(
+    name = "smoke_test_codegen_tco",
+    srcs = ["smoke_test_codegen_tco.sh"],
+    data = ["//compiler:kardc"],
+)
+
 sh_test(
     name = "smoke_test_composite_eq_hash",
     srcs = ["smoke_test_composite_eq_hash.sh"],

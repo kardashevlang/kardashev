@@ -18,6 +18,28 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.106.0] — Codegen: tail-call + bounds-elision locked (closes ARC B)
+
+**Lock-only** (the v95 pattern): live probing proved the default `-O2` build
+already (a) lowers self-tail-recursion to a loop/closed form (so deep recursion
+doesn't blow the stack) and (b) elides monotone bounds checks where sound — so
+v106 ships **no codegen change** (one would be a no-op stub / regression risk) and
+instead pins the wins with a permanent gate.
+
+### Added
+- **`tests/smoke_test_codegen_tco.sh`** — deterministic, target-aware, zero
+  wall-time: BLOCKING structural IR-greps (0 surviving `call @sum` at -O2; monotone
+  array loop 0 bounds checks; `vec_get` loop 0 range/sign/panic checks) + a runtime
+  no-overflow + correctness proof (`sum(1_000_000,0)` exit ≠ 139 and ==
+  `500000500000`) + loop correctness oracle; vectorization x86-64-enforce /
+  arm64-soft. Complements the v95 perf-lock + v90 vector-lock.
+
+### Deferred (honest)
+- TCO at explicit `-O0` (a deliberate opt-out); a `become`/`musttail` language
+  *guarantee*; general/mutual tail-call-elimination guarantee; the `vec_get`
+  null-data branch (correctness-neutral, off the benchmark surface — `vec_get_ref`
+  already vectorizes); LTO / cross-module inlining (XL).
+
 ## [0.105.0] — Generic Eq/Hash for Option/Result (opens ARC B)
 
 Prelude-only blanket impls (verified post-v101 resolver).
