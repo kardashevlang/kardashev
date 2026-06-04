@@ -1247,10 +1247,12 @@ sh_test(
     srcs = ["smoke_test_v100_close.sh"],
     data = [
         "smoke_test_bootstrap.sh",
+        "smoke_test_lsp.sh",
         "smoke_test_packed_write.sh",
         "smoke_test_perf_regression.sh",
         "smoke_test_repr_packed.sh",
         "smoke_test_selfhost_effects.sh",
+        "smoke_test_slice_mut.sh",
         "smoke_test_v90_close.sh",
         "//bench:fib.kd",
         "//bench:loop.kd",
