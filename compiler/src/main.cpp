@@ -1353,6 +1353,105 @@ std::string applyPrelude(const std::string& userSrc) {
             "    idx\n"
             "}\n";
     }
+    // v104: slice utilities. Source from a `&[T]` fat-pointer via the
+    // slice_len/slice_get/slice_get_ref builtins (which take the slice BY VALUE —
+    // it is a Copy {ptr,len} aggregate, so inside the iterator we pass `self.s`,
+    // never `&self.s`). Each guarded per-name so a user definition wins.
+    // SliceIter<T>: a borrowing `&[T]` -> Iterator<T> bridge — holds the slice
+    // directly (probe-proven that `&[T]` in a struct typechecks + lowers), so it
+    // feeds the v101 g* adaptor tower (gmap/gtake/gfilter) + iter_collect.
+    // slice_get COPIES element i, so T is Copy at the yield; for a non-Copy
+    // element, drive the lazy tower over slice_to_vec(s) instead.
+    if (userSrc.find("trait Iterator") == std::string::npos &&
+        userSrc.find("fn slice_iter") == std::string::npos &&
+        userSrc.find("struct SliceIter") == std::string::npos) {
+        prelude +=
+            "struct SliceIter<T> { s: &[T], pos: i64 }\n"
+            "impl<T> Iterator<T> for SliceIter<T> {\n"
+            "    fn next(&mut self) -> Option<T> ! { alloc } {\n"
+            "        if self.pos < slice_len(self.s) {\n"
+            "            let x = slice_get(self.s, self.pos);\n"
+            "            self.pos = self.pos + 1; Some(x)\n"
+            "        } else { None }\n"
+            "    }\n"
+            "}\n"
+            "fn slice_iter<T>(s: &[T]) -> SliceIter<T> { SliceIter { s: s, pos: 0 } }\n";
+    }
+    // slice_to_vec<T: Clone>: an OWNED deep-copy via slice_get_ref(...).clone()
+    // (not slice_get), so non-Copy elements (struct / String) work.
+    if (userSrc.find("fn slice_to_vec") == std::string::npos) {
+        prelude +=
+            "fn slice_to_vec<T: Clone>(s: &[T]) -> Vec<T> ! { alloc } {\n"
+            "    let mut out: Vec<T> = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < slice_len(s) {\n"
+            "        vec_push(&mut out, slice_get_ref(s, i).clone());\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    // slice_contains<T: Eq> / slice_index_of<T: Eq>: linear search via
+    // slice_get_ref(...).eq(target). `break` (not an early `return`) keeps the
+    // result binding un-moved (an early `return out;` then a later use is E0382).
+    if (userSrc.find("fn slice_contains") == std::string::npos) {
+        prelude +=
+            "fn slice_contains<T: Eq>(s: &[T], x: &T) -> bool ! { alloc } {\n"
+            "    let mut i = 0;\n"
+            "    let mut found = false;\n"
+            "    while i < slice_len(s) {\n"
+            "        if slice_get_ref(s, i).eq(x) { found = true; break; } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    found\n"
+            "}\n";
+    }
+    if (userSrc.find("fn slice_index_of") == std::string::npos) {
+        prelude +=
+            "fn slice_index_of<T: Eq>(s: &[T], x: &T) -> i64 ! { alloc } {\n"
+            "    let mut i = 0;\n"
+            "    let mut idx = 0 - 1;\n"
+            "    while i < slice_len(s) {\n"
+            "        if slice_get_ref(s, i).eq(x) { idx = i; break; } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    idx\n"
+            "}\n";
+    }
+    // slice_chunks / slice_windows: ZERO-COPY views — Vec<&[T]> of sub-slices.
+    // They take `&Vec<T>` (NOT `&[T]`): re-slicing a `&[T]` is rejected, AND the
+    // returned slice views must root in a ref-param to stay sound (the escape
+    // checker does not track refs nested inside a Vec — returning Vec<&[local]>
+    // would be unchecked UB). The `n > 0` guard is folded into the `while`
+    // (an early `return out;` would move `out` before the loop's vec_push).
+    if (userSrc.find("fn slice_chunks") == std::string::npos) {
+        prelude +=
+            "fn slice_chunks<T>(v: &Vec<T>, n: i64) -> Vec<&[T]> ! { alloc } {\n"
+            "    let mut out: Vec<&[T]> = vec_new();\n"
+            "    let total = vec_len(v);\n"
+            "    let mut i = 0;\n"
+            "    while n > 0 && i < total {\n"
+            "        let mut end = i + n;\n"
+            "        if end > total { end = total; } else {}\n"
+            "        vec_push(&mut out, &v[i..end]);\n"
+            "        i = i + n;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn slice_windows") == std::string::npos) {
+        prelude +=
+            "fn slice_windows<T>(v: &Vec<T>, n: i64) -> Vec<&[T]> ! { alloc } {\n"
+            "    let mut out: Vec<&[T]> = vec_new();\n"
+            "    let total = vec_len(v);\n"
+            "    let mut i = 0;\n"
+            "    while n > 0 && i + n <= total {\n"
+            "        vec_push(&mut out, &v[i..(i + n)]);\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
     // Phase 53 (v9): generic Vec higher-order combinators over closures, each
     // effect-polymorphic in the closure's effect row `e` (so a pure mapper
     // keeps the caller pure, an allocating one adds `alloc`). The closure

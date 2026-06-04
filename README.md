@@ -90,7 +90,7 @@ Build with Bazel (`bazel build //... && bazel test //...`) on ubuntu or macOS, o
 
 ## Status
 
-kardashev is **pre-1.0**. Every numbered roadmap through **v100** has shipped (v0.1.0 – v0.100.0), and the **v101–v110 "production-depth" arc** ([roadmap/ROADMAP-v101-v110.md](roadmap/ROADMAP-v101-v110.md)) is now underway — v101 **element-generic iterators**, v102 **recursive container `Debug`**, v103 **quicksort + `binary_search` + `partition`**. Each release is green on a cleared clean build (6 unit suites plus the full smoke / fuzz aggregate, **JIT and AOT**) on **Linux + macOS** CI. The per-version detail lives in **[CHANGELOG.md](CHANGELOG.md)**; the current release is **[v0.103.0](https://github.com/kardashevlang/kardashev/releases/latest)**.
+kardashev is **pre-1.0**. Every numbered roadmap through **v100** has shipped (v0.1.0 – v0.100.0), and the **v101–v110 "production-depth" arc** ([roadmap/ROADMAP-v101-v110.md](roadmap/ROADMAP-v101-v110.md)) is now underway — v101 **element-generic iterators**, v102 **recursive container `Debug`**, v103 **quicksort + `binary_search`**, v104 **slice utilities** (`slice_to_vec`/`slice_iter`/`chunks`/`windows`) — closing ARC A (stdlib depth). Each release is green on a cleared clean build (6 unit suites plus the full smoke / fuzz aggregate, **JIT and AOT**) on **Linux + macOS** CI. The per-version detail lives in **[CHANGELOG.md](CHANGELOG.md)**; the current release is **[v0.104.0](https://github.com/kardashevlang/kardashev/releases/latest)**.
 
 ### Highlights
 
