@@ -29,6 +29,7 @@ enum Stmt {
     IfS(Box<Expr>, Vec<Stmt>, Vec<Stmt>),  // statement-if: cond, then-stmts, else-stmts (CFG)
     Break,                              // br to the current loop's exit
     Continue,                          // br to the current loop's header
+    ExprStmt(Box<Expr>),               // a bare expression statement `e ;` (value discarded) — e.g. vec_push(&mut v, x);
 }
 struct Token { kind: i64, start: i64, len: i64, value: i64 }
 struct Pos { i: i64 }
@@ -43,7 +44,10 @@ struct Val { op: String, ty: i64 }
 struct LoopCtx { header: i64, exit: i64 }
 // Codegen block state: termd = 1 once the current block already has a terminator
 // (so we don't emit two terminators / instructions in a dead block).
-struct CgState { termd: i64 }
+// owned/owned_ty (v92): parallel lists of the alloca SLOTS of non-escaping owned
+// heap locals (Vec<i64> / owned String) and their type tags (4 = Vec, 3 = String),
+// to be freed once at the function exit before `ret` (Drop discipline).
+struct CgState { termd: i64, owned: Vec<String>, owned_ty: Vec<i64> }
 
 fn is_alpha(b: i64) -> i64 {
     if b == 95 { 1 }                                    // '_' (was dead code: 95 fell into the A-Z branch)
@@ -163,17 +167,33 @@ fn field_index(structs: &Vec<SDef>, si: i64, fname: &String) -> i64 ! { alloc } 
 // for the caller's single post-increment.
 fn ty_tag(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> i64 ! { alloc } {
     let is_ref = if peek_kind(toks, pos) == 23 { pos.i = pos.i + 1; 1 } else { 0 };   // consume '&'
-    let txt = tok_text_at(src, toks, pos); let kw_bool = "bool"; let kw_str = "String";
+    let txt = tok_text_at(src, toks, pos); let kw_bool = "bool"; let kw_str = "String"; let kw_vec = "Vec";
     let base = if str_eq(&txt, &kw_bool) { 2 }
                else { if str_eq(&txt, &kw_str) { 3 }
-               else { let si = struct_index(structs, &txt); if si >= 0 { 100 + si } else { 1 } } };
+               else { if str_eq(&txt, &kw_vec) {
+                   // `Vec < i64 >` — consume the angle-bracket args. The caller does
+                   // ONE post-increment past the "Vec" name token; here we skip the
+                   // `<` (kind 20), the `i64` element ident, and whatever single token
+                   // closes it. NB: the lexer has no `>` token — '>' lexes as kind -1
+                   // (Risk R4) — so we skip one token regardless of its kind.
+                   pos.i = pos.i + 1;   // '<'   (kind 20)
+                   pos.i = pos.i + 1;   // 'i64' element ident
+                   pos.i = pos.i + 1;   // '>'   (kind -1; skipped blindly)
+                   4
+               }
+               else { let si = struct_index(structs, &txt); if si >= 0 { 100 + si } else { 1 } } } };
     if is_ref == 1 { 200 + base } else { base }
 }
 
 fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>) -> Box<Expr> ! { alloc } {
     let t = vec_get(toks, pos.i);
-    if t.kind == 23 {                               // `&e` address-of
+    if t.kind == 23 {                               // `&e` / `&mut e` address-of
         pos.i = pos.i + 1;
+        // v92: skip an optional `mut` (lexed as an ident) — `&mut v` and `&v` both
+        // lower/type to a reference (tag 200+base); the subset has no separate
+        // mutable-borrow tag, so we just consume the keyword (Risk R5).
+        let kw_mut = "mut";
+        if at_kw(src, toks, pos, &kw_mut) == 1 { pos.i = pos.i + 1; } else { let z = 0; }
         let inner = parse_factor(src, toks, pos, structs);
         parse_post(src, toks, pos, structs, Box::new(Ref(inner)))
     }
@@ -366,12 +386,22 @@ fn parse_stmt(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef
         pos.i = pos.i + 1;                          // ';'
         vec_push(out, Continue);
     } else {
-        // assignment: ident '=' expr ';'
-        let name = tok_text_at(src, toks, pos); pos.i = pos.i + 1;   // ident
-        pos.i = pos.i + 1;                          // '='
-        let e = parse_expr(src, toks, pos, structs);
-        pos.i = pos.i + 1;                          // ';'
-        vec_push(out, Assign(name, e));
+        // Either `ident '=' expr ';'` (assignment) or a bare expression statement
+        // `expr ';'` (e.g. `vec_push(&mut v, x);`). Disambiguate by lookahead: an
+        // ident immediately followed by '=' is an assignment; anything else is an
+        // expr-statement (its value discarded).
+        let is_assign = if peek_kind(toks, pos) == 2 { if peek_kind_at(toks, pos, 1) == 14 { 1 } else { 0 } } else { 0 };
+        if is_assign == 1 {
+            let name = tok_text_at(src, toks, pos); pos.i = pos.i + 1;   // ident
+            pos.i = pos.i + 1;                          // '='
+            let e = parse_expr(src, toks, pos, structs);
+            pos.i = pos.i + 1;                          // ';'
+            vec_push(out, Assign(name, e));
+        } else {
+            let e = parse_expr(src, toks, pos, structs);
+            if peek_kind(toks, pos) == 15 { pos.i = pos.i + 1; } else { let z = 0; }   // ';'
+            vec_push(out, ExprStmt(e));
+        }
     } } } } } }
 }
 // Parse `{ stmt* }` (a loop body — statements only, no result expression).
@@ -394,7 +424,27 @@ fn parse_block(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDe
         if starts == 1 { parse_stmt(src, toks, pos, structs, &mut lets); }
         else { go = false; }
     }
-    let result = parse_expr(src, toks, pos, structs);
+    // The remaining tokens are either a bare expr-statement `e ;` (e.g.
+    // `vec_push(&mut v, x);`) followed by more block content, or the trailing
+    // RESULT expression (no `;`). Parse an expr; if a `;` follows, it was an
+    // expr-statement — record it and keep going; the last `;`-less expr is the
+    // block result. (A block must end in a result expression in this subset.)
+    let mut result = parse_expr(src, toks, pos, structs);
+    let mut more = true;
+    while more {
+        if peek_kind(toks, pos) == 15 {                 // ';' -> the parsed expr was a statement
+            pos.i = pos.i + 1;                          // ';'
+            vec_push(&mut lets, ExprStmt(result));
+            // After an expr-statement there may be further keyword statements
+            // (let/while/...) before the next expr — fold them in.
+            let mut go2 = true;
+            while go2 {
+                let starts = is_stmt_start(src, toks, pos);
+                if starts == 1 { parse_stmt(src, toks, pos, structs, &mut lets); } else { go2 = false; }
+            }
+            result = parse_expr(src, toks, pos, structs);
+        } else { more = false; }
+    }
     Block { lets: lets, result: result }
 }
 // Parse all leading `struct NAME { f: TY, ... }` declarations into the registry.
@@ -493,9 +543,53 @@ fn type_of(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<
         StrLit(_, _) => 3,                                  // string type tag = 3
         Call(name, args) => {
             let kw = "str_len";
+            let kw_vnew = "vec_new"; let kw_vpush = "vec_push"; let kw_vget = "vec_get";
+            let kw_vlen = "vec_len"; let kw_vset = "vec_set"; let kw_scat = "str_concat";
+            let kw_scharat = "str_char_at";
             if str_eq(name, &kw) {
                 // str_len(&String) -> i64. Validate the one arg is a &String (203).
                 if vec_len(args) == 1 { let a = vec_get(args, 0); if type_of(&(*a), env, structs, fns) == 203 { 1 } else { 0 } } else { 0 }
+            } else { if str_eq(name, &kw_scharat) {
+                // str_char_at(&String, i64) -> i64.
+                if vec_len(args) == 2 {
+                    let a0 = vec_get(args, 0); let a1 = vec_get(args, 1);
+                    let t0 = type_of(&(*a0), env, structs, fns); let t1 = type_of(&(*a1), env, structs, fns);
+                    if t0 == 203 { if t1 == 1 { 1 } else { 0 } } else { 0 }
+                } else { 0 }
+            } else { if str_eq(name, &kw_vnew) {
+                // vec_new() -> Vec<i64> (tag 4). No args.
+                if vec_len(args) == 0 { 4 } else { 0 }
+            } else { if str_eq(name, &kw_vpush) {
+                // vec_push(&mut Vec<i64>, i64) -> i64. arg0 is &Vec (204), arg1 i64.
+                if vec_len(args) == 2 {
+                    let a0 = vec_get(args, 0); let a1 = vec_get(args, 1);
+                    let t0 = type_of(&(*a0), env, structs, fns); let t1 = type_of(&(*a1), env, structs, fns);
+                    if t0 == 204 { if t1 == 1 { 1 } else { 0 } } else { 0 }
+                } else { 0 }
+            } else { if str_eq(name, &kw_vget) {
+                // vec_get(&Vec<i64>, i64) -> i64.
+                if vec_len(args) == 2 {
+                    let a0 = vec_get(args, 0); let a1 = vec_get(args, 1);
+                    let t0 = type_of(&(*a0), env, structs, fns); let t1 = type_of(&(*a1), env, structs, fns);
+                    if t0 == 204 { if t1 == 1 { 1 } else { 0 } } else { 0 }
+                } else { 0 }
+            } else { if str_eq(name, &kw_vlen) {
+                // vec_len(&Vec<i64>) -> i64.
+                if vec_len(args) == 1 { let a0 = vec_get(args, 0); if type_of(&(*a0), env, structs, fns) == 204 { 1 } else { 0 } } else { 0 }
+            } else { if str_eq(name, &kw_vset) {
+                // vec_set(&mut Vec<i64>, i64, i64) -> i64.
+                if vec_len(args) == 3 {
+                    let a0 = vec_get(args, 0); let a1 = vec_get(args, 1); let a2 = vec_get(args, 2);
+                    let t0 = type_of(&(*a0), env, structs, fns); let t1 = type_of(&(*a1), env, structs, fns); let t2 = type_of(&(*a2), env, structs, fns);
+                    if t0 == 204 { if t1 == 1 { if t2 == 1 { 1 } else { 0 } } else { 0 } } else { 0 }
+                } else { 0 }
+            } else { if str_eq(name, &kw_scat) {
+                // str_concat(&String, &String) -> String (owned, tag 3).
+                if vec_len(args) == 2 {
+                    let a0 = vec_get(args, 0); let a1 = vec_get(args, 1);
+                    let t0 = type_of(&(*a0), env, structs, fns); let t1 = type_of(&(*a1), env, structs, fns);
+                    if t0 == 203 { if t1 == 203 { 3 } else { 0 } } else { 0 }
+                } else { 0 }
             } else {
                 let gi = fn_index(fns, name);
                 if gi < 0 { 0 } else {
@@ -511,7 +605,7 @@ fn type_of(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<
                         if bad == 1 { 0 } else { g.ret }
                     }
                 }
-            }
+            } } } } } } } }
         },
     }
 }
@@ -547,6 +641,7 @@ fn check_stmts(stmts: &Vec<Stmt>, env: &mut HashMap<String, i64>, structs: &Vec<
             },
             Break => { bad = if loop_depth == 0 { 1 } else { bad }; },
             Continue => { bad = if loop_depth == 0 { 1 } else { bad }; },
+            ExprStmt(e) => { let t = type_of(&(*e), env, structs, fns); bad = if t == 0 { 1 } else { bad }; },
         }
         k = k + 1;
     }
@@ -581,6 +676,7 @@ fn app(buf: &mut String, s: String) ! { alloc } { string_push_str(buf, s); }
 fn ty_llvm(ty: i64, structs: &Vec<SDef>) -> String ! { alloc } {
     if ty >= 200 { let p = "ptr"; clone(&p) }
     else { if ty == 3 { let s = "{ ptr, i64, i64 }"; clone(&s) }
+    else { if ty == 4 { let s = "{ ptr, i64, i64 }"; clone(&s) }   // Vec<i64> = {data,len,cap}
     else { if ty < 100 { let s = "i64"; clone(&s) }
     else {
         let sd = vec_get(structs, ty - 100);
@@ -595,7 +691,7 @@ fn ty_llvm(ty: i64, structs: &Vec<SDef>) -> String ! { alloc } {
         }
         let close = " }"; app(&mut out, clone(&close));
         out
-    } } }
+    } } } }
 }
 
 // Lower one expression; append instructions; return its value (operand + type).
@@ -692,14 +788,34 @@ fn lower(e: &Expr, oenv: &HashMap<String, String>, tenv: &HashMap<String, i64>, 
             Val { op: reg(r), ty: f.ty }
         },
         Ref(inner) => {
-            // `&e`: materialize e into a stack slot and yield its pointer. Inline
-            // alloca is valid LLVM (unoptimized); the gate compares exit codes.
-            let vi = lower(&(**inner), oenv, tenv, menv, structs, fns, c, buf);
-            let ity = ty_llvm(vi.ty, structs);
-            let slot = fresh(c);
-            app(buf, "  "); app(buf, reg(slot)); app(buf, " = alloca "); app(buf, clone(&ity)); app(buf, "\n");
-            app(buf, "  store "); app(buf, ity); app(buf, " "); app(buf, vi.op); app(buf, ", ptr "); app(buf, reg(slot)); app(buf, "\n");
-            Val { op: reg(slot), ty: 200 + vi.ty }
+            // CRITICAL (v92, Risk R1): `&mut <mutable-local>` must yield the local's
+            // ACTUAL alloca slot (already a `ptr`), NOT a load+re-alloca copy. Otherwise
+            // `vec_push(&mut v, x)` would grow/mutate a throwaway copy and `vec_len(&v)`
+            // would read the stale original (len stays 0) and the realloc'd buffer leaks.
+            // For a mutable local we have its slot in `oenv` and its tag in `tenv`.
+            let is_mut_local = match &(**inner) {
+                Var(nm) => { match hashmap_get(menv, clone(nm)) { Some(m) => m, None => 0 } },
+                _ => 0,
+            };
+            if is_mut_local == 1 {
+                match &(**inner) {
+                    Var(nm) => {
+                        let slot = match hashmap_get(oenv, clone(nm)) { Some(x) => x, None => string_new() };
+                        let t = match hashmap_get(tenv, clone(nm)) { Some(x) => x, None => 1 };
+                        Val { op: slot, ty: 200 + t }
+                    },
+                    _ => { Val { op: string_new(), ty: 0 } },   // unreachable (is_mut_local guards it)
+                }
+            } else {
+                // `&e`: materialize e into a stack slot and yield its pointer. Inline
+                // alloca is valid LLVM (unoptimized); the gate compares exit codes.
+                let vi = lower(&(**inner), oenv, tenv, menv, structs, fns, c, buf);
+                let ity = ty_llvm(vi.ty, structs);
+                let slot = fresh(c);
+                app(buf, "  "); app(buf, reg(slot)); app(buf, " = alloca "); app(buf, clone(&ity)); app(buf, "\n");
+                app(buf, "  store "); app(buf, ity); app(buf, " "); app(buf, vi.op); app(buf, ", ptr "); app(buf, reg(slot)); app(buf, "\n");
+                Val { op: reg(slot), ty: 200 + vi.ty }
+            }
         },
         StrLit(start, len) => {
             // Reference the module-preamble global @.str.<start> (id = source offset,
@@ -720,6 +836,9 @@ fn lower(e: &Expr, oenv: &HashMap<String, String>, tenv: &HashMap<String, i64>, 
         },
         Call(name, args) => {
             let kw = "str_len";
+            let kw_vnew = "vec_new"; let kw_vpush = "vec_push"; let kw_vget = "vec_get";
+            let kw_vlen = "vec_len"; let kw_vset = "vec_set"; let kw_scat = "str_concat";
+            let kw_scharat = "str_char_at";
             if str_eq(name, &kw) {
                 // str_len(&String): arg0 is a ptr to { ptr, i64, i64 }; load field 1 (len).
                 let a = vec_get(args, 0);
@@ -729,6 +848,60 @@ fn lower(e: &Expr, oenv: &HashMap<String, String>, tenv: &HashMap<String, i64>, 
                 let ld = fresh(c);
                 app(buf, "  "); app(buf, reg(ld)); app(buf, " = load i64, ptr "); app(buf, reg(gep)); app(buf, "\n");
                 Val { op: reg(ld), ty: 1 }
+            } else { if str_eq(name, &kw_scharat) {
+                // str_char_at(&String, i64) -> i64 (the i-th byte; -1 on OOB).
+                let a0 = vec_get(args, 0); let a1 = vec_get(args, 1);
+                let v0 = lower(&(*a0), oenv, tenv, menv, structs, fns, c, buf);
+                let v1 = lower(&(*a1), oenv, tenv, menv, structs, fns, c, buf);
+                let r = fresh(c);
+                app(buf, "  "); app(buf, reg(r)); app(buf, " = call i64 @kdstr_char_at(ptr "); app(buf, v0.op); app(buf, ", i64 "); app(buf, v1.op); app(buf, ")\n");
+                Val { op: reg(r), ty: 1 }
+            } else { if str_eq(name, &kw_vnew) {
+                // vec_new() -> {ptr,i64,i64} aggregate (an empty Vec<i64>).
+                let r = fresh(c);
+                app(buf, "  "); app(buf, reg(r)); app(buf, " = call { ptr, i64, i64 } @kdvec_new_i64()\n");
+                Val { op: reg(r), ty: 4 }
+            } else { if str_eq(name, &kw_vlen) {
+                // vec_len(&Vec<i64>): arg0 is a `ptr` to the {data,len,cap}; call runtime.
+                let a = vec_get(args, 0);
+                let va = lower(&(*a), oenv, tenv, menv, structs, fns, c, buf);
+                let r = fresh(c);
+                app(buf, "  "); app(buf, reg(r)); app(buf, " = call i64 @kdvec_len_i64(ptr "); app(buf, va.op); app(buf, ")\n");
+                Val { op: reg(r), ty: 1 }
+            } else { if str_eq(name, &kw_vpush) {
+                // vec_push(&mut Vec<i64>, i64): all grow/realloc lives in the runtime def.
+                let a0 = vec_get(args, 0); let a1 = vec_get(args, 1);
+                let v0 = lower(&(*a0), oenv, tenv, menv, structs, fns, c, buf);
+                let v1 = lower(&(*a1), oenv, tenv, menv, structs, fns, c, buf);
+                let r = fresh(c);
+                app(buf, "  "); app(buf, reg(r)); app(buf, " = call i64 @kdvec_push_i64(ptr "); app(buf, v0.op); app(buf, ", i64 "); app(buf, v1.op); app(buf, ")\n");
+                Val { op: reg(r), ty: 1 }
+            } else { if str_eq(name, &kw_vget) {
+                // vec_get(&Vec<i64>, i64) -> i64 (bounds-checked in the runtime).
+                let a0 = vec_get(args, 0); let a1 = vec_get(args, 1);
+                let v0 = lower(&(*a0), oenv, tenv, menv, structs, fns, c, buf);
+                let v1 = lower(&(*a1), oenv, tenv, menv, structs, fns, c, buf);
+                let r = fresh(c);
+                app(buf, "  "); app(buf, reg(r)); app(buf, " = call i64 @kdvec_get_i64(ptr "); app(buf, v0.op); app(buf, ", i64 "); app(buf, v1.op); app(buf, ")\n");
+                Val { op: reg(r), ty: 1 }
+            } else { if str_eq(name, &kw_vset) {
+                // vec_set(&mut Vec<i64>, i64, i64) -> i64 (bounds-checked store).
+                let a0 = vec_get(args, 0); let a1 = vec_get(args, 1); let a2 = vec_get(args, 2);
+                let v0 = lower(&(*a0), oenv, tenv, menv, structs, fns, c, buf);
+                let v1 = lower(&(*a1), oenv, tenv, menv, structs, fns, c, buf);
+                let v2 = lower(&(*a2), oenv, tenv, menv, structs, fns, c, buf);
+                let r = fresh(c);
+                app(buf, "  "); app(buf, reg(r)); app(buf, " = call i64 @kdvec_set_i64(ptr "); app(buf, v0.op); app(buf, ", i64 "); app(buf, v1.op); app(buf, ", i64 "); app(buf, v2.op); app(buf, ")\n");
+                Val { op: reg(r), ty: 1 }
+            } else { if str_eq(name, &kw_scat) {
+                // str_concat(&String, &String) -> owned String (cap>0). malloc+2×memcpy
+                // in the runtime def; returns the {data,len,cap} aggregate by value.
+                let a0 = vec_get(args, 0); let a1 = vec_get(args, 1);
+                let v0 = lower(&(*a0), oenv, tenv, menv, structs, fns, c, buf);
+                let v1 = lower(&(*a1), oenv, tenv, menv, structs, fns, c, buf);
+                let r = fresh(c);
+                app(buf, "  "); app(buf, reg(r)); app(buf, " = call { ptr, i64, i64 } @kdstr_concat(ptr "); app(buf, v0.op); app(buf, ", ptr "); app(buf, v1.op); app(buf, ")\n");
+                Val { op: reg(r), ty: 3 }
             } else {
                 // user call: lower each arg, then emit `call <rty> @name(<pty> <op>, ...)`
                 // using the CALLEE's param types so a &String arg prints `ptr`, etc.
@@ -750,7 +923,7 @@ fn lower(e: &Expr, oenv: &HashMap<String, String>, tenv: &HashMap<String, i64>, 
                 }
                 app(buf, ")\n");
                 Val { op: reg(r), ty: g.ret }
-            }
+            } } } } } } } }
         },
     }
 }
@@ -788,6 +961,7 @@ fn collect_strs_stmts(stmts: &Vec<Stmt>, src: &String, pre: &mut String) ! { all
             IfS(cond, then_b, else_b) => { collect_strs(&(*cond), src, pre); collect_strs_stmts(&then_b, src, pre); collect_strs_stmts(&else_b, src, pre); },
             Break => { let z = 0; },
             Continue => { let z = 0; },
+            ExprStmt(e) => { collect_strs(&(*e), src, pre); },
         }
         k = k + 1;
     }
@@ -795,6 +969,122 @@ fn collect_strs_stmts(stmts: &Vec<Stmt>, src: &String, pre: &mut String) ! { all
 fn collect_strs_block(b: &Block, src: &String, pre: &mut String) ! { alloc } {
     collect_strs_stmts(&b.lets, src, pre);
     collect_strs(&(*b.result), src, pre);
+}
+
+// ---- v92: detect whether a program uses the Vec / str_concat builtins, so the
+// runtime defines are emitted ONLY when needed (keeps every prior gate's output
+// byte-identical — Risk R0). `kind` selects the family: 1 = any vec_* call,
+// 2 = str_concat. Walk mirrors collect_strs's recursion exactly.
+fn expr_uses_rt(e: &Expr, kind: i64) -> i64 ! { alloc } {
+    match e {
+        Num(_) => 0,
+        Var(_) => 0,
+        Bin(_, a, b) => { if expr_uses_rt(&(**a), kind) == 1 { 1 } else { expr_uses_rt(&(**b), kind) } },
+        If(c, t, e2) => { if expr_uses_rt(&(**c), kind) == 1 { 1 } else { if expr_uses_rt(&(**t), kind) == 1 { 1 } else { expr_uses_rt(&(**e2), kind) } } },
+        SLit(_, vals) => { let nv = vec_len(vals); let mut i = 0; let mut f = 0; while i < nv { let v = vec_get(vals, i); f = if expr_uses_rt(&(*v), kind) == 1 { 1 } else { f }; i = i + 1; } f },
+        Field(obj, _) => { expr_uses_rt(&(**obj), kind) },
+        Ref(inner) => { expr_uses_rt(&(**inner), kind) },
+        Call(nm, args) => {
+            let here = if kind == 1 {
+                // any vec_* op (new/push/get/len/set)
+                let a = "vec_new"; let b = "vec_push"; let c = "vec_get"; let d = "vec_len"; let e2 = "vec_set";
+                if str_eq(nm, &a) { 1 } else { if str_eq(nm, &b) { 1 } else { if str_eq(nm, &c) { 1 } else { if str_eq(nm, &d) { 1 } else { if str_eq(nm, &e2) { 1 } else { 0 } } } } }
+            } else { let s = "str_concat"; let s2 = "str_char_at"; if str_eq(nm, &s) { 1 } else { if str_eq(nm, &s2) { 1 } else { 0 } } };
+            if here == 1 { 1 } else {
+                let na = vec_len(args); let mut i = 0; let mut f = 0;
+                while i < na { let a = vec_get(args, i); f = if expr_uses_rt(&(*a), kind) == 1 { 1 } else { f }; i = i + 1; } f
+            }
+        },
+        StrLit(_, _) => 0,
+    }
+}
+fn stmts_use_rt(stmts: &Vec<Stmt>, kind: i64) -> i64 ! { alloc } {
+    let nl = vec_len(stmts); let mut k = 0; let mut f = 0;
+    while k < nl {
+        let s = vec_get(stmts, k);
+        let h = match s {
+            Let(_, e) => { expr_uses_rt(&(*e), kind) },
+            LetMut(_, e) => { expr_uses_rt(&(*e), kind) },
+            Assign(_, e) => { expr_uses_rt(&(*e), kind) },
+            While(cond, body) => { if expr_uses_rt(&(*cond), kind) == 1 { 1 } else { stmts_use_rt(&body, kind) } },
+            IfS(cond, then_b, else_b) => { if expr_uses_rt(&(*cond), kind) == 1 { 1 } else { if stmts_use_rt(&then_b, kind) == 1 { 1 } else { stmts_use_rt(&else_b, kind) } } },
+            Break => 0,
+            Continue => 0,
+            ExprStmt(e) => { expr_uses_rt(&(*e), kind) },
+        };
+        f = if h == 1 { 1 } else { f };
+        k = k + 1;
+    }
+    f
+}
+fn block_uses_rt(b: &Block, kind: i64) -> i64 ! { alloc } {
+    if stmts_use_rt(&b.lets, kind) == 1 { 1 } else { expr_uses_rt(&(*b.result), kind) }
+}
+// Scan ALL fns for a given runtime family.
+fn fns_use_rt(fns: &Vec<Fn>, kind: i64) -> i64 ! { alloc } {
+    let nf = vec_len(fns); let mut i = 0; let mut f = 0;
+    while i < nf { let g = vec_get(fns, i); f = if block_uses_rt(&g.body, kind) == 1 { 1 } else { f }; i = i + 1; }
+    f
+}
+
+// Emit the self-contained Vec<i64> / growable-String runtime into the module
+// preamble — libc `declare`s + the `kdvec_*` / `kdstr_*` `define`s — ONLY when the
+// program actually uses them. clang links libc by default, so malloc/realloc/free/
+// memcpy resolve standalone (no kardashev runtime linked). Emitting nothing when
+// unused keeps the v84-v91 gate outputs byte-for-byte identical (Risk R0).
+fn emit_runtime_decls(pre: &mut String, want_vec: i64, want_str: i64) ! { alloc } {
+    let any = if want_vec == 1 { 1 } else { if want_str == 1 { 1 } else { 0 } };
+    if any == 1 {
+    // libc declarations (shared by Vec + String runtime).
+    app(pre, "declare ptr @malloc(i64)\n");
+    app(pre, "declare ptr @realloc(ptr, i64)\n");
+    app(pre, "declare void @free(ptr)\n");
+    app(pre, "declare ptr @memcpy(ptr, ptr, i64)\n");
+    if want_vec == 1 {
+        // Vec<i64> = { ptr data, i64 len, i64 cap }; doubling growth from cap 0->4.
+        app(pre, "define { ptr, i64, i64 } @kdvec_new_i64() {\nentry:\n  ret { ptr, i64, i64 } { ptr null, i64 0, i64 0 }\n}\n");
+        app(pre, "define i64 @kdvec_len_i64(ptr %v) {\nentry:\n  %p = getelementptr { ptr, i64, i64 }, ptr %v, i32 0, i32 1\n  %l = load i64, ptr %p\n  ret i64 %l\n}\n");
+        app(pre, "define i64 @kdvec_push_i64(ptr %v, i64 %x) {\nentry:\n  %lenp = getelementptr { ptr, i64, i64 }, ptr %v, i32 0, i32 1\n  %capp = getelementptr { ptr, i64, i64 }, ptr %v, i32 0, i32 2\n  %datp = getelementptr { ptr, i64, i64 }, ptr %v, i32 0, i32 0\n  %len = load i64, ptr %lenp\n  %cap = load i64, ptr %capp\n  %full = icmp eq i64 %len, %cap\n  br i1 %full, label %grow, label %store\ngrow:\n  %capz = icmp eq i64 %cap, 0\n  %dbl = mul i64 %cap, 2\n  %nc = select i1 %capz, i64 4, i64 %dbl\n  %olddat = load ptr, ptr %datp\n  %bytes = mul i64 %nc, 8\n  %nd = call ptr @realloc(ptr %olddat, i64 %bytes)\n  store ptr %nd, ptr %datp\n  store i64 %nc, ptr %capp\n  br label %store\nstore:\n  %data = load ptr, ptr %datp\n  %slot = getelementptr i64, ptr %data, i64 %len\n  store i64 %x, ptr %slot\n  %len1 = add i64 %len, 1\n  store i64 %len1, ptr %lenp\n  ret i64 0\n}\n");
+        app(pre, "define i64 @kdvec_get_i64(ptr %v, i64 %i) {\nentry:\n  %lenp = getelementptr { ptr, i64, i64 }, ptr %v, i32 0, i32 1\n  %datp = getelementptr { ptr, i64, i64 }, ptr %v, i32 0, i32 0\n  %len = load i64, ptr %lenp\n  %neg = icmp slt i64 %i, 0\n  %big = icmp sge i64 %i, %len\n  %oob = or i1 %neg, %big\n  br i1 %oob, label %bad, label %ok\nbad:\n  ret i64 0\nok:\n  %data = load ptr, ptr %datp\n  %slot = getelementptr i64, ptr %data, i64 %i\n  %r = load i64, ptr %slot\n  ret i64 %r\n}\n");
+        app(pre, "define i64 @kdvec_set_i64(ptr %v, i64 %i, i64 %x) {\nentry:\n  %lenp = getelementptr { ptr, i64, i64 }, ptr %v, i32 0, i32 1\n  %datp = getelementptr { ptr, i64, i64 }, ptr %v, i32 0, i32 0\n  %len = load i64, ptr %lenp\n  %neg = icmp slt i64 %i, 0\n  %big = icmp sge i64 %i, %len\n  %oob = or i1 %neg, %big\n  br i1 %oob, label %bad, label %ok\nbad:\n  ret i64 0\nok:\n  %data = load ptr, ptr %datp\n  %slot = getelementptr i64, ptr %data, i64 %i\n  store i64 %x, ptr %slot\n  ret i64 0\n}\n");
+        app(pre, "define void @kdvec_drop_i64(ptr %v) {\nentry:\n  %datp = getelementptr { ptr, i64, i64 }, ptr %v, i32 0, i32 0\n  %data = load ptr, ptr %datp\n  call void @free(ptr %data)\n  ret void\n}\n");
+    } else { let z = 0; }
+    if want_str == 1 {
+        // str_char_at(&String, i64) -> i64: the i-th byte (0..255), -1 if OOB.
+        // Mirrors the host's clamp-OOB-to-(-1) so the differential gate holds.
+        app(pre, "define i64 @kdstr_char_at(ptr %s, i64 %i) {\nentry:\n  %lenp = getelementptr { ptr, i64, i64 }, ptr %s, i32 0, i32 1\n  %datp = getelementptr { ptr, i64, i64 }, ptr %s, i32 0, i32 0\n  %len = load i64, ptr %lenp\n  %neg = icmp slt i64 %i, 0\n  %big = icmp sge i64 %i, %len\n  %oob = or i1 %neg, %big\n  br i1 %oob, label %bad, label %ok\nbad:\n  ret i64 -1\nok:\n  %data = load ptr, ptr %datp\n  %bp = getelementptr i8, ptr %data, i64 %i\n  %byte = load i8, ptr %bp\n  %z = zext i8 %byte to i64\n  ret i64 %z\n}\n");
+        // String = { ptr data, i64 len, i64 cap }; concat mallocs len(a)+len(b)+1,
+        // memcpys both halves, returns an owned (cap>0) value. drop frees iff cap>0.
+        app(pre, "define { ptr, i64, i64 } @kdstr_concat(ptr %a, ptr %b) {\nentry:\n  %ad = getelementptr { ptr, i64, i64 }, ptr %a, i32 0, i32 0\n  %al = getelementptr { ptr, i64, i64 }, ptr %a, i32 0, i32 1\n  %bd = getelementptr { ptr, i64, i64 }, ptr %b, i32 0, i32 0\n  %bl = getelementptr { ptr, i64, i64 }, ptr %b, i32 0, i32 1\n  %adp = load ptr, ptr %ad\n  %alen = load i64, ptr %al\n  %bdp = load ptr, ptr %bd\n  %blen = load i64, ptr %bl\n  %tot = add i64 %alen, %blen\n  %cap = add i64 %tot, 1\n  %nb = call ptr @malloc(i64 %cap)\n  %c1 = call ptr @memcpy(ptr %nb, ptr %adp, i64 %alen)\n  %tail = getelementptr i8, ptr %nb, i64 %alen\n  %c2 = call ptr @memcpy(ptr %tail, ptr %bdp, i64 %blen)\n  %r0 = insertvalue { ptr, i64, i64 } undef, ptr %nb, 0\n  %r1 = insertvalue { ptr, i64, i64 } %r0, i64 %tot, 1\n  %r2 = insertvalue { ptr, i64, i64 } %r1, i64 %cap, 2\n  ret { ptr, i64, i64 } %r2\n}\n");
+        app(pre, "define void @kdstr_drop(ptr %s) {\nentry:\n  %capp = getelementptr { ptr, i64, i64 }, ptr %s, i32 0, i32 2\n  %cap = load i64, ptr %capp\n  %owned = icmp ne i64 %cap, 0\n  br i1 %owned, label %dofree, label %done\ndofree:\n  %datp = getelementptr { ptr, i64, i64 }, ptr %s, i32 0, i32 0\n  %data = load ptr, ptr %datp\n  call void @free(ptr %data)\n  br label %done\ndone:\n  ret void\n}\n");
+    } else { let z = 0; }
+    } else { let z = 0; }
+}
+
+// True if `slot` already appears in the owned-drop list (avoid double-free when a
+// `let mut s` is later reassigned a `str_concat` — it was already tracked at decl
+// or a prior assign).
+fn slot_tracked(owned: &Vec<String>, slot: &String) -> i64 ! { alloc } {
+    let n = vec_len(owned); let mut i = 0; let mut found = 0;
+    while i < n { let s = vec_get(owned, i); found = if str_eq(&s, slot) { 1 } else { found }; i = i + 1; }
+    found
+}
+
+// True if `e` is a `str_concat(...)` call — i.e. it produces an OWNED (cap>0)
+// String (vs a borrowed literal / string_new). Used to decide whether a `let mut`
+// String local needs an exit-time free (v92 Drop discipline).
+fn is_str_concat(e: &Expr) -> i64 ! { alloc } {
+    match e {
+        Call(nm, args) => { let kw = "str_concat"; if str_eq(nm, &kw) { 1 } else { 0 } },
+        Num(_) => 0,
+        Var(_) => 0,
+        Bin(_, _, _) => 0,
+        If(_, _, _) => 0,
+        SLit(_, _) => 0,
+        Field(_, _) => 0,
+        Ref(_) => 0,
+        StrLit(_, _) => 0,
+    }
 }
 
 // Lower one statement into the current basic block, threading codegen state.
@@ -823,13 +1113,25 @@ fn lower_stmt(s: &Stmt, oenv: &mut HashMap<String, String>, tenv: &mut HashMap<S
             hashmap_insert(tenv, clone(name), v.ty);
             hashmap_insert(oenv, clone(name), reg(slot));
             hashmap_insert(menv, clone(name), 1);
+            // v92 Drop tracking: a `let mut` Vec<i64> (tag 4) is always owned; a
+            // `let mut` String (tag 3) is owned iff initialized by str_concat. Track
+            // the SLOT so emit_fn frees it once before `ret`. (Owned-string drop is
+            // cap-gated at runtime, so an initially-borrowed `let mut s = ""` that is
+            // later reassigned a str_concat is also tracked at that assign below.)
+            if v.ty == 4 { vec_push(&mut cg.owned, reg(slot)); vec_push(&mut cg.owned_ty, 4); }
+            else { if v.ty == 3 { if is_str_concat(&(**e)) == 1 { vec_push(&mut cg.owned, reg(slot)); vec_push(&mut cg.owned_ty, 3); } else { let z = 0; } } else { let z = 0; } }
         },
         Assign(name, e) => {
             let v = lower(&(**e), oenv, tenv, menv, structs, fns, c, buf);
             let t = match hashmap_get(tenv, clone(name)) { Some(x) => x, None => 1 };
             let lt = ty_llvm(t, structs);
             let slot = match hashmap_get(oenv, clone(name)) { Some(x) => x, None => string_new() };
-            app(buf, "  store "); app(buf, lt); app(buf, " "); app(buf, v.op); app(buf, ", ptr "); app(buf, slot); app(buf, "\n");
+            app(buf, "  store "); app(buf, clone(&lt)); app(buf, " "); app(buf, v.op); app(buf, ", ptr "); app(buf, clone(&slot)); app(buf, "\n");
+            // v92: an `s = str_concat(...)` makes `s` own a heap buffer — track its
+            // slot for exit-time free if not already tracked. (The PRIOR value the
+            // slot held is overwritten/leaked: drop-on-reassign needs liveness and is
+            // a documented v92 deferral; only the FINAL value is freed at exit.)
+            if t == 3 { if is_str_concat(&(**e)) == 1 { if slot_tracked(&cg.owned, &slot) == 0 { vec_push(&mut cg.owned, clone(&slot)); vec_push(&mut cg.owned_ty, 3); } else { let z = 0; } } else { let z = 0; } } else { let z = 0; }
         },
         While(cond, body) => {
             let stem_h = "loop.header."; let stem_b = "loop.body."; let stem_x = "loop.exit.";
@@ -896,6 +1198,12 @@ fn lower_stmt(s: &Stmt, oenv: &mut HashMap<String, String>, tenv: &mut HashMap<S
                 cg.termd = 1;
             } else { let z = 0; }
         },
+        ExprStmt(e) => {
+            // Lower the expr for its side effect (e.g. vec_push / vec_set);
+            // the produced value is discarded.
+            let v = lower(&(**e), oenv, tenv, menv, structs, fns, c, buf);
+            let z = 0;
+        },
     }
 }
 
@@ -920,7 +1228,7 @@ fn emit_fn(f: &Fn, structs: &Vec<SDef>, fns: &Vec<Fn>, buf: &mut String) ! { all
     app(buf, ") {\nentry:\n");
     let mut c = Ctr { n: 0 };
     let mut loops = vec_new();
-    let mut cg = CgState { termd: 0 };
+    let mut cg = CgState { termd: 0, owned: vec_new(), owned_ty: vec_new() };
     let nl = vec_len(&f.body.lets);
     let mut k = 0;
     while k < nl {
@@ -933,6 +1241,23 @@ fn emit_fn(f: &Fn, structs: &Vec<SDef>, fns: &Vec<Fn>, buf: &mut String) ! { all
     // guard anyway), open a fresh block first.
     if cg.termd == 1 { let dn = fresh(&mut c); let stem = "dead."; app(buf, label(&stem, dn)); app(buf, ":\n"); cg.termd = 0; } else { let z = 0; }
     let res = lower(&(*f.body.result), &oenv, &tenv, &menv, structs, fns, &mut c, buf);
+    // v92 Drop discipline: free each non-escaping owned heap local (Vec<i64> /
+    // owned String) once, here at the single fn exit (the emitted subset has no
+    // early `return`, so one free-block suffices — Risk R2). The result is already
+    // an SSA i64 value, so freeing the buffers now cannot affect it. We SKIP frees
+    // entirely when f itself returns an owned-heap type (3/4): returning a Vec /
+    // owned String transfers ownership to the caller and is a documented v92
+    // deferral (Risk R3) — never freed here to avoid a use-after-free.
+    let escapes = if f.ret == 3 { 1 } else { if f.ret == 4 { 1 } else { 0 } };
+    if escapes == 0 {
+        let no = vec_len(&cg.owned); let mut oi = 0;
+        while oi < no {
+            let slot = vec_get(&cg.owned, oi); let oty = vec_get(&cg.owned_ty, oi);
+            if oty == 4 { app(buf, "  call void @kdvec_drop_i64(ptr "); app(buf, slot); app(buf, ")\n"); }
+            else { app(buf, "  call void @kdstr_drop(ptr "); app(buf, slot); app(buf, ")\n"); }
+            oi = oi + 1;
+        }
+    } else { let z = 0; }
     app(buf, "  ret "); app(buf, rty); app(buf, " "); app(buf, res.op); app(buf, "\n}\n");
 }
 fn emit_main(f: &Fn, args: &Vec<i64>, structs: &Vec<SDef>, buf: &mut String) ! { alloc } {
@@ -983,6 +1308,11 @@ fn main() -> i64 ! { io, alloc } {
         let mut pre = string_new();
         let mut pj = 0;
         while pj < nf { let g = vec_get(&fns, pj); collect_strs_block(&g.body, &src, &mut pre); pj = pj + 1; }
+        // v92: emit the Vec<i64> / growable-String runtime (libc declares + the
+        // kdvec_*/kdstr_* defines) ONLY when the program actually uses them, so
+        // every prior (no-Vec) program's preamble stays byte-for-byte identical.
+        let wv = fns_use_rt(&fns, 1); let ws = fns_use_rt(&fns, 2);
+        emit_runtime_decls(&mut pre, wv, ws);
         // Emit every fn.
         let mut out = string_new();
         let mut ej = 0;
