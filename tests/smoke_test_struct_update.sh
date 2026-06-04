@@ -38,7 +38,12 @@ diff_run chain $'10\n20\n30' "$S"' fn main() -> i64 ! { io } { let a = S { x: 1,
 diff_run boolfld $'1\n0' 'struct F { a: bool, b: bool } fn main() -> i64 ! { io } { let f = F { a: false, b: false }; let g = F { a: true, ..f }; if g.a { print(1); } else { print(0); } if g.b { print(1); } else { print(0); } 0 }'
 
 # ---- rejects ----
-reject wrong_type  'same struct' 'struct A { x: i64 } struct B { x: i64 } fn main() -> i64 { let a = A { x: 1 }; let b = B { ..a }; 0 }'
+# NB: struct names must avoid single-uppercase letters (A/B/E/F/T/...) — those
+# collide with prelude generic params and emit spurious "generic parameter 'X'
+# shadows an existing type" errors whose emission order is hash-map-iteration
+# dependent (libstdc++ vs libc++), which non-deterministically crowded out the
+# intended "same struct" error on ubuntu CI. Use Widget/Gadget.
+reject wrong_type  'same struct' 'struct Widget { x: i64 } struct Gadget { x: i64 } fn main() -> i64 { let a = Widget { x: 1 }; let b = Gadget { ..a }; 0 }'
 reject move_field  'Copy'        'struct M { name: String, n: i64 } fn main() -> i64 ! { alloc } { let a = M { name: "x", n: 1 }; let b = M { n: 2, ..a }; 0 }'
 
 echo "ALL STRUCT-UPDATE SMOKE TESTS PASSED"

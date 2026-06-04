@@ -18,6 +18,32 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.95.0] — Codegen perf: a permanent perf-regression gate (parity is already at 1.00× C)
+
+A ground-truth measurement found the roadmap's "~1.2× fib gap" was **stale**:
+`fib(40)` and the 200M `loop` are at **1.00× C** today (`@fib`'s asm is
+byte-identical to clang's; `@main` in `loop` has 0 allocas + 16 vector ops at -O2
+— the v51 TargetMachine/TTI fix already neutralized the old alloca-heavy
+lowering). So v95 ships **no codegen change** (one would be a no-op stub) and
+instead installs the version's actual unaddressed risk: a perf-regression gate.
+
+### Added
+- **`smoke_test_perf_regression.sh`** — a CI-robust gate that LOCKS the measured
+  parity invariants so a future PassBuilder/codegen refactor can't silently
+  regress perf:
+  - **BLOCKING** deterministic structural IR-greps (identical on x86-64 + arm64,
+    zero wall-time): `@fib` has 0 allocas at -O2; `@main` (loop) has 0 allocas;
+    the loop auto-vectorizes (arch-aware: x86-64 strict, arm64 soft).
+  - **ADVISORY** wall-time sanity: generous (≤ 2.0× = gross regression only),
+    best-of-5, x86-64-only, fully skippable — can never flake CI. The tight 1.00×
+    numbers live in BENCHMARKS.md, never asserted in CI.
+- Complements (does not duplicate) the v65 codegen-perf and v90 vector-lock gates.
+
+### Deferred (honest)
+- LTO / cross-module inlining, true tail-call elimination, escape-to-stack for
+  closure envs (all XL / their own version). The fib gap is irreducible below
+  1.00× without them — and it is already at 1.00×.
+
 ## [0.94.0] — Self-hosting: monomorphic generics (`fn id<T>`, `struct Pair<T>`)
 
 The self-hosted LLVM-IR compiler (`examples/selfhost/structgen.kd`) gains the
