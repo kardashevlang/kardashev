@@ -20,6 +20,7 @@ enum Expr {
     Ref(Box<Expr>),                     // address-of `&e` -> a reference (tag 200+base)
     Call(String, Vec<Box<Expr>>),       // user fn call (or builtin str_len): name + args
     StrLit(i64, i64),                   // read-only string literal: src byte span (start, len)
+    MethodCall(Box<Expr>, String, Vec<Box<Expr>>),  // v98: recv.method(args) — STATIC (monomorphized) trait dispatch
 }
 enum Stmt {
     Let(String, Box<Expr>),             // immutable SSA binding (unchanged)
@@ -322,7 +323,25 @@ fn parse_post(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef
         if peek_kind(toks, pos) == 22 {                 // '.'
             pos.i = pos.i + 1;
             let fname = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
-            e = Box::new(Field(e, fname));
+            // v98: a `.ident` FOLLOWED BY '(' is a method call (static trait
+            // dispatch); a `.ident` NOT followed by '(' stays a field access.
+            if peek_kind(toks, pos) == 12 {             // '(' -> method call
+                pos.i = pos.i + 1;
+                let mut args = vec_new();
+                let mut g2 = true;
+                while g2 {
+                    if peek_kind(toks, pos) == 13 { g2 = false; }   // immediate ')' = 0 args
+                    else {
+                        let a = parse_expr(src, toks, pos, structs);
+                        vec_push(&mut args, a);
+                        if peek_kind(toks, pos) == 17 { pos.i = pos.i + 1; } else { g2 = false; }
+                    }
+                }
+                pos.i = pos.i + 1;                      // ')'
+                e = Box::new(MethodCall(e, fname, args));
+            } else {
+                e = Box::new(Field(e, fname));
+            }
         } else { go = false; }
     }
     e
@@ -569,6 +588,91 @@ fn parse_fn(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>)
     Fn { name: name, gp: gp, params: params, ret: ret, body: body }
 }
 
+// ---- v98 static trait dispatch ----
+// Parse all leading `trait NAME { fn m(&self, p: TY) -> RET ; ... }` declarations.
+// We only need to CONSUME them: each `impl` method carries a complete signature and
+// is registered as an ordinary `Fn`, so the trait body's signatures are redundant
+// for codegen. (A method called with no matching impl surfaces as a TYPE ERROR via
+// the missing mangled fn — no trait registry needed.) Returns nothing; advances pos.
+fn parse_traits(src: &String, toks: &Vec<Token>, pos: &mut Pos) ! { alloc } {
+    let kw_trait = "trait";
+    let mut go = true;
+    while go {
+        if at_kw(src, toks, pos, &kw_trait) == 1 {
+            pos.i = pos.i + 1;                          // 'trait'
+            pos.i = pos.i + 1;                          // trait name
+            pos.i = pos.i + 1;                          // '{'
+            // Skip method signatures until the closing '}' (kind 19). Each signature
+            // is `fn m(...) -> RET ;`; we don't interpret it, just scan to the brace.
+            let mut g2 = true;
+            while g2 {
+                if peek_kind(toks, pos) == 19 { g2 = false; }   // '}' ends the trait
+                else { pos.i = pos.i + 1; }
+            }
+            pos.i = pos.i + 1;                          // '}'
+        } else { go = false; }
+    }
+}
+// Parse one impl-method signature `fn m(&self, p: TY, ...) -> RET { body }` and push
+// it into `fns` under the MANGLED name `StructName_method`. Param 0 is synthesized as
+// `self : 200+(100+si)` = a `&Widget` (tag 300+si); the declared params follow. The
+// first declared param after `self` is `&self` (kind 23 then `self` ident, no `:TY`).
+fn parse_impl_method(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>, sname: &String, si: i64, out: &mut Vec<Fn>) ! { alloc } {
+    pos.i = pos.i + 1;                                  // 'fn'
+    let mname = tok_text_at(src, toks, pos); pos.i = pos.i + 1;  // method name
+    pos.i = pos.i + 1;                                  // '('
+    let mut params = vec_new();
+    // The receiver `&self`: '&' (kind 23) then the `self` ident — no `: TYPE`.
+    // Synthesize its tag = 200 + (100+si) = a &Struct reference (tag 300+si).
+    if peek_kind(toks, pos) == 23 { pos.i = pos.i + 1; } else { let z = 0; }   // '&'
+    let kw_self = "self"; let snm = tok_text_at(src, toks, pos); pos.i = pos.i + 1;  // 'self' ident
+    vec_push(&mut params, Param { name: clone(&snm), ty: 200 + (100 + si) });
+    if peek_kind(toks, pos) == 17 { pos.i = pos.i + 1; } else { let z = 0; }   // ',' after self
+    // Remaining declared params `name : TY` (impl methods are monomorphic — gp = 0).
+    let mut go = true;
+    while go {
+        if peek_kind(toks, pos) == 2 {
+            let pn = tok_text_at(src, toks, pos); pos.i = pos.i + 1;
+            pos.i = pos.i + 1;                          // ':'
+            let pty = ty_tag(src, toks, pos, structs, 0); pos.i = pos.i + 1;
+            vec_push(&mut params, Param { name: pn, ty: pty });
+            if peek_kind(toks, pos) == 17 { pos.i = pos.i + 1; } else { go = false; }
+        } else { go = false; }
+    }
+    pos.i = pos.i + 1;                                  // ')'
+    pos.i = pos.i + 1;                                  // '->'
+    let ret = ty_tag(src, toks, pos, structs, 0); pos.i = pos.i + 1;
+    pos.i = pos.i + 1;                                  // '{'
+    let body = parse_block(src, toks, pos, structs);
+    pos.i = pos.i + 1;                                  // '}' (method body close)
+    let sep = "_"; let a = str_concat(sname, &sep); let mangled = str_concat(&a, &mname);
+    vec_push(out, Fn { name: mangled, gp: 0, params: params, ret: ret, body: body });
+}
+// Parse all leading `impl NAME for Widget { fn m(&self, ...) -> R { .. } ... }`
+// blocks, pushing each method into `fns` under its `Widget_method` mangled name.
+fn parse_impls(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>, out: &mut Vec<Fn>) ! { alloc } {
+    let kw_impl = "impl"; let kw_for = "for"; let kw_fn = "fn";
+    let mut go = true;
+    while go {
+        if at_kw(src, toks, pos, &kw_impl) == 1 {
+            pos.i = pos.i + 1;                          // 'impl'
+            pos.i = pos.i + 1;                          // trait name (unused — impl methods are self-describing)
+            pos.i = pos.i + 1;                          // 'for'
+            let sname = tok_text_at(src, toks, pos); pos.i = pos.i + 1;  // struct name
+            let si = struct_index(structs, &sname);
+            pos.i = pos.i + 1;                          // '{'
+            let mut g2 = true;
+            while g2 {
+                let is_m = at_kw(src, toks, pos, &kw_fn);   // end the shared borrow before the &mut call
+                if is_m == 1 {
+                    parse_impl_method(src, toks, pos, structs, &sname, si, out);
+                } else { g2 = false; }
+            }
+            pos.i = pos.i + 1;                          // '}'
+        } else { go = false; }
+    }
+}
+
 // ---- type checker (i64 / bool / struct) ----
 fn type_of(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<Fn>) -> i64 ! { alloc } {
     match e {
@@ -695,6 +799,32 @@ fn type_of(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<
                 }
             } } } } } } } }
         },
+        MethodCall(recv, mname, args) => {
+            // v98 STATIC dispatch: resolve `recv.m(args)` to the monomorphized impl
+            // fn `StructName_m`. The receiver's static type must be a struct (100+idx)
+            // or a &struct (300+idx); form the mangled name and look it up in `fns`.
+            // self is param 0 (passed by ref) — declared args line up with params[1..].
+            let to = type_of(&(**recv), env, structs, fns);
+            let base = if to >= 300 { to - 200 } else { to };   // auto-deref a &Struct receiver
+            if base >= 100 { if base < 200 {
+                let sd = vec_get(structs, base - 100);
+                let sep = "_"; let a = str_concat(&sd.name, &sep); let mn = str_concat(&a, mname);
+                let gi = fn_index(fns, &mn);
+                if gi < 0 { 0 } else {
+                    let g = vec_get(fns, gi);
+                    let np = vec_len(&g.params); let na = vec_len(args);
+                    if np != na + 1 { 0 } else {        // params[0] = self; rest = declared args
+                        let mut bad = 0; let mut i = 0;
+                        while i < na {
+                            let av = vec_get(args, i); let pm = vec_get(&g.params, i + 1);
+                            bad = if type_of(&(*av), env, structs, fns) != pm.ty { 1 } else { bad };
+                            i = i + 1;
+                        }
+                        if bad == 1 { 0 } else { g.ret }
+                    }
+                }
+            } else { 0 } } else { 0 }
+        },
     }
 }
 // v94: infer the concrete tag bound to `T` for a generic call — the type of the
@@ -772,6 +902,7 @@ fn mono_structs_expr(e: &Expr, env: &HashMap<String, i64>, structs: &mut Vec<SDe
         Ref(inner) => { mono_structs_expr(&(**inner), env, structs, fns); },
         Call(_, args) => { let na = vec_len(args); let mut i = 0; while i < na { let a = vec_get(args, i); mono_structs_expr(&(*a), env, structs, fns); i = i + 1; } },
         StrLit(_, _) => { let z = 0; },
+        MethodCall(recv, _, args) => { mono_structs_expr(&(**recv), env, structs, fns); let na = vec_len(args); let mut i = 0; while i < na { let a = vec_get(args, i); mono_structs_expr(&(*a), env, structs, fns); i = i + 1; } },
     }
 }
 fn mono_structs_stmts(stmts: &Vec<Stmt>, env: &mut HashMap<String, i64>, structs: &mut Vec<SDef>, fns: &Vec<Fn>) ! { alloc } {
@@ -836,6 +967,13 @@ fn mono_fns_expr(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns:
             } else { let z = 0; }
         },
         StrLit(_, _) => { let z = 0; },
+        MethodCall(recv, _, args) => {
+            // impl methods are monomorphic (gp=0) so no generic instance to request;
+            // still recurse into the receiver + args for any nested generic calls.
+            mono_fns_expr(&(**recv), env, structs, fns, reqs);
+            let na = vec_len(args); let mut i = 0;
+            while i < na { let a = vec_get(args, i); mono_fns_expr(&(*a), env, structs, fns, reqs); i = i + 1; }
+        },
     }
 }
 fn mono_fns_stmts(stmts: &Vec<Stmt>, env: &mut HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<Fn>, reqs: &mut Vec<MonoReq>) ! { alloc } {
@@ -1216,6 +1354,45 @@ fn lower(e: &Expr, oenv: &HashMap<String, String>, tenv: &HashMap<String, i64>, 
                 Val { op: reg(r), ty: rtag }
             } } } } } } } }
         },
+        MethodCall(recv, mname, args) => {
+            // v98 STATIC dispatch: emit a DIRECT call to `@StructName_method`, passing
+            // the receiver BY REFERENCE (a `ptr` to its storage) as arg 0, then the
+            // declared args. Resolve the receiver's static struct type to find the
+            // mangled callee (already registered as an ordinary Fn by parse_impls).
+            let vr = lower(&(**recv), oenv, tenv, menv, structs, fns, c, buf);
+            // The receiver pointer: a &Struct (tag>=300) operand is ALREADY a ptr to
+            // the struct; a plain struct VALUE (100..200) is materialized into a slot.
+            let is_ref = if vr.ty >= 300 { 1 } else { 0 };
+            let base = if is_ref == 1 { vr.ty - 200 } else { vr.ty };
+            let recv_ptr = if is_ref == 1 { vr.op } else {
+                let sty = ty_llvm(base, structs);
+                let slot = fresh(c);
+                app(buf, "  "); app(buf, reg(slot)); app(buf, " = alloca "); app(buf, clone(&sty)); app(buf, "\n");
+                app(buf, "  store "); app(buf, sty); app(buf, " "); app(buf, vr.op); app(buf, ", ptr "); app(buf, reg(slot)); app(buf, "\n");
+                reg(slot)
+            };
+            let sd = vec_get(structs, base - 100);
+            let sep = "_"; let a = str_concat(&sd.name, &sep); let mn = str_concat(&a, mname);
+            let gi = fn_index(fns, &mn);
+            let g = vec_get(fns, gi);
+            // lower each declared arg (params[0] is self -> recv_ptr; rest = args)
+            let na = vec_len(args);
+            let mut ops = vec_new();
+            let mut i = 0;
+            while i < na { let av = vec_get(args, i); let va = lower(&(*av), oenv, tenv, menv, structs, fns, c, buf); vec_push(&mut ops, va.op); i = i + 1; }
+            let rty = ty_llvm(g.ret, structs);
+            let r = fresh(c);
+            app(buf, "  "); app(buf, reg(r)); app(buf, " = call "); app(buf, clone(&rty)); app(buf, " @"); app(buf, mn); app(buf, "(ptr "); app(buf, recv_ptr);
+            let mut j = 0;
+            while j < na {
+                let sep2 = ", "; app(buf, clone(&sep2));
+                let pm = vec_get(&g.params, j + 1); let pty = ty_llvm(pm.ty, structs); let opj = vec_get(&ops, j);
+                app(buf, pty); app(buf, " "); app(buf, opj);
+                j = j + 1;
+            }
+            app(buf, ")\n");
+            Val { op: reg(r), ty: g.ret }
+        },
     }
 }
 
@@ -1238,6 +1415,7 @@ fn collect_strs(e: &Expr, src: &String, pre: &mut String) ! { alloc } {
             app(pre, gname); app(pre, " = private unnamed_addr constant ["); app(pre, asz);
             app(pre, " x i8] c\""); app(pre, bytes); app(pre, "\\00\"\n");   // MVP: literals are plain ASCII (no \\ or ")
         },
+        MethodCall(recv, _, args) => { collect_strs(&(**recv), src, pre); let na = vec_len(args); let mut i = 0; while i < na { let a = vec_get(args, i); collect_strs(&(*a), src, pre); i = i + 1; } },
     }
 }
 fn collect_strs_stmts(stmts: &Vec<Stmt>, src: &String, pre: &mut String) ! { alloc } {
@@ -1287,6 +1465,12 @@ fn expr_uses_rt(e: &Expr, kind: i64) -> i64 ! { alloc } {
             }
         },
         StrLit(_, _) => 0,
+        MethodCall(recv, _, args) => {
+            if expr_uses_rt(&(**recv), kind) == 1 { 1 } else {
+                let na = vec_len(args); let mut i = 0; let mut f = 0;
+                while i < na { let a = vec_get(args, i); f = if expr_uses_rt(&(*a), kind) == 1 { 1 } else { f }; i = i + 1; } f
+            }
+        },
     }
 }
 fn stmts_use_rt(stmts: &Vec<Stmt>, kind: i64) -> i64 ! { alloc } {
@@ -1375,6 +1559,7 @@ fn is_str_concat(e: &Expr) -> i64 ! { alloc } {
         Field(_, _) => 0,
         Ref(_) => 0,
         StrLit(_, _) => 0,
+        MethodCall(_, _, _) => 0,
     }
 }
 
@@ -1587,8 +1772,15 @@ fn main() -> i64 ! { io, alloc } {
     let toks = lex(&src);
     let mut pos = Pos { i: 0 };
     let mut structs = parse_structs(&src, &toks, &mut pos);
-    // Parse ALL top-level fns into a registry (user calls need every callee).
+    // v98: parse trait declarations (signatures only — consumed) then impl blocks,
+    // BEFORE the fns loop. Each impl method is registered into `fns` under a mangled
+    // `StructName_method` name, so the existing emit_fn loop emits it and the static
+    // dispatch lowering can call it directly. Convention: structs -> traits -> impls
+    // -> fns (structgen requires structs declared first).
+    parse_traits(&src, &toks, &mut pos);
     let mut fns = vec_new();
+    parse_impls(&src, &toks, &mut pos, &structs, &mut fns);
+    // Parse ALL top-level fns into a registry (user calls need every callee).
     let kw_fn = "fn";
     let mut more = true;
     while more {

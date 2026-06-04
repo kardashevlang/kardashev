@@ -18,6 +18,46 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.98.0] — Self-hosting: static trait dispatch in the self-hosted emitter
+
+The self-hosted compiler (`examples/selfhost/structgen.kd`) gains **static
+(monomorphized) trait dispatch** — the v94-generics pattern extended from generic
+*functions* to trait *methods*. Of the three coupled candidates (modules,
+closures, trait dispatch), ground-truth probing picked the one genuine capability
+increment that fits the existing machinery (struct-tag registry + direct-call
+lowering + mangled-name monomorphization) and avoids a half-feature.
+
+### Added (self-hosted emitter)
+- **`trait Name { fn m(&self, …) -> R ; }`** — method signatures (no default
+  bodies).
+- **`impl Name for Widget { fn m(&self, …) -> R { … } }`** — each impl method is
+  registered as an ordinary function under a mangled symbol `Widget_m` and emitted
+  by the existing `emit_fn` loop.
+- **`recv.method(args)`** — a new `MethodCall` `Expr` variant, disambiguated from
+  field access by a `(`-lookahead in `parse_post`.
+- **Static dispatch** — typecheck + lower resolve the receiver's concrete struct
+  type to the mangled `Struct_method` and emit a **direct** `call <ret>
+  @Struct_method(ptr %recv, <args>)`, passing the receiver by reference as
+  `&self`. No vtable, no fat pointer, no `dyn` — it reuses the direct-call path.
+- **`tests/smoke_test_selfhost_traits.sh`** — 10 differential self==host
+  assertions (byte-identity for trait-free programs, single impl, method-with-arg,
+  two impls of one trait for two types, a method calling another method on `self`,
+  and a no-such-impl negative → self-hosted `TYPE ERROR`).
+
+### Deferred (honest, with evidence)
+- **`dyn Trait` vtable dispatch** — the emitter has zero indirect-call machinery
+  (every `Call` lowers to a direct `call @name`); vtables need `{data,vtable}` fat
+  pointers + per-(trait,type) vtable structs + slot-load indirect calls (~400-500
+  lines). Its own arc.
+- **Closures `|x| …`** — need an env-struct + heap env-alloc + hoisted
+  `__closure_N` + the same fat-ptr/indirect-call ABI the emitter lacks (shares the
+  `dyn` prerequisite).
+- **`mod`/`use`/`pub`** — the emitter is a single-source-string compiler with a
+  flat global registry, so modules would lower to *nothing*; real value needs a
+  multi-file bootstrap arc.
+- Default method bodies, supertraits, associated types/consts, generic/`dyn`-safe
+  traits — each an independent increment atop the static core.
+
 ## [0.97.0] — Binary-format systems: repr(packed) + endianness + volatile
 
 The "parse-a-packet-header / touch-a-device-register / read-a-binary-file"
