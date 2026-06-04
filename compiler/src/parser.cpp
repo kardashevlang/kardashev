@@ -1044,6 +1044,7 @@ private:
         decl.allowMissingEffect = pendingAllowMissingEffect_; // v82
         pendingAllowMissingEffect_ = false;
         pendingReprC_ = false; // v88: `#[repr(C)]` only applies to a struct
+        pendingReprPacked_ = false; // v97: `#[repr(packed)]` only applies to a struct
         decl.noAlloc = pendingNoAlloc_; // v48 `#[codegen(no_alloc)]`
         decl.noPanic = pendingNoPanic_; // v48 `#[codegen(no_panic)]`
         decl.noIo = pendingNoIo_;       // v48 `#[codegen(no_io)]`
@@ -1195,6 +1196,16 @@ private:
         }
         Token nameTok = expect(TokenKind::Identifier, "parameter name");
         expect(TokenKind::Colon, ":");
+        // v97 follow-on (DEFERRED, designed): a bit-field width annotation
+        // `field: uN : W` for a `#[repr(packed)]`-style single-i64-backing
+        // struct (read = (backing >> off) & mask; write = read-modify-write).
+        // Deferred from v97 — it is a genuine L feature: a parallel struct
+        // representation special-cased across emitStructLit, the three field-
+        // access/lvalue codegen paths, field-assign, struct-body declaration and
+        // size_of, plus a typecheck/borrow ban on taking `&` of a sub-byte
+        // field. v97 ships repr(packed) + endianness + volatile (which already
+        // cover packet-header / device-register access at byte granularity);
+        // bit-fields are the sub-byte refinement, tracked in ROADMAP-v91-v100.
         return {nameTok.lexeme, parseTypeRef()};
     }
 
@@ -1236,6 +1247,8 @@ private:
         pendingDerives_.clear();
         decl.reprC = pendingReprC_; // v88: `#[repr(C)]`
         pendingReprC_ = false;
+        decl.reprPacked = pendingReprPacked_; // v97: `#[repr(packed)]`
+        pendingReprPacked_ = false;
         decl.genericParams = parseOptionalGenericParams();
 
         expect(TokenKind::LBrace, "{");
@@ -1262,6 +1275,7 @@ private:
         decl.derives = std::move(pendingDerives_); // Phase 42
         pendingDerives_.clear();
         pendingReprC_ = false; // v88: `#[repr(C)]` only applies to a struct (enum repr is a follow-on)
+        pendingReprPacked_ = false; // v97: `#[repr(packed)]` only applies to a struct
         decl.genericParams = parseOptionalGenericParams();
 
         expect(TokenKind::LBrace, "{");
@@ -2516,6 +2530,7 @@ private:
     // attributes are tolerated (skipped to the closing `]`).
     std::vector<std::string> pendingDerives_;
     bool pendingReprC_ = false; // v88 `#[repr(C)]` for the next struct decl
+    bool pendingReprPacked_ = false; // v97 `#[repr(packed)]` for the next struct decl
     bool pendingTotal_ = false; // v47 `#[total]` for the next fn decl
     bool pendingAllowMissingEffect_ = false; // v82 `#[allow(missing_effect)]`
     bool pendingNoAlloc_ = false; // v48 `#[codegen(no_alloc)]` for the next fn
@@ -2550,14 +2565,16 @@ private:
                 if (!enabled) cfgDropNext_ = true;
             } else if (attr.lexeme == "repr") {
                 // v88: `#[repr(C)]` — guaranteed C layout for the next struct
-                // (FFI-by-pointer eligible). `repr(packed)`/`repr(transparent)`/
-                // `repr(align(N))` change layout and are NOT yet supported, so
-                // they are rejected rather than silently ignored.
+                // (FFI-by-pointer eligible). v97: `#[repr(packed)]` — no
+                // inter-field padding. `repr(transparent)`/`repr(align(N))`
+                // change layout and are NOT yet supported, so they are rejected
+                // rather than silently ignored.
                 expect(TokenKind::LParen, "(");
                 Token r = expect(TokenKind::Identifier, "repr kind");
                 if (r.lexeme == "C") pendingReprC_ = true;
-                else errorAt("only `repr(C)` is supported (got `repr(" +
-                                 r.lexeme + ")`)",
+                else if (r.lexeme == "packed") pendingReprPacked_ = true; // v97
+                else errorAt("only `repr(C)` and `repr(packed)` are supported "
+                             "(got `repr(" + r.lexeme + ")`)",
                              r.line, r.column);
                 expect(TokenKind::RParen, ")");
             } else if (attr.lexeme == "total") {

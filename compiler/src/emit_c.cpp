@@ -1405,6 +1405,15 @@ struct CEmitter {
             progress = false;
             for (const auto& s : program.structs) {
                 if (emitted.count(s.name)) continue;
+                // v97: `#[repr(packed)]` is layout-sensitive — the C backend
+                // refuses it rather than risk a byte layout that diverges from
+                // the LLVM packed struct (never miscompile).
+                if (s.reprPacked) {
+                    err("`#[repr(packed)]` struct `" + s.name +
+                        "` is outside the C-backend subset (layout-sensitive; "
+                        "use the LLVM backend)");
+                    return;
+                }
                 // All struct-typed field dependencies must be emitted first.
                 bool ready = true;
                 for (const auto& f : s.fields)

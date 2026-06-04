@@ -1192,6 +1192,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v97: #[repr(packed)] (no inter-field padding) + width-aware endianness
+# intrinsics (swap_bytes/to_le/to_be/from_le/from_be) + unsafe-gated volatile
+# load/store. C backend refuses each. (Bit-fields deferred — see the test.)
+sh_test(
+    name = "smoke_test_repr_packed",
+    srcs = ["smoke_test_repr_packed.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v93: write-capable &mut [T] slices (slice_set/slice_get_mut), variadic-C FFI,
 # and C-backend slice-from-array. In-place sort JIT==AOT==C; E0502 alias negative.
 sh_test(

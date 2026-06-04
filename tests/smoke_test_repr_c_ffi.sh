@@ -94,9 +94,16 @@ printf '%s' '#[repr(C)] struct Q { a: i32 } extern "C" fn g(p: Q) -> i64; fn mai
 "$KARDC" "$TMP/n2.kd" >/dev/null 2>"$TMP/n2.err" && { echo "FAIL [neg-by-value]: struct-by-value should be rejected"; exit 1; }
 grep -qi "by value" "$TMP/n2.err" || { echo "FAIL [neg-by-value]: wrong message"; cat "$TMP/n2.err"; exit 1; }
 echo "PASS [neg-by-value]: struct-by-value across extern \"C\" is rejected (pass &T)"
-printf '%s' '#[repr(packed)] struct W { a: i32 } fn main() -> i64 { 0 }' > "$TMP/n3.kd"
-"$KARDC" "$TMP/n3.kd" >/dev/null 2>"$TMP/n3.err" && { echo "FAIL [neg-repr-packed]: repr(packed) should be rejected"; exit 1; }
-grep -qi "repr(C)" "$TMP/n3.err" || { echo "FAIL [neg-repr-packed]: wrong message"; cat "$TMP/n3.err"; exit 1; }
-echo "PASS [neg-repr-packed]: repr(packed) is rejected (not silently ignored)"
+# v97: `#[repr(packed)]` is now SUPPORTED (no inter-field padding) — see
+# smoke_test_repr_packed.sh. The remaining unsupported repr kind is
+# `repr(transparent)`, which is still rejected (not silently ignored).
+printf '%s' '#[repr(transparent)] struct Wrapper { a: i32 } fn main() -> i64 { 0 }' > "$TMP/n3.kd"
+"$KARDC" "$TMP/n3.kd" >/dev/null 2>"$TMP/n3.err" && { echo "FAIL [neg-repr-transparent]: repr(transparent) should be rejected"; exit 1; }
+grep -qi "repr(C)" "$TMP/n3.err" || { echo "FAIL [neg-repr-transparent]: wrong message"; cat "$TMP/n3.err"; exit 1; }
+echo "PASS [neg-repr-transparent]: repr(transparent) is rejected (not silently ignored)"
+# v97: `#[repr(packed)]` now COMPILES (positive).
+printf '%s' '#[repr(packed)] struct Hdr { a: u8, b: u32 } fn main() -> i64 { 0 }' > "$TMP/p3.kd"
+"$KARDC" "$TMP/p3.kd" >/dev/null 2>"$TMP/p3.err" || { echo "FAIL [pos-repr-packed]: repr(packed) should compile now"; cat "$TMP/p3.err"; exit 1; }
+echo "PASS [pos-repr-packed]: repr(packed) compiles (v97)"
 
 echo "ALL REPR(C) FFI SMOKE TESTS PASSED"
