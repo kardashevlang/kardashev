@@ -1201,6 +1201,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v100 codegen audit: a packed-struct field WRITE must be `align 1` (was wrongly
+# over-aligned — IR-UB / SIGBUS on strict-alignment targets). + non-packed control
+# stays align 8; + a &mut [u32] element store stays align 4 (audit-verified lock).
+sh_test(
+    name = "smoke_test_packed_write",
+    srcs = ["smoke_test_packed_write.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v93: write-capable &mut [T] slices (slice_set/slice_get_mut), variadic-C FFI,
 # and C-backend slice-from-array. In-place sort JIT==AOT==C; E0502 alias negative.
 sh_test(
@@ -1227,6 +1236,28 @@ sh_test(
     data = [
         "//compiler:kardc",
         "//bench:loop.kd",
+    ],
+)
+
+# v100 consolidation close: composes the v100 deliverable gates + the inherited
+# perf/vector/binary-format locks + a docs/road-to-1.0.md ledger cross-check. It
+# shells out to the sub-gates, so it carries their scripts + transitive data.
+sh_test(
+    name = "smoke_test_v100_close",
+    srcs = ["smoke_test_v100_close.sh"],
+    data = [
+        "smoke_test_bootstrap.sh",
+        "smoke_test_packed_write.sh",
+        "smoke_test_perf_regression.sh",
+        "smoke_test_repr_packed.sh",
+        "smoke_test_selfhost_effects.sh",
+        "smoke_test_v90_close.sh",
+        "//bench:fib.kd",
+        "//bench:loop.kd",
+        "//compiler:kardc",
+        "//examples/selfhost:structgen.kd",
+        "//docs:road-to-1.0.md",
+        "//docs:bootstrap-status.md",
     ],
 )
 

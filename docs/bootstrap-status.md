@@ -111,6 +111,24 @@ self-hosted subset still needs, roughly in dependency order:
 Each is a tracked feature; this ledger is updated as they land, moving files from
 **blocked** to a real in-subset corpus.
 
+## Known self/host divergences (honest, from the v100 audit)
+
+The v100 adversarial audit ran the self-hosted emitter against the host on edge
+cases the per-feature gates never combined. Two were real miscompiles and are
+**fixed in v100**; two are documented one-directional divergences (the self-hosted
+emitter never produces a *wrong answer* for an accepted program — it either
+matches the host or conservatively rejects/loops, so no silent miscompile ships):
+
+| # | Case | Behavior | v100 status |
+|---|---|---|---|
+| 1 | binary `-` (subtraction) | the lexer had no `-` token → `a - b` silently returned `a` | **FIXED** (lexer kind 28 + `parse_sum` + `sub i64` + `type_of`); locked by the `subtract` corpus case |
+| 2 | `for i in lo..hi { … continue … }` | `for` desugars with the increment at the body tail; `continue` branches to the loop header, skipping it → **infinite loop** | **DEFERRED** — needs a continue-targeted latch (a `ForRange` Stmt variant + a latch block, touching ~7 `match`-over-`Stmt` sites). Plain `for` (no `continue`) works self==host; `while`+`continue` works. Documented here rather than risk the structural change in the consolidation version. |
+| 3 | effect-row enforcement | self treats `! { … }` as unenforced metadata (v99); host enforces `E0710`. Self **over-accepts** (a superset) — never miscompiles an accepted program | DEFERRED (effect *enforcement* in the subset; v99 ships parse+propagate) |
+| 4 | a generic-struct-typed param `p: Pair<T>` | `ty_tag_base` doesn't consume the `<T>`, so self **over-rejects** with a conservative `TYPE ERROR`; host accepts. Concrete non-generic struct params work | DEFERRED (generic-struct param types in the subset) |
+
+\#2's `for`+`continue` latch and #3/#4 are tracked as part of the full-bootstrap
+mega-arc above.
+
 ## Gates
 
 - `tests/smoke_test_bootstrap.sh` — the determinism + corpus candidate (above).
