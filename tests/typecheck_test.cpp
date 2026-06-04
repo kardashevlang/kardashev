@@ -2411,12 +2411,24 @@ void test_marker_traits_send_sync() {
         "}",
         "marker_optin_grants_send");
 
-    // A negative impl is only allowed for the marker traits.
+    // v96: a negative impl of an UNKNOWN trait is rejected (the marker-only
+    // restriction was lifted, but the trait must still be declared).
     expectErr(
         "struct W { x: i64 }\n"
-        "impl !Clone for W { }\n"
+        "impl !Bogus for W { }\n"
         "fn main() -> i64 { 0 }",
-        "marker_negative_nonmarker_rejected");
+        "negative_unknown_trait_rejected");
+
+    // v96: a negative impl of a DECLARED (non-marker) trait is accepted — it
+    // opts the type out of that trait's blanket impl. (A method body on a
+    // negative impl is rejected at PARSE time — see smoke_test_coherence.sh —
+    // so it cannot be exercised through this parse-then-typecheck harness.)
+    expectOk(
+        "trait Greetable { fn g(&self) -> i64; }\n"
+        "struct W { x: i64 }\n"
+        "impl !Greetable for W { }\n"
+        "fn main() -> i64 { 0 }",
+        "negative_declared_trait_ok");
 
     // A marker trait must have no methods.
     expectErr(

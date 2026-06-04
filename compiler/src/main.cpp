@@ -3105,6 +3105,17 @@ const std::vector<ErrorCode>& errorCodes() {
          "Assignment requires a `let mut` binding (or a `&mut` place).\n"
          "Declare the binding `let mut x = …;` to make it reassignable.",
          "declare the binding as `let mut …` to make it reassignable"},
+        // --- coherence / trait impls (v96) ---
+        {"E0119",
+         {"conflicting implementations", "conflicting `impl",
+          "duplicate impl of marker", "duplicate negative impl"},
+         "conflicting trait implementations (coherence)",
+         "Two impls of the same trait apply to the same type — a type may have\n"
+         "at most one impl of a given trait. Remove the duplicate. If one is a\n"
+         "blanket `impl<T> Tr for T`, opt the type out with a negative impl\n"
+         "`impl !Tr for ThatType {}` so the concrete impl is the only one.\n"
+         "A positive `impl Tr` and a negative `impl !Tr` for the same type also\n"
+         "conflict — keep one."},
         // --- broad fallbacks (LAST) ---
         {"E0308",
          {"does not match", "same integer type", "expects bool", "arm body "

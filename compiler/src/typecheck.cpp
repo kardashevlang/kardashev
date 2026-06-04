@@ -2182,7 +2182,8 @@ public:
                 }
                 return s;
             };
-            std::unordered_set<std::string> seenImplPairs;
+            std::unordered_set<std::string> seenImplPairs; // positive impls
+            std::unordered_set<std::string> seenNegPairs;  // v96 negative impls
             for (const auto& impl : program.impls) {
                 if (impl.traitName.empty()) continue;
                 // v31 Phase 167: marker (Send/Sync) impls — positive and
@@ -2193,14 +2194,47 @@ public:
                 std::string key = impl.forType.name +
                                   spellArgs(impl.forType.typeArgs) + "/" +
                                   impl.traitName + spellArgs(impl.traitTypeArgs);
+                // v96: a negative impl `impl !Tr for X {}` is an opt-out, not a
+                // positive impl — it must NOT register a positive key (else a
+                // legal `impl Tr for X` would read as two positives). A
+                // duplicate `!Tr`/`!Tr`, or a `Tr` and `!Tr` for the same type,
+                // conflict (checked order-independently below).
+                if (impl.isNegative) {
+                    if (!seenNegPairs.insert(key).second)
+                        error("duplicate negative impl of trait '" +
+                                  impl.traitName + "' for type '" +
+                                  impl.forType.name + "'",
+                              impl.line, impl.column);
+                    else if (seenImplPairs.count(key))
+                        error("conflicting `impl " + impl.traitName +
+                                  "` and `impl !" + impl.traitName +
+                                  "` for type '" + impl.forType.name + "'",
+                              impl.line, impl.column);
+                    continue;
+                }
                 if (!seenImplPairs.insert(key).second) {
                     error("conflicting implementations of trait '" +
                               impl.traitName + "' for type '" +
                               impl.forType.name + "'",
                           impl.line, impl.column);
+                } else if (seenNegPairs.count(key)) {
+                    error("conflicting `impl " + impl.traitName +
+                              "` and `impl !" + impl.traitName + "` for type '" +
+                              impl.forType.name + "'",
+                          impl.line, impl.column);
                 }
             }
         }
+
+        // v96 NOTE (orphan rule, DEFERRED — not meaningful single-crate): an
+        // orphan rule ("an impl must own the trait or the type") guards
+        // cross-crate coherence. kardashev has no crate boundary: every impl
+        // lives in one program with one prelude. A "foreign trait + foreign
+        // type" impl can only either (a) conflict with a prelude impl — already
+        // caught by the coherence pass above — or (b) be a benign, useful
+        // extension. Enforcing an orphan rule here would FORBID (b) while
+        // catching nothing new, so it is deliberately not enforced. Revisit when
+        // a real module/crate boundary exists (the package-ecosystem mega-arc).
 
         // v31 Phase 167: build the Send/Sync marker oracle. A positive `impl
         // Send for T {}` forces T: Send (the legible witness for an opaque /
@@ -2214,9 +2248,26 @@ public:
             const bool isMarker =
                 impl.traitName == "Send" || impl.traitName == "Sync";
             if (impl.isNegative && !isMarker) {
-                error("negative impls are only allowed for the marker traits "
-                      "`Send` and `Sync`",
-                      impl.line, impl.column);
+                // v96: a negative impl `impl !Tr for X {}` opts X out of a
+                // blanket `impl<T> Tr for T` — generalized from the v31
+                // Send/Sync-only restriction. The trait must be declared and the
+                // impl method-less; the opt-out itself is enforced by
+                // expandBlanketImpls, which already skips synthesizing
+                // `impl Tr for X` because the negative impl seeds "X/Tr" into
+                // its `impld` set. The `impl Tr` vs `impl !Tr` and duplicate
+                // `!Tr` conflicts are reported by the coherence pass above.
+                if (!traits_.count(impl.traitName)) {
+                    error("negative impl references unknown trait '" +
+                              impl.traitName + "'",
+                          impl.line, impl.column);
+                    continue;
+                }
+                if (!impl.methods.empty()) {
+                    error("a negative impl of '" + impl.traitName +
+                              "' must have no methods",
+                          impl.line, impl.column);
+                    continue;
+                }
                 continue;
             }
             if (!isMarker) continue;
