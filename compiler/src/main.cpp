@@ -50,6 +50,7 @@
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Host.h"
 
+#include <chrono> // v109: kard bench wall-clock timing
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -2641,6 +2642,25 @@ std::string applyPrelude(const std::string& userSrc) {
             "{ { let la = $a; let lb = $b;"
             " if la == lb { __assert_report(la, lb, 0); return 1; } else { } } }; }\n";
     }
+    // v109: `expect!`/`expect_eq!`/`expect_ne!` — the Rust-semantics PANIC form of
+    // assert, usable ANYWHERE (not just `test_*() -> i64`). On failure they
+    // panic(format!(...)) — aborting with exit 101 and a Debug-formatted left/right
+    // message — instead of `return 1`. They use the `Eq` trait's `.eq()` (so they
+    // generalize to any `T: Eq + Debug`: i64, bool, String, Option, Result, …; the
+    // `==` operator is i64/bool-only) and `{:?}` Debug formatting. COST: the panic
+    // form forces the caller to declare `! { alloc, panic }` (format! allocates the
+    // message, panic aborts) — which is why the effect-free `return 1` test asserts
+    // above stay the DEFAULT for `test_*` fns. A user `macro_rules! expect` overrides.
+    if (userSrc.find("macro_rules! expect") == std::string::npos) {
+        prelude +=
+            "macro_rules! expect { ($c:expr) => { if $c { } else { panic(\"assertion failed\".to_string()); } }; }\n"
+            "macro_rules! expect_eq { ($a:expr, $b:expr) => "
+            "{ { let la = $a; let lb = $b;"
+            " if la.eq(&lb) { } else { panic(format!(\"assertion `left == right` failed\\n  left: {:?}\\n right: {:?}\", la, lb)); } } }; }\n"
+            "macro_rules! expect_ne { ($a:expr, $b:expr) => "
+            "{ { let la = $a; let lb = $b;"
+            " if la.eq(&lb) { panic(format!(\"assertion `left != right` failed\\n  left: {:?}\\n right: {:?}\", la, lb)); } else { } } }; }\n";
+    }
     return prelude + userSrc;
 }
 
@@ -4593,6 +4613,18 @@ bool isTestFn(const kardashev::ast::FnDecl& fn) {
     return true;
 }
 
+// v109: a bench fn — `bench_*() -> i64`, no params/generics. Mirrors isTestFn; the
+// returned i64 is the workload's deterministic checksum (so the gate asserts the
+// RESULT, never wall-time). Prelude fns don't start with `bench_`, so are excluded.
+bool isBenchFn(const kardashev::ast::FnDecl& fn) {
+    if (fn.name.rfind("bench_", 0) != 0) return false;
+    if (!fn.params.empty()) return false;
+    if (!fn.genericParams.empty()) return false;
+    if (fn.returnType.name != "i64") return false;
+    if (fn.returnType.isRef || !fn.returnType.typeArgs.empty()) return false;
+    return true;
+}
+
 int runTests(const std::string& srcRaw, const std::string& srcDir,
              bool emitDebug, const std::string& sourceFile,
              kardashev::OptLevel optLevel, const std::string& filter = "",
@@ -4708,6 +4740,80 @@ int runTests(const std::string& srcRaw, const std::string& srcDir,
     return failed == 0 ? 0 : 1;
 }
 
+// v109: `kard bench` / `kardc --bench` — discover + JIT-run `bench_*() -> i64` fns,
+// timing each in the C++ host with std::chrono (sidestepping monotonic_millis's `io`
+// effect + ms-only resolution), printing `bench <name> ... <ms> ms (result=<r>)`. The
+// result is asserted by the gate; wall-time is reported but NEVER gated (CI timing is
+// nondeterministic — the v95 / BENCHMARKS.md philosophy). Near-copy of runTests.
+int runBench(const std::string& srcRaw, const std::string& srcDir,
+             bool emitDebug, const std::string& sourceFile,
+             kardashev::OptLevel optLevel, const std::string& filter = "") {
+    auto progOpt = buildProgram(srcRaw, srcDir);
+    if (!progOpt) return 1;
+    auto& program = *progOpt;
+    expandDerives(program);
+    expandBlanketImpls(program);
+    fillTraitDefaults(program);
+    auto tcr = kardashev::typecheck(program);
+    if (!tcr.ok()) { reportTypeErrors(tcr, srcRaw, sourceFile); return 1; }
+    auto bcr = kardashev::borrow_check(program, tcr);
+    if (!bcr.ok()) { reportBorrowErrors(bcr, srcRaw, sourceFile); return 1; }
+    std::vector<std::string> benchNames;
+    for (const auto& fn : program.functions) {
+        if (isBenchFn(fn) &&
+            (filter.empty() || fn.name.find(filter) != std::string::npos))
+            benchNames.push_back(fn.name);
+    }
+    if (benchNames.empty()) {
+        std::cerr << "kardc: no matching `bench_*() -> i64` functions in "
+                  << sourceFile
+                  << (filter.empty() ? "" : " (filter: " + filter + ")") << '\n';
+        // No bench under a filter = success (nothing failed); a file with none = error.
+        return filter.empty() ? 1 : 0;
+    }
+    auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile, optLevel);
+    if (!cgr.ok()) {
+        for (const auto& msg : cgr.errors) std::cerr << "codegen error: " << msg << '\n';
+        return 1;
+    }
+    auto jitOrErr = llvm::orc::LLJITBuilder().create();
+    if (!jitOrErr) {
+        llvm::errs() << "LLJIT create failed: "
+                     << llvm::toString(jitOrErr.takeError()) << '\n';
+        return 1;
+    }
+    auto jit = std::move(*jitOrErr);
+    auto tsm = llvm::orc::ThreadSafeModule(std::move(cgr.module),
+                                           std::move(cgr.context));
+    if (auto err = jit->addIRModule(std::move(tsm))) {
+        llvm::errs() << "addIRModule failed: "
+                     << llvm::toString(std::move(err)) << '\n';
+        return 1;
+    }
+    std::cout << "running " << benchNames.size() << " bench"
+              << (benchNames.size() == 1 ? "" : "es") << '\n';
+    using BenchFn = std::int64_t (*)();
+    int failed = 0;
+    for (const auto& name : benchNames) {
+        auto symOrErr = jit->lookup(name);
+        if (!symOrErr) {
+            llvm::consumeError(symOrErr.takeError());
+            std::cout << "bench " << name << " ... FAILED (lookup error)\n";
+            ++failed;
+            continue;
+        }
+        auto fn = symOrErr->toPtr<BenchFn>();
+        auto t0 = std::chrono::steady_clock::now();
+        std::int64_t r = fn();
+        auto t1 = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0)
+                      .count();
+        std::cout << "bench " << name << " ... " << ms << " ms (result=" << r
+                  << ")\n";
+    }
+    return failed == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -4739,6 +4845,7 @@ int main(int argc, char** argv) {
     bool warnEnabled = false;
     // Phase 20a: `--test` discovers + JIT-runs `test_*() -> i64` fns.
     bool testMode = false;
+    bool benchMode = false; // v109: --bench
     std::string testFilter; // v37 --filter
     bool testJson = false;  // v37 --format=json
     // Phase 20a: optimization level for the post-codegen LLVM pipeline.
@@ -4831,6 +4938,8 @@ int main(int argc, char** argv) {
             warnEnabled = true;
         } else if (a == "--test") {
             testMode = true;
+        } else if (a == "--bench") {
+            benchMode = true; // v109: discover + run bench_* fns
         } else if (a == "--filter" && i + 1 < argc) {
             testFilter = argv[++i]; // v37: run only tests whose name contains it
         } else if (a == "--format=json") {
@@ -4857,6 +4966,7 @@ int main(int argc, char** argv) {
                          "       kardc <file.kd>            # JIT-run main()\n"
                          "       kardc -o <out> <file.kd>   # AOT-compile to native exe\n"
                          "       kardc --test <file.kd>     # discover + run test_* fns\n"
+                         "       kardc --bench <file.kd>    # discover + run bench_* fns (times each, asserts result)\n"
                          "       kardc -O0|-O1|-O2|-O3 ...   # optimization level (default -O2)\n"
                          "       kardc -g ...               # emit DWARF debug info\n"
                          "       kardc --emit-llvm <file.kd> # print LLVM IR to stdout\n"
@@ -4899,6 +5009,19 @@ int main(int argc, char** argv) {
         }
         return runTests(*src, dirOf(inputPath), emitDebug, inputPath,
                         optLevel, testFilter, testJson);
+    }
+    if (benchMode) {
+        if (inputPath.empty()) {
+            std::cerr << "kardc: --bench requires an input file\n";
+            return 2;
+        }
+        auto src = readFile(inputPath);
+        if (!src) {
+            std::cerr << "kardc: cannot open file: " << inputPath << '\n';
+            return 1;
+        }
+        return runBench(*src, dirOf(inputPath), emitDebug, inputPath,
+                        optLevel, testFilter);
     }
     if (emitIr) {
         if (inputPath.empty()) {
