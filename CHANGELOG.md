@@ -18,6 +18,30 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.110.0] — Bound-satisfaction diagnostics + LSP code actions (closes ARC D; completes the v101–v110 arc)
+
+The final version of the v101–v110 production-depth arc.
+
+### Added
+- **Trait-bound-satisfaction diagnostics** (`typecheck.cpp`): a missing trait `impl`
+  now emits a clear, actionable **E0277** — it names the bound (**the trait bound
+  `X: Trait` is not satisfied**), suggests the fix (**add `impl Trait for X`**), and
+  lists the types that DO provide the method. A direct missing-method call gets a
+  correct caret on the call.
+- **LSP `textDocument/codeAction`** (`lsp_main.cpp`): the server advertises
+  `codeActionProvider` and offers, for each bound diagnostic, a **quick-fix** whose
+  `WorkspaceEdit` inserts an `impl` skeleton at the end of the file (parsed straight
+  out of the v110 diagnostic — so the diagnostic and the fix compose).
+- **`tests/smoke_test_bound_diag.sh`** (4 checks) and
+  **`tests/smoke_test_lsp_codeaction.sh`** (3 checks).
+
+### Deferred (honest)
+- A generic CALL site whose type-param is bound to a concrete type lacking the impl
+  still surfaces at codegen (not typecheck) — a deeper monomorphization-time check;
+  the `#[derive]` diagnostic's caret still points into the synthesized prelude region
+  (message names the type correctly); the inserted `impl` stub is an empty block
+  (auto-generating the method signatures is future work).
+
 ## [0.109.0] — expect_* panic asserts + kard bench (opens ARC D)
 
 Scope corrected by live probing (research workflow `wg1nxd1fu`):

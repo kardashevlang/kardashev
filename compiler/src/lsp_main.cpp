@@ -38,6 +38,7 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <set> // v110: dedup code-action impl stubs
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -1127,6 +1128,52 @@ std::string buildCompletionResult(const DocIndex& idx,
     return ss.str();
 }
 
+// v110: textDocument/codeAction — surface the v110 trait-bound diagnostic's actionable
+// fix as an LSP quick-fix. Re-runs the pipeline; for each "no impl / unsatisfied bound"
+// diagnostic whose message carries the `add `impl Trait for Type`` hint (emitted by the
+// typechecker in v110), it offers a quick-fix that inserts a skeleton `impl` block at
+// the end of the file (a WorkspaceEdit). Honest deferral: the stub is an empty block —
+// the user fills in the method bodies (auto-generating the signatures is future work).
+std::string buildCodeActionResult(const std::string& uri,
+                                  const std::string& docText) {
+    std::vector<Diag> diags;
+    runPipeline(docText, diags);
+    // End-of-document insert position (0-based line = newline count; character =
+    // length of the final line).
+    std::size_t lineCount = 0, lastLineLen = 0;
+    for (char c : docText) {
+        if (c == '\n') { ++lineCount; lastLineLen = 0; }
+        else ++lastLineLen;
+    }
+    std::ostringstream ss;
+    ss << "[";
+    std::set<std::string> seen;
+    bool first = true;
+    for (const auto& d : diags) {
+        // Extract the `impl Trait for Type` between "add `" and the next "`".
+        const std::string anchor = "add `";
+        auto p = d.message.find(anchor);
+        if (p == std::string::npos) continue;
+        auto contentStart = p + anchor.size();
+        auto q = d.message.find('`', contentStart);
+        if (q == std::string::npos) continue;
+        std::string implSig = d.message.substr(contentStart, q - contentStart);
+        if (implSig.rfind("impl ", 0) != 0) continue; // defensive: must be an impl
+        if (!seen.insert(implSig).second) continue;    // dedup repeated bounds
+        std::string newText = "\n\n" + implSig + " {\n}\n";
+        if (!first) ss << ",";
+        first = false;
+        ss << "{\"title\":\"Add `" << jsonEscape(implSig)
+           << "`\",\"kind\":\"quickfix\",\"edit\":{\"changes\":{\""
+           << jsonEscape(uri) << "\":[{\"range\":{\"start\":{\"line\":"
+           << lineCount << ",\"character\":" << lastLineLen
+           << "},\"end\":{\"line\":" << lineCount << ",\"character\":" << lastLineLen
+           << "}},\"newText\":\"" << jsonEscape(newText) << "\"}]}}}";
+    }
+    ss << "]";
+    return ss.str();
+}
+
 } // namespace
 
 int main() {
@@ -1151,6 +1198,7 @@ int main() {
                 "\"referencesProvider\":true,"
                 "\"renameProvider\":true,"
                 "\"documentSymbolProvider\":true,"
+                "\"codeActionProvider\":true,"
                 "\"completionProvider\":{\"triggerCharacters\":[\".\"]},"
                 "\"diagnosticProvider\":{\"interFileDependencies\":false,"
                                         "\"workspaceDiagnostics\":false}"
@@ -1236,6 +1284,18 @@ int main() {
             }
             auto pr = kardashev::parse(dit->second);
             sendResponse(id, buildDocumentSymbolResult(pr.program, uri));
+        } else if (method == "textDocument/codeAction") {
+            // v110: quick-fixes for the trait-bound diagnostics. Recomputes the
+            // file's diagnostics and offers an `impl` skeleton insert per unsatisfied
+            // bound. (The request's range is advisory — we return all matching fixes;
+            // the client filters by the range it asked about.)
+            std::string uri = findStringField(msg, "uri");
+            auto dit = docs.find(uri);
+            if (dit == docs.end()) {
+                sendResponse(id, "[]");
+                continue;
+            }
+            sendResponse(id, buildCodeActionResult(uri, dit->second));
         } else if (method == "shutdown") {
             shutdownRequested = true;
             sendResponse(id, "null");
