@@ -21,6 +21,8 @@ enum Expr {
     Call(String, Vec<Box<Expr>>),       // user fn call (or builtin str_len): name + args
     StrLit(i64, i64),                   // read-only string literal: src byte span (start, len)
     MethodCall(Box<Expr>, String, Vec<Box<Expr>>),  // v98: recv.method(args) — STATIC (monomorphized) trait dispatch
+    ECon(i64, Vec<Box<Expr>>),                       // v107: enum constructor `Just(x)` / `Nope` — variant tag (Just=0, Nope=1) + payload args (1 for Just, 0 for Nope)
+    Match(Box<Expr>, String, Box<Expr>, Box<Expr>),  // v107: `match o { Just(b) => jbody, Nope => nbody }` — scrutinee, Just-binder, Just-body, Nope-body
 }
 enum Stmt {
     Let(String, Box<Expr>),             // immutable SSA binding (unchanged)
@@ -192,7 +194,7 @@ fn ty_tag(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>, g
 // short-circuit before it). Same logic as before: bool->2, String->3, Vec<..>->4
 // (consuming the angle-bracket args), a registered struct->100+idx, else i64 (1).
 fn ty_tag_base(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>, txt: &String) -> i64 ! { alloc } {
-    let kw_bool = "bool"; let kw_str = "String"; let kw_vec = "Vec";
+    let kw_bool = "bool"; let kw_str = "String"; let kw_vec = "Vec"; let kw_opt = "Opt";
     let base = if str_eq(txt, &kw_bool) { 2 }
                else { if str_eq(txt, &kw_str) { 3 }
                else { if str_eq(txt, &kw_vec) {
@@ -206,7 +208,16 @@ fn ty_tag_base(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDe
                    pos.i = pos.i + 1;   // '>'   (kind -1; skipped blindly)
                    4
                }
-               else { let si = struct_index(structs, txt); if si >= 0 { 100 + si } else { 1 } } } };
+               else { if str_eq(txt, &kw_opt) {
+                   // v107: `Opt < i64 >` — the fixed generic enum instance (tag 500),
+                   // lowered as a tagged struct `{ i64, i64 }`. Consume the angle-bracket
+                   // args exactly like Vec<i64> (3 blind increments; the caller does the 4th).
+                   pos.i = pos.i + 1;   // 'Opt' name
+                   pos.i = pos.i + 1;   // '<'
+                   pos.i = pos.i + 1;   // 'i64' element ident
+                   500
+               }
+               else { let si = struct_index(structs, txt); if si >= 0 { 100 + si } else { 1 } } } } };
     base
 }
 
@@ -260,7 +271,7 @@ fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SD
     }
     else { if t.kind == 1 { pos.i = pos.i + 1; parse_post(src, toks, pos, structs, Box::new(Num(t.value))) }
     else { if t.kind == 2 {
-        let txt = tok_text(src, &t); let kw_if = "if";
+        let txt = tok_text(src, &t); let kw_if = "if"; let kw_match = "match";
         if str_eq(&txt, &kw_if) {
             pos.i = pos.i + 1;
             let c = parse_expr(src, toks, pos, structs);
@@ -272,6 +283,34 @@ fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SD
             let el = parse_expr(src, toks, pos, structs);
             pos.i = pos.i + 1;                          // '}'
             parse_post(src, toks, pos, structs, Box::new(If(c, th, el)))
+        } else { if str_eq(&txt, &kw_match) {
+            // v107: `match o { Just(b) => jbody, Nope => nbody }` — a fixed 2-arm Opt
+            // match. The `=>` is TWO tokens ('=' kind 14, '>' kind -1), consumed blindly.
+            pos.i = pos.i + 1;                          // 'match'
+            let scrut = parse_expr(src, toks, pos, structs);
+            pos.i = pos.i + 1;                          // '{'
+            // --- arm 1 ---
+            let av1 = tok_text_at(src, toks, pos); pos.i = pos.i + 1;   // variant name
+            let mut ab1 = string_new();
+            if peek_kind(toks, pos) == 12 { pos.i = pos.i + 1; ab1 = tok_text_at(src, toks, pos); pos.i = pos.i + 1; pos.i = pos.i + 1; } else { let z = 0; }   // '(' binder ')'
+            pos.i = pos.i + 1;                          // '=' (kind 14)
+            pos.i = pos.i + 1;                          // '>' (kind -1)
+            let abody1 = parse_expr(src, toks, pos, structs);
+            if peek_kind(toks, pos) == 17 { pos.i = pos.i + 1; } else { let z = 0; }   // optional ','
+            // --- arm 2 ---
+            let av2 = tok_text_at(src, toks, pos); pos.i = pos.i + 1;   // variant name
+            let mut ab2 = string_new();
+            if peek_kind(toks, pos) == 12 { pos.i = pos.i + 1; ab2 = tok_text_at(src, toks, pos); pos.i = pos.i + 1; pos.i = pos.i + 1; } else { let z = 0; }
+            pos.i = pos.i + 1;                          // '='
+            pos.i = pos.i + 1;                          // '>'
+            let abody2 = parse_expr(src, toks, pos, structs);
+            if peek_kind(toks, pos) == 17 { pos.i = pos.i + 1; } else { let z = 0; }   // optional trailing ','
+            pos.i = pos.i + 1;                          // '}'
+            // order-independent: route the Just arm (binder + body) and the Nope arm
+            // into the canonical Match(scrut, just-binder, just-body, nope-body) shape.
+            let kw_just3 = "Just";
+            let m = if str_eq(&av1, &kw_just3) { Match(scrut, ab1, abody1, abody2) } else { Match(scrut, ab2, abody2, abody1) };
+            parse_post(src, toks, pos, structs, Box::new(m))
         } else {
             let si = struct_index(structs, &txt);
             if si >= 0 {
@@ -293,7 +332,7 @@ fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SD
                     parse_post(src, toks, pos, structs, Box::new(SLit(si, vals)))
                 } else { pos.i = pos.i + 1; parse_call_or_var(src, toks, pos, structs, txt) }
             } else { pos.i = pos.i + 1; parse_call_or_var(src, toks, pos, structs, txt) }
-        }
+        } }
     } else {
         pos.i = pos.i + 1;                              // '('
         let e = parse_expr(src, toks, pos, structs);
@@ -303,6 +342,19 @@ fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SD
 }
 // `name(...)` -> a Call (user fn or the str_len builtin); bare `name` -> a Var.
 fn parse_call_or_var(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>, name: String) -> Box<Expr> ! { alloc } {
+    // v107: recognize the fixed Opt enum constructors by name (as the str_len/vec_*
+    // builtins are recognized) — `Just(x)` (tag 0, one payload) and `Nope` (tag 1).
+    let kw_just = "Just"; let kw_nope = "Nope";
+    if str_eq(&name, &kw_just) {
+        pos.i = pos.i + 1;                          // '('
+        let ja = parse_expr(src, toks, pos, structs);
+        pos.i = pos.i + 1;                          // ')'
+        let mut jargs = vec_new(); vec_push(&mut jargs, ja);
+        parse_post(src, toks, pos, structs, Box::new(ECon(0, jargs)))
+    } else { if str_eq(&name, &kw_nope) {
+        let nargs = vec_new();
+        parse_post(src, toks, pos, structs, Box::new(ECon(1, nargs)))
+    } else {
     if peek_kind(toks, pos) == 12 {                 // '(' -> call
         pos.i = pos.i + 1;
         let mut args = vec_new();
@@ -318,6 +370,7 @@ fn parse_call_or_var(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &V
         pos.i = pos.i + 1;                          // ')'
         parse_post(src, toks, pos, structs, Box::new(Call(name, args)))
     } else { parse_post(src, toks, pos, structs, Box::new(Var(name))) }
+    } }
 }
 // Postfix field accesses: `.f .g ...`.
 fn parse_post(src: &String, toks: &Vec<Token>, pos: &mut Pos, structs: &Vec<SDef>, base: Box<Expr>) -> Box<Expr> ! { alloc } {
@@ -559,6 +612,35 @@ fn parse_structs(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Vec<SDef> ! 
         } else { go = false; }
     }
     out
+}
+// v107: consume any leading `enum NAME [<T>] { V(TY), V, ... }` declarations. The
+// self-hosted subset supports the single fixed generic enum `Opt<T> { Just(T), Nope }`
+// — recognized by name at use sites (exactly as the str_*/vec_* builtins are) and
+// lowered as a tagged struct `{ i64, i64 }`. We genuinely parse+consume the declaration
+// syntax here (so it is accepted, not ignored), ahead of traits/impls/fns, mirroring
+// the structs-first convention. Arbitrary enum/variant names and >2 variants are a
+// documented v107 deferral.
+fn skip_enum_decls(src: &String, toks: &Vec<Token>, pos: &mut Pos) ! { alloc } {
+    let kw_enum = "enum";
+    let mut go = true;
+    while go {
+        if at_kw(src, toks, pos, &kw_enum) == 1 {
+            pos.i = pos.i + 1;                          // 'enum'
+            pos.i = pos.i + 1;                          // NAME
+            if peek_kind(toks, pos) == 20 {            // optional '<T>'
+                pos.i = pos.i + 1;                      // '<'
+                pos.i = pos.i + 1;                      // 'T'
+                pos.i = pos.i + 1;                      // '>' (kind -1; blind skip)
+            } else { let z = 0; }
+            pos.i = pos.i + 1;                          // '{'
+            let mut g2 = true;
+            while g2 {
+                if peek_kind(toks, pos) == 19 { g2 = false; }   // '}' ends the body
+                else { pos.i = pos.i + 1; }                      // consume a body token (no nested braces)
+            }
+            pos.i = pos.i + 1;                          // '}'
+        } else { go = false; }
+    }
 }
 // v99: consume an OPTIONAL opt-in effect row `! { name, ... }` that may appear
 // after a fn's return type (before the body `{`). Returns the row as a bitset
@@ -857,6 +939,29 @@ fn type_of(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<
                 }
             } else { 0 } } else { 0 }
         },
+        ECon(tag, eargs) => {
+            // v107: `Just(x)` (tag 0) carries exactly one i64 payload; `Nope` (tag 1)
+            // carries none. Both have type Opt<i64> = tag 500. A non-i64 payload is a
+            // type error (the subset is Opt<i64> only).
+            if *tag == 0 {
+                if vec_len(eargs) == 1 { let a = vec_get(eargs, 0); if type_of(&(*a), env, structs, fns) == 1 { 500 } else { 0 } } else { 0 }
+            } else {
+                if vec_len(eargs) == 0 { 500 } else { 0 }
+            }
+        },
+        Match(scrut, jb, jbody, nbody) => {
+            // v107: the scrutinee must be an owned Opt<i64> (tag 500); the Just binder is
+            // bound to the i64 payload in a CHILD env; both arm bodies must share the same
+            // non-ref result type, which becomes the match's type. A mismatch -> 0 (error).
+            let ts = type_of(&(**scrut), env, structs, fns);
+            if ts == 500 {
+                let mut env2 = clone(env);
+                hashmap_insert(&mut env2, clone(jb), 1);
+                let tj = type_of(&(**jbody), &env2, structs, fns);
+                let tn = type_of(&(**nbody), env, structs, fns);
+                if tj == 0 { 0 } else { if tn == 0 { 0 } else { if tj == tn { if tj >= 200 { 0 } else { tj } } else { 0 } } }
+            } else { 0 }
+        },
     }
 }
 // v94: infer the concrete tag bound to `T` for a generic call — the type of the
@@ -935,6 +1040,8 @@ fn mono_structs_expr(e: &Expr, env: &HashMap<String, i64>, structs: &mut Vec<SDe
         Call(_, args) => { let na = vec_len(args); let mut i = 0; while i < na { let a = vec_get(args, i); mono_structs_expr(&(*a), env, structs, fns); i = i + 1; } },
         StrLit(_, _) => { let z = 0; },
         MethodCall(recv, _, args) => { mono_structs_expr(&(**recv), env, structs, fns); let na = vec_len(args); let mut i = 0; while i < na { let a = vec_get(args, i); mono_structs_expr(&(*a), env, structs, fns); i = i + 1; } },
+        ECon(_, eargs) => { let na = vec_len(eargs); let mut i = 0; while i < na { let a = vec_get(eargs, i); mono_structs_expr(&(*a), env, structs, fns); i = i + 1; } },
+        Match(scrut, _, jbody, nbody) => { mono_structs_expr(&(**scrut), env, structs, fns); mono_structs_expr(&(**jbody), env, structs, fns); mono_structs_expr(&(**nbody), env, structs, fns); },
     }
 }
 fn mono_structs_stmts(stmts: &Vec<Stmt>, env: &mut HashMap<String, i64>, structs: &mut Vec<SDef>, fns: &Vec<Fn>) ! { alloc } {
@@ -1006,6 +1113,8 @@ fn mono_fns_expr(e: &Expr, env: &HashMap<String, i64>, structs: &Vec<SDef>, fns:
             let na = vec_len(args); let mut i = 0;
             while i < na { let a = vec_get(args, i); mono_fns_expr(&(*a), env, structs, fns, reqs); i = i + 1; }
         },
+        ECon(_, eargs) => { let na = vec_len(eargs); let mut i = 0; while i < na { let a = vec_get(eargs, i); mono_fns_expr(&(*a), env, structs, fns, reqs); i = i + 1; } },
+        Match(scrut, _, jbody, nbody) => { mono_fns_expr(&(**scrut), env, structs, fns, reqs); mono_fns_expr(&(**jbody), env, structs, fns, reqs); mono_fns_expr(&(**nbody), env, structs, fns, reqs); },
     }
 }
 fn mono_fns_stmts(stmts: &Vec<Stmt>, env: &mut HashMap<String, i64>, structs: &Vec<SDef>, fns: &Vec<Fn>, reqs: &mut Vec<MonoReq>) ! { alloc } {
@@ -1110,7 +1219,8 @@ fn app(buf: &mut String, s: String) ! { alloc } { string_push_str(buf, s); }
 // "{ ptr, i64, i64 }" (the host's {data,len,cap}), struct -> "{ i64, ... }",
 // any reference (tag >= 200) -> "ptr" (opaque pointer, what the host emits for &T).
 fn ty_llvm(ty: i64, structs: &Vec<SDef>) -> String ! { alloc } {
-    if ty >= 200 { let p = "ptr"; clone(&p) }
+    if ty == 500 { let s = "{ i64, i64 }"; clone(&s) }   // v107: Opt<i64> = tagged struct { i64 tag, i64 payload } (checked FIRST: 500 >= 200 would mis-hit ptr)
+    else { if ty >= 200 { let p = "ptr"; clone(&p) }
     else { if ty == 3 { let s = "{ ptr, i64, i64 }"; clone(&s) }
     else { if ty == 4 { let s = "{ ptr, i64, i64 }"; clone(&s) }   // Vec<i64> = {data,len,cap}
     else { if ty < 100 { let s = "i64"; clone(&s) }
@@ -1127,7 +1237,7 @@ fn ty_llvm(ty: i64, structs: &Vec<SDef>) -> String ! { alloc } {
         }
         let close = " }"; app(&mut out, clone(&close));
         out
-    } } } }
+    } } } } }
 }
 
 // Lower one expression; append instructions; return its value (operand + type).
@@ -1429,6 +1539,47 @@ fn lower(e: &Expr, oenv: &HashMap<String, String>, tenv: &HashMap<String, i64>, 
             app(buf, ")\n");
             Val { op: reg(r), ty: g.ret }
         },
+        ECon(tag, eargs) => {
+            // v107: build the tagged struct { i64 tag, i64 payload }. Just(x) = {0, x};
+            // Nope = {1, undef}. Mirrors SLit's insertvalue chain (payload lowered first).
+            if *tag == 0 {
+                let a = vec_get(eargs, 0);
+                let va = lower(&(*a), oenv, tenv, menv, structs, fns, c, buf);
+                let r0 = fresh(c);
+                app(buf, "  "); app(buf, reg(r0)); app(buf, " = insertvalue { i64, i64 } undef, i64 0, 0\n");
+                let r1 = fresh(c);
+                app(buf, "  "); app(buf, reg(r1)); app(buf, " = insertvalue { i64, i64 } "); app(buf, reg(r0)); app(buf, ", i64 "); app(buf, va.op); app(buf, ", 1\n");
+                Val { op: reg(r1), ty: 500 }
+            } else {
+                let r0 = fresh(c);
+                app(buf, "  "); app(buf, reg(r0)); app(buf, " = insertvalue { i64, i64 } undef, i64 1, 0\n");
+                Val { op: reg(r0), ty: 500 }
+            }
+        },
+        Match(scrut, jb, jbody, nbody) => {
+            // v107: lower the scrutinee (an Opt<i64> value), extract tag (field 0) and
+            // payload (field 1); bind the Just binder to the payload in CHILD env copies;
+            // lower BOTH arm bodies; `select` on tag==0. Mirrors If's select form — so
+            // match/if expressions emit NO branches (single basic block), and nested
+            // matches compose. (Side-effecting arms would need branch+phi: deferred.)
+            let vs = lower(&(**scrut), oenv, tenv, menv, structs, fns, c, buf);
+            let so = vs.op;
+            let tgr = fresh(c);
+            app(buf, "  "); app(buf, reg(tgr)); app(buf, " = extractvalue { i64, i64 } "); app(buf, clone(&so)); app(buf, ", 0\n");
+            let plr = fresh(c);
+            app(buf, "  "); app(buf, reg(plr)); app(buf, " = extractvalue { i64, i64 } "); app(buf, so); app(buf, ", 1\n");
+            let mut oenv2 = clone(oenv); let mut tenv2 = clone(tenv);
+            hashmap_insert(&mut oenv2, clone(jb), reg(plr));
+            hashmap_insert(&mut tenv2, clone(jb), 1);
+            let vj = lower(&(**jbody), &oenv2, &tenv2, menv, structs, fns, c, buf);
+            let vn = lower(&(**nbody), oenv, tenv, menv, structs, fns, c, buf);
+            let ci = fresh(c);
+            app(buf, "  "); app(buf, reg(ci)); app(buf, " = icmp eq i64 "); app(buf, reg(tgr)); app(buf, ", 0\n");
+            let bt = ty_llvm(vj.ty, structs);
+            let r = fresh(c);
+            app(buf, "  "); app(buf, reg(r)); app(buf, " = select i1 "); app(buf, reg(ci)); app(buf, ", "); app(buf, clone(&bt)); app(buf, " "); app(buf, vj.op); app(buf, ", "); app(buf, bt); app(buf, " "); app(buf, vn.op); app(buf, "\n");
+            Val { op: reg(r), ty: vj.ty }
+        },
     }
 }
 
@@ -1452,6 +1603,8 @@ fn collect_strs(e: &Expr, src: &String, pre: &mut String) ! { alloc } {
             app(pre, " x i8] c\""); app(pre, bytes); app(pre, "\\00\"\n");   // MVP: literals are plain ASCII (no \\ or ")
         },
         MethodCall(recv, _, args) => { collect_strs(&(**recv), src, pre); let na = vec_len(args); let mut i = 0; while i < na { let a = vec_get(args, i); collect_strs(&(*a), src, pre); i = i + 1; } },
+        ECon(_, eargs) => { let na = vec_len(eargs); let mut i = 0; while i < na { let a = vec_get(eargs, i); collect_strs(&(*a), src, pre); i = i + 1; } },
+        Match(scrut, _, jbody, nbody) => { collect_strs(&(**scrut), src, pre); collect_strs(&(**jbody), src, pre); collect_strs(&(**nbody), src, pre); },
     }
 }
 fn collect_strs_stmts(stmts: &Vec<Stmt>, src: &String, pre: &mut String) ! { alloc } {
@@ -1507,6 +1660,8 @@ fn expr_uses_rt(e: &Expr, kind: i64) -> i64 ! { alloc } {
                 while i < na { let a = vec_get(args, i); f = if expr_uses_rt(&(*a), kind) == 1 { 1 } else { f }; i = i + 1; } f
             }
         },
+        ECon(_, eargs) => { let na = vec_len(eargs); let mut i = 0; let mut f = 0; while i < na { let a = vec_get(eargs, i); f = if expr_uses_rt(&(*a), kind) == 1 { 1 } else { f }; i = i + 1; } f },
+        Match(scrut, _, jbody, nbody) => { if expr_uses_rt(&(**scrut), kind) == 1 { 1 } else { if expr_uses_rt(&(**jbody), kind) == 1 { 1 } else { expr_uses_rt(&(**nbody), kind) } } },
     }
 }
 fn stmts_use_rt(stmts: &Vec<Stmt>, kind: i64) -> i64 ! { alloc } {
@@ -1596,6 +1751,8 @@ fn is_str_concat(e: &Expr) -> i64 ! { alloc } {
         Ref(_) => 0,
         StrLit(_, _) => 0,
         MethodCall(_, _, _) => 0,
+        ECon(_, _) => 0,
+        Match(_, _, _, _) => 0,
     }
 }
 
@@ -1808,6 +1965,8 @@ fn main() -> i64 ! { io, alloc } {
     let toks = lex(&src);
     let mut pos = Pos { i: 0 };
     let mut structs = parse_structs(&src, &toks, &mut pos);
+    // v107: consume any enum declarations (the fixed Opt<T> shape) right after structs.
+    skip_enum_decls(&src, &toks, &mut pos);
     // v98: parse trait declarations (signatures only — consumed) then impl blocks,
     // BEFORE the fns loop. Each impl method is registered into `fns` under a mangled
     // `StructName_method` name, so the existing emit_fn loop emits it and the static
