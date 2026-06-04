@@ -2067,6 +2067,30 @@ sh_test(
     ],
 )
 
+# v99: self-hosted opt-in effect rows (`! { alloc }` / `! { io }`) parse + propagate
+# in the subset; codegen-inert (byte-identical to a row-free fn). Differential self==host.
+sh_test(
+    name = "smoke_test_selfhost_effects",
+    srcs = ["smoke_test_selfhost_effects.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:structgen.kd",
+    ],
+)
+
+# v99: bootstrap fixed-point CANDIDATE — determinism/idempotence + a per-feature
+# in-subset corpus, each deterministic + self==host. Honestly NOT a self-compile
+# (structgen is a subset emitter; the full-tree bootstrap is tracked in
+# docs/bootstrap-status.md).
+sh_test(
+    name = "smoke_test_bootstrap",
+    srcs = ["smoke_test_bootstrap.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:structgen.kd",
+    ],
+)
+
 # v95: permanent perf-regression gate over bench/*.kd. Deterministic structural
 # IR-greps (fib 0-allocas, loop 0-allocas + vectorized) BLOCK; a generous best-of-5
 # wall-time check is advisory/skippable (never flakes CI).

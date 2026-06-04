@@ -18,6 +18,45 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.99.0] — Self-hosting: effect rows + an honest bootstrap candidate + ledger
+
+The self-hosted compiler gains opt-in **effect rows**, and the arc gets its honest
+**bootstrap accounting**. Empirical probing confirmed: effect rows genuinely
+failed in the subset (no `!` token), determinism already holds, and structgen
+genuinely cannot self-compile (it is a single-`fn f` subset emitter — feeding it a
+real `examples/selfhost/*.kd` segfaults). So v99 ships the genuine increment, not
+a faked self-compile.
+
+### Added (self-hosted emitter)
+- **Opt-in effect rows** `! { alloc }` / `! { io }` / `! { io, alloc }` — the lexer
+  gained `!` (token kind 27); `parse_fn`/`parse_impl_method` consume an optional row
+  after the return type; a new `effects: i64` bitset field on the `Fn` record
+  **propagates** it (1 = alloc, 2 = io). Codegen ignores it, so a row-free fn emits
+  **byte-identical** IR (matching the host's opt-in default). Before v99, any
+  effectful program emitted `; TYPE ERROR`.
+
+### Added (bootstrap accounting)
+- **`docs/bootstrap-status.md`** — the honest, file-by-file ledger of all 18
+  `examples/selfhost/*.kd`: in-subset vs blocked, the first blocking feature for
+  each (`Box`/`Option`/`HashMap`/library-shape), and the explicit remaining gap to
+  a full bootstrap. Turns the XL bootstrap into a tracked contract.
+- **`tests/smoke_test_bootstrap.sh`** — the bootstrap fixed-point **candidate**,
+  named honestly: **NOT** a self-compile (impossible on a subset emitter), but the
+  two bootstrap-necessary properties that hold — **determinism/idempotence** (a
+  fixed program → byte-identical IR across runs) and **corpus self-application** (a
+  10-program corpus, one per shipped self-hosting feature, each deterministic AND
+  `self == host`).
+- **`tests/smoke_test_selfhost_effects.sh`** — effect rows parse + run `self ==
+  host`, a row vs row-free byte-identity assertion, and a no-false-`TYPE ERROR`
+  regression guard.
+
+### Deferred (honest, named per-file in `docs/bootstrap-status.md`)
+- The **full-tree fixed-point** (structgen compiling the real library-shaped files
+  / its own source) — blocked by `Box<T>`, `Option`/`Result` + `match`, `HashMap`
+  codegen, multi-param generics, closures, `dyn`, and modules.
+- **Effect enforcement** in the subset (v99 ships parse + propagate, not strict
+  checking — matching the host's opt-in default).
+
 ## [0.98.0] — Self-hosting: static trait dispatch in the self-hosted emitter
 
 The self-hosted compiler (`examples/selfhost/structgen.kd`) gains **static
