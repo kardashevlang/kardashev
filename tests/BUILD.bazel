@@ -2149,6 +2149,19 @@ sh_test(
     ],
 )
 
+# v107: self-hosted ENUM + MATCH — the self-hosted compiler parses a fixed generic
+# `Opt<T> { Just(T), Nope }` + value-producing `match`, lowering an enum value to a
+# tagged struct `{ i64, i64 }` (insertvalue) and the match to extractvalue + select.
+# Differential self == host; byte-identical for no-enum programs (R0).
+sh_test(
+    name = "smoke_test_selfhost_enum_match",
+    srcs = ["smoke_test_selfhost_enum_match.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:structgen.kd",
+    ],
+)
+
 # v99: self-hosted opt-in effect rows (`! { alloc }` / `! { io }`) parse + propagate
 # in the subset; codegen-inert (byte-identical to a row-free fn). Differential self==host.
 sh_test(

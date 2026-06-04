@@ -18,6 +18,36 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.107.0] — Self-hosted enum + match (opens ARC C)
+
+The self-hosted LLVM-IR compiler (`examples/selfhost/structgen.kd`) gains a real
+generic enum + `match` lowering — the next bootstrap rung. Research workflow
+`w9sa01eh6` probed the live host to fix the target IR shape; implemented + verified
+in-session.
+
+### Added
+- **`Opt<T> { Just(T), Nope }` in the self-hosted subset** — recognized by name
+  (`Opt`/`Just`/`Nope`/`match`) exactly as the `str_*`/`vec_*` builtins are; the
+  declaration is genuinely parsed + consumed (`skip_enum_decls`). An enum value is a
+  tagged struct `{ i64 tag, i64 payload }` (type tag 500), passed by value like a
+  struct; `o: Opt<i64>` params resolve to it.
+- **Constructors** `Just(x)` → `insertvalue {0, x}`, `Nope` → `{1, undef}` (mirrors
+  the struct-literal lowering).
+- **`match o { Just(b) => .., Nope => .. }`** — a new `Expr` variant lowered as
+  `extractvalue` (tag + payload) + the Just binder bound to the payload in a child
+  env + `select` on `tag == 0`. The `select` form mirrors the If-as-value lowering, so
+  match/if expressions emit no branches (single basic block) and compose, even nested.
+- **`tests/smoke_test_selfhost_enum_match.sh`** — differential self == host gate (12
+  checks: R0 byte-identity, just/nope paths, both-arms, arm-order independence,
+  binder-in-expr, inferred let-bound enum, mismatched-arm + wrong-payload negatives).
+
+### Deferred (honest)
+- Arbitrary enum/variant names + >2 variants (the recognizer is keyed to the fixed
+  `Opt` shape — like v94's single-`T` generics start); single i64 payload only
+  (multi-payload / non-i64 / struct payloads); `match &o` (scrutinee must be owned);
+  side-effecting arms (would need branch+phi instead of `select`); `let` type
+  annotations (a separate pre-existing structgen limitation — bindings infer the type).
+
 ## [0.106.0] — Codegen: tail-call + bounds-elision locked (closes ARC B)
 
 **Lock-only** (the v95 pattern): live probing proved the default `-O2` build
