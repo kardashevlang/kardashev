@@ -18,6 +18,28 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.123.0] — Cross-compilation
+
+Completes the numbered Gen-2 roadmap (v0.112 – v0.123).
+
+### Added
+- **`kard build FILE -target <TRIPLE>`** cross-compiles via clang's
+  `--target=`; **`-c` / `--emit obj`** emits an object file (skipping the link
+  step); **`kard targets`** lists common triples.
+- `backend::BuildOptions { target, object_only }`, threaded into `cc_build`.
+
+### Honest limitation
+Because the runtime uses libc (`<stdio.h>`/`<stdlib.h>`/`<stdint.h>`), foreign
+targets need that target's C headers/sysroot installed — even for `-c`. The
+**host triple builds and runs out of the box** (and multi-arch SDKs like macOS
+x86_64 ↔ arm64 work); other triples require the target toolchain. **Bundling
+cross sysroots** (Zig's "cross-compile anything out of the box") is the headline
+remaining work — the `-target`/`-c`/`targets` *mechanism* is complete, the
+bundled sysroots are not yet. CI smoke-tests `kard targets` and a `-target`
+host-triple build end to end.
+
+- 485 unit + 21 e2e tests.
+
 ## [0.122.0] — The build graph (`build.ks`)
 
 ### Added

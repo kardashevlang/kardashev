@@ -115,14 +115,28 @@ A `build.ks` describing a graph of one or more named executable targets
 model (a kardashev program with a `build(*Builder)` entry point, step
 dependencies and install artifacts) remains a future item.
 
-### v0.123.0 — First-class cross-compilation
-`kard build -target <triple>` producing binaries for foreign targets out of the
-box (bundled/located cross C toolchains), the way `zig build` cross-compiles
-trivially.
+### v0.123.0 — Cross-compilation (the mechanism) ✅
+`kard build -target <triple>` (via clang `--target=`), `-c`/`--emit obj` object
+output, and `kard targets`. The host triple builds + runs out of the box.
+**Honest limitation:** because the runtime uses libc, foreign-target builds need
+that target's C headers/sysroot installed — **bundling cross sysroots** (Zig's
+"cross-compile anything out of the box") is the headline remaining work, now
+tracked under *Beyond*. The compiler-side mechanism is complete.
+
+---
+
+🏁 **The numbered roadmap (v0.112 – v0.123) is complete.** Only the open-ended
+*Beyond* items remain (each a multi-session effort).
 
 ### Beyond
-Re-self-hosting (the compiler in kardashev), a package registry, an LSP +
-formatter parity pass, and a mechanized spec → 1.0 stability commitment.
+**Bundled cross-compilation sysroots** (Zig's "cross-compile anything out of the
+box" — ship/locate target libc + headers so `-target` produces foreign binaries
+with no host setup); the full imperative `build.zig` build graph; tagged unions
+`union(enum)` + payload capture; `errdefer` / `catch |e|` capture / named error
+sets; a standard prelude built on the allocator; generic structs /
+type-returning functions; re-self-hosting (the compiler in kardashev); a package
+registry; an LSP + formatter-parity pass; and a mechanized spec → 1.0 stability
+commitment.
 
 ---
 
