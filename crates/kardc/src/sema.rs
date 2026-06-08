@@ -67,6 +67,8 @@
 //! - `E0251` — a type argument to a generic-function call that does not name a
 //!   concrete type (SPEC §17.2).
 //! - `E0252` — too few type arguments for a generic-function call (SPEC §17.2).
+//! - `E0260` — an un-annotated `var`/`const` whose initializer's type cannot be
+//!   inferred without context (a bare `null` / `error.X` / `.Variant`) (§18.2).
 
 use std::collections::{HashMap, HashSet};
 
@@ -348,14 +350,25 @@ impl Checker {
         // Pass 2: fold top-level consts in source order.
         for item in &m.items {
             if let Item::Const(c) = item {
-                let declared = self.resolve_type_opt(&c.ty);
-                if declared.is_none() {
-                    self.error(
-                        c.ty.span,
-                        "E0100",
-                        format!("unknown type `{}`", c.ty.name),
-                    );
-                }
+                // The type annotation is optional (v0.121, SPEC §18.2). When
+                // present it is resolved (`E0100` for an unknown type name) and
+                // type-checked against the folded value below. When absent the
+                // binding's type is *inferred* from the comptime value
+                // (`Int => i64`, `Bool => bool`) — see the `unwrap_or` below.
+                let declared = match &c.ty {
+                    Some(te) => {
+                        let d = self.resolve_type_opt(te);
+                        if d.is_none() {
+                            self.error(
+                                te.span,
+                                "E0100",
+                                format!("unknown type `{}`", te.name),
+                            );
+                        }
+                        d
+                    }
+                    None => None,
+                };
                 match const_eval::eval(&c.value, &self.consts) {
                     Ok(val) => {
                         if let Some(dt) = declared {
@@ -644,23 +657,54 @@ impl Checker {
                 value,
                 ..
             } => {
-                let declared = self.resolve_type(ty);
-                // An initializer is a statement-level position, so a top-level
-                // `try` is allowed (SPEC §12.1). Otherwise, with a known
-                // annotation, apply optional / error-union coercion (§11.2,
-                // §12.2): a `T` value, `null`, or `error.X` widens to `?T`/`!T`.
-                let vt = self.check_value_with_try(value, declared);
-                if let (Some(dt), Some(vt)) = (declared, vt) {
-                    if dt != vt {
-                        let msg = format!(
-                            "initializer type mismatch: expected `{}`, found `{}`",
-                            self.type_name(dt),
-                            self.type_name(vt)
-                        );
-                        self.error(value.span(), "E0110", msg);
+                let bind_ty = match ty {
+                    // Annotated binding (unchanged from earlier versions): resolve
+                    // the annotation (`E0100` for an unknown name), then check the
+                    // initializer coerces to it (`E0110` on a mismatch). An
+                    // initializer is a statement-level position, so a top-level
+                    // `try` is allowed (SPEC §12.1); otherwise optional /
+                    // error-union coercion (§11.2, §12.2) lets a `T` value, `null`,
+                    // or `error.X` widen to `?T`/`!T`.
+                    Some(te) => {
+                        let declared = self.resolve_type(te);
+                        let vt = self.check_value_with_try(value, declared);
+                        if let (Some(dt), Some(vt)) = (declared, vt) {
+                            if dt != vt {
+                                let msg = format!(
+                                    "initializer type mismatch: expected `{}`, found `{}`",
+                                    self.type_name(dt),
+                                    self.type_name(vt)
+                                );
+                                self.error(value.span(), "E0110", msg);
+                            }
+                        }
+                        declared.unwrap_or(Type::I64)
                     }
-                }
-                let bind_ty = declared.unwrap_or(Type::I64);
+                    // Inferred binding (v0.121, SPEC §18.2): the binding's type is
+                    // the initializer's type, checked with *no* expected type (an
+                    // integer literal therefore defaults to `i64`). A value whose
+                    // type needs context to be known — a bare `null`, an
+                    // `error.X`, or an unqualified `.Variant` — is `E0260`.
+                    None => {
+                        if needs_inference_context(value) {
+                            self.error(
+                                value.span(),
+                                "E0260",
+                                "cannot infer type; add an annotation",
+                            );
+                            // Fall back to `i64` so dependent statements still
+                            // check; the missing-annotation error is enough.
+                            Type::I64
+                        } else {
+                            // `check_value_with_try` also yields the payload of a
+                            // top-level `try` initializer. `None` here means the
+                            // initializer already reported its own error; fall back
+                            // to `i64` to avoid cascading diagnostics.
+                            self.check_value_with_try(value, None)
+                                .unwrap_or(Type::I64)
+                        }
+                    }
+                };
                 self.define(name, bind_ty, *is_const);
             }
             Stmt::Assign { name, value, span } => match self.lookup(name) {
@@ -2651,6 +2695,22 @@ fn is_type_kw(te: &TypeExpr) -> bool {
         && !te.slice
 }
 
+/// Whether `e` is a value whose type cannot be inferred without a contextual
+/// expectation (SPEC §18.2), so an *un-annotated* `var`/`const` binding of it is
+/// `E0260` ("cannot infer type; add an annotation"). These are exactly the
+/// literals whose [`check_expr`] type comes solely from the expected type at
+/// their position: a bare `null` ([`Expr::Null`]), an `error.X`
+/// ([`Expr::ErrorLit`]), and an unqualified `.Variant` ([`Expr::EnumLit`]).
+///
+/// An array literal `[N]T{ … }` is **not** included: it always carries its
+/// element type `T` (and length `N`), so its type is inferable even when empty.
+fn needs_inference_context(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Null { .. } | Expr::ErrorLit { .. } | Expr::EnumLit { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2760,7 +2820,7 @@ mod tests {
         Stmt::Let {
             is_const: false,
             name: name.into(),
-            ty: te_ptr(elem),
+            ty: Some(te_ptr(elem)),
             value,
             span: sp(),
         }
@@ -2770,7 +2830,7 @@ mod tests {
         Stmt::Let {
             is_const: false,
             name: name.into(),
-            ty: te_slice(elem),
+            ty: Some(te_slice(elem)),
             value,
             span: sp(),
         }
@@ -2805,7 +2865,7 @@ mod tests {
         Stmt::Let {
             is_const: false,
             name: name.into(),
-            ty: te_arr(elem, len),
+            ty: Some(te_arr(elem, len)),
             value,
             span: sp(),
         }
@@ -2869,7 +2929,7 @@ mod tests {
         Stmt::Let {
             is_const: false,
             name: name.into(),
-            ty: te_opt(inner),
+            ty: Some(te_opt(inner)),
             value,
             span: sp(),
         }
@@ -2962,7 +3022,18 @@ mod tests {
         Item::Const(ConstDecl {
             is_pub: false,
             name: name.into(),
-            ty: te(ty),
+            ty: Some(te(ty)),
+            value,
+            span: sp(),
+        })
+    }
+    /// A top-level `const NAME = value;` with **no** annotation (v0.121); the
+    /// type is inferred from the comptime value.
+    fn const_item_infer(name: &str, value: Expr) -> Item {
+        Item::Const(ConstDecl {
+            is_pub: false,
+            name: name.into(),
+            ty: None,
             value,
             span: sp(),
         })
@@ -3043,7 +3114,7 @@ mod tests {
         Stmt::Let {
             is_const: false,
             name: name.into(),
-            ty: te(ty),
+            ty: Some(te(ty)),
             value,
             span: sp(),
         }
@@ -3052,7 +3123,27 @@ mod tests {
         Stmt::Let {
             is_const: true,
             name: name.into(),
-            ty: te(ty),
+            ty: Some(te(ty)),
+            value,
+            span: sp(),
+        }
+    }
+    /// `var name = value;` — an *inferred* local (no annotation, v0.121).
+    fn let_var_infer(name: &str, value: Expr) -> Stmt {
+        Stmt::Let {
+            is_const: false,
+            name: name.into(),
+            ty: None,
+            value,
+            span: sp(),
+        }
+    }
+    /// `const name = value;` — an *inferred* local `const` (no annotation, v0.121).
+    fn let_const_infer(name: &str, value: Expr) -> Stmt {
+        Stmt::Let {
+            is_const: true,
+            name: name.into(),
+            ty: None,
             value,
             span: sp(),
         }
@@ -5691,5 +5782,325 @@ mod tests {
             ),
         ];
         assert!(codes(items).contains(&"E0110"));
+    }
+
+    // ---- v0.121: type inference for `var`/`const` (SPEC §18) ---------------
+
+    #[test]
+    fn inferred_var_int_defaults_to_i64_and_is_usable() {
+        // fn main() void { var x = 5; print(x); }  — `x` infers `i64`.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_infer("x", int(5)),
+                Stmt::Expr(call("print", vec![ident("x")])),
+            ],
+        )];
+        assert!(codes(items).is_empty());
+    }
+
+    #[test]
+    fn inferred_var_int_is_concretely_i64() {
+        // A bare integer literal with no annotation infers `i64` (§18.2), so
+        // re-binding it to an `i64` is fine but to an `i32` is a mismatch.
+        // fn main() void { var x = 5; var y: i64 = x; var z: i32 = x; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_infer("x", int(5)),
+                let_var("y", "i64", ident("x")),
+                let_var("z", "i32", ident("x")),
+            ],
+        )];
+        // Only the `i32` re-binding mismatches (`i64` -> `i32`).
+        assert_eq!(codes(items), vec!["E0110"]);
+    }
+
+    #[test]
+    fn annotated_var_still_respects_annotation() {
+        // `var x: i32 = 5;` still binds `i32` (annotation path unchanged), so a
+        // later `var y: i64 = x;` is a mismatch.
+        // fn main() void { var x: i32 = 5; var y: i64 = x; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("x", "i32", int(5)),
+                let_var("y", "i64", ident("x")),
+            ],
+        )];
+        assert_eq!(codes(items), vec!["E0110"]);
+    }
+
+    #[test]
+    fn inferred_binding_used_in_arithmetic() {
+        // fn main() void { var x = 5; var y = x + 1; var z: i64 = y; print(z); }
+        // `x` and `y` both infer `i64`, so the arithmetic and the `i64`
+        // re-binding all type-check.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_infer("x", int(5)),
+                let_var_infer("y", bin(BinOp::Add, ident("x"), int(1))),
+                let_var("z", "i64", ident("y")),
+                Stmt::Expr(call("print", vec![ident("z")])),
+            ],
+        )];
+        assert!(codes(items).is_empty());
+    }
+
+    #[test]
+    fn inferred_bool_binding() {
+        // fn main() void { var b = true; var c: bool = b; var d: i64 = b; }
+        // `b` infers `bool`: the `bool` re-binding is fine, the `i64` one is not.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_infer("b", boolean(true)),
+                let_var("c", "bool", ident("b")),
+                let_var("d", "i64", ident("b")),
+            ],
+        )];
+        assert_eq!(codes(items), vec!["E0110"]);
+    }
+
+    #[test]
+    fn inferred_local_const_is_immutable() {
+        // An inferred local `const` keeps its `is_const` flag, so assigning to
+        // it is rejected (E0110, "cannot assign to immutable binding").
+        // fn main() void { const x = 5; x = 6; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_const_infer("x", int(5)), assign("x", int(6))],
+        )];
+        assert_eq!(codes(items), vec!["E0110"]);
+    }
+
+    #[test]
+    fn inferred_from_call_result() {
+        // fn id(a: i32) i32 { return a; }
+        // fn main() void { var x = id(0); var y: i32 = x; var z: i64 = x; }
+        // `x` infers the call's return type `i32`.
+        let items = vec![
+            func(
+                "id",
+                vec![param("a", "i32")],
+                "i32",
+                vec![ret(Some(ident("a")))],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var_infer("x", call("id", vec![int(0)])),
+                    let_var("y", "i32", ident("x")),
+                    let_var("z", "i64", ident("x")),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), vec!["E0110"]);
+    }
+
+    #[test]
+    fn inferred_from_struct_literal() {
+        // const Point = struct { x: i32, y: i32 };
+        // fn main() void { var p = Point{ .x = 1, .y = 2 }; var q: Point = p; print(p.x); }
+        // `p` infers `Point`, so the `Point` re-binding and field access type-check.
+        let items = vec![
+            struct_item("Point", vec![("x", "i32"), ("y", "i32")]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var_infer("p", struct_lit("Point", vec![("x", int(1)), ("y", int(2))])),
+                    let_var("q", "Point", ident("p")),
+                    Stmt::Expr(call("print", vec![field(ident("p"), "x")])),
+                ],
+            ),
+        ];
+        assert!(codes(items).is_empty());
+    }
+
+    #[test]
+    fn inferred_top_level_const_int() {
+        // const Z = 7;
+        // fn main() void { var x: i64 = Z; print(x); }
+        // `Z` infers `i64` from its comptime value (§18.2).
+        let items = vec![
+            const_item_infer("Z", int(7)),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("x", "i64", ident("Z")),
+                    Stmt::Expr(call("print", vec![ident("x")])),
+                ],
+            ),
+        ];
+        assert!(codes(items).is_empty());
+    }
+
+    #[test]
+    fn inferred_top_level_const_int_is_i64_not_i32() {
+        // const Z = 7;  fn main() void { var x: i32 = Z; }
+        // The inferred const is `i64`, so re-binding it to `i32` is a mismatch.
+        let items = vec![
+            const_item_infer("Z", int(7)),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("x", "i32", ident("Z"))],
+            ),
+        ];
+        assert_eq!(codes(items), vec!["E0110"]);
+    }
+
+    #[test]
+    fn inferred_top_level_const_bool() {
+        // const FLAG = true;  fn main() void { var b: bool = FLAG; }
+        let items = vec![
+            const_item_infer("FLAG", boolean(true)),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("b", "bool", ident("FLAG"))],
+            ),
+        ];
+        assert!(codes(items).is_empty());
+    }
+
+    #[test]
+    fn inferred_top_level_const_usable_in_other_const() {
+        // const A = 2;  const B = A + 3;  fn main() void { var x: i64 = B; }
+        // An inferred top-level const folds and is referable by later consts.
+        let items = vec![
+            const_item_infer("A", int(2)),
+            const_item_infer("B", bin(BinOp::Add, ident("A"), int(3))),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("x", "i64", ident("B"))],
+            ),
+        ];
+        assert!(codes(items).is_empty());
+    }
+
+    #[test]
+    fn inferred_var_null_is_e0260() {
+        // fn main() void { var x = null; }  — `null` has no inferable type (§18.2).
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_infer("x", null_lit())],
+        )];
+        // Exactly E0260 — not also E0180 (the no-context-null error is suppressed
+        // in favour of the missing-annotation message).
+        assert_eq!(codes(items), vec!["E0260"]);
+    }
+
+    #[test]
+    fn inferred_var_error_lit_is_e0260() {
+        // fn main() void { var x = error.Boom; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_infer("x", error_lit("Boom"))],
+        )];
+        assert_eq!(codes(items), vec!["E0260"]);
+    }
+
+    #[test]
+    fn inferred_var_unqualified_enum_lit_is_e0260() {
+        // const Color = enum { Red, Green };
+        // fn main() void { var x = .Red; }  — `.Red` needs an enum context.
+        let items = vec![
+            Item::Enum(EnumDecl {
+                is_pub: false,
+                name: "Color".into(),
+                variants: vec!["Red".into(), "Green".into()],
+                span: sp(),
+            }),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var_infer("x", Expr::EnumLit {
+                    variant: "Red".into(),
+                    span: sp(),
+                })],
+            ),
+        ];
+        assert_eq!(codes(items), vec!["E0260"]);
+    }
+
+    #[test]
+    fn inferred_const_null_is_e0260() {
+        // An inferred local `const` of `null` is also E0260.
+        // fn main() void { const x = null; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_const_infer("x", null_lit())],
+        )];
+        assert_eq!(codes(items), vec!["E0260"]);
+    }
+
+    #[test]
+    fn inferred_var_from_qualified_enum_lit() {
+        // A *qualified* enum literal carries its enum type, so it is inferable.
+        // const Color = enum { Red, Green };
+        // fn main() void { var c = Color.Red; var d: Color = c; }
+        let items = vec![
+            Item::Enum(EnumDecl {
+                is_pub: false,
+                name: "Color".into(),
+                variants: vec!["Red".into(), "Green".into()],
+                span: sp(),
+            }),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var_infer("c", field(ident("Color"), "Red")),
+                    let_var("d", "Color", ident("c")),
+                ],
+            ),
+        ];
+        assert!(codes(items).is_empty());
+    }
+
+    #[test]
+    fn inferred_var_does_not_mask_real_error() {
+        // An inferred binding off an unknown name reports just that error
+        // (E0100), not also E0260 — the value's error is already surfaced.
+        // fn main() void { var x = bogus; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_infer("x", ident("bogus"))],
+        )];
+        assert_eq!(codes(items), vec!["E0100"]);
     }
 }

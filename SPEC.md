@@ -699,6 +699,33 @@ Comptime **value** parameters (`comptime n: usize`), generic structs /
 type-returning functions (`fn List(comptime T: type) type`), comptime control
 flow, and `anytype`.
 
+## 18. Type inference for `var`/`const` (v0.121)
+
+The type annotation on a binding becomes **optional**: `var x = expr;` /
+`const x = expr;` (and top-level `const X = expr;`) infer the type from `expr`.
+`Stmt::Let.ty` and `ConstDecl.ty` are now `Option<TypeExpr>`.
+
+### 18.1 Syntax
+`("var" | "const") IDENT (":" type)? "=" expr ";"`. A top-level `const IDENT =
+expr ;` with no annotation is an inferred value binding **unless** `expr` begins
+with `struct`/`enum` (those remain type declarations, §9/§13).
+
+### 18.2 Semantics (`sema`)
+- Annotation present → unchanged: check `expr` coerces to the annotated type.
+- Annotation absent → the binding's type is the **inferred** type of `expr`
+  (checked with no expected type; an integer literal defaults to `i64`). A value
+  with no inferable type without context — bare `null`, `error.X`, `.Variant`,
+  or an empty array literal — is `E0260` ("cannot infer type; add an
+  annotation"). Top-level inferred `const` infers from the comptime value
+  (`i64`/`bool`).
+
+### 18.3 Backend (`emit_c`)
+For an inferred binding, the C declaration type is `cty(type_of_expr(value))`;
+for an annotated binding, unchanged. Everything else (initializer emission,
+coercion) is as before.
+
+`kard fmt` omits the `: T` when a binding has no annotation.
+
 ### 13.3 Backend (`emit_c`)
 Emit each enum among the dependency-ordered type defs (enums have no
 dependencies):
