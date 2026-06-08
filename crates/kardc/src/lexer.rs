@@ -167,6 +167,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diagnostic>> {
             b'=' => {
                 if next == Some(b'=') {
                     (TokenKind::EqEq, 2)
+                } else if next == Some(b'>') {
+                    (TokenKind::FatArrow, 2)
                 } else {
                     (TokenKind::Eq, 1)
                 }

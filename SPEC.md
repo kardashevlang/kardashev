@@ -491,3 +491,53 @@ if (__kd_tryN.err != 0) { <flush active defers>; return (<RET>){ .err = __kd_try
 ### 12.4 Deferred (honest)
 `errdefer`, `catch |e|` capture, explicit named error sets `error{ … }`, and
 `try` in arbitrary (nested) expression positions.
+
+## 13. Enums & `switch` (v0.116)
+
+Plain (C-like) enums plus an exhaustive `switch`. Tagged-union payloads
+(`union(enum)`) and payload capture are a later roadmap item.
+
+### 13.1 Syntax & AST
+- `pub? const Name = enum { A, B, C };` → `Item::Enum(EnumDecl{name,variants})`,
+  `Type::Enum(id)`. Variants are 0-based.
+- Enum values: **`Name.Variant`** (qualified — reuses `Expr::Field` with an
+  `Ident(Name)` base; sema recognises the base as an enum type) and
+  **`.Variant`** (`Expr::EnumLit`; its enum type comes from context — the
+  expected type / the `switch` scrutinee).
+- `switch (scrutinee) { arm* else_arm? }` → `Stmt::Switch{scrutinee, arms,
+  default}`. An arm is `label ("," label)* "=>" block` (`SwitchArm{labels:
+  Vec<Expr>, body: Block}`); the optional final `else => block` is `default`.
+  Labels are constant patterns: enum literals (`.V` / `Enum.V`) for an enum
+  scrutinee, or integer literals for an integer scrutinee. Arms are separated by
+  `,` (a trailing `,` after a `}` block is optional).
+
+### 13.2 Semantics (`sema`)
+- Pre-pass: intern enum decls (`StructTable::intern_enum` + `set_enum_variants`);
+  duplicate variant name within an enum is an error. Resolve `enum` type names.
+- `Enum.V` / `.V`: `V` must be a variant of the (resolved/expected) enum
+  (`E0212`); `.V` with no enum context is `E0215`. Result type `Enum(id)`.
+- `switch`: the scrutinee is an enum or an integer type (`E0213` otherwise).
+  Every label must be a valid pattern for the scrutinee type; an enum label not
+  a variant, or a duplicated label, is `E0212`/`E0211`. For an **enum**
+  scrutinee, the arms must cover **every** variant exactly once **or** include an
+  `else` (`E0210` if neither). For an **integer** scrutinee an `else` is
+  required (`E0214`). Each arm body is checked as a block.
+
+### 13.3 Backend (`emit_c`)
+Emit each enum among the dependency-ordered type defs (enums have no
+dependencies):
+```c
+typedef enum { kd_enum_<E>_<V0> = 0, kd_enum_<E>_<V1> = 1, ... } kd_enum_<E>;
+```
+`Enum.V` / `.V` → the enumerator `kd_enum_<E>_<V>`. A `switch` lowers to a C
+`switch`:
+```c
+switch (<scrutinee>) {
+  case <label>: { <body> } break;        /* one case per label in an arm */
+  ...
+  default: { <else body, or nothing> } break;
+}
+```
+`cty(Type::Enum(id))` → `StructTable::enum_c_name(id)`. (Because sema proves
+enum switches exhaustive, a `default:` is emitted only when the source has an
+`else`.)

@@ -286,3 +286,46 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "12\n-1\n0\n100\n");
 }
+
+// --- v0.116 enums + switch -------------------------------------------------
+
+#[test]
+fn enums_and_exhaustive_switch() {
+    let src = r#"
+const Dir = enum { North, East, South, West };
+fn turn(d: Dir) Dir {
+    switch (d) {                  // exhaustive over all variants, no else
+        .North => { return .East; },
+        .East => { return .South; },
+        .South => { return .West; },
+        .West => { return .North; },
+    }
+}
+fn code(d: Dir) i32 {
+    switch (d) {
+        .North => { return 0; },
+        .East => { return 1; },
+        .South => { return 2; },
+        .West => { return 3; },
+    }
+}
+fn bucket(n: i32) i32 {
+    switch (n) {                  // integer switch with multi-label + else
+        0 => { return 100; },
+        1, 2 => { return 200; },
+        else => { return 999; },
+    }
+}
+pub fn main() i32 {
+    print(code(turn(.North)));    // 1  (North -> East)
+    print(code(turn(Dir.West)));  // 0  (West -> North), qualified literal
+    print(bucket(0));             // 100
+    print(bucket(2));             // 200
+    print(bucket(7));             // 999
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "1\n0\n100\n200\n999\n");
+}

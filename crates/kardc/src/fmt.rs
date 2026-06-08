@@ -21,6 +21,11 @@
 //!   trailing comma on each; an empty struct prints `const Name = struct {};`.
 //!   Struct literals print `Name{ .f = e, … }` and field access `base.field`
 //!   (SPEC §9).
+//! - `const Name = enum { A, B, … };` — one variant per line, 4-space indent,
+//!   trailing comma on each; an empty enum prints `const Name = enum {};`. An
+//!   unqualified enum literal prints `.Variant`; the qualified form reuses field
+//!   access (`Enum.Variant`). A `switch` prints with each arm `labels => { … }`
+//!   indented one level, arms comma-terminated, an `else` arm last (SPEC §13).
 //!
 //! ## Idempotence
 //!
@@ -28,7 +33,8 @@
 //! canonical output produces byte-identical text.
 
 use crate::ast::{
-    BinOp, Block, ConstDecl, Expr, Func, Item, Module, Stmt, StructDecl, TestBlock, TypeExpr, UnOp,
+    BinOp, Block, ConstDecl, EnumDecl, Expr, Func, Item, Module, Stmt, StructDecl, SwitchArm,
+    TestBlock, TypeExpr, UnOp,
 };
 use crate::diag::Diagnostic;
 
@@ -59,6 +65,7 @@ pub fn print_module(module: &Module) -> String {
             Item::Const(c) => p.print_const(c),
             Item::Test(t) => p.print_test(t),
             Item::Struct(s) => p.print_struct(s),
+            Item::Enum(e) => p.print_enum(e),
         }
     }
     p.out
@@ -170,6 +177,34 @@ impl Printer {
                 self.out.push('\n');
             }
             self.print_func(method);
+        }
+        self.indent -= 1;
+        self.write_indent();
+        self.out.push_str("};\n");
+    }
+
+    /// Print an enum declaration (SPEC §13). One `    Variant,` per line with a
+    /// 4-space indent and a trailing comma on every variant, then `};` to close.
+    /// An empty enum — no variants — collapses to `const Name = enum {};` on a
+    /// single line. A `pub` enum keeps its leading `pub`.
+    fn print_enum(&mut self, e: &EnumDecl) {
+        self.write_indent();
+        if e.is_pub {
+            self.out.push_str("pub ");
+        }
+        self.out.push_str("const ");
+        self.out.push_str(&e.name);
+        self.out.push_str(" = enum {");
+        if e.variants.is_empty() {
+            self.out.push_str("};\n");
+            return;
+        }
+        self.out.push('\n');
+        self.indent += 1;
+        for variant in &e.variants {
+            self.write_indent();
+            self.out.push_str(variant);
+            self.out.push_str(",\n");
         }
         self.indent -= 1;
         self.write_indent();
@@ -289,7 +324,51 @@ impl Printer {
                 self.write_indent();
                 self.out.push_str("}\n");
             }
+            Stmt::Switch {
+                scrutinee,
+                arms,
+                default,
+                ..
+            } => self.print_switch(scrutinee, arms, default),
         }
+    }
+
+    /// Print a `switch` statement (SPEC §13). The header is
+    /// `switch (<scrutinee>) {`; each arm is printed one indent deeper as
+    /// `<labels> => {` (labels joined with `, `) followed by its body and a
+    /// closing `},`. The optional `else` arm prints last as `else => { … },`.
+    /// Every arm — the `else` included — ends with a trailing comma (the parser
+    /// accepts a trailing comma after a `}` block), which keeps the canonical
+    /// form uniform and idempotent.
+    fn print_switch(&mut self, scrutinee: &Expr, arms: &[SwitchArm], default: &Option<Block>) {
+        self.write_indent();
+        self.out.push_str("switch (");
+        self.out.push_str(&fmt_expr(scrutinee));
+        self.out.push_str(") {\n");
+        self.indent += 1;
+        for arm in arms {
+            self.write_indent();
+            for (i, label) in arm.labels.iter().enumerate() {
+                if i > 0 {
+                    self.out.push_str(", ");
+                }
+                self.out.push_str(&fmt_expr(label));
+            }
+            self.out.push_str(" => {\n");
+            self.print_block_body(&arm.body);
+            self.write_indent();
+            self.out.push_str("},\n");
+        }
+        if let Some(block) = default {
+            self.write_indent();
+            self.out.push_str("else => {\n");
+            self.print_block_body(block);
+            self.write_indent();
+            self.out.push_str("},\n");
+        }
+        self.indent -= 1;
+        self.write_indent();
+        self.out.push_str("}\n");
     }
 
     /// Print an `if`/`else if`/`else` chain. `cond`/`then` are this `if`'s
@@ -386,6 +465,8 @@ fn expr_prec(e: &Expr) -> u8 {
         | Expr::Null { .. }
         // `error.Name` is atomic — a bare error literal binds as a primary.
         | Expr::ErrorLit { .. }
+        // `.Variant` is atomic — an unqualified enum literal binds as a primary.
+        | Expr::EnumLit { .. }
         | Expr::Unwrap { .. } => 8,
         Expr::Comptime { .. } => 7,
         // `try expr` is a prefix form (SPEC §12.1), at the same binding power as
@@ -576,6 +657,10 @@ fn fmt_expr(e: &Expr) -> String {
         // `error.Name` — an error value from the implicit global error set
         // (SPEC §12.1). Atomic, like a literal.
         Expr::ErrorLit { name, .. } => format!("error.{}", name),
+        // `.Variant` — an unqualified enum literal (SPEC §13); its enum type
+        // comes from context. The qualified form `Enum.Variant` is an
+        // [`Expr::Field`] off an `Ident` base and prints there. Atomic.
+        Expr::EnumLit { variant, .. } => format!(".{}", variant),
         // `try expr` — statement-level error-union propagation (SPEC §12.1). The
         // operand stands at a value position, so a primary/postfix operand
         // prints bare (`try parse(s)`) while anything looser is parenthesised
@@ -1745,6 +1830,231 @@ mod tests {
         let printed = print_module(&m);
         assert_eq!(printed, expected);
         // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    // ----- enums & switch (v0.116) -----------------------------------------
+
+    fn enum_lit(variant: &str) -> Expr {
+        Expr::EnumLit {
+            variant: variant.to_string(),
+            span: D,
+        }
+    }
+
+    fn arm(labels: Vec<Expr>, body: Vec<Stmt>) -> SwitchArm {
+        SwitchArm {
+            labels,
+            body: Block { stmts: body, span: D },
+            span: D,
+        }
+    }
+
+    fn call_stmt(callee: &str, args: Vec<Expr>) -> Stmt {
+        Stmt::Expr(call(callee, args))
+    }
+
+    #[test]
+    fn enum_decl_canonical_form() {
+        // One variant per line, 4-space indent, trailing comma on each, `};` to
+        // close. A `pub` enum keeps its leading `pub`.
+        let m = Module {
+            items: vec![Item::Enum(EnumDecl {
+                is_pub: true,
+                name: "Color".to_string(),
+                variants: vec!["Red".to_string(), "Green".to_string(), "Blue".to_string()],
+                span: D,
+            })],
+        };
+        let expected = "pub const Color = enum {\n    Red,\n    Green,\n    Blue,\n};\n";
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn empty_enum_decl_is_single_line() {
+        let m = Module {
+            items: vec![Item::Enum(EnumDecl {
+                is_pub: false,
+                name: "Never".to_string(),
+                variants: vec![],
+                span: D,
+            })],
+        };
+        assert_eq!(print_module(&m), "const Never = enum {};\n");
+    }
+
+    #[test]
+    fn enum_literal_qualified_and_unqualified_print() {
+        // Unqualified `.Variant` (an `EnumLit`).
+        assert_eq!(fmt_expr(&enum_lit("Red")), ".Red");
+
+        // Qualified `Enum.Variant` reuses field access off an `Ident` base.
+        assert_eq!(fmt_expr(&field(ident("Color"), "Red")), "Color.Red");
+
+        // `.Variant` binds as a primary: a method call directly off it needs no
+        // parentheses, and an `orelse` over it keeps the literal bare.
+        assert_eq!(
+            fmt_expr(&orelse(enum_lit("Red"), enum_lit("Blue"))),
+            ".Red orelse .Blue"
+        );
+    }
+
+    #[test]
+    fn switch_with_else_is_idempotent() {
+        // A `switch` with a multi-label arm and an `else` arm. Arms are printed
+        // one indent deep, labels joined with `, `, every arm (else included)
+        // ends with a trailing comma.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![Param {
+                    name: "c".to_string(),
+                    ty: ty("Color"),
+                    span: D,
+                }],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::Switch {
+                        scrutinee: ident("c"),
+                        arms: vec![arm(
+                            vec![enum_lit("Red"), enum_lit("Green")],
+                            vec![call_stmt("print", vec![int(1)])],
+                        )],
+                        default: Some(Block {
+                            stmts: vec![call_stmt("print", vec![int(0)])],
+                            span: D,
+                        }),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f(c: Color) void {\n",
+            "    switch (c) {\n",
+            "        .Red, .Green => {\n",
+            "            print(1);\n",
+            "        },\n",
+            "        else => {\n",
+            "            print(0);\n",
+            "        },\n",
+            "    }\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn exhaustive_switch_without_else_prints_no_else_arm() {
+        // An enum switch covering every variant has no `else` arm
+        // (`default = None`); the printer emits only the explicit arms.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "g".to_string(),
+                params: vec![Param {
+                    name: "c".to_string(),
+                    ty: ty("Color"),
+                    span: D,
+                }],
+                ret: ty("i32"),
+                body: Block {
+                    stmts: vec![Stmt::Switch {
+                        scrutinee: ident("c"),
+                        arms: vec![
+                            arm(
+                                vec![enum_lit("Red")],
+                                vec![Stmt::Return {
+                                    value: Some(int(1)),
+                                    span: D,
+                                }],
+                            ),
+                            arm(
+                                vec![enum_lit("Green")],
+                                vec![Stmt::Return {
+                                    value: Some(int(2)),
+                                    span: D,
+                                }],
+                            ),
+                        ],
+                        default: None,
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn g(c: Color) i32 {\n",
+            "    switch (c) {\n",
+            "        .Red => {\n",
+            "            return 1;\n",
+            "        },\n",
+            "        .Green => {\n",
+            "            return 2;\n",
+            "        },\n",
+            "    }\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn integer_switch_with_else_prints() {
+        // An integer scrutinee with integer labels and a required `else` arm.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "h".to_string(),
+                params: vec![Param {
+                    name: "n".to_string(),
+                    ty: ty("i32"),
+                    span: D,
+                }],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::Switch {
+                        scrutinee: ident("n"),
+                        arms: vec![arm(
+                            vec![int(0), int(1)],
+                            vec![call_stmt("print", vec![ident("n")])],
+                        )],
+                        default: Some(Block {
+                            stmts: vec![],
+                            span: D,
+                        }),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn h(n: i32) void {\n",
+            "    switch (n) {\n",
+            "        0, 1 => {\n",
+            "            print(n);\n",
+            "        },\n",
+            "        else => {\n",
+            "        },\n",
+            "    }\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
         assert_eq!(print_module(&m), printed);
     }
 }
