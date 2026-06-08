@@ -177,8 +177,13 @@ pub enum Stmt {
     },
     /// `if (cond) then [else els]`. `els` is another statement so that
     /// `else if` chains and `else { ... }` blocks are both representable.
+    ///
+    /// `capture` is `Some(name)` for the optional-payload form
+    /// `if (opt) |name| { … } else { … }` (v0.125): `cond` is an optional, and
+    /// `name` binds the unwrapped value in `then`; `els` runs when it is null.
     If {
         cond: Expr,
+        capture: Option<String>,
         then: Block,
         els: Option<Box<Stmt>>,
         span: Span,
@@ -199,6 +204,13 @@ pub enum Stmt {
     Continue(Span),
     /// `defer stmt;` — runs `stmt` at scope exit, in LIFO order.
     Defer {
+        stmt: Box<Stmt>,
+        span: Span,
+    },
+    /// `errdefer stmt;` — like `defer`, but runs (LIFO) only on **error-return**
+    /// paths (a `try` propagation or `return error.X`), not on normal exit
+    /// (v0.125).
+    ErrDefer {
         stmt: Box<Stmt>,
         span: Span,
     },
@@ -239,6 +251,7 @@ impl Stmt {
             Stmt::Break(s) => *s,
             Stmt::Continue(s) => *s,
             Stmt::Defer { span, .. } => *span,
+            Stmt::ErrDefer { span, .. } => *span,
             Stmt::Block(b) => b.span,
             Stmt::Switch { span, .. } => *span,
         }

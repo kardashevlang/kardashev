@@ -35,6 +35,7 @@ pub enum Kw {
     Enum,
     Switch,
     Union,
+    Errdefer,
 }
 
 impl Kw {
@@ -67,6 +68,7 @@ impl Kw {
             "enum" => Kw::Enum,
             "switch" => Kw::Switch,
             "union" => Kw::Union,
+            "errdefer" => Kw::Errdefer,
             _ => return None,
         })
     }
@@ -99,6 +101,7 @@ impl Kw {
             Kw::Enum => "enum",
             Kw::Switch => "switch",
             Kw::Union => "union",
+            Kw::Errdefer => "errdefer",
         }
     }
 }

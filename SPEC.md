@@ -837,3 +837,36 @@ Construction `Name{ .v = e }` → `((kd_union_<Name>){ .tag = <idx>, .data = { .
 A union `switch` lowers to a C `switch` on `(<u>).tag`; each arm `case <idx>: {`
 begins (when captured) with `<payload cty> kd_<cap> = (<u>).data.kd_<v>;` then
 the arm body, then `break;`. `cty(Type::Union(id))` → `StructTable::union_c_name`.
+
+## 21. Payload captures + `errdefer` (v0.125)
+
+### 21.1 Optional `if` capture
+`if (opt) |v| { then } else { els }` — `Stmt::If` with `capture = Some("v")`.
+The condition must be an optional `?T` (else `E0280`); `v` binds the unwrapped
+`T` inside `then`; `els` runs when the optional is null. A plain `if (cond)`
+(no capture) is unchanged (`cond` is `bool`). Lowering (the condition is
+evaluated once into a temp):
+```c
+{ <opt cty> __kd_ifN = (<cond>); if (__kd_ifN.has) { <T cty> kd_v = __kd_ifN.val; <then> } else { <els> } }
+```
+
+### 21.2 `errdefer`
+`errdefer stmt;` (`Stmt::ErrDefer`) registers `stmt` to run **only on
+error-return** paths, in LIFO order, alongside regular `defer`s.
+
+- Each scope keeps its deferred statements **in registration order**, each
+  tagged `defer` or `errdefer`. On a **normal** exit (fall-through, `break`,
+  `continue`, or a *success* `return`), only the `defer`s run (reverse order).
+  On an **error-return** edge, **both** `defer`s and `errdefer`s run (reverse
+  registration order, merged).
+- Error-return edges are: a **`try` propagation** (`if (__kd_tryN.err != 0) {
+  <flush incl. errdefers>; return …; }`) and a **`return error.X`** (an
+  `ErrorLit` return). A `return <value>` (success) and normal fall-through flush
+  only `defer`s.
+- sema checks an `errdefer`'s statement like a `defer`'s; it is accepted in any
+  function (it simply never fires in one that never returns an error).
+
+### 21.3 Deferred (honest)
+`catch |e| { … }` capture (the block/expression handler binding the error) — the
+non-capturing `expr catch default` (§12) stays; the capturing form is a later
+version.

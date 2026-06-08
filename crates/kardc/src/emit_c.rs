@@ -60,7 +60,10 @@ pub fn emit(module: &Module, structs: &crate::types::StructTable, mode: EmitMode
 /// to stop flushing). A loop-body scope also carries the loop's optional
 /// continue-expression.
 struct Scope {
-    defers: Vec<Stmt>,
+    /// Deferred statements in registration order, each tagged `is_errdefer`.
+    /// `defer`s run on every scope exit; `errdefer`s run only on error-return
+    /// edges (SPEC §21.2).
+    defers: Vec<(bool, Stmt)>,
     is_loop_body: bool,
     cont: Option<Stmt>,
     /// Types of locals/params introduced in this scope, keyed by source name.
@@ -135,6 +138,9 @@ struct Emitter<'a> {
     /// bounds-checked array index-assignment (SPEC §14.3). Reset per
     /// function/test body, exactly like `try_counter`.
     idx_counter: usize,
+    /// Monotonic counter for the `__kd_ifN` temporaries of an optional-`if`
+    /// capture (SPEC §21.1). Reset per function/test body.
+    if_counter: usize,
     /// Pointee types of the `*T` pointer types written in this module's
     /// signatures / locals, in first-seen order (SPEC §15.1). Pointers have no
     /// typedef and the table exposes no `pointers()` iterator, so emit keeps
@@ -172,6 +178,7 @@ impl<'a> Emitter<'a> {
             method_params: HashMap::new(),
             try_counter: 0,
             idx_counter: 0,
+            if_counter: 0,
             local_ptr_pointees: Vec::new(),
             subst: HashMap::new(),
             generics: HashMap::new(),
@@ -328,6 +335,7 @@ impl<'a> Emitter<'a> {
             Stmt::While { body, .. } => self.note_block_ptrs(body),
             Stmt::Block(b) => self.note_block_ptrs(b),
             Stmt::Defer { stmt, .. } => self.note_stmt_ptrs(stmt),
+            Stmt::ErrDefer { stmt, .. } => self.note_stmt_ptrs(stmt),
             Stmt::Switch { arms, default, .. } => {
                 for a in arms {
                     self.note_block_ptrs(&a.body);
@@ -1031,6 +1039,7 @@ impl<'a> Emitter<'a> {
         self.scopes.clear();
         self.try_counter = 0;
         self.idx_counter = 0;
+        self.if_counter = 0;
         self.current_ret = self.resolve_ty(&f.ret);
         let ret = self.cty(&f.ret);
         let params = self.format_params(&f.params);
@@ -1069,7 +1078,7 @@ impl<'a> Emitter<'a> {
             }
         }
         if !diverged {
-            self.flush_current_reversed();
+            self.flush_current_reversed(false);
             // A loop body runs its continue-clause at the end of each iteration
             // (the fall-through edge), after the body's defers.
             let cont = {
@@ -1225,8 +1234,15 @@ impl<'a> Emitter<'a> {
                 true
             }
             Stmt::If {
-                cond, then, els, ..
-            } => self.emit_if(cond, then, els),
+                cond,
+                capture,
+                then,
+                els,
+                ..
+            } => match capture {
+                Some(name) => self.emit_if_capture(cond, name, then, els),
+                None => self.emit_if(cond, then, els),
+            },
             Stmt::While {
                 cond, cont, body, ..
             } => {
@@ -1254,9 +1270,16 @@ impl<'a> Emitter<'a> {
                 true
             }
             Stmt::Defer { stmt, .. } => {
-                // Register only; the body runs at scope exit, not now.
+                // Register only; the body runs at every scope exit (LIFO).
                 if let Some(scope) = self.scopes.last_mut() {
-                    scope.defers.push((**stmt).clone());
+                    scope.defers.push((false, (**stmt).clone()));
+                }
+                false
+            }
+            Stmt::ErrDefer { stmt, .. } => {
+                // Register tagged as errdefer; runs only on error-return edges.
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.defers.push((true, (**stmt).clone()));
                 }
                 false
             }
@@ -1466,7 +1489,7 @@ impl<'a> Emitter<'a> {
                     };
                     self.line(&format!("if (!({})) {{", cs));
                     self.indent += 1;
-                    self.flush_all_reversed();
+                    self.flush_all_reversed(false);
                     self.line("return 1;");
                     self.indent -= 1;
                     self.line("}");
@@ -1500,26 +1523,31 @@ impl<'a> Emitter<'a> {
             }
             Some(e) => Some(self.emit_coerced(e, ret_ty)),
         };
-        self.finish_return(val_str, ret_ty);
+        // A `return error.X;` is an error-return edge, so `errdefer`s run too.
+        // (`return try e;` propagates errors inside `emit_try`; the value it
+        // then returns is the success payload, so this return is not an error
+        // edge.)
+        let include_err = matches!(value, Some(Expr::ErrorLit { .. }));
+        self.finish_return(val_str, ret_ty, include_err);
     }
 
     /// Emit the actual `return` (with the deferred-temp dance) from a
     /// pre-computed, already-coerced value string. Shared by ordinary returns
     /// and `return try e;`.
-    fn finish_return(&mut self, val_str: Option<String>, ret_ty: Type) {
+    fn finish_return(&mut self, val_str: Option<String>, ret_ty: Type, include_err: bool) {
         let non_void = ret_ty != Type::Void;
-        let active = self.any_defer_active();
+        let active = self.any_defer_active(include_err);
         if active && non_void {
             // Evaluate the value into a temporary *before* running the defers,
             // since the defers may mutate state the value depends on.
             let es = val_str.unwrap_or_else(|| "0".to_string());
             let ret = self.cty_of(ret_ty);
             self.line(&format!("{} __kd_ret = ({});", ret, es));
-            self.flush_all_reversed();
+            self.flush_all_reversed(include_err);
             self.line("return __kd_ret;");
         } else {
             if active {
-                self.flush_all_reversed();
+                self.flush_all_reversed(include_err);
             }
             match val_str {
                 Some(es) => self.line(&format!("return ({});", es)),
@@ -1547,7 +1575,8 @@ impl<'a> Emitter<'a> {
         self.line(&format!("{} {} = {};", err_cty, temp, es));
         self.line(&format!("if ({}.err != 0) {{", temp));
         self.indent += 1;
-        self.flush_all_reversed();
+        // An error propagation is an error-return edge: run errdefers too.
+        self.flush_all_reversed(true);
         let ret_cty = self.cty_of(self.current_ret);
         self.line(&format!("return ({}){{ .err = {}.err }};", ret_cty, temp));
         self.indent -= 1;
@@ -1594,6 +1623,69 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Emit an optional-capture `if (opt) |name| { … } else { … }` (SPEC §21.1).
+    /// The optional is evaluated once into a temp; on `.has`, the unwrapped
+    /// payload binds `kd_<name>` in the then-branch. Returns `false`
+    /// (conservatively non-diverging).
+    fn emit_if_capture(
+        &mut self,
+        cond: &Expr,
+        name: &str,
+        then: &Block,
+        els: &Option<Box<Stmt>>,
+    ) -> bool {
+        // Resolve the optional's C type + inner payload type.
+        let (opt_cty, inner_ty) = match self.type_of_expr(cond) {
+            Some(Type::Optional(id)) => {
+                (self.structs.optional_c_name(id), self.structs.optional_inner(id))
+            }
+            // Validated input always makes `cond` an optional here; fall back to
+            // a plain `if` so emission never panics on unexpected shapes.
+            _ => return self.emit_if(cond, then, els),
+        };
+        let n = self.if_counter;
+        self.if_counter += 1;
+        let temp = format!("__kd_if{}", n);
+        let cs = self.emit_expr(cond);
+        let inner_cty = self.cty_of(inner_ty);
+        self.line("{");
+        self.indent += 1;
+        self.line(&format!("{} {} = {};", opt_cty, temp, cs));
+        self.line(&format!("if ({}.has) {{", temp));
+        self.indent += 1;
+        // Bind the unwrapped payload inside a scope so the then-block resolves
+        // its type and `defer`s flush at the branch's exit.
+        let mut scope = Scope::plain();
+        scope.var_types.insert(name.to_string(), inner_ty);
+        self.scopes.push(scope);
+        self.line(&format!("{} kd_{} = {}.val;", inner_cty, name, temp));
+        let mut diverged = false;
+        for s in &then.stmts {
+            diverged = self.emit_stmt(s);
+            if diverged {
+                break;
+            }
+        }
+        if !diverged {
+            self.flush_current_reversed(false);
+        }
+        self.scopes.pop();
+        self.indent -= 1;
+        match els {
+            Some(boxed) => {
+                self.line("} else {");
+                self.indent += 1;
+                self.emit_stmt(boxed.as_ref());
+                self.indent -= 1;
+                self.line("}");
+            }
+            None => self.line("}"),
+        }
+        self.indent -= 1;
+        self.line("}");
+        false
+    }
+
     /// Emit an `if`/`else if`/`else` chain. Returns `true` only if there is a
     /// final `else` and every arm diverges.
     fn emit_if(&mut self, cond: &Expr, then: &Block, els: &Option<Box<Stmt>>) -> bool {
@@ -1608,8 +1700,15 @@ impl<'a> Emitter<'a> {
             match cur {
                 None => break,
                 Some(boxed) => match boxed.as_ref() {
+                    // Only flatten capture-less `else if`s; an `else if (opt) |v|`
+                    // capture must go through emit_stmt → emit_if_capture, so it
+                    // is treated as an else-statement here.
                     Stmt::If {
-                        cond, then, els, ..
+                        cond,
+                        capture: None,
+                        then,
+                        els,
+                        ..
                     } => {
                         conds.push(cond);
                         blocks.push(then);
@@ -1660,36 +1759,46 @@ impl<'a> Emitter<'a> {
 
     // -- defer flushing -----------------------------------------------------
 
-    fn any_defer_active(&self) -> bool {
-        self.scopes.iter().any(|s| !s.defers.is_empty())
+    /// Whether any scope has a deferred statement that would run on this exit:
+    /// for a normal exit (`include_err = false`) only plain `defer`s count; for
+    /// an error-return edge (`include_err = true`) `errdefer`s count too.
+    fn any_defer_active(&self, include_err: bool) -> bool {
+        self.scopes
+            .iter()
+            .any(|s| s.defers.iter().any(|(is_err, _)| include_err || !is_err))
     }
 
-    /// Flush the innermost scope's defers in reverse registration order.
-    fn flush_current_reversed(&mut self) {
-        if let Some(scope) = self.scopes.last() {
-            let defers = scope.defers.clone();
-            for s in defers.iter().rev() {
+    /// Emit one scope's deferred statements in reverse registration order,
+    /// skipping `errdefer`s unless `include_err`.
+    fn flush_scope(&mut self, idx: usize, include_err: bool) {
+        let defers = self.scopes[idx].defers.clone();
+        for (is_err, s) in defers.iter().rev() {
+            if include_err || !is_err {
                 self.emit_stmt(s);
             }
         }
     }
 
+    /// Flush the innermost scope's defers in reverse registration order.
+    fn flush_current_reversed(&mut self, include_err: bool) {
+        if !self.scopes.is_empty() {
+            self.flush_scope(self.scopes.len() - 1, include_err);
+        }
+    }
+
     /// Flush every active scope, innermost first down to the function scope,
-    /// each in reverse registration order. Used by deferred `return` and by a
-    /// failed `expect`.
-    fn flush_all_reversed(&mut self) {
-        let n = self.scopes.len();
-        for i in (0..n).rev() {
-            let defers = self.scopes[i].defers.clone();
-            for s in defers.iter().rev() {
-                self.emit_stmt(s);
-            }
+    /// each in reverse registration order. Used by deferred `return`, a failed
+    /// `expect`, and (with `include_err`) error-return edges.
+    fn flush_all_reversed(&mut self, include_err: bool) {
+        for i in (0..self.scopes.len()).rev() {
+            self.flush_scope(i, include_err);
         }
     }
 
     /// Flush scopes innermost-first down to and including the nearest loop-body
     /// scope (each reversed). Returns that loop-body scope's index, or `None`
     /// if there is no enclosing loop (which a validated module never hits).
+    /// `break`/`continue` are normal exits, so `errdefer`s never run here.
     fn flush_to_loop_reversed(&mut self) -> Option<usize> {
         let n = self.scopes.len();
         let mut loop_idx = None;
@@ -1701,10 +1810,7 @@ impl<'a> Emitter<'a> {
         }
         let loop_idx = loop_idx?;
         for i in (loop_idx..n).rev() {
-            let defers = self.scopes[i].defers.clone();
-            for s in defers.iter().rev() {
-                self.emit_stmt(s);
-            }
+            self.flush_scope(i, false);
         }
         Some(loop_idx)
     }
@@ -2582,6 +2688,7 @@ impl<'a> Emitter<'a> {
         self.scopes.clear();
         self.try_counter = 0;
         self.idx_counter = 0;
+        self.if_counter = 0;
         self.current_ret = Type::I32; // the harness test functions return `int`
         self.line(&format!("static int kd_test_{}(void) {{", idx));
         self.indent += 1;
@@ -2594,7 +2701,7 @@ impl<'a> Emitter<'a> {
             }
         }
         if !diverged {
-            self.flush_current_reversed();
+            self.flush_current_reversed(false);
         }
         self.scopes.pop();
         self.line("return 0;");
@@ -5448,6 +5555,7 @@ mod tests {
             "T",
             vec![
                 Stmt::If {
+                    capture: None,
                     cond: Expr::Binary {
                         op: BinOp::Gt,
                         lhs: Box::new(ident("a")),

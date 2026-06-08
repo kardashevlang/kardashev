@@ -18,6 +18,23 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.125.0] — Payload captures: `if (opt) |v|` + `errdefer`
+
+### Added
+- **Optional `if` capture**: `if (opt) |v| { … } else { … }` evaluates the
+  optional once, binds the unwrapped value `v` on the present branch, and runs
+  `else` on null.
+- **`errdefer`**: registers cleanup that runs (LIFO, alongside `defer`) only on
+  **error-return** edges — a `try` propagation or a `return error.X` — and not
+  on success or normal exit. The defer machinery now tags each entry and flushes
+  errdefers only on error paths.
+- `Stmt::If.capture`, `Stmt::ErrDefer`; lexer `errdefer`. Diagnostics `E0280`.
+- 535 unit + 23 e2e tests; `examples/captures.ks`.
+
+### Deferred
+- `catch |e| { … }` (the capturing error handler); the non-capturing
+  `expr catch default` remains.
+
 ## [0.124.0] — Tagged unions `union(enum)` + `switch` capture
 
 First version of **Arc 2** (completing the language surface).

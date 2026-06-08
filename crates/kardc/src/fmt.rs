@@ -15,12 +15,14 @@
 //!   `comptime ` keyword — `fn max(comptime T: type, a: T, b: T) T { … }`
 //!   (SPEC §17).
 //! - Spaces around every binary operator (`a + b`, `a and b`).
-//! - `if (cond) { … } else if (cond) { … } else { … }`.
+//! - `if (cond) { … } else if (cond) { … } else { … }`. The optional-payload
+//!   form binds the unwrapped value: `if (opt) |v| { … } else { … }` (SPEC §21).
 //! - `while (cond) { … }` / `while (cond) : (cont) { … }`.
 //! - `const NAME: T = expr;` / `var name: T = expr;` / `return expr;`. The type
 //!   annotation is optional (SPEC §18): an inferred binding prints with no
 //!   `: T` — `const NAME = expr;` / `var name = expr;`.
-//! - `defer <stmt>`; `test "name" { … }`.
+//! - `defer <stmt>`; `errdefer <stmt>` — the latter mirrors `defer`'s printing
+//!   but runs only on error-return paths (SPEC §21); `test "name" { … }`.
 //! - `const Name = struct { f: T, … };` — one field per line, 4-space indent,
 //!   trailing comma on each; an empty struct prints `const Name = struct {};`.
 //!   Struct literals print `Name{ .f = e, … }` and field access `base.field`
@@ -341,8 +343,12 @@ impl Printer {
                 }
             }
             Stmt::If {
-                cond, then, els, ..
-            } => self.print_if(cond, then, els),
+                cond,
+                capture,
+                then,
+                els,
+                ..
+            } => self.print_if(cond, capture, then, els),
             Stmt::While {
                 cond, cont, body, ..
             } => {
@@ -373,6 +379,15 @@ impl Printer {
                 self.out.push_str("defer ");
                 // The guarded statement shares the `defer` line: suppress the
                 // indent it would otherwise emit for its first line.
+                self.suppress_indent = true;
+                self.print_stmt(stmt);
+            }
+            // `errdefer <stmt>` (SPEC §21.2) prints exactly like `defer`, with
+            // the `errdefer` keyword: the keyword and the guarded statement
+            // share one line, so the statement's leading indent is suppressed.
+            Stmt::ErrDefer { stmt, .. } => {
+                self.write_indent();
+                self.out.push_str("errdefer ");
                 self.suppress_indent = true;
                 self.print_stmt(stmt);
             }
@@ -440,13 +455,24 @@ impl Printer {
         self.out.push_str("}\n");
     }
 
-    /// Print an `if`/`else if`/`else` chain. `cond`/`then` are this `if`'s
-    /// condition and body; `els` is its optional trailing branch.
-    fn print_if(&mut self, cond: &Expr, then: &Block, els: &Option<Box<Stmt>>) {
+    /// Print an `if`/`else if`/`else` chain. `cond`/`capture`/`then` are this
+    /// `if`'s condition, optional payload capture and body; `els` is its optional
+    /// trailing branch. With a capture (SPEC §21.1) the header prints
+    /// `if (<cond>) |<name>| {`; without one it is the unchanged `if (<cond>) {`.
+    /// An `else if` whose own `if` carries a capture chains the same way
+    /// (`} else if (<cond>) |<name>| {`).
+    fn print_if(
+        &mut self,
+        cond: &Expr,
+        capture: &Option<String>,
+        then: &Block,
+        els: &Option<Box<Stmt>>,
+    ) {
         self.write_indent();
         self.out.push_str("if (");
         self.out.push_str(&fmt_expr(cond));
-        self.out.push_str(") {\n");
+        self.out.push(')');
+        self.print_if_open(capture);
         self.print_block_body(then);
 
         let mut els = els;
@@ -460,6 +486,7 @@ impl Printer {
                 Some(boxed) => match boxed.as_ref() {
                     Stmt::If {
                         cond: c2,
+                        capture: cap2,
                         then: t2,
                         els: e2,
                         ..
@@ -467,7 +494,8 @@ impl Printer {
                         self.write_indent();
                         self.out.push_str("} else if (");
                         self.out.push_str(&fmt_expr(c2));
-                        self.out.push_str(") {\n");
+                        self.out.push(')');
+                        self.print_if_open(cap2);
                         self.print_block_body(t2);
                         els = e2;
                     }
@@ -493,6 +521,21 @@ impl Printer {
                     }
                 },
             }
+        }
+    }
+
+    /// Print the opening of an `if` header after its `)`: an optional-payload
+    /// capture (`|<name>|`, SPEC §21.1) when present, then ` {` and a newline.
+    /// With no capture this is the unchanged ` {`, so a plain `if` prints exactly
+    /// as before.
+    fn print_if_open(&mut self, capture: &Option<String>) {
+        match capture {
+            Some(name) => {
+                self.out.push_str(" |");
+                self.out.push_str(name);
+                self.out.push_str("| {\n");
+            }
+            None => self.out.push_str(" {\n"),
         }
     }
 }
@@ -1160,6 +1203,7 @@ mod tests {
         });
         let else_if = Stmt::If {
             cond: ident("b"),
+            capture: None,
             then: Block {
                 stmts: vec![Stmt::Return {
                     value: Some(int(2)),
@@ -1172,6 +1216,7 @@ mod tests {
         };
         let top_if = Stmt::If {
             cond: ident("a"),
+            capture: None,
             then: Block {
                 stmts: vec![Stmt::Return {
                     value: Some(int(1)),
@@ -2923,6 +2968,7 @@ mod tests {
                 body: Block {
                     stmts: vec![Stmt::If {
                         cond: bin(BinOp::Gt, ident("a"), ident("b")),
+                        capture: None,
                         then: Block {
                             stmts: vec![Stmt::Return {
                                 value: Some(ident("a")),
@@ -3212,6 +3258,138 @@ mod tests {
             "    const b: i64 = 2;\n",
             "    var c = a + b;\n",
             "    print(c);\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    // ----- payload captures + errdefer (v0.125) ---------------------------
+
+    #[test]
+    fn if_with_optional_capture_prints_pipe_binding() {
+        // SPEC §21.1: `if (opt) |v| { … } else { … }` — the capture binds the
+        // unwrapped optional in the then-block. The header prints `|v|` between
+        // the `)` and the `{`; the `else` branch is the usual block form.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![param("opt", opt_ty("i32"))],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::If {
+                        cond: ident("opt"),
+                        capture: Some("v".to_string()),
+                        then: Block {
+                            stmts: vec![call_stmt("print", vec![ident("v")])],
+                            span: D,
+                        },
+                        els: Some(Box::new(Stmt::Block(Block {
+                            stmts: vec![call_stmt("print", vec![int(0)])],
+                            span: D,
+                        }))),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f(opt: ?i32) void {\n",
+            "    if (opt) |v| {\n",
+            "        print(v);\n",
+            "    } else {\n",
+            "        print(0);\n",
+            "    }\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn plain_if_without_capture_is_unchanged() {
+        // A capture-less `if` (capture = None) prints exactly as before:
+        // `if (cond) {` with no `|…|` between the `)` and the `{`.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![param("c", ty("bool"))],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::If {
+                        cond: ident("c"),
+                        capture: None,
+                        then: Block {
+                            stmts: vec![call_stmt("print", vec![int(1)])],
+                            span: D,
+                        },
+                        els: None,
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f(c: bool) void {\n",
+            "    if (c) {\n",
+            "        print(1);\n",
+            "    }\n",
+            "}\n",
+        );
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn errdefer_prints_like_defer_with_keyword() {
+        // SPEC §21.2: `errdefer <stmt>` mirrors `defer`'s printing — the keyword
+        // and the guarded statement share one line — but spells `errdefer`.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: err_ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::ErrDefer {
+                        stmt: Box::new(call_stmt("print", vec![ident("x")])),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = "fn f() !void {\n    errdefer print(x);\n}\n";
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn optional_capture_and_errdefer_round_trip() {
+        // End-to-end (lex → parse → print), SPEC §21: a function mixing an
+        // `errdefer` and an optional-payload `if` capture is already canonical,
+        // so formatting reproduces it byte-for-byte and re-formatting that output
+        // is byte-identical (idempotence).
+        let src = concat!(
+            "fn f(opt: ?i32) !void {\n",
+            "    errdefer print(0);\n",
+            "    if (opt) |v| {\n",
+            "        print(v);\n",
+            "    } else {\n",
+            "        print(1);\n",
+            "    }\n",
             "}\n",
         );
         let once = format_source(src).expect("source formats");
