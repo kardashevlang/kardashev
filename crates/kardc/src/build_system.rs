@@ -1,12 +1,12 @@
 //! The in-language build system.
 //!
-//! Zig-philosophy: the build is described in the project's own `build.kd`,
+//! Zig-philosophy: the build is described in the project's own `build.ks`,
 //! read by the same `kard` binary. v1 supports a minimal declarative form:
 //!
 //! ```text
 //! build {
 //!     name = "hello";
-//!     root = "src/main.kd";
+//!     root = "src/main.ks";
 //! }
 //! ```
 //!
@@ -14,7 +14,7 @@
 //! is a later roadmap item.
 //!
 //! `parse_build_kd` is a tiny self-contained recursive parser — it does not
-//! reuse the language lexer/parser, because `build.kd` is a fixed declarative
+//! reuse the language lexer/parser, because `build.ks` is a fixed declarative
 //! shape rather than a program. It is tolerant of surrounding whitespace and
 //! `//` line comments (SPEC §1/§7). Any malformed or missing field yields a
 //! single error code, `E0300`.
@@ -31,10 +31,10 @@ pub struct BuildSpec {
     pub root: String,
 }
 
-/// The stable error code for every `build.kd` parse failure.
+/// The stable error code for every `build.ks` parse failure.
 const E_BUILD: &str = "E0300";
 
-/// Parse the v1 minimal `build.kd` form, extracting `name` and `root`.
+/// Parse the v1 minimal `build.ks` form, extracting `name` and `root`.
 ///
 /// Tolerates leading/trailing whitespace and `//` comments anywhere between
 /// tokens. Unknown fields (still of the `IDENT = "..." ;` shape) are ignored so
@@ -144,7 +144,7 @@ pub fn parse_build_kd(src: &str) -> Result<BuildSpec, Vec<Diagnostic>> {
     })
 }
 
-/// A minimal cursor over `build.kd` source, tracking a byte offset for spans.
+/// A minimal cursor over `build.ks` source, tracking a byte offset for spans.
 struct Scanner<'a> {
     src: &'a str,
     pos: usize,
@@ -331,28 +331,28 @@ mod tests {
 
     #[test]
     fn parses_the_canonical_form() {
-        let src = "build {\n    name = \"hello\";\n    root = \"src/main.kd\";\n}\n";
+        let src = "build {\n    name = \"hello\";\n    root = \"src/main.ks\";\n}\n";
         let spec = parse_build_kd(src).expect("should parse");
         assert_eq!(spec.name, "hello");
-        assert_eq!(spec.root, "src/main.kd");
+        assert_eq!(spec.root, "src/main.ks");
     }
 
     #[test]
     fn tolerates_whitespace_and_comments() {
         let src = "  // a project\n\n  build  {  // open\n\
-                   \t root = \"src/app.kd\" ;  // the entrypoint\n\
+                   \t root = \"src/app.ks\" ;  // the entrypoint\n\
                    name=\"app\";\n} // done\n\n";
         let spec = parse_build_kd(src).expect("should parse");
         assert_eq!(spec.name, "app");
-        assert_eq!(spec.root, "src/app.kd");
+        assert_eq!(spec.root, "src/app.ks");
     }
 
     #[test]
     fn fields_may_appear_in_any_order_with_extras() {
-        let src = "build { root = \"r.kd\"; version = \"0.1.0\"; name = \"n\"; }";
+        let src = "build { root = \"r.ks\"; version = \"0.1.0\"; name = \"n\"; }";
         let spec = parse_build_kd(src).expect("should parse");
         assert_eq!(spec.name, "n");
-        assert_eq!(spec.root, "r.kd");
+        assert_eq!(spec.root, "r.ks");
     }
 
     #[test]
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn missing_name_is_an_error() {
-        let src = "build { root = \"src/main.kd\"; }";
+        let src = "build { root = \"src/main.ks\"; }";
         let errs = parse_build_kd(src).expect_err("should fail");
         assert!(errs.iter().any(|d| d.message.contains("name")));
     }

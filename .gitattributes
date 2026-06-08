@@ -1,0 +1,5 @@
+# kardashev source files use the `.ks` extension ("Kardashev Scale").
+# GitHub Linguist maps `.ks` to KerboScript by default; override it so the
+# repository's language stats and syntax highlighting use Zig — the closest
+# grammar to kardashev's Zig-inspired surface — until a dedicated grammar exists.
+*.ks linguist-language=Zig

@@ -28,7 +28,7 @@ binary`: kardashev lowers to portable C11 and hands it to your system C compiler
 ## A taste
 
 ```rust
-// hello.kd
+// hello.ks
 const LIMIT: i32 = comptime (5 * 2);
 
 fn sum_to(n: i32) i32 {
@@ -52,10 +52,10 @@ test "sum_to adds 0..n" {
 ```
 
 ```console
-$ kard run hello.kd
+$ kard run hello.ks
 45
 999
-$ kard test hello.kd
+$ kard test hello.ks
 ok: sum_to adds 0..n
 1/1 tests passed
 ```
@@ -85,14 +85,14 @@ kard version                                   # print the toolchain version
 kard help                                      # usage
 ```
 
-With no `FILE`, `build`/`run`/`test` read `./build.kd` — the in-language build
+With no `FILE`, `build`/`run`/`test` read `./build.ks` — the in-language build
 description:
 
 ```rust
-// build.kd
+// build.ks
 build {
     name = "hello";
-    root = "src/main.kd";
+    root = "src/main.ks";
 }
 ```
 

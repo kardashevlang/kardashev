@@ -53,7 +53,7 @@ fn line_text(line: usize, src: &str) -> &str {
 ///
 /// ```text
 /// error[E0001]: unexpected token
-///  --> main.kd:3:5
+///  --> main.ks:3:5
 ///   |
 /// 3 |     retunr 0;
 ///   |     ^^^^^^
