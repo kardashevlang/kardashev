@@ -112,6 +112,11 @@ struct Emitter<'a> {
     /// `self`), keyed by `(struct_name, method_name)`. Drives optional coercion
     /// of method/associated-call arguments.
     method_params: HashMap<(String, String), Vec<Type>>,
+    /// Monotonic counter for the `__kd_tryN` temporaries that lower `try`
+    /// expressions. Reset at the start of every function/test body so the
+    /// numbering stays small and deterministic; names never collide because
+    /// distinct functions are distinct C blocks.
+    try_counter: usize,
 }
 
 impl<'a> Emitter<'a> {
@@ -128,6 +133,7 @@ impl<'a> Emitter<'a> {
             fn_ret: HashMap::new(),
             fn_params: HashMap::new(),
             method_params: HashMap::new(),
+            try_counter: 0,
         }
     }
 
@@ -200,20 +206,26 @@ impl<'a> Emitter<'a> {
     fn emit_type_defs(&mut self) {
         use std::collections::HashSet;
         let structs = self.structs;
-        if structs.is_empty() && structs.optionals().next().is_none() {
+        if structs.is_empty()
+            && structs.optionals().next().is_none()
+            && structs.error_unions().next().is_none()
+        {
             return;
         }
 
-        // A definition node: either a struct or an interned optional.
+        // A definition node: a struct, an interned optional, or an interned
+        // error union.
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         enum Node {
             Struct(u32),
             Opt(u32),
+            ErrU(u32),
         }
         fn dep_of(t: Type) -> Option<Node> {
             match t {
                 Type::Struct(s) => Some(Node::Struct(s)),
                 Type::Optional(o) => Some(Node::Opt(o)),
+                Type::ErrorUnion(e) => Some(Node::ErrU(e)),
                 _ => None,
             }
         }
@@ -239,6 +251,11 @@ impl<'a> Emitter<'a> {
                         visit(d, structs, seen, order);
                     }
                 }
+                Node::ErrU(e) => {
+                    if let Some(d) = dep_of(structs.error_union_payload(e)) {
+                        visit(d, structs, seen, order);
+                    }
+                }
             }
             order.push(n);
         }
@@ -251,11 +268,15 @@ impl<'a> Emitter<'a> {
         for (id, _) in structs.optionals() {
             visit(Node::Opt(id), structs, &mut seen, &mut order);
         }
+        for (id, _) in structs.error_unions() {
+            visit(Node::ErrU(id), structs, &mut seen, &mut order);
+        }
 
         for n in order {
             match n {
                 Node::Struct(id) => self.emit_one_struct(id),
                 Node::Opt(id) => self.emit_one_optional(id),
+                Node::ErrU(id) => self.emit_one_error_union(id),
             }
         }
         self.blank();
@@ -294,6 +315,24 @@ impl<'a> Emitter<'a> {
         self.line(&format!(
             "static inline {} {}_unwrap({} o) {{ if (!o.has) {{ fputs(\"panic: unwrapped a null optional\\n\", stderr); exit(101); }} return o.val; }}",
             inner_cty, oname, oname
+        ));
+    }
+
+    /// Emit one `kd_err_<tag>` error-union typedef plus its inline `_catch`
+    /// helper, per SPEC §12.3. The struct carries an `int32_t err` (0 = success,
+    /// otherwise the failing error's 1-based code) and the payload `val`;
+    /// `_catch` yields the payload on success or the eager default on error.
+    fn emit_one_error_union(&mut self, id: u32) {
+        let structs = self.structs;
+        let ename = structs.error_union_c_name(id);
+        let payload_cty = self.cty_of(structs.error_union_payload(id));
+        self.line(&format!(
+            "typedef struct {{ int32_t err; {} val; }} {};",
+            payload_cty, ename
+        ));
+        self.line(&format!(
+            "static inline {} {}_catch({} e, {} d) {{ return e.err == 0 ? e.val : d; }}",
+            payload_cty, ename, ename, payload_cty
         ));
     }
 
@@ -398,6 +437,14 @@ impl<'a> Emitter<'a> {
                 .find(|(_, inner)| *inner == base)
                 .map(|(id, _)| Type::Optional(id))
                 .unwrap_or(base)
+        } else if t.error_union {
+            // Likewise sema interned every `!T`; map the base payload back to
+            // its `Type::ErrorUnion(id)`.
+            self.structs
+                .error_unions()
+                .find(|(_, payload)| *payload == base)
+                .map(|(id, _)| Type::ErrorUnion(id))
+                .unwrap_or(base)
         } else {
             base
         }
@@ -410,6 +457,7 @@ impl<'a> Emitter<'a> {
         match t {
             Type::Struct(id) => self.structs.c_name(id),
             Type::Optional(id) => self.structs.optional_c_name(id),
+            Type::ErrorUnion(id) => self.structs.error_union_c_name(id),
             other => other.c_name().to_string(),
         }
     }
@@ -430,6 +478,9 @@ impl<'a> Emitter<'a> {
             // Matches `optional_c_name(id)` (`kd_opt_<type_mangle(inner)>`)
             // without needing the interned id.
             format!("kd_opt_{}", self.structs.type_mangle(base))
+        } else if t.error_union {
+            // Matches `error_union_c_name(id)` (`kd_err_<type_mangle(payload)>`).
+            format!("kd_err_{}", self.structs.type_mangle(base))
         } else {
             self.cty_of(base)
         }
@@ -450,6 +501,7 @@ impl<'a> Emitter<'a> {
     /// one of them resolves to its struct.
     fn emit_func_named(&mut self, f: &Func, c_name: &str) {
         self.scopes.clear();
+        self.try_counter = 0;
         self.current_ret = self.resolve_ty(&f.ret);
         let ret = self.cty(&f.ret);
         let params = self.format_params(&f.params);
@@ -516,10 +568,17 @@ impl<'a> Emitter<'a> {
                 value,
                 ..
             } => {
-                // Coerce the initializer to the declared type (a `T` value or
-                // `null` widens to `?T` when the annotation is optional).
+                // Coerce the initializer to the declared type (a `T` value,
+                // `null` or `error.X` widens to `?T` / `!T` when annotated).
                 let lty = self.resolve_ty(ty);
-                let es = self.emit_coerced(value, lty);
+                let es = if let Expr::Try { expr, .. } = value {
+                    // `var x = try e;` hoists the error propagation (which may
+                    // early-return) and binds the unwrapped payload.
+                    let payload = self.emit_try(expr);
+                    self.coerce_str(&payload, self.try_payload_type(expr), lty)
+                } else {
+                    self.emit_coerced(value, lty)
+                };
                 let ct = self.cty(ty);
                 let prefix = if *is_const { "const " } else { "" };
                 self.line(&format!("{}{} kd_{} = {};", prefix, ct, name, es));
@@ -643,6 +702,13 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+        // `try e;` as a bare statement: hoist the propagation, discard the
+        // unwrapped payload.
+        if let Expr::Try { expr, .. } = e {
+            let val = self.emit_try(expr);
+            self.line(&format!("(void)({});", val));
+            return false;
+        }
         let es = self.emit_expr(e);
         self.line(&format!("{};", es));
         false
@@ -650,16 +716,31 @@ impl<'a> Emitter<'a> {
 
     fn emit_return(&mut self, value: &Option<Expr>) {
         let ret_ty = self.current_ret;
+        // Compute the (coerced) C return-value string, or `None` for `return;`.
+        // A `return try e;` first hoists the error propagation — which itself
+        // early-returns on error — then returns the unwrapped payload coerced
+        // back to the (error-union) return type.
+        let val_str: Option<String> = match value {
+            None => None,
+            Some(Expr::Try { expr, .. }) => {
+                let payload = self.emit_try(expr);
+                Some(self.coerce_str(&payload, self.try_payload_type(expr), ret_ty))
+            }
+            Some(e) => Some(self.emit_coerced(e, ret_ty)),
+        };
+        self.finish_return(val_str, ret_ty);
+    }
+
+    /// Emit the actual `return` (with the deferred-temp dance) from a
+    /// pre-computed, already-coerced value string. Shared by ordinary returns
+    /// and `return try e;`.
+    fn finish_return(&mut self, val_str: Option<String>, ret_ty: Type) {
         let non_void = ret_ty != Type::Void;
         let active = self.any_defer_active();
         if active && non_void {
             // Evaluate the value into a temporary *before* running the defers,
-            // since the defers may mutate state the value depends on. Coerce it
-            // to the (possibly optional) return type first.
-            let es = match value {
-                Some(e) => self.emit_coerced(e, ret_ty),
-                None => "0".to_string(),
-            };
+            // since the defers may mutate state the value depends on.
+            let es = val_str.unwrap_or_else(|| "0".to_string());
             let ret = self.cty_of(ret_ty);
             self.line(&format!("{} __kd_ret = ({});", ret, es));
             self.flush_all_reversed();
@@ -668,13 +749,76 @@ impl<'a> Emitter<'a> {
             if active {
                 self.flush_all_reversed();
             }
-            match value {
-                Some(e) => {
-                    let es = self.emit_coerced(e, ret_ty);
-                    self.line(&format!("return ({});", es));
-                }
+            match val_str {
+                Some(es) => self.line(&format!("return ({});", es)),
                 None => self.line("return;"),
             }
+        }
+    }
+
+    /// Lower a `try inner` at a statement position: hoist `inner` (an `!T`) into
+    /// a fresh `__kd_tryN` temporary, propagate the error out of the enclosing
+    /// function (flushing active defers first, per SPEC §12.3), and return the C
+    /// expression (`__kd_tryN.val`) that yields the unwrapped payload.
+    fn emit_try(&mut self, inner: &Expr) -> String {
+        let n = self.try_counter;
+        self.try_counter += 1;
+        let temp = format!("__kd_try{}", n);
+        // The temp holds the inner expression's own error-union value.
+        let err_cty = match self.type_of_expr(inner) {
+            Some(t @ Type::ErrorUnion(_)) => self.cty_of(t),
+            // Validated input always resolves the inner; fall back to the
+            // enclosing function's error-union type (same `{err,val}` layout).
+            _ => self.cty_of(self.current_ret),
+        };
+        let es = self.emit_expr(inner);
+        self.line(&format!("{} {} = {};", err_cty, temp, es));
+        self.line(&format!("if ({}.err != 0) {{", temp));
+        self.indent += 1;
+        self.flush_all_reversed();
+        let ret_cty = self.cty_of(self.current_ret);
+        self.line(&format!("return ({}){{ .err = {}.err }};", ret_cty, temp));
+        self.indent -= 1;
+        self.line("}");
+        format!("{}.val", temp)
+    }
+
+    /// The payload type `T` of a `try inner` (i.e. the inner `!T`'s payload),
+    /// used to coerce the unwrapped value back into a wider position. Falls back
+    /// to the enclosing function's payload, which `try` always matches.
+    fn try_payload_type(&self, inner: &Expr) -> Type {
+        match self.type_of_expr(inner) {
+            Some(Type::ErrorUnion(id)) => self.structs.error_union_payload(id),
+            _ => match self.current_ret {
+                Type::ErrorUnion(id) => self.structs.error_union_payload(id),
+                other => other,
+            },
+        }
+    }
+
+    /// Coerce a raw C-expression string of source type `src` to `expected`,
+    /// mirroring [`Emitter::emit_coerced`] but for a value that is already a
+    /// string (e.g. a `try` payload). Widens `T` to `?T` / `!T`; an already-wide
+    /// value (or a non-optional/non-error target) passes through unchanged.
+    fn coerce_str(&self, raw: &str, src: Type, expected: Type) -> String {
+        match expected {
+            Type::Optional(oid) => {
+                if matches!(src, Type::Optional(_)) {
+                    raw.to_string()
+                } else {
+                    let oname = self.structs.optional_c_name(oid);
+                    format!("(({}){{ .has = true, .val = {} }})", oname, raw)
+                }
+            }
+            Type::ErrorUnion(eid) => {
+                if matches!(src, Type::ErrorUnion(_)) {
+                    raw.to_string()
+                } else {
+                    let ename = self.structs.error_union_c_name(eid);
+                    format!("(({}){{ .err = 0, .val = {} }})", ename, raw)
+                }
+            }
+            _ => raw.to_string(),
         }
     }
 
@@ -929,6 +1073,36 @@ impl<'a> Emitter<'a> {
                     _ => format!("({})", inner),
                 }
             }
+            Expr::ErrorLit { name, .. } => {
+                // A bare `error.Name` reaches here only with no expected `!T` to
+                // wrap into; coercion (`emit_coerced`) handles every legitimate
+                // use, so this is unreachable for validated input. Emit the bare
+                // 1-based error code so the output stays syntactically valid.
+                let code = self.structs.error_code(name).unwrap_or(0);
+                code.to_string()
+            }
+            Expr::Try { expr, .. } => {
+                // `try` is statement-level (SPEC §12.1) and is lowered by the
+                // statement emitters (`emit_try`); sema rejects it in any other
+                // expression position (E0191). This arm is unreachable for
+                // validated input — emit the inner value so output stays valid.
+                format!("({})", self.emit_expr(expr))
+            }
+            Expr::Catch { expr, default, .. } => {
+                // `e catch d` → `kd_err_<tag>_catch(<e>, <d>)`; `d` is eager and
+                // coerced to the payload type.
+                let l = self.emit_expr(expr);
+                match self.type_of_expr(expr) {
+                    Some(Type::ErrorUnion(eid)) => {
+                        let ename = self.structs.error_union_c_name(eid);
+                        let payload = self.structs.error_union_payload(eid);
+                        let r = self.emit_coerced(default, payload);
+                        format!("{}_catch({}, {})", ename, l, r)
+                    }
+                    // Unreachable for validated input (`expr` is always `!T`).
+                    _ => format!("({})", l),
+                }
+            }
         }
     }
 
@@ -1111,6 +1285,18 @@ impl<'a> Emitter<'a> {
                 Type::Optional(id) => Some(self.structs.optional_inner(id)),
                 other => Some(other),
             },
+            // A bare `error.Name` has no intrinsic type — its `!T` comes from
+            // context (it coerces to any error union).
+            Expr::ErrorLit { .. } => None,
+            // `try` / `catch` both produce the payload `T` of the `!T` operand.
+            Expr::Try { expr, .. } => match self.type_of_expr(expr)? {
+                Type::ErrorUnion(id) => Some(self.structs.error_union_payload(id)),
+                other => Some(other),
+            },
+            Expr::Catch { expr, .. } => match self.type_of_expr(expr)? {
+                Type::ErrorUnion(id) => Some(self.structs.error_union_payload(id)),
+                other => Some(other),
+            },
         }
     }
 
@@ -1133,6 +1319,22 @@ impl<'a> Emitter<'a> {
             // Otherwise it is a `T` value being widened to `?T`.
             let inner = self.emit_expr(e);
             return format!("(({}){{ .has = true, .val = {} }})", oname, inner);
+        }
+        if let Type::ErrorUnion(eid) = expected {
+            let ename = self.structs.error_union_c_name(eid);
+            // An `error.Name` literal becomes a failure value carrying its code.
+            if let Expr::ErrorLit { name, .. } = e {
+                let code = self.structs.error_code(name).unwrap_or(0);
+                return format!("(({}){{ .err = {} }})", ename, code);
+            }
+            // Already an error-union value? Pass it through. (sema dedups, so a
+            // structurally-equal but differently-interned `!T` cannot occur.)
+            if matches!(self.type_of_expr(e), Some(Type::ErrorUnion(_))) {
+                return self.emit_expr(e);
+            }
+            // Otherwise it is a `T` value being widened to a success `!T`.
+            let inner = self.emit_expr(e);
+            return format!("(({}){{ .err = 0, .val = {} }})", ename, inner);
         }
         self.emit_expr(e)
     }
@@ -1202,6 +1404,7 @@ impl<'a> Emitter<'a> {
 
     fn emit_test_fn(&mut self, idx: usize, t: &TestBlock) {
         self.scopes.clear();
+        self.try_counter = 0;
         self.current_ret = Type::I32; // the harness test functions return `int`
         self.line(&format!("static int kd_test_{}(void) {{", idx));
         self.indent += 1;
@@ -1267,6 +1470,7 @@ mod tests {
         TypeExpr {
             name: name.to_string(),
             optional: false,
+            error_union: false,
             span: Span::DUMMY,
         }
     }
@@ -1275,6 +1479,16 @@ mod tests {
         TypeExpr {
             name: name.to_string(),
             optional: true,
+            error_union: false,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn err_ty(name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: false,
+            error_union: true,
             span: Span::DUMMY,
         }
     }
@@ -2340,5 +2554,313 @@ mod tests {
             out.contains("return (((kd_opt_int32_t){ .has = true, .val = 9 }));"),
             "optional return coercion wrong:\n{out}"
         );
+    }
+
+    // -- error unions (v0.115) ----------------------------------------------
+
+    /// A `StructTable` with a single interned `!i32` (`kd_err_int32_t`, id 0).
+    fn err_int_table() -> StructTable {
+        let mut t = StructTable::new();
+        t.intern_error_union(Type::I32);
+        t
+    }
+
+    fn error_lit(name: &str) -> Expr {
+        Expr::ErrorLit {
+            name: name.to_string(),
+            span: Span::DUMMY,
+        }
+    }
+
+    fn call(callee: &str, args: Vec<Expr>) -> Expr {
+        Expr::Call {
+            callee: callee.to_string(),
+            args,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn try_expr(inner: Expr) -> Expr {
+        Expr::Try {
+            expr: Box::new(inner),
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn error_union_typedef_and_catch_emitted() {
+        // The typedef + inline `_catch` come straight off `error_unions`.
+        let structs = err_int_table();
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("typedef struct { int32_t err; int32_t val; } kd_err_int32_t;"),
+            "error-union typedef missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "static inline int32_t kd_err_int32_t_catch(kd_err_int32_t e, int32_t d) { return e.err == 0 ? e.val : d; }"
+            ),
+            "catch helper missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn error_lit_coerces_to_err_code() {
+        // fn f() !i32 { return error.Oops; }  — the error literal carries its code.
+        let mut structs = StructTable::new();
+        structs.intern_error_union(Type::I32);
+        structs.intern_error("Oops"); // 1-based code 1
+
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: err_ty("i32"),
+            body: block(vec![ret(error_lit("Oops"))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The `!i32` return type uses the error-union typedef.
+        assert!(
+            out.contains("kd_err_int32_t kd_f(void)"),
+            "error-union return type wrong:\n{out}"
+        );
+        // `error.Oops` widens to a failure value carrying its 1-based code.
+        assert!(
+            out.contains("return (((kd_err_int32_t){ .err = 1 }));"),
+            "error literal coercion wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn value_coerces_to_success_error_union() {
+        // fn f() !i32 { return 9; }  — a `T` value widens to a success `!i32`.
+        let structs = err_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: err_ty("i32"),
+            body: block(vec![ret(int(9))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("return (((kd_err_int32_t){ .err = 0, .val = 9 }));"),
+            "success-value coercion wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn catch_emits_helper_call() {
+        // fn f(x: !i32) i32 { return x catch 0; }
+        let structs = err_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![Param {
+                name: "x".to_string(),
+                ty: err_ty("i32"),
+                span: Span::DUMMY,
+            }],
+            ret: ty("i32"),
+            body: block(vec![ret(Expr::Catch {
+                expr: Box::new(ident("x")),
+                default: Box::new(int(0)),
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The `!i32` param is typed with the error-union typedef.
+        assert!(
+            out.contains("int32_t kd_f(kd_err_int32_t kd_x)"),
+            "error-union param type wrong:\n{out}"
+        );
+        // `catch` lowers to the inline helper call.
+        assert!(
+            out.contains("kd_err_int32_t_catch(kd_x, 0)"),
+            "catch lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn try_let_emits_temp_if_and_propagation() {
+        // fn g() !i32 { return 1; }
+        // fn f() !i32 { var x = try g(); return x; }
+        let structs = err_int_table();
+        let g = Func {
+            is_pub: false,
+            name: "g".to_string(),
+            params: vec![],
+            ret: err_ty("i32"),
+            body: block(vec![ret(int(1))]),
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: err_ty("i32"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "x".to_string(),
+                    ty: ty("i32"),
+                    value: try_expr(call("g", vec![])),
+                    span: Span::DUMMY,
+                },
+                ret(ident("x")),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(g), Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The temp holds the inner call's error-union value.
+        assert!(
+            out.contains("kd_err_int32_t __kd_try0 = kd_g();"),
+            "try temp hoist wrong:\n{out}"
+        );
+        // On error, propagate it out of the enclosing function.
+        assert!(
+            out.contains("if (__kd_try0.err != 0) {"),
+            "try error check missing:\n{out}"
+        );
+        assert!(
+            out.contains("return (kd_err_int32_t){ .err = __kd_try0.err };"),
+            "try error propagation wrong:\n{out}"
+        );
+        // The bound local takes the unwrapped payload.
+        assert!(
+            out.contains("int32_t kd_x = __kd_try0.val;"),
+            "try payload binding wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn try_return_propagates_and_wraps_payload() {
+        // fn g() !i32 { return 1; }
+        // fn f() !i32 { return try g(); }
+        let structs = err_int_table();
+        let g = Func {
+            is_pub: false,
+            name: "g".to_string(),
+            params: vec![],
+            ret: err_ty("i32"),
+            body: block(vec![ret(int(1))]),
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: err_ty("i32"),
+            body: block(vec![ret(try_expr(call("g", vec![])))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(g), Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_err_int32_t __kd_try0 = kd_g();"),
+            "try temp hoist wrong:\n{out}"
+        );
+        assert!(
+            out.contains("return (kd_err_int32_t){ .err = __kd_try0.err };"),
+            "try error propagation wrong:\n{out}"
+        );
+        // The success path wraps the unwrapped payload back into `!i32`.
+        assert!(
+            out.contains("return (((kd_err_int32_t){ .err = 0, .val = __kd_try0.val }));"),
+            "try success wrap wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn try_statement_discards_payload() {
+        // fn g() !i32 { return 1; }
+        // fn f() !i32 { try g(); return 0; }
+        let structs = err_int_table();
+        let g = Func {
+            is_pub: false,
+            name: "g".to_string(),
+            params: vec![],
+            ret: err_ty("i32"),
+            body: block(vec![ret(int(1))]),
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: err_ty("i32"),
+            body: block(vec![Stmt::Expr(try_expr(call("g", vec![]))), ret(int(0))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(g), Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_err_int32_t __kd_try0 = kd_g();"),
+            "try temp hoist wrong:\n{out}"
+        );
+        // The payload is discarded.
+        assert!(
+            out.contains("(void)(__kd_try0.val);"),
+            "try statement discard wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn try_return_flushes_defers_on_error_path() {
+        // fn g() !i32 { return 1; }
+        // fn f() !i32 { defer print(7); return try g(); }
+        // The error path must flush active defers before propagating.
+        let structs = err_int_table();
+        let g = Func {
+            is_pub: false,
+            name: "g".to_string(),
+            params: vec![],
+            ret: err_ty("i32"),
+            body: block(vec![ret(int(1))]),
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: err_ty("i32"),
+            body: block(vec![defer(print(int(7))), ret(try_expr(call("g", vec![])))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(g), Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        let check = out.find("if (__kd_try0.err != 0) {").expect("error check missing");
+        let flush = out[check..]
+            .find("kd_print((long long)(7));")
+            .map(|i| check + i)
+            .expect("defer flush on error path missing");
+        let prop = out[check..]
+            .find("return (kd_err_int32_t){ .err = __kd_try0.err };")
+            .map(|i| check + i)
+            .expect("error propagation missing");
+        // Inside the error branch the defer runs before the propagation return.
+        assert!(flush < prop, "defer must flush before propagation:\n{out}");
     }
 }

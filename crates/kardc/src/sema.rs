@@ -32,6 +32,12 @@
 //! - `E0180` — a bare `null` with no expected optional type at its position.
 //! - `E0181` — `orelse` whose left operand is not an optional (`?T`).
 //! - `E0182` — `.?` (force-unwrap) whose operand is not an optional (`?T`).
+//! - `E0190` — `try` whose operand is not an error union, or whose enclosing
+//!   function does not return an error union (`!T`).
+//! - `E0191` — `try` used outside a statement-level position (initializer,
+//!   `return`, or expression statement).
+//! - `E0192` — `catch` whose left operand is not an error union (`!T`).
+//! - `E0193` — an `error.Name` value with no expected error-union (`!T`) type.
 
 use std::collections::{HashMap, HashSet};
 
@@ -131,6 +137,9 @@ impl Checker {
             Type::Struct(id) => self.structs.get(id).name.clone(),
             Type::Optional(id) => {
                 format!("?{}", self.type_name(self.structs.optional_inner(id)))
+            }
+            Type::ErrorUnion(id) => {
+                format!("!{}", self.type_name(self.structs.error_union_payload(id)))
             }
             other => other.name().to_string(),
         }
@@ -387,12 +396,15 @@ impl Checker {
     /// When the [`TypeExpr`] is written `?T` (`optional`), the inner type is
     /// resolved first and the result is `Type::Optional(intern_optional(inner))`
     /// — so optional types are interned the moment a signature, field or local
-    /// declaration mentions them (SPEC §11.1).
+    /// declaration mentions them (SPEC §11.1). Likewise `!T` (`error_union`)
+    /// resolves to `Type::ErrorUnion(intern_error_union(payload))` (SPEC §12.1).
     fn resolve_type_opt(&mut self, te: &TypeExpr) -> Option<Type> {
         let inner =
             Type::from_name(&te.name).or_else(|| self.structs.id_of(&te.name).map(Type::Struct))?;
         if te.optional {
             Some(Type::Optional(self.structs.intern_optional(inner)))
+        } else if te.error_union {
+            Some(Type::ErrorUnion(self.structs.intern_error_union(inner)))
         } else {
             Some(inner)
         }
@@ -441,6 +453,8 @@ impl Checker {
         };
         if te.optional {
             Some(Type::Optional(self.structs.intern_optional(inner)))
+        } else if te.error_union {
+            Some(Type::ErrorUnion(self.structs.intern_error_union(inner)))
         } else {
             Some(inner)
         }
@@ -466,12 +480,11 @@ impl Checker {
                 ..
             } => {
                 let declared = self.resolve_type(ty);
-                // With a known annotation, apply optional coercion (§11.2): a
-                // `T` value or `null` widens to an expected `?T`.
-                let vt = match declared {
-                    Some(dt) => self.check_coerce(value, dt),
-                    None => self.check_expr(value, None),
-                };
+                // An initializer is a statement-level position, so a top-level
+                // `try` is allowed (SPEC §12.1). Otherwise, with a known
+                // annotation, apply optional / error-union coercion (§11.2,
+                // §12.2): a `T` value, `null`, or `error.X` widens to `?T`/`!T`.
+                let vt = self.check_value_with_try(value, declared);
                 if let (Some(dt), Some(vt)) = (declared, vt) {
                     if dt != vt {
                         let msg = format!(
@@ -534,7 +547,9 @@ impl Checker {
                 }
             }
             Stmt::Expr(e) => {
-                self.check_expr(e, None);
+                // An expression statement is a statement-level position, so a
+                // top-level `try` is allowed here (SPEC §12.1).
+                self.check_value_with_try(e, None);
             }
             Stmt::Return { value, span } => match value {
                 Some(e) => {
@@ -544,12 +559,15 @@ impl Checker {
                             "E0110",
                             "cannot return a value from a `void` function",
                         );
-                        self.check_expr(e, None);
+                        // Still a statement-level position: a top-level `try`
+                        // here reports E0190 (non-`!` enclosing fn), not E0191.
+                        self.check_value_with_try(e, None);
                     } else {
                         let expected = self.ret_type;
-                        // Optional coercion (§11.2): `return e` widens `T`/`null`
-                        // to a `?T` function return type.
-                        let vt = self.check_coerce(e, expected);
+                        // `return` is a statement-level position (top-level `try`
+                        // allowed, SPEC §12.1); otherwise `T`/`null`/`error.X`
+                        // widen to a `?T`/`!T` return type (§11.2, §12.2).
+                        let vt = self.check_value_with_try(e, Some(expected));
                         if let Some(vt) = vt {
                             if vt != expected {
                                 let msg = format!(
@@ -800,6 +818,77 @@ impl Checker {
                     None => None,
                 }
             }
+            // `error.Name` registers `Name` in the implicit global error set and
+            // coerces to any expected `!T` (SPEC §12.1). With no error-union
+            // expectation at this position it is `E0193`.
+            Expr::ErrorLit { name, span } => {
+                self.structs.intern_error(name);
+                match expected {
+                    Some(Type::ErrorUnion(id)) => Some(Type::ErrorUnion(id)),
+                    _ => {
+                        let msg = format!(
+                            "error value `error.{}` has no expected error-union type here; \
+                             use it where an `!T` is expected",
+                            name
+                        );
+                        self.error(*span, "E0193", msg);
+                        None
+                    }
+                }
+            }
+            // A `try` reaching `check_expr` is not at a statement-level position
+            // (those are routed through `check_value_with_try`), so it is
+            // `E0191` (SPEC §12.1). The operand is still checked to surface its
+            // own errors.
+            Expr::Try { expr: inner, span } => {
+                self.error(
+                    *span,
+                    "E0191",
+                    "`try` is only allowed as the whole value of a `var`/`const` initializer, \
+                     a `return`, or an expression statement",
+                );
+                self.check_expr(inner, None);
+                None
+            }
+            // `expr catch default`: `expr` must be `!T` (else `E0192`); `default`
+            // is a `T`; the result is `T` (SPEC §12.1).
+            Expr::Catch {
+                expr: inner,
+                default,
+                span,
+            } => {
+                let inner_expected = self.as_error_union_expectation(expected);
+                match self.check_expr(inner, inner_expected) {
+                    Some(Type::ErrorUnion(id)) => {
+                        let payload = self.structs.error_union_payload(id);
+                        if let Some(dt) = self.check_expr(default, Some(payload)) {
+                            if dt != payload {
+                                let msg = format!(
+                                    "`catch` default type mismatch: expected `{}`, found `{}`",
+                                    self.type_name(payload),
+                                    self.type_name(dt)
+                                );
+                                self.error(default.span(), "E0110", msg);
+                            }
+                        }
+                        Some(payload)
+                    }
+                    Some(other) => {
+                        let msg = format!(
+                            "`catch` requires an error-union (`!T`) left operand, found `{}`",
+                            self.type_name(other)
+                        );
+                        self.error(*span, "E0192", msg);
+                        // Still check the default to surface its own errors.
+                        self.check_expr(default, None);
+                        None
+                    }
+                    None => {
+                        self.check_expr(default, None);
+                        None
+                    }
+                }
+            }
         }
     }
 
@@ -817,33 +906,125 @@ impl Checker {
         }
     }
 
+    /// The error-union analogue of [`as_optional_expectation`]: when a `catch`'s
+    /// *result* is expected to be `T`, its left operand should be `!T`. An
+    /// expected payload `T` becomes `!T` (interning it if necessary), an
+    /// already-`!T` expectation is kept, and no expectation stays `None`.
+    fn as_error_union_expectation(&mut self, expected: Option<Type>) -> Option<Type> {
+        match expected {
+            Some(t @ Type::ErrorUnion(_)) => Some(t),
+            Some(other) => Some(Type::ErrorUnion(self.structs.intern_error_union(other))),
+            None => None,
+        }
+    }
+
     /// Type-check `expr` against an expected type, applying optional coercion
-    /// (SPEC §11.2). When `expected` is `?T`, this accepts:
+    /// (SPEC §11.2) and error-union coercion (SPEC §12.2). When `expected` is
+    /// `?T`, this accepts:
     /// - a `null` literal (which adopts `?T`),
     /// - a value whose type is the inner `T` (which widens to `?T`), or
-    /// - a value already of type `?T`,
-    /// returning the expected `?T` in each accepting case so the caller's
-    /// equality check passes. Any other type is returned unchanged for the
-    /// caller to report as `E0110`. For a non-optional `expected`, this is just
+    /// - a value already of type `?T`.
+    /// When `expected` is `!T`, this accepts:
+    /// - an `error.X` literal (which adopts `!T`),
+    /// - a value whose type is the payload `T` (which widens to `!T`), or
+    /// - a value already of type `!T`.
+    /// In each accepting case the expected composite type is returned so the
+    /// caller's equality check passes. Any other type is returned unchanged for
+    /// the caller to report as `E0110`. For a plain `expected`, this is just
     /// [`check_expr`] with that expectation.
     fn check_coerce(&mut self, expr: &Expr, expected: Type) -> Option<Type> {
-        if let Type::Optional(id) = expected {
-            // `null` adopts the optional type directly.
-            if matches!(expr, Expr::Null { .. }) {
-                return self.check_expr(expr, Some(expected));
+        match expected {
+            Type::Optional(id) => {
+                // `null` adopts the optional type directly.
+                if matches!(expr, Expr::Null { .. }) {
+                    return self.check_expr(expr, Some(expected));
+                }
+                // Otherwise check against the inner `T` so that integer literals
+                // and nested constructs adopt it, then accept either `T`
+                // (coerces) or an already-`?T` value.
+                let inner = self.structs.optional_inner(id);
+                let vt = self.check_expr(expr, Some(inner))?;
+                if vt == inner || vt == expected {
+                    Some(expected)
+                } else {
+                    Some(vt)
+                }
             }
-            // Otherwise check against the inner `T` so that integer literals and
-            // nested constructs adopt it, then accept either `T` (coerces) or an
-            // already-`?T` value.
-            let inner = self.structs.optional_inner(id);
-            let vt = self.check_expr(expr, Some(inner))?;
-            if vt == inner || vt == expected {
-                Some(expected)
-            } else {
-                Some(vt)
+            Type::ErrorUnion(id) => {
+                // `error.X` adopts the error-union type directly.
+                if matches!(expr, Expr::ErrorLit { .. }) {
+                    return self.check_expr(expr, Some(expected));
+                }
+                // Otherwise check against the payload `T` so integer literals
+                // adopt it, then accept either `T` (coerces) or an already-`!T`
+                // value.
+                let payload = self.structs.error_union_payload(id);
+                let vt = self.check_expr(expr, Some(payload))?;
+                if vt == payload || vt == expected {
+                    Some(expected)
+                } else {
+                    Some(vt)
+                }
             }
+            _ => self.check_expr(expr, Some(expected)),
+        }
+    }
+
+    /// Check the value expression of a statement-level position — a `var`/`const`
+    /// initializer, a `return`, or an expression statement — where a *top-level*
+    /// `try` is permitted (SPEC §12.1). If `value` is a `try`, it is handled by
+    /// [`check_try`] (yielding the operand's payload, then coerced to `declared`
+    /// if given); otherwise it is checked normally, so a `try` nested anywhere
+    /// inside is reported as `E0191` by [`check_expr`].
+    fn check_value_with_try(&mut self, value: &Expr, declared: Option<Type>) -> Option<Type> {
+        if let Expr::Try { expr: inner, span } = value {
+            let payload = self.check_try(inner, *span)?;
+            Some(match declared {
+                Some(dt) => self.coerce_type(payload, dt),
+                None => payload,
+            })
         } else {
-            self.check_expr(expr, Some(expected))
+            match declared {
+                Some(dt) => self.check_coerce(value, dt),
+                None => self.check_expr(value, None),
+            }
+        }
+    }
+
+    /// Type-check `try inner` at a statement-level position (SPEC §12.1). The
+    /// enclosing function must return some `!U` (`E0190`) and `inner` must be an
+    /// error union `!T` (`E0190`); the result is the payload `T`. (Propagation
+    /// of the error is the backend's job — see SPEC §12.3.)
+    fn check_try(&mut self, inner: &Expr, span: Span) -> Option<Type> {
+        if !matches!(self.ret_type, Type::ErrorUnion(_)) {
+            let msg = format!(
+                "`try` requires the enclosing function to return an error union (`!T`), found `{}`",
+                self.type_name(self.ret_type)
+            );
+            self.error(span, "E0190", msg);
+        }
+        match self.check_expr(inner, None)? {
+            Type::ErrorUnion(id) => Some(self.structs.error_union_payload(id)),
+            other => {
+                let msg = format!(
+                    "`try` requires an error-union (`!T`) operand, found `{}`",
+                    self.type_name(other)
+                );
+                self.error(span, "E0190", msg);
+                None
+            }
+        }
+    }
+
+    /// The type a value of type `from` takes at a position expecting `to`,
+    /// applying the implicit widenings `T -> ?T` (§11.2) and `T -> !T` (§12.2).
+    /// Used for a `try` result (a payload `T`) flowing into a `?T`/`!T` target.
+    /// Returns `to` when the widening applies, otherwise `from` unchanged.
+    fn coerce_type(&self, from: Type, to: Type) -> Type {
+        match to {
+            Type::Optional(id) if self.structs.optional_inner(id) == from => to,
+            Type::ErrorUnion(id) if self.structs.error_union_payload(id) == from => to,
+            _ => from,
         }
     }
 
@@ -1396,6 +1577,7 @@ mod tests {
         TypeExpr {
             name: name.into(),
             optional: false,
+            error_union: false,
             span: sp(),
         }
     }
@@ -1404,8 +1586,48 @@ mod tests {
         TypeExpr {
             name: name.into(),
             optional: true,
+            error_union: false,
             span: sp(),
         }
+    }
+    /// An error-union type expression `!name`.
+    fn te_err(name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.into(),
+            optional: false,
+            error_union: true,
+            span: sp(),
+        }
+    }
+    fn error_lit(name: &str) -> Expr {
+        Expr::ErrorLit {
+            name: name.into(),
+            span: sp(),
+        }
+    }
+    fn try_expr(e: Expr) -> Expr {
+        Expr::Try {
+            expr: Box::new(e),
+            span: sp(),
+        }
+    }
+    fn catch_expr(e: Expr, default: Expr) -> Expr {
+        Expr::Catch {
+            expr: Box::new(e),
+            default: Box::new(default),
+            span: sp(),
+        }
+    }
+    /// A function with an arbitrary [`TypeExpr`] return type (e.g. `!i32`).
+    fn func_te(name: &str, params: Vec<Param>, ret: TypeExpr, body: Vec<Stmt>) -> Item {
+        Item::Func(Func {
+            is_pub: false,
+            name: name.into(),
+            params,
+            ret,
+            body: block(body),
+            span: sp(),
+        })
     }
     fn null_lit() -> Expr {
         Expr::Null { span: sp() }
@@ -2460,5 +2682,236 @@ mod tests {
             ),
         ];
         assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    // ---- error-union tests (v0.115) --------------------------------------
+
+    #[test]
+    fn error_union_return_value_and_errorlit_coerce_ok() {
+        // fn f() !i32 { return 3; }      // T coerces to !T on return
+        // fn g() !i32 { return error.Oops; }   // error.X coerces to !T
+        let items = vec![
+            func_te("f", vec![], te_err("i32"), vec![ret(Some(int(3)))]),
+            func_te("g", vec![], te_err("i32"), vec![ret(Some(error_lit("Oops")))]),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn catch_yields_payload_type_ok() {
+        // fn f() !i32 { return 1; }
+        // fn main() void { var v: i32 = f() catch 0; print(v); }
+        let items = vec![
+            func_te("f", vec![], te_err("i32"), vec![ret(Some(int(1)))]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("v", "i32", catch_expr(call("f", vec![]), int(0))),
+                    Stmt::Expr(call("print", vec![ident("v")])),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn try_in_let_initializer_ok() {
+        // fn f() !i32 { return 1; }
+        // fn g() !i32 { var x: i32 = try f(); return x; }
+        let items = vec![
+            func_te("f", vec![], te_err("i32"), vec![ret(Some(int(1)))]),
+            func_te(
+                "g",
+                vec![],
+                te_err("i32"),
+                vec![
+                    let_var("x", "i32", try_expr(call("f", vec![]))),
+                    ret(Some(ident("x"))),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn try_as_expression_statement_ok() {
+        // fn f() !i32 { return 1; }
+        // fn g() !i32 { try f(); return 0; }
+        let items = vec![
+            func_te("f", vec![], te_err("i32"), vec![ret(Some(int(1)))]),
+            func_te(
+                "g",
+                vec![],
+                te_err("i32"),
+                vec![Stmt::Expr(try_expr(call("f", vec![]))), ret(Some(int(0)))],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn return_try_coerces_payload_to_error_union_ok() {
+        // fn f() !i32 { return 1; }
+        // fn g() !i32 { return try f(); }   // try yields i32, coerces to !i32
+        let items = vec![
+            func_te("f", vec![], te_err("i32"), vec![ret(Some(int(1)))]),
+            func_te(
+                "g",
+                vec![],
+                te_err("i32"),
+                vec![ret(Some(try_expr(call("f", vec![]))))],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn try_outside_error_union_fn_is_e0190() {
+        // fn f() !i32 { return 1; }
+        // fn main() void { var x: i32 = try f(); }   // enclosing returns void
+        let items = vec![
+            func_te("f", vec![], te_err("i32"), vec![ret(Some(int(1)))]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("x", "i32", try_expr(call("f", vec![])))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0190"));
+    }
+
+    #[test]
+    fn try_on_non_error_union_operand_is_e0190() {
+        // fn g() !i32 { var x: i32 = try 5; return x; }   // 5 is not an !T
+        let items = vec![func_te(
+            "g",
+            vec![],
+            te_err("i32"),
+            vec![
+                let_var("x", "i32", try_expr(int(5))),
+                ret(Some(ident("x"))),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0190"));
+    }
+
+    #[test]
+    fn try_in_compound_expr_is_e0191() {
+        // fn f() !i32 { return 1; }
+        // fn g() !i32 { var x: i32 = (try f()) + 1; return x; }
+        let items = vec![
+            func_te("f", vec![], te_err("i32"), vec![ret(Some(int(1)))]),
+            func_te(
+                "g",
+                vec![],
+                te_err("i32"),
+                vec![
+                    let_var(
+                        "x",
+                        "i32",
+                        bin(BinOp::Add, try_expr(call("f", vec![])), int(1)),
+                    ),
+                    ret(Some(ident("x"))),
+                ],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0191"));
+    }
+
+    #[test]
+    fn catch_on_non_error_union_is_e0192() {
+        // fn f(x: i32) void { var v: i32 = x catch 0; }   // x is i32, not !T
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "void",
+            vec![let_var("v", "i32", catch_expr(ident("x"), int(0)))],
+        )];
+        assert!(codes(items).contains(&"E0192"));
+    }
+
+    #[test]
+    fn error_lit_without_context_is_e0193() {
+        // fn f() void { var x: i32 = error.Oops; }   // i32 is not an !T
+        let items = vec![func(
+            "f",
+            vec![],
+            "void",
+            vec![let_var("x", "i32", error_lit("Oops"))],
+        )];
+        assert!(codes(items).contains(&"E0193"));
+    }
+
+    #[test]
+    fn catch_default_type_mismatch_is_e0110() {
+        // fn f() !i32 { return 1; }
+        // fn main() void { var v: i32 = f() catch true; }   // default is bool
+        let items = vec![
+            func_te("f", vec![], te_err("i32"), vec![ret(Some(int(1)))]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("v", "i32", catch_expr(call("f", vec![]), boolean(true)))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn error_union_interned_in_table_and_error_registered() {
+        // fn f() !i32 { return error.Oops; }
+        // The table holds one error union over i32 and registers `Oops` (code 1).
+        let items = vec![func_te(
+            "f",
+            vec![],
+            te_err("i32"),
+            vec![ret(Some(error_lit("Oops")))],
+        )];
+        let m = Module { items };
+        let table = check(&m).expect("error-union program should type-check");
+        let erus: Vec<Type> = table.error_unions().map(|(_, t)| t).collect();
+        assert_eq!(erus, vec![Type::I32]);
+        assert_eq!(table.error_code("Oops"), Some(1));
+    }
+
+    #[test]
+    fn error_union_struct_field_ok_and_interned() {
+        // const Box = struct { val: !i32 };
+        // fn mk() Box { return Box{ .val = 9 }; }          // T coerces in field
+        // fn err() Box { return Box{ .val = error.Oops }; } // error.X in field
+        let box_struct = Item::Struct(StructDecl {
+            is_pub: false,
+            name: "Box".into(),
+            fields: vec![FieldDecl {
+                name: "val".into(),
+                ty: te_err("i32"),
+                span: sp(),
+            }],
+            methods: Vec::new(),
+            span: sp(),
+        });
+        let items = vec![
+            box_struct,
+            func_te("mk", vec![], te("Box"), vec![ret(Some(struct_lit("Box", vec![("val", int(9))])))]),
+            func_te(
+                "err",
+                vec![],
+                te("Box"),
+                vec![ret(Some(struct_lit("Box", vec![("val", error_lit("Oops"))])))],
+            ),
+        ];
+        let m = Module { items };
+        let table = check(&m).expect("error-union-field program should type-check");
+        let erus: Vec<Type> = table.error_unions().map(|(_, t)| t).collect();
+        assert_eq!(erus, vec![Type::I32]);
+        let id = table.id_of("Box").unwrap();
+        assert_eq!(
+            table.get(id).fields,
+            vec![("val".to_string(), Type::ErrorUnion(0))]
+        );
     }
 }

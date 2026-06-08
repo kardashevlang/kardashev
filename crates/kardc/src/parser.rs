@@ -265,11 +265,13 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
-    /// Parse a type reference (SPEC §11.1). A leading `?` marks an optional
-    /// type `?T`: the parser records `optional = true` and parses the inner
-    /// type name. v0.114 forbids nesting (`??T`), which sema rejects; the
-    /// parser only ever consumes a single leading `?`. A type with no `?` has
-    /// `optional = false`. The node's span covers the `?` when present.
+    /// Parse a type reference (SPEC §11.1, §12.1). A leading `?` marks an
+    /// optional type `?T` (`optional = true`); a leading `!` marks an error
+    /// union `!T` (`error_union = true`). The two prefixes are **mutually
+    /// exclusive** in v0.115 and the parser consumes at most one: after a `?`
+    /// or `!` it requires the inner type name, so `?!T` / `!?T` fail with an
+    /// "expected identifier" diagnostic. A bare type has both flags `false`.
+    /// The node's span covers the prefix when present.
     fn parse_type(&mut self) -> PResult<TypeExpr> {
         let opt_span = if self.at_punct(&TokenKind::Question) {
             let sp = self.peek_span();
@@ -278,14 +280,24 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        // Only consider a `!` error-union prefix when there was no `?`, so the
+        // two prefixes can never both apply to one type.
+        let err_span = if opt_span.is_none() && self.at_punct(&TokenKind::Bang) {
+            let sp = self.peek_span();
+            self.bump();
+            Some(sp)
+        } else {
+            None
+        };
         let (name, name_span) = self.expect_ident()?;
-        let span = match opt_span {
-            Some(q) => q.merge(name_span),
+        let span = match opt_span.or(err_span) {
+            Some(prefix) => prefix.merge(name_span),
             None => name_span,
         };
         Ok(TypeExpr {
             name,
             optional: opt_span.is_some(),
+            error_union: err_span.is_some(),
             span,
         })
     }
@@ -583,21 +595,35 @@ impl<'a> Parser<'a> {
         self.parse_orelse()
     }
 
-    /// The lowest expression level (SPEC §11.1): `orelse` binds looser than
-    /// every other operator, including `or`. Left-associative, so
-    /// `a orelse b orelse c` nests as `(a orelse b) orelse c`. Each operand is
-    /// a full `or`-expression.
+    /// The lowest expression level (SPEC §11.1, §12.1): `orelse` and `catch`
+    /// bind looser than every other operator, including `or`. They share this
+    /// level and are left-associative, so `a orelse b catch c` nests as
+    /// `((a orelse b) catch c)`. Each operand is a full `or`-expression.
+    /// `a orelse b` unwraps an optional; `a catch b` unwraps an error union.
     fn parse_orelse(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_or()?;
-        while self.at_kw(Kw::Orelse) {
-            self.bump();
-            let rhs = self.parse_or()?;
-            let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Orelse {
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
+        loop {
+            if self.at_kw(Kw::Orelse) {
+                self.bump();
+                let rhs = self.parse_or()?;
+                let span = lhs.span().merge(rhs.span());
+                lhs = Expr::Orelse {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+            } else if self.at_kw(Kw::Catch) {
+                self.bump();
+                let default = self.parse_or()?;
+                let span = lhs.span().merge(default.span());
+                lhs = Expr::Catch {
+                    expr: Box::new(lhs),
+                    default: Box::new(default),
+                    span,
+                };
+            } else {
+                break;
+            }
         }
         Ok(lhs)
     }
@@ -703,6 +729,21 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
+        // `try expr` (SPEC §12.1) is a prefix at the unary level: it parses a
+        // unary operand after it (mirroring the `comptime` prefix) and yields
+        // `Expr::Try`. The parser accepts `try` in any expression position; the
+        // v0.115 statement-level-only restriction (E0190/E0191) is enforced in
+        // sema, not here.
+        if self.at_kw(Kw::Try) {
+            let start = self.peek_span();
+            self.bump(); // `try`
+            let inner = self.parse_unary()?;
+            let span = start.merge(inner.span());
+            return Ok(Expr::Try {
+                expr: Box::new(inner),
+                span,
+            });
+        }
         let op = match self.peek_kind() {
             TokenKind::Minus => Some(UnOp::Neg),
             TokenKind::Bang => Some(UnOp::Not),
@@ -817,6 +858,18 @@ impl<'a> Parser<'a> {
                 // type is taken from the expected type at its position in sema.
                 self.bump();
                 Ok(Expr::Null { span: tok.span })
+            }
+            TokenKind::Keyword(Kw::Error) => {
+                // `error.Name` (SPEC §12.1): an error value from the implicit
+                // global error set. The `error` keyword is always followed by
+                // `.` then the error name; the value coerces to any `!T`.
+                self.bump(); // `error`
+                self.expect_punct(&TokenKind::Dot, "`.`")?;
+                let (name, name_span) = self.expect_ident()?;
+                Ok(Expr::ErrorLit {
+                    name,
+                    span: tok.span.merge(name_span),
+                })
             }
             TokenKind::Ident(name) => {
                 self.bump();
@@ -1213,6 +1266,25 @@ mod tests {
             },
             other => panic!("expected func, got {:?}", other),
         }
+    }
+
+    /// Like [`parse_assign_rhs`] but returns the raw parse result, so a test can
+    /// assert that an ill-formed expression is *rejected*.
+    fn parse_assign_rhs_result(expr_kinds: Vec<TokenKind>) -> Result<Module, Vec<Diagnostic>> {
+        let mut kinds = vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            id("x"),
+            TokenKind::Eq,
+        ];
+        kinds.extend(expr_kinds);
+        kinds.push(TokenKind::Semicolon);
+        kinds.push(TokenKind::RBrace);
+        parse(&toks(kinds))
     }
 
     #[test]
@@ -2071,6 +2143,316 @@ mod tests {
                 assert!(matches!(*rhs, Expr::Ident { ref name, .. } if name == "b"));
             }
             other => panic!("expected orelse at the root, got {:?}", other),
+        }
+    }
+
+    // ---- v0.115: error unions (`!T`, `error.Name`, `try`, `catch`) --------
+
+    #[test]
+    fn error_union_return_type() {
+        // fn f() !i32 { return 0; }  — the `!` marks the return type an error
+        // union; `optional` stays false (the two prefixes are exclusive).
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::Bang,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Int(0),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert_eq!(f.ret.name, "i32");
+                assert!(f.ret.error_union, "`!i32` return must be an error union");
+                assert!(!f.ret.optional, "`!i32` must not also be optional");
+                assert!(f.ret.span.start < f.ret.span.end);
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn error_union_param_and_local_types() {
+        // fn f(a: !i32) void { var x: !bool = true; }  — `!T` works in param and
+        // local positions too, each through the shared `parse_type`.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            id("a"),
+            TokenKind::Colon,
+            TokenKind::Bang,
+            id("i32"),
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Var),
+            id("x"),
+            TokenKind::Colon,
+            TokenKind::Bang,
+            id("bool"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::True),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert!(f.params[0].ty.error_union, "`!i32` param must be an error union");
+                assert!(!f.params[0].ty.optional);
+                match &f.body.stmts[0] {
+                    Stmt::Let { ty, .. } => {
+                        assert_eq!(ty.name, "bool");
+                        assert!(ty.error_union, "`!bool` local must be an error union");
+                        assert!(!ty.optional);
+                    }
+                    other => panic!("expected let, got {:?}", other),
+                }
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn optional_and_error_union_are_mutually_exclusive() {
+        // `?i32` is optional-not-error; `!i32` is error-not-optional. A type is
+        // never flagged as both (SPEC §12.1).
+        fn ret_ty(prefix: TokenKind) -> TypeExpr {
+            let m = parse(&toks(vec![
+                TokenKind::Keyword(Kw::Fn),
+                id("f"),
+                TokenKind::LParen,
+                TokenKind::RParen,
+                prefix,
+                id("i32"),
+                TokenKind::LBrace,
+                TokenKind::Keyword(Kw::Return),
+                TokenKind::Int(0),
+                TokenKind::Semicolon,
+                TokenKind::RBrace,
+            ]))
+            .expect("should parse");
+            match &m.items[0] {
+                Item::Func(f) => f.ret.clone(),
+                other => panic!("expected func, got {:?}", other),
+            }
+        }
+        let q = ret_ty(TokenKind::Question);
+        assert!(q.optional && !q.error_union, "`?i32` is optional only");
+        let bang = ret_ty(TokenKind::Bang);
+        assert!(bang.error_union && !bang.optional, "`!i32` is error-union only");
+    }
+
+    #[test]
+    fn bare_type_has_neither_flag() {
+        // A plain `i32` is neither optional nor an error union (regression guard
+        // for the new `error_union` field).
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Int(0),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert!(!f.ret.optional);
+                assert!(!f.ret.error_union);
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn double_type_prefix_is_rejected() {
+        // `?!i32` is not a valid type: after `?` the parser requires an
+        // identifier and finds `!`, so it reports E0200 (mutual exclusion).
+        let err = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::Question,
+            TokenKind::Bang,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect_err("`?!i32` should fail");
+        assert!(err.iter().any(|d| d.code == "E0200"));
+    }
+
+    #[test]
+    fn error_literal() {
+        // x = error.Oops;  ==>  ErrorLit { name: "Oops" }
+        let e = parse_assign_rhs(vec![
+            TokenKind::Keyword(Kw::Error),
+            TokenKind::Dot,
+            id("Oops"),
+        ]);
+        match e {
+            Expr::ErrorLit { name, span } => {
+                assert_eq!(name, "Oops");
+                assert!(span.start < span.end, "span should cover `error.Oops`");
+            }
+            other => panic!("expected error literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn error_without_dot_is_rejected() {
+        // `error 0` (no `.`) is a syntax error: `error` must be followed by `.`.
+        let e = parse_assign_rhs_result(vec![TokenKind::Keyword(Kw::Error), TokenKind::Int(0)]);
+        let err = e.expect_err("`error 0` should fail");
+        assert!(err.iter().any(|d| d.code == "E0200"));
+    }
+
+    #[test]
+    fn try_prefix_on_call() {
+        // x = try f();  ==>  Try { expr: Call f }
+        let e = parse_assign_rhs(vec![
+            TokenKind::Keyword(Kw::Try),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+        ]);
+        match e {
+            Expr::Try { expr, .. } => {
+                assert!(matches!(*expr, Expr::Call { ref callee, .. } if callee == "f"));
+            }
+            other => panic!("expected try, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn try_as_return_value() {
+        // fn f() void { return try g(); }  — `try` parses as the return value
+        // (statement-position legality is checked later in sema).
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Keyword(Kw::Try),
+            id("g"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        let body = match &m.items[0] {
+            Item::Func(f) => &f.body,
+            other => panic!("expected func, got {:?}", other),
+        };
+        match &body.stmts[0] {
+            Stmt::Return {
+                value: Some(Expr::Try { expr, .. }),
+                ..
+            } => {
+                assert!(matches!(**expr, Expr::Call { ref callee, .. } if callee == "g"));
+            }
+            other => panic!("expected `return try g();`, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn catch_expression() {
+        // x = g() catch 0;  ==>  Catch { expr: Call g, default: Int 0 }
+        let e = parse_assign_rhs(vec![
+            id("g"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::Keyword(Kw::Catch),
+            TokenKind::Int(0),
+        ]);
+        match e {
+            Expr::Catch { expr, default, .. } => {
+                assert!(matches!(*expr, Expr::Call { ref callee, .. } if callee == "g"));
+                assert!(matches!(*default, Expr::Int { value: 0, .. }));
+            }
+            other => panic!("expected catch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn catch_is_left_associative() {
+        // a catch b catch c  ==>  ((a catch b) catch c)
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Keyword(Kw::Catch),
+            id("b"),
+            TokenKind::Keyword(Kw::Catch),
+            id("c"),
+        ]);
+        match e {
+            Expr::Catch { expr, default, .. } => {
+                assert!(matches!(*default, Expr::Ident { ref name, .. } if name == "c"));
+                assert!(matches!(*expr, Expr::Catch { .. }), "left operand should nest");
+            }
+            other => panic!("expected catch at the root, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn catch_shares_level_with_orelse() {
+        // a orelse b catch c  ==>  ((a orelse b) catch c)  — `catch` and `orelse`
+        // share the lowest precedence level and are left-associative.
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Keyword(Kw::Orelse),
+            id("b"),
+            TokenKind::Keyword(Kw::Catch),
+            id("c"),
+        ]);
+        match e {
+            Expr::Catch { expr, default, .. } => {
+                assert!(matches!(*default, Expr::Ident { ref name, .. } if name == "c"));
+                assert!(
+                    matches!(*expr, Expr::Orelse { .. }),
+                    "left operand should be the `orelse`, got {:?}",
+                    expr
+                );
+            }
+            other => panic!("expected catch at the root, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn catch_binds_looser_than_or() {
+        // a or b catch c  ==>  ((a or b) catch c)  — `catch` is among the loosest.
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Keyword(Kw::Or),
+            id("b"),
+            TokenKind::Keyword(Kw::Catch),
+            id("c"),
+        ]);
+        match e {
+            Expr::Catch { expr, .. } => {
+                assert!(
+                    matches!(*expr, Expr::Binary { op: BinOp::Or, .. }),
+                    "left operand should be the `or`, got {:?}",
+                    expr
+                );
+            }
+            other => panic!("expected catch at the root, got {:?}", other),
         }
     }
 }

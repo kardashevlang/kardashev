@@ -69,9 +69,10 @@ Null-safety the Zig way; lowered as a tagged `{ bool has; T val; }` value in C
 with `T → ?T` coercion. `if (x) |v|` payload capture is deferred to a later
 increment.
 
-### v0.115.0 — Error unions: `!T`, error sets, `try`, `catch`, `errdefer`
-Errors as values, explicit propagation. `errdefer` joins `defer` in the
-LIFO-flush machinery.
+### v0.115.0 — Error unions: `!T`, `error.X`, `try`, `catch` ✅
+Errors as values (implicit global error set), explicit propagation. Lowered as
+`{ i32 err; T val; }` in C. Deferred: `errdefer`, `catch |e|` capture, named
+error sets, `try` in nested expression positions.
 
 ### v0.116.0 — Enums & tagged unions; exhaustive `switch`
 `enum`, `union(enum)`, `switch` with exhaustiveness checking — no hidden

@@ -18,6 +18,26 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.115.0] — Error unions (`!T`, `error.X`, `try`, `catch`)
+
+Errors as values, the Zig way — with an implicit global error set.
+
+### Added
+- **`!T`** error-union types; **`error.Name`** error values; **`try expr`**
+  (propagates the error out of the enclosing `!U` function; statement-level in
+  v0.115); **`expr catch default`** (fall back to `default` on error). Implicit
+  `T → !T` / `error.X → !T` coercion at typed positions.
+- Type system: `Type::ErrorUnion(id)` + an interned payload table + a global
+  error-name registry; lexer/keywords `try`/`catch`/`error` and the `!T` type
+  prefix. Lowered to a tagged C struct `{ int32_t err; T val; }` with a
+  per-union `_catch` helper; composite C typedefs still emitted in dependency
+  order. Diagnostics `E0190`–`E0193`.
+- 243 unit + 13 e2e tests; `examples/errunion.ks`.
+
+### Deferred
+- `errdefer`, `catch |e|` capture, named error sets `error{ … }`, and `try` in
+  nested (non-statement) expression positions.
+
 ## [0.114.0] — Optionals (`?T`, `null`, `orelse`, `.?`)
 
 Explicit, checked nullability — the Zig way.

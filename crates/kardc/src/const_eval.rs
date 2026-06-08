@@ -78,6 +78,13 @@ pub fn eval(expr: &Expr, consts: &HashMap<String, ConstVal>) -> Result<ConstVal,
                 "optionals are not allowed in a constant expression",
             ))
         }
+        Expr::ErrorLit { span, .. } | Expr::Try { span, .. } | Expr::Catch { span, .. } => {
+            Err(Diagnostic::error(
+                *span,
+                "E0130",
+                "error unions are not allowed in a constant expression",
+            ))
+        }
     }
 }
 

@@ -29,6 +29,9 @@ pub enum Kw {
     Struct,
     Orelse,
     Null,
+    Try,
+    Catch,
+    Error,
 }
 
 impl Kw {
@@ -55,6 +58,9 @@ impl Kw {
             "struct" => Kw::Struct,
             "orelse" => Kw::Orelse,
             "null" => Kw::Null,
+            "try" => Kw::Try,
+            "catch" => Kw::Catch,
+            "error" => Kw::Error,
             _ => return None,
         })
     }
@@ -81,6 +87,9 @@ impl Kw {
             Kw::Struct => "struct",
             Kw::Orelse => "orelse",
             Kw::Null => "null",
+            Kw::Try => "try",
+            Kw::Catch => "catch",
+            Kw::Error => "error",
         }
     }
 }

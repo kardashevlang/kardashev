@@ -442,3 +442,52 @@ source is `null` or its `type_of_expr` is the inner `T`, wrap it; if it is
 already `?T`, pass it through.
 
 Deferred to a later increment (honest): `if (opt) |v| { … }` payload capture.
+
+## 12. Error unions (v0.115)
+
+Errors are values. v0.115 uses a single **implicit global error set** (an
+`anyerror`-like set built from every `error.Name` mentioned in the program).
+
+### 12.1 Syntax & AST
+- Type `!T`: `TypeExpr.error_union = true` (e.g. `fn f() !i32`). Resolves to
+  `Type::ErrorUnion(StructTable::intern_error_union(payload))`. (Not combined
+  with `?` in v0.115.)
+- `error.Name` — `Expr::ErrorLit{name}`; registers `Name` via
+  `StructTable::intern_error` (1-based code; 0 = "no error"). Coerces to any
+  `!T`.
+- `try expr` — `Expr::Try{expr}`. **v0.115: statement-level only** — allowed as
+  the whole value of a `var`/`const` initializer, a `return`, or an expression
+  statement; anywhere else is `E0191`. The enclosing function must return some
+  `!U` (`E0190`). On error it returns the error from the enclosing function;
+  otherwise it yields the payload.
+- `expr catch default` — `Expr::Catch{expr,default}` (parses at the lowest
+  precedence, beside `orelse`). `expr` must be `!T` (`E0192`); `default` is a
+  `T`; result `T`; `default` is evaluated eagerly in v0.115.
+
+### 12.2 Coercion
+`T → !T` (success) and `error.X → !T` (failure) at typed positions (initializer
+with `!T` annotation, assignment, return, call arg, struct field). Mismatches
+reuse `E0110`.
+
+### 12.3 Backend (`emit_c`)
+For each `StructTable::error_unions()`, after the optionals, emit (in dependency
+order, see §11.3) :
+```c
+typedef struct { int32_t err; <payload cty> val; } kd_err_<tag>;
+static inline <payload cty> kd_err_<tag>_catch(kd_err_<tag> e, <payload cty> d) { return e.err == 0 ? e.val : d; }
+```
+Lowerings: `error.Name` (expected `!T`) → `((kd_err_<tag>){ .err = <code> })`; a
+coerced `T` → `((kd_err_<tag>){ .err = 0, .val = <e> })`; `expr catch default` →
+`kd_err_<tag>_catch(<expr>, <default>)`. **`try expr`** at a statement position
+lowers to a hoisted temp + propagation, using the enclosing function's
+error-union C type `<RET>`:
+```c
+kd_err_<tag> __kd_tryN = <expr>;
+if (__kd_tryN.err != 0) { <flush active defers>; return (<RET>){ .err = __kd_tryN.err }; }
+/* then: bind/return/use __kd_tryN.val */
+```
+`cty(Type::ErrorUnion(id))` → `StructTable::error_union_c_name(id)`.
+
+### 12.4 Deferred (honest)
+`errdefer`, `catch |e|` capture, explicit named error sets `error{ … }`, and
+`try` in arbitrary (nested) expression positions.

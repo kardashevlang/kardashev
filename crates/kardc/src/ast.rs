@@ -89,6 +89,9 @@ pub struct TypeExpr {
     pub name: String,
     /// True if written as `?T` (an optional). v0.114: no nesting (`??T`).
     pub optional: bool,
+    /// True if written as `!T` (an error union). v0.115: implicit global error
+    /// set; not combined with `optional`.
+    pub error_union: bool,
     pub span: Span,
 }
 
@@ -303,6 +306,17 @@ pub enum Expr {
     },
     /// `expr.?` — force-unwrap an optional; panics (exit 101) if null.
     Unwrap { expr: Box<Expr>, span: Span },
+    /// `error.Name` — an error value from the (implicit global) error set.
+    ErrorLit { name: String, span: Span },
+    /// `try expr` — unwrap an error union `!T`, or propagate the error by
+    /// returning it from the enclosing `!U` function. v0.115: statement-level.
+    Try { expr: Box<Expr>, span: Span },
+    /// `expr catch default` — unwrap `!T`, or evaluate `default` (a `T`) on error.
+    Catch {
+        expr: Box<Expr>,
+        default: Box<Expr>,
+        span: Span,
+    },
 }
 
 /// One `.name = value` initializer inside a struct literal.
@@ -329,6 +343,9 @@ impl Expr {
             Expr::Null { span } => *span,
             Expr::Orelse { span, .. } => *span,
             Expr::Unwrap { span, .. } => *span,
+            Expr::ErrorLit { span, .. } => *span,
+            Expr::Try { span, .. } => *span,
+            Expr::Catch { span, .. } => *span,
         }
     }
 }

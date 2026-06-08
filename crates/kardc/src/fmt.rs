@@ -351,13 +351,18 @@ impl Printer {
 
 // ----- types ----------------------------------------------------------------
 
-/// Format a type reference (SPEC §11.1). An optional type (`TypeExpr.optional`)
-/// prints with a leading `?` — e.g. `?i32` — and a plain type prints as its bare
-/// name. Used wherever a type appears: params, return types, `var`/`const`
+/// Format a type reference (SPEC §11.1 / §12.1). An optional type
+/// (`TypeExpr.optional`) prints with a leading `?` — e.g. `?i32` — an error
+/// union (`TypeExpr.error_union`) prints with a leading `!` — e.g. `!i32` — and
+/// a plain type prints as its bare name. The two qualifiers are mutually
+/// exclusive (v0.115: `?` and `!` are never combined), so at most one prefix is
+/// emitted. Used wherever a type appears: params, return types, `var`/`const`
 /// annotations and struct fields.
 fn fmt_type(ty: &TypeExpr) -> String {
     if ty.optional {
         format!("?{}", ty.name)
+    } else if ty.error_union {
+        format!("!{}", ty.name)
     } else {
         ty.name.clone()
     }
@@ -379,9 +384,15 @@ fn expr_prec(e: &Expr) -> u8 {
         | Expr::Field { .. }
         | Expr::MethodCall { .. }
         | Expr::Null { .. }
+        // `error.Name` is atomic — a bare error literal binds as a primary.
+        | Expr::ErrorLit { .. }
         | Expr::Unwrap { .. } => 8,
         Expr::Comptime { .. } => 7,
-        Expr::Unary { .. } => 6,
+        // `try expr` is a prefix form (SPEC §12.1), at the same binding power as
+        // the other prefixes (`-`/`!`). v0.115 only ever produces it at a
+        // statement position, so it is rarely a sub-operand; this keeps the
+        // printer total.
+        Expr::Unary { .. } | Expr::Try { .. } => 6,
         Expr::Binary { op, .. } => match op {
             BinOp::Mul | BinOp::Div | BinOp::Rem => 5,
             BinOp::Add | BinOp::Sub => 4,
@@ -389,10 +400,11 @@ fn expr_prec(e: &Expr) -> u8 {
             BinOp::And => 2,
             BinOp::Or => 1,
         },
-        // `orelse` is the loosest operator: its right-hand fallback is an
-        // ordinary `T` expression, so `head orelse a + b` reads as
-        // `head orelse (a + b)` with no parentheses.
-        Expr::Orelse { .. } => 0,
+        // `orelse` and `catch` are the loosest operators (SPEC §12.1 places
+        // `catch` beside `orelse`): the right-hand fallback is an ordinary `T`
+        // expression, so `head orelse a + b` / `head catch a + b` read with no
+        // parentheses around the fallback.
+        Expr::Orelse { .. } | Expr::Catch { .. } => 0,
     }
 }
 
@@ -561,6 +573,33 @@ fn fmt_expr(e: &Expr) -> String {
                 format!("({}).?", fmt_expr(expr))
             }
         }
+        // `error.Name` — an error value from the implicit global error set
+        // (SPEC §12.1). Atomic, like a literal.
+        Expr::ErrorLit { name, .. } => format!("error.{}", name),
+        // `try expr` — statement-level error-union propagation (SPEC §12.1). The
+        // operand stands at a value position, so a primary/postfix operand
+        // prints bare (`try parse(s)`) while anything looser is parenthesised
+        // (`try (a + b)`). The parentheses make the result re-parse to the same
+        // AST whether `try` is read as a prefix (binding tighter than `+`) or as
+        // consuming the whole following expression — both accept `try (e)`.
+        Expr::Try { expr, .. } => {
+            if expr_prec(expr) >= 8 {
+                format!("try {}", fmt_expr(expr))
+            } else {
+                format!("try ({})", fmt_expr(expr))
+            }
+        }
+        // `expr catch default` (SPEC §12.1) — like `orelse`, the loosest
+        // operator, so its left operand never needs parentheses and only an
+        // equal-precedence right operand (another `catch`/`orelse`) does. This
+        // yields the left-associative `a catch b catch c` and the explicit
+        // `a catch (b catch c)`.
+        Expr::Catch { expr, default, .. } => {
+            let p = expr_prec(e);
+            let l = fmt_operand(expr, p, false);
+            let r = fmt_operand(default, p, true);
+            format!("{} catch {}", l, r)
+        }
     }
 }
 
@@ -611,6 +650,7 @@ mod tests {
         TypeExpr {
             name: name.to_string(),
             optional: false,
+            error_union: false,
             span: D,
         }
     }
@@ -620,6 +660,47 @@ mod tests {
         TypeExpr {
             name: name.to_string(),
             optional: true,
+            error_union: false,
+            span: D,
+        }
+    }
+
+    /// An error-union type `!name` (`TypeExpr.error_union = true`; v0.115).
+    fn err_ty(name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: false,
+            error_union: true,
+            span: D,
+        }
+    }
+
+    fn error_lit(name: &str) -> Expr {
+        Expr::ErrorLit {
+            name: name.to_string(),
+            span: D,
+        }
+    }
+
+    fn try_(expr: Expr) -> Expr {
+        Expr::Try {
+            expr: Box::new(expr),
+            span: D,
+        }
+    }
+
+    fn catch_(expr: Expr, default: Expr) -> Expr {
+        Expr::Catch {
+            expr: Box::new(expr),
+            default: Box::new(default),
+            span: D,
+        }
+    }
+
+    fn call(callee: &str, args: Vec<Expr>) -> Expr {
+        Expr::Call {
+            callee: callee.to_string(),
+            args,
             span: D,
         }
     }
@@ -1478,6 +1559,187 @@ mod tests {
             "fn f(x: ?i32) i32 {\n",
             "    var y: ?i32 = null;\n",
             "    return x orelse y.?;\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    // ----- error unions (v0.115) -------------------------------------------
+
+    #[test]
+    fn error_union_type_prints_with_leading_bang() {
+        // The error-union helper prepends `!`; the bare and optional helpers are
+        // unaffected, and `!` and `?` are never combined.
+        assert_eq!(fmt_type(&ty("i32")), "i32");
+        assert_eq!(fmt_type(&err_ty("i32")), "!i32");
+        // A struct error union formats the same way: `!Point`.
+        assert_eq!(fmt_type(&err_ty("Point")), "!Point");
+        // The optional prefix is independent and unchanged.
+        assert_eq!(fmt_type(&opt_ty("i32")), "?i32");
+    }
+
+    #[test]
+    fn error_lit_try_catch_expr_print() {
+        // `error.Name` is a bare error literal.
+        assert_eq!(fmt_expr(&error_lit("Oops")), "error.Oops");
+
+        // `try parse(s)`: the call operand is a primary, so it prints bare.
+        assert_eq!(
+            fmt_expr(&try_(call("parse", vec![ident("s")]))),
+            "try parse(s)"
+        );
+
+        // `parse(s) catch 0`: both operands are primaries, so no parentheses.
+        assert_eq!(
+            fmt_expr(&catch_(call("parse", vec![ident("s")]), int(0))),
+            "parse(s) catch 0"
+        );
+
+        // `error.Bad` as a catch fallback: still atomic.
+        assert_eq!(
+            fmt_expr(&catch_(call("parse", vec![ident("s")]), error_lit("Bad"))),
+            "parse(s) catch error.Bad"
+        );
+    }
+
+    #[test]
+    fn try_and_catch_precedence_and_associativity() {
+        // `catch` is the loosest operator: the fallback `a + b` needs no
+        // parentheses — `head catch a + b`.
+        let e = catch_(ident("head"), bin(BinOp::Add, ident("a"), ident("b")));
+        assert_eq!(fmt_expr(&e), "head catch a + b");
+
+        // Left-associative chain prints without parentheses.
+        let left = catch_(catch_(ident("a"), ident("b")), ident("c"));
+        assert_eq!(fmt_expr(&left), "a catch b catch c");
+
+        // A right-nested `catch` keeps its parentheses (equal precedence on the
+        // right of a left-associative operator).
+        let right = catch_(ident("a"), catch_(ident("b"), ident("c")));
+        assert_eq!(fmt_expr(&right), "a catch (b catch c)");
+
+        // `try` over a non-primary operand parenthesises it so it re-parses to
+        // the same node regardless of how tightly `try` binds.
+        let t = try_(bin(BinOp::Add, ident("a"), ident("b")));
+        assert_eq!(fmt_expr(&t), "try (a + b)");
+
+        // `try` over a primary (field access binds as a primary) does not.
+        let tf = try_(field(ident("a"), "b"));
+        assert_eq!(fmt_expr(&tf), "try a.b");
+    }
+
+    #[test]
+    fn error_union_type_in_every_position() {
+        // `!T` must print wherever a type appears: a top-level `const`, a struct
+        // field, a function's params and return, and a `var`/`const` local
+        // annotation. `error.Name` supplies the values.
+        let const_decl = Item::Const(ConstDecl {
+            is_pub: true,
+            name: "NIL".to_string(),
+            ty: err_ty("i32"),
+            value: error_lit("Oops"),
+            span: D,
+        });
+        let strukt = Item::Struct(StructDecl {
+            is_pub: false,
+            name: "Box".to_string(),
+            fields: vec![FieldDecl {
+                name: "payload".to_string(),
+                ty: err_ty("i32"),
+                span: D,
+            }],
+            methods: vec![],
+            span: D,
+        });
+        let func = Item::Func(Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![Param {
+                name: "x".to_string(),
+                ty: err_ty("i32"),
+                span: D,
+            }],
+            ret: err_ty("i32"),
+            body: Block {
+                stmts: vec![Stmt::Let {
+                    is_const: false,
+                    name: "y".to_string(),
+                    ty: err_ty("i32"),
+                    value: error_lit("Bad"),
+                    span: D,
+                }],
+                span: D,
+            },
+            span: D,
+        });
+        let m = Module {
+            items: vec![const_decl, strukt, func],
+        };
+        let expected = concat!(
+            "pub const NIL: !i32 = error.Oops;\n",
+            "\n",
+            "const Box = struct {\n",
+            "    payload: !i32,\n",
+            "};\n",
+            "\n",
+            "fn f(x: !i32) !i32 {\n",
+            "    var y: !i32 = error.Bad;\n",
+            "}\n",
+        );
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn error_union_sample_is_idempotent() {
+        // A whole function returning `!i32` that uses `try` (statement-level, as
+        // a `const` initializer) and `catch` (as an expression). The pure
+        // printer is deterministic, so idempotence is checked here as
+        // re-printing the same AST byte-identically (the parser is not involved
+        // in this isolated unit).
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![Param {
+                    name: "s".to_string(),
+                    ty: ty("i32"),
+                    span: D,
+                }],
+                ret: err_ty("i32"),
+                body: Block {
+                    stmts: vec![
+                        Stmt::Let {
+                            is_const: true,
+                            name: "x".to_string(),
+                            ty: ty("i32"),
+                            value: catch_(call("parse", vec![ident("s")]), int(0)),
+                            span: D,
+                        },
+                        Stmt::Let {
+                            is_const: true,
+                            name: "y".to_string(),
+                            ty: ty("i32"),
+                            value: try_(call("parse", vec![ident("s")])),
+                            span: D,
+                        },
+                        Stmt::Return {
+                            value: Some(ident("y")),
+                            span: D,
+                        },
+                    ],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f(s: i32) !i32 {\n",
+            "    const x: i32 = parse(s) catch 0;\n",
+            "    const y: i32 = try parse(s);\n",
+            "    return y;\n",
             "}\n",
         );
         let printed = print_module(&m);
