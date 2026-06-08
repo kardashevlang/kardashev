@@ -32,6 +32,8 @@ pub enum Kw {
     Try,
     Catch,
     Error,
+    Enum,
+    Switch,
 }
 
 impl Kw {
@@ -61,6 +63,8 @@ impl Kw {
             "try" => Kw::Try,
             "catch" => Kw::Catch,
             "error" => Kw::Error,
+            "enum" => Kw::Enum,
+            "switch" => Kw::Switch,
             _ => return None,
         })
     }
@@ -90,6 +94,8 @@ impl Kw {
             Kw::Try => "try",
             Kw::Catch => "catch",
             Kw::Error => "error",
+            Kw::Enum => "enum",
+            Kw::Switch => "switch",
         }
     }
 }
@@ -127,6 +133,7 @@ pub enum TokenKind {
     Percent,  // %
     Bang,     // !
     Question, // ?
+    FatArrow, // =>  (switch arms)
 
     /// End of input. Always the final token.
     Eof,

@@ -31,6 +31,9 @@ pub enum Type {
     /// `!T` — an error union (implicit global error set, v0.115). The `u32`
     /// indexes the error-union-payload table (`error_union_payload`).
     ErrorUnion(u32),
+    /// A plain (C-like) enum, v0.116. The `u32` indexes the enum table
+    /// (`enum_info`).
+    Enum(u32),
 }
 
 impl Type {
@@ -71,6 +74,7 @@ impl Type {
             Type::Struct(_) => "struct",
             Type::Optional(_) => "optional",
             Type::ErrorUnion(_) => "error union",
+            Type::Enum(_) => "enum",
         }
     }
 
@@ -99,6 +103,7 @@ impl Type {
             Type::ErrorUnion(_) => {
                 unreachable!("c_name on an error-union type; use StructTable::error_union_c_name")
             }
+            Type::Enum(_) => unreachable!("c_name on an enum type; use StructTable::enum_c_name"),
         }
     }
 
@@ -137,6 +142,20 @@ impl StructInfo {
     }
 }
 
+/// A resolved plain-enum definition: its name and ordered variant names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumInfo {
+    pub name: String,
+    pub variants: Vec<String>,
+}
+
+impl EnumInfo {
+    /// The 0-based index (and C value) of `variant`, if present.
+    pub fn variant_index(&self, variant: &str) -> Option<usize> {
+        self.variants.iter().position(|v| v == variant)
+    }
+}
+
 /// The table of all struct types in a program, built by semantic analysis and
 /// consumed by the backend. Ids are dense indices assigned in declaration
 /// order, so iterating `0..len()` yields structs in source order — exactly the
@@ -154,6 +173,9 @@ pub struct StructTable {
     /// The (implicit global) error set: declared error names, 1-based codes
     /// (`error_names[0]` has code 1; code 0 means "no error").
     error_names: Vec<String>,
+    /// Plain enum definitions, indexed by the id in `Type::Enum(id)`.
+    enum_defs: Vec<EnumInfo>,
+    enum_by_name: HashMap<String, u32>,
 }
 
 impl StructTable {
@@ -239,8 +261,53 @@ impl StructTable {
             Type::ErrorUnion(eid) => {
                 format!("err_{}", self.type_mangle(self.error_union_payload(eid)))
             }
+            Type::Enum(eid) => format!("enum_{}", self.enum_defs[eid as usize].name),
             other => other.c_name().to_string(),
         }
+    }
+
+    // --- enums (v0.116) ----------------------------------------------------
+
+    /// Register enum `name`, returning its id (existing id if already interned;
+    /// variants are filled later via `set_enum_variants`).
+    pub fn intern_enum(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.enum_by_name.get(name) {
+            return id;
+        }
+        let id = self.enum_defs.len() as u32;
+        self.enum_defs.push(EnumInfo {
+            name: name.to_string(),
+            variants: Vec::new(),
+        });
+        self.enum_by_name.insert(name.to_string(), id);
+        id
+    }
+
+    pub fn enum_id_of(&self, name: &str) -> Option<u32> {
+        self.enum_by_name.get(name).copied()
+    }
+
+    pub fn enum_get(&self, id: u32) -> &EnumInfo {
+        &self.enum_defs[id as usize]
+    }
+
+    pub fn set_enum_variants(&mut self, id: u32, variants: Vec<String>) {
+        self.enum_defs[id as usize].variants = variants;
+    }
+
+    /// The C typedef name for an enum, e.g. `kd_enum_Color`.
+    pub fn enum_c_name(&self, id: u32) -> String {
+        format!("kd_enum_{}", self.enum_defs[id as usize].name)
+    }
+
+    /// The C enumerator name for a variant, e.g. `kd_enum_Color_Red`.
+    pub fn enum_variant_c_name(&self, id: u32, variant: &str) -> String {
+        format!("kd_enum_{}_{}", self.enum_defs[id as usize].name, variant)
+    }
+
+    /// Enums in declaration (id) order, paired with their id.
+    pub fn enums(&self) -> impl Iterator<Item = (u32, &EnumInfo)> {
+        self.enum_defs.iter().enumerate().map(|(i, e)| (i as u32, e))
     }
 
     // --- error unions (`!T`) + the implicit global error set --------------

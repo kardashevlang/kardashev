@@ -38,11 +38,23 @@
 //!   `return`, or expression statement).
 //! - `E0192` — `catch` whose left operand is not an error union (`!T`).
 //! - `E0193` — an `error.Name` value with no expected error-union (`!T`) type.
+//! - `E0210` — a non-exhaustive `switch` on an enum (a variant is uncovered and
+//!   there is no `else` arm).
+//! - `E0211` — a duplicate enum variant in a declaration, or a duplicate
+//!   `switch` label across arms.
+//! - `E0212` — an enum variant name (`Enum.V` / `.V` / a `switch` label) that
+//!   the enum does not declare.
+//! - `E0213` — a `switch` scrutinee whose type is neither an enum nor an
+//!   integer.
+//! - `E0214` — a non-exhaustive `switch` on an integer type (no `else` arm).
+//! - `E0215` — an unqualified enum literal `.V` with no expected enum type at
+//!   its position.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    BinOp, Block, Expr, FieldInit, Func, Item, Module, Stmt, StructDecl, TestBlock, TypeExpr, UnOp,
+    BinOp, Block, Expr, FieldInit, Func, Item, Module, Stmt, StructDecl, SwitchArm, TestBlock,
+    TypeExpr, UnOp,
 };
 use crate::const_eval::{self, ConstVal};
 use crate::diag::Diagnostic;
@@ -141,6 +153,7 @@ impl Checker {
             Type::ErrorUnion(id) => {
                 format!("!{}", self.type_name(self.structs.error_union_payload(id)))
             }
+            Type::Enum(id) => self.structs.enum_get(id).name.clone(),
             other => other.name().to_string(),
         }
     }
@@ -148,6 +161,28 @@ impl Checker {
     // ---- top-level driving ------------------------------------------------
 
     fn check_module(&mut self, m: &Module) {
+        // Pass 0 (enums): intern every enum and record its variants (SPEC §13.2).
+        // Enums have no dependencies, so declaration order is irrelevant; doing
+        // this first lets any signature, const or local mention an enum type
+        // (resolved via `resolve_type_opt`). A variant name repeated within one
+        // enum is `E0211`.
+        for item in &m.items {
+            if let Item::Enum(e) = item {
+                let id = self.structs.intern_enum(&e.name);
+                let mut variants: Vec<String> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                for v in &e.variants {
+                    if !seen.insert(v.clone()) {
+                        let msg = format!("duplicate variant `{}` in enum `{}`", v, e.name);
+                        self.error(e.span, "E0211", msg);
+                        continue;
+                    }
+                    variants.push(v.clone());
+                }
+                self.structs.set_enum_variants(id, variants);
+            }
+        }
+
         // Pass 0a: intern every struct name first so that field types and
         // signatures may refer to any struct (forward references in signatures
         // are fine; forward references in *field types* are caught below).
@@ -308,6 +343,8 @@ impl Checker {
                 Item::Test(t) => self.check_test(t),
                 Item::Const(_) => {}
                 Item::Struct(s) => self.check_struct_methods(s),
+                // Enums are fully resolved in Pass 0; they have no body to check.
+                Item::Enum(_) => {}
             }
         }
     }
@@ -399,8 +436,9 @@ impl Checker {
     /// declaration mentions them (SPEC §11.1). Likewise `!T` (`error_union`)
     /// resolves to `Type::ErrorUnion(intern_error_union(payload))` (SPEC §12.1).
     fn resolve_type_opt(&mut self, te: &TypeExpr) -> Option<Type> {
-        let inner =
-            Type::from_name(&te.name).or_else(|| self.structs.id_of(&te.name).map(Type::Struct))?;
+        let inner = Type::from_name(&te.name)
+            .or_else(|| self.structs.id_of(&te.name).map(Type::Struct))
+            .or_else(|| self.structs.enum_id_of(&te.name).map(Type::Enum))?;
         if te.optional {
             Some(Type::Optional(self.structs.intern_optional(inner)))
         } else if te.error_union {
@@ -627,6 +665,14 @@ impl Checker {
             Stmt::Block(b) => {
                 self.check_block(b);
             }
+            Stmt::Switch {
+                scrutinee,
+                arms,
+                default,
+                span,
+            } => {
+                self.check_switch(scrutinee, arms, default, *span);
+            }
         }
     }
 
@@ -636,6 +682,238 @@ impl Checker {
                 let msg = format!("`{}` condition must be `bool`, found `{}`", kw, self.type_name(t));
                 self.error(cond.span(), "E0110", msg);
             }
+        }
+    }
+
+    // ---- switch (v0.116) --------------------------------------------------
+
+    /// Type-check a `switch` (SPEC §13.2). The scrutinee must be an enum or an
+    /// integer (`E0213`); each arm's labels must be constant patterns of that
+    /// type; the arms must be exhaustive (every enum variant covered, `E0210`,
+    /// or an `else` for an integer, `E0214`). Each arm body and the `else` block
+    /// are checked as nested scopes.
+    fn check_switch(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[SwitchArm],
+        default: &Option<Block>,
+        span: Span,
+    ) {
+        match self.check_expr(scrutinee, None) {
+            Some(Type::Enum(eid)) => self.check_enum_switch(eid, arms, default, span),
+            Some(t) if t.is_int() => self.check_int_switch(t, arms, default, span),
+            Some(t) => {
+                let msg = format!(
+                    "`switch` scrutinee must be an enum or integer type, found `{}`",
+                    self.type_name(t)
+                );
+                self.error(scrutinee.span(), "E0213", msg);
+                // The scrutinee is unswitchable, so labels cannot be validated,
+                // but arm bodies and the `else` block are still checked so their
+                // own errors surface.
+                self.check_switch_blocks(arms, default);
+            }
+            // The scrutinee itself errored; just check the arm bodies + else.
+            None => self.check_switch_blocks(arms, default),
+        }
+    }
+
+    /// Check only the arm bodies and the `else` block of a `switch` (used when
+    /// the scrutinee type is unusable, so labels are skipped).
+    fn check_switch_blocks(&mut self, arms: &[SwitchArm], default: &Option<Block>) {
+        for arm in arms {
+            self.check_block(&arm.body);
+        }
+        if let Some(d) = default {
+            self.check_block(d);
+        }
+    }
+
+    /// Check a `switch` whose scrutinee is the enum `eid`.
+    fn check_enum_switch(
+        &mut self,
+        eid: u32,
+        arms: &[SwitchArm],
+        default: &Option<Block>,
+        span: Span,
+    ) {
+        // The set of variant indices covered so far, for exhaustiveness and to
+        // detect a variant repeated across arms.
+        let mut covered: HashSet<usize> = HashSet::new();
+        for arm in arms {
+            for label in &arm.labels {
+                if let Some(idx) = self.switch_enum_label_index(eid, label) {
+                    if !covered.insert(idx) {
+                        let ename = self.structs.enum_get(eid).name.clone();
+                        let vname = self.structs.enum_get(eid).variants[idx].clone();
+                        let msg = format!("duplicate `switch` label `{}.{}`", ename, vname);
+                        self.error(label.span(), "E0211", msg);
+                    }
+                }
+            }
+            self.check_block(&arm.body);
+        }
+        if let Some(d) = default {
+            // An `else` makes the `switch` exhaustive regardless of coverage.
+            self.check_block(d);
+        } else {
+            let total = self.structs.enum_get(eid).variants.len();
+            let missing: Vec<String> = (0..total)
+                .filter(|i| !covered.contains(i))
+                .map(|i| self.structs.enum_get(eid).variants[i].clone())
+                .collect();
+            if !missing.is_empty() {
+                let ename = self.structs.enum_get(eid).name.clone();
+                let msg = format!(
+                    "non-exhaustive `switch` on enum `{}`: missing variant(s) `{}`; \
+                     cover them or add an `else` arm",
+                    ename,
+                    missing.join("`, `")
+                );
+                self.error(span, "E0210", msg);
+            }
+        }
+    }
+
+    /// Check a `switch` whose scrutinee is the integer type `scrut_ty`. An
+    /// integer `switch` can never be proven exhaustive, so it requires an
+    /// `else` (`E0214`).
+    fn check_int_switch(
+        &mut self,
+        scrut_ty: Type,
+        arms: &[SwitchArm],
+        default: &Option<Block>,
+        span: Span,
+    ) {
+        let mut covered: HashSet<i64> = HashSet::new();
+        for arm in arms {
+            for label in &arm.labels {
+                if let Some(v) = self.switch_int_label_value(scrut_ty, label) {
+                    if !covered.insert(v) {
+                        self.error(
+                            label.span(),
+                            "E0211",
+                            format!("duplicate `switch` label `{}`", v),
+                        );
+                    }
+                }
+            }
+            self.check_block(&arm.body);
+        }
+        if let Some(d) = default {
+            self.check_block(d);
+        } else {
+            self.error(
+                span,
+                "E0214",
+                "non-exhaustive `switch` on an integer type: an integer `switch` requires an `else` arm",
+            );
+        }
+    }
+
+    /// Resolve one label of an enum `switch` to the 0-based index of the
+    /// variant it names, or `None` (after emitting a diagnostic) if it is not a
+    /// valid variant pattern of enum `eid`. Accepts `.V` ([`Expr::EnumLit`]) and
+    /// `Enum.V` ([`Expr::Field`] over the scrutinee enum); anything else is a
+    /// type mismatch.
+    fn switch_enum_label_index(&mut self, eid: u32, label: &Expr) -> Option<usize> {
+        match label {
+            Expr::EnumLit { variant, span } => {
+                match self.structs.enum_get(eid).variant_index(variant) {
+                    Some(i) => Some(i),
+                    None => {
+                        let ename = self.structs.enum_get(eid).name.clone();
+                        let msg = format!("enum `{}` has no variant `{}`", ename, variant);
+                        self.error(*span, "E0212", msg);
+                        None
+                    }
+                }
+            }
+            Expr::Field { base, field, span } => {
+                // A qualified `Enum.V` label must name the scrutinee's enum.
+                if let Expr::Ident { name, .. } = base.as_ref() {
+                    if self.structs.enum_id_of(name) == Some(eid) {
+                        return match self.structs.enum_get(eid).variant_index(field) {
+                            Some(i) => Some(i),
+                            None => {
+                                let ename = self.structs.enum_get(eid).name.clone();
+                                let msg = format!("enum `{}` has no variant `{}`", ename, field);
+                                self.error(*span, "E0212", msg);
+                                None
+                            }
+                        };
+                    }
+                }
+                // Some other field access / a different enum's literal: type it
+                // (to surface its own errors) and report a mismatch.
+                let lt = self.check_expr(label, None);
+                let ename = self.structs.enum_get(eid).name.clone();
+                let found = match lt {
+                    Some(t) => self.type_name(t),
+                    None => "<error>".to_string(),
+                };
+                let msg = format!(
+                    "`switch` label of type `{}` does not match scrutinee enum `{}`",
+                    found, ename
+                );
+                self.error(*span, "E0110", msg);
+                None
+            }
+            _ => {
+                // Not an enum-literal pattern (e.g. an integer literal).
+                self.check_expr(label, Some(Type::Enum(eid)));
+                let ename = self.structs.enum_get(eid).name.clone();
+                let msg = format!(
+                    "`switch` label on enum `{}` must be a variant (`.V` or `{}.V`)",
+                    ename, ename
+                );
+                self.error(label.span(), "E0110", msg);
+                None
+            }
+        }
+    }
+
+    /// Resolve one label of an integer `switch` to its constant value (for
+    /// duplicate detection), or `None` (after emitting a diagnostic) if the
+    /// label's type does not match the scrutinee or it is not constant.
+    fn switch_int_label_value(&mut self, scrut_ty: Type, label: &Expr) -> Option<i64> {
+        match self.check_expr(label, Some(scrut_ty)) {
+            Some(t) if t == scrut_ty => {}
+            Some(t) => {
+                let msg = format!(
+                    "`switch` label type mismatch: expected `{}`, found `{}`",
+                    self.type_name(scrut_ty),
+                    self.type_name(t)
+                );
+                self.error(label.span(), "E0110", msg);
+                return None;
+            }
+            None => return None,
+        }
+        // The label is of the right integer type; fold it to a constant so that
+        // duplicate labels across arms can be detected.
+        match const_eval::eval(label, &self.consts) {
+            Ok(ConstVal::Int(n)) => Some(n),
+            // Unreachable: a `Bool` value would have failed the type check above.
+            Ok(ConstVal::Bool(_)) => None,
+            Err(d) => {
+                // A non-constant integer label is itself an error.
+                self.diags.push(d);
+                None
+            }
+        }
+    }
+
+    /// Resolve `Enum.V` / `.V` to its enum value type, emitting `E0212` if `eid`
+    /// has no variant named `variant`.
+    fn check_enum_variant(&mut self, eid: u32, variant: &str, span: Span) -> Option<Type> {
+        if self.structs.enum_get(eid).variant_index(variant).is_some() {
+            Some(Type::Enum(eid))
+        } else {
+            let ename = self.structs.enum_get(eid).name.clone();
+            let msg = format!("enum `{}` has no variant `{}`", ename, variant);
+            self.error(span, "E0212", msg);
+            None
         }
     }
 
@@ -744,6 +1022,19 @@ impl Checker {
             }
             Expr::StructLit { name, fields, span } => self.check_struct_lit(name, fields, *span),
             Expr::Field { base, field, span } => {
+                // `Enum.Variant` — a qualified enum literal (SPEC §13.1). It is
+                // recognised when the base is an identifier naming an enum type
+                // that is not shadowed by a value in scope (mirroring the
+                // associated-call rule in `check_method_call`), and is handled
+                // *before* struct field access so `Color.Red` is an enum value,
+                // not field access on a value named `Color`.
+                if let Expr::Ident { name, .. } = base.as_ref() {
+                    if self.lookup(name).is_none() {
+                        if let Some(eid) = self.structs.enum_id_of(name) {
+                            return self.check_enum_variant(eid, field, *span);
+                        }
+                    }
+                }
                 let bt = self.check_expr(base, None)?;
                 self.field_type_of(bt, field, *span)
             }
@@ -850,6 +1141,21 @@ impl Checker {
                 self.check_expr(inner, None);
                 None
             }
+            // `.Variant` — an unqualified enum literal whose enum type comes from
+            // the expected type at this position (SPEC §13.1). With no expected
+            // enum type it is `E0215`.
+            Expr::EnumLit { variant, span } => match expected {
+                Some(Type::Enum(id)) => self.check_enum_variant(id, variant, *span),
+                _ => {
+                    let msg = format!(
+                        "enum literal `.{}` has no expected enum type here; \
+                         use it where an enum is expected or write `Enum.{}`",
+                        variant, variant
+                    );
+                    self.error(*span, "E0215", msg);
+                    None
+                }
+            },
             // `expr catch default`: `expr` must be `!T` (else `E0192`); `default`
             // is a `T`; the result is `T` (SPEC §12.1).
             Expr::Catch {
@@ -1568,7 +1874,9 @@ fn is_flex_int_literal(e: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{ConstDecl, FieldDecl, FieldInit, Func, Param, StructDecl, TestBlock};
+    use crate::ast::{
+        ConstDecl, EnumDecl, FieldDecl, FieldInit, Func, Param, StructDecl, TestBlock,
+    };
 
     fn sp() -> Span {
         Span::DUMMY
@@ -2913,5 +3221,328 @@ mod tests {
             table.get(id).fields,
             vec![("val".to_string(), Type::ErrorUnion(0))]
         );
+    }
+
+    // ---- enum + switch tests (v0.116) ------------------------------------
+
+    fn enum_item(name: &str, variants: Vec<&str>) -> Item {
+        Item::Enum(EnumDecl {
+            is_pub: false,
+            name: name.into(),
+            variants: variants.into_iter().map(|v| v.into()).collect(),
+            span: sp(),
+        })
+    }
+    /// An unqualified enum literal `.variant`.
+    fn enum_lit(variant: &str) -> Expr {
+        Expr::EnumLit {
+            variant: variant.into(),
+            span: sp(),
+        }
+    }
+    fn switch_arm(labels: Vec<Expr>, body: Vec<Stmt>) -> SwitchArm {
+        SwitchArm {
+            labels,
+            body: block(body),
+            span: sp(),
+        }
+    }
+    fn switch_stmt(scrutinee: Expr, arms: Vec<SwitchArm>, default: Option<Vec<Stmt>>) -> Stmt {
+        Stmt::Switch {
+            scrutinee,
+            arms,
+            default: default.map(block),
+            span: sp(),
+        }
+    }
+    /// The canonical three-variant `Color` enum used by the switch tests.
+    fn color_enum() -> Item {
+        enum_item("Color", vec!["Red", "Green", "Blue"])
+    }
+
+    #[test]
+    fn enum_value_typing_ok_and_interned() {
+        // const Color = enum { Red, Green, Blue };
+        // fn qualified() Color { return Color.Red; }   // `Enum.V`
+        // fn unqualified() Color { return .Green; }     // `.V`
+        let items = vec![
+            color_enum(),
+            func(
+                "qualified",
+                vec![],
+                "Color",
+                vec![ret(Some(field(ident("Color"), "Red")))],
+            ),
+            func(
+                "unqualified",
+                vec![],
+                "Color",
+                vec![ret(Some(enum_lit("Green")))],
+            ),
+        ];
+        let m = Module { items };
+        let table = check(&m).expect("enum program should type-check");
+        let id = table.enum_id_of("Color").expect("Color should be registered");
+        assert_eq!(table.enum_get(id).variants, vec!["Red", "Green", "Blue"]);
+        assert_eq!(table.enum_get(id).variant_index("Blue"), Some(2));
+    }
+
+    #[test]
+    fn switch_exhaustive_over_enum_ok() {
+        // fn classify(c: Color) void {
+        //     switch (c) { .Red => { print(1); }, .Green => { print(2); }, .Blue => { print(3); } }
+        // }
+        let items = vec![
+            color_enum(),
+            func(
+                "classify",
+                vec![param("c", "Color")],
+                "void",
+                vec![switch_stmt(
+                    ident("c"),
+                    vec![
+                        switch_arm(vec![enum_lit("Red")], vec![Stmt::Expr(call("print", vec![int(1)]))]),
+                        switch_arm(vec![enum_lit("Green")], vec![Stmt::Expr(call("print", vec![int(2)]))]),
+                        switch_arm(vec![enum_lit("Blue")], vec![Stmt::Expr(call("print", vec![int(3)]))]),
+                    ],
+                    None,
+                )],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn switch_qualified_labels_and_multi_label_arm_ok() {
+        // Mixing `Color.V` labels and a multi-label arm still covers every variant.
+        // switch (c) { Color.Red, Color.Green => {}, Color.Blue => {} }
+        let items = vec![
+            color_enum(),
+            func(
+                "classify",
+                vec![param("c", "Color")],
+                "void",
+                vec![switch_stmt(
+                    ident("c"),
+                    vec![
+                        switch_arm(
+                            vec![field(ident("Color"), "Red"), field(ident("Color"), "Green")],
+                            vec![],
+                        ),
+                        switch_arm(vec![field(ident("Color"), "Blue")], vec![]),
+                    ],
+                    None,
+                )],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn switch_missing_variant_is_e0210() {
+        // switch (c) { .Red => {}, .Green => {} }   // missing Blue, no else
+        let items = vec![
+            color_enum(),
+            func(
+                "classify",
+                vec![param("c", "Color")],
+                "void",
+                vec![switch_stmt(
+                    ident("c"),
+                    vec![
+                        switch_arm(vec![enum_lit("Red")], vec![]),
+                        switch_arm(vec![enum_lit("Green")], vec![]),
+                    ],
+                    None,
+                )],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0210"));
+    }
+
+    #[test]
+    fn switch_else_covers_missing_variant_ok() {
+        // switch (c) { .Red => {}, else => {} }   // else makes it exhaustive
+        let items = vec![
+            color_enum(),
+            func(
+                "classify",
+                vec![param("c", "Color")],
+                "void",
+                vec![switch_stmt(
+                    ident("c"),
+                    vec![switch_arm(vec![enum_lit("Red")], vec![])],
+                    Some(vec![]),
+                )],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn switch_duplicate_label_is_e0211() {
+        // switch (c) { .Red => {}, .Red => {}, .Green => {}, .Blue => {} }
+        let items = vec![
+            color_enum(),
+            func(
+                "classify",
+                vec![param("c", "Color")],
+                "void",
+                vec![switch_stmt(
+                    ident("c"),
+                    vec![
+                        switch_arm(vec![enum_lit("Red")], vec![]),
+                        switch_arm(vec![enum_lit("Red")], vec![]),
+                        switch_arm(vec![enum_lit("Green")], vec![]),
+                        switch_arm(vec![enum_lit("Blue")], vec![]),
+                    ],
+                    None,
+                )],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0211"));
+    }
+
+    #[test]
+    fn duplicate_enum_variant_decl_is_e0211() {
+        // const Color = enum { Red, Red };
+        let items = vec![enum_item("Color", vec!["Red", "Red"])];
+        assert!(codes(items).contains(&"E0211"));
+    }
+
+    #[test]
+    fn unknown_enum_variant_value_is_e0212() {
+        // fn f() Color { return Color.Purple; }   // Purple is not a variant
+        let items = vec![
+            color_enum(),
+            func(
+                "f",
+                vec![],
+                "Color",
+                vec![ret(Some(field(ident("Color"), "Purple")))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0212"));
+    }
+
+    #[test]
+    fn unknown_enum_variant_label_is_e0212() {
+        // switch (c) { .Red => {}, .Green => {}, .Blue => {}, .Purple => {} }
+        let items = vec![
+            color_enum(),
+            func(
+                "classify",
+                vec![param("c", "Color")],
+                "void",
+                vec![switch_stmt(
+                    ident("c"),
+                    vec![
+                        switch_arm(vec![enum_lit("Red")], vec![]),
+                        switch_arm(vec![enum_lit("Green")], vec![]),
+                        switch_arm(vec![enum_lit("Blue")], vec![]),
+                        switch_arm(vec![enum_lit("Purple")], vec![]),
+                    ],
+                    None,
+                )],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0212"));
+    }
+
+    #[test]
+    fn int_switch_without_else_is_e0214() {
+        // fn f(x: i32) void { switch (x) { 0 => {}, 1 => {} } }   // no else
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "void",
+            vec![switch_stmt(
+                ident("x"),
+                vec![
+                    switch_arm(vec![int(0)], vec![]),
+                    switch_arm(vec![int(1)], vec![]),
+                ],
+                None,
+            )],
+        )];
+        assert!(codes(items).contains(&"E0214"));
+    }
+
+    #[test]
+    fn int_switch_with_else_ok() {
+        // fn f(x: i32) void { switch (x) { 0 => { print(0); }, else => { print(9); } } }
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "void",
+            vec![switch_stmt(
+                ident("x"),
+                vec![switch_arm(vec![int(0)], vec![Stmt::Expr(call("print", vec![int(0)]))])],
+                Some(vec![Stmt::Expr(call("print", vec![int(9)]))]),
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn int_switch_duplicate_label_is_e0211() {
+        // fn f(x: i32) void { switch (x) { 0 => {}, 0 => {}, else => {} } }
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "void",
+            vec![switch_stmt(
+                ident("x"),
+                vec![
+                    switch_arm(vec![int(0)], vec![]),
+                    switch_arm(vec![int(0)], vec![]),
+                ],
+                Some(vec![]),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0211"));
+    }
+
+    #[test]
+    fn switch_on_bool_is_e0213() {
+        // fn f(b: bool) void { switch (b) { else => {} } }   // bool is not switchable
+        let items = vec![func(
+            "f",
+            vec![param("b", "bool")],
+            "void",
+            vec![switch_stmt(ident("b"), vec![], Some(vec![]))],
+        )];
+        assert!(codes(items).contains(&"E0213"));
+    }
+
+    #[test]
+    fn switch_on_struct_is_e0213() {
+        // const Point = struct { x: i32 };
+        // fn f(p: Point) void { switch (p) { else => {} } }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            func(
+                "f",
+                vec![param("p", "Point")],
+                "void",
+                vec![switch_stmt(ident("p"), vec![], Some(vec![]))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0213"));
+    }
+
+    #[test]
+    fn bare_enum_literal_without_context_is_e0215() {
+        // fn f() void { var x: i32 = .Red; }   // i32 is not an enum
+        let items = vec![
+            color_enum(),
+            func(
+                "f",
+                vec![],
+                "void",
+                vec![let_var("x", "i32", enum_lit("Red"))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0215"));
     }
 }

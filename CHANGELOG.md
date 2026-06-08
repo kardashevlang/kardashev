@@ -18,6 +18,22 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.116.0] — Enums & exhaustive `switch`
+
+### Added
+- **Plain enums**: `pub? const Name = enum { A, B, C };`. Values written
+  `Name.Variant` (qualified) or `.Variant` (inferred from context).
+- **`switch`** with **exhaustiveness checking**: an enum switch must cover every
+  variant or carry an `else`; an integer switch requires `else`. Multi-label
+  arms (`.A, .B => { … }`). No hidden fall-through.
+- Type system: `Type::Enum(id)` + an enum table; lexer `enum`/`switch` and the
+  `=>` token. Lowered to a C `enum` typedef + a C `switch`. Diagnostics
+  `E0210`–`E0215`.
+- 282 unit + 14 e2e tests; `examples/enums.ks`.
+
+### Deferred
+- Tagged unions (`union(enum)`) and payload capture.
+
 ## [0.115.0] — Error unions (`!T`, `error.X`, `try`, `catch`)
 
 Errors as values, the Zig way — with an implicit global error set.

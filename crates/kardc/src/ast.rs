@@ -19,6 +19,17 @@ pub enum Item {
     Const(ConstDecl),
     Test(TestBlock),
     Struct(StructDecl),
+    Enum(EnumDecl),
+}
+
+/// An enum declaration: `pub? const Name = enum { A, B, C };` (v0.116).
+/// Plain (C-like) enums; tagged-union payloads are a later roadmap item.
+#[derive(Clone, Debug)]
+pub struct EnumDecl {
+    pub is_pub: bool,
+    pub name: String,
+    pub variants: Vec<String>,
+    pub span: Span,
 }
 
 /// A struct declaration: `pub? const Name = struct { f: T, ... };` (v0.112).
@@ -161,6 +172,23 @@ pub enum Stmt {
     },
     /// A bare nested block `{ ... }`.
     Block(Block),
+    /// `switch (scrutinee) { labels => body, ..., else => body }`.
+    Switch {
+        scrutinee: Expr,
+        arms: Vec<SwitchArm>,
+        default: Option<Block>,
+        span: Span,
+    },
+}
+
+/// One `labels => body` arm of a `switch`. `labels` are constant patterns
+/// (enum literals `.V` / `Enum.V`, or integer literals); multiple labels share
+/// one body (`.A, .B => …`).
+#[derive(Clone, Debug)]
+pub struct SwitchArm {
+    pub labels: Vec<Expr>,
+    pub body: Block,
+    pub span: Span,
 }
 
 impl Stmt {
@@ -177,6 +205,7 @@ impl Stmt {
             Stmt::Continue(s) => *s,
             Stmt::Defer { span, .. } => *span,
             Stmt::Block(b) => b.span,
+            Stmt::Switch { span, .. } => *span,
         }
     }
 }
@@ -308,6 +337,9 @@ pub enum Expr {
     Unwrap { expr: Box<Expr>, span: Span },
     /// `error.Name` — an error value from the (implicit global) error set.
     ErrorLit { name: String, span: Span },
+    /// `.Variant` — an unqualified enum literal; its enum type comes from
+    /// context. (The qualified form `Enum.Variant` reuses [`Expr::Field`].)
+    EnumLit { variant: String, span: Span },
     /// `try expr` — unwrap an error union `!T`, or propagate the error by
     /// returning it from the enclosing `!U` function. v0.115: statement-level.
     Try { expr: Box<Expr>, span: Span },
@@ -346,6 +378,7 @@ impl Expr {
             Expr::ErrorLit { span, .. } => *span,
             Expr::Try { span, .. } => *span,
             Expr::Catch { span, .. } => *span,
+            Expr::EnumLit { span, .. } => *span,
         }
     }
 }

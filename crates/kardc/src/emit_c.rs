@@ -8,7 +8,9 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{Block, Expr, Func, Item, Module, Param, Stmt, TestBlock, TypeExpr, UnOp};
+use crate::ast::{
+    Block, Expr, Func, Item, Module, Param, Stmt, SwitchArm, TestBlock, TypeExpr, UnOp,
+};
 use crate::const_eval::ConstVal;
 use crate::types::{StructTable, Type};
 
@@ -209,23 +211,27 @@ impl<'a> Emitter<'a> {
         if structs.is_empty()
             && structs.optionals().next().is_none()
             && structs.error_unions().next().is_none()
+            && structs.enums().next().is_none()
         {
             return;
         }
 
-        // A definition node: a struct, an interned optional, or an interned
-        // error union.
+        // A definition node: a struct, an interned optional, an interned error
+        // union, or a plain enum. An enum has no by-value dependencies, so it
+        // is always a leaf of the dependency graph.
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         enum Node {
             Struct(u32),
             Opt(u32),
             ErrU(u32),
+            Enum(u32),
         }
         fn dep_of(t: Type) -> Option<Node> {
             match t {
                 Type::Struct(s) => Some(Node::Struct(s)),
                 Type::Optional(o) => Some(Node::Opt(o)),
                 Type::ErrorUnion(e) => Some(Node::ErrU(e)),
+                Type::Enum(e) => Some(Node::Enum(e)),
                 _ => None,
             }
         }
@@ -256,12 +262,20 @@ impl<'a> Emitter<'a> {
                         visit(d, structs, seen, order);
                     }
                 }
+                // A plain enum embeds nothing by value: it is a graph leaf.
+                Node::Enum(_) => {}
             }
             order.push(n);
         }
 
         let mut seen = HashSet::new();
         let mut order = Vec::new();
+        // Enums first: they have no dependencies, and a struct/optional/error
+        // union that embeds one will already have pulled it in by the time it
+        // is visited (so it is never emitted twice).
+        for (id, _) in structs.enums() {
+            visit(Node::Enum(id), structs, &mut seen, &mut order);
+        }
         for (id, _) in structs.iter() {
             visit(Node::Struct(id), structs, &mut seen, &mut order);
         }
@@ -277,9 +291,34 @@ impl<'a> Emitter<'a> {
                 Node::Struct(id) => self.emit_one_struct(id),
                 Node::Opt(id) => self.emit_one_optional(id),
                 Node::ErrU(id) => self.emit_one_error_union(id),
+                Node::Enum(id) => self.emit_one_enum(id),
             }
         }
         self.blank();
+    }
+
+    /// Emit one `kd_enum_<Name>` typedef. Each variant becomes a C enumerator
+    /// `kd_enum_<Name>_<Variant>` with its explicit 0-based index, so the C
+    /// value matches the variant's declaration order regardless of how the
+    /// typedef is later reordered. An enum carries no by-value dependencies.
+    fn emit_one_enum(&mut self, id: u32) {
+        let structs = self.structs;
+        let info = structs.enum_get(id);
+        let cname = structs.enum_c_name(id);
+        let body = if info.variants.is_empty() {
+            // A variant-less enum is degenerate (sema rejects it), but an empty
+            // C `enum {}` is invalid; give it one placeholder enumerator so the
+            // emitted source always compiles.
+            format!("{}__empty = 0", cname)
+        } else {
+            info.variants
+                .iter()
+                .enumerate()
+                .map(|(i, v)| format!("{} = {}", structs.enum_variant_c_name(id, v), i))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        self.line(&format!("typedef enum {{ {} }} {};", body, cname));
     }
 
     fn emit_one_struct(&mut self, id: u32) {
@@ -428,6 +467,7 @@ impl<'a> Emitter<'a> {
     fn resolve_ty(&self, t: &TypeExpr) -> Type {
         let base = Type::from_name(&t.name)
             .or_else(|| self.structs.id_of(&t.name).map(Type::Struct))
+            .or_else(|| self.structs.enum_id_of(&t.name).map(Type::Enum))
             .unwrap_or(Type::Void);
         if t.optional {
             // sema interned every `?T` that appears, so the table holds it; map
@@ -458,6 +498,7 @@ impl<'a> Emitter<'a> {
             Type::Struct(id) => self.structs.c_name(id),
             Type::Optional(id) => self.structs.optional_c_name(id),
             Type::ErrorUnion(id) => self.structs.error_union_c_name(id),
+            Type::Enum(id) => self.structs.enum_c_name(id),
             other => other.c_name().to_string(),
         }
     }
@@ -471,6 +512,8 @@ impl<'a> Emitter<'a> {
             prim
         } else if let Some(id) = self.structs.id_of(&t.name) {
             Type::Struct(id)
+        } else if let Some(id) = self.structs.enum_id_of(&t.name) {
+            Type::Enum(id)
         } else {
             Type::I64
         };
@@ -654,7 +697,81 @@ impl<'a> Emitter<'a> {
                 false
             }
             Stmt::Block(b) => self.emit_block(b, Scope::plain()),
+            Stmt::Switch {
+                scrutinee,
+                arms,
+                default,
+                ..
+            } => self.emit_switch(scrutinee, arms, default),
         }
+    }
+
+    /// Lower a `switch` to a C `switch`. The scrutinee's type resolves bare
+    /// enum-literal labels (`.V`) to their C enumerator; qualified `Enum.V`
+    /// labels and integer labels lower directly. Each arm's labels share one
+    /// body block (reusing [`Emitter::emit_block`], so `defer`s inside an arm
+    /// flush at the arm's block exit); a `break;` ends every arm so control
+    /// never falls through to the next. An `else` arm becomes `default:`; sema
+    /// proves enum switches exhaustive, so no `default:` is emitted otherwise.
+    ///
+    /// Returns `true` (diverges) when the switch is *total* and every arm — and
+    /// the `else`, if present — diverges. A validated switch is always total
+    /// (an enum switch is exhaustive or has an `else`; an integer switch
+    /// requires an `else`), so this mirrors the `if`/`else` divergence rule.
+    fn emit_switch(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[SwitchArm],
+        default: &Option<Block>,
+    ) -> bool {
+        let scrut_ty = self.type_of_expr(scrutinee);
+        let scrut = self.emit_expr(scrutinee);
+        self.line(&format!("switch ({}) {{", scrut));
+        self.indent += 1;
+        let mut all_diverge = true;
+        for arm in arms {
+            let n = arm.labels.len();
+            for (i, label) in arm.labels.iter().enumerate() {
+                let lc = self.emit_switch_label(label, scrut_ty);
+                // The final label of the arm opens the shared body block.
+                if i + 1 < n {
+                    self.line(&format!("case {}:", lc));
+                } else {
+                    self.line(&format!("case {}: {{", lc));
+                }
+            }
+            // A label-less arm cannot be produced by the parser; guard so the
+            // emitted C stays brace-balanced if one ever appears.
+            if n == 0 {
+                self.line("{");
+            }
+            let d = self.emit_block(&arm.body, Scope::plain());
+            self.line("} break;");
+            all_diverge = all_diverge && d;
+        }
+        if let Some(else_body) = default {
+            self.line("default: {");
+            let d = self.emit_block(else_body, Scope::plain());
+            self.line("} break;");
+            all_diverge = all_diverge && d;
+        }
+        self.indent -= 1;
+        self.line("}");
+        let total = default.is_some() || matches!(scrut_ty, Some(Type::Enum(_)));
+        total && all_diverge
+    }
+
+    /// The C `case` label text for one `switch` arm pattern. A bare enum
+    /// literal `.V` takes its enum from the scrutinee's type; a qualified
+    /// `Enum.V` (a `Field`) and an integer literal already lower to a valid
+    /// integer-constant case label via [`Emitter::emit_expr`].
+    fn emit_switch_label(&mut self, label: &Expr, scrut_ty: Option<Type>) -> String {
+        if let Expr::EnumLit { variant, .. } = label {
+            if let Some(Type::Enum(eid)) = scrut_ty {
+                return self.structs.enum_variant_c_name(eid, variant);
+            }
+        }
+        self.emit_expr(label)
     }
 
     /// Emit a `while` continue-clause statement (an assignment or expression).
@@ -962,8 +1079,8 @@ impl<'a> Emitter<'a> {
                 format!("({}{})", opc, inner)
             }
             Expr::Binary { op, lhs, rhs, .. } => {
-                let l = self.emit_expr(lhs);
-                let r = self.emit_expr(rhs);
+                let l = self.emit_binop_operand(lhs, rhs);
+                let r = self.emit_binop_operand(rhs, lhs);
                 format!("({} {} {})", l, op.c_op(), r)
             }
             Expr::Call { callee, args, .. } => {
@@ -1004,6 +1121,14 @@ impl<'a> Emitter<'a> {
                 }
             }
             Expr::Field { base, field, .. } => {
+                // A qualified enum literal `Enum.Variant` reuses the field-access
+                // shape: its base is an `Ident` naming an enum type. Lower it to
+                // the C enumerator rather than a struct member access.
+                if let Expr::Ident { name, .. } = base.as_ref() {
+                    if let Some(eid) = self.structs.enum_id_of(name) {
+                        return self.structs.enum_variant_c_name(eid, field);
+                    }
+                }
                 // Field access: `(<base>).kd_<field>`. The base is parenthesized
                 // so a compound base expression (e.g. a literal or another access)
                 // composes correctly: `((p).kd_a).kd_b`.
@@ -1081,6 +1206,15 @@ impl<'a> Emitter<'a> {
                 let code = self.structs.error_code(name).unwrap_or(0);
                 code.to_string()
             }
+            Expr::EnumLit { variant, .. } => {
+                // A bare `.Variant` gets its enum type from context — a coercion
+                // target (`emit_coerced`), a `switch` label (`emit_switch_label`)
+                // or a comparison sibling (`emit_binop_operand`) supplies it.
+                // Reaching here means no context was available, which sema
+                // rejects (E0215); emit a harmless `0` so output stays valid C.
+                let _ = variant;
+                "0".to_string()
+            }
             Expr::Try { expr, .. } => {
                 // `try` is statement-level (SPEC §12.1) and is lowered by the
                 // statement emitters (`emit_try`); sema rejects it in any other
@@ -1104,6 +1238,19 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+    }
+
+    /// Lower one operand of a binary expression. This is ordinarily just
+    /// [`Emitter::emit_expr`]; the sole exception is a bare enum literal `.V`,
+    /// which has no intrinsic type — its enum is taken from the sibling operand
+    /// so that e.g. `c == .Red` lowers `.Red` to the matching C enumerator.
+    fn emit_binop_operand(&mut self, e: &Expr, sibling: &Expr) -> String {
+        if matches!(e, Expr::EnumLit { .. }) {
+            if let Some(t @ Type::Enum(_)) = self.type_of_expr(sibling) {
+                return self.emit_coerced(e, t);
+            }
+        }
+        self.emit_expr(e)
     }
 
     /// Lower a method / associated-function call to a free-function call.
@@ -1261,10 +1408,19 @@ impl<'a> Emitter<'a> {
             Expr::Call { callee, .. } => self.fn_ret.get(callee).copied(),
             Expr::Comptime { expr, .. } => self.type_of_expr(expr),
             Expr::StructLit { name, .. } => self.structs.id_of(name).map(Type::Struct),
-            Expr::Field { base, field, .. } => match self.type_of_expr(base)? {
-                Type::Struct(id) => self.structs.get(id).field_type(field),
-                _ => None,
-            },
+            Expr::Field { base, field, .. } => {
+                // A qualified enum literal `Enum.V` (base names an enum type) has
+                // type `Enum(id)`; otherwise it is an ordinary struct-field access.
+                if let Expr::Ident { name, .. } = base.as_ref() {
+                    if let Some(eid) = self.structs.enum_id_of(name) {
+                        return Some(Type::Enum(eid));
+                    }
+                }
+                match self.type_of_expr(base)? {
+                    Type::Struct(id) => self.structs.get(id).field_type(field),
+                    _ => None,
+                }
+            }
             Expr::MethodCall {
                 receiver, method, ..
             } => {
@@ -1288,6 +1444,9 @@ impl<'a> Emitter<'a> {
             // A bare `error.Name` has no intrinsic type — its `!T` comes from
             // context (it coerces to any error union).
             Expr::ErrorLit { .. } => None,
+            // A bare `.Variant` has no intrinsic type — its enum comes from
+            // context (the expected type or the `switch` scrutinee).
+            Expr::EnumLit { .. } => None,
             // `try` / `catch` both produce the payload `T` of the `!T` operand.
             Expr::Try { expr, .. } => match self.type_of_expr(expr)? {
                 Type::ErrorUnion(id) => Some(self.structs.error_union_payload(id)),
@@ -1306,6 +1465,15 @@ impl<'a> Emitter<'a> {
     /// widens to `{ .has = true, .val = <e> }`. When `expected` is not an
     /// optional this is just [`Emitter::emit_expr`].
     fn emit_coerced(&mut self, e: &Expr, expected: Type) -> String {
+        if let Type::Enum(eid) = expected {
+            // A bare `.Variant` resolves to its C enumerator using the expected
+            // enum. Any other enum-typed value (a qualified `Enum.V`, an
+            // enum-typed local, a call result) already lowers correctly.
+            if let Expr::EnumLit { variant, .. } = e {
+                return self.structs.enum_variant_c_name(eid, variant);
+            }
+            return self.emit_expr(e);
+        }
         if let Type::Optional(oid) = expected {
             let oname = self.structs.optional_c_name(oid);
             if matches!(e, Expr::Null { .. }) {
@@ -1461,7 +1629,7 @@ mod tests {
     use super::*;
     use crate::ast::{
         BinOp, Block, Expr, FieldDecl, FieldInit, Func, Item, Module, Param, Stmt, StructDecl,
-        TestBlock, TypeExpr,
+        SwitchArm, TestBlock, TypeExpr,
     };
     use crate::span::Span;
     use crate::types::{StructTable, Type};
@@ -2862,5 +3030,337 @@ mod tests {
             .expect("error propagation missing");
         // Inside the error branch the defer runs before the propagation return.
         assert!(flush < prop, "defer must flush before propagation:\n{out}");
+    }
+
+    // -- enums & switch (v0.116) -------------------------------------------
+
+    fn enum_lit(variant: &str) -> Expr {
+        Expr::EnumLit {
+            variant: variant.to_string(),
+            span: Span::DUMMY,
+        }
+    }
+
+    fn assign(name: &str, value: Expr) -> Stmt {
+        Stmt::Assign {
+            name: name.to_string(),
+            value,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn arm(labels: Vec<Expr>, body: Vec<Stmt>) -> SwitchArm {
+        SwitchArm {
+            labels,
+            body: block(body),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A `StructTable` with `Color = enum { Red, Green, Blue }` at enum id 0.
+    fn color_enum_table() -> StructTable {
+        let mut t = StructTable::new();
+        let id = t.intern_enum("Color");
+        t.set_enum_variants(
+            id,
+            vec!["Red".to_string(), "Green".to_string(), "Blue".to_string()],
+        );
+        t
+    }
+
+    #[test]
+    fn enum_typedef_emitted_with_indexed_enumerators() {
+        // The typedef comes straight off the enum table, variants 0-based.
+        let structs = color_enum_table();
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains(
+                "typedef enum { kd_enum_Color_Red = 0, kd_enum_Color_Green = 1, kd_enum_Color_Blue = 2 } kd_enum_Color;"
+            ),
+            "enum typedef missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn qualified_enum_literal_lowers_to_enumerator() {
+        // fn pick() Color { return Color.Green; }
+        let structs = color_enum_table();
+        let f = Func {
+            is_pub: false,
+            name: "pick".to_string(),
+            params: vec![],
+            ret: ty("Color"),
+            body: block(vec![ret(field(ident("Color"), "Green"))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // An enum return type uses the enum typedef.
+        assert!(
+            out.contains("kd_enum_Color kd_pick(void)"),
+            "enum return type wrong:\n{out}"
+        );
+        // `Color.Green` lowers to the enumerator (not a `.kd_Green` field access).
+        assert!(
+            out.contains("return (kd_enum_Color_Green);"),
+            "qualified enum literal lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn unqualified_enum_literal_coerces_via_expected_type() {
+        // fn f() void { var c: Color = .Blue; }
+        let structs = color_enum_table();
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![Stmt::Let {
+                is_const: false,
+                name: "c".to_string(),
+                ty: ty("Color"),
+                value: enum_lit("Blue"),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The enum-typed local uses the enum typedef; `.Blue` resolves via the
+        // expected type to its enumerator.
+        assert!(
+            out.contains("kd_enum_Color kd_c = kd_enum_Color_Blue;"),
+            "unqualified enum literal coercion wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn switch_emits_c_switch_with_cases_break_and_default() {
+        // fn f(c: Color) i32 {
+        //     var r: i32 = 0;
+        //     switch (c) {
+        //         .Red => { r = 1; }
+        //         .Green, .Blue => { r = 2; }
+        //         else => { r = 3; }
+        //     }
+        //     return r;
+        // }
+        let structs = color_enum_table();
+        let sw = Stmt::Switch {
+            scrutinee: ident("c"),
+            arms: vec![
+                arm(vec![enum_lit("Red")], vec![assign("r", int(1))]),
+                arm(
+                    vec![enum_lit("Green"), enum_lit("Blue")],
+                    vec![assign("r", int(2))],
+                ),
+            ],
+            default: Some(block(vec![assign("r", int(3))])),
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![param("c", "Color")],
+            ret: ty("i32"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "r".to_string(),
+                    ty: ty("i32"),
+                    value: int(0),
+                    span: Span::DUMMY,
+                },
+                sw,
+                ret(ident("r")),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The enum-typed param uses the enum typedef.
+        assert!(
+            out.contains("kd_enum_Color kd_c"),
+            "enum param type wrong:\n{out}"
+        );
+        // The C switch header dispatches on the (kd_-prefixed) scrutinee.
+        assert!(out.contains("switch (kd_c) {"), "switch header missing:\n{out}");
+        // The single-label arm opens its body block.
+        assert!(
+            out.contains("case kd_enum_Color_Red: {"),
+            "first case (body) missing:\n{out}"
+        );
+        // Shared labels: the first is a bare `case`, the last opens the body.
+        assert!(
+            out.contains("case kd_enum_Color_Green:"),
+            "shared label 1 missing:\n{out}"
+        );
+        assert!(
+            out.contains("case kd_enum_Color_Blue: {"),
+            "shared label 2 (body) missing:\n{out}"
+        );
+        // Each arm ends with a break so control never falls through.
+        assert!(out.contains("} break;"), "arm break missing:\n{out}");
+        // The source `else` becomes a C `default:`.
+        assert!(out.contains("default: {"), "default arm missing:\n{out}");
+    }
+
+    #[test]
+    fn enum_switch_without_else_emits_no_default() {
+        // fn f(c: Color) i32 {
+        //     switch (c) { .Red => { return 1; } .Green => { return 2; } .Blue => { return 3; } }
+        // }
+        // An exhaustive enum switch with no `else` emits no `default:`.
+        let structs = color_enum_table();
+        let sw = Stmt::Switch {
+            scrutinee: ident("c"),
+            arms: vec![
+                arm(vec![enum_lit("Red")], vec![ret(int(1))]),
+                arm(vec![enum_lit("Green")], vec![ret(int(2))]),
+                arm(vec![enum_lit("Blue")], vec![ret(int(3))]),
+            ],
+            default: None,
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![param("c", "Color")],
+            ret: ty("i32"),
+            body: block(vec![sw]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(out.contains("switch (kd_c) {"), "switch header missing:\n{out}");
+        assert!(
+            out.contains("case kd_enum_Color_Blue: {"),
+            "blue case missing:\n{out}"
+        );
+        assert!(
+            !out.contains("default:"),
+            "exhaustive enum switch must not emit a default:\n{out}"
+        );
+    }
+
+    #[test]
+    fn integer_switch_emits_int_cases_and_default() {
+        // fn f(n: i32) i32 {
+        //     var r: i32 = 0;
+        //     switch (n) { 1 => { r = 10; } 2, 3 => { r = 20; } else => { r = 0; } }
+        //     return r;
+        // }
+        let structs = StructTable::new();
+        let sw = Stmt::Switch {
+            scrutinee: ident("n"),
+            arms: vec![
+                arm(vec![int(1)], vec![assign("r", int(10))]),
+                arm(vec![int(2), int(3)], vec![assign("r", int(20))]),
+            ],
+            default: Some(block(vec![assign("r", int(0))])),
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![param("n", "i32")],
+            ret: ty("i32"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "r".to_string(),
+                    ty: ty("i32"),
+                    value: int(0),
+                    span: Span::DUMMY,
+                },
+                sw,
+                ret(ident("r")),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(out.contains("switch (kd_n) {"), "switch header missing:\n{out}");
+        assert!(out.contains("case 1: {"), "int case 1 missing:\n{out}");
+        assert!(out.contains("case 2:"), "shared int label missing:\n{out}");
+        assert!(out.contains("case 3: {"), "int case 3 (body) missing:\n{out}");
+        assert!(out.contains("default: {"), "int switch default missing:\n{out}");
+    }
+
+    #[test]
+    fn switch_arm_flushes_defer_at_arm_exit() {
+        // fn f(c: Color) void {
+        //     switch (c) { .Red => { defer print(7); print(1); } else => {} }
+        // }
+        // A defer registered inside an arm flushes at that arm's block exit
+        // (before the trailing `break;`), in LIFO order — reusing emit_block.
+        let structs = color_enum_table();
+        let sw = Stmt::Switch {
+            scrutinee: ident("c"),
+            arms: vec![arm(
+                vec![enum_lit("Red")],
+                vec![defer(print(int(7))), print(int(1))],
+            )],
+            default: Some(block(vec![])),
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![param("c", "Color")],
+            ret: ty("void"),
+            body: block(vec![sw]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        let body = out.find("kd_print((long long)(1));").expect("arm body missing");
+        let deferred = out[body..]
+            .find("kd_print((long long)(7));")
+            .map(|i| body + i)
+            .expect("deferred call missing");
+        let brk = out[body..]
+            .find("} break;")
+            .map(|i| body + i)
+            .expect("arm break missing");
+        // The body runs, then the defer flushes, then the arm's `break`.
+        assert!(body < deferred, "defer must flush after body:\n{out}");
+        assert!(deferred < brk, "defer must flush before the break:\n{out}");
+    }
+
+    #[test]
+    fn enum_struct_field_typedef_orders_enum_first() {
+        // const Pixel = struct { c: Color };  — a struct embedding an enum.
+        // The enum typedef must precede the struct typedef that embeds it.
+        let mut structs = color_enum_table();
+        let color_id = structs.enum_id_of("Color").unwrap();
+        let pid = structs.intern("Pixel");
+        structs.set_fields(pid, vec![("c".to_string(), Type::Enum(color_id))]);
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        let enum_at = out
+            .find("typedef enum { kd_enum_Color_Red = 0")
+            .expect("enum typedef missing");
+        let struct_at = out
+            .find("typedef struct { kd_enum_Color kd_c; } kd_struct_Pixel;")
+            .expect("struct-with-enum-field typedef missing/wrong");
+        assert!(
+            enum_at < struct_at,
+            "enum typedef must precede the struct that embeds it:\n{out}"
+        );
     }
 }

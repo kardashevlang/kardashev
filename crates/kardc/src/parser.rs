@@ -12,8 +12,8 @@
 //! `Err` if any diagnostic was produced.
 
 use crate::ast::{
-    BinOp, Block, ConstDecl, Expr, FieldDecl, FieldInit, Func, Item, Module, Param, Stmt,
-    StructDecl, TestBlock, TypeExpr, UnOp,
+    BinOp, Block, ConstDecl, EnumDecl, Expr, FieldDecl, FieldInit, Func, Item, Module, Param, Stmt,
+    StructDecl, SwitchArm, TestBlock, TypeExpr, UnOp,
 };
 use crate::diag::Diagnostic;
 use crate::span::Span;
@@ -306,9 +306,13 @@ impl<'a> Parser<'a> {
         self.bump(); // `const`
         let (name, _) = self.expect_ident()?;
         // A `const IDENT =` (rather than `const IDENT :`) introduces a struct
-        // declaration (SPEC §9.1); a `const IDENT : type = expr;` is the
-        // ordinary value binding of §2.
+        // declaration (SPEC §9.1) or an enum declaration (SPEC §13.1); a
+        // `const IDENT : type = expr;` is the ordinary value binding of §2.
+        // The `struct`/`enum` keyword after the `=` selects the form.
         if self.at_punct(&TokenKind::Eq) {
+            if matches!(self.peek2_kind(), TokenKind::Keyword(Kw::Enum)) {
+                return self.parse_enum_decl(is_pub, name, start);
+            }
             return self.parse_struct_decl(is_pub, name, start);
         }
         self.expect_punct(&TokenKind::Colon, "`:`")?;
@@ -382,6 +386,36 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    /// Parse the tail of an enum declaration, with `const IDENT` already
+    /// consumed and the cursor on the `=`:
+    /// `= "enum" "{" IDENT ("," IDENT)* ","? "}" ";"` (SPEC §13.1). Plain
+    /// (C-like) enums: a comma-separated list of variant names (no payloads),
+    /// with an optional trailing comma. Variants are 0-based; duplicate-variant
+    /// detection is a sema concern (`E0211`/`E0212`), not the parser's.
+    fn parse_enum_decl(&mut self, is_pub: bool, name: String, start: Span) -> PResult<Item> {
+        self.bump(); // `=`
+        if !self.eat_kw(Kw::Enum) {
+            return Err(self.expected("`enum`"));
+        }
+        self.expect_punct(&TokenKind::LBrace, "`{`")?;
+        let mut variants = Vec::new();
+        while !self.at_punct(&TokenKind::RBrace) {
+            let (vname, _) = self.expect_ident()?;
+            variants.push(vname);
+            if !self.eat_punct(&TokenKind::Comma) {
+                break; // no separator → the variant list is done
+            }
+        }
+        self.expect_punct(&TokenKind::RBrace, "`}`")?;
+        let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
+        Ok(Item::Enum(EnumDecl {
+            is_pub,
+            name,
+            variants,
+            span: start.merge(semi),
+        }))
+    }
+
     fn parse_test(&mut self, start: Span) -> PResult<Item> {
         self.bump(); // `test`
         let (name, _) = self.expect_str()?;
@@ -418,6 +452,7 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Kw::Break) => self.parse_break(),
             TokenKind::Keyword(Kw::Continue) => self.parse_continue(),
             TokenKind::Keyword(Kw::Defer) => self.parse_defer(),
+            TokenKind::Keyword(Kw::Switch) => self.parse_switch(),
             TokenKind::LBrace => Ok(Stmt::Block(self.parse_block()?)),
             TokenKind::Ident(_) if matches!(self.peek2_kind(), TokenKind::Eq) => self.parse_assign(),
             _ => self.parse_expr_stmt(),
@@ -566,6 +601,59 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Defer {
             stmt: Box::new(inner),
             span,
+        })
+    }
+
+    /// Parse a `switch` statement (SPEC §13.1):
+    /// `switch "(" expr ")" "{" arm* else_arm? "}"`. Each arm is a
+    /// comma-separated list of constant-pattern labels, then `=>`, then a
+    /// block; the optional `else => block` arm becomes `default`. Arms are
+    /// separated by `,`, and a trailing `,` after a `}` block is optional, so
+    /// the separator is consumed leniently after every arm. Labels are parsed
+    /// as full expressions (they will be enum literals `.V` / `Enum.V` or
+    /// integer literals); their validity against the scrutinee type and the
+    /// exhaustiveness of the arms are sema concerns (`E0210`–`E0215`).
+    fn parse_switch(&mut self) -> PResult<Stmt> {
+        let start = self.peek_span();
+        self.bump(); // `switch`
+        self.expect_punct(&TokenKind::LParen, "`(`")?;
+        let scrutinee = self.parse_expr()?;
+        self.expect_punct(&TokenKind::RParen, "`)`")?;
+        self.expect_punct(&TokenKind::LBrace, "`{`")?;
+        let mut arms = Vec::new();
+        let mut default = None;
+        while !self.at_eof() && !self.at_punct(&TokenKind::RBrace) {
+            if self.at_kw(Kw::Else) {
+                // The default arm: `else => block`. A later `else` simply
+                // overwrites (a duplicate-default is a sema concern).
+                self.bump(); // `else`
+                self.expect_punct(&TokenKind::FatArrow, "`=>`")?;
+                default = Some(self.parse_block()?);
+            } else {
+                let arm_start = self.peek_span();
+                let mut labels = vec![self.parse_expr()?];
+                while self.eat_punct(&TokenKind::Comma) {
+                    // Tolerate a trailing `,` before the `=>` in a label list.
+                    if self.at_punct(&TokenKind::FatArrow) {
+                        break;
+                    }
+                    labels.push(self.parse_expr()?);
+                }
+                self.expect_punct(&TokenKind::FatArrow, "`=>`")?;
+                let body = self.parse_block()?;
+                let span = arm_start.merge(body.span);
+                arms.push(SwitchArm { labels, body, span });
+            }
+            // Arms are separated by `,`; a trailing comma after a block is
+            // optional, so consume one if present and otherwise carry on.
+            self.eat_punct(&TokenKind::Comma);
+        }
+        let rbrace = self.expect_punct(&TokenKind::RBrace, "`}`")?;
+        Ok(Stmt::Switch {
+            scrutinee,
+            arms,
+            default,
+            span: start.merge(rbrace),
         })
     }
 
@@ -871,6 +959,20 @@ impl<'a> Parser<'a> {
                     span: tok.span.merge(name_span),
                 })
             }
+            TokenKind::Dot => {
+                // A leading `.Variant` in expression-start position is an
+                // unqualified enum literal (SPEC §13.1); its enum type comes
+                // from context (the expected type or a `switch` scrutinee).
+                // This is distinct from the *postfix* `.field` / `.method()` /
+                // `.?` forms, which follow an operand and are handled in
+                // `parse_postfix`; here there is no preceding operand.
+                self.bump(); // `.`
+                let (variant, variant_span) = self.expect_ident()?;
+                Ok(Expr::EnumLit {
+                    variant,
+                    span: tok.span.merge(variant_span),
+                })
+            }
             TokenKind::Ident(name) => {
                 self.bump();
                 if self.at_punct(&TokenKind::LParen) {
@@ -990,6 +1092,7 @@ fn describe_kind(kind: &TokenKind) -> String {
         TokenKind::Percent => "`%`".to_string(),
         TokenKind::Bang => "`!`".to_string(),
         TokenKind::Question => "`?`".to_string(),
+        TokenKind::FatArrow => "`=>`".to_string(),
         TokenKind::Eof => "end of input".to_string(),
     }
 }
@@ -2453,6 +2556,315 @@ mod tests {
                 );
             }
             other => panic!("expected catch at the root, got {:?}", other),
+        }
+    }
+
+    // ---- v0.116: enums & switch -------------------------------------------
+
+    /// Wrap a sequence of statement tokens inside `fn f() void { ... }` and
+    /// return the parsed function body (so `switch` statements can be exercised
+    /// in their natural statement position).
+    fn parse_fn_body(stmt_kinds: Vec<TokenKind>) -> Block {
+        let mut kinds = vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+        ];
+        kinds.extend(stmt_kinds);
+        kinds.push(TokenKind::RBrace);
+        let m = parse(&toks(kinds)).expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => f.body.clone(),
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enum_decl_three_variants() {
+        // pub const Color = enum { Red, Green, Blue };
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Pub),
+            TokenKind::Keyword(Kw::Const),
+            id("Color"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Enum),
+            TokenKind::LBrace,
+            id("Red"),
+            TokenKind::Comma,
+            id("Green"),
+            TokenKind::Comma,
+            id("Blue"),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Enum(e) => {
+                assert!(e.is_pub);
+                assert_eq!(e.name, "Color");
+                assert_eq!(e.variants, vec!["Red", "Green", "Blue"]);
+                assert!(e.span.start < e.span.end);
+            }
+            other => panic!("expected enum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enum_decl_trailing_comma() {
+        // const E = enum { A, };  — a single variant with a trailing comma.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("E"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Enum),
+            TokenKind::LBrace,
+            id("A"),
+            TokenKind::Comma,
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Enum(e) => {
+                assert!(!e.is_pub);
+                assert_eq!(e.name, "E");
+                assert_eq!(e.variants, vec!["A"]);
+            }
+            other => panic!("expected enum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn struct_decl_still_parses_alongside_enum_branch() {
+        // The `= struct {...}` branch must still parse after the `= enum`
+        // dispatch is added (regression guard for the const-item dispatch).
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("Point"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            id("x"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        assert!(matches!(&m.items[0], Item::Struct(s) if s.name == "Point"));
+    }
+
+    #[test]
+    fn enum_lit_unqualified() {
+        // x = .Red;  ==>  EnumLit { variant: "Red" }
+        let e = parse_assign_rhs(vec![TokenKind::Dot, id("Red")]);
+        match e {
+            Expr::EnumLit { variant, span } => {
+                assert_eq!(variant, "Red");
+                assert!(span.start < span.end, "span should cover `.Red`");
+            }
+            other => panic!("expected enum literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enum_lit_qualified_is_field() {
+        // x = Color.Red;  ==>  Field { base: Ident Color, field: "Red" } — the
+        // qualified form reuses `Expr::Field`, with no new parser code.
+        let e = parse_assign_rhs(vec![id("Color"), TokenKind::Dot, id("Red")]);
+        match e {
+            Expr::Field { base, field, .. } => {
+                assert_eq!(field, "Red");
+                assert!(matches!(*base, Expr::Ident { ref name, .. } if name == "Color"));
+            }
+            other => panic!("expected field access, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enum_lit_does_not_break_postfix_field() {
+        // x = a.b;  must still be postfix `Field`, NOT a leading-dot EnumLit —
+        // the leading-`.` rule only fires at the *start* of a primary.
+        let e = parse_assign_rhs(vec![id("a"), TokenKind::Dot, id("b")]);
+        assert!(
+            matches!(e, Expr::Field { ref field, .. } if field == "b"),
+            "expected postfix field, got {:?}",
+            e
+        );
+    }
+
+    #[test]
+    fn switch_over_enum_with_else() {
+        // switch (c) { .Red => { return; }, .Green => { return; }, else => { return; } }
+        let body = parse_fn_body(vec![
+            TokenKind::Keyword(Kw::Switch),
+            TokenKind::LParen,
+            id("c"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            // .Red => { return; },
+            TokenKind::Dot,
+            id("Red"),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+            TokenKind::Comma,
+            // .Green => { return; },
+            TokenKind::Dot,
+            id("Green"),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+            TokenKind::Comma,
+            // else => { return; }
+            TokenKind::Keyword(Kw::Else),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+            TokenKind::RBrace, // close switch
+        ]);
+        match &body.stmts[0] {
+            Stmt::Switch {
+                scrutinee,
+                arms,
+                default,
+                span,
+            } => {
+                assert!(matches!(scrutinee, Expr::Ident { name, .. } if name == "c"));
+                assert_eq!(arms.len(), 2);
+                assert_eq!(arms[0].labels.len(), 1);
+                assert!(matches!(&arms[0].labels[0], Expr::EnumLit { variant, .. } if variant == "Red"));
+                assert!(matches!(&arms[1].labels[0], Expr::EnumLit { variant, .. } if variant == "Green"));
+                assert!(default.is_some(), "the `else` arm should set `default`");
+                assert!(span.start < span.end);
+            }
+            other => panic!("expected switch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn switch_multi_label_arm() {
+        // switch (c) { .A, .B => { } else => { } }  — one arm with two labels;
+        // no comma between the block and `else` (the separator is optional).
+        let body = parse_fn_body(vec![
+            TokenKind::Keyword(Kw::Switch),
+            TokenKind::LParen,
+            id("c"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            // .A, .B => { }
+            TokenKind::Dot,
+            id("A"),
+            TokenKind::Comma,
+            TokenKind::Dot,
+            id("B"),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            // else => { }
+            TokenKind::Keyword(Kw::Else),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace, // close switch
+        ]);
+        match &body.stmts[0] {
+            Stmt::Switch { arms, default, .. } => {
+                assert_eq!(arms.len(), 1);
+                assert_eq!(arms[0].labels.len(), 2);
+                assert!(matches!(&arms[0].labels[0], Expr::EnumLit { variant, .. } if variant == "A"));
+                assert!(matches!(&arms[0].labels[1], Expr::EnumLit { variant, .. } if variant == "B"));
+                assert!(default.is_some());
+            }
+            other => panic!("expected switch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn switch_on_int_with_else() {
+        // switch (n) { 1 => { } 2 => { } else => { } }  — integer scrutinee,
+        // integer-literal labels, no commas between arms (separator optional).
+        let body = parse_fn_body(vec![
+            TokenKind::Keyword(Kw::Switch),
+            TokenKind::LParen,
+            id("n"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::Int(1),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Int(2),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Keyword(Kw::Else),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace, // close switch
+        ]);
+        match &body.stmts[0] {
+            Stmt::Switch {
+                scrutinee,
+                arms,
+                default,
+                ..
+            } => {
+                assert!(matches!(scrutinee, Expr::Ident { name, .. } if name == "n"));
+                assert_eq!(arms.len(), 2);
+                assert!(matches!(&arms[0].labels[0], Expr::Int { value: 1, .. }));
+                assert!(matches!(&arms[1].labels[0], Expr::Int { value: 2, .. }));
+                assert!(default.is_some(), "an int switch needs an `else`");
+            }
+            other => panic!("expected switch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn switch_qualified_enum_labels() {
+        // switch (c) { Color.Red => { } else => { } }  — a qualified `Enum.V`
+        // label parses as `Expr::Field`, and the leading-dot rule does not
+        // interfere with it.
+        let body = parse_fn_body(vec![
+            TokenKind::Keyword(Kw::Switch),
+            TokenKind::LParen,
+            id("c"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            id("Color"),
+            TokenKind::Dot,
+            id("Red"),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Keyword(Kw::Else),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace, // close switch
+        ]);
+        match &body.stmts[0] {
+            Stmt::Switch { arms, .. } => {
+                assert_eq!(arms.len(), 1);
+                match &arms[0].labels[0] {
+                    Expr::Field { base, field, .. } => {
+                        assert_eq!(field, "Red");
+                        assert!(matches!(**base, Expr::Ident { ref name, .. } if name == "Color"));
+                    }
+                    other => panic!("expected `Color.Red` field label, got {:?}", other),
+                }
+            }
+            other => panic!("expected switch, got {:?}", other),
         }
     }
 }

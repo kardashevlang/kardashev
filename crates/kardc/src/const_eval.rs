@@ -85,6 +85,11 @@ pub fn eval(expr: &Expr, consts: &HashMap<String, ConstVal>) -> Result<ConstVal,
                 "error unions are not allowed in a constant expression",
             ))
         }
+        Expr::EnumLit { span, .. } => Err(Diagnostic::error(
+            *span,
+            "E0130",
+            "enum values are not allowed in a constant expression",
+        )),
     }
 }
 

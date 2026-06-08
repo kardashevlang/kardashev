@@ -74,9 +74,10 @@ Errors as values (implicit global error set), explicit propagation. Lowered as
 `{ i32 err; T val; }` in C. Deferred: `errdefer`, `catch |e|` capture, named
 error sets, `try` in nested expression positions.
 
-### v0.116.0 — Enums & tagged unions; exhaustive `switch`
-`enum`, `union(enum)`, `switch` with exhaustiveness checking — no hidden
-fall-through.
+### v0.116.0 — Enums & exhaustive `switch` ✅
+Plain `enum` + `switch` with exhaustiveness checking (every variant or `else`;
+`else` required for integers) — no hidden fall-through. Lowered to C `enum` +
+`switch`. Tagged unions (`union(enum)`) + payload capture are a later item.
 
 ### v0.117.0 — Arrays, slices, pointers; the **Allocator** interface
 `[N]T`, `[]T`, `*T`, `[*]T`. Introduce the explicit `Allocator` interface —
