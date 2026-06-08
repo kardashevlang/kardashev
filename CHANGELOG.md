@@ -18,6 +18,27 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.120.0] — `comptime` generics (generic functions)
+
+Zig's metaprogramming model: compile-time type parameters + monomorphisation.
+
+### Added
+- **Generic functions** `fn f(comptime T: type, …)`. A function with a
+  `comptime IDENT: type` parameter is generic; its runtime parameters, return
+  type and body may use the type parameter as a type (including `?T`, `[]T`,
+  `[N]T`, `*T`, `!T`).
+- **Monomorphisation**: each distinct type argument emits its own specialised C
+  function (`kd_max__int32_t`, …) — no runtime dispatch. Supports **transitive
+  instantiation** and **type-parameter forwarding** (`max(T, …)` inside another
+  generic). Type arguments are passed positionally: `max(i32, a, b)`.
+- `Param.is_comptime`; a `StructTable` instantiation registry; substitution
+  threaded through sema and the backend. Diagnostics `E0250`–`E0252`.
+- 423 unit + 20 e2e tests; `examples/generics.ks`.
+
+### Deferred
+- Generic structs / type-returning functions, comptime *value* parameters,
+  comptime control flow, and `anytype`.
+
 ## [0.119.0] — The Allocator interface + heap
 
 Zig's law — no global allocator; heap memory is requested from an `Allocator`

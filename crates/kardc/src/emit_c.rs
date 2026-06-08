@@ -12,7 +12,7 @@ use crate::ast::{
     Block, Expr, Func, Item, Module, Param, Stmt, SwitchArm, TestBlock, TypeExpr, UnOp,
 };
 use crate::const_eval::ConstVal;
-use crate::types::{StructTable, Type};
+use crate::types::{Instantiation, StructTable, Type};
 
 /// Id-space base for emit-local pointer types (v0.118). The [`StructTable`]
 /// interns slices (and exposes a `slices()` iterator) but pointers carry no
@@ -142,6 +142,18 @@ struct Emitter<'a> {
     /// resolve (ids are offset by [`PTR_LOCAL_BASE`]). Populated in
     /// [`Emitter::collect_signatures`] before any type is resolved.
     local_ptr_pointees: Vec<Type>,
+    /// The active type-parameter substitution while emitting a generic
+    /// function's instantiation (v0.120, SPEC §17.3). Maps a comptime
+    /// type-parameter name (e.g. `"T"`) to the concrete [`Type`] it stands for
+    /// in the current instance. Empty everywhere else, so `resolve_ty` / `cty`
+    /// behave exactly as before for non-generic code.
+    subst: HashMap<String, Type>,
+    /// Every generic top-level function (one with ≥1 `comptime` type
+    /// parameter), keyed by name. A generic function is never emitted under its
+    /// plain name — only one specialised C function per recorded instantiation
+    /// is emitted (see [`Emitter::emit_instance_defs`]). Stored as clones so a
+    /// `Call` to a generic can be lowered to its instance's C name anywhere.
+    generics: HashMap<String, Func>,
 }
 
 impl<'a> Emitter<'a> {
@@ -161,6 +173,24 @@ impl<'a> Emitter<'a> {
             try_counter: 0,
             idx_counter: 0,
             local_ptr_pointees: Vec::new(),
+            subst: HashMap::new(),
+            generics: HashMap::new(),
+        }
+    }
+
+    /// True if `f` is a generic function: it has at least one `comptime` type
+    /// parameter (SPEC §17.1). Such a function is checked + emitted only per
+    /// instantiation, never under its plain name.
+    fn is_generic(f: &Func) -> bool {
+        f.params.iter().any(|p| p.is_comptime)
+    }
+
+    /// Set [`Emitter::subst`] to map `f`'s comptime type parameters (in order)
+    /// to `type_args` — the substitution active while emitting one instance.
+    fn set_subst_for(&mut self, f: &Func, type_args: &[Type]) {
+        self.subst.clear();
+        for (p, t) in f.params.iter().filter(|p| p.is_comptime).zip(type_args.iter()) {
+            self.subst.insert(p.name.clone(), *t);
         }
     }
 
@@ -169,14 +199,43 @@ impl<'a> Emitter<'a> {
     /// receiver chain that passes through a call to find the struct whose
     /// function a method call invokes. Pure bookkeeping — emits nothing.
     fn collect_signatures(&mut self, module: &Module) {
+        // Register every generic top-level function first (SPEC §17). The
+        // pointer pre-pass and the signature pass below both recognise and skip
+        // generic functions — their signatures only make sense under a concrete
+        // substitution, handled per instantiation.
+        for item in &module.items {
+            if let Item::Func(f) = item {
+                if Self::is_generic(f) {
+                    self.generics.insert(f.name.clone(), f.clone());
+                }
+            }
+        }
         // Pre-pass: register every `*T` written in a signature or local so
         // `resolve_ty` can map those pointer types to a `Type::Ptr` id. Must run
         // before any `resolve_ty` call below (which already resolves return /
         // parameter types into the signature tables).
         self.collect_ptr_types(module);
+        // Register the `*T` pointee types that appear *inside* each generic
+        // instantiation, resolved under that instance's substitution — so a
+        // `*T` used in a generic body (e.g. `*i32` for the `i32` instance) maps
+        // to a real pointee in [`Emitter::local_ptr_pointees`] (SPEC §17.3).
+        let structs = self.structs;
+        let insts = structs.instantiations().to_vec();
+        for inst in &insts {
+            if let Some(f) = self.generics.get(&inst.fn_name).cloned() {
+                self.set_subst_for(&f, &inst.type_args);
+                self.note_func_ptrs(&f);
+                self.subst.clear();
+            }
+        }
         for item in &module.items {
             match item {
                 Item::Func(f) => {
+                    // A generic function has no resolvable signature without a
+                    // substitution; it is handled per instantiation, not here.
+                    if Self::is_generic(f) {
+                        continue;
+                    }
                     let ret = self.resolve_ty(&f.ret);
                     self.fn_ret.insert(f.name.clone(), ret);
                     let ptys: Vec<Type> = f.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
@@ -207,7 +266,13 @@ impl<'a> Emitter<'a> {
     fn collect_ptr_types(&mut self, module: &Module) {
         for item in &module.items {
             match item {
-                Item::Func(f) => self.note_func_ptrs(f),
+                // Generic functions are scanned per instantiation (under a
+                // substitution) in `collect_signatures`, not here.
+                Item::Func(f) => {
+                    if !Self::is_generic(f) {
+                        self.note_func_ptrs(f);
+                    }
+                }
                 Item::Struct(s) => {
                     for m in &s.methods {
                         self.note_func_ptrs(m);
@@ -591,14 +656,24 @@ impl<'a> Emitter<'a> {
 
     fn emit_forward_decls(&mut self, module: &Module) {
         let mut any = false;
-        // Ordinary top-level functions first.
+        // Ordinary top-level functions first. A generic function is never
+        // forward-declared under its plain name (SPEC §17.3) — only its
+        // instances are (see `emit_instance_forward_decls`).
         for item in &module.items {
             if let Item::Func(f) = item {
+                if Self::is_generic(f) {
+                    continue;
+                }
                 let ret = self.cty(&f.ret);
                 let params = self.format_params(&f.params);
                 self.line(&format!("{} kd_{}({});", ret, f.name, params));
                 any = true;
             }
+        }
+        // Forward-declare every generic instantiation alongside ordinary
+        // functions, each under the active substitution (SPEC §17.3).
+        if self.emit_instance_forward_decls() {
+            any = true;
         }
         // Then every struct function, declared alongside ordinary ones. Each
         // lowers to a free C function `kd_<Struct>_<method>` whose `self`
@@ -620,9 +695,13 @@ impl<'a> Emitter<'a> {
 
     fn emit_func_defs(&mut self, module: &Module) {
         // Ordinary top-level functions first, then struct functions, matching
-        // the forward-declaration order.
+        // the forward-declaration order. A generic function is not emitted under
+        // its plain name (SPEC §17.3) — its instances are emitted below.
         for item in &module.items {
             if let Item::Func(f) = item {
+                if Self::is_generic(f) {
+                    continue;
+                }
                 self.emit_func(f);
                 self.blank();
             }
@@ -636,13 +715,67 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+        // Emit one specialised C function per recorded instantiation (SPEC
+        // §17.3), each under its concrete type-parameter substitution.
+        self.emit_instance_defs();
+    }
+
+    /// Forward-declare every recorded generic instantiation (SPEC §17.3), each
+    /// under the instance's substitution so its runtime parameter types and
+    /// return type resolve to concrete types. Returns `true` if any were
+    /// emitted (so the caller can add the trailing blank line).
+    fn emit_instance_forward_decls(&mut self) -> bool {
+        let structs = self.structs;
+        let insts = structs.instantiations().to_vec();
+        let mut any = false;
+        for inst in &insts {
+            let f = match self.generics.get(&inst.fn_name).cloned() {
+                Some(f) => f,
+                // An instantiation of a function not present as a generic in
+                // this module cannot occur for validated input; skip it.
+                None => continue,
+            };
+            self.set_subst_for(&f, &inst.type_args);
+            let ret = self.cty(&f.ret);
+            let params = self.format_params(&f.params);
+            let cname = self.structs.instantiation_c_name(inst);
+            self.line(&format!("{} {}({});", ret, cname, params));
+            self.subst.clear();
+            any = true;
+        }
+        any
+    }
+
+    /// Emit one specialised C function body per recorded instantiation (SPEC
+    /// §17.3). The substitution drives `cty` / `resolve_ty` / `type_of_expr`, so
+    /// every type-parameter use in the runtime params, return type and body
+    /// resolves to the concrete type; the body reuses all existing lowering.
+    fn emit_instance_defs(&mut self) {
+        let structs = self.structs;
+        let insts = structs.instantiations().to_vec();
+        for inst in &insts {
+            let f = match self.generics.get(&inst.fn_name).cloned() {
+                Some(f) => f,
+                None => continue,
+            };
+            self.set_subst_for(&f, &inst.type_args);
+            let cname = self.structs.instantiation_c_name(inst);
+            self.emit_func_named(&f, &cname);
+            self.subst.clear();
+            self.blank();
+        }
     }
 
     fn format_params(&self, params: &[Param]) -> String {
-        if params.is_empty() {
+        // `comptime` type parameters are compile-time only — they never become
+        // C parameters (SPEC §17.3). A generic instance emits its runtime
+        // parameters under the active substitution; a fully-comptime parameter
+        // list collapses to `void`.
+        let runtime: Vec<&Param> = params.iter().filter(|p| !p.is_comptime).collect();
+        if runtime.is_empty() {
             "void".to_string()
         } else {
-            params
+            runtime
                 .iter()
                 .map(|p| format!("{} kd_{}", self.cty(&p.ty), p.name))
                 .collect::<Vec<_>>()
@@ -656,7 +789,14 @@ impl<'a> Emitter<'a> {
     /// [`Type::from_name`], else a struct via the table, else `Void` for the
     /// impossible unresolved case so emission can never panic.
     fn resolve_ty(&self, t: &TypeExpr) -> Type {
-        let base = self.base_type(&t.name);
+        self.resolve_ty_in(t, &self.subst)
+    }
+
+    /// Like [`Emitter::resolve_ty`] but consults an explicit `subst` for the
+    /// base type name (used by the immutable `type_of_expr` to resolve a
+    /// generic call's substituted types without touching `self.subst`).
+    fn resolve_ty_in(&self, t: &TypeExpr, subst: &HashMap<String, Type>) -> Type {
+        let base = self.base_type_in(&t.name, subst);
         if let Some(n) = t.array_len {
             // sema interned every `[N]T`; map the (element, length) pair back to
             // its `Type::Array(id)`. (`base` is the element type — `t.name` is
@@ -710,6 +850,16 @@ impl<'a> Emitter<'a> {
     /// impossible unresolved case. Shared by `resolve_ty` (for the base of a
     /// composite type) and by the pointer pre-pass.
     fn base_type(&self, name: &str) -> Type {
+        self.base_type_in(name, &self.subst)
+    }
+
+    /// Like [`Emitter::base_type`] but consults an explicit `subst`. A name
+    /// bound in `subst` is a generic type parameter and resolves to its
+    /// concrete [`Type`] (SPEC §17.2); otherwise normal resolution applies.
+    fn base_type_in(&self, name: &str, subst: &HashMap<String, Type>) -> Type {
+        if let Some(&t) = subst.get(name) {
+            return t;
+        }
         Type::from_name(name)
             .or_else(|| self.structs.id_of(name).map(Type::Struct))
             .or_else(|| self.structs.enum_id_of(name).map(Type::Enum))
@@ -752,7 +902,12 @@ impl<'a> Emitter<'a> {
     /// table; an unresolvable name (never reached for a validated module) falls
     /// back to `int64_t`.
     fn cty(&self, t: &TypeExpr) -> String {
-        let base = if let Some(prim) = Type::from_name(&t.name) {
+        // A name bound in the active substitution is a generic type parameter:
+        // resolve it to the concrete type, then apply the composite wrappers
+        // below exactly as for an ordinary base type (SPEC §17.3).
+        let base = if let Some(&s) = self.subst.get(&t.name) {
+            s
+        } else if let Some(prim) = Type::from_name(&t.name) {
             prim
         } else if let Some(id) = self.structs.id_of(&t.name) {
             Type::Struct(id)
@@ -808,6 +963,12 @@ impl<'a> Emitter<'a> {
         self.line(&format!("{} {}({}) {{", ret, c_name, params));
         let mut scope = Scope::function();
         for p in &f.params {
+            // `comptime` type parameters are not value bindings; skip them (a
+            // generic instance records only its runtime params, resolved under
+            // the active substitution).
+            if p.is_comptime {
+                continue;
+            }
             let pty = self.resolve_ty(&p.ty);
             scope.var_types.insert(p.name.clone(), pty);
         }
@@ -1441,6 +1602,11 @@ impl<'a> Emitter<'a> {
                         None => "0".to_string(),
                     };
                     format!("free(({}).ptr)", s)
+                } else if let Some(gf) = self.generics.get(callee).cloned() {
+                    // A call to a generic function (SPEC §17.3): the leading
+                    // type-name args pick the instantiation; the call lowers to
+                    // that instance's C name, passing ONLY the runtime args.
+                    self.emit_generic_call(callee, &gf, args)
                 } else {
                     // Coerce each argument to its parameter type, so a `T`/`null`
                     // argument widens to a `?T` parameter.
@@ -1704,6 +1870,70 @@ impl<'a> Emitter<'a> {
         )
     }
 
+    /// Lower a call to a generic function `gf` (SPEC §17.3). The first `k` args
+    /// (one per comptime type parameter) are type-name `Ident`s that pick the
+    /// instantiation; they are resolved under the *current* substitution (so a
+    /// type argument that is itself an enclosing instance's type parameter
+    /// resolves transitively), used to build the instance's C name, and then
+    /// dropped. Only the remaining runtime args are passed — each coerced to its
+    /// substituted parameter type so a `T`/`null` value widens correctly.
+    fn emit_generic_call(&mut self, callee: &str, gf: &Func, args: &[Expr]) -> String {
+        let k = gf.params.iter().filter(|p| p.is_comptime).count();
+        // Type arguments, resolved under the current substitution.
+        let type_args: Vec<Type> = gf
+            .params
+            .iter()
+            .filter(|p| p.is_comptime)
+            .zip(args.iter())
+            .map(|(_, a)| match a {
+                Expr::Ident { name, .. } => self.base_type(name),
+                _ => Type::Void,
+            })
+            .collect();
+        let inst = Instantiation {
+            fn_name: callee.to_string(),
+            type_args: type_args.clone(),
+        };
+        let cname = self.structs.instantiation_c_name(&inst);
+        // The instance's runtime parameter types, resolved under the inner
+        // substitution (comptime params → these concrete type args), drive
+        // coercion of the runtime arguments.
+        let mut inner: HashMap<String, Type> = HashMap::new();
+        for (p, t) in gf.params.iter().filter(|p| p.is_comptime).zip(type_args.iter()) {
+            inner.insert(p.name.clone(), *t);
+        }
+        let runtime_param_tys: Vec<Type> = gf
+            .params
+            .iter()
+            .filter(|p| !p.is_comptime)
+            .map(|p| self.resolve_ty_in(&p.ty, &inner))
+            .collect();
+        let mut arg_strs = Vec::with_capacity(args.len().saturating_sub(k));
+        for (i, x) in args.iter().skip(k).enumerate() {
+            let s = match runtime_param_tys.get(i) {
+                Some(t) => self.emit_coerced(x, *t),
+                None => self.emit_expr(x),
+            };
+            arg_strs.push(s);
+        }
+        format!("{}({})", cname, arg_strs.join(", "))
+    }
+
+    /// The substituted return type of a call to generic function `gf` with the
+    /// given call `args` (the leading type-name args pick the substitution),
+    /// resolved under the current substitution (SPEC §17.2). Lets `type_of_expr`
+    /// / `struct_of_expr` infer a generic call's result type (so e.g.
+    /// `var x: i32 = max(i32, a, b);` coerces correctly and `g(T, …).len` works).
+    fn generic_call_ret(&self, gf: &Func, args: &[Expr]) -> Type {
+        let mut inner: HashMap<String, Type> = HashMap::new();
+        for (p, a) in gf.params.iter().filter(|p| p.is_comptime).zip(args.iter()) {
+            if let Expr::Ident { name, .. } = a {
+                inner.insert(p.name.clone(), self.base_type(name));
+            }
+        }
+        self.resolve_ty_in(&gf.ret, &inner)
+    }
+
     /// Lower one operand of a binary expression. This is ordinarily just
     /// [`Emitter::emit_expr`]; the sole exception is a bare enum literal `.V`,
     /// which has no intrinsic type — its enum is taken from the sibling operand
@@ -1810,10 +2040,20 @@ impl<'a> Emitter<'a> {
                 },
                 _ => None,
             },
-            Expr::Call { callee, .. } => match self.fn_ret.get(callee)? {
-                Type::Struct(id) => Some(self.structs.get(*id).name.clone()),
-                _ => None,
-            },
+            Expr::Call { callee, args, .. } => {
+                // A generic call's struct is taken from its substituted return
+                // type (SPEC §17.2); an ordinary call's from its recorded ret.
+                if let Some(gf) = self.generics.get(callee) {
+                    return match self.generic_call_ret(gf, args) {
+                        Type::Struct(id) => Some(self.structs.get(id).name.clone()),
+                        _ => None,
+                    };
+                }
+                match self.fn_ret.get(callee)? {
+                    Type::Struct(id) => Some(self.structs.get(*id).name.clone()),
+                    _ => None,
+                }
+            }
             Expr::MethodCall {
                 receiver, method, ..
             } => {
@@ -1896,6 +2136,11 @@ impl<'a> Emitter<'a> {
                         .slices()
                         .find(|(_, e)| *e == elem)
                         .map(|(id, _)| Type::Slice(id));
+                }
+                // A generic call's result is its substituted return type (SPEC
+                // §17.2), so e.g. `max(i32, a, b)` reports `i32`.
+                if let Some(gf) = self.generics.get(callee) {
+                    return Some(self.generic_call_ret(gf, args));
                 }
                 self.fn_ret.get(callee).copied()
             }
@@ -2301,11 +2546,13 @@ mod tests {
                 Param {
                     name: "a".to_string(),
                     ty: ty("i32"),
+                    is_comptime: false,
                     span: Span::DUMMY,
                 },
                 Param {
                     name: "b".to_string(),
                     ty: ty("i32"),
+                    is_comptime: false,
                     span: Span::DUMMY,
                 },
             ],
@@ -2533,6 +2780,7 @@ mod tests {
             params: vec![Param {
                 name: "p".to_string(),
                 ty: ty("Point"),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: ty("i32"),
@@ -2677,6 +2925,7 @@ mod tests {
             params: vec![Param {
                 name: "a".to_string(),
                 ty: ty("Outer"),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: ty("i32"),
@@ -2741,6 +2990,7 @@ mod tests {
         Param {
             name: name.to_string(),
             ty: ty(ty_name),
+            is_comptime: false,
             span: Span::DUMMY,
         }
     }
@@ -3148,6 +3398,7 @@ mod tests {
             params: vec![Param {
                 name: "x".to_string(),
                 ty: opt_ty("i32"),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: ty("i32"),
@@ -3184,6 +3435,7 @@ mod tests {
             params: vec![Param {
                 name: "x".to_string(),
                 ty: opt_ty("i32"),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: ty("i32"),
@@ -3214,6 +3466,7 @@ mod tests {
             params: vec![Param {
                 name: "x".to_string(),
                 ty: opt_ty("i32"),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: ty("void"),
@@ -3423,6 +3676,7 @@ mod tests {
             params: vec![Param {
                 name: "x".to_string(),
                 ty: err_ty("i32"),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: ty("i32"),
@@ -4031,6 +4285,7 @@ mod tests {
                 Param {
                     name: "a".to_string(),
                     ty: arr_ty("i32", 3),
+                    is_comptime: false,
                     span: Span::DUMMY,
                 },
                 param("i", "i32"),
@@ -4065,6 +4320,7 @@ mod tests {
             params: vec![Param {
                 name: "a".to_string(),
                 ty: arr_ty("i32", 3),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: ty("usize"),
@@ -4097,6 +4353,7 @@ mod tests {
             params: vec![Param {
                 name: "a".to_string(),
                 ty: arr_ty("i32", 3),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: ty("void"),
@@ -4230,6 +4487,7 @@ mod tests {
             params: vec![Param {
                 name: "p".to_string(),
                 ty: ptr_ty("i32"),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: ty("i32"),
@@ -4287,6 +4545,7 @@ mod tests {
             params: vec![Param {
                 name: "p".to_string(),
                 ty: ptr_ty("i32"),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: ty("void"),
@@ -4338,6 +4597,7 @@ mod tests {
             params: vec![Param {
                 name: "a".to_string(),
                 ty: arr_ty("i32", 3),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: slice_ty("i32"),
@@ -4375,6 +4635,7 @@ mod tests {
             params: vec![Param {
                 name: "s".to_string(),
                 ty: slice_ty("i32"),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: slice_ty("i32"),
@@ -4407,6 +4668,7 @@ mod tests {
                 Param {
                     name: "s".to_string(),
                     ty: slice_ty("i32"),
+                    is_comptime: false,
                     span: Span::DUMMY,
                 },
                 param("i", "i32"),
@@ -4441,6 +4703,7 @@ mod tests {
             params: vec![Param {
                 name: "s".to_string(),
                 ty: slice_ty("i32"),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: ty("usize"),
@@ -4472,6 +4735,7 @@ mod tests {
             params: vec![Param {
                 name: "s".to_string(),
                 ty: slice_ty("i32"),
+                is_comptime: false,
                 span: Span::DUMMY,
             }],
             ret: ty("void"),
@@ -4642,6 +4906,7 @@ mod tests {
                 Param {
                     name: "s".to_string(),
                     ty: slice_ty("i32"),
+                    is_comptime: false,
                     span: Span::DUMMY,
                 },
             ],
@@ -4685,6 +4950,207 @@ mod tests {
         assert!(
             out.contains("(kd_slice_int32_t_alloc((uintptr_t)(2))).len"),
             "alloc result type not inferred as a slice (`.len` not lowered):\n{out}"
+        );
+    }
+
+    // -- comptime generics (v0.120, SPEC §17) ------------------------------
+
+    /// A `comptime IDENT: type` type parameter (`is_comptime = true`).
+    fn comptime_param(name: &str) -> Param {
+        Param {
+            name: name.to_string(),
+            ty: ty("type"),
+            is_comptime: true,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `fn max(comptime T: type, a: T, b: T) T { if (a > b) { return a; } return b; }`
+    fn generic_max() -> Func {
+        func(
+            "max",
+            vec![comptime_param("T"), param("a", "T"), param("b", "T")],
+            "T",
+            vec![
+                Stmt::If {
+                    cond: Expr::Binary {
+                        op: BinOp::Gt,
+                        lhs: Box::new(ident("a")),
+                        rhs: Box::new(ident("b")),
+                        span: Span::DUMMY,
+                    },
+                    then: block(vec![ret(ident("a"))]),
+                    els: None,
+                    span: Span::DUMMY,
+                },
+                ret(ident("b")),
+            ],
+        )
+    }
+
+    /// `fn first(comptime T: type, x: ?T) T { return x orelse 0; }`
+    fn generic_first() -> Func {
+        Func {
+            is_pub: false,
+            name: "first".to_string(),
+            params: vec![
+                comptime_param("T"),
+                Param {
+                    name: "x".to_string(),
+                    ty: opt_ty("T"),
+                    is_comptime: false,
+                    span: Span::DUMMY,
+                },
+            ],
+            ret: ty("T"),
+            body: block(vec![ret(Expr::Orelse {
+                lhs: Box::new(ident("x")),
+                rhs: Box::new(int(0)),
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn generic_fn_monomorphised_at_i32() {
+        // fn pick(x: i32, y: i32) i32 { return max(i32, x, y); }
+        let mut structs = StructTable::new();
+        assert!(
+            structs.intern_instantiation("max", vec![Type::I32]),
+            "first instantiation should be newly recorded"
+        );
+        let user = func(
+            "pick",
+            vec![param("x", "i32"), param("y", "i32")],
+            "i32",
+            vec![ret(call("max", vec![ident("i32"), ident("x"), ident("y")]))],
+        );
+        let m = Module {
+            items: vec![Item::Func(generic_max()), Item::Func(user)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The instance is forward-declared and defined under its mangled C
+        // name, with the type parameter resolved to `int32_t`.
+        assert!(
+            out.contains("int32_t kd_max__int32_t(int32_t kd_a, int32_t kd_b);"),
+            "instance forward decl missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains("int32_t kd_max__int32_t(int32_t kd_a, int32_t kd_b) {"),
+            "instance definition missing/wrong:\n{out}"
+        );
+        // The body lowers under the substitution (comparison + returns).
+        assert!(
+            out.contains("((kd_a > kd_b))"),
+            "instance body comparison wrong:\n{out}"
+        );
+        // The call drops the leading type arg and targets the instance C name
+        // with ONLY the runtime args.
+        assert!(
+            out.contains("kd_max__int32_t(kd_x, kd_y)"),
+            "generic call should use the instance name with only runtime args:\n{out}"
+        );
+        // The generic function is NEVER emitted under its plain name.
+        assert!(
+            !out.contains("kd_max("),
+            "a generic function must not be emitted under its plain name:\n{out}"
+        );
+    }
+
+    #[test]
+    fn generic_fn_two_instantiations_emit_two_functions() {
+        // The same generic, recorded at `i32` and `i64`, yields two C functions.
+        let mut structs = StructTable::new();
+        structs.intern_instantiation("max", vec![Type::I32]);
+        structs.intern_instantiation("max", vec![Type::I64]);
+        let m = Module {
+            items: vec![Item::Func(generic_max())],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("int32_t kd_max__int32_t(int32_t kd_a, int32_t kd_b) {"),
+            "i32 instance missing:\n{out}"
+        );
+        assert!(
+            out.contains("int64_t kd_max__int64_t(int64_t kd_a, int64_t kd_b) {"),
+            "i64 instance missing:\n{out}"
+        );
+        // Still never under the plain name.
+        assert!(
+            !out.contains("kd_max("),
+            "plain generic name must not be emitted:\n{out}"
+        );
+    }
+
+    #[test]
+    fn generic_call_result_type_drives_coercion() {
+        // fn pick(x: i32, y: i32) ?i32 { return max(i32, x, y); }
+        // `type_of_expr(max(i32, …))` must be `i32` so the `T` result widens to
+        // `?i32` at the return (SPEC §17.2 substituted return type).
+        let mut structs = StructTable::new();
+        structs.intern_optional(Type::I32);
+        structs.intern_instantiation("max", vec![Type::I32]);
+        let user = Func {
+            is_pub: false,
+            name: "pick".to_string(),
+            params: vec![param("x", "i32"), param("y", "i32")],
+            ret: opt_ty("i32"),
+            body: block(vec![ret(call(
+                "max",
+                vec![ident("i32"), ident("x"), ident("y")],
+            ))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(generic_max()), Item::Func(user)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains(
+                "((kd_opt_int32_t){ .has = true, .val = kd_max__int32_t(kd_x, kd_y) })"
+            ),
+            "generic call result not inferred as `i32` (no `?i32` widening):\n{out}"
+        );
+    }
+
+    #[test]
+    fn generic_runtime_arg_coerces_under_substitution() {
+        // fn first(comptime T: type, x: ?T) T { return x orelse 0; }
+        // fn use(v: i32) i32 { return first(i32, v); }
+        // The `?T` param resolves to `?i32` under the substitution, so the
+        // instance body uses the `?i32` helper and the runtime arg `v` (an
+        // `i32`) widens to the present optional at the call site.
+        let mut structs = StructTable::new();
+        structs.intern_optional(Type::I32);
+        structs.intern_instantiation("first", vec![Type::I32]);
+        let user = func(
+            "use",
+            vec![param("v", "i32")],
+            "i32",
+            vec![ret(call("first", vec![ident("i32"), ident("v")]))],
+        );
+        let m = Module {
+            items: vec![Item::Func(generic_first()), Item::Func(user)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The instance's runtime param is the substituted optional type; its
+        // return type is the concrete `int32_t`.
+        assert!(
+            out.contains("int32_t kd_first__int32_t(kd_opt_int32_t kd_x) {"),
+            "instance optional param / return type wrong:\n{out}"
+        );
+        // The body uses the substituted optional helper.
+        assert!(
+            out.contains("kd_opt_int32_t_orelse(kd_x, 0)"),
+            "instance body orelse lowering wrong:\n{out}"
+        );
+        // The runtime arg widens to `?i32` at the call site.
+        assert!(
+            out.contains(
+                "kd_first__int32_t(((kd_opt_int32_t){ .has = true, .val = kd_v }))"
+            ),
+            "runtime arg should widen to the substituted optional param:\n{out}"
         );
     }
 }

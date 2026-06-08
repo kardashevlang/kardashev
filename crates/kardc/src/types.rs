@@ -206,6 +206,16 @@ pub struct StructTable {
     ptr_pointees: Vec<Type>,
     /// Slice element types, indexed by the id in `Type::Slice(id)` (v0.118).
     slice_elems: Vec<Type>,
+    /// Monomorphisation instantiations of generic functions (v0.120): each is a
+    /// `(generic fn name, concrete type arguments)` pair the backend must emit.
+    instantiations: Vec<Instantiation>,
+}
+
+/// One monomorphised instantiation of a generic function (v0.120).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Instantiation {
+    pub fn_name: String,
+    pub type_args: Vec<Type>,
 }
 
 impl StructTable {
@@ -429,6 +439,41 @@ impl StructTable {
             .iter()
             .enumerate()
             .map(|(i, t)| (i as u32, *t))
+    }
+
+    // --- generic-function instantiations (v0.120) -------------------------
+
+    /// Record a monomorphisation instantiation; returns true if newly added.
+    pub fn intern_instantiation(&mut self, fn_name: &str, type_args: Vec<Type>) -> bool {
+        if self
+            .instantiations
+            .iter()
+            .any(|i| i.fn_name == fn_name && i.type_args == type_args)
+        {
+            return false;
+        }
+        self.instantiations.push(Instantiation {
+            fn_name: fn_name.to_string(),
+            type_args,
+        });
+        true
+    }
+
+    /// All recorded instantiations, in discovery order.
+    pub fn instantiations(&self) -> &[Instantiation] {
+        &self.instantiations
+    }
+
+    /// The C name for an instantiation, e.g. `kd_max__int32_t`.
+    pub fn instantiation_c_name(&self, inst: &Instantiation) -> String {
+        let mut s = format!("kd_{}__", inst.fn_name);
+        for (i, t) in inst.type_args.iter().enumerate() {
+            if i > 0 {
+                s.push('_');
+            }
+            s.push_str(&self.type_mangle(*t));
+        }
+        s
     }
 
     // --- error unions (`!T`) + the implicit global error set --------------

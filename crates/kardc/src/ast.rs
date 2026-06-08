@@ -71,6 +71,10 @@ pub struct Func {
 pub struct Param {
     pub name: String,
     pub ty: TypeExpr,
+    /// True for a `comptime IDENT: type` parameter (a compile-time type
+    /// parameter, v0.120). A function with any such parameter is generic and is
+    /// monomorphised per concrete type argument.
+    pub is_comptime: bool,
     pub span: Span,
 }
 
