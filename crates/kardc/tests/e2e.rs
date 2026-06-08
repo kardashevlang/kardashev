@@ -25,7 +25,7 @@ fn build_and_capture(src: &str, mode: EmitMode) -> (i32, String) {
     let c = kardc::compile_to_c(src, mode).unwrap_or_else(|d| {
         panic!(
             "compile failed:\n{}",
-            kardc::diag::render_all(&d, "test.kd", src)
+            kardc::diag::render_all(&d, "test.ks", src)
         )
     });
     let exe = temp_path("exe");

@@ -18,6 +18,18 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.111.1] — Source extension `.kd` → `.ks` ("Kardashev Scale")
+
+### Changed
+- The canonical source extension is now **`.ks`** — for "**K**ardashev
+  **S**cale", the scale the project is named after. The build manifest is
+  `build.ks` (Zig-style: the build is written in the language). `kard init`
+  scaffolds `src/main.ks` + `build.ks`; `kard build`/`run`/`test` default to
+  `build.ks`; examples are `examples/*.ks`.
+- Added `.gitattributes` mapping `*.ks linguist-language=Zig` so GitHub labels
+  and highlights kardashev sources with Zig's (closest) grammar rather than
+  **KerboScript**, which owns `.ks` in GitHub Linguist by default.
+
 ## [0.111.0] — Generation 2: ground-up Rust rewrite, Zig-philosophy reboot
 
 **A complete change of direction.** Generations 1 (`0.1.0`–`0.110.0`) was a

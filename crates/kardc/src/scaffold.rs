@@ -1,14 +1,14 @@
 //! Project scaffolding (`kard init`): create a new project directory with a
-//! `build.kd` and a hello-world `src/main.kd`, in the spirit of `zig init`.
+//! `build.ks` and a hello-world `src/main.ks`, in the spirit of `zig init`.
 //!
 //! Layout produced:
 //!
 //! ```text
 //! <dir>/
-//!   build.kd        # the v1 minimal build manifest (SPEC §7)
+//!   build.ks        # the v1 minimal build manifest (SPEC §7)
 //!   README.md
 //!   src/
-//!     main.kd       # a runnable Gen-2 hello-world (SPEC §2)
+//!     main.ks       # a runnable Gen-2 hello-world (SPEC §2)
 //! ```
 
 use std::fs;
@@ -17,8 +17,8 @@ use std::path::Path;
 
 /// Scaffold a new project named `name` rooted at `dir`.
 ///
-/// Creates `dir` (and `dir/src`) if needed, then writes `build.kd`,
-/// `src/main.kd` and `README.md`. If `dir` already exists and is **non-empty**,
+/// Creates `dir` (and `dir/src`) if needed, then writes `build.ks`,
+/// `src/main.ks` and `README.md`. If `dir` already exists and is **non-empty**,
 /// nothing is written and an [`io::ErrorKind::AlreadyExists`] error is returned,
 /// so an existing project is never clobbered.
 pub fn init_project(dir: &Path, name: &str) -> io::Result<()> {
@@ -39,17 +39,17 @@ pub fn init_project(dir: &Path, name: &str) -> io::Result<()> {
     let src_dir = dir.join("src");
     fs::create_dir_all(&src_dir)?;
 
-    fs::write(dir.join("build.kd"), build_kd(name))?;
-    fs::write(src_dir.join("main.kd"), main_kd())?;
+    fs::write(dir.join("build.ks"), build_kd(name))?;
+    fs::write(src_dir.join("main.ks"), main_kd())?;
     fs::write(dir.join("README.md"), readme_md(name))?;
 
     Ok(())
 }
 
-/// Render the minimal `build.kd` manifest for `name` (SPEC §7).
+/// Render the minimal `build.ks` manifest for `name` (SPEC §7).
 fn build_kd(name: &str) -> String {
     format!(
-        "build {{\n    name = \"{}\";\n    root = \"src/main.kd\";\n}}\n",
+        "build {{\n    name = \"{}\";\n    root = \"src/main.ks\";\n}}\n",
         escape_kd_string(name)
     )
 }
@@ -90,13 +90,13 @@ fn readme_md(name: &str) -> String {
          kard test       # build and run the test harness\n\
          ```\n\
          \n\
-         The build is described in `build.kd`; the program entrypoint is\n\
-         `src/main.kd`.\n",
+         The build is described in `build.ks`; the program entrypoint is\n\
+         `src/main.ks`.\n",
         name = name
     )
 }
 
-/// Escape a string for embedding inside a `build.kd` double-quoted literal.
+/// Escape a string for embedding inside a `build.ks` double-quoted literal.
 /// Mirrors the lexer's escapes (`\\` and `\"`); other characters pass through.
 fn escape_kd_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -138,22 +138,22 @@ mod tests {
         with_temp("layout", |dir| {
             init_project(dir, "demo").expect("init should succeed");
 
-            let build = dir.join("build.kd");
-            let main = dir.join("src").join("main.kd");
+            let build = dir.join("build.ks");
+            let main = dir.join("src").join("main.ks");
             let readme = dir.join("README.md");
 
-            assert!(build.exists(), "build.kd should exist");
-            assert!(main.exists(), "src/main.kd should exist");
+            assert!(build.exists(), "build.ks should exist");
+            assert!(main.exists(), "src/main.ks should exist");
             assert!(readme.exists(), "README.md should exist");
 
             let build_txt = fs::read_to_string(&build).unwrap();
-            assert!(build_txt.contains("name = \"demo\""), "build.kd has the name");
-            assert!(build_txt.contains("root = \"src/main.kd\""), "build.kd has the root");
+            assert!(build_txt.contains("name = \"demo\""), "build.ks has the name");
+            assert!(build_txt.contains("root = \"src/main.ks\""), "build.ks has the root");
 
             let main_txt = fs::read_to_string(&main).unwrap();
-            assert!(main_txt.contains("fn main"), "main.kd defines main");
-            assert!(main_txt.contains("print("), "main.kd calls print");
-            assert!(main_txt.contains("return 0"), "main.kd returns 0");
+            assert!(main_txt.contains("fn main"), "main.ks defines main");
+            assert!(main_txt.contains("print("), "main.ks calls print");
+            assert!(main_txt.contains("return 0"), "main.ks returns 0");
 
             let readme_txt = fs::read_to_string(&readme).unwrap();
             assert!(readme_txt.contains("demo"), "README mentions the project name");
@@ -164,11 +164,11 @@ mod tests {
     fn generated_build_kd_round_trips_through_the_parser() {
         with_temp("roundtrip", |dir| {
             init_project(dir, "roundtrip-demo").expect("init should succeed");
-            let build_txt = fs::read_to_string(dir.join("build.kd")).unwrap();
+            let build_txt = fs::read_to_string(dir.join("build.ks")).unwrap();
             let spec = crate::build_system::parse_build_kd(&build_txt)
-                .expect("generated build.kd should parse");
+                .expect("generated build.ks should parse");
             assert_eq!(spec.name, "roundtrip-demo");
-            assert_eq!(spec.root, "src/main.kd");
+            assert_eq!(spec.root, "src/main.ks");
         });
     }
 
@@ -183,7 +183,7 @@ mod tests {
 
             // The pre-existing file must be untouched.
             assert_eq!(fs::read_to_string(dir.join("existing.txt")).unwrap(), "keep me");
-            assert!(!dir.join("build.kd").exists(), "no build.kd was written");
+            assert!(!dir.join("build.ks").exists(), "no build.ks was written");
         });
     }
 
@@ -192,7 +192,7 @@ mod tests {
         with_temp("empty", |dir| {
             fs::create_dir_all(dir).unwrap();
             init_project(dir, "into-empty").expect("empty dir is fine");
-            assert!(dir.join("build.kd").exists());
+            assert!(dir.join("build.ks").exists());
         });
     }
 }

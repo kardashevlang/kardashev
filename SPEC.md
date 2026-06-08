@@ -18,7 +18,7 @@
    and run with `kard test`.
 5. **One self-contained toolchain.** A single `kard` binary is compiler, build
    system, test runner and formatter. The build is described in-language in
-   `build.kd`.
+   `build.ks`.
 
 ## 1. Lexical grammar
 
@@ -228,7 +228,7 @@ kard version                                   # print the version (also --versi
 kard help                                      # usage (also --help, -h, no args)
 ```
 
-- With no `FILE`, `build`/`run`/`test` read `./build.kd` for the `root` source
+- With no `FILE`, `build`/`run`/`test` read `./build.ks` for the `root` source
   and (for `build`) the output `name`.
 - `-target` is accepted and, for v1, passed through to the C compiler's
   `-target` flag where supported; the full cross-compilation matrix is a
@@ -241,12 +241,12 @@ kard help                                      # usage (also --help, -h, no args
   not yet preserved** by `fmt` (the code is reproduced faithfully and the
   result is idempotent). Comment-preserving formatting is a roadmap item.
 
-## 7. `build.kd` (v1 minimal form)
+## 7. `build.ks` (v1 minimal form)
 
 ```
 build {
     name = "hello";
-    root = "src/main.kd";
+    root = "src/main.ks";
 }
 ```
 
@@ -259,6 +259,6 @@ a roadmap item.
 Optionals `?T`, error unions `!T` + `try`/`catch`/`errdefer`, structs, enums,
 tagged unions, arrays/slices/pointers, the allocator interface and an
 allocator-based stdlib, generics via `comptime T: type`, type inference for
-`var`/`const`, the full imperative `build.kd`, the real cross-compilation
+`var`/`const`, the full imperative `build.ks`, the real cross-compilation
 matrix, comment-preserving `fmt`, and re-self-hosting. None of these are stubbed
 in v1 — they are absent and scheduled.

@@ -43,7 +43,7 @@ The foundation everything else builds on.
 **Toolchain (single `kard` binary)**
 - `kard build/run/test/fmt/init/version/help`.
 - C backend: `lex → parse → sema → emit C → cc → native binary`.
-- `build.kd` minimal declarative form; `kard init` scaffolding.
+- `build.ks` minimal declarative form; `kard init` scaffolding.
 - Diagnostics with filename, line/column and a source caret.
 
 **Engineering**
@@ -80,7 +80,7 @@ metaprogramming model.
 ### v0.118.0 — Type inference for `var`/`const`; the standard prelude
 Inferred local types; a small std built on the allocator interface.
 
-### v0.119.0 — The full in-language build graph (`build.kd`)
+### v0.119.0 — The full in-language build graph (`build.ks`)
 The imperative `build.zig`-style build description: steps, dependencies,
 install artifacts, declared dependencies — run by `kard build`.
 

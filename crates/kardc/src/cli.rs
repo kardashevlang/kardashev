@@ -24,8 +24,8 @@ Usage:
 Commands:
     build [FILE] [-o OUT] [-target TRIPLE]
             Compile a program to a native executable. With no FILE, reads
-            ./build.kd for the root source and the output name. OUT defaults
-            to the source filename without its `.kd` extension.
+            ./build.ks for the root source and the output name. OUT defaults
+            to the source filename without its `.ks` extension.
 
     run   [FILE] [-- ARGS...]
             Build to a temporary executable, run it, and propagate its exit
@@ -295,8 +295,8 @@ struct Source {
     filename: String,
     /// The source text.
     text: String,
-    /// The default output executable name for `build` (source minus `.kd`, or
-    /// the `name` from `build.kd`).
+    /// The default output executable name for `build` (source minus `.ks`, or
+    /// the `name` from `build.ks`).
     default_out: String,
 }
 
@@ -306,18 +306,18 @@ fn read_file(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("error: cannot read `{path}`: {e}\n"))
 }
 
-/// Strip a trailing `.kd` to produce a default executable name. A path with no
-/// `.kd` suffix (or exactly `.kd`) gets a `.out` suffix so the source is never
+/// Strip a trailing `.ks` to produce a default executable name. A path with no
+/// `.ks` suffix (or exactly `.ks`) gets a `.out` suffix so the source is never
 /// overwritten.
 fn default_out_name(path: &str) -> String {
-    match path.strip_suffix(".kd") {
+    match path.strip_suffix(".ks") {
         Some(stem) if !stem.is_empty() => stem.to_string(),
         _ => format!("{path}.out"),
     }
 }
 
 /// Resolve the source to compile. With an explicit `file`, read it directly.
-/// Without one, read `./build.kd` for the `root` source and output `name`
+/// Without one, read `./build.ks` for the `root` source and output `name`
 /// (SPEC §6/§7). The error string is fully rendered and newline-terminated,
 /// ready to print to stderr.
 fn resolve_source(file: Option<&str>) -> Result<Source, String> {
@@ -331,18 +331,18 @@ fn resolve_source(file: Option<&str>) -> Result<Source, String> {
             })
         }
         None => {
-            let build_src = match read_file("build.kd") {
+            let build_src = match read_file("build.ks") {
                 Ok(s) => s,
                 Err(e) => {
                     return Err(format!(
-                        "{e}note: no FILE given, so `kard` looked for `./build.kd` in the current directory\n"
+                        "{e}note: no FILE given, so `kard` looked for `./build.ks` in the current directory\n"
                     ));
                 }
             };
             let spec = match crate::build_system::parse_build_kd(&build_src) {
                 Ok(spec) => spec,
                 Err(diags) => {
-                    return Err(crate::diag::render_all(&diags, "build.kd", &build_src));
+                    return Err(crate::diag::render_all(&diags, "build.ks", &build_src));
                 }
             };
             let text = read_file(&spec.root)?;
@@ -559,9 +559,9 @@ mod tests {
     #[test]
     fn build_with_file() {
         assert_eq!(
-            parse(&["build", "main.kd"]).unwrap(),
+            parse(&["build", "main.ks"]).unwrap(),
             Command::Build {
-                file: Some("main.kd".to_string()),
+                file: Some("main.ks".to_string()),
                 out: None,
                 target: None,
             }
@@ -583,18 +583,18 @@ mod tests {
     #[test]
     fn build_with_out_and_target_in_any_order() {
         assert_eq!(
-            parse(&["build", "-o", "prog", "-target", "x86_64-linux", "src.kd"]).unwrap(),
+            parse(&["build", "-o", "prog", "-target", "x86_64-linux", "src.ks"]).unwrap(),
             Command::Build {
-                file: Some("src.kd".to_string()),
+                file: Some("src.ks".to_string()),
                 out: Some("prog".to_string()),
                 target: Some("x86_64-linux".to_string()),
             }
         );
         // Flags may also follow the positional.
         assert_eq!(
-            parse(&["build", "src.kd", "-o", "prog"]).unwrap(),
+            parse(&["build", "src.ks", "-o", "prog"]).unwrap(),
             Command::Build {
-                file: Some("src.kd".to_string()),
+                file: Some("src.ks".to_string()),
                 out: Some("prog".to_string()),
                 target: None,
             }
@@ -610,15 +610,15 @@ mod tests {
     #[test]
     fn build_unknown_flag_and_extra_arg_error() {
         assert!(parse(&["build", "--zonk"]).is_err());
-        assert!(parse(&["build", "a.kd", "b.kd"]).is_err());
+        assert!(parse(&["build", "a.ks", "b.ks"]).is_err());
     }
 
     #[test]
     fn run_collects_program_args_after_double_dash() {
         assert_eq!(
-            parse(&["run", "main.kd", "--", "alpha", "-V", "beta"]).unwrap(),
+            parse(&["run", "main.ks", "--", "alpha", "-V", "beta"]).unwrap(),
             Command::Run {
-                file: Some("main.kd".to_string()),
+                file: Some("main.ks".to_string()),
                 args: vec!["alpha".to_string(), "-V".to_string(), "beta".to_string()],
             }
         );
@@ -649,9 +649,9 @@ mod tests {
     #[test]
     fn test_with_and_without_file() {
         assert_eq!(
-            parse(&["test", "t.kd"]).unwrap(),
+            parse(&["test", "t.ks"]).unwrap(),
             Command::Test {
-                file: Some("t.kd".to_string()),
+                file: Some("t.ks".to_string()),
             }
         );
         assert_eq!(parse(&["test"]).unwrap(), Command::Test { file: None });
@@ -660,23 +660,23 @@ mod tests {
     #[test]
     fn fmt_modes() {
         assert_eq!(
-            parse(&["fmt", "f.kd"]).unwrap(),
+            parse(&["fmt", "f.ks"]).unwrap(),
             Command::Fmt {
-                file: "f.kd".to_string(),
+                file: "f.ks".to_string(),
                 mode: FmtMode::Stdout,
             }
         );
         assert_eq!(
-            parse(&["fmt", "f.kd", "--check"]).unwrap(),
+            parse(&["fmt", "f.ks", "--check"]).unwrap(),
             Command::Fmt {
-                file: "f.kd".to_string(),
+                file: "f.ks".to_string(),
                 mode: FmtMode::Check,
             }
         );
         assert_eq!(
-            parse(&["fmt", "-w", "f.kd"]).unwrap(),
+            parse(&["fmt", "-w", "f.ks"]).unwrap(),
             Command::Fmt {
-                file: "f.kd".to_string(),
+                file: "f.ks".to_string(),
                 mode: FmtMode::Write,
             }
         );
@@ -690,8 +690,8 @@ mod tests {
 
     #[test]
     fn fmt_conflicting_modes_error() {
-        assert!(parse(&["fmt", "f.kd", "--check", "-w"]).is_err());
-        assert!(parse(&["fmt", "f.kd", "-w", "--check"]).is_err());
+        assert!(parse(&["fmt", "f.ks", "--check", "-w"]).is_err());
+        assert!(parse(&["fmt", "f.ks", "-w", "--check"]).is_err());
     }
 
     #[test]
@@ -712,10 +712,10 @@ mod tests {
 
     #[test]
     fn default_out_name_strips_kd() {
-        assert_eq!(default_out_name("main.kd"), "main");
-        assert_eq!(default_out_name("src/app.kd"), "src/app");
-        // No `.kd` suffix: append `.out` rather than clobber the source.
+        assert_eq!(default_out_name("main.ks"), "main");
+        assert_eq!(default_out_name("src/app.ks"), "src/app");
+        // No `.ks` suffix: append `.out` rather than clobber the source.
         assert_eq!(default_out_name("prog"), "prog.out");
-        assert_eq!(default_out_name(".kd"), ".kd.out");
+        assert_eq!(default_out_name(".ks"), ".ks.out");
     }
 }
