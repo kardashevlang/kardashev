@@ -11,6 +11,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use crate::build_system::{BuildSpec, Target};
 use crate::emit_c::EmitMode;
 
 /// Top-level usage text, printed by `help` (to stdout) and after a usage error
@@ -22,18 +23,24 @@ Usage:
     kard <command> [options]
 
 Commands:
-    build [FILE] [-o OUT] [-target TRIPLE]
-            Compile a program to a native executable. With no FILE, reads
-            ./build.ks for the root source and the output name. OUT defaults
-            to the source filename without its `.ks` extension.
+    build [FILE|TARGET] [-o OUT] [-target TRIPLE]
+            Compile a program to a native executable. A `.ks` (or existing)
+            argument is a source FILE; any other argument names a build.ks
+            TARGET. With no argument, reads ./build.ks: a single target is
+            built, and a multi-target graph builds every target (each to its
+            own name). OUT defaults to the target name (or, for a direct FILE,
+            the filename without its `.ks` extension).
 
-    run   [FILE] [-- ARGS...]
+    run   [FILE|TARGET] [-- ARGS...]
             Build to a temporary executable, run it, and propagate its exit
-            code. Arguments after `--` are passed through to the program.
+            code. Arguments after `--` are passed through to the program. With
+            no argument and multiple targets in ./build.ks, a TARGET name is
+            required.
 
-    test  [FILE]
+    test  [FILE|TARGET]
             Build and run the test harness; reports pass/fail counts and
-            exits non-zero if any test fails.
+            exits non-zero if any test fails. With no argument and multiple
+            targets in ./build.ks, a TARGET name is required.
 
     fmt   FILE [--check | -w]
             Format source. With no flag, prints canonical source to stdout.
@@ -316,63 +323,159 @@ fn default_out_name(path: &str) -> String {
     }
 }
 
-/// Resolve the source to compile. With an explicit `file`, read it directly.
-/// Without one, read `./build.ks` for the `root` source and output `name`
-/// (SPEC §6/§7). The error string is fully rendered and newline-terminated,
-/// ready to print to stderr.
-fn resolve_source(file: Option<&str>) -> Result<Source, String> {
+/// Whether a positional `build`/`run`/`test` argument names a source FILE
+/// directly (it ends in `.ks`) as opposed to a build-graph TARGET (SPEC §7).
+///
+/// We key purely on the `.ks` extension — not on whether a file of that name
+/// exists — so that a target name (e.g. `app`) is never misread as a file just
+/// because a previous build left an executable of the same name in the cwd.
+fn looks_like_file(arg: &str) -> bool {
+    arg.ends_with(".ks")
+}
+
+/// A resolved compilation input built directly from a `.ks` source file.
+fn source_from_file(path: &str) -> Result<Source, String> {
+    let text = read_file(path)?;
+    Ok(Source {
+        filename: path.to_string(),
+        text,
+        default_out: default_out_name(path),
+    })
+}
+
+/// A resolved compilation input built from a build-graph target: the source is
+/// the target's `root` and the default output name is the target's `name`.
+fn source_from_target(target: &Target) -> Result<Source, String> {
+    let text = read_file(&target.root)?;
+    Ok(Source {
+        filename: target.root.clone(),
+        text,
+        default_out: target.name.clone(),
+    })
+}
+
+/// Read & parse `./build.ks` into a [`BuildSpec`]. On a missing file,
+/// `missing_note` (a fully rendered, newline-terminated note) is appended to the
+/// I/O error; on a parse failure, the `E0300` diagnostics are rendered. The
+/// returned error string is ready to print to stderr.
+fn read_build_spec(missing_note: &str) -> Result<BuildSpec, String> {
+    let build_src = match read_file("build.ks") {
+        Ok(s) => s,
+        Err(e) => return Err(format!("{e}{missing_note}")),
+    };
+    crate::build_system::parse_build_kd(&build_src)
+        .map_err(|diags| crate::diag::render_all(&diags, "build.ks", &build_src))
+}
+
+/// An "available targets: a, b, c" hint, or empty when there are none.
+fn target_list_hint(spec: &BuildSpec) -> String {
+    if spec.targets.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = spec.targets.iter().map(|t| t.name.as_str()).collect();
+    format!("\nnote: available targets: {}", names.join(", "))
+}
+
+/// Select the build-graph target named `name`, or a ready-to-print error with an
+/// "available targets" hint. Pure (no I/O), so it is unit-testable.
+fn select_target<'a>(spec: &'a BuildSpec, name: &str) -> Result<&'a Target, String> {
+    spec.select(Some(name)).ok_or_else(|| {
+        format!(
+            "error: no target named `{name}` in `build.ks`{}\n",
+            target_list_hint(spec)
+        )
+    })
+}
+
+/// Select the sole target (when `build.ks` declares exactly one), or a
+/// ready-to-print error: multiple targets require a name, zero is malformed.
+/// Pure (no I/O), so it is unit-testable.
+fn select_sole_target(spec: &BuildSpec) -> Result<&Target, String> {
+    match spec.select(None) {
+        Some(t) => Ok(t),
+        None if spec.targets.is_empty() => {
+            Err("error: `build.ks` declares no targets\n".to_string())
+        }
+        None => Err(format!(
+            "error: `build.ks` declares multiple targets; specify one{}\n",
+            target_list_hint(spec)
+        )),
+    }
+}
+
+/// Resolve the single source to compile for `run`/`test`. A `.ks` (or existing)
+/// positional is a direct FILE; any other positional is a build-graph TARGET
+/// name; with no positional, the sole target of `./build.ks` is used (multiple
+/// targets are an error, since `run`/`test` act on exactly one program). The
+/// error string is fully rendered and newline-terminated.
+fn resolve_single_source(file: Option<&str>) -> Result<Source, String> {
     match file {
-        Some(f) => {
-            let text = read_file(f)?;
-            Ok(Source {
-                filename: f.to_string(),
-                text,
-                default_out: default_out_name(f),
-            })
+        Some(arg) if looks_like_file(arg) => source_from_file(arg),
+        Some(name) => {
+            let spec = read_build_spec(&target_lookup_note(name))?;
+            source_from_target(select_target(&spec, name)?)
         }
         None => {
-            let build_src = match read_file("build.ks") {
-                Ok(s) => s,
-                Err(e) => {
-                    return Err(format!(
-                        "{e}note: no FILE given, so `kard` looked for `./build.ks` in the current directory\n"
-                    ));
-                }
-            };
-            let spec = match crate::build_system::parse_build_kd(&build_src) {
-                Ok(spec) => spec,
-                Err(diags) => {
-                    return Err(crate::diag::render_all(&diags, "build.ks", &build_src));
-                }
-            };
-            let text = read_file(&spec.root)?;
-            Ok(Source {
-                filename: spec.root,
-                text,
-                default_out: spec.name,
-            })
+            let spec = read_build_spec(NO_FILE_NOTE)?;
+            source_from_target(select_sole_target(&spec)?)
         }
     }
 }
 
-/// Resolve and compile a source for `mode`. On failure, the appropriate error
-/// (rendered diagnostics or an I/O message) is already printed to stderr; the
-/// caller just needs to return a failure exit code.
+/// Resolve the source(s) to compile for `build`. Like [`resolve_single_source`],
+/// except that with no positional and *multiple* targets, **all** targets are
+/// built (each to its own name) rather than being an error.
+fn resolve_build_sources(file: Option<&str>) -> Result<Vec<Source>, String> {
+    match file {
+        Some(arg) if looks_like_file(arg) => Ok(vec![source_from_file(arg)?]),
+        Some(name) => {
+            let spec = read_build_spec(&target_lookup_note(name))?;
+            Ok(vec![source_from_target(select_target(&spec, name)?)?])
+        }
+        None => {
+            let spec = read_build_spec(NO_FILE_NOTE)?;
+            if spec.targets.is_empty() {
+                return Err("error: `build.ks` declares no targets\n".to_string());
+            }
+            // One target, or the whole graph: build them all, each to its name.
+            spec.targets.iter().map(source_from_target).collect()
+        }
+    }
+}
+
+/// The note appended when `./build.ks` is missing and no positional was given.
+const NO_FILE_NOTE: &str =
+    "note: no FILE given, so `kard` looked for `./build.ks` in the current directory\n";
+
+/// The note appended when a non-`.ks` positional was treated as a TARGET name
+/// but `./build.ks` is missing.
+fn target_lookup_note(name: &str) -> String {
+    format!(
+        "note: `{name}` is not a `.ks` file, so `kard` treated it as a build-graph target \
+         and looked for `./build.ks` in the current directory\n"
+    )
+}
+
+/// Lower one resolved [`Source`] to C, printing rendered diagnostics to stderr
+/// on failure.
+fn compile_one(src: &Source, mode: EmitMode) -> Result<String, ()> {
+    crate::compile_to_c(&src.text, mode)
+        .map_err(|diags| eprint!("{}", crate::diag::render_all(&diags, &src.filename, &src.text)))
+}
+
+/// Resolve and compile a single source for `run`/`test`. On failure, the
+/// appropriate error (rendered diagnostics or an I/O message) is already printed
+/// to stderr; the caller just needs to return a failure exit code.
 fn compile_source(file: Option<String>, mode: EmitMode) -> Result<(Source, String), ()> {
-    let src = match resolve_source(file.as_deref()) {
+    let src = match resolve_single_source(file.as_deref()) {
         Ok(s) => s,
         Err(msg) => {
             eprint!("{msg}");
             return Err(());
         }
     };
-    match crate::compile_to_c(&src.text, mode) {
-        Ok(c) => Ok((src, c)),
-        Err(diags) => {
-            eprint!("{}", crate::diag::render_all(&diags, &src.filename, &src.text));
-            Err(())
-        }
-    }
+    let c = compile_one(&src, mode)?;
+    Ok((src, c))
 }
 
 // ---------------------------------------------------------------------------
@@ -386,19 +489,35 @@ fn cmd_build(file: Option<String>, out: Option<String>, target: Option<String>) 
         );
     }
 
-    let (src, c) = match compile_source(file, EmitMode::Program) {
-        Ok(v) => v,
-        Err(()) => return ExitCode::FAILURE,
+    let sources = match resolve_build_sources(file.as_deref()) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprint!("{msg}");
+            return ExitCode::FAILURE;
+        }
     };
 
-    let out_path = out.unwrap_or(src.default_out);
-    match crate::backend::cc_build(&c, Path::new(&out_path)) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+    // `-o OUT` names one output file; it is meaningless when building a whole
+    // multi-target graph, where each target compiles to its own name.
+    if out.is_some() && sources.len() > 1 {
+        eprintln!(
+            "error: `-o OUT` cannot be used when building multiple targets; build a single target by name"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    for src in &sources {
+        let c = match compile_one(src, EmitMode::Program) {
+            Ok(c) => c,
+            Err(()) => return ExitCode::FAILURE,
+        };
+        let out_path = out.clone().unwrap_or_else(|| src.default_out.clone());
+        if let Err(e) = crate::backend::cc_build(&c, Path::new(&out_path)) {
             eprintln!("error: C compilation failed:\n{e}");
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
     }
+    ExitCode::SUCCESS
 }
 
 fn cmd_run(file: Option<String>, prog_args: Vec<String>) -> ExitCode {
@@ -717,5 +836,79 @@ mod tests {
         // No `.ks` suffix: append `.out` rather than clobber the source.
         assert_eq!(default_out_name("prog"), "prog.out");
         assert_eq!(default_out_name(".ks"), ".ks.out");
+    }
+
+    // ---- Build-graph target selection (v0.122) --------------------------
+    //
+    // These exercise the pure selection helpers with constructed specs; none
+    // touch the filesystem or invoke the C compiler.
+
+    fn mk_spec(targets: &[(&str, &str)]) -> BuildSpec {
+        BuildSpec {
+            targets: targets
+                .iter()
+                .map(|(n, r)| Target {
+                    name: (*n).to_string(),
+                    root: (*r).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn looks_like_file_distinguishes_files_from_target_names() {
+        // A `.ks` suffix always reads as a direct FILE.
+        assert!(looks_like_file("main.ks"));
+        assert!(looks_like_file("src/app.ks"));
+        // Names without a `.ks` suffix (and not naming an existing file) are
+        // treated as build-graph TARGET names.
+        assert!(!looks_like_file("app"));
+        assert!(!looks_like_file("a-target-name-that-does-not-exist"));
+    }
+
+    #[test]
+    fn select_target_finds_named_target() {
+        let spec = mk_spec(&[("app", "src/main.ks"), ("tool", "src/tool.ks")]);
+        assert_eq!(select_target(&spec, "tool").unwrap().root, "src/tool.ks");
+        assert_eq!(select_target(&spec, "app").unwrap().root, "src/main.ks");
+    }
+
+    #[test]
+    fn select_target_unknown_errors_with_available_hint() {
+        let spec = mk_spec(&[("app", "a.ks"), ("tool", "t.ks")]);
+        let err = select_target(&spec, "nope").unwrap_err();
+        assert!(err.contains("no target named `nope`"), "{err}");
+        // The hint lists the real targets so the user can fix the typo.
+        assert!(err.contains("app") && err.contains("tool"), "{err}");
+    }
+
+    #[test]
+    fn select_sole_target_when_single() {
+        let spec = mk_spec(&[("only", "m.ks")]);
+        assert_eq!(select_sole_target(&spec).unwrap().name, "only");
+    }
+
+    #[test]
+    fn select_sole_target_multiple_requires_a_name() {
+        let spec = mk_spec(&[("a", "a.ks"), ("b", "b.ks")]);
+        let err = select_sole_target(&spec).unwrap_err();
+        assert!(err.contains("multiple targets"), "{err}");
+        assert!(err.contains("specify one"), "{err}");
+    }
+
+    #[test]
+    fn select_sole_target_zero_is_malformed() {
+        let spec = mk_spec(&[]);
+        let err = select_sole_target(&spec).unwrap_err();
+        assert!(err.contains("no targets"), "{err}");
+    }
+
+    #[test]
+    fn target_list_hint_lists_names_and_is_empty_when_none() {
+        let spec = mk_spec(&[("a", "a.ks"), ("b", "b.ks")]);
+        let hint = target_list_hint(&spec);
+        assert!(hint.contains("available targets"), "{hint}");
+        assert!(hint.contains('a') && hint.contains('b'), "{hint}");
+        assert_eq!(target_list_hint(&mk_spec(&[])), "");
     }
 }

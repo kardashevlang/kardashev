@@ -108,9 +108,12 @@ The `: T` annotation on a binding is optional — inferred from the initializer
 (local `var`/`const` and top-level `const`). Inferred types are concrete (no
 implicit conversions). A standard prelude/std is a later item.
 
-### v0.122.0 — The full in-language build graph (`build.ks`)
-The imperative `build.zig`-style build description: steps, dependencies,
-install artifacts, declared dependencies — run by `kard build`.
+### v0.122.0 — The build graph (`build.ks`) ✅
+A `build.ks` describing a graph of one or more named executable targets
+(`exe "name" { root = ".."; }`), with CLI target selection (`kard build/run/test
+[TARGET]`; `build` with no name builds all). The full imperative `build.zig`
+model (a kardashev program with a `build(*Builder)` entry point, step
+dependencies and install artifacts) remains a future item.
 
 ### v0.123.0 — First-class cross-compilation
 `kard build -target <triple>` producing binaries for foreign targets out of the

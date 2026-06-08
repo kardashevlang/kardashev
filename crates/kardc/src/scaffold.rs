@@ -167,8 +167,12 @@ mod tests {
             let build_txt = fs::read_to_string(dir.join("build.ks")).unwrap();
             let spec = crate::build_system::parse_build_kd(&build_txt)
                 .expect("generated build.ks should parse");
-            assert_eq!(spec.name, "roundtrip-demo");
-            assert_eq!(spec.root, "src/main.ks");
+            // The legacy single-target sugar must parse to exactly one target.
+            assert_eq!(spec.targets.len(), 1);
+            assert_eq!(spec.targets[0].name, "roundtrip-demo");
+            assert_eq!(spec.targets[0].root, "src/main.ks");
+            // ...and an unnamed selection resolves to that sole target.
+            assert_eq!(spec.select(None).unwrap().name, "roundtrip-demo");
         });
     }
 
