@@ -415,3 +415,32 @@ pub fn main() i32 {
     let (code, _out) = build_and_capture(src, EmitMode::Program);
     assert_eq!(code, 101, "out-of-bounds slice index must panic with exit 101");
 }
+
+// --- v0.119 Allocator + heap -----------------------------------------------
+
+#[test]
+fn allocator_heap_alloc_write_and_free() {
+    let src = r#"
+fn sumSlice(s: []i32) i32 {
+    var total: i32 = 0;
+    var i: usize = 0;
+    while (i < s.len) : (i = i + 1) { total = total + s[i]; }
+    return total;
+}
+pub fn main() i32 {
+    var a: Allocator = c_allocator();   // explicitly obtained + passed
+    var xs: []i32 = alloc(a, i32, 5);   // heap-allocate a []i32 of length 5
+    var i: usize = 0;
+    while (i < xs.len) : (i = i + 1) { xs[i] = 10; }
+    print(xs.len);          // 5
+    print(sumSlice(xs));    // 50
+    xs[2] = 99;
+    print(sumSlice(xs));    // 139
+    free(a, xs);
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "5\n50\n139\n");
+}

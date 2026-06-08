@@ -10,7 +10,8 @@
 //!
 //! Error codes (SPEC §3, §9.4):
 //! - `E0100` — unknown name (value, callee, or type name).
-//! - `E0101` — redefining a builtin (`print` / `expect`).
+//! - `E0101` — redefining a builtin (`print` / `expect` / `c_allocator` /
+//!   `alloc` / `free`).
 //! - `E0110` — a type mismatch (the general sema type-error code).
 //! - `E0120` — `break` / `continue` outside a loop.
 //! - `E0130` / `E0131` / `E0132` — non-constant / unknown-const / type error
@@ -59,6 +60,9 @@
 //! - `E0231` — `&` (address-of) applied to a non-lvalue expression.
 //! - `E0232` — slicing (`a[lo..hi]`) a value that is neither a (addressable)
 //!   array nor a slice.
+//! - `E0241` — `alloc`'s second argument is not an identifier naming a type
+//!   (a builtin, struct or enum) (SPEC §16.1).
+//! - `E0242` — `free`'s second argument is not a slice (`[]T`) (SPEC §16.1).
 
 use std::collections::{HashMap, HashSet};
 
@@ -243,7 +247,10 @@ impl Checker {
         // Pass 1: collect function signatures so calls can forward-reference.
         for item in &m.items {
             if let Item::Func(f) = item {
-                if f.name == "print" || f.name == "expect" {
+                if matches!(
+                    f.name.as_str(),
+                    "print" | "expect" | "c_allocator" | "alloc" | "free"
+                ) {
                     self.error(
                         f.span,
                         "E0101",
@@ -2045,6 +2052,16 @@ impl Checker {
                     }
                     return None;
                 }
+                // An `Allocator` is an opaque interface value (SPEC §16): it
+                // supports assignment / parameters / return but never comparison.
+                if matches!(lt, Type::Allocator) || matches!(rt, Type::Allocator) {
+                    self.error(
+                        span,
+                        "E0110",
+                        "`Allocator` values do not support comparison",
+                    );
+                    return None;
+                }
                 if lt != rt {
                     let msg = format!(
                         "comparison operands must have the same type, found `{}` and `{}`",
@@ -2120,6 +2137,54 @@ impl Checker {
         }
     }
 
+    /// Type-check the first argument of `alloc` / `free`, which must be an
+    /// `Allocator` (SPEC §16.1). A mismatch is the general type error `E0110`.
+    fn check_allocator_arg(&mut self, arg: &Expr, callee: &str) {
+        if let Some(t) = self.check_expr(arg, Some(Type::Allocator)) {
+            if t != Type::Allocator {
+                let msg = format!(
+                    "`{}` requires an `Allocator` as its first argument, found `{}`",
+                    callee,
+                    self.type_name(t)
+                );
+                self.error(arg.span(), "E0110", msg);
+            }
+        }
+    }
+
+    /// Resolve `alloc`'s second argument, which must be an identifier naming a
+    /// type — a builtin (via [`Type::from_name`]), a struct, or an enum (SPEC
+    /// §16.1). It is *not* type-checked as a value. A non-identifier argument or
+    /// an identifier that names no type is `E0241`.
+    fn resolve_type_arg(&mut self, arg: &Expr) -> Option<Type> {
+        match arg {
+            Expr::Ident { name, span } => {
+                let resolved = Type::from_name(name)
+                    .or_else(|| self.structs.id_of(name).map(Type::Struct))
+                    .or_else(|| self.structs.enum_id_of(name).map(Type::Enum));
+                match resolved {
+                    Some(t) => Some(t),
+                    None => {
+                        let msg = format!(
+                            "`alloc`'s second argument `{}` does not name a type",
+                            name
+                        );
+                        self.error(*span, "E0241", msg);
+                        None
+                    }
+                }
+            }
+            other => {
+                self.error(
+                    other.span(),
+                    "E0241",
+                    "`alloc`'s second argument must be a type name",
+                );
+                None
+            }
+        }
+    }
+
     fn check_call(&mut self, callee: &str, args: &[Expr], span: Span) -> Option<Type> {
         match callee {
             "print" => {
@@ -2171,6 +2236,98 @@ impl Checker {
                             self.type_name(t)
                         );
                         self.error(args[0].span(), "E0110", msg);
+                    }
+                }
+                Some(Type::Void)
+            }
+            // `c_allocator() -> Allocator` (SPEC §16): the malloc/free-backed
+            // allocator. Takes no arguments; its result is always `Allocator`.
+            "c_allocator" => {
+                if !args.is_empty() {
+                    self.error(
+                        span,
+                        "E0110",
+                        format!(
+                            "`c_allocator` takes no arguments, found {}",
+                            args.len()
+                        ),
+                    );
+                    for a in args {
+                        self.check_expr(a, None);
+                    }
+                }
+                Some(Type::Allocator)
+            }
+            // `alloc(a: Allocator, T, n: usize) -> []T` (SPEC §16). The second
+            // argument is a *type name* (an identifier), resolved here — it is
+            // never type-checked as a value. The result is the interned `[]T`.
+            "alloc" => {
+                if args.len() != 3 {
+                    self.error(
+                        span,
+                        "E0110",
+                        format!(
+                            "`alloc` takes exactly 3 arguments (an `Allocator`, a type, and a count), found {}",
+                            args.len()
+                        ),
+                    );
+                    // Recover: check the allocator + any trailing value args, but
+                    // never the slot that would hold the type name (index 1), to
+                    // avoid a spurious "unknown name" for a type identifier.
+                    if let Some(a) = args.first() {
+                        self.check_allocator_arg(a, "alloc");
+                    }
+                    for a in args.iter().skip(2) {
+                        self.check_expr(a, None);
+                    }
+                    return None;
+                }
+                // arg0: the allocator.
+                self.check_allocator_arg(&args[0], "alloc");
+                // arg2: the element count — any integer (a bare literal adopts
+                // `usize`).
+                if let Some(nt) = self.check_expr(&args[2], Some(Type::Usize)) {
+                    if !nt.is_int() {
+                        let msg = format!(
+                            "`alloc` requires an integer count, found `{}`",
+                            self.type_name(nt)
+                        );
+                        self.error(args[2].span(), "E0110", msg);
+                    }
+                }
+                // arg1: the element *type* — an identifier naming a builtin,
+                // struct or enum. Resolved without type-checking it as a value.
+                match self.resolve_type_arg(&args[1]) {
+                    Some(elem) => Some(Type::Slice(self.structs.intern_slice(elem))),
+                    None => None,
+                }
+            }
+            // `free(a: Allocator, s: []T) -> void` (SPEC §16): the second
+            // argument must be a slice (`E0242`).
+            "free" => {
+                if args.len() != 2 {
+                    self.error(
+                        span,
+                        "E0110",
+                        format!(
+                            "`free` takes exactly 2 arguments (an `Allocator` and a slice), found {}",
+                            args.len()
+                        ),
+                    );
+                    for a in args {
+                        self.check_expr(a, None);
+                    }
+                    return Some(Type::Void);
+                }
+                self.check_allocator_arg(&args[0], "free");
+                match self.check_expr(&args[1], None) {
+                    Some(Type::Slice(_)) | None => {}
+                    Some(other) => {
+                        let msg = format!(
+                            "`free` requires a slice (`[]T`) as its second argument, found `{}`",
+                            self.type_name(other)
+                        );
+                        self.error(args[1].span(), "E0242", msg);
                     }
                 }
                 Some(Type::Void)
@@ -4722,5 +4879,219 @@ mod tests {
             Type::Slice(sid) => assert_eq!(table.slice_elem(sid), Type::I32),
             other => panic!("expected a slice field type, found {:?}", other),
         }
+    }
+
+    // ---- Allocator + heap tests (v0.119) ---------------------------------
+
+    #[test]
+    fn c_allocator_yields_allocator_and_alloc_free_ok() {
+        // fn main() void {
+        //   var a: Allocator = c_allocator();
+        //   var s: []i32 = alloc(a, i32, 4);
+        //   free(a, s);
+        // }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("a", "Allocator", call("c_allocator", vec![])),
+                let_var_slice(
+                    "s",
+                    "i32",
+                    call("alloc", vec![ident("a"), ident("i32"), int(4)]),
+                ),
+                Stmt::Expr(call("free", vec![ident("a"), ident("s")])),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn alloc_yields_slice_of_elem_type() {
+        // fn f(a: Allocator) []i32 { return alloc(a, i32, 4); }
+        let items = vec![func_te(
+            "f",
+            vec![param("a", "Allocator")],
+            te_slice("i32"),
+            vec![ret(Some(call(
+                "alloc",
+                vec![ident("a"), ident("i32"), int(4)],
+            )))],
+        )];
+        let m = Module { items };
+        let table = check(&m).expect("alloc program should type-check");
+        // The result is `[]i32`: the interned slice's element is `i32`.
+        let elems: Vec<Type> = table.slices().map(|(_, e)| e).collect();
+        assert!(elems.contains(&Type::I32), "slices = {:?}", elems);
+    }
+
+    #[test]
+    fn alloc_of_struct_type_ok() {
+        // const Point = struct { x: i32, y: i32 };
+        // fn f(a: Allocator) []Point { return alloc(a, Point, 2); }
+        let point = struct_item("Point", vec![("x", "i32"), ("y", "i32")]);
+        let f = func_te(
+            "f",
+            vec![param("a", "Allocator")],
+            te_slice("Point"),
+            vec![ret(Some(call(
+                "alloc",
+                vec![ident("a"), ident("Point"), int(2)],
+            )))],
+        );
+        let m = Module {
+            items: vec![point, f],
+        };
+        let table = check(&m).expect("alloc-of-struct should type-check");
+        let pid = table.id_of("Point").unwrap();
+        let elems: Vec<Type> = table.slices().map(|(_, e)| e).collect();
+        assert!(
+            elems.contains(&Type::Struct(pid)),
+            "expected a `[]Point` slice, slices = {:?}",
+            elems
+        );
+    }
+
+    #[test]
+    fn alloc_with_non_type_second_arg_is_e0241() {
+        // fn f(a: Allocator) []i32 { return alloc(a, nope, 4); }  // `nope` is no type
+        let items = vec![func_te(
+            "f",
+            vec![param("a", "Allocator")],
+            te_slice("i32"),
+            vec![ret(Some(call(
+                "alloc",
+                vec![ident("a"), ident("nope"), int(4)],
+            )))],
+        )];
+        let cs = codes(items);
+        assert!(cs.contains(&"E0241"), "codes = {:?}", cs);
+        // The type-name slot is never type-checked as a value, so there is no
+        // spurious "unknown name" diagnostic.
+        assert!(!cs.contains(&"E0100"), "codes = {:?}", cs);
+    }
+
+    #[test]
+    fn alloc_with_non_ident_second_arg_is_e0241() {
+        // fn f(a: Allocator) []i32 { return alloc(a, 5, 4); }  // `5` is not a type
+        let items = vec![func_te(
+            "f",
+            vec![param("a", "Allocator")],
+            te_slice("i32"),
+            vec![ret(Some(call("alloc", vec![ident("a"), int(5), int(4)])))],
+        )];
+        assert!(codes(items).contains(&"E0241"));
+    }
+
+    #[test]
+    fn free_of_non_slice_is_e0242() {
+        // fn f(a: Allocator, x: i32) void { free(a, x); }   // x is not a slice
+        let items = vec![func(
+            "f",
+            vec![param("a", "Allocator"), param("x", "i32")],
+            "void",
+            vec![Stmt::Expr(call("free", vec![ident("a"), ident("x")]))],
+        )];
+        assert!(codes(items).contains(&"E0242"));
+    }
+
+    #[test]
+    fn alloc_with_non_allocator_first_arg_is_e0110() {
+        // fn f(x: i32) []i32 { return alloc(x, i32, 4); }   // x is not an Allocator
+        let items = vec![func_te(
+            "f",
+            vec![param("x", "i32")],
+            te_slice("i32"),
+            vec![ret(Some(call(
+                "alloc",
+                vec![ident("x"), ident("i32"), int(4)],
+            )))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn redefining_allocator_builtins_is_e0101() {
+        for name in ["c_allocator", "alloc", "free"] {
+            let items = vec![func(name, vec![], "void", vec![])];
+            assert!(
+                codes(items).contains(&"E0101"),
+                "redefining `{}` should be E0101",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn allocator_param_and_return_ok() {
+        // fn dup(a: Allocator) Allocator { return a; }  — assign/param/return ok.
+        let items = vec![func(
+            "dup",
+            vec![param("a", "Allocator")],
+            "Allocator",
+            vec![ret(Some(ident("a")))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn allocator_arithmetic_is_type_error() {
+        // fn f(a: Allocator) Allocator { return a + a; }  — not arithmetic-able.
+        let items = vec![func(
+            "f",
+            vec![param("a", "Allocator")],
+            "Allocator",
+            vec![ret(Some(bin(BinOp::Add, ident("a"), ident("a"))))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn allocator_comparison_is_type_error() {
+        // fn f(a: Allocator) bool { return a == a; }  — not comparable.
+        let items = vec![func(
+            "f",
+            vec![param("a", "Allocator")],
+            "bool",
+            vec![ret(Some(bin(BinOp::Eq, ident("a"), ident("a"))))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn allocator_index_is_e0220() {
+        // fn f(a: Allocator) i32 { return a[0]; }  — not indexable.
+        let items = vec![func(
+            "f",
+            vec![param("a", "Allocator")],
+            "i32",
+            vec![ret(Some(index(ident("a"), int(0))))],
+        )];
+        assert!(codes(items).contains(&"E0220"));
+    }
+
+    #[test]
+    fn allocator_field_access_is_e0165() {
+        // fn f(a: Allocator) i32 { return a.x; }  — no fields.
+        let items = vec![func(
+            "f",
+            vec![param("a", "Allocator")],
+            "i32",
+            vec![ret(Some(field(ident("a"), "x")))],
+        )];
+        assert!(codes(items).contains(&"E0165"));
+    }
+
+    #[test]
+    fn c_allocator_with_args_is_e0110() {
+        // fn f() void { var x: i32 = c_allocator(5); }  — takes no arguments.
+        let items = vec![func(
+            "f",
+            vec![],
+            "void",
+            vec![let_var("a", "Allocator", call("c_allocator", vec![int(5)]))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
     }
 }
