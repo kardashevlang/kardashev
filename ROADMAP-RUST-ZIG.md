@@ -144,10 +144,13 @@ joins the LIFO flush but runs only on error-return edges (`try` propagation /
 `return error.X`). `catch |e|` (the capturing error handler) is deferred to a
 later version — the non-capturing `expr catch default` (§12) remains.
 
-### v0.126.0 — Multi-file modules (`@import`)
-`const m = @import("util.ks");` then `m.func(…)` / `m.Type`. The compiler
-resolves, lexes, parses and checks imported files; names are namespaced per
-module. Real programs span files.
+### v0.126.0 — Multi-file modules (`@import`) ✅
+`@import("util.ks");` (a top-level import) — the compiler resolves, lexes,
+parses and **flattens** the transitively-imported files into one program
+(relative paths, dedup, cycle detection `E0292`, global-unique names `E0293`).
+v0.126 is `#include`-style: bare-name access, `pub` not yet enforced across
+modules, no `m.member` qualified access (all deferred to a later namespacing
+pass).
 
 ### v0.127.0 — Generic structs / type-returning functions
 `fn List(comptime T: type) type { return struct { … }; }` — comptime functions

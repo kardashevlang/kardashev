@@ -299,6 +299,8 @@ impl<'a> Emitter<'a> {
                 // `ptr_pointee_any`); none are registered in the emit-local
                 // pointer registry, exactly like struct field types.
                 Item::Union(_) => {}
+                // Imports are erased by the module flattener before emit.
+                Item::Import(_) => {}
             }
         }
     }

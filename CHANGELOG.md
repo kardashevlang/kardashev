@@ -18,6 +18,24 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.126.0] — Multi-file modules (`@import`)
+
+### Added
+- **`@import("path.ks");`** — a top-level import. A new `modules::resolve`
+  flattener lexes/parses the root and every transitively-imported file
+  (relative paths, file dedup, cycle detection) and concatenates them into one
+  program, fed to the existing `sema`/`emit_c`. `compile_program(path)` drives
+  it; `kard build`/`run`/`test` now compile from a path.
+- Lexer `@`/`At`; `Item::Import`. Diagnostics `E0290`–`E0294` (residual import,
+  not-found, cycle, duplicate name, imported-file error). CI smoke-tests a
+  two-file program.
+- 545 unit + 23 e2e tests.
+
+### Limitations (honest, v0.126)
+`#include`-style flatten: bare-name access (no `m.member`), `pub` not enforced
+across modules, no package/std resolver — all deferred to a later namespacing
+pass.
+
 ## [0.125.0] — Payload captures: `if (opt) |v|` + `errdefer`
 
 ### Added

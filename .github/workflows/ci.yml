@@ -72,6 +72,11 @@ jobs:
           printf 'pub fn main() i32 { print(1); return 0; }\n' > "$mt/src/app.ks"
           printf 'pub fn main() i32 { print(2); return 0; }\n' > "$mt/src/tool.ks"
           ( cd "$mt" && "$KARD" build && [ "$("$KARD" run app)" = "1" ] && [ "$("$KARD" run tool)" = "2" ] )
+          # Multi-file modules (v0.126): a root that @imports another file.
+          md="$(mktemp -d)"
+          printf 'pub fn triple(n: i32) i32 { return n * 3; }\n' > "$md/util.ks"
+          printf '@import("util.ks");\npub fn main() i32 { print(triple(7)); return 0; }\n' > "$md/main.ks"
+          ( cd "$md" && [ "$("$KARD" run main.ks)" = "21" ] )
           # Cross-compilation plumbing (v0.123): `targets` lists triples, and
           # `-target <host triple>` exercises clang's --target end to end (the
           # host triple always has its sysroot, so it links + runs).

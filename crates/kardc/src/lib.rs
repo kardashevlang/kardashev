@@ -16,6 +16,7 @@ pub mod diag;
 pub mod emit_c;
 pub mod fmt;
 pub mod lexer;
+pub mod modules;
 pub mod parser;
 pub mod scaffold;
 pub mod sema;
@@ -28,7 +29,7 @@ use emit_c::EmitMode;
 
 /// The toolchain version. Single source of truth; keep in sync with
 /// `Cargo.toml` and `CHANGELOG.md`.
-pub const VERSION: &str = "0.125.0";
+pub const VERSION: &str = "0.126.0";
 
 /// Front-to-middle pipeline: lex, parse and type-check `src`, then lower the
 /// validated module to C source text for `mode`.
@@ -37,6 +38,24 @@ pub const VERSION: &str = "0.125.0";
 pub fn compile_to_c(src: &str, mode: EmitMode) -> Result<String, Vec<Diagnostic>> {
     let tokens = lexer::lex(src)?;
     let module = parser::parse(&tokens)?;
+    let structs = sema::check(&module)?;
+    if mode == EmitMode::Program && !has_main(&module) {
+        return Err(vec![Diagnostic::error(
+            span::Span::DUMMY,
+            "E0150",
+            "program has no `fn main`",
+        )]);
+    }
+    Ok(emit_c::emit(&module, &structs, mode))
+}
+
+/// Compile a program rooted at `root` to C source for `mode`, resolving any
+/// `@import` declarations into one flattened module first (v0.126).
+pub fn compile_program(
+    root: &std::path::Path,
+    mode: EmitMode,
+) -> Result<String, Vec<Diagnostic>> {
+    let module = modules::resolve(root)?;
     let structs = sema::check(&module)?;
     if mode == EmitMode::Program && !has_main(&module) {
         return Err(vec![Diagnostic::error(
