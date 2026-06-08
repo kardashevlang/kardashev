@@ -258,3 +258,31 @@ pub fn main() i32 {
     let (code, _out) = build_and_capture(src, EmitMode::Program);
     assert_eq!(code, 101, "unwrapping null must panic with exit code 101");
 }
+
+// --- v0.115 error unions ---------------------------------------------------
+
+#[test]
+fn error_unions_try_propagation_and_catch() {
+    let src = r#"
+fn parseDigit(c: i32) !i32 {
+    if (c < 48) { return error.TooLow; }
+    if (c > 57) { return error.TooHigh; }
+    return c - 48;
+}
+fn sumTwo(a: i32, b: i32) !i32 {
+    var x: i32 = try parseDigit(a);   // try: propagate the error on failure
+    var y: i32 = try parseDigit(b);
+    return x + y;
+}
+pub fn main() i32 {
+    print(sumTwo(53, 55) catch 0 - 1);   // 12  (5 + 7)
+    print(sumTwo(50, 99) catch 0 - 1);   // -1  (error.TooHigh propagated)
+    print(parseDigit(48) catch 100);     // 0
+    print(parseDigit(40) catch 100);     // 100 (error.TooLow)
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "12\n-1\n0\n100\n");
+}

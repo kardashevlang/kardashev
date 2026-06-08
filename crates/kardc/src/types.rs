@@ -28,6 +28,9 @@ pub enum Type {
     /// [`StructTable`] (`optional_inner`). v0.114: inner is never itself
     /// optional (no `??T`).
     Optional(u32),
+    /// `!T` — an error union (implicit global error set, v0.115). The `u32`
+    /// indexes the error-union-payload table (`error_union_payload`).
+    ErrorUnion(u32),
 }
 
 impl Type {
@@ -67,6 +70,7 @@ impl Type {
             // StructTable.
             Type::Struct(_) => "struct",
             Type::Optional(_) => "optional",
+            Type::ErrorUnion(_) => "error union",
         }
     }
 
@@ -91,6 +95,9 @@ impl Type {
             Type::Struct(_) => unreachable!("c_name on a struct type; use StructTable::c_name"),
             Type::Optional(_) => {
                 unreachable!("c_name on an optional type; use StructTable::optional_c_name")
+            }
+            Type::ErrorUnion(_) => {
+                unreachable!("c_name on an error-union type; use StructTable::error_union_c_name")
             }
         }
     }
@@ -142,6 +149,11 @@ pub struct StructTable {
     /// Despite the name, this table holds the program's *composite* types too,
     /// not only structs.
     optional_inners: Vec<Type>,
+    /// Payload types of `!T` error unions, indexed by `Type::ErrorUnion(id)`.
+    error_union_payloads: Vec<Type>,
+    /// The (implicit global) error set: declared error names, 1-based codes
+    /// (`error_names[0]` has code 1; code 0 means "no error").
+    error_names: Vec<String>,
 }
 
 impl StructTable {
@@ -224,8 +236,66 @@ impl StructTable {
         match t {
             Type::Struct(sid) => format!("struct_{}", self.defs[sid as usize].name),
             Type::Optional(oid) => format!("opt_{}", self.type_mangle(self.optional_inner(oid))),
+            Type::ErrorUnion(eid) => {
+                format!("err_{}", self.type_mangle(self.error_union_payload(eid)))
+            }
             other => other.c_name().to_string(),
         }
+    }
+
+    // --- error unions (`!T`) + the implicit global error set --------------
+
+    /// Intern error name `name`, returning its 1-based code (0 = "no error").
+    pub fn intern_error(&mut self, name: &str) -> u32 {
+        if let Some(i) = self.error_names.iter().position(|n| n == name) {
+            return i as u32 + 1;
+        }
+        self.error_names.push(name.to_string());
+        self.error_names.len() as u32
+    }
+
+    /// The 1-based code of error `name`, if declared.
+    pub fn error_code(&self, name: &str) -> Option<u32> {
+        self.error_names.iter().position(|n| n == name).map(|i| i as u32 + 1)
+    }
+
+    /// All declared error names paired with their 1-based code.
+    pub fn errors(&self) -> impl Iterator<Item = (u32, &str)> + '_ {
+        self.error_names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (i as u32 + 1, n.as_str()))
+    }
+
+    /// Intern an `!T` error union with payload `payload`, returning its id.
+    pub fn intern_error_union(&mut self, payload: Type) -> u32 {
+        if let Some(i) = self.error_union_payloads.iter().position(|t| *t == payload) {
+            return i as u32;
+        }
+        let id = self.error_union_payloads.len() as u32;
+        self.error_union_payloads.push(payload);
+        id
+    }
+
+    /// The payload type `T` of `!T` for `Type::ErrorUnion(id)`.
+    pub fn error_union_payload(&self, id: u32) -> Type {
+        self.error_union_payloads[id as usize]
+    }
+
+    /// The C typedef name for `!T`, e.g. `kd_err_int32_t`.
+    pub fn error_union_c_name(&self, id: u32) -> String {
+        format!(
+            "kd_err_{}",
+            self.type_mangle(self.error_union_payloads[id as usize])
+        )
+    }
+
+    /// All interned error unions, paired with id, in interning order.
+    pub fn error_unions(&self) -> impl Iterator<Item = (u32, Type)> + '_ {
+        self.error_union_payloads
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i as u32, *t))
     }
 
     /// All interned optionals, paired with their id, in interning order — the
