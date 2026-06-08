@@ -13,7 +13,7 @@
 
 use crate::ast::{
     BinOp, Block, ConstDecl, EnumDecl, Expr, FieldDecl, FieldInit, Func, Item, Module, Param, Stmt,
-    StructDecl, SwitchArm, TestBlock, TypeExpr, UnOp,
+    StructDecl, SwitchArm, TestBlock, TypeExpr, UnOp, UnionDecl, UnionVariant,
 };
 use crate::diag::Diagnostic;
 use crate::span::Span;
@@ -405,10 +405,11 @@ impl<'a> Parser<'a> {
         //   - `:` introduces a typed value binding `const IDENT : type = expr ;`
         //     (SPEC §2), with an explicit annotation (`ty = Some`).
         //   - `=` introduces either a *type declaration* — `= struct { … }`
-        //     (SPEC §9.1) / `= enum { … }` (SPEC §13.1), selected by the
-        //     keyword that follows the `=` — or, for any other following token,
-        //     an *inferred* value binding `const IDENT = expr ;` (SPEC §18.1)
-        //     whose type sema infers from the initializer (`ty = None`).
+        //     (SPEC §9.1) / `= enum { … }` (SPEC §13.1) / `= union(enum) { … }`
+        //     (SPEC §20.1), selected by the keyword that follows the `=` — or,
+        //     for any other following token, an *inferred* value binding
+        //     `const IDENT = expr ;` (SPEC §18.1) whose type sema infers from
+        //     the initializer (`ty = None`).
         if self.at_punct(&TokenKind::Eq) {
             match self.peek2_kind() {
                 TokenKind::Keyword(Kw::Struct) => {
@@ -416,6 +417,9 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::Keyword(Kw::Enum) => {
                     return self.parse_enum_decl(is_pub, name, start);
+                }
+                TokenKind::Keyword(Kw::Union) => {
+                    return self.parse_union_decl(is_pub, name, start);
                 }
                 _ => {
                     // Inferred value const `const IDENT = expr ;` (no annotation).
@@ -528,6 +532,53 @@ impl<'a> Parser<'a> {
         self.expect_punct(&TokenKind::RBrace, "`}`")?;
         let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
         Ok(Item::Enum(EnumDecl {
+            is_pub,
+            name,
+            variants,
+            span: start.merge(semi),
+        }))
+    }
+
+    /// Parse the tail of a tagged-union declaration, with `const IDENT` already
+    /// consumed and the cursor on the `=`:
+    /// `= "union" "(" "enum" ")" "{" variant ("," variant)* ","? "}" ";"` where
+    /// `variant := IDENT ":" type` (SPEC §20.1). The `(enum)` after `union` is
+    /// required syntax (kardashev's only union flavour is the tagged
+    /// `union(enum)`). Each variant carries a payload type, parsed with the
+    /// shared [`Parser::parse_type`] so payloads grow new type forms for free.
+    /// A comma separates variants, with an optional trailing comma; duplicate
+    /// variant names and payload-type resolution are sema concerns, not the
+    /// parser's.
+    fn parse_union_decl(&mut self, is_pub: bool, name: String, start: Span) -> PResult<Item> {
+        self.bump(); // `=`
+        if !self.eat_kw(Kw::Union) {
+            return Err(self.expected("`union`"));
+        }
+        // The required `(enum)` tag after `union`.
+        self.expect_punct(&TokenKind::LParen, "`(`")?;
+        if !self.eat_kw(Kw::Enum) {
+            return Err(self.expected("`enum`"));
+        }
+        self.expect_punct(&TokenKind::RParen, "`)`")?;
+        self.expect_punct(&TokenKind::LBrace, "`{`")?;
+        let mut variants = Vec::new();
+        while !self.at_punct(&TokenKind::RBrace) {
+            let (vname, vname_span) = self.expect_ident()?;
+            self.expect_punct(&TokenKind::Colon, "`:`")?;
+            let payload = self.parse_type()?;
+            let span = vname_span.merge(payload.span);
+            variants.push(UnionVariant {
+                name: vname,
+                payload,
+                span,
+            });
+            if !self.eat_punct(&TokenKind::Comma) {
+                break; // no separator → the variant list is done
+            }
+        }
+        self.expect_punct(&TokenKind::RBrace, "`}`")?;
+        let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
+        Ok(Item::Union(UnionDecl {
             is_pub,
             name,
             variants,
@@ -730,15 +781,19 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parse a `switch` statement (SPEC §13.1):
+    /// Parse a `switch` statement (SPEC §13.1, §20.1):
     /// `switch "(" expr ")" "{" arm* else_arm? "}"`. Each arm is a
-    /// comma-separated list of constant-pattern labels, then `=>`, then a
-    /// block; the optional `else => block` arm becomes `default`. Arms are
-    /// separated by `,`, and a trailing `,` after a `}` block is optional, so
-    /// the separator is consumed leniently after every arm. Labels are parsed
-    /// as full expressions (they will be enum literals `.V` / `Enum.V` or
-    /// integer literals); their validity against the scrutinee type and the
-    /// exhaustiveness of the arms are sema concerns (`E0210`–`E0215`).
+    /// comma-separated list of constant-pattern labels, then `=>`, then an
+    /// optional `| IDENT |` payload capture, then a block; the optional
+    /// `else => block` arm becomes `default`. Arms are separated by `,`, and a
+    /// trailing `,` after a `}` block is optional, so the separator is consumed
+    /// leniently after every arm. Labels are parsed as full expressions (they
+    /// will be enum literals `.V` / `Enum.V` or integer literals); their
+    /// validity against the scrutinee type and the exhaustiveness of the arms
+    /// are sema concerns (`E0210`–`E0215`). A `| IDENT |` after `=>` binds the
+    /// matched tagged-union variant's payload as a local in the arm body
+    /// (`SwitchArm.capture`); a capture on a non-union switch (or a union arm
+    /// missing one) is a sema concern (`E0272`), not the parser's.
     fn parse_switch(&mut self) -> PResult<Stmt> {
         let start = self.peek_span();
         self.bump(); // `switch`
@@ -766,9 +821,25 @@ impl<'a> Parser<'a> {
                     labels.push(self.parse_expr()?);
                 }
                 self.expect_punct(&TokenKind::FatArrow, "`=>`")?;
+                // An optional `| IDENT |` payload capture (SPEC §20.1) binds the
+                // matched variant's payload in the arm body. A bare `=>` (no
+                // pipes) leaves `capture = None` (enum / integer switches).
+                let capture = if self.at_punct(&TokenKind::Pipe) {
+                    self.bump(); // `|`
+                    let (cap, _) = self.expect_ident()?;
+                    self.expect_punct(&TokenKind::Pipe, "`|`")?;
+                    Some(cap)
+                } else {
+                    None
+                };
                 let body = self.parse_block()?;
                 let span = arm_start.merge(body.span);
-                arms.push(SwitchArm { labels, body, span });
+                arms.push(SwitchArm {
+                    labels,
+                    capture,
+                    body,
+                    span,
+                });
             }
             // Arms are separated by `,`; a trailing comma after a block is
             // optional, so consume one if present and otherwise carry on.
@@ -1334,6 +1405,7 @@ fn describe_kind(kind: &TokenKind) -> String {
         TokenKind::FatArrow => "`=>`".to_string(),
         TokenKind::Amp => "`&`".to_string(),
         TokenKind::DotDot => "`..`".to_string(),
+        TokenKind::Pipe => "`|`".to_string(),
         TokenKind::Eof => "end of input".to_string(),
     }
 }
@@ -4259,6 +4331,272 @@ mod tests {
                 assert_eq!(e.variants, vec!["A", "B"]);
             }
             other => panic!("expected enum, got {:?}", other),
+        }
+    }
+
+    // ---- v0.124: tagged unions (`union(enum)`) + switch capture -----------
+
+    #[test]
+    fn union_decl_two_variants() {
+        // pub const Shape = union(enum) { circle: i32, rect: i64, };  (trailing
+        // comma) — each variant carries a payload type.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Pub),
+            TokenKind::Keyword(Kw::Const),
+            id("Shape"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Union),
+            TokenKind::LParen,
+            TokenKind::Keyword(Kw::Enum),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            id("circle"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::Comma,
+            id("rect"),
+            TokenKind::Colon,
+            id("i64"),
+            TokenKind::Comma,
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Union(u) => {
+                assert!(u.is_pub);
+                assert_eq!(u.name, "Shape");
+                assert_eq!(u.variants.len(), 2);
+                assert_eq!(u.variants[0].name, "circle");
+                assert_eq!(u.variants[0].payload.name, "i32");
+                assert_eq!(u.variants[1].name, "rect");
+                assert_eq!(u.variants[1].payload.name, "i64");
+                assert!(u.span.start < u.span.end);
+                assert!(u.variants[0].span.start < u.variants[0].span.end);
+            }
+            other => panic!("expected union, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn union_decl_composite_payload_types() {
+        // const Val = union(enum) { i: i32, p: *i32, s: []u8 };  — payloads reuse
+        // `parse_type`, so pointer / slice forms work as variant payloads.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("Val"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Union),
+            TokenKind::LParen,
+            TokenKind::Keyword(Kw::Enum),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            id("i"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::Comma,
+            id("p"),
+            TokenKind::Colon,
+            TokenKind::Star,
+            id("i32"),
+            TokenKind::Comma,
+            id("s"),
+            TokenKind::Colon,
+            TokenKind::LBracket,
+            TokenKind::RBracket,
+            id("u8"),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Union(u) => {
+                assert!(!u.is_pub);
+                assert_eq!(u.name, "Val");
+                assert_eq!(u.variants.len(), 3);
+                assert_eq!(u.variants[0].payload.name, "i32");
+                assert!(!u.variants[0].payload.pointer);
+                assert_eq!(u.variants[1].name, "p");
+                assert!(u.variants[1].payload.pointer, "`*i32` payload is a pointer");
+                assert_eq!(u.variants[2].name, "s");
+                assert!(u.variants[2].payload.slice, "`[]u8` payload is a slice");
+            }
+            other => panic!("expected union, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn struct_and_enum_still_parse_after_union_branch() {
+        // The `= struct` / `= enum` dispatch must keep working after the new
+        // `= union(enum)` branch joins the const-item dispatch (regression).
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("Point"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            id("x"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+            TokenKind::Keyword(Kw::Const),
+            id("E"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Enum),
+            TokenKind::LBrace,
+            id("A"),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        assert!(matches!(&m.items[0], Item::Struct(s) if s.name == "Point"));
+        assert!(matches!(&m.items[1], Item::Enum(e) if e.name == "E"));
+    }
+
+    #[test]
+    fn union_construction_parses_as_struct_lit() {
+        // x = Shape{ .circle = 5 };  — union construction reuses `Expr::StructLit`
+        // with no new parser code; sema distinguishes union vs struct by name.
+        let e = parse_assign_rhs(vec![
+            id("Shape"),
+            TokenKind::LBrace,
+            TokenKind::Dot,
+            id("circle"),
+            TokenKind::Eq,
+            TokenKind::Int(5),
+            TokenKind::RBrace,
+        ]);
+        match e {
+            Expr::StructLit { name, fields, .. } => {
+                assert_eq!(name, "Shape");
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].name, "circle");
+                assert!(matches!(fields[0].value, Expr::Int { value: 5, .. }));
+            }
+            other => panic!("expected struct literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn switch_with_capture_arms() {
+        // switch (v) { .circle => |r| { return; } .rect => |w| { return; }
+        //              else => { return; } }
+        // The `| IDENT |` after `=>` sets `SwitchArm.capture`.
+        let body = parse_fn_body(vec![
+            TokenKind::Keyword(Kw::Switch),
+            TokenKind::LParen,
+            id("v"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            // .circle => |r| { return; }
+            TokenKind::Dot,
+            id("circle"),
+            TokenKind::FatArrow,
+            TokenKind::Pipe,
+            id("r"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+            // .rect => |w| { return; }
+            TokenKind::Dot,
+            id("rect"),
+            TokenKind::FatArrow,
+            TokenKind::Pipe,
+            id("w"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+            // else => { return; }
+            TokenKind::Keyword(Kw::Else),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+            TokenKind::RBrace, // close switch
+        ]);
+        match &body.stmts[0] {
+            Stmt::Switch { arms, default, .. } => {
+                assert_eq!(arms.len(), 2);
+                assert!(matches!(&arms[0].labels[0], Expr::EnumLit { variant, .. } if variant == "circle"));
+                assert_eq!(arms[0].capture.as_deref(), Some("r"));
+                assert!(matches!(&arms[1].labels[0], Expr::EnumLit { variant, .. } if variant == "rect"));
+                assert_eq!(arms[1].capture.as_deref(), Some("w"));
+                assert!(default.is_some(), "the `else` arm should set `default`");
+            }
+            other => panic!("expected switch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn switch_without_capture_sets_none() {
+        // switch (c) { .Red => { } else => { } }  — a bare `=>` (no `| |`) leaves
+        // `SwitchArm.capture == None` (regression guard for the new field).
+        let body = parse_fn_body(vec![
+            TokenKind::Keyword(Kw::Switch),
+            TokenKind::LParen,
+            id("c"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::Dot,
+            id("Red"),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Keyword(Kw::Else),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace, // close switch
+        ]);
+        match &body.stmts[0] {
+            Stmt::Switch { arms, .. } => {
+                assert_eq!(arms.len(), 1);
+                assert!(arms[0].capture.is_none(), "a bare `=>` arm has no capture");
+            }
+            other => panic!("expected switch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn switch_capture_on_multi_label_arm() {
+        // switch (v) { .a, .b => |x| { } else => { } }  — a capture follows the
+        // whole label list, after the `=>`.
+        let body = parse_fn_body(vec![
+            TokenKind::Keyword(Kw::Switch),
+            TokenKind::LParen,
+            id("v"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::Dot,
+            id("a"),
+            TokenKind::Comma,
+            TokenKind::Dot,
+            id("b"),
+            TokenKind::FatArrow,
+            TokenKind::Pipe,
+            id("x"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Keyword(Kw::Else),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace, // close switch
+        ]);
+        match &body.stmts[0] {
+            Stmt::Switch { arms, .. } => {
+                assert_eq!(arms.len(), 1);
+                assert_eq!(arms[0].labels.len(), 2);
+                assert_eq!(arms[0].capture.as_deref(), Some("x"));
+            }
+            other => panic!("expected switch, got {:?}", other),
         }
     }
 }

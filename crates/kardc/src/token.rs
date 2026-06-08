@@ -34,6 +34,7 @@ pub enum Kw {
     Error,
     Enum,
     Switch,
+    Union,
 }
 
 impl Kw {
@@ -65,6 +66,7 @@ impl Kw {
             "error" => Kw::Error,
             "enum" => Kw::Enum,
             "switch" => Kw::Switch,
+            "union" => Kw::Union,
             _ => return None,
         })
     }
@@ -96,6 +98,7 @@ impl Kw {
             Kw::Error => "error",
             Kw::Enum => "enum",
             Kw::Switch => "switch",
+            Kw::Union => "union",
         }
     }
 }
@@ -136,6 +139,7 @@ pub enum TokenKind {
     FatArrow, // =>  (switch arms)
     Amp,      // &   (address-of)
     DotDot,   // ..  (slice ranges)
+    Pipe,     // |   (switch / capture payload binding)
 
     /// End of input. Always the final token.
     Eof,

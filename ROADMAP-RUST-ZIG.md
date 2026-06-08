@@ -125,18 +125,52 @@ tracked under *Beyond*. The compiler-side mechanism is complete.
 
 ---
 
-🏁 **The numbered roadmap (v0.112 – v0.123) is complete.** Only the open-ended
-*Beyond* items remain (each a multi-session effort).
+🏁 **Arc 1 — the numbered roadmap v0.112 – v0.123 — is complete.**
 
-### Beyond
+## Arc 2 — completing the language surface (v0.124 – v0.130)
+
+Promotes the tractable, high-value items out of *Beyond* into numbered versions
+that finish the Zig-philosophy language surface. Same discipline; XL platform
+items stay in *Beyond*.
+
+### v0.124.0 — Tagged unions `union(enum)` + `switch` capture ✅
+`const Shape = union(enum) { circle: i64, rect: Point };`; `switch` arms capture
+the payload `.circle => |r| …`. Lowered to a tagged C struct
+`{ int32_t tag; union { … } data; }`. Builds on the enum/switch machinery.
+
+### v0.125.0 — Payload captures: `if (opt) |v|`, `catch |e|`, `errdefer`
+The deferred capture sugar: `if (x) |v| { … } else { … }` for optionals,
+`expr catch |e| { … }` for error unions, and `errdefer` joining the LIFO flush
+on error-return paths.
+
+### v0.126.0 — Multi-file modules (`@import`)
+`const m = @import("util.ks");` then `m.func(…)` / `m.Type`. The compiler
+resolves, lexes, parses and checks imported files; names are namespaced per
+module. Real programs span files.
+
+### v0.127.0 — Generic structs / type-returning functions
+`fn List(comptime T: type) type { return struct { … }; }` — comptime functions
+that return `struct` types, monomorphised. Unlocks generic containers.
+
+### v0.128.0 — Standard prelude: `ArrayList(T)`
+A growable list built on the `Allocator` + generic structs (`append`, `get`,
+`len`, `deinit`) — the first piece of an allocator-based std.
+
+### v0.129.0 — Strings: `[]const u8` + string literals as values
+String literals evaluate to `[]const u8` slices; basic length/index/compare;
+`print` for strings.
+
+### v0.130.0 — `comptime` value params + `inline` loops
+`comptime n: usize` parameters (array-size generics) and `inline while/for`
+(compile-time-unrolled), rounding out comptime.
+
+### Beyond (Arc 3+, each multi-session)
 **Bundled cross-compilation sysroots** (Zig's "cross-compile anything out of the
-box" — ship/locate target libc + headers so `-target` produces foreign binaries
-with no host setup); the full imperative `build.zig` build graph; tagged unions
-`union(enum)` + payload capture; `errdefer` / `catch |e|` capture / named error
-sets; a standard prelude built on the allocator; generic structs /
-type-returning functions; re-self-hosting (the compiler in kardashev); a package
-registry; an LSP + formatter-parity pass; and a mechanized spec → 1.0 stability
-commitment.
+box"); the full imperative `build.zig` build graph (a kardashev program with a
+`build(*Builder)` entry point); named error sets `error{…}`; a richer std
+(`HashMap`, I/O, formatting); re-self-hosting (the compiler in kardashev); a
+package registry; an LSP + formatter-parity pass; and a mechanized spec → 1.0
+stability commitment.
 
 ---
 

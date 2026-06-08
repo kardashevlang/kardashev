@@ -20,6 +20,24 @@ pub enum Item {
     Test(TestBlock),
     Struct(StructDecl),
     Enum(EnumDecl),
+    Union(UnionDecl),
+}
+
+/// A tagged union: `pub? const Name = union(enum) { v: T, ... };` (v0.124).
+/// Each variant carries a payload type. Lowered to a tagged C struct.
+#[derive(Clone, Debug)]
+pub struct UnionDecl {
+    pub is_pub: bool,
+    pub name: String,
+    pub variants: Vec<UnionVariant>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct UnionVariant {
+    pub name: String,
+    pub payload: TypeExpr,
+    pub span: Span,
 }
 
 /// An enum declaration: `pub? const Name = enum { A, B, C };` (v0.116).
@@ -201,6 +219,9 @@ pub enum Stmt {
 #[derive(Clone, Debug)]
 pub struct SwitchArm {
     pub labels: Vec<Expr>,
+    /// `|name|` payload capture (v0.124, tagged-union switch): binds the matched
+    /// variant's payload in the arm body. `None` for enum/integer switches.
+    pub capture: Option<String>,
     pub body: Block,
     pub span: Span,
 }

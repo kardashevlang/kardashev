@@ -287,6 +287,11 @@ impl<'a> Emitter<'a> {
                 }
                 Item::Test(t) => self.note_block_ptrs(&t.body),
                 Item::Enum(_) => {}
+                // A union's variant payload types are stored resolved in the
+                // table (a `*T` payload carries a table pointer id, resolved via
+                // `ptr_pointee_any`); none are registered in the emit-local
+                // pointer registry, exactly like struct field types.
+                Item::Union(_) => {}
             }
         }
     }
@@ -397,6 +402,7 @@ impl<'a> Emitter<'a> {
             && structs.optionals().next().is_none()
             && structs.error_unions().next().is_none()
             && structs.enums().next().is_none()
+            && structs.unions().next().is_none()
             && structs.arrays().next().is_none()
             && structs.slices().next().is_none()
         {
@@ -412,6 +418,7 @@ impl<'a> Emitter<'a> {
             Opt(u32),
             ErrU(u32),
             Enum(u32),
+            Union(u32),
             Array(u32),
             Slice(u32),
         }
@@ -421,6 +428,7 @@ impl<'a> Emitter<'a> {
                 Type::Optional(o) => Some(Node::Opt(o)),
                 Type::ErrorUnion(e) => Some(Node::ErrU(e)),
                 Type::Enum(e) => Some(Node::Enum(e)),
+                Type::Union(u) => Some(Node::Union(u)),
                 Type::Array(a) => Some(Node::Array(a)),
                 Type::Slice(s) => Some(Node::Slice(s)),
                 // A pointer needs no typedef of its own, but the type it points
@@ -461,6 +469,16 @@ impl<'a> Emitter<'a> {
                 }
                 // A plain enum embeds nothing by value: it is a graph leaf.
                 Node::Enum(_) => {}
+                // A tagged union embeds each variant's payload type by value
+                // (inside its `data` union), so every payload must be declared
+                // first — exactly like a struct's fields.
+                Node::Union(u) => {
+                    for (_, pty) in &structs.union_get(u).variants {
+                        if let Some(d) = dep_of(*pty, structs) {
+                            visit(d, structs, seen, order);
+                        }
+                    }
+                }
                 // An array `[N]T` embeds its element type `T` by value.
                 Node::Array(a) => {
                     if let Some(d) = dep_of(structs.array_elem(a), structs) {
@@ -494,6 +512,9 @@ impl<'a> Emitter<'a> {
         for (id, _) in structs.error_unions() {
             visit(Node::ErrU(id), structs, &mut seen, &mut order);
         }
+        for (id, _) in structs.unions() {
+            visit(Node::Union(id), structs, &mut seen, &mut order);
+        }
         for (id, _, _) in structs.arrays() {
             visit(Node::Array(id), structs, &mut seen, &mut order);
         }
@@ -507,6 +528,7 @@ impl<'a> Emitter<'a> {
                 Node::Opt(id) => self.emit_one_optional(id),
                 Node::ErrU(id) => self.emit_one_error_union(id),
                 Node::Enum(id) => self.emit_one_enum(id),
+                Node::Union(id) => self.emit_one_union(id),
                 Node::Array(id) => self.emit_one_array(id),
                 Node::Slice(id) => self.emit_one_slice(id),
             }
@@ -536,6 +558,35 @@ impl<'a> Emitter<'a> {
                 .join(", ")
         };
         self.line(&format!("typedef enum {{ {} }} {};", body, cname));
+    }
+
+    /// Emit one tagged-union typedef (SPEC §20.3): a struct carrying an
+    /// `int32_t tag` (the active variant's 0-based index) and an anonymous C
+    /// `union` of every variant payload, keyed by `data.kd_<variant>`:
+    /// ```c
+    /// typedef struct { int32_t tag; union { <T1 cty> kd_<v1>; ... } data; } kd_union_<Name>;
+    /// ```
+    /// A union depends on every payload type (pulled in first by the dependency
+    /// walk). Sema requires at least one variant; a degenerate empty union would
+    /// be invalid C (`union { }`), so a placeholder member keeps the output
+    /// compilable in that impossible case.
+    fn emit_one_union(&mut self, id: u32) {
+        let structs = self.structs;
+        let info = structs.union_get(id);
+        let cname = structs.union_c_name(id);
+        let body = if info.variants.is_empty() {
+            "char _unused;".to_string()
+        } else {
+            info.variants
+                .iter()
+                .map(|(vname, pty)| format!("{} kd_{};", self.cty_of(*pty), vname))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        self.line(&format!(
+            "typedef struct {{ int32_t tag; union {{ {} }} data; }} {};",
+            body, cname
+        ));
     }
 
     fn emit_one_struct(&mut self, id: u32) {
@@ -882,6 +933,7 @@ impl<'a> Emitter<'a> {
         Type::from_name(name)
             .or_else(|| self.structs.id_of(name).map(Type::Struct))
             .or_else(|| self.structs.enum_id_of(name).map(Type::Enum))
+            .or_else(|| self.structs.union_id_of(name).map(Type::Union))
             .unwrap_or(Type::Void)
     }
 
@@ -908,6 +960,7 @@ impl<'a> Emitter<'a> {
             Type::Optional(id) => self.structs.optional_c_name(id),
             Type::ErrorUnion(id) => self.structs.error_union_c_name(id),
             Type::Enum(id) => self.structs.enum_c_name(id),
+            Type::Union(id) => self.structs.union_c_name(id),
             Type::Array(id) => self.structs.array_c_name(id),
             // `*T` has no typedef: its C spelling is `<pointee cty>*`.
             Type::Ptr(id) => format!("{}*", self.cty_of(self.ptr_pointee_any(id))),
@@ -932,6 +985,8 @@ impl<'a> Emitter<'a> {
             Type::Struct(id)
         } else if let Some(id) = self.structs.enum_id_of(&t.name) {
             Type::Enum(id)
+        } else if let Some(id) = self.structs.union_id_of(&t.name) {
+            Type::Union(id)
         } else {
             Type::I64
         };
@@ -1234,6 +1289,11 @@ impl<'a> Emitter<'a> {
         default: &Option<Block>,
     ) -> bool {
         let scrut_ty = self.type_of_expr(scrutinee);
+        // A union scrutinee switches on the runtime `.tag` and may capture the
+        // active variant's payload — a distinct lowering (SPEC §20.3).
+        if let Some(Type::Union(uid)) = scrut_ty {
+            return self.emit_union_switch(scrutinee, uid, arms, default);
+        }
         let scrut = self.emit_expr(scrutinee);
         self.line(&format!("switch ({}) {{", scrut));
         self.indent += 1;
@@ -1278,6 +1338,92 @@ impl<'a> Emitter<'a> {
         if let Expr::EnumLit { variant, .. } = label {
             if let Some(Type::Enum(eid)) = scrut_ty {
                 return self.structs.enum_variant_c_name(eid, variant);
+            }
+        }
+        self.emit_expr(label)
+    }
+
+    /// Lower a `switch` over a tagged union (SPEC §20.3). The C switch dispatches
+    /// on the scrutinee's `.tag`; each label `.v` becomes the variant's 0-based
+    /// tag as an integer `case`. When an arm carries a `|cap|` capture, the
+    /// matched variant's payload is bound first — `<payload cty> kd_<cap> =
+    /// (<u>).data.kd_<v>;` — and recorded in the arm's scope so its uses inside
+    /// the body resolve. Each arm ends with `break;`; an `else` becomes
+    /// `default:` (sema proves a union switch exhaustive, so no `default:` is
+    /// emitted otherwise). A validated union switch is total, so it diverges iff
+    /// every arm (and the `else`, if present) does.
+    fn emit_union_switch(
+        &mut self,
+        scrutinee: &Expr,
+        uid: u32,
+        arms: &[SwitchArm],
+        default: &Option<Block>,
+    ) -> bool {
+        let scrut = self.emit_expr(scrutinee);
+        self.line(&format!("switch (({}).tag) {{", scrut));
+        self.indent += 1;
+        let mut all_diverge = true;
+        for arm in arms {
+            let n = arm.labels.len();
+            // The variant named by the arm's (first) label drives both the tag
+            // and, for a captured arm, the union member the payload is read from.
+            let mut variant: Option<String> = None;
+            for (i, label) in arm.labels.iter().enumerate() {
+                if variant.is_none() {
+                    if let Expr::EnumLit { variant: v, .. } = label {
+                        variant = Some(v.clone());
+                    }
+                }
+                let idx = self.union_label_index(label, uid);
+                if i + 1 < n {
+                    self.line(&format!("case {}:", idx));
+                } else {
+                    self.line(&format!("case {}: {{", idx));
+                }
+            }
+            // A label-less arm cannot be produced by the parser; guard so the
+            // emitted C stays brace-balanced if one ever appears.
+            if n == 0 {
+                self.line("{");
+            }
+            // Bind the captured payload (if any) and seed the arm scope with its
+            // type, so the body's uses of `cap` resolve through `type_of_expr`.
+            let mut scope = Scope::plain();
+            if let (Some(cap), Some(v)) = (&arm.capture, &variant) {
+                let payload = self
+                    .structs
+                    .union_get(uid)
+                    .payload_type(v)
+                    .unwrap_or(Type::Void);
+                let cty = self.cty_of(payload);
+                self.indent += 1;
+                self.line(&format!("{} kd_{} = ({}).data.kd_{};", cty, cap, scrut, v));
+                self.indent -= 1;
+                scope.var_types.insert(cap.clone(), payload);
+            }
+            let d = self.emit_block(&arm.body, scope);
+            self.line("} break;");
+            all_diverge = all_diverge && d;
+        }
+        if let Some(else_body) = default {
+            self.line("default: {");
+            let d = self.emit_block(else_body, Scope::plain());
+            self.line("} break;");
+            all_diverge = all_diverge && d;
+        }
+        self.indent -= 1;
+        self.line("}");
+        // A validated union switch is total (every variant, or an `else`).
+        all_diverge
+    }
+
+    /// The integer `case` label for one union-switch arm pattern: a variant
+    /// literal `.v` resolves to its 0-based tag index. A non-variant label is
+    /// unreachable for validated input; it falls back to ordinary lowering.
+    fn union_label_index(&mut self, label: &Expr, uid: u32) -> String {
+        if let Expr::EnumLit { variant, .. } = label {
+            if let Some(idx) = self.structs.union_get(uid).variant_index(variant) {
+                return idx.to_string();
             }
         }
         self.emit_expr(label)
@@ -1695,6 +1841,12 @@ impl<'a> Emitter<'a> {
                 format!("({}).kd_{}", b, field)
             }
             Expr::StructLit { name, fields, .. } => {
+                // A union construction `Name{ .v = e }` reuses the struct-literal
+                // shape but lowers to a tagged compound literal (SPEC §20.3).
+                // The table tells unions and structs apart by name.
+                if let Some(uid) = self.structs.union_id_of(name) {
+                    return self.emit_union_lit(uid, fields);
+                }
                 // C99 compound literal: `((kd_struct_<Name>){ .kd_<f> = <v>, ... })`.
                 let (cname, sid) = match self.structs.id_of(name) {
                     Some(id) => (self.structs.c_name(id), Some(id)),
@@ -1858,6 +2010,40 @@ impl<'a> Emitter<'a> {
                     _ => format!("({})", l),
                 }
             }
+        }
+    }
+
+    /// Lower a union construction `Name{ .v = e }` to a tagged C compound
+    /// literal (SPEC §20.3):
+    /// `((kd_union_<Name>){ .tag = <idx>, .data = { .kd_<v> = <e> } })`, where
+    /// `<idx>` is the variant's 0-based tag and `<e>` is coerced to the
+    /// variant's payload type. A validated union literal names exactly one
+    /// variant; the impossible empty case zero-initialises so the output stays
+    /// valid C.
+    fn emit_union_lit(&mut self, uid: u32, fields: &[crate::ast::FieldInit]) -> String {
+        let cname = self.structs.union_c_name(uid);
+        match fields.first() {
+            Some(fi) => {
+                // `variant_index` / `payload_type` return `Copy` values, so the
+                // immutable table borrow ends before the `&mut self` coercion.
+                let idx = self
+                    .structs
+                    .union_get(uid)
+                    .variant_index(&fi.name)
+                    .unwrap_or(0);
+                let payload = self
+                    .structs
+                    .union_get(uid)
+                    .payload_type(&fi.name)
+                    .unwrap_or(Type::Void);
+                let v = self.emit_coerced(&fi.value, payload);
+                format!(
+                    "(({}){{ .tag = {}, .data = {{ .kd_{} = {} }} }})",
+                    cname, idx, fi.name, v
+                )
+            }
+            // Unreachable for validated input (a union literal has one field).
+            None => format!("(({}){{0}})", cname),
         }
     }
 
@@ -2179,7 +2365,13 @@ impl<'a> Emitter<'a> {
                 self.fn_ret.get(callee).copied()
             }
             Expr::Comptime { expr, .. } => self.type_of_expr(expr),
-            Expr::StructLit { name, .. } => self.structs.id_of(name).map(Type::Struct),
+            // A union literal `Name{ .v = e }` reuses the struct-literal shape;
+            // the table distinguishes it, and it has type `Union(id)` (SPEC §20).
+            Expr::StructLit { name, .. } => self
+                .structs
+                .union_id_of(name)
+                .map(Type::Union)
+                .or_else(|| self.structs.id_of(name).map(Type::Struct)),
             Expr::Field { base, field, .. } => {
                 // A qualified enum literal `Enum.V` (base names an enum type) has
                 // type `Enum(id)`; otherwise it is an ordinary struct-field access.
@@ -3937,6 +4129,18 @@ mod tests {
     fn arm(labels: Vec<Expr>, body: Vec<Stmt>) -> SwitchArm {
         SwitchArm {
             labels,
+            capture: None,
+            body: block(body),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A union-switch arm `.variant => |cap| { body }` that captures the
+    /// matched variant's payload (v0.124).
+    fn cap_arm(labels: Vec<Expr>, cap: &str, body: Vec<Stmt>) -> SwitchArm {
+        SwitchArm {
+            labels,
+            capture: Some(cap.to_string()),
             body: block(body),
             span: Span::DUMMY,
         }
@@ -4246,6 +4450,233 @@ mod tests {
         assert!(
             enum_at < struct_at,
             "enum typedef must precede the struct that embeds it:\n{out}"
+        );
+    }
+
+    // -- tagged unions & switch capture (v0.124) ---------------------------
+
+    /// A `StructTable` with `Shape = union(enum) { circle: i32, rect: i64 }` at
+    /// union id 0.
+    fn shape_union_table() -> StructTable {
+        let mut t = StructTable::new();
+        let id = t.intern_union("Shape");
+        t.set_union_variants(
+            id,
+            vec![
+                ("circle".to_string(), Type::I32),
+                ("rect".to_string(), Type::I64),
+            ],
+        );
+        t
+    }
+
+    /// A union construction `Name{ .variant = value }` (reuses the struct-
+    /// literal AST shape, SPEC §20.1).
+    fn union_lit(name: &str, variant: &str, value: Expr) -> Expr {
+        Expr::StructLit {
+            name: name.to_string(),
+            fields: vec![finit(variant, value)],
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn union_typedef_emitted_as_tagged_struct() {
+        // The typedef comes straight off the union table: a tag plus an
+        // anonymous C union of every payload, keyed `data.kd_<variant>`.
+        let structs = shape_union_table();
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains(
+                "typedef struct { int32_t tag; union { int32_t kd_circle; int64_t kd_rect; } data; } kd_union_Shape;"
+            ),
+            "union typedef missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn union_construction_emits_tagged_compound_literal() {
+        // fn make() Shape { return Shape{ .circle = 5 }; }
+        let structs = shape_union_table();
+        let f = func(
+            "make",
+            vec![],
+            "Shape",
+            vec![ret(union_lit("Shape", "circle", int(5)))],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The union return type uses the union typedef.
+        assert!(
+            out.contains("kd_union_Shape kd_make(void)"),
+            "union return type wrong:\n{out}"
+        );
+        // The first variant lowers to `.tag = 0` and the named union member.
+        assert!(
+            out.contains("((kd_union_Shape){ .tag = 0, .data = { .kd_circle = 5 } })"),
+            "union construction lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn union_construction_second_variant_uses_its_tag_and_member() {
+        // fn make() Shape { return Shape{ .rect = 10 }; }  — `.rect` is tag 1.
+        let structs = shape_union_table();
+        let f = func(
+            "make",
+            vec![],
+            "Shape",
+            vec![ret(union_lit("Shape", "rect", int(10)))],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("((kd_union_Shape){ .tag = 1, .data = { .kd_rect = 10 } })"),
+            "second-variant union construction wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn union_switch_dispatches_on_tag_and_binds_capture() {
+        // fn pick(s: Shape) i64 {
+        //     switch (s) {
+        //         .circle => |r| { return r; }
+        //         .rect   => |w| { return w; }
+        //     }
+        // }
+        let structs = shape_union_table();
+        let sw = Stmt::Switch {
+            scrutinee: ident("s"),
+            arms: vec![
+                cap_arm(vec![enum_lit("circle")], "r", vec![ret(ident("r"))]),
+                cap_arm(vec![enum_lit("rect")], "w", vec![ret(ident("w"))]),
+            ],
+            default: None,
+            span: Span::DUMMY,
+        };
+        let f = func("pick", vec![param("s", "Shape")], "i64", vec![sw]);
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // A union-typed param uses the union typedef.
+        assert!(
+            out.contains("kd_union_Shape kd_s"),
+            "union param type wrong:\n{out}"
+        );
+        // The C switch dispatches on the runtime `.tag`.
+        assert!(
+            out.contains("switch ((kd_s).tag) {"),
+            "tag dispatch header missing:\n{out}"
+        );
+        // Variant labels become their 0-based tag index.
+        assert!(out.contains("case 0: {"), "circle tag case missing:\n{out}");
+        assert!(out.contains("case 1: {"), "rect tag case missing:\n{out}");
+        // Each capture binds the matched variant's payload from `.data.kd_<v>`,
+        // typed by that variant's payload (i32 for circle, i64 for rect).
+        assert!(
+            out.contains("int32_t kd_r = (kd_s).data.kd_circle;"),
+            "circle capture binding wrong:\n{out}"
+        );
+        assert!(
+            out.contains("int64_t kd_w = (kd_s).data.kd_rect;"),
+            "rect capture binding wrong:\n{out}"
+        );
+        // Each arm ends with a break.
+        assert!(out.contains("} break;"), "arm break missing:\n{out}");
+        // An exhaustive union switch with no `else` emits no `default:`.
+        assert!(
+            !out.contains("default:"),
+            "exhaustive union switch must not emit a default:\n{out}"
+        );
+    }
+
+    #[test]
+    fn union_switch_else_lowers_to_default() {
+        // fn pick(s: Shape) i64 {
+        //     var r: i64 = 0;
+        //     switch (s) { .circle => |c| { r = c; } else => { r = 9; } }
+        //     return r;
+        // }
+        let structs = shape_union_table();
+        let sw = Stmt::Switch {
+            scrutinee: ident("s"),
+            arms: vec![cap_arm(
+                vec![enum_lit("circle")],
+                "c",
+                vec![assign("r", ident("c"))],
+            )],
+            default: Some(block(vec![assign("r", int(9))])),
+            span: Span::DUMMY,
+        };
+        let f = func(
+            "pick",
+            vec![param("s", "Shape")],
+            "i64",
+            vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "r".to_string(),
+                    ty: Some(ty("i64")),
+                    value: int(0),
+                    span: Span::DUMMY,
+                },
+                sw,
+                ret(ident("r")),
+            ],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("switch ((kd_s).tag) {"),
+            "tag dispatch header missing:\n{out}"
+        );
+        assert!(out.contains("case 0: {"), "circle case missing:\n{out}");
+        assert!(
+            out.contains("int32_t kd_c = (kd_s).data.kd_circle;"),
+            "capture binding missing:\n{out}"
+        );
+        // The source `else` becomes a C `default:`.
+        assert!(out.contains("default: {"), "else must lower to default:\n{out}");
+    }
+
+    #[test]
+    fn union_payload_struct_typedef_emitted_before_union() {
+        // const Wrap = union(enum) { p: Point, n: i32 };
+        // The struct payload typedef must precede the union that embeds it.
+        let mut structs = point_table();
+        let pid = structs.id_of("Point").unwrap();
+        let uid = structs.intern_union("Wrap");
+        structs.set_union_variants(
+            uid,
+            vec![
+                ("p".to_string(), Type::Struct(pid)),
+                ("n".to_string(), Type::I32),
+            ],
+        );
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        let point_at = out
+            .find("} kd_struct_Point;")
+            .expect("Point struct typedef missing");
+        let wrap_at = out
+            .find("} kd_union_Wrap;")
+            .expect("Wrap union typedef missing");
+        assert!(
+            point_at < wrap_at,
+            "payload struct typedef must precede the union that embeds it:\n{out}"
+        );
+        // The union embeds the struct payload by its C name inside `data`.
+        assert!(
+            out.contains("union { kd_struct_Point kd_p; int32_t kd_n; } data; } kd_union_Wrap;"),
+            "union payload members wrong:\n{out}"
         );
     }
 

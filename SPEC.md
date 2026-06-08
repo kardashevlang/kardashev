@@ -795,3 +795,45 @@ switch (<scrutinee>) {
 `cty(Type::Enum(id))` → `StructTable::enum_c_name(id)`. (Because sema proves
 enum switches exhaustive, a `default:` is emitted only when the source has an
 `else`.)
+
+## 20. Tagged unions `union(enum)` + `switch` capture (v0.124)
+
+A tagged union holds one of several typed variants, with a `switch` that
+captures the active payload. v0.124: every variant carries a payload type
+(payload-less cases stay plain enums, §13).
+
+### 20.1 Syntax & AST
+- `pub? const Name = union(enum) { v1: T1, v2: T2, ... };` →
+  `Item::Union(UnionDecl{ variants: Vec<UnionVariant{name, payload}> })`,
+  `Type::Union(id)`.
+- **Construction** reuses `Expr::StructLit`: `Name{ .v1 = e }` — exactly **one**
+  field, naming a variant; `e` coerces to that variant's payload type. Result
+  `Type::Union(id)`.
+- **`switch` over a union**: labels are `.variant` (`Expr::EnumLit`) resolved
+  against the union's variants; an arm may bind the payload with
+  `SwitchArm.capture` (`.v1 => |x| { … }`) — `x` is a local of the variant's
+  payload type within the arm. Exhaustiveness: every variant, or an `else`.
+
+### 20.2 Semantics (`sema`)
+- Pre-pass: intern union decls (`intern_union` + `set_union_variants`),
+  resolving each variant's payload type (duplicate variant → error).
+- `Name{ .v = e }` where `Name` is a union: exactly one field that names a
+  variant (else `E0270`); unknown variant → `E0271`; `e` coerces to the payload
+  type (`E0110`); result `Type::Union(id)`.
+- `switch (u)` where `u: Union(id)`: each label `.v` must be a variant
+  (`E0271`); exhaustiveness as for enums (`E0210`/`else`); a `capture` binds the
+  variant payload type in the arm body; a capture on a non-union switch, or a
+  union switch arm lacking a capture where one is needed, is `E0272`. (An enum
+  or integer switch with a capture → `E0272`.)
+- `type_name(Union(id))` = the union's source name.
+
+### 20.3 Backend (`emit_c`)
+Emit, among the dependency-ordered type defs (a union depends on its payload
+types):
+```c
+typedef struct { int32_t tag; union { <T1 cty> kd_<v1>; <T2 cty> kd_<v2>; ... } data; } kd_union_<Name>;
+```
+Construction `Name{ .v = e }` → `((kd_union_<Name>){ .tag = <idx>, .data = { .kd_<v> = <e> } })`.
+A union `switch` lowers to a C `switch` on `(<u>).tag`; each arm `case <idx>: {`
+begins (when captured) with `<payload cty> kd_<cap> = (<u>).data.kd_<v>;` then
+the arm body, then `break;`. `cty(Type::Union(id))` → `StructTable::union_c_name`.

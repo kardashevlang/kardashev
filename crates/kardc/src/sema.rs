@@ -69,6 +69,12 @@
 //! - `E0252` — too few type arguments for a generic-function call (SPEC §17.2).
 //! - `E0260` — an un-annotated `var`/`const` whose initializer's type cannot be
 //!   inferred without context (a bare `null` / `error.X` / `.Variant`) (§18.2).
+//! - `E0270` — a tagged-union construction `Name{ … }` that does not have
+//!   exactly one variant initializer (SPEC §20.2).
+//! - `E0271` — a union construction field, or a union `switch` label, that does
+//!   not name a variant of the union (SPEC §20.2).
+//! - `E0272` — a payload capture (`|x|`) on a `switch` whose scrutinee is not a
+//!   tagged union (an enum / integer / otherwise un-switchable type) (SPEC §20.2).
 
 use std::collections::{HashMap, HashSet};
 
@@ -186,6 +192,7 @@ impl Checker {
                 format!("!{}", self.type_name(self.structs.error_union_payload(id)))
             }
             Type::Enum(id) => self.structs.enum_get(id).name.clone(),
+            Type::Union(id) => self.structs.union_get(id).name.clone(),
             Type::Array(id) => format!(
                 "[{}]{}",
                 self.structs.array_len(id),
@@ -259,6 +266,43 @@ impl Checker {
                 }
                 self.structs.set_fields(id, fields);
                 declared.insert(s.name.clone());
+            }
+        }
+
+        // Pass 0c (tagged unions, v0.124, SPEC §20.2). Intern every union name
+        // first so a variant payload may reference any union (and so
+        // `resolve_base` recognises union type names from here on) — this also
+        // lets later signatures, consts and locals mention a union type. Then
+        // resolve each variant's payload type. A variant name repeated within
+        // one union is `E0211`.
+        for item in &m.items {
+            if let Item::Union(u) = item {
+                self.structs.intern_union(&u.name);
+            }
+        }
+        for item in &m.items {
+            if let Item::Union(u) = item {
+                let id = match self.structs.union_id_of(&u.name) {
+                    Some(id) => id,
+                    None => continue, // unreachable: interned just above
+                };
+                let mut variants: Vec<(String, Type)> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                for v in &u.variants {
+                    if !seen.insert(v.name.clone()) {
+                        let msg =
+                            format!("duplicate variant `{}` in union `{}`", v.name, u.name);
+                        self.error(v.span, "E0211", msg);
+                        continue;
+                    }
+                    // A variant payload type resolves to a builtin / struct /
+                    // enum / union / composite (`resolve_type` emits `E0100` for
+                    // an unknown name); fall back to `i64` so downstream
+                    // construction / capture checks still see a usable type.
+                    let pty = self.resolve_type(&v.payload).unwrap_or(Type::I64);
+                    variants.push((v.name.clone(), pty));
+                }
+                self.structs.set_union_variants(id, variants);
             }
         }
 
@@ -421,6 +465,8 @@ impl Checker {
                 Item::Struct(s) => self.check_struct_methods(s),
                 // Enums are fully resolved in Pass 0; they have no body to check.
                 Item::Enum(_) => {}
+                // Unions are fully resolved in Pass 0c; they have no body either.
+                Item::Union(_) => {}
             }
         }
     }
@@ -547,12 +593,13 @@ impl Checker {
     }
 
     /// Resolve a bare type *name* (no `?`/`!`/`[N]`/`*`/`[]` wrappers) to a
-    /// builtin, a registered struct, or an enum, without consulting any
-    /// substitution. Returns `None` for an unknown name.
+    /// builtin, a registered struct, an enum, or a tagged union, without
+    /// consulting any substitution. Returns `None` for an unknown name.
     fn resolve_base(&self, name: &str) -> Option<Type> {
         Type::from_name(name)
             .or_else(|| self.structs.id_of(name).map(Type::Struct))
             .or_else(|| self.structs.enum_id_of(name).map(Type::Enum))
+            .or_else(|| self.structs.union_id_of(name).map(Type::Union))
     }
 
     /// Apply a [`TypeExpr`]'s composite wrappers around an already-resolved base
@@ -871,11 +918,21 @@ impl Checker {
         span: Span,
     ) {
         match self.check_expr(scrutinee, None) {
-            Some(Type::Enum(eid)) => self.check_enum_switch(eid, arms, default, span),
-            Some(t) if t.is_int() => self.check_int_switch(t, arms, default, span),
+            // A tagged-union scrutinee is the only kind whose arms may bind a
+            // payload capture (SPEC §20.2); enum/integer arms with a capture are
+            // rejected (`E0272`) below.
+            Some(Type::Union(uid)) => self.check_union_switch(uid, arms, default, span),
+            Some(Type::Enum(eid)) => {
+                self.reject_arm_captures(arms);
+                self.check_enum_switch(eid, arms, default, span)
+            }
+            Some(t) if t.is_int() => {
+                self.reject_arm_captures(arms);
+                self.check_int_switch(t, arms, default, span)
+            }
             Some(t) => {
                 let msg = format!(
-                    "`switch` scrutinee must be an enum or integer type, found `{}`",
+                    "`switch` scrutinee must be an enum, integer or union type, found `{}`",
                     self.type_name(t)
                 );
                 self.error(scrutinee.span(), "E0213", msg);
@@ -886,6 +943,22 @@ impl Checker {
             }
             // The scrutinee itself errored; just check the arm bodies + else.
             None => self.check_switch_blocks(arms, default),
+        }
+    }
+
+    /// Emit `E0272` for any arm declaring a payload capture (`|x|`) on a
+    /// non-union `switch`: only a tagged-union switch binds a payload (SPEC
+    /// §20.2). Enum / integer arms with a capture are otherwise checked normally
+    /// (the capture name is simply not bound).
+    fn reject_arm_captures(&mut self, arms: &[SwitchArm]) {
+        for arm in arms {
+            if arm.capture.is_some() {
+                self.error(
+                    arm.span,
+                    "E0272",
+                    "a payload capture `|x|` is only valid in a `switch` over a tagged union",
+                );
+            }
         }
     }
 
@@ -979,6 +1052,125 @@ impl Checker {
                 "E0214",
                 "non-exhaustive `switch` on an integer type: an integer `switch` requires an `else` arm",
             );
+        }
+    }
+
+    /// Check a `switch` whose scrutinee is the tagged union `uid` (SPEC §20.2).
+    /// Each label is a variant pattern (`E0271` if it names no variant); a
+    /// variant repeated across arms is `E0211`; the arms must cover every
+    /// variant or include an `else` (`E0210`). When an arm declares a payload
+    /// capture, it is bound — as an immutable local of the matched variant's
+    /// payload type — within that arm's body scope. (An arm without a capture is
+    /// fine: the payload is simply not bound.) For a multi-label arm the capture
+    /// binds the *first* matched variant's payload type.
+    fn check_union_switch(
+        &mut self,
+        uid: u32,
+        arms: &[SwitchArm],
+        default: &Option<Block>,
+        span: Span,
+    ) {
+        let mut covered: HashSet<usize> = HashSet::new();
+        for arm in arms {
+            // The payload type a capture in this arm binds (the first matched
+            // variant's payload).
+            let mut payload: Option<Type> = None;
+            for label in &arm.labels {
+                if let Some(idx) = self.switch_union_label_index(uid, label) {
+                    if !covered.insert(idx) {
+                        let uname = self.structs.union_get(uid).name.clone();
+                        let vname = self.structs.union_get(uid).variants[idx].0.clone();
+                        let msg = format!("duplicate `switch` label `{}.{}`", uname, vname);
+                        self.error(label.span(), "E0211", msg);
+                    }
+                    if payload.is_none() {
+                        payload = Some(self.structs.union_get(uid).variants[idx].1);
+                    }
+                }
+            }
+            // Check the arm body in a fresh scope that (when the arm captures)
+            // binds the payload as an immutable local; `check_block` then nests
+            // its own scope inside, so the capture is visible throughout.
+            self.scopes.push(HashMap::new());
+            if let Some(cap) = &arm.capture {
+                let pty = payload.unwrap_or(Type::I64);
+                self.define(cap, pty, true);
+            }
+            self.check_block(&arm.body);
+            self.scopes.pop();
+        }
+        if let Some(d) = default {
+            // An `else` makes the `switch` exhaustive regardless of coverage.
+            self.check_block(d);
+        } else {
+            let total = self.structs.union_get(uid).variants.len();
+            let missing: Vec<String> = (0..total)
+                .filter(|i| !covered.contains(i))
+                .map(|i| self.structs.union_get(uid).variants[i].0.clone())
+                .collect();
+            if !missing.is_empty() {
+                let uname = self.structs.union_get(uid).name.clone();
+                let msg = format!(
+                    "non-exhaustive `switch` on union `{}`: missing variant(s) `{}`; \
+                     cover them or add an `else` arm",
+                    uname,
+                    missing.join("`, `")
+                );
+                self.error(span, "E0210", msg);
+            }
+        }
+    }
+
+    /// Resolve one label of a union `switch` to the 0-based index of the variant
+    /// it names, or `None` (after emitting a diagnostic). Accepts the
+    /// unqualified `.V` ([`Expr::EnumLit`]) form — and, for parity with enums,
+    /// the qualified `Union.V` ([`Expr::Field`]) form. A label that is not a
+    /// variant of `uid` is `E0271`.
+    fn switch_union_label_index(&mut self, uid: u32, label: &Expr) -> Option<usize> {
+        match label {
+            Expr::EnumLit { variant, span } => {
+                match self.structs.union_get(uid).variant_index(variant) {
+                    Some(i) => Some(i),
+                    None => {
+                        let uname = self.structs.union_get(uid).name.clone();
+                        let msg = format!("union `{}` has no variant `{}`", uname, variant);
+                        self.error(*span, "E0271", msg);
+                        None
+                    }
+                }
+            }
+            Expr::Field { base, field, span } => {
+                if let Expr::Ident { name, .. } = base.as_ref() {
+                    if self.structs.union_id_of(name) == Some(uid) {
+                        return match self.structs.union_get(uid).variant_index(field) {
+                            Some(i) => Some(i),
+                            None => {
+                                let uname = self.structs.union_get(uid).name.clone();
+                                let msg =
+                                    format!("union `{}` has no variant `{}`", uname, field);
+                                self.error(*span, "E0271", msg);
+                                None
+                            }
+                        };
+                    }
+                }
+                let uname = self.structs.union_get(uid).name.clone();
+                let msg = format!(
+                    "`switch` label on union `{}` must be a variant (`.V` or `{}.V`)",
+                    uname, uname
+                );
+                self.error(*span, "E0271", msg);
+                None
+            }
+            _ => {
+                let uname = self.structs.union_get(uid).name.clone();
+                let msg = format!(
+                    "`switch` label on union `{}` must be a variant (`.V` or `{}.V`)",
+                    uname, uname
+                );
+                self.error(label.span(), "E0271", msg);
+                None
+            }
         }
     }
 
@@ -2007,6 +2199,12 @@ impl Checker {
 
     /// Type-check a struct literal `Name{ .f = e, ... }`.
     fn check_struct_lit(&mut self, name: &str, inits: &[FieldInit], span: Span) -> Option<Type> {
+        // A `Name{ … }` literal whose name is a tagged union is *union
+        // construction* (SPEC §20.2), not a struct literal — it reuses
+        // `Expr::StructLit` but means "build this variant".
+        if let Some(uid) = self.structs.union_id_of(name) {
+            return self.check_union_lit(name, inits, span, uid);
+        }
         let id = match self.structs.id_of(name) {
             Some(id) => id,
             None => {
@@ -2058,6 +2256,66 @@ impl Checker {
             }
         }
         Some(Type::Struct(id))
+    }
+
+    /// Type-check a tagged-union construction `Name{ .v = e }` (SPEC §20.2).
+    /// Exactly **one** initializer is required (`E0270`); it must name a variant
+    /// of the union (`E0271`); its value must coerce to that variant's payload
+    /// type (`E0110`). The result type is always `Type::Union(uid)` — even on a
+    /// recoverable error — so a typed target avoids cascading diagnostics.
+    fn check_union_lit(
+        &mut self,
+        name: &str,
+        inits: &[FieldInit],
+        span: Span,
+        uid: u32,
+    ) -> Option<Type> {
+        if inits.len() != 1 {
+            let msg = format!(
+                "union `{}` is constructed with exactly one variant initializer, found {}",
+                name,
+                inits.len()
+            );
+            self.error(span, "E0270", msg);
+            // Still check each initializer's value to surface its own errors,
+            // typing it against the named variant's payload when one matches.
+            for fi in inits {
+                match self.structs.union_get(uid).payload_type(&fi.name) {
+                    Some(p) => {
+                        self.check_coerce(&fi.value, p);
+                    }
+                    None => {
+                        self.check_expr(&fi.value, None);
+                    }
+                }
+            }
+            return Some(Type::Union(uid));
+        }
+        let fi = &inits[0];
+        // The single initializer must name a variant of the union (`E0271`).
+        let payload = match self.structs.union_get(uid).payload_type(&fi.name) {
+            Some(p) => p,
+            None => {
+                let msg = format!("union `{}` has no variant `{}`", name, fi.name);
+                self.error(fi.span, "E0271", msg);
+                self.check_expr(&fi.value, None);
+                return Some(Type::Union(uid));
+            }
+        };
+        // The value must coerce to the variant's payload type (`E0110`).
+        if let Some(vt) = self.check_coerce(&fi.value, payload) {
+            if vt != payload {
+                let msg = format!(
+                    "union `{}` variant `{}` payload type mismatch: expected `{}`, found `{}`",
+                    name,
+                    fi.name,
+                    self.type_name(payload),
+                    self.type_name(vt)
+                );
+                self.error(fi.value.span(), "E0110", msg);
+            }
+        }
+        Some(Type::Union(uid))
     }
 
     fn check_unary(
@@ -2715,7 +2973,8 @@ fn needs_inference_context(e: &Expr) -> bool {
 mod tests {
     use super::*;
     use crate::ast::{
-        ConstDecl, EnumDecl, FieldDecl, FieldInit, Func, Param, StructDecl, TestBlock,
+        ConstDecl, EnumDecl, FieldDecl, FieldInit, Func, Param, StructDecl, TestBlock, UnionDecl,
+        UnionVariant,
     };
 
     fn sp() -> Span {
@@ -4271,6 +4530,16 @@ mod tests {
     fn switch_arm(labels: Vec<Expr>, body: Vec<Stmt>) -> SwitchArm {
         SwitchArm {
             labels,
+            capture: None,
+            body: block(body),
+            span: sp(),
+        }
+    }
+    /// A `switch` arm that binds a payload capture `|cap|` (v0.124).
+    fn switch_arm_cap(labels: Vec<Expr>, cap: &str, body: Vec<Stmt>) -> SwitchArm {
+        SwitchArm {
+            labels,
+            capture: Some(cap.into()),
             body: block(body),
             span: sp(),
         }
@@ -6102,5 +6371,351 @@ mod tests {
             vec![let_var_infer("x", ident("bogus"))],
         )];
         assert_eq!(codes(items), vec!["E0100"]);
+    }
+
+    // ---- tagged unions `union(enum)` + capture (v0.124) ------------------
+
+    /// A tagged-union item `const name = union(enum) { v: T, ... };` (v0.124).
+    fn union_item(name: &str, variants: Vec<(&str, &str)>) -> Item {
+        Item::Union(UnionDecl {
+            is_pub: false,
+            name: name.into(),
+            variants: variants
+                .into_iter()
+                .map(|(n, t)| UnionVariant {
+                    name: n.into(),
+                    payload: te(t),
+                    span: sp(),
+                })
+                .collect(),
+            span: sp(),
+        })
+    }
+    /// The canonical `Num = union(enum) { i: i32, b: bool }` of the union tests.
+    fn num_union() -> Item {
+        union_item("Num", vec![("i", "i32"), ("b", "bool")])
+    }
+
+    #[test]
+    fn union_construction_typed_and_interned() {
+        // const Num = union(enum) { i: i32, b: bool };
+        // fn make() Num { return Num{ .i = 5 }; }
+        let items = vec![
+            num_union(),
+            func(
+                "make",
+                vec![],
+                "Num",
+                vec![ret(Some(struct_lit("Num", vec![("i", int(5))])))],
+            ),
+        ];
+        let m = Module { items };
+        let table = check(&m).expect("union program should type-check");
+        let id = table.union_id_of("Num").expect("Num should be registered");
+        assert_eq!(table.union_get(id).variant_index("i"), Some(0));
+        assert_eq!(table.union_get(id).variant_index("b"), Some(1));
+        assert_eq!(table.union_get(id).payload_type("i"), Some(Type::I32));
+        assert_eq!(table.union_get(id).payload_type("b"), Some(Type::Bool));
+    }
+
+    #[test]
+    fn union_construction_wrong_field_count_is_e0270() {
+        // Num{ .i = 1, .b = true } — two initializers, not exactly one.
+        let items = vec![
+            num_union(),
+            func(
+                "make",
+                vec![],
+                "Num",
+                vec![ret(Some(struct_lit(
+                    "Num",
+                    vec![("i", int(1)), ("b", boolean(true))],
+                )))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0270"));
+    }
+
+    #[test]
+    fn union_construction_zero_fields_is_e0270() {
+        // Num{} — zero initializers, not exactly one.
+        let items = vec![
+            num_union(),
+            func(
+                "make",
+                vec![],
+                "Num",
+                vec![ret(Some(struct_lit("Num", vec![])))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0270"));
+    }
+
+    #[test]
+    fn union_construction_unknown_variant_is_e0271() {
+        // Num{ .z = 1 } — `z` is not a variant of `Num`.
+        let items = vec![
+            num_union(),
+            func(
+                "make",
+                vec![],
+                "Num",
+                vec![ret(Some(struct_lit("Num", vec![("z", int(1))])))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0271"));
+    }
+
+    #[test]
+    fn union_construction_payload_mismatch_is_e0110() {
+        // Num{ .i = true } — variant `i` carries `i32`, value is `bool`.
+        let items = vec![
+            num_union(),
+            func(
+                "make",
+                vec![],
+                "Num",
+                vec![ret(Some(struct_lit("Num", vec![("i", boolean(true))])))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn union_switch_exhaustive_with_capture_binds_payload() {
+        // fn f(n: Num) void {
+        //     switch (n) {
+        //         .i => |x| { var w: i32 = x; },
+        //         .b => |y| { var z: bool = y; },
+        //     }
+        // }
+        // Binding the captures to their declared payload types proves each
+        // capture is typed as the matched variant's payload (else E0110).
+        let items = vec![
+            num_union(),
+            func(
+                "f",
+                vec![param("n", "Num")],
+                "void",
+                vec![switch_stmt(
+                    ident("n"),
+                    vec![
+                        switch_arm_cap(
+                            vec![enum_lit("i")],
+                            "x",
+                            vec![let_var("w", "i32", ident("x"))],
+                        ),
+                        switch_arm_cap(
+                            vec![enum_lit("b")],
+                            "y",
+                            vec![let_var("z", "bool", ident("y"))],
+                        ),
+                    ],
+                    None,
+                )],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn union_switch_capture_type_is_the_variant_payload() {
+        // Using the `i32` payload `x` where a `bool` is expected is `E0110` —
+        // confirming the capture is the variant payload type, not something else.
+        // switch (n) { .i => |x| { var w: bool = x; }, .b => {} }
+        let items = vec![
+            num_union(),
+            func(
+                "f",
+                vec![param("n", "Num")],
+                "void",
+                vec![switch_stmt(
+                    ident("n"),
+                    vec![
+                        switch_arm_cap(
+                            vec![enum_lit("i")],
+                            "x",
+                            vec![let_var("w", "bool", ident("x"))],
+                        ),
+                        switch_arm(vec![enum_lit("b")], vec![]),
+                    ],
+                    None,
+                )],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn union_switch_arm_without_capture_ok() {
+        // A union switch arm need not capture; the payload is simply not bound.
+        // switch (n) { .i => {}, .b => {} }
+        let items = vec![
+            num_union(),
+            func(
+                "f",
+                vec![param("n", "Num")],
+                "void",
+                vec![switch_stmt(
+                    ident("n"),
+                    vec![
+                        switch_arm(vec![enum_lit("i")], vec![]),
+                        switch_arm(vec![enum_lit("b")], vec![]),
+                    ],
+                    None,
+                )],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn union_switch_with_else_is_exhaustive() {
+        // switch (n) { .i => |x| { var w: i32 = x; }, else => {} }
+        let items = vec![
+            num_union(),
+            func(
+                "f",
+                vec![param("n", "Num")],
+                "void",
+                vec![switch_stmt(
+                    ident("n"),
+                    vec![switch_arm_cap(
+                        vec![enum_lit("i")],
+                        "x",
+                        vec![let_var("w", "i32", ident("x"))],
+                    )],
+                    Some(vec![]),
+                )],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn union_switch_missing_variant_is_e0210() {
+        // switch (n) { .i => |x| {} } — missing `.b`, no `else`.
+        let items = vec![
+            num_union(),
+            func(
+                "f",
+                vec![param("n", "Num")],
+                "void",
+                vec![switch_stmt(
+                    ident("n"),
+                    vec![switch_arm_cap(vec![enum_lit("i")], "x", vec![])],
+                    None,
+                )],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0210"));
+    }
+
+    #[test]
+    fn union_switch_unknown_variant_label_is_e0271() {
+        // switch (n) { .i => {}, .z => {}, else => {} } — `.z` is no variant.
+        let items = vec![
+            num_union(),
+            func(
+                "f",
+                vec![param("n", "Num")],
+                "void",
+                vec![switch_stmt(
+                    ident("n"),
+                    vec![
+                        switch_arm(vec![enum_lit("i")], vec![]),
+                        switch_arm(vec![enum_lit("z")], vec![]),
+                    ],
+                    Some(vec![]),
+                )],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0271"));
+    }
+
+    #[test]
+    fn capture_on_enum_switch_is_e0272() {
+        // A payload capture on an *enum* switch is invalid (E0272).
+        // switch (c) { .Red => |x| {}, .Green => {}, .Blue => {} }
+        let items = vec![
+            color_enum(),
+            func(
+                "classify",
+                vec![param("c", "Color")],
+                "void",
+                vec![switch_stmt(
+                    ident("c"),
+                    vec![
+                        switch_arm_cap(vec![enum_lit("Red")], "x", vec![]),
+                        switch_arm(vec![enum_lit("Green")], vec![]),
+                        switch_arm(vec![enum_lit("Blue")], vec![]),
+                    ],
+                    None,
+                )],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0272"));
+    }
+
+    #[test]
+    fn capture_on_int_switch_is_e0272() {
+        // A payload capture on an *integer* switch is invalid (E0272).
+        // switch (n) { 0 => |x| {}, else => {} }
+        let items = vec![func(
+            "f",
+            vec![param("n", "i32")],
+            "void",
+            vec![switch_stmt(
+                ident("n"),
+                vec![switch_arm_cap(vec![int(0)], "x", vec![])],
+                Some(vec![]),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0272"));
+    }
+
+    #[test]
+    fn union_variant_with_struct_payload_ok() {
+        // const Point = struct { x: i32, y: i32 };
+        // const Shape = union(enum) { p: Point, n: i32 };
+        // fn make() Shape { return Shape{ .p = Point{ .x = 1, .y = 2 } }; }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32"), ("y", "i32")]),
+            union_item("Shape", vec![("p", "Point"), ("n", "i32")]),
+            func(
+                "make",
+                vec![],
+                "Shape",
+                vec![ret(Some(struct_lit(
+                    "Shape",
+                    vec![(
+                        "p",
+                        struct_lit("Point", vec![("x", int(1)), ("y", int(2))]),
+                    )],
+                )))],
+            ),
+        ];
+        let m = Module { items };
+        let table = check(&m).expect("union-with-struct-payload should type-check");
+        let pid = table.id_of("Point").unwrap();
+        let sid = table.union_id_of("Shape").unwrap();
+        assert_eq!(
+            table.union_get(sid).payload_type("p"),
+            Some(Type::Struct(pid))
+        );
+    }
+
+    #[test]
+    fn duplicate_union_variant_is_e0211() {
+        // const Bad = union(enum) { i: i32, i: bool };
+        let items = vec![union_item("Bad", vec![("i", "i32"), ("i", "bool")])];
+        assert!(codes(items).contains(&"E0211"));
+    }
+
+    #[test]
+    fn union_variant_unknown_payload_type_is_e0100() {
+        // const U = union(enum) { x: Nope };  — `Nope` is not a type.
+        let items = vec![union_item("U", vec![("x", "Nope")])];
+        assert!(codes(items).contains(&"E0100"));
     }
 }

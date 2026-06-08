@@ -30,6 +30,12 @@
 //!   unqualified enum literal prints `.Variant`; the qualified form reuses field
 //!   access (`Enum.Variant`). A `switch` prints with each arm `labels => { … }`
 //!   indented one level, arms comma-terminated, an `else` arm last (SPEC §13).
+//! - `const Name = union(enum) { v: T, … };` — a tagged union, one `v: T` per
+//!   line, 4-space indent, trailing comma on each, mirroring the struct form;
+//!   an empty union prints `const Name = union(enum) {};`. Union construction
+//!   reuses the struct-literal form (`Name{ .v = e }`). A `switch` arm that
+//!   binds the matched variant's payload prints `labels => |cap| { … }` (SPEC
+//!   §20).
 //!
 //! ## Idempotence
 //!
@@ -38,7 +44,7 @@
 
 use crate::ast::{
     BinOp, Block, ConstDecl, EnumDecl, Expr, Func, Item, Module, Stmt, StructDecl, SwitchArm,
-    TestBlock, TypeExpr, UnOp,
+    TestBlock, TypeExpr, UnOp, UnionDecl,
 };
 use crate::diag::Diagnostic;
 
@@ -70,6 +76,7 @@ pub fn print_module(module: &Module) -> String {
             Item::Test(t) => p.print_test(t),
             Item::Struct(s) => p.print_struct(s),
             Item::Enum(e) => p.print_enum(e),
+            Item::Union(u) => p.print_union(u),
         }
     }
     p.out
@@ -225,6 +232,40 @@ impl Printer {
         self.out.push_str("};\n");
     }
 
+    /// Print a tagged-union declaration (SPEC §20). Mirrors the struct printer:
+    /// one `    variant: PayloadType,` per line with a 4-space indent and a
+    /// trailing comma on every variant, wrapped in `union(enum) { … };`. A
+    /// variant-less union — which the grammar never produces, since every
+    /// `union(enum)` variant carries a payload — collapses to
+    /// `const Name = union(enum) {};` on a single line, matching the empty
+    /// struct/enum forms and keeping the printer total. A `pub` union keeps its
+    /// leading `pub`.
+    fn print_union(&mut self, u: &UnionDecl) {
+        self.write_indent();
+        if u.is_pub {
+            self.out.push_str("pub ");
+        }
+        self.out.push_str("const ");
+        self.out.push_str(&u.name);
+        self.out.push_str(" = union(enum) {");
+        if u.variants.is_empty() {
+            self.out.push_str("};\n");
+            return;
+        }
+        self.out.push('\n');
+        self.indent += 1;
+        for variant in &u.variants {
+            self.write_indent();
+            self.out.push_str(&variant.name);
+            self.out.push_str(": ");
+            self.out.push_str(&fmt_type(&variant.payload));
+            self.out.push_str(",\n");
+        }
+        self.indent -= 1;
+        self.write_indent();
+        self.out.push_str("};\n");
+    }
+
     fn print_test(&mut self, t: &TestBlock) {
         self.write_indent();
         self.out.push_str("test ");
@@ -351,13 +392,16 @@ impl Printer {
         }
     }
 
-    /// Print a `switch` statement (SPEC §13). The header is
+    /// Print a `switch` statement (SPEC §13/§20). The header is
     /// `switch (<scrutinee>) {`; each arm is printed one indent deeper as
     /// `<labels> => {` (labels joined with `, `) followed by its body and a
-    /// closing `},`. The optional `else` arm prints last as `else => { … },`.
-    /// Every arm — the `else` included — ends with a trailing comma (the parser
-    /// accepts a trailing comma after a `}` block), which keeps the canonical
-    /// form uniform and idempotent.
+    /// closing `},`. A tagged-union arm that binds the matched variant's payload
+    /// (`SwitchArm.capture = Some(name)`, SPEC §20) prints the capture between
+    /// the arrow and the block — `<labels> => |<name>| {`. The optional `else`
+    /// arm prints last as `else => { … },` (it never carries a capture). Every
+    /// arm — the `else` included — ends with a trailing comma (the parser accepts
+    /// a trailing comma after a `}` block), which keeps the canonical form
+    /// uniform and idempotent.
     fn print_switch(&mut self, scrutinee: &Expr, arms: &[SwitchArm], default: &Option<Block>) {
         self.write_indent();
         self.out.push_str("switch (");
@@ -372,7 +416,14 @@ impl Printer {
                 }
                 self.out.push_str(&fmt_expr(label));
             }
-            self.out.push_str(" => {\n");
+            match &arm.capture {
+                Some(cap) => {
+                    self.out.push_str(" => |");
+                    self.out.push_str(cap);
+                    self.out.push_str("| {\n");
+                }
+                None => self.out.push_str(" => {\n"),
+            }
             self.print_block_body(&arm.body);
             self.write_indent();
             self.out.push_str("},\n");
@@ -829,7 +880,7 @@ fn escape_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{FieldDecl, FieldInit, Param, TypeExpr};
+    use crate::ast::{FieldDecl, FieldInit, Param, TypeExpr, UnionVariant};
     use crate::span::Span;
 
     const D: Span = Span::DUMMY;
@@ -2005,6 +2056,18 @@ mod tests {
     fn arm(labels: Vec<Expr>, body: Vec<Stmt>) -> SwitchArm {
         SwitchArm {
             labels,
+            capture: None,
+            body: Block { stmts: body, span: D },
+            span: D,
+        }
+    }
+
+    /// A tagged-union switch arm `labels => |cap| { … }` (SPEC §20): like
+    /// [`arm`], but binds the matched variant's payload via `capture`.
+    fn arm_capture(labels: Vec<Expr>, capture: &str, body: Vec<Stmt>) -> SwitchArm {
+        SwitchArm {
+            labels,
+            capture: Some(capture.to_string()),
             body: Block { stmts: body, span: D },
             span: D,
         }
@@ -2212,6 +2275,173 @@ mod tests {
             "            print(n);\n",
             "        },\n",
             "        else => {\n",
+            "        },\n",
+            "    }\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        assert_eq!(print_module(&m), printed);
+    }
+
+    // ----- tagged unions & capture (v0.124) --------------------------------
+
+    /// A union variant `name: PayloadType` (SPEC §20).
+    fn union_variant(name: &str, payload: &str) -> UnionVariant {
+        UnionVariant {
+            name: name.to_string(),
+            payload: ty(payload),
+            span: D,
+        }
+    }
+
+    #[test]
+    fn union_decl_canonical_form() {
+        // One `variant: Type,` per line, 4-space indent, trailing comma on each,
+        // `};` to close — mirroring the struct form. A `pub` union keeps `pub`.
+        let m = Module {
+            items: vec![Item::Union(UnionDecl {
+                is_pub: true,
+                name: "Value".to_string(),
+                variants: vec![union_variant("int", "i64"), union_variant("flag", "bool")],
+                span: D,
+            })],
+        };
+        let expected = "pub const Value = union(enum) {\n    int: i64,\n    flag: bool,\n};\n";
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn empty_union_decl_is_single_line() {
+        // A variant-less union collapses to a single line, like an empty
+        // struct/enum. (The grammar never produces one, but the printer stays
+        // total and idempotent.)
+        let m = Module {
+            items: vec![Item::Union(UnionDecl {
+                is_pub: false,
+                name: "Empty".to_string(),
+                variants: vec![],
+                span: D,
+            })],
+        };
+        assert_eq!(print_module(&m), "const Empty = union(enum) {};\n");
+    }
+
+    #[test]
+    fn union_construction_reuses_struct_literal() {
+        // Construction `Name{ .v = e }` is an ordinary `Expr::StructLit` (SPEC
+        // §20.1): exactly one field naming a variant. No special printing.
+        let lit = Expr::StructLit {
+            name: "Value".to_string(),
+            fields: vec![field_init("int", int(5))],
+            span: D,
+        };
+        assert_eq!(fmt_expr(&lit), "Value{ .int = 5 }");
+    }
+
+    #[test]
+    fn switch_with_capture_arm_round_trips() {
+        // A tagged-union `switch`: each arm binds the matched variant's payload
+        // with `=> |cap| {`. Arms are one indent deep, comma-terminated. A union
+        // switch covering every variant needs no `else` arm (`default = None`).
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![Param {
+                    name: "v".to_string(),
+                    ty: ty("Value"),
+                    is_comptime: false,
+                    span: D,
+                }],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::Switch {
+                        scrutinee: ident("v"),
+                        arms: vec![
+                            arm_capture(
+                                vec![enum_lit("int")],
+                                "x",
+                                vec![call_stmt("print", vec![ident("x")])],
+                            ),
+                            arm_capture(
+                                vec![enum_lit("flag")],
+                                "b",
+                                vec![call_stmt("print", vec![int(0)])],
+                            ),
+                        ],
+                        default: None,
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f(v: Value) void {\n",
+            "    switch (v) {\n",
+            "        .int => |x| {\n",
+            "            print(x);\n",
+            "        },\n",
+            "        .flag => |b| {\n",
+            "            print(0);\n",
+            "        },\n",
+            "    }\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn switch_capture_and_non_capture_arms_mix() {
+        // A capture arm and a plain `else` arm in the same switch: the capture
+        // arm prints `=> |cap| {`, the `else` (which never captures) prints
+        // `else => {` as before.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "g".to_string(),
+                params: vec![Param {
+                    name: "v".to_string(),
+                    ty: ty("Value"),
+                    is_comptime: false,
+                    span: D,
+                }],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::Switch {
+                        scrutinee: ident("v"),
+                        arms: vec![arm_capture(
+                            vec![enum_lit("int")],
+                            "x",
+                            vec![call_stmt("print", vec![ident("x")])],
+                        )],
+                        default: Some(Block {
+                            stmts: vec![call_stmt("print", vec![int(0)])],
+                            span: D,
+                        }),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn g(v: Value) void {\n",
+            "    switch (v) {\n",
+            "        .int => |x| {\n",
+            "            print(x);\n",
+            "        },\n",
+            "        else => {\n",
+            "            print(0);\n",
             "        },\n",
             "    }\n",
             "}\n",
