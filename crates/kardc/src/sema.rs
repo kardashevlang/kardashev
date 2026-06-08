@@ -75,6 +75,8 @@
 //!   not name a variant of the union (SPEC §20.2).
 //! - `E0272` — a payload capture (`|x|`) on a `switch` whose scrutinee is not a
 //!   tagged union (an enum / integer / otherwise un-switchable type) (SPEC §20.2).
+//! - `E0280` — an optional `if` capture (`if (cond) |v| { … }`) whose condition
+//!   is not an optional (`?T`) (SPEC §21.1).
 
 use std::collections::{HashMap, HashSet};
 
@@ -847,14 +849,57 @@ impl Checker {
                 }
             },
             Stmt::If {
-                cond, then, els, ..
-            } => {
-                self.check_condition(cond, "if");
-                self.check_block(then);
-                if let Some(els) = els {
-                    self.check_stmt(els);
+                cond,
+                capture,
+                then,
+                els,
+                ..
+            } => match capture {
+                // Optional `if` capture (SPEC §21.1): `if (opt) |v| { then } else
+                // { els }`. The condition must be an optional `?T` (else `E0280`);
+                // `v` binds the unwrapped `T` as an immutable local inside `then`;
+                // `els` runs (with **no** binding) when the optional is null.
+                Some(name) => {
+                    let inner = match self.check_expr(cond, None) {
+                        Some(Type::Optional(id)) => self.structs.optional_inner(id),
+                        Some(other) => {
+                            let msg = format!(
+                                "`if` capture `|{}|` requires an optional (`?T`) condition, \
+                                 found `{}`",
+                                name,
+                                self.type_name(other)
+                            );
+                            self.error(cond.span(), "E0280", msg);
+                            // Fall back to `i64` so the then-block still checks
+                            // (avoids a cascade of unknown-name errors on `name`).
+                            Type::I64
+                        }
+                        // The condition itself errored; bind a fallback so the
+                        // then-block still checks.
+                        None => Type::I64,
+                    };
+                    // Bind the capture in a scope wrapping `then`; `check_block`
+                    // nests its own scope inside, so the binding is visible
+                    // throughout the then-block — and only there.
+                    self.scopes.push(HashMap::new());
+                    self.define(name, inner, true);
+                    self.check_block(then);
+                    self.scopes.pop();
+                    // `els` is checked outside that scope: it never sees `name`.
+                    if let Some(els) = els {
+                        self.check_stmt(els);
+                    }
                 }
-            }
+                // Plain `if (cond) { … }` (no capture): unchanged — the condition
+                // must be `bool` (SPEC §3).
+                None => {
+                    self.check_condition(cond, "if");
+                    self.check_block(then);
+                    if let Some(els) = els {
+                        self.check_stmt(els);
+                    }
+                }
+            },
             Stmt::While {
                 cond, cont, body, ..
             } => {
@@ -878,6 +923,13 @@ impl Checker {
                 }
             }
             Stmt::Defer { stmt, .. } => {
+                self.check_stmt(stmt);
+            }
+            // `errdefer stmt;` (SPEC §21.2): the deferred statement is checked
+            // exactly like a `defer`'s — same scope / loop-depth treatment. It is
+            // accepted in any function (it simply never fires in one that never
+            // returns an error); the error-only firing is a backend concern.
+            Stmt::ErrDefer { stmt, .. } => {
                 self.check_stmt(stmt);
             }
             Stmt::Block(b) => {
@@ -3206,6 +3258,24 @@ mod tests {
             methods: Vec::new(),
             span: sp(),
         })
+    }
+    /// `if (cond) |cap| { then } [else { els }]` — an optional-capture `if`
+    /// (v0.125, SPEC §21.1). `els` (when `Some`) becomes an `else { … }` block.
+    fn if_capture(cond: Expr, cap: &str, then: Vec<Stmt>, els: Option<Vec<Stmt>>) -> Stmt {
+        Stmt::If {
+            cond,
+            capture: Some(cap.into()),
+            then: block(then),
+            els: els.map(|s| Box::new(Stmt::Block(block(s)))),
+            span: sp(),
+        }
+    }
+    /// `errdefer stmt;` (v0.125, SPEC §21.2).
+    fn errdefer_stmt(stmt: Stmt) -> Stmt {
+        Stmt::ErrDefer {
+            stmt: Box::new(stmt),
+            span: sp(),
+        }
     }
     fn int(v: i64) -> Expr {
         Expr::Int { value: v, span: sp() }
@@ -5753,6 +5823,7 @@ mod tests {
             vec![
                 Stmt::If {
                     cond: bin(BinOp::Gt, ident("a"), ident("b")),
+                    capture: None,
                     then: block(vec![ret(Some(ident("a")))]),
                     els: None,
                     span: sp(),
@@ -6716,6 +6787,132 @@ mod tests {
     fn union_variant_unknown_payload_type_is_e0100() {
         // const U = union(enum) { x: Nope };  — `Nope` is not a type.
         let items = vec![union_item("U", vec![("x", "Nope")])];
+        assert!(codes(items).contains(&"E0100"));
+    }
+
+    // ---- optional `if` capture + `errdefer` (v0.125, SPEC §21) ------------
+
+    #[test]
+    fn if_capture_binds_unwrapped_value_as_inner_type() {
+        // fn f(o: ?i32) void { if (o) |v| { var x: i32 = v + 1; print(x); } }
+        // `v` is the unwrapped `i32`, so `v + 1` is `i32` and assigns to `x: i32`.
+        let items = vec![func(
+            "f",
+            vec![param_opt("o", "i32")],
+            "void",
+            vec![if_capture(
+                ident("o"),
+                "v",
+                vec![
+                    let_var("x", "i32", bin(BinOp::Add, ident("v"), int(1))),
+                    Stmt::Expr(call("print", vec![ident("x")])),
+                ],
+                None,
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn if_capture_value_is_returnable_as_inner_type() {
+        // fn f(o: ?i32) i32 { if (o) |v| { return v; } return 0; }
+        // The captured `v` (an `i32`) matches the `i32` return type.
+        let items = vec![func(
+            "f",
+            vec![param_opt("o", "i32")],
+            "i32",
+            vec![
+                if_capture(ident("o"), "v", vec![ret(Some(ident("v")))], None),
+                ret(Some(int(0))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn if_capture_on_non_optional_is_e0280() {
+        // fn f(b: bool) void { if (b) |v| { print(0); } }
+        // A capture requires an optional condition; `bool` is rejected.
+        let items = vec![func(
+            "f",
+            vec![param("b", "bool")],
+            "void",
+            vec![if_capture(
+                ident("b"),
+                "v",
+                vec![Stmt::Expr(call("print", vec![int(0)]))],
+                None,
+            )],
+        )];
+        assert_eq!(codes(items), vec!["E0280"]);
+    }
+
+    #[test]
+    fn if_capture_else_branch_has_no_binding() {
+        // fn f(o: ?i32) i32 {
+        //     if (o) |v| { return v; } else { return v; }  // `v` unknown in else
+        //     return 0;
+        // }
+        // The capture binds only in `then`; using it in `else` is an unknown name.
+        let items = vec![func(
+            "f",
+            vec![param_opt("o", "i32")],
+            "i32",
+            vec![
+                if_capture(
+                    ident("o"),
+                    "v",
+                    vec![ret(Some(ident("v")))],
+                    Some(vec![ret(Some(ident("v")))]),
+                ),
+                ret(Some(int(0))),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0100"));
+    }
+
+    #[test]
+    fn if_capture_does_not_leak_into_following_statements() {
+        // fn f(o: ?i32) void { if (o) |v| { print(v); } print(v); }  // 2nd `v` unknown
+        let items = vec![func(
+            "f",
+            vec![param_opt("o", "i32")],
+            "void",
+            vec![
+                if_capture(
+                    ident("o"),
+                    "v",
+                    vec![Stmt::Expr(call("print", vec![ident("v")]))],
+                    None,
+                ),
+                Stmt::Expr(call("print", vec![ident("v")])),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0100"));
+    }
+
+    #[test]
+    fn errdefer_stmt_type_checks_in_any_function() {
+        // fn f() void { errdefer print(0); }
+        // `errdefer` is accepted in any function and its inner stmt is checked.
+        let items = vec![func(
+            "f",
+            vec![],
+            "void",
+            vec![errdefer_stmt(Stmt::Expr(call("print", vec![int(0)])))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn errdefer_bad_inner_stmt_reports_its_error() {
+        // fn f() void { errdefer print(missing); }  // `missing` unknown => E0100
+        let items = vec![func(
+            "f",
+            vec![],
+            "void",
+            vec![errdefer_stmt(Stmt::Expr(call("print", vec![ident("missing")])))],
+        )];
         assert!(codes(items).contains(&"E0100"));
     }
 }

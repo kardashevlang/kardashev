@@ -526,3 +526,32 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "300\n20\n");
 }
+
+// --- v0.125 optional if-capture + errdefer ---------------------------------
+
+#[test]
+fn if_capture_and_errdefer() {
+    let src = r#"
+fn lookup(found: bool) ?i32 {
+    if (found) { return 42; }
+    return null;
+}
+fn risky(bad: bool) !i32 {
+    errdefer print(911);          // runs only on an error return
+    if (bad) { return error.Boom; }
+    return 7;
+}
+pub fn main() i32 {
+    var a: ?i32 = lookup(true);
+    if (a) |v| { print(v); } else { print(0); }     // 42
+    var b: ?i32 = lookup(false);
+    if (b) |v| { print(v); } else { print(99); }     // 99
+    print(risky(false) catch 0 - 1);                  // 7   (errdefer did NOT fire)
+    print(risky(true) catch 0 - 1);                   // 911 then -1 (errdefer fired)
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "42\n99\n7\n911\n-1\n");
+}

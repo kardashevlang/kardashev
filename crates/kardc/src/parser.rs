@@ -622,6 +622,7 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Kw::Break) => self.parse_break(),
             TokenKind::Keyword(Kw::Continue) => self.parse_continue(),
             TokenKind::Keyword(Kw::Defer) => self.parse_defer(),
+            TokenKind::Keyword(Kw::Errdefer) => self.parse_errdefer(),
             TokenKind::Keyword(Kw::Switch) => self.parse_switch(),
             TokenKind::LBrace => Ok(Stmt::Block(self.parse_block()?)),
             TokenKind::Ident(_) if matches!(self.peek2_kind(), TokenKind::Eq) => self.parse_assign(),
@@ -686,12 +687,34 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse an `if` statement (SPEC §2, §21.1):
+    /// `if "(" cond ")" ("|" IDENT "|")? block ("else" (if_stmt | block))?`.
+    /// After the parenthesised condition an optional `| IDENT |` payload capture
+    /// (`TokenKind::Pipe IDENT Pipe`) selects the optional-`if` form
+    /// `if (opt) |v| { … } else { … }` (SPEC §21.1): `cond` is an optional `?T`,
+    /// and `v` (`capture = Some`) binds the unwrapped `T` inside the then-block.
+    /// A plain `if (cond)` with no pipes leaves `capture = None` and `cond` is a
+    /// `bool` (SPEC §2). That the captured condition is actually an optional, and
+    /// the binding of `v`, are sema concerns (`E0280`), not the parser's. The
+    /// optional `else` is parsed exactly as before — another `if` (an `else if`
+    /// chain) or a block.
     fn parse_if(&mut self) -> PResult<Stmt> {
         let start = self.peek_span();
         self.bump(); // `if`
         self.expect_punct(&TokenKind::LParen, "`(`")?;
         let cond = self.parse_expr()?;
         self.expect_punct(&TokenKind::RParen, "`)`")?;
+        // An optional `| IDENT |` capture (SPEC §21.1) binds the unwrapped
+        // optional payload in the then-block. A bare `if (cond)` (no pipes)
+        // leaves `capture = None` (a plain boolean `if`).
+        let capture = if self.at_punct(&TokenKind::Pipe) {
+            self.bump(); // `|`
+            let (cap, _) = self.expect_ident()?;
+            self.expect_punct(&TokenKind::Pipe, "`|`")?;
+            Some(cap)
+        } else {
+            None
+        };
         let then = self.parse_block()?;
         let mut end = then.span;
         let els = if self.at_kw(Kw::Else) {
@@ -708,6 +731,7 @@ impl<'a> Parser<'a> {
         };
         Ok(Stmt::If {
             cond,
+            capture,
             then,
             els,
             span: start.merge(end),
@@ -776,6 +800,25 @@ impl<'a> Parser<'a> {
         let inner = self.parse_stmt()?;
         let span = start.merge(inner.span());
         Ok(Stmt::Defer {
+            stmt: Box::new(inner),
+            span,
+        })
+    }
+
+    /// Parse an `errdefer stmt;` statement (SPEC §21.2): like `defer`, it
+    /// registers a single following statement to run on scope exit, but only on
+    /// **error-return** paths (a `try` propagation or `return error.X`), not on
+    /// normal exit. Parsing mirrors [`Parser::parse_defer`] exactly — the
+    /// deferred body is one ordinary statement (a `print(x);` expression
+    /// statement, a `{ … }` block, etc.) — and yields [`Stmt::ErrDefer`]. Which
+    /// exit edges fire it is an emit concern (SPEC §4.4 / §21.2); sema checks the
+    /// inner statement like a `defer`'s.
+    fn parse_errdefer(&mut self) -> PResult<Stmt> {
+        let start = self.peek_span();
+        self.bump(); // `errdefer`
+        let inner = self.parse_stmt()?;
+        let span = start.merge(inner.span());
+        Ok(Stmt::ErrDefer {
             stmt: Box::new(inner),
             span,
         })
@@ -1658,6 +1701,150 @@ mod tests {
                 other => panic!("expected deferred print() call, got {:?}", other),
             },
             other => panic!("expected defer, got {:?}", other),
+        }
+    }
+
+    /// Parse the statements `stmt_kinds` by wrapping them in
+    /// `fn f() void { <stmt_kinds> }` and returning the function body's
+    /// statements. (v0.125 `if`-capture / `errdefer` statement tests.)
+    fn body_stmts(stmt_kinds: Vec<TokenKind>) -> Vec<Stmt> {
+        let mut kinds = vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+        ];
+        kinds.extend(stmt_kinds);
+        kinds.push(TokenKind::RBrace);
+        let m = parse(&toks(kinds)).expect("should parse");
+        match m.items.into_iter().next() {
+            Some(Item::Func(f)) => f.body.stmts,
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn if_optional_capture() {
+        // fn f() void { if (opt) |v| { } }
+        let stmts = body_stmts(vec![
+            TokenKind::Keyword(Kw::If),
+            TokenKind::LParen,
+            id("opt"),
+            TokenKind::RParen,
+            TokenKind::Pipe,
+            id("v"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]);
+        match &stmts[0] {
+            Stmt::If {
+                cond,
+                capture,
+                els,
+                ..
+            } => {
+                assert_eq!(capture.as_deref(), Some("v"));
+                assert!(matches!(cond, Expr::Ident { .. }));
+                assert!(els.is_none(), "no else clause");
+            }
+            other => panic!("expected if with capture, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn if_optional_capture_with_else() {
+        // fn f() void { if (opt) |v| { } else { } }
+        let stmts = body_stmts(vec![
+            TokenKind::Keyword(Kw::If),
+            TokenKind::LParen,
+            id("opt"),
+            TokenKind::RParen,
+            TokenKind::Pipe,
+            id("v"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Keyword(Kw::Else),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]);
+        match &stmts[0] {
+            Stmt::If {
+                capture,
+                els: Some(els),
+                ..
+            } => {
+                assert_eq!(capture.as_deref(), Some("v"));
+                assert!(matches!(**els, Stmt::Block(_)), "else is a block");
+            }
+            other => panic!("expected if-capture/else, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plain_if_has_no_capture() {
+        // fn f() void { if (c) { } }  — a bare boolean `if` sets `capture = None`.
+        let stmts = body_stmts(vec![
+            TokenKind::Keyword(Kw::If),
+            TokenKind::LParen,
+            id("c"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]);
+        match &stmts[0] {
+            Stmt::If { capture, .. } => {
+                assert!(capture.is_none(), "a plain `if (c)` has no capture");
+            }
+            other => panic!("expected plain if, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn errdefer_statement() {
+        // fn f() void { errdefer print(1); }
+        let stmts = body_stmts(vec![
+            TokenKind::Keyword(Kw::Errdefer),
+            id("print"),
+            TokenKind::LParen,
+            TokenKind::Int(1),
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+        ]);
+        match &stmts[0] {
+            Stmt::ErrDefer { stmt, .. } => match &**stmt {
+                Stmt::Expr(Expr::Call { callee, .. }) => assert_eq!(callee, "print"),
+                other => panic!("expected errdeferred print() call, got {:?}", other),
+            },
+            other => panic!("expected errdefer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn errdefer_wrapping_a_block() {
+        // fn f() void { errdefer { print(1); } }
+        let stmts = body_stmts(vec![
+            TokenKind::Keyword(Kw::Errdefer),
+            TokenKind::LBrace,
+            id("print"),
+            TokenKind::LParen,
+            TokenKind::Int(1),
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]);
+        match &stmts[0] {
+            Stmt::ErrDefer { stmt, .. } => match &**stmt {
+                Stmt::Block(b) => {
+                    assert_eq!(b.stmts.len(), 1);
+                    assert!(matches!(b.stmts[0], Stmt::Expr(Expr::Call { .. })));
+                }
+                other => panic!("expected errdefer wrapping a block, got {:?}", other),
+            },
+            other => panic!("expected errdefer, got {:?}", other),
         }
     }
 

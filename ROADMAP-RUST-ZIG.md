@@ -138,10 +138,11 @@ items stay in *Beyond*.
 the payload `.circle => |r| …`. Lowered to a tagged C struct
 `{ int32_t tag; union { … } data; }`. Builds on the enum/switch machinery.
 
-### v0.125.0 — Payload captures: `if (opt) |v|`, `catch |e|`, `errdefer`
-The deferred capture sugar: `if (x) |v| { … } else { … }` for optionals,
-`expr catch |e| { … }` for error unions, and `errdefer` joining the LIFO flush
-on error-return paths.
+### v0.125.0 — Payload captures: `if (opt) |v|` + `errdefer` ✅
+`if (x) |v| { … } else { … }` unwraps an optional, binding the value; `errdefer`
+joins the LIFO flush but runs only on error-return edges (`try` propagation /
+`return error.X`). `catch |e|` (the capturing error handler) is deferred to a
+later version — the non-capturing `expr catch default` (§12) remains.
 
 ### v0.126.0 — Multi-file modules (`@import`)
 `const m = @import("util.ks");` then `m.func(…)` / `m.Type`. The compiler
