@@ -152,21 +152,24 @@ v0.126 is `#include`-style: bare-name access, `pub` not yet enforced across
 modules, no `m.member` qualified access (all deferred to a later namespacing
 pass).
 
-### v0.127.0 — Generic structs / type-returning functions
-`fn List(comptime T: type) type { return struct { … }; }` — comptime functions
-that return `struct` types, monomorphised. Unlocks generic containers.
+(Reordered by tractability / risk; the XL generic-structs work sits late.)
 
-### v0.128.0 — Standard prelude: `ArrayList(T)`
+### v0.127.0 — Strings: `[]u8` literals as values ✅
+String literals evaluate to `[]u8` slices (over static bytes), with length /
+indexing / sub-slicing (via the slice machinery) and `print` for strings.
+Reuses slices, so no new type.
+
+### v0.128.0 — `comptime` value params
+`comptime n: usize` parameters — array-size generics (`fn zeros(comptime n:
+usize) [n]i32`), monomorphised per concrete value, extending v0.120.
+
+### v0.129.0 — Generic structs / type-returning functions
+`fn List(comptime T: type) type { return struct { … }; }` — comptime functions
+that return `struct` types, monomorphised. Unlocks generic containers. (XL.)
+
+### v0.130.0 — Standard prelude: `ArrayList(T)`
 A growable list built on the `Allocator` + generic structs (`append`, `get`,
 `len`, `deinit`) — the first piece of an allocator-based std.
-
-### v0.129.0 — Strings: `[]const u8` + string literals as values
-String literals evaluate to `[]const u8` slices; basic length/index/compare;
-`print` for strings.
-
-### v0.130.0 — `comptime` value params + `inline` loops
-`comptime n: usize` parameters (array-size generics) and `inline while/for`
-(compile-time-unrolled), rounding out comptime.
 
 ### Beyond (Arc 3+, each multi-session)
 **Bundled cross-compilation sysroots** (Zig's "cross-compile anything out of the

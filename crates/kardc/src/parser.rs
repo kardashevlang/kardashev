@@ -1268,6 +1268,19 @@ impl<'a> Parser<'a> {
                     span: tok.span,
                 })
             }
+            TokenKind::Str(value) => {
+                // A string literal `"…"` in expression position is an
+                // `Expr::StrLit` of type `[]u8` (SPEC §23.1). The `Str` token
+                // already carries the decoded (unescaped) contents, so we just
+                // move them into the node. (The `test "name" { … }` block name
+                // consumes a `Str` directly in `parse_test` and never reaches
+                // here, so test names are not string-literal expressions.)
+                self.bump();
+                Ok(Expr::StrLit {
+                    value,
+                    span: tok.span,
+                })
+            }
             TokenKind::Keyword(Kw::True) => {
                 self.bump();
                 Ok(Expr::Bool {
@@ -1613,6 +1626,144 @@ mod tests {
                     }
                     other => panic!("expected expect(true) call, got {:?}", other),
                 }
+            }
+            other => panic!("expected test, got {:?}", other),
+        }
+    }
+
+    /// `var s = "hello";` — the initializer parses as an `Expr::StrLit`
+    /// (SPEC §23.1) carrying the decoded contents.
+    #[test]
+    fn str_lit_in_var_init() {
+        // fn f() void { var s = "hello"; }
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Var),
+            id("s"),
+            TokenKind::Eq,
+            TokenKind::Str("hello".to_string()),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        let body = match &m.items[0] {
+            Item::Func(f) => &f.body,
+            other => panic!("expected func, got {:?}", other),
+        };
+        match &body.stmts[0] {
+            Stmt::Let {
+                is_const: false,
+                name,
+                ty: None,
+                value: Expr::StrLit { value, .. },
+                ..
+            } => {
+                assert_eq!(name, "s");
+                assert_eq!(value, "hello");
+            }
+            other => panic!("expected `var s = \"hello\";`, got {:?}", other),
+        }
+    }
+
+    /// `print("hi")` — a string literal passed as a call argument is a `StrLit`.
+    #[test]
+    fn str_lit_call_arg() {
+        // fn f() void { print("hi"); }
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            id("print"),
+            TokenKind::LParen,
+            TokenKind::Str("hi".to_string()),
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        let body = match &m.items[0] {
+            Item::Func(f) => &f.body,
+            other => panic!("expected func, got {:?}", other),
+        };
+        match &body.stmts[0] {
+            Stmt::Expr(Expr::Call { callee, args, .. }) => {
+                assert_eq!(callee, "print");
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    Expr::StrLit { value, .. } => assert_eq!(value, "hi"),
+                    other => panic!("expected StrLit arg, got {:?}", other),
+                }
+            }
+            other => panic!("expected print(\"hi\") call, got {:?}", other),
+        }
+    }
+
+    /// A `Str` inside a larger expression (here `s.len`) parses: the string
+    /// literal is the base operand of a postfix `.len` field access.
+    #[test]
+    fn str_lit_in_larger_expr() {
+        // fn f() void { var n = "abc".len; }
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Var),
+            id("n"),
+            TokenKind::Eq,
+            TokenKind::Str("abc".to_string()),
+            TokenKind::Dot,
+            id("len"),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        let body = match &m.items[0] {
+            Item::Func(f) => &f.body,
+            other => panic!("expected func, got {:?}", other),
+        };
+        match &body.stmts[0] {
+            Stmt::Let {
+                value: Expr::Field { base, field, .. },
+                ..
+            } => {
+                assert_eq!(field, "len");
+                match base.as_ref() {
+                    Expr::StrLit { value, .. } => assert_eq!(value, "abc"),
+                    other => panic!("expected StrLit base, got {:?}", other),
+                }
+            }
+            other => panic!("expected `\"abc\".len` field access, got {:?}", other),
+        }
+    }
+
+    /// `test "name" { … }` still parses with the name as the test's `name`
+    /// field, NOT as a `StrLit` expression: the `Str` is consumed by
+    /// `parse_test`, not by `parse_primary`.
+    #[test]
+    fn test_name_is_not_str_lit_expr() {
+        // test "adds" { }
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Test),
+            TokenKind::Str("adds".to_string()),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Test(t) => {
+                assert_eq!(t.name, "adds");
+                assert!(t.body.stmts.is_empty());
             }
             other => panic!("expected test, got {:?}", other),
         }

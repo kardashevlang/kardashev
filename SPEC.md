@@ -902,3 +902,24 @@ work, as is a package/std path resolver.
 `kard build`/`run`/`test` compile via `compile_program(root_path)` (path-based)
 so `@import`s resolve. The string entry `compile_to_c(src)` remains for
 single-file compiles and errors (`E0290`) on a residual `@import`.
+
+## 23. Strings — `[]u8` literals (v0.127)
+
+A string literal `"…"` is a **value** of type `[]u8` (`Type::Slice(u8)`) — a
+slice over static bytes. (Reuses the slice machinery, so no new type.)
+
+### 23.1 Syntax & semantics
+- `Expr::StrLit{value}` (parser: a `Str` token in expression position). Its type
+  is `[]u8` (`Type::Slice(intern_slice(U8))`).
+- Slice operations apply: `s.len` (byte length, `usize`), `s[i]` → `u8`
+  (bounds-checked), `s[lo..hi]` → `[]u8`.
+- **`print`** accepts a `[]u8` (a string) in addition to integers: it writes the
+  bytes followed by a newline. A `print` of any other type stays an error.
+
+### 23.2 Backend (`emit_c`)
+`StrLit("hi")` → `((kd_slice_uint8_t){ .ptr = (uint8_t *)<C string literal>,
+.len = <byte length> })`, where the C string literal escapes the bytes
+(`\n \t \" \\` and non-printables) and the length is the decoded byte count.
+`print(s)` where `s: []u8` → `{ fwrite((s).ptr, 1, (s).len, stdout); fputc('\n',
+stdout); }` (the integer `print` path is unchanged). `cty`/`type_of_expr` treat
+a `StrLit` as `Type::Slice(u8)`.

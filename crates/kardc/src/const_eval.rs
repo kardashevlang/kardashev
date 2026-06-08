@@ -102,6 +102,11 @@ pub fn eval(expr: &Expr, consts: &HashMap<String, ConstVal>) -> Result<ConstVal,
                 "pointers and slices are not allowed in a constant expression",
             ))
         }
+        Expr::StrLit { span, .. } => Err(Diagnostic::error(
+            *span,
+            "E0130",
+            "string literals are not allowed in a constant expression",
+        )),
     }
 }
 

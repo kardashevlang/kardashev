@@ -141,6 +141,10 @@ struct Emitter<'a> {
     /// Monotonic counter for the `__kd_ifN` temporaries of an optional-`if`
     /// capture (SPEC §21.1). Reset per function/test body.
     if_counter: usize,
+    /// Monotonic counter for the `__kd_strN` temporaries that hoist the slice of
+    /// a `print(s)` where `s: []u8` (a string), so the slice expression is only
+    /// evaluated once before `fwrite` (SPEC §23.2). Reset per function/test body.
+    str_counter: usize,
     /// Pointee types of the `*T` pointer types written in this module's
     /// signatures / locals, in first-seen order (SPEC §15.1). Pointers have no
     /// typedef and the table exposes no `pointers()` iterator, so emit keeps
@@ -179,6 +183,7 @@ impl<'a> Emitter<'a> {
             try_counter: 0,
             idx_counter: 0,
             if_counter: 0,
+            str_counter: 0,
             local_ptr_pointees: Vec::new(),
             subst: HashMap::new(),
             generics: HashMap::new(),
@@ -1042,6 +1047,7 @@ impl<'a> Emitter<'a> {
         self.try_counter = 0;
         self.idx_counter = 0;
         self.if_counter = 0;
+        self.str_counter = 0;
         self.current_ret = self.resolve_ty(&f.ret);
         let ret = self.cty(&f.ret);
         let params = self.format_params(&f.params);
@@ -1832,6 +1838,18 @@ impl<'a> Emitter<'a> {
                     "false".to_string()
                 }
             }
+            // A string literal is a `[]u8` slice over static bytes (SPEC §23.2):
+            // a `kd_slice_uint8_t` compound literal whose `.ptr` is the C string
+            // literal of the (byte-escaped) bytes and whose `.len` is the decoded
+            // byte count. The `kd_slice_uint8_t` typedef is emitted because sema
+            // interned the `[]u8` slice as this expression's type.
+            Expr::StrLit { value, .. } => {
+                format!(
+                    "((kd_slice_uint8_t){{ .ptr = (uint8_t *){}, .len = {} }})",
+                    c_string_literal(value),
+                    value.as_bytes().len()
+                )
+            }
             Expr::Ident { name, .. } => format!("kd_{}", name),
             Expr::Unary { op, expr, .. } => {
                 let inner = self.emit_expr(expr);
@@ -1848,6 +1866,27 @@ impl<'a> Emitter<'a> {
             }
             Expr::Call { callee, args, .. } => {
                 if callee == "print" {
+                    // `print` of a `[]u8` (a string) writes the raw bytes plus a
+                    // newline (SPEC §23.2). The slice is hoisted into a fresh
+                    // `__kd_strN` temporary so the slice expression — which may
+                    // have side effects or be costly — is evaluated exactly once
+                    // before `fwrite`. Any other slice/type keeps the integer
+                    // `kd_print` path below (sema rejects a non-int, non-string
+                    // `print`, so only these two cases reach emit).
+                    if let Some(arg) = args.first() {
+                        if let Some(Type::Slice(sid)) = self.type_of_expr(arg) {
+                            if self.structs.slice_elem(sid) == Type::U8 {
+                                let s = self.emit_expr(arg);
+                                let n = self.str_counter;
+                                self.str_counter += 1;
+                                return format!(
+                                    "{{ kd_slice_uint8_t __kd_str{n} = ({s}); fwrite(__kd_str{n}.ptr, 1, __kd_str{n}.len, stdout); fputc('\\n', stdout); }}",
+                                    n = n,
+                                    s = s
+                                );
+                            }
+                        }
+                    }
                     let a = match args.first() {
                         Some(a) => self.emit_expr(a),
                         None => "0".to_string(),
@@ -2433,6 +2472,15 @@ impl<'a> Emitter<'a> {
         match e {
             Expr::Int { .. } => Some(Type::I64),
             Expr::Bool { .. } => Some(Type::Bool),
+            // A string literal has type `[]u8` (SPEC §23.1). The struct table is
+            // immutable here, but sema already interned the `[]u8` slice (a
+            // `StrLit` exists), so map back to its `Type::Slice(id)` by finding
+            // the interned slice whose element is `u8`.
+            Expr::StrLit { .. } => self
+                .structs
+                .slices()
+                .find(|(_, e)| *e == Type::U8)
+                .map(|(id, _)| Type::Slice(id)),
             Expr::Ident { name, .. } => self.lookup_var_type(name),
             Expr::Unary { op, expr, .. } => match op {
                 UnOp::Not => Some(Type::Bool),
@@ -2749,6 +2797,63 @@ fn c_escape(s: &str) -> String {
             c => o.push(c),
         }
     }
+    o
+}
+
+/// Render the bytes of a Kardashev string as a complete, double-quoted C string
+/// literal (including the surrounding `"`), for the `[]u8` lowering (SPEC §23.2).
+///
+/// A string is `[]u8`, so escaping is byte-exact (not char-based): each byte of
+/// `s` is rendered independently. Backslash and double-quote are escaped; `\n`,
+/// `\t`, `\r` stay readable; every other byte outside the printable ASCII range
+/// (`0x20..=0x7e`) becomes a two-digit `\xNN` hex escape.
+///
+/// A C hex escape consumes *all* following hex digits, so `"\x07f"` would mean
+/// the single byte `0x7f`, not `0x07` then `'f'`. To keep each byte faithful,
+/// when a `\xNN` escape is immediately followed by a byte that renders as a
+/// literal hex digit, the string literal is split with `" "` (adjacent string
+/// literals concatenate in C) so the escape cannot absorb that digit.
+fn c_string_literal(s: &str) -> String {
+    let mut o = String::from("\"");
+    let mut prev_was_hex_escape = false;
+    for &b in s.as_bytes() {
+        match b {
+            b'\\' => {
+                o.push_str("\\\\");
+                prev_was_hex_escape = false;
+            }
+            b'"' => {
+                o.push_str("\\\"");
+                prev_was_hex_escape = false;
+            }
+            b'\n' => {
+                o.push_str("\\n");
+                prev_was_hex_escape = false;
+            }
+            b'\t' => {
+                o.push_str("\\t");
+                prev_was_hex_escape = false;
+            }
+            b'\r' => {
+                o.push_str("\\r");
+                prev_was_hex_escape = false;
+            }
+            0x20..=0x7e => {
+                // A literal hex digit right after a `\xNN` escape would extend
+                // it; break the literal so the escape stops at two digits.
+                if prev_was_hex_escape && b.is_ascii_hexdigit() {
+                    o.push_str("\" \"");
+                }
+                o.push(b as char);
+                prev_was_hex_escape = false;
+            }
+            _ => {
+                o.push_str(&format!("\\x{:02x}", b));
+                prev_was_hex_escape = true;
+            }
+        }
+    }
+    o.push('"');
     o
 }
 
@@ -5911,5 +6016,174 @@ mod tests {
             out.contains("static const bool kd_B = true;"),
             "inferred bool const should be bool:\n{out}"
         );
+    }
+
+    // -- v0.127 strings -----------------------------------------------------
+
+    fn str_lit(value: &str) -> Expr {
+        Expr::StrLit {
+            value: value.to_string(),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A `let s = e;` (inferred type, immutable binding); used to observe the
+    /// lowering + inferred C declaration type of a string-typed initializer.
+    fn let_infer(name: &str, value: Expr) -> Stmt {
+        Stmt::Let {
+            is_const: false,
+            name: name.to_string(),
+            ty: None,
+            value,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A struct table that has interned the `[]u8` slice (exactly what sema does
+    /// the moment a string literal appears), so its typedef + the `Type::Slice`
+    /// id for `[]u8` are available to emission.
+    fn u8_slice_table() -> StructTable {
+        let mut t = StructTable::new();
+        t.intern_slice(Type::U8);
+        t
+    }
+
+    #[test]
+    fn strlit_emits_compound_slice_literal() {
+        // fn f() void { let s = "hi"; }
+        let f = func("f", vec![], "void", vec![let_infer("s", str_lit("hi"))]);
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        // The initializer is a `kd_slice_uint8_t` compound literal over the C
+        // string `"hi"` with the right byte length, and the inferred binding
+        // type is the `[]u8` slice typedef.
+        assert!(
+            out.contains(
+                "kd_slice_uint8_t kd_s = ((kd_slice_uint8_t){ .ptr = (uint8_t *)\"hi\", .len = 2 });"
+            ),
+            "strlit compound slice literal missing:\n{out}"
+        );
+        // The `[]u8` slice typedef was emitted (interned by sema / the table).
+        assert!(
+            out.contains("} kd_slice_uint8_t;"),
+            "[]u8 slice typedef missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn strlit_len_counts_bytes_not_chars() {
+        // A multi-byte UTF-8 string ("é" = 0xc3 0xa9) reports its byte length,
+        // and its non-ASCII bytes are emitted as \xNN escapes.
+        let f = func("f", vec![], "void", vec![let_infer("s", str_lit("é"))]);
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(
+            out.contains(".ptr = (uint8_t *)\"\\xc3\\xa9\", .len = 2"),
+            "byte-exact length / hex escaping wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn print_of_strlit_emits_fwrite_and_newline() {
+        // fn f() void { print("hi"); }
+        let f = func("f", vec![], "void", vec![print(str_lit("hi"))]);
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        // The slice is hoisted to a temp, then written with a trailing newline.
+        assert!(
+            out.contains("kd_slice_uint8_t __kd_str0 = (((kd_slice_uint8_t){ .ptr = (uint8_t *)\"hi\", .len = 2 }));"),
+            "string-print temp hoist missing:\n{out}"
+        );
+        assert!(
+            out.contains("fwrite(__kd_str0.ptr, 1, __kd_str0.len, stdout); fputc('\\n', stdout);"),
+            "string-print fwrite/newline missing:\n{out}"
+        );
+        // The integer print helper must NOT be used for a string argument.
+        assert!(
+            !out.contains("kd_print((long long)"),
+            "string print must not use the integer kd_print path:\n{out}"
+        );
+    }
+
+    #[test]
+    fn print_of_string_local_hoists_via_type_of_expr() {
+        // fn f() void { let s = "hi"; print(s); } — the arg is an `Ident` whose
+        // type (resolved through the scope) is `[]u8`, so it still takes the
+        // string-print path rather than the integer one.
+        let f = func(
+            "f",
+            vec![],
+            "void",
+            vec![let_infer("s", str_lit("hi")), print(ident("s"))],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(
+            out.contains("kd_slice_uint8_t __kd_str0 = (kd_s);"),
+            "string-local print should hoist the slice variable:\n{out}"
+        );
+        assert!(
+            out.contains("fwrite(__kd_str0.ptr, 1, __kd_str0.len, stdout); fputc('\\n', stdout);"),
+            "string-local print fwrite/newline missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn print_of_int_still_uses_kd_print() {
+        // fn f() void { print(7); } — unchanged integer path.
+        let f = func("f", vec![], "void", vec![print(int(7))]);
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(
+            out.contains("kd_print((long long)(7));"),
+            "integer print path changed:\n{out}"
+        );
+        assert!(
+            !out.contains("fwrite("),
+            "integer print must not emit fwrite:\n{out}"
+        );
+    }
+
+    #[test]
+    fn two_string_prints_get_distinct_temps() {
+        // Each `print(s)` uses the monotonic str_counter, so two in one function
+        // get distinct temp names (__kd_str0, __kd_str1).
+        let f = func(
+            "f",
+            vec![],
+            "void",
+            vec![print(str_lit("a")), print(str_lit("b"))],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(out.contains("__kd_str0"), "first temp missing:\n{out}");
+        assert!(out.contains("__kd_str1"), "second temp missing:\n{out}");
+    }
+
+    #[test]
+    fn c_string_literal_escapes_specials_and_breaks_hex() {
+        // Backslash / quote / readable control escapes.
+        assert_eq!(c_string_literal("a\\b\"c\n\t"), "\"a\\\\b\\\"c\\n\\t\"");
+        // A non-printable byte becomes \xNN; a following literal hex digit forces
+        // a string-literal split so the escape isn't extended.
+        // bytes: 0x07, 'f'  ->  "\x07" "f"
+        assert_eq!(c_string_literal("\u{7}f"), "\"\\x07\" \"f\"");
+        // A non-hex-digit char after a \xNN escape needs no split.
+        // bytes: 0x07, 'g'  ->  "\x07g"
+        assert_eq!(c_string_literal("\u{7}g"), "\"\\x07g\"");
+        // The empty string is a valid empty C literal.
+        assert_eq!(c_string_literal(""), "\"\"");
     }
 }

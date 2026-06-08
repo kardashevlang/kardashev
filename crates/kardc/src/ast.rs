@@ -374,6 +374,9 @@ pub enum Expr {
         field: String,
         span: Span,
     },
+    /// A string literal `"…"` as a value of type `[]u8` (v0.127): a slice over
+    /// static bytes. `value` is the decoded (unescaped) contents.
+    StrLit { value: String, span: Span },
     /// A method / associated-function call: `receiver.method(args)`.
     /// `receiver` is either a struct value (method; `self` is prepended) or an
     /// `Ident` naming a struct type (associated call). Resolved in sema.
@@ -464,6 +467,7 @@ impl Expr {
             Expr::EnumLit { span, .. } => *span,
             Expr::ArrayLit { span, .. } => *span,
             Expr::Index { span, .. } => *span,
+            Expr::StrLit { span, .. } => *span,
             Expr::AddrOf { span, .. } => *span,
             Expr::Deref { span, .. } => *span,
             Expr::SliceExpr { span, .. } => *span,

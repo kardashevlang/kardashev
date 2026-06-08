@@ -1570,6 +1570,11 @@ impl Checker {
                 _ => Type::I64,
             }),
             Expr::Bool { .. } => Some(Type::Bool),
+            // A string literal `"…"` is a value of type `[]u8` — a slice over
+            // static bytes (SPEC §23.1). It reuses the slice machinery, so the
+            // interned `[]u8` slice type carries every slice operation already:
+            // `s.len` (`usize`), `s[i]` (`u8`), `s[lo..hi]` (`[]u8`).
+            Expr::StrLit { .. } => Some(Type::Slice(self.structs.intern_slice(Type::U8))),
             Expr::Ident { name, span } => match self.lookup(name) {
                 Some((t, _)) => Some(t),
                 None => {
@@ -2622,9 +2627,15 @@ impl Checker {
                     return Some(Type::Void);
                 }
                 if let Some(t) = self.check_expr(&args[0], None) {
-                    if !t.is_int() {
+                    // `print` accepts an integer or a string — a `[]u8` slice
+                    // (SPEC §23.1). Any other type is rejected.
+                    let is_string = match t {
+                        Type::Slice(id) => self.structs.slice_elem(id) == Type::U8,
+                        _ => false,
+                    };
+                    if !t.is_int() && !is_string {
                         let msg = format!(
-                            "`print` requires an integer argument, found `{}`",
+                            "`print` requires an integer or string (`[]u8`) argument, found `{}`",
                             self.type_name(t)
                         );
                         self.error(args[0].span(), "E0110", msg);
@@ -3179,6 +3190,15 @@ mod tests {
             span: sp(),
         }
     }
+    /// A parameter of slice type: `name: []elem`.
+    fn param_slice(name: &str, elem: &str) -> Param {
+        Param {
+            name: name.into(),
+            ty: te_slice(elem),
+            is_comptime: false,
+            span: sp(),
+        }
+    }
     /// `var name: [len]elem = value;`
     fn let_var_arr(name: &str, elem: &str, len: i64, value: Expr) -> Stmt {
         Stmt::Let {
@@ -3290,6 +3310,13 @@ mod tests {
     }
     fn boolean(v: bool) -> Expr {
         Expr::Bool { value: v, span: sp() }
+    }
+    /// A string literal `"…"` (v0.127); its type is `[]u8`.
+    fn str_lit(s: &str) -> Expr {
+        Expr::StrLit {
+            value: s.into(),
+            span: sp(),
+        }
     }
     fn ident(n: &str) -> Expr {
         Expr::Ident {
@@ -6922,5 +6949,162 @@ mod tests {
             vec![errdefer_stmt(Stmt::Expr(call("print", vec![ident("missing")])))],
         )];
         assert!(codes(items).contains(&"E0100"));
+    }
+
+    // ---- strings (`[]u8` literals, v0.127, SPEC §23) ----------------------
+
+    #[test]
+    fn str_lit_is_slice_of_u8() {
+        // A string literal `"hi"` type-checks to the interned `[]u8` slice type.
+        let mut cx = Checker::new();
+        let t = cx.check_expr(&str_lit("hi"), None);
+        let expected = Type::Slice(cx.structs.intern_slice(Type::U8));
+        assert_eq!(t, Some(expected));
+        // And `type_name` renders it as `[]u8` via the existing slice naming.
+        assert_eq!(cx.type_name(expected), "[]u8");
+    }
+
+    #[test]
+    fn inferred_str_var_is_slice_of_u8() {
+        // fn main() void { var s = "hi"; var t: []u8 = s; }
+        // The inferred `s` must be `[]u8`, so assigning it to a `[]u8` binding
+        // type-checks (and only an `[]u8` would).
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_infer("s", str_lit("hi")),
+                let_var_slice("t", "u8", ident("s")),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn inferred_str_var_is_not_slice_of_i32() {
+        // fn main() void { var s = "hi"; var t: []i32 = s; }  // []u8 != []i32
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_infer("s", str_lit("hi")),
+                let_var_slice("t", "i32", ident("s")),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn print_of_string_literal_ok() {
+        // fn main() void { print("hi"); }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![Stmt::Expr(call("print", vec![str_lit("hi")]))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn print_of_string_var_ok() {
+        // fn main() void { var s = "hi"; print(s); }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_infer("s", str_lit("hi")),
+                Stmt::Expr(call("print", vec![ident("s")])),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn print_of_u8_slice_param_ok() {
+        // fn f(s: []u8) void { print(s); }
+        let items = vec![func(
+            "f",
+            vec![param_slice("s", "u8")],
+            "void",
+            vec![Stmt::Expr(call("print", vec![ident("s")]))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn string_len_is_usize_and_index_is_u8() {
+        // fn main() void { var s = "hi"; var n: usize = s.len; var b: u8 = s[0]; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_infer("s", str_lit("hi")),
+                let_var("n", "usize", field(ident("s"), "len")),
+                let_var("b", "u8", index(ident("s"), int(0))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn string_slice_expr_is_slice_of_u8() {
+        // fn main() void { var s = "hello"; var t: []u8 = s[1..3]; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_infer("s", str_lit("hello")),
+                let_var_slice("t", "u8", slice_expr(ident("s"), int(1), int(3))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn print_of_bool_still_errors() {
+        // fn main() void { print(true); }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![Stmt::Expr(call("print", vec![boolean(true)]))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn print_of_struct_still_errors() {
+        // const P = struct { x: i32 }; fn main() void { print(P{ .x = 1 }); }
+        let items = vec![
+            struct_item("P", vec![("x", "i32")]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![Stmt::Expr(call(
+                    "print",
+                    vec![struct_lit("P", vec![("x", int(1))])],
+                ))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn print_of_non_u8_slice_errors() {
+        // fn f(s: []i32) void { print(s); }  // []i32 is not a valid print arg
+        let items = vec![func(
+            "f",
+            vec![param_slice("s", "i32")],
+            "void",
+            vec![Stmt::Expr(call("print", vec![ident("s")]))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
     }
 }
