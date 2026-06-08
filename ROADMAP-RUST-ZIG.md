@@ -87,9 +87,9 @@ Array types, array literals `[N]T{ … }`, indexing `a[i]` (read + write,
 runtime-bounds-checked, panic on OOB), `a.len`, value semantics. Lowered to a
 by-value C struct wrapper with a bounds-checked accessor.
 
-### v0.118.0 — Pointers `*T` & slices `[]T`
+### v0.118.0 — Pointers `*T` & slices `[]T` ✅
 `&place`, `p.*`, `p.* = e`; slices as `{ ptr, len }` views with `a[i]` / `.len`
-and slicing `a[lo..hi]`.
+and slicing `a[lo..hi]`, bounds-checked. Raw (no lifetime checking).
 
 ### v0.119.0 — The **Allocator** interface + heap
 The explicit `Allocator` (alloc/free); every heap allocation takes an allocator

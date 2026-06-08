@@ -430,17 +430,23 @@ impl Printer {
 
 // ----- types ----------------------------------------------------------------
 
-/// Format a type reference (SPEC §11.1 / §12.1 / §14.1). A fixed-size array
-/// (`TypeExpr.array_len = Some(N)`) prints with a leading `[N]` — e.g. `[3]i32`
-/// — an optional type (`TypeExpr.optional`) prints with a leading `?` — e.g.
-/// `?i32` — an error union (`TypeExpr.error_union`) prints with a leading `!` —
-/// e.g. `!i32` — and a plain type prints as its bare name. The three qualifiers
-/// are mutually exclusive (v0.115: `?` and `!` are never combined; v0.117: `[N]`
-/// is not combined with either), so at most one prefix is emitted. Used wherever
-/// a type appears: params, return types, `var`/`const` annotations and struct
-/// fields.
+/// Format a type reference (SPEC §11.1 / §12.1 / §14.1 / §15). A pointer
+/// (`TypeExpr.pointer`) prints with a leading `*` — e.g. `*i32` — a slice
+/// (`TypeExpr.slice`) with a leading `[]` — e.g. `[]i32` — a fixed-size array
+/// (`TypeExpr.array_len = Some(N)`) with a leading `[N]` — e.g. `[3]i32` — an
+/// optional type (`TypeExpr.optional`) with a leading `?` — e.g. `?i32` — an
+/// error union (`TypeExpr.error_union`) with a leading `!` — e.g. `!i32` — and a
+/// plain type as its bare name. The qualifiers are mutually exclusive (v0.115:
+/// `?` and `!` are never combined; v0.117: `[N]` is not combined with either;
+/// v0.118: `*`/`[]` are not combined with the others), so at most one prefix is
+/// emitted. Used wherever a type appears: params, return types, `var`/`const`
+/// annotations and struct fields.
 fn fmt_type(ty: &TypeExpr) -> String {
-    if let Some(n) = ty.array_len {
+    if ty.pointer {
+        format!("*{}", ty.name)
+    } else if ty.slice {
+        format!("[]{}", ty.name)
+    } else if let Some(n) = ty.array_len {
         format!("[{}]{}", n, ty.name)
     } else if ty.optional {
         format!("?{}", ty.name)
@@ -475,13 +481,17 @@ fn expr_prec(e: &Expr) -> u8 {
         // Both bind tightest (SPEC §14.1).
         | Expr::ArrayLit { .. }
         | Expr::Index { .. }
+        // `expr.*` (deref) and `base[lo..hi]` (slice) are postfix forms and bind
+        // as primaries, like `.?` and `a[i]` (SPEC §15).
+        | Expr::Deref { .. }
+        | Expr::SliceExpr { .. }
         | Expr::Unwrap { .. } => 8,
         Expr::Comptime { .. } => 7,
         // `try expr` is a prefix form (SPEC §12.1), at the same binding power as
-        // the other prefixes (`-`/`!`). v0.115 only ever produces it at a
-        // statement position, so it is rarely a sub-operand; this keeps the
-        // printer total.
-        Expr::Unary { .. } | Expr::Try { .. } => 6,
+        // the other prefixes (`-`/`!`); `&place` (address-of) is likewise a
+        // prefix (SPEC §15.1). v0.115 only ever produces `try` at a statement
+        // position, so it is rarely a sub-operand; this keeps the printer total.
+        Expr::Unary { .. } | Expr::Try { .. } | Expr::AddrOf { .. } => 6,
         Expr::Binary { op, .. } => match op {
             BinOp::Mul | BinOp::Div | BinOp::Rem => 5,
             BinOp::Add | BinOp::Sub => 4,
@@ -702,6 +712,40 @@ fn fmt_expr(e: &Expr) -> String {
                 format!("({})[{}]", fmt_expr(base), fmt_expr(index))
             }
         }
+        // `&place` — address-of an lvalue, yielding `*T` (SPEC §15.1). `&` is a
+        // prefix; the place is an lvalue (an `Ident`, a field chain, an index or
+        // a `Deref`), all of which bind as primaries/postfix and so print bare.
+        // Anything looser is parenthesised to keep the printer total and
+        // idempotent; the parser never produces such a place.
+        Expr::AddrOf { place, .. } => {
+            if expr_prec(place) >= 8 {
+                format!("&{}", fmt_expr(place))
+            } else {
+                format!("&({})", fmt_expr(place))
+            }
+        }
+        // `expr.*` — postfix pointer dereference (SPEC §15.1). Like the `.?`
+        // unwrap it binds as a primary, so a non-primary/non-postfix operand
+        // (e.g. an `orelse`) is parenthesised to stay total and idempotent.
+        Expr::Deref { expr, .. } => {
+            if expr_prec(expr) >= 8 {
+                format!("{}.*", fmt_expr(expr))
+            } else {
+                format!("({}).*", fmt_expr(expr))
+            }
+        }
+        // `base[lo..hi]` — slice an array (or slice), yielding `[]T` (SPEC §15.2).
+        // Postfix, like indexing: a base that is not itself primary/postfix is
+        // parenthesised; the bounds are full expressions and print bare, joined
+        // by `..` inside the brackets.
+        Expr::SliceExpr { base, lo, hi, .. } => {
+            let b = if expr_prec(base) >= 8 {
+                fmt_expr(base)
+            } else {
+                format!("({})", fmt_expr(base))
+            };
+            format!("{}[{}..{}]", b, fmt_expr(lo), fmt_expr(hi))
+        }
         // `try expr` — statement-level error-union propagation (SPEC §12.1). The
         // operand stands at a value position, so a primary/postfix operand
         // prints bare (`try parse(s)`) while anything looser is parenthesised
@@ -778,6 +822,8 @@ mod tests {
             optional: false,
             error_union: false,
             array_len: None,
+            pointer: false,
+            slice: false,
             span: D,
         }
     }
@@ -789,6 +835,8 @@ mod tests {
             optional: true,
             error_union: false,
             array_len: None,
+            pointer: false,
+            slice: false,
             span: D,
         }
     }
@@ -800,6 +848,8 @@ mod tests {
             optional: false,
             error_union: true,
             array_len: None,
+            pointer: false,
+            slice: false,
             span: D,
         }
     }
@@ -812,6 +862,34 @@ mod tests {
             optional: false,
             error_union: false,
             array_len: Some(len),
+            pointer: false,
+            slice: false,
+            span: D,
+        }
+    }
+
+    /// A pointer type `*name` (`TypeExpr.pointer = true`; v0.118).
+    fn ptr_ty(name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: false,
+            error_union: false,
+            array_len: None,
+            pointer: true,
+            slice: false,
+            span: D,
+        }
+    }
+
+    /// A slice type `[]name` (`TypeExpr.slice = true`; v0.118).
+    fn slice_ty(name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: false,
+            error_union: false,
+            array_len: None,
+            pointer: false,
+            slice: true,
             span: D,
         }
     }
@@ -2289,6 +2367,251 @@ mod tests {
             "    a[0] = 5;\n",
             "    print(a[1]);\n",
             "    print(a.len);\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    // ----- pointers & slices (v0.118) --------------------------------------
+
+    /// `&place` — address-of an lvalue (SPEC §15.1).
+    fn addr_of(place: Expr) -> Expr {
+        Expr::AddrOf {
+            place: Box::new(place),
+            span: D,
+        }
+    }
+
+    /// `expr.*` — pointer dereference (SPEC §15.1).
+    fn deref(expr: Expr) -> Expr {
+        Expr::Deref {
+            expr: Box::new(expr),
+            span: D,
+        }
+    }
+
+    /// `base[lo..hi]` — slice an array or slice (SPEC §15.2).
+    fn slice_expr(base: Expr, lo: Expr, hi: Expr) -> Expr {
+        Expr::SliceExpr {
+            base: Box::new(base),
+            lo: Box::new(lo),
+            hi: Box::new(hi),
+            span: D,
+        }
+    }
+
+    #[test]
+    fn pointer_type_prints_with_leading_star() {
+        // The pointer helper renders `*T`; the other type forms are unaffected,
+        // and `*` is never combined with `?`/`!`/`[N]`/`[]`.
+        assert_eq!(fmt_type(&ptr_ty("i32")), "*i32");
+        // A pointer to a struct prints the struct name after the `*`.
+        assert_eq!(fmt_type(&ptr_ty("Point")), "*Point");
+        // The other type forms are unchanged.
+        assert_eq!(fmt_type(&ty("i32")), "i32");
+        assert_eq!(fmt_type(&opt_ty("i32")), "?i32");
+        assert_eq!(fmt_type(&err_ty("i32")), "!i32");
+        assert_eq!(fmt_type(&arr_ty("i32", 3)), "[3]i32");
+    }
+
+    #[test]
+    fn slice_type_prints_with_leading_brackets() {
+        // The slice helper renders `[]T`; a slice of a struct prints the struct
+        // name after the `[]`. The other type forms are unaffected.
+        assert_eq!(fmt_type(&slice_ty("i32")), "[]i32");
+        assert_eq!(fmt_type(&slice_ty("Point")), "[]Point");
+        assert_eq!(fmt_type(&ty("i32")), "i32");
+        assert_eq!(fmt_type(&arr_ty("i32", 3)), "[3]i32");
+    }
+
+    #[test]
+    fn pointer_and_slice_type_in_every_position() {
+        // `*T` and `[]T` must print wherever a type appears: a struct field, a
+        // function's params and return, and a `var`/`const` local annotation.
+        let strukt = Item::Struct(StructDecl {
+            is_pub: false,
+            name: "View".to_string(),
+            fields: vec![
+                FieldDecl {
+                    name: "p".to_string(),
+                    ty: ptr_ty("i32"),
+                    span: D,
+                },
+                FieldDecl {
+                    name: "s".to_string(),
+                    ty: slice_ty("i32"),
+                    span: D,
+                },
+            ],
+            methods: vec![],
+            span: D,
+        });
+        let func = Item::Func(Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![Param {
+                name: "p".to_string(),
+                ty: ptr_ty("i32"),
+                span: D,
+            }],
+            ret: slice_ty("i32"),
+            body: Block {
+                stmts: vec![Stmt::Let {
+                    is_const: false,
+                    name: "q".to_string(),
+                    ty: ptr_ty("i32"),
+                    value: addr_of(ident("x")),
+                    span: D,
+                }],
+                span: D,
+            },
+            span: D,
+        });
+        let m = Module {
+            items: vec![strukt, func],
+        };
+        let expected = concat!(
+            "const View = struct {\n",
+            "    p: *i32,\n",
+            "    s: []i32,\n",
+            "};\n",
+            "\n",
+            "fn f(p: *i32) []i32 {\n",
+            "    var q: *i32 = &x;\n",
+            "}\n",
+        );
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn addr_of_deref_and_slice_expr_print() {
+        // `&x` — address-of a simple lvalue prints bare.
+        assert_eq!(fmt_expr(&addr_of(ident("x"))), "&x");
+
+        // `&a.b` — the place is a field chain (a primary), so no parentheses.
+        assert_eq!(fmt_expr(&addr_of(field(ident("a"), "b"))), "&a.b");
+
+        // `&a[0]` — the place is an index (postfix), so no parentheses.
+        assert_eq!(fmt_expr(&addr_of(index(ident("a"), int(0)))), "&a[0]");
+
+        // `p.*` — postfix deref of a simple pointer.
+        assert_eq!(fmt_expr(&deref(ident("p"))), "p.*");
+
+        // `&p.*` — address-of a deref place (the place binds as a primary).
+        assert_eq!(fmt_expr(&addr_of(deref(ident("p")))), "&p.*");
+
+        // `s[lo..hi]` — slice with identifier bounds.
+        assert_eq!(
+            fmt_expr(&slice_expr(ident("s"), ident("lo"), ident("hi"))),
+            "s[lo..hi]"
+        );
+
+        // The bounds are full expressions and print bare inside the brackets.
+        assert_eq!(
+            fmt_expr(&slice_expr(
+                ident("a"),
+                int(0),
+                bin(BinOp::Sub, ident("n"), int(1)),
+            )),
+            "a[0..n - 1]"
+        );
+
+        // `s[i]` (index) on a slice and `s.len` (field) reuse the existing
+        // postfix forms.
+        assert_eq!(fmt_expr(&index(ident("s"), ident("i"))), "s[i]");
+        assert_eq!(fmt_expr(&field(ident("s"), "len")), "s.len");
+    }
+
+    #[test]
+    fn pointer_and_slice_postfix_parenthesisation() {
+        // `.*` binds tightest, so chained deref needs no inner parens: `p.*.*`.
+        assert_eq!(fmt_expr(&deref(deref(ident("p")))), "p.*.*");
+
+        // A deref of a non-primary operand (an `orelse`) parenthesises it.
+        assert_eq!(
+            fmt_expr(&deref(orelse(ident("a"), ident("b")))),
+            "(a orelse b).*"
+        );
+
+        // Address-of a non-lvalue (a binary) is parenthesised to stay total.
+        assert_eq!(
+            fmt_expr(&addr_of(bin(BinOp::Add, ident("a"), ident("b")))),
+            "&(a + b)"
+        );
+
+        // Slicing a non-primary base parenthesises it.
+        assert_eq!(
+            fmt_expr(&slice_expr(orelse(ident("a"), ident("b")), int(0), int(1))),
+            "(a orelse b)[0..1]"
+        );
+
+        // Field access off a deref needs no parentheses (both primaries): `p.*.f`.
+        assert_eq!(fmt_expr(&field(deref(ident("p")), "f")), "p.*.f");
+    }
+
+    #[test]
+    fn pointer_and_slice_sample_is_idempotent() {
+        // A whole function exercising a pointer (`&` address-of and `.*` deref,
+        // including a deref-assign as a `FieldAssign` with a `Deref` place) and a
+        // slice (`a[lo..hi]` slice, `s[i]` index read and `s.len`). The pure
+        // printer is deterministic, so idempotence here is checked as re-printing
+        // the same AST byte-identically (the parser is not involved in this
+        // isolated unit).
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![
+                        Stmt::Let {
+                            is_const: false,
+                            name: "a".to_string(),
+                            ty: arr_ty("i32", 3),
+                            value: array_lit("i32", 3, vec![int(1), int(2), int(3)]),
+                            span: D,
+                        },
+                        Stmt::Let {
+                            is_const: false,
+                            name: "p".to_string(),
+                            ty: ptr_ty("i32"),
+                            value: addr_of(index(ident("a"), int(0))),
+                            span: D,
+                        },
+                        Stmt::FieldAssign {
+                            place: deref(ident("p")),
+                            value: int(9),
+                            span: D,
+                        },
+                        Stmt::Let {
+                            is_const: false,
+                            name: "s".to_string(),
+                            ty: slice_ty("i32"),
+                            value: slice_expr(ident("a"), int(0), int(2)),
+                            span: D,
+                        },
+                        Stmt::Expr(call("print", vec![deref(ident("p"))])),
+                        Stmt::Expr(call("print", vec![index(ident("s"), int(1))])),
+                        Stmt::Expr(call("print", vec![field(ident("s"), "len")])),
+                    ],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f() void {\n",
+            "    var a: [3]i32 = [3]i32{ 1, 2, 3 };\n",
+            "    var p: *i32 = &a[0];\n",
+            "    p.* = 9;\n",
+            "    var s: []i32 = a[0..2];\n",
+            "    print(p.*);\n",
+            "    print(s[1]);\n",
+            "    print(s.len);\n",
             "}\n",
         );
         let printed = print_module(&m);

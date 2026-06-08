@@ -18,6 +18,20 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.118.0] — Pointers `*T` & slices `[]T`
+
+### Added
+- **Pointers `*T`**: `&place` (address-of an lvalue), `p.*` (dereference), and
+  `p.* = e` (assign through a pointer). Raw — no lifetime checking.
+- **Slices `[]T`**: `{ ptr, len }` views created by slicing an array
+  `a[lo..hi]` (aliasing the backing storage); `s[i]` (bounds-checked), `s[i] =
+  e`, and `s.len`.
+- Type system: `Type::Ptr(id)` / `Type::Slice(id)` + tables; lexer `&` and `..`.
+  Pointers lower to C `T*`; slices to a `{ T* ptr; uintptr_t len; }` struct with
+  a bounds-checked accessor (emitted in dependency order); slice/array bounds
+  violations panic with exit 101. Diagnostics `E0230`–`E0232`.
+- 380 unit + 18 e2e tests; `examples/slices.ks`.
+
 ## [0.117.0] — Fixed-size arrays `[N]T`
 
 ### Added

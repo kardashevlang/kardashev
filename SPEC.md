@@ -567,6 +567,42 @@ index-assign `a[i] = e;` lowers to a bounds-checked block:
 ```
 `cty(Type::Array(id))` → `StructTable::array_c_name(id)`.
 
+## 15. Pointers `*T` & slices `[]T` (v0.118)
+
+Raw single pointers and `{ptr, len}` slice views. Lifetimes are the
+programmer's responsibility (no borrow checking), as for Zig's raw pointers.
+
+### 15.1 Pointers
+- Type `*T`: `TypeExpr.pointer = true` → `Type::Ptr(intern_ptr(T))`.
+- `&place` → `Expr::AddrOf{place}`: `place` must be an lvalue (a `var`, a field
+  chain, an index, or a deref) (`E0231`); result `*T`.
+- `p.*` → `Expr::Deref{expr}`: `expr` must be `*T` (`E0230`); result `T`.
+- `p.* = e` reuses `Stmt::FieldAssign` with a `Deref` place; `e` coerces to `T`.
+- C: `cty(Ptr) = "<T cty>*"`; `&place` → `(&(<place>))`; `p.*` → `(*(<p>))`;
+  deref-assign → `*(<p>) = (<e>);`.
+
+### 15.2 Slices
+- Type `[]T`: `TypeExpr.slice = true` → `Type::Slice(intern_slice(T))`. C:
+  `typedef struct { <T cty> *ptr; uintptr_t len; } kd_slice_<tag>;`.
+- `base[lo..hi]` → `Expr::SliceExpr{base, lo, hi}`: `base` is an **array** (an
+  addressable `var`) or a slice (`E0232`); `lo`,`hi` integers; result `[]T`.
+  Runtime-checked `0 <= lo <= hi <= len` (panic exit 101 otherwise).
+- `s[i]` (`Expr::Index` on a slice) → element `T`, runtime-bounds-checked.
+- `s[i] = e` reuses `Stmt::FieldAssign` with an `Index` place on a slice.
+- `s.len` (`Expr::Field` `len`) → `usize`.
+- C: a slice from an array `a` lowers to `(kd_slice_<tag>){ .ptr = (a).data +
+  <lo>, .len = <hi> - <lo> }` after a bounds check on `lo`/`hi`; from a slice,
+  `.ptr = (base).ptr + <lo>`. `s[i]` read → a bounds-checked accessor
+  `kd_slice_<tag>_get(s, i)` (`if (i<0 || (uint64_t)i>=s.len) panic; return
+  s.ptr[i];`). `s[i] = e` → a bounds-checked block writing `(s).ptr[i] = e`.
+  `s.len` → `(s).len`. Emit slice typedefs + accessors among the
+  dependency-ordered type defs (a slice depends on its element type).
+
+### 15.3 Notes / deferred
+Slices are non-owning views — the backing array must outlive the slice (raw, no
+lifetime check). Many-item pointers `[*]T` and pointer arithmetic beyond
+slicing are deferred.
+
 ### 13.3 Backend (`emit_c`)
 Emit each enum among the dependency-ordered type defs (enums have no
 dependencies):

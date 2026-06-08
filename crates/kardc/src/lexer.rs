@@ -157,7 +157,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diagnostic>> {
             b',' => (TokenKind::Comma, 1),
             b';' => (TokenKind::Semicolon, 1),
             b':' => (TokenKind::Colon, 1),
-            b'.' => (TokenKind::Dot, 1),
+            b'.' => {
+                if next == Some(b'.') {
+                    (TokenKind::DotDot, 2)
+                } else {
+                    (TokenKind::Dot, 1)
+                }
+            }
+            b'&' => (TokenKind::Amp, 1),
             b'+' => (TokenKind::Plus, 1),
             b'-' => (TokenKind::Minus, 1),
             b'*' => (TokenKind::Star, 1),
