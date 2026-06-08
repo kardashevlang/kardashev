@@ -17,13 +17,19 @@
 //! - `while (cond) { … }` / `while (cond) : (cont) { … }`.
 //! - `const NAME: T = expr;` / `var name: T = expr;` / `return expr;`.
 //! - `defer <stmt>`; `test "name" { … }`.
+//! - `const Name = struct { f: T, … };` — one field per line, 4-space indent,
+//!   trailing comma on each; an empty struct prints `const Name = struct {};`.
+//!   Struct literals print `Name{ .f = e, … }` and field access `base.field`
+//!   (SPEC §9).
 //!
 //! ## Idempotence
 //!
 //! Parenthesisation is precedence-driven and minimal, so re-formatting the
 //! canonical output produces byte-identical text.
 
-use crate::ast::{BinOp, Block, ConstDecl, Expr, Func, Item, Module, Stmt, TestBlock, UnOp};
+use crate::ast::{
+    BinOp, Block, ConstDecl, Expr, Func, Item, Module, Stmt, StructDecl, TestBlock, UnOp,
+};
 use crate::diag::Diagnostic;
 
 /// Parse `src` and re-emit it in canonical form.
@@ -52,6 +58,7 @@ pub fn print_module(module: &Module) -> String {
             Item::Func(f) => p.print_func(f),
             Item::Const(c) => p.print_const(c),
             Item::Test(t) => p.print_test(t),
+            Item::Struct(s) => p.print_struct(s),
         }
     }
     p.out
@@ -126,6 +133,35 @@ impl Printer {
         self.out.push_str(";\n");
     }
 
+    /// Print a struct declaration (SPEC §9). One `    field: Type,` per line
+    /// with a trailing comma on every field; an empty struct collapses to
+    /// `const Name = struct {};` on a single line.
+    fn print_struct(&mut self, s: &StructDecl) {
+        self.write_indent();
+        if s.is_pub {
+            self.out.push_str("pub ");
+        }
+        self.out.push_str("const ");
+        self.out.push_str(&s.name);
+        self.out.push_str(" = struct {");
+        if s.fields.is_empty() {
+            self.out.push_str("};\n");
+            return;
+        }
+        self.out.push('\n');
+        self.indent += 1;
+        for field in &s.fields {
+            self.write_indent();
+            self.out.push_str(&field.name);
+            self.out.push_str(": ");
+            self.out.push_str(&field.ty.name);
+            self.out.push_str(",\n");
+        }
+        self.indent -= 1;
+        self.write_indent();
+        self.out.push_str("};\n");
+    }
+
     fn print_test(&mut self, t: &TestBlock) {
         self.write_indent();
         self.out.push_str("test ");
@@ -169,6 +205,13 @@ impl Printer {
             Stmt::Assign { name, value, .. } => {
                 self.write_indent();
                 self.out.push_str(name);
+                self.out.push_str(" = ");
+                self.out.push_str(&fmt_expr(value));
+                self.out.push_str(";\n");
+            }
+            Stmt::FieldAssign { place, value, .. } => {
+                self.write_indent();
+                self.out.push_str(&fmt_expr(place));
                 self.out.push_str(" = ");
                 self.out.push_str(&fmt_expr(value));
                 self.out.push_str(";\n");
@@ -298,7 +341,14 @@ impl Printer {
 /// binds tighter. Mirrors the grammar in SPEC §2.
 fn expr_prec(e: &Expr) -> u8 {
     match e {
-        Expr::Int { .. } | Expr::Bool { .. } | Expr::Ident { .. } | Expr::Call { .. } => 8,
+        // Primaries and postfix forms (calls, struct literals, field access)
+        // bind tightest.
+        Expr::Int { .. }
+        | Expr::Bool { .. }
+        | Expr::Ident { .. }
+        | Expr::Call { .. }
+        | Expr::StructLit { .. }
+        | Expr::Field { .. } => 8,
         Expr::Comptime { .. } => 7,
         Expr::Unary { .. } => 6,
         Expr::Binary { op, .. } => match op {
@@ -390,6 +440,38 @@ fn fmt_expr(e: &Expr) -> String {
                 format!("comptime ({})", fmt_expr(expr))
             }
         }
+        Expr::StructLit { name, fields, .. } => {
+            // `Name{}` when empty, else `Name{ .f = e, .g = e }` with a single
+            // space inside the braces and `, ` between initializers.
+            if fields.is_empty() {
+                return format!("{}{{}}", name);
+            }
+            let mut s = String::new();
+            s.push_str(name);
+            s.push_str("{ ");
+            for (i, init) in fields.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push('.');
+                s.push_str(&init.name);
+                s.push_str(" = ");
+                s.push_str(&fmt_expr(&init.value));
+            }
+            s.push_str(" }");
+            s
+        }
+        Expr::Field { base, field, .. } => {
+            // `base.field` with no spaces. Field access is postfix (binds as a
+            // primary), so a base that is not itself primary/postfix is
+            // parenthesised. The parser never produces such a base, but this
+            // keeps the printer total and idempotent.
+            if expr_prec(base) >= 8 {
+                format!("{}.{}", fmt_expr(base), field)
+            } else {
+                format!("({}).{}", fmt_expr(base), field)
+            }
+        }
     }
 }
 
@@ -431,7 +513,7 @@ fn escape_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Param, TypeExpr};
+    use crate::ast::{FieldDecl, FieldInit, Param, TypeExpr};
     use crate::span::Span;
 
     const D: Span = Span::DUMMY;
@@ -799,5 +881,152 @@ mod tests {
         let b = print_module(&m);
         assert_eq!(a, b);
         assert!(a.ends_with('\n'));
+    }
+
+    // ----- structs (v0.112) -----------------------------------------------
+
+    fn field_decl(name: &str, type_name: &str) -> FieldDecl {
+        FieldDecl {
+            name: name.to_string(),
+            ty: ty(type_name),
+            span: D,
+        }
+    }
+
+    fn field(base: Expr, name: &str) -> Expr {
+        Expr::Field {
+            base: Box::new(base),
+            field: name.to_string(),
+            span: D,
+        }
+    }
+
+    fn field_init(name: &str, value: Expr) -> FieldInit {
+        FieldInit {
+            name: name.to_string(),
+            value,
+            span: D,
+        }
+    }
+
+    #[test]
+    fn struct_decl_canonical_form() {
+        // One field per line, 4-space indent, trailing comma on each, `};` to
+        // close. A `pub` struct keeps its leading `pub`.
+        let m = Module {
+            items: vec![Item::Struct(StructDecl {
+                is_pub: true,
+                name: "Point".to_string(),
+                fields: vec![field_decl("x", "i32"), field_decl("y", "i32")],
+                span: D,
+            })],
+        };
+        let expected = "pub const Point = struct {\n    x: i32,\n    y: i32,\n};\n";
+        assert_eq!(print_module(&m), expected);
+        // Idempotence: re-printing the same AST is byte-identical.
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn empty_struct_decl_is_single_line() {
+        let m = Module {
+            items: vec![Item::Struct(StructDecl {
+                is_pub: false,
+                name: "Empty".to_string(),
+                fields: vec![],
+                span: D,
+            })],
+        };
+        assert_eq!(print_module(&m), "const Empty = struct {};\n");
+    }
+
+    #[test]
+    fn struct_literal_field_access_and_assign() {
+        // A struct decl followed (blank-line separated) by a function that uses
+        // a struct literal, a field assignment chain and a field access.
+        let lit = Expr::StructLit {
+            name: "Point".to_string(),
+            fields: vec![field_init("x", int(1)), field_init("y", int(2))],
+            span: D,
+        };
+        let m = Module {
+            items: vec![
+                Item::Struct(StructDecl {
+                    is_pub: false,
+                    name: "Point".to_string(),
+                    fields: vec![field_decl("x", "i32"), field_decl("y", "i32")],
+                    span: D,
+                }),
+                Item::Func(Func {
+                    is_pub: false,
+                    name: "f".to_string(),
+                    params: vec![],
+                    ret: ty("void"),
+                    body: Block {
+                        stmts: vec![
+                            Stmt::Let {
+                                is_const: false,
+                                name: "p".to_string(),
+                                ty: ty("Point"),
+                                value: lit,
+                                span: D,
+                            },
+                            Stmt::FieldAssign {
+                                place: field(ident("p"), "x"),
+                                value: field(ident("p"), "y"),
+                                span: D,
+                            },
+                            Stmt::Expr(Expr::Call {
+                                callee: "print".to_string(),
+                                args: vec![field(ident("p"), "x")],
+                                span: D,
+                            }),
+                        ],
+                        span: D,
+                    },
+                    span: D,
+                }),
+            ],
+        };
+        let expected = concat!(
+            "const Point = struct {\n",
+            "    x: i32,\n",
+            "    y: i32,\n",
+            "};\n",
+            "\n",
+            "fn f() void {\n",
+            "    var p: Point = Point{ .x = 1, .y = 2 };\n",
+            "    p.x = p.y;\n",
+            "    print(p.x);\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence (as determinism): the pure printer re-prints identically.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn empty_struct_literal_and_field_chains() {
+        // Empty struct literal: `Empty{}`.
+        let empty = Expr::StructLit {
+            name: "Empty".to_string(),
+            fields: vec![],
+            span: D,
+        };
+        assert_eq!(fmt_expr(&empty), "Empty{}");
+
+        // Chained field access prints with no spaces: `a.b.c`.
+        let chain = field(field(ident("a"), "b"), "c");
+        assert_eq!(fmt_expr(&chain), "a.b.c");
+
+        // Field access directly off a struct literal needs no parentheses,
+        // because both bind as primaries: `Point{ .x = 1 }.x`.
+        let lit = Expr::StructLit {
+            name: "Point".to_string(),
+            fields: vec![field_init("x", int(1))],
+            span: D,
+        };
+        assert_eq!(fmt_expr(&field(lit, "x")), "Point{ .x = 1 }.x");
     }
 }

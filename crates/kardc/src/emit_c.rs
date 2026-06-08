@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crate::ast::{Block, Expr, Func, Item, Module, Param, Stmt, TestBlock, TypeExpr, UnOp};
 use crate::const_eval::ConstVal;
-use crate::types::Type;
+use crate::types::{StructTable, Type};
 
 /// What kind of program to emit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,10 +22,13 @@ pub enum EmitMode {
     Test,
 }
 
-/// Lower a validated `module` to C11 source text for `mode`.
-pub fn emit(module: &Module, mode: EmitMode) -> String {
-    let mut em = Emitter::new(mode);
+/// Lower a validated `module` to C11 source text for `mode`. `structs` is the
+/// table produced by semantic analysis; its declaration order drives the C
+/// `typedef` emission and resolves every `Type::Struct(id)` to its C name.
+pub fn emit(module: &Module, structs: &crate::types::StructTable, mode: EmitMode) -> String {
+    let mut em = Emitter::new(mode, structs);
     em.emit_prelude();
+    em.emit_structs();
     em.emit_consts(module);
     em.emit_forward_decls(module);
     em.emit_func_defs(module);
@@ -71,7 +74,7 @@ impl Scope {
     }
 }
 
-struct Emitter {
+struct Emitter<'a> {
     mode: EmitMode,
     out: String,
     indent: usize,
@@ -84,10 +87,12 @@ struct Emitter {
     /// Folded top-level constants, in source order, used to evaluate
     /// `comptime` expressions during emission.
     consts: HashMap<String, ConstVal>,
+    /// The struct table from sema: resolves struct C names and field types.
+    structs: &'a StructTable,
 }
 
-impl Emitter {
-    fn new(mode: EmitMode) -> Emitter {
+impl<'a> Emitter<'a> {
+    fn new(mode: EmitMode, structs: &'a StructTable) -> Emitter<'a> {
         Emitter {
             mode,
             out: String::new(),
@@ -95,6 +100,7 @@ impl Emitter {
             scopes: Vec::new(),
             current_ret: Type::Void,
             consts: HashMap::new(),
+            structs,
         }
     }
 
@@ -124,6 +130,33 @@ impl Emitter {
         self.blank();
     }
 
+    /// Emit one C `typedef struct { ... } kd_struct_<Name>;` per struct, in
+    /// declaration (id) order — exactly the table's iteration order, so a
+    /// field of a previously-declared struct type is always already in scope.
+    /// An empty struct gets a `char _unused;` member so it stays valid C.
+    fn emit_structs(&mut self) {
+        // Copy the reference so the iteration borrows the table (lifetime `'a`)
+        // rather than `self`, leaving `self` free for `cty_of` / `line`.
+        let structs = self.structs;
+        if structs.is_empty() {
+            return;
+        }
+        for (id, info) in structs.iter() {
+            let body = if info.fields.is_empty() {
+                "char _unused;".to_string()
+            } else {
+                info.fields
+                    .iter()
+                    .map(|(fname, fty)| format!("{} kd_{};", self.cty_of(*fty), fname))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let cname = structs.c_name(id);
+            self.line(&format!("typedef struct {{ {} }} {};", body, cname));
+        }
+        self.blank();
+    }
+
     /// Fold each top-level `const` initializer to a literal (C does not treat
     /// `const` objects as constant expressions) and emit it. Constants are
     /// processed in source order so later ones may reference earlier ones.
@@ -134,7 +167,7 @@ impl Emitter {
                 // The module is validated, so this evaluation always succeeds;
                 // if it somehow does not we skip the const rather than panic.
                 if let Ok(v) = crate::const_eval::eval(&c.value, &self.consts) {
-                    let cty = cty(&c.ty);
+                    let cty = self.cty(&c.ty);
                     let lit = const_literal(v);
                     self.line(&format!("static const {} kd_{} = {};", cty, c.name, lit));
                     self.consts.insert(c.name.clone(), v);
@@ -151,7 +184,7 @@ impl Emitter {
         let mut any = false;
         for item in &module.items {
             if let Item::Func(f) = item {
-                let ret = cty(&f.ret);
+                let ret = self.cty(&f.ret);
                 let params = self.format_params(&f.params);
                 self.line(&format!("{} kd_{}({});", ret, f.name, params));
                 any = true;
@@ -177,9 +210,44 @@ impl Emitter {
         } else {
             params
                 .iter()
-                .map(|p| format!("{} kd_{}", cty(&p.ty), p.name))
+                .map(|p| format!("{} kd_{}", self.cty(&p.ty), p.name))
                 .collect::<Vec<_>>()
                 .join(", ")
+        }
+    }
+
+    // -- type spelling ------------------------------------------------------
+
+    /// Resolve a (validated) source type reference to a [`Type`]: a builtin via
+    /// [`Type::from_name`], else a struct via the table, else `Void` for the
+    /// impossible unresolved case so emission can never panic.
+    fn resolve_ty(&self, t: &TypeExpr) -> Type {
+        Type::from_name(&t.name)
+            .or_else(|| self.structs.id_of(&t.name).map(Type::Struct))
+            .unwrap_or(Type::Void)
+    }
+
+    /// The C type spelling for a resolved [`Type`]: a struct resolves through
+    /// the table (`Type::c_name` would panic on it); primitives use their
+    /// builtin C name.
+    fn cty_of(&self, t: Type) -> String {
+        match t {
+            Type::Struct(id) => self.structs.c_name(id),
+            other => other.c_name().to_string(),
+        }
+    }
+
+    /// The C type spelling for a source type reference. Builtins map through
+    /// [`Type::c_name`]; struct names resolve to `kd_struct_<Name>` via the
+    /// table; an unresolvable name (never reached for a validated module) falls
+    /// back to `int64_t`.
+    fn cty(&self, t: &TypeExpr) -> String {
+        if let Some(prim) = Type::from_name(&t.name) {
+            prim.c_name().to_string()
+        } else if let Some(id) = self.structs.id_of(&t.name) {
+            self.structs.c_name(id)
+        } else {
+            "int64_t".to_string()
         }
     }
 
@@ -187,8 +255,8 @@ impl Emitter {
 
     fn emit_func(&mut self, f: &Func) {
         self.scopes.clear();
-        self.current_ret = Type::from_name(&f.ret.name).unwrap_or(Type::Void);
-        let ret = cty(&f.ret);
+        self.current_ret = self.resolve_ty(&f.ret);
+        let ret = self.cty(&f.ret);
         let params = self.format_params(&f.params);
         self.line(&format!("{} kd_{}({}) {{", ret, f.name, params));
         self.emit_block(&f.body, Scope::function());
@@ -249,13 +317,22 @@ impl Emitter {
                 ..
             } => {
                 let es = self.emit_expr(value);
+                let ct = self.cty(ty);
                 let prefix = if *is_const { "const " } else { "" };
-                self.line(&format!("{}{} kd_{} = {};", prefix, cty(ty), name, es));
+                self.line(&format!("{}{} kd_{} = {};", prefix, ct, name, es));
                 false
             }
             Stmt::Assign { name, value, .. } => {
                 let es = self.emit_expr(value);
                 self.line(&format!("kd_{} = {};", name, es));
+                false
+            }
+            Stmt::FieldAssign { place, value, .. } => {
+                // `place` is a field-access chain (`a.b.c`); lowering it yields a
+                // C lvalue, so the assignment is a plain `(<place>) = (<value>);`.
+                let ps = self.emit_expr(place);
+                let es = self.emit_expr(value);
+                self.line(&format!("({}) = ({});", ps, es));
                 false
             }
             Stmt::Expr(e) => self.emit_expr_stmt(e),
@@ -360,7 +437,7 @@ impl Emitter {
                 Some(e) => self.emit_expr(e),
                 None => "0".to_string(),
             };
-            let ret = self.current_ret.c_name();
+            let ret = self.cty_of(self.current_ret);
             self.line(&format!("{} __kd_ret = ({});", ret, es));
             self.flush_all_reversed();
             self.line("return __kd_ret;");
@@ -552,6 +629,35 @@ impl Emitter {
                     Err(_) => self.emit_expr(expr),
                 }
             }
+            Expr::Field { base, field, .. } => {
+                // Field access: `(<base>).kd_<field>`. The base is parenthesized
+                // so a compound base expression (e.g. a literal or another access)
+                // composes correctly: `((p).kd_a).kd_b`.
+                let b = self.emit_expr(base);
+                format!("({}).kd_{}", b, field)
+            }
+            Expr::StructLit { name, fields, .. } => {
+                // C99 compound literal: `((kd_struct_<Name>){ .kd_<f> = <v>, ... })`.
+                let cname = match self.structs.id_of(name) {
+                    Some(id) => self.structs.c_name(id),
+                    // Validated input always resolves; fall back to the canonical
+                    // spelling so emission stays well-formed even if it does not.
+                    None => format!("kd_struct_{}", name),
+                };
+                if fields.is_empty() {
+                    format!("(({}){{0}})", cname)
+                } else {
+                    let inits = fields
+                        .iter()
+                        .map(|fi| {
+                            let v = self.emit_expr(&fi.value);
+                            format!(".kd_{} = {}", fi.name, v)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("(({}){{ {} }})", cname, inits)
+                }
+            }
         }
     }
 
@@ -641,13 +747,6 @@ impl Emitter {
     }
 }
 
-/// The C type used for a (validated) source type reference. Resolves through
-/// [`Type::from_name`]; falls back to `int64_t` for the impossible
-/// unresolved case so emission can never panic.
-fn cty(t: &TypeExpr) -> &'static str {
-    Type::from_name(&t.name).map(|x| x.c_name()).unwrap_or("int64_t")
-}
-
 /// Render a folded constant as a C literal.
 fn const_literal(v: ConstVal) -> String {
     match v {
@@ -681,8 +780,11 @@ fn c_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{BinOp, Block, Expr, Func, Item, Module, Param, Stmt, TestBlock, TypeExpr};
+    use crate::ast::{
+        BinOp, Block, Expr, FieldInit, Func, Item, Module, Param, Stmt, TestBlock, TypeExpr,
+    };
     use crate::span::Span;
+    use crate::types::{StructTable, Type};
 
     fn ty(name: &str) -> TypeExpr {
         TypeExpr {
@@ -764,7 +866,7 @@ mod tests {
         let m = Module {
             items: vec![Item::Func(f)],
         };
-        let out = emit(&m, EmitMode::Program);
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
 
         assert!(
             out.contains("static void kd_print(long long v) { printf(\"%lld\\n\", v); }"),
@@ -809,7 +911,7 @@ mod tests {
         let m = Module {
             items: vec![Item::Func(f)],
         };
-        let out = emit(&m, EmitMode::Program);
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
 
         let temp = out.find("int32_t __kd_ret = (3);").expect("temp missing");
         let p2 = out.find("kd_print((long long)(2));").expect("defer 2 missing");
@@ -840,7 +942,7 @@ mod tests {
         let m = Module {
             items: vec![Item::Test(t)],
         };
-        let out = emit(&m, EmitMode::Test);
+        let out = emit(&m, &StructTable::new(), EmitMode::Test);
 
         assert!(
             out.contains("static int kd_test_0(void) {"),
@@ -901,7 +1003,7 @@ mod tests {
         let m = Module {
             items: vec![Item::Func(f)],
         };
-        let out = emit(&m, EmitMode::Program);
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
 
         assert!(out.contains("while (true) {"), "while missing:\n{out}");
         let cont_call = out.find("kd_print((long long)(9));").expect("cont missing");
@@ -909,6 +1011,272 @@ mod tests {
         assert!(
             cont_call < cont_kw,
             "cont-expr must run before continue:\n{out}"
+        );
+    }
+
+    // -- struct codegen (v0.112) -------------------------------------------
+
+    /// A `StructTable` with `Point { x: i32, y: i32 }` at id 0.
+    fn point_table() -> StructTable {
+        let mut t = StructTable::new();
+        let id = t.intern("Point");
+        t.set_fields(
+            id,
+            vec![("x".to_string(), Type::I32), ("y".to_string(), Type::I32)],
+        );
+        t
+    }
+
+    fn finit(name: &str, value: Expr) -> FieldInit {
+        FieldInit {
+            name: name.to_string(),
+            value,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn field(base: Expr, name: &str) -> Expr {
+        Expr::Field {
+            base: Box::new(base),
+            field: name.to_string(),
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn struct_typedef_emitted_with_prefixed_fields() {
+        // The typedefs come straight off the StructTable, in declaration order.
+        let structs = point_table();
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("typedef struct { int32_t kd_x; int32_t kd_y; } kd_struct_Point;"),
+            "struct typedef missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn empty_struct_typedef_has_unused_member() {
+        let mut structs = StructTable::new();
+        let id = structs.intern("Unit");
+        structs.set_fields(id, vec![]);
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("typedef struct { char _unused; } kd_struct_Unit;"),
+            "empty struct typedef missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn field_access_emits_dot_kd_member() {
+        // fn getx(p: Point) i32 { return p.x; }
+        let structs = point_table();
+        let f = Func {
+            is_pub: false,
+            name: "getx".to_string(),
+            params: vec![Param {
+                name: "p".to_string(),
+                ty: ty("Point"),
+                span: Span::DUMMY,
+            }],
+            ret: ty("i32"),
+            body: block(vec![ret(field(ident("p"), "x"))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // Struct params are by value, typed with the struct's typedef.
+        assert!(
+            out.contains("kd_struct_Point kd_p"),
+            "struct param type wrong:\n{out}"
+        );
+        // Field access lowers to `(<base>).kd_<field>`.
+        assert!(
+            out.contains("(kd_p).kd_x"),
+            "field access lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn struct_literal_emits_compound_literal() {
+        // fn make() Point { return Point{ .x = 1, .y = 2 }; }
+        let structs = point_table();
+        let lit = Expr::StructLit {
+            name: "Point".to_string(),
+            fields: vec![finit("x", int(1)), finit("y", int(2))],
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "make".to_string(),
+            params: vec![],
+            ret: ty("Point"),
+            body: block(vec![ret(lit)]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // A struct return type uses the typedef (by value).
+        assert!(
+            out.contains("kd_struct_Point kd_make("),
+            "struct return type wrong:\n{out}"
+        );
+        // C99 compound literal with kd_-prefixed designators.
+        assert!(
+            out.contains("((kd_struct_Point){ .kd_x = 1, .kd_y = 2 })"),
+            "struct literal lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn empty_struct_literal_uses_zero_init() {
+        let mut structs = StructTable::new();
+        let id = structs.intern("Unit");
+        structs.set_fields(id, vec![]);
+        // fn make() Unit { return Unit{}; }
+        let f = Func {
+            is_pub: false,
+            name: "make".to_string(),
+            params: vec![],
+            ret: ty("Unit"),
+            body: block(vec![ret(Expr::StructLit {
+                name: "Unit".to_string(),
+                fields: vec![],
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("((kd_struct_Unit){0})"),
+            "empty struct literal lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn field_assign_emits_assignment() {
+        // fn set() void { var p: Point = Point{ .x = 0, .y = 0 }; p.x = 5; }
+        let structs = point_table();
+        let lit = Expr::StructLit {
+            name: "Point".to_string(),
+            fields: vec![finit("x", int(0)), finit("y", int(0))],
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "set".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "p".to_string(),
+                    ty: ty("Point"),
+                    value: lit,
+                    span: Span::DUMMY,
+                },
+                Stmt::FieldAssign {
+                    place: field(ident("p"), "x"),
+                    value: int(5),
+                    span: Span::DUMMY,
+                },
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // A struct-typed local uses the typedef.
+        assert!(
+            out.contains("kd_struct_Point kd_p ="),
+            "struct local decl wrong:\n{out}"
+        );
+        // FieldAssign lowers to `(<place>) = (<value>);`.
+        assert!(
+            out.contains("((kd_p).kd_x) = (5);"),
+            "field assign lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn nested_field_access_chains() {
+        // A chain `a.b.c` nests left-associatively: `((kd_a).kd_b).kd_c`.
+        let mut structs = StructTable::new();
+        let inner = structs.intern("Inner");
+        structs.set_fields(inner, vec![("c".to_string(), Type::I32)]);
+        let outer = structs.intern("Outer");
+        structs.set_fields(outer, vec![("b".to_string(), Type::Struct(inner))]);
+
+        let f = Func {
+            is_pub: false,
+            name: "deep".to_string(),
+            params: vec![Param {
+                name: "a".to_string(),
+                ty: ty("Outer"),
+                span: Span::DUMMY,
+            }],
+            ret: ty("i32"),
+            body: block(vec![ret(field(field(ident("a"), "b"), "c"))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // Both typedefs emit in declaration order; the inner one first.
+        assert!(
+            out.contains("typedef struct { int32_t kd_c; } kd_struct_Inner;"),
+            "inner typedef wrong:\n{out}"
+        );
+        assert!(
+            out.contains("typedef struct { kd_struct_Inner kd_b; } kd_struct_Outer;"),
+            "outer typedef (struct field) wrong:\n{out}"
+        );
+        assert!(
+            out.contains("((kd_a).kd_b).kd_c"),
+            "nested field access lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn deferred_struct_return_uses_struct_temp() {
+        // fn make() Point { defer print(1); return Point{ .x = 7, .y = 8 }; }
+        // Exercises the return-temp path: `current_ret` must resolve to the
+        // struct type (not a bogus `void`) so the temp carries the typedef.
+        let structs = point_table();
+        let lit = Expr::StructLit {
+            name: "Point".to_string(),
+            fields: vec![finit("x", int(7)), finit("y", int(8))],
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "make".to_string(),
+            params: vec![],
+            ret: ty("Point"),
+            body: block(vec![defer(print(int(1))), ret(lit)]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_struct_Point __kd_ret = (((kd_struct_Point){ .kd_x = 7, .kd_y = 8 }));"),
+            "deferred struct return temp wrong:\n{out}"
+        );
+        assert!(
+            out.contains("return __kd_ret;"),
+            "deferred return temp missing:\n{out}"
         );
     }
 }

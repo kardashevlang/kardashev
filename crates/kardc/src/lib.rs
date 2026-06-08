@@ -28,7 +28,7 @@ use emit_c::EmitMode;
 
 /// The toolchain version. Single source of truth; keep in sync with
 /// `Cargo.toml` and `CHANGELOG.md`.
-pub const VERSION: &str = "0.111.1";
+pub const VERSION: &str = "0.112.0";
 
 /// Front-to-middle pipeline: lex, parse and type-check `src`, then lower the
 /// validated module to C source text for `mode`.
@@ -37,7 +37,7 @@ pub const VERSION: &str = "0.111.1";
 pub fn compile_to_c(src: &str, mode: EmitMode) -> Result<String, Vec<Diagnostic>> {
     let tokens = lexer::lex(src)?;
     let module = parser::parse(&tokens)?;
-    sema::check(&module)?;
+    let structs = sema::check(&module)?;
     if mode == EmitMode::Program && !has_main(&module) {
         return Err(vec![Diagnostic::error(
             span::Span::DUMMY,
@@ -45,7 +45,7 @@ pub fn compile_to_c(src: &str, mode: EmitMode) -> Result<String, Vec<Diagnostic>
             "program has no `fn main`",
         )]);
     }
-    Ok(emit_c::emit(&module, mode))
+    Ok(emit_c::emit(&module, &structs, mode))
 }
 
 /// True if the module declares a top-level `fn main`.

@@ -1,12 +1,14 @@
 //! Semantic analysis: name resolution + type checking + comptime validation.
 //!
 //! `check` runs a single pass over the module with a stack of lexical scopes.
-//! It first collects every top-level function signature (so calls may refer to
+//! It first collects every struct declaration (interning ids and resolving
+//! field types), then every top-level function signature (so calls may refer to
 //! functions defined later), then folds the top-level constants in source order
 //! via [`const_eval`], then type-checks every function and test body. All
-//! diagnostics are collected — analysis never stops at the first error.
+//! diagnostics are collected — analysis never stops at the first error. On
+//! success it returns the built [`StructTable`] for the backend.
 //!
-//! Error codes (SPEC §3):
+//! Error codes (SPEC §3, §9.4):
 //! - `E0100` — unknown name (value, callee, or type name).
 //! - `E0101` — redefining a builtin (`print` / `expect`).
 //! - `E0110` — a type mismatch (the general sema type-error code).
@@ -14,21 +16,33 @@
 //! - `E0130` / `E0131` / `E0132` — non-constant / unknown-const / type error
 //!   in a `comptime` or top-level `const` initializer (raised by `const_eval`).
 //! - `E0140` — `expect` called outside a `test` block.
+//! - `E0160` — forward / cyclic struct reference in a field type.
+//! - `E0161` — unknown type name in a struct field.
+//! - `E0162` — duplicate field name within a struct.
+//! - `E0163` — struct literal of a name that is not a struct.
+//! - `E0164` — missing / extra / duplicate field in a struct literal.
+//! - `E0165` — field access on a non-struct value.
+//! - `E0166` — access of a field the struct does not have.
+//! - `E0167` — field-assignment target not rooted in an assignable `var`.
+//! - `E0168` — `==` / `!=` on struct types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::ast::{BinOp, Block, Expr, Func, Item, Module, Stmt, TestBlock, TypeExpr, UnOp};
+use crate::ast::{
+    BinOp, Block, Expr, FieldInit, Func, Item, Module, Stmt, TestBlock, TypeExpr, UnOp,
+};
 use crate::const_eval::{self, ConstVal};
 use crate::diag::Diagnostic;
 use crate::span::Span;
-use crate::types::Type;
+use crate::types::{StructTable, Type};
 
-/// One-pass semantic check of a whole module.
-pub fn check(module: &Module) -> Result<(), Vec<Diagnostic>> {
+/// One-pass semantic check of a whole module. On success, returns the resolved
+/// [`StructTable`] (consumed by the backend); on failure, every diagnostic.
+pub fn check(module: &Module) -> Result<StructTable, Vec<Diagnostic>> {
     let mut cx = Checker::new();
     cx.check_module(module);
     if cx.diags.is_empty() {
-        Ok(())
+        Ok(cx.structs)
     } else {
         Err(cx.diags)
     }
@@ -47,6 +61,8 @@ type Binding = (Type, bool);
 
 struct Checker {
     diags: Vec<Diagnostic>,
+    /// All struct types, interned in declaration order.
+    structs: StructTable,
     /// Folded values of top-level consts, in source order so far.
     consts: HashMap<String, ConstVal>,
     /// Declared types of top-level consts.
@@ -67,6 +83,7 @@ impl Checker {
     fn new() -> Checker {
         Checker {
             diags: Vec::new(),
+            structs: StructTable::new(),
             consts: HashMap::new(),
             const_types: HashMap::new(),
             funcs: HashMap::new(),
@@ -81,9 +98,59 @@ impl Checker {
         self.diags.push(Diagnostic::error(span, code, message));
     }
 
+    /// The source spelling of a type for diagnostics — struct types are named
+    /// via the [`StructTable`] (their declared name), everything else via
+    /// [`Type::name`].
+    fn type_name(&self, t: Type) -> String {
+        match t {
+            Type::Struct(id) => self.structs.get(id).name.clone(),
+            other => other.name().to_string(),
+        }
+    }
+
     // ---- top-level driving ------------------------------------------------
 
     fn check_module(&mut self, m: &Module) {
+        // Pass 0a: intern every struct name first so that field types and
+        // signatures may refer to any struct (forward references in signatures
+        // are fine; forward references in *field types* are caught below).
+        for item in &m.items {
+            if let Item::Struct(s) = item {
+                self.structs.intern(&s.name);
+            }
+        }
+
+        // Pass 0b: resolve struct field types. A field type resolves to a
+        // builtin or to a struct declared *earlier* in source order; a
+        // reference to a not-yet-declared struct (forward/cyclic) is E0160, an
+        // unknown name is E0161, a duplicate field is E0162.
+        let mut declared: HashSet<String> = HashSet::new();
+        for item in &m.items {
+            if let Item::Struct(s) = item {
+                let id = match self.structs.id_of(&s.name) {
+                    Some(id) => id,
+                    None => continue, // unreachable: interned in pass 0a
+                };
+                let mut fields: Vec<(String, Type)> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                for f in &s.fields {
+                    if !seen.insert(f.name.clone()) {
+                        let msg = format!("duplicate field `{}` in struct `{}`", f.name, s.name);
+                        self.error(f.span, "E0162", msg);
+                        continue;
+                    }
+                    // Unresolved field types fall back to `i64` so downstream
+                    // field-access checks still recognise the field name.
+                    let fty = self
+                        .resolve_field_type(&f.ty, &declared, &s.name)
+                        .unwrap_or(Type::I64);
+                    fields.push((f.name.clone(), fty));
+                }
+                self.structs.set_fields(id, fields);
+                declared.insert(s.name.clone());
+            }
+        }
+
         // Pass 1: collect function signatures so calls can forward-reference.
         for item in &m.items {
             if let Item::Func(f) = item {
@@ -97,9 +164,9 @@ impl Checker {
                 let params = f
                     .params
                     .iter()
-                    .map(|p| Type::from_name(&p.ty.name).unwrap_or(Type::I64))
+                    .map(|p| self.resolve_type_opt(&p.ty).unwrap_or(Type::I64))
                     .collect();
-                let ret = Type::from_name(&f.ret.name).unwrap_or(Type::Void);
+                let ret = self.resolve_type_opt(&f.ret).unwrap_or(Type::Void);
                 self.funcs.insert(f.name.clone(), FuncSig { params, ret });
             }
         }
@@ -107,7 +174,7 @@ impl Checker {
         // Pass 2: fold top-level consts in source order.
         for item in &m.items {
             if let Item::Const(c) = item {
-                let declared = Type::from_name(&c.ty.name);
+                let declared = self.resolve_type_opt(&c.ty);
                 if declared.is_none() {
                     self.error(
                         c.ty.span,
@@ -127,15 +194,12 @@ impl Checker {
                                     ConstVal::Int(_) => "integer",
                                     ConstVal::Bool(_) => "bool",
                                 };
-                                self.error(
-                                    c.value.span(),
-                                    "E0110",
-                                    format!(
-                                        "constant initializer type mismatch: expected `{}`, found `{}`",
-                                        dt.name(),
-                                        found
-                                    ),
+                                let msg = format!(
+                                    "constant initializer type mismatch: expected `{}`, found `{}`",
+                                    self.type_name(dt),
+                                    found
                                 );
+                                self.error(c.value.span(), "E0110", msg);
                             }
                         }
                         self.consts.insert(c.name.clone(), val);
@@ -164,6 +228,7 @@ impl Checker {
                 Item::Func(f) => self.check_func(f),
                 Item::Test(t) => self.check_test(t),
                 Item::Const(_) => {}
+                Item::Struct(_) => {}
             }
         }
     }
@@ -210,14 +275,49 @@ impl Checker {
         self.const_types.get(name).map(|&t| (t, true))
     }
 
+    /// Resolve a type name to a builtin or a registered struct, without
+    /// emitting a diagnostic. Returns `None` for an unknown name.
+    fn resolve_type_opt(&self, te: &TypeExpr) -> Option<Type> {
+        Type::from_name(&te.name).or_else(|| self.structs.id_of(&te.name).map(Type::Struct))
+    }
+
+    /// Resolve a type name to a builtin or a registered struct, emitting
+    /// `E0100` for an unknown name.
     fn resolve_type(&mut self, te: &TypeExpr) -> Option<Type> {
-        match Type::from_name(&te.name) {
+        match self.resolve_type_opt(te) {
             Some(t) => Some(t),
             None => {
                 self.error(te.span, "E0100", format!("unknown type `{}`", te.name));
                 None
             }
         }
+    }
+
+    /// Resolve a *struct field* type: a builtin, or a struct declared earlier
+    /// (tracked by `declared`). A reference to a struct not yet declared is a
+    /// forward/cyclic reference (`E0160`); an unknown name is `E0161`.
+    fn resolve_field_type(
+        &mut self,
+        te: &TypeExpr,
+        declared: &HashSet<String>,
+        owner: &str,
+    ) -> Option<Type> {
+        if let Some(t) = Type::from_name(&te.name) {
+            return Some(t);
+        }
+        if let Some(id) = self.structs.id_of(&te.name) {
+            if declared.contains(&te.name) {
+                return Some(Type::Struct(id));
+            }
+            let msg = format!(
+                "field of struct `{}` refers to struct `{}` before it is declared (forward or cyclic reference)",
+                owner, te.name
+            );
+            self.error(te.span, "E0160", msg);
+            return None;
+        }
+        self.error(te.span, "E0161", format!("unknown type `{}`", te.name));
+        None
     }
 
     // ---- statements -------------------------------------------------------
@@ -243,15 +343,12 @@ impl Checker {
                 let vt = self.check_expr(value, declared);
                 if let (Some(dt), Some(vt)) = (declared, vt) {
                     if dt != vt {
-                        self.error(
-                            value.span(),
-                            "E0110",
-                            format!(
-                                "initializer type mismatch: expected `{}`, found `{}`",
-                                dt.name(),
-                                vt.name()
-                            ),
+                        let msg = format!(
+                            "initializer type mismatch: expected `{}`, found `{}`",
+                            self.type_name(dt),
+                            self.type_name(vt)
                         );
+                        self.error(value.span(), "E0110", msg);
                     }
                 }
                 let bind_ty = declared.unwrap_or(Type::I64);
@@ -270,16 +367,13 @@ impl Checker {
                         let vt = self.check_expr(value, Some(ty));
                         if let Some(vt) = vt {
                             if vt != ty {
-                                self.error(
-                                    value.span(),
-                                    "E0110",
-                                    format!(
-                                        "cannot assign value of type `{}` to `{}` of type `{}`",
-                                        vt.name(),
-                                        name,
-                                        ty.name()
-                                    ),
+                                let msg = format!(
+                                    "cannot assign value of type `{}` to `{}` of type `{}`",
+                                    self.type_name(vt),
+                                    name,
+                                    self.type_name(ty)
                                 );
+                                self.error(value.span(), "E0110", msg);
                             }
                         }
                     }
@@ -289,6 +383,22 @@ impl Checker {
                     self.check_expr(value, None);
                 }
             },
+            Stmt::FieldAssign { place, value, .. } => {
+                if let Some(pt) = self.resolve_place(place) {
+                    if let Some(vt) = self.check_expr(value, Some(pt)) {
+                        if vt != pt {
+                            let msg = format!(
+                                "cannot assign value of type `{}` to field of type `{}`",
+                                self.type_name(vt),
+                                self.type_name(pt)
+                            );
+                            self.error(value.span(), "E0110", msg);
+                        }
+                    }
+                } else {
+                    self.check_expr(value, None);
+                }
+            }
             Stmt::Expr(e) => {
                 self.check_expr(e, None);
             }
@@ -306,29 +416,23 @@ impl Checker {
                         let vt = self.check_expr(e, Some(expected));
                         if let Some(vt) = vt {
                             if vt != expected {
-                                self.error(
-                                    e.span(),
-                                    "E0110",
-                                    format!(
-                                        "return type mismatch: expected `{}`, found `{}`",
-                                        expected.name(),
-                                        vt.name()
-                                    ),
+                                let msg = format!(
+                                    "return type mismatch: expected `{}`, found `{}`",
+                                    self.type_name(expected),
+                                    self.type_name(vt)
                                 );
+                                self.error(e.span(), "E0110", msg);
                             }
                         }
                     }
                 }
                 None => {
                     if self.ret_type != Type::Void {
-                        self.error(
-                            *span,
-                            "E0110",
-                            format!(
-                                "`return;` is only valid in a `void` function, found return type `{}`",
-                                self.ret_type.name()
-                            ),
+                        let msg = format!(
+                            "`return;` is only valid in a `void` function, found return type `{}`",
+                            self.type_name(self.ret_type)
                         );
+                        self.error(*span, "E0110", msg);
                     }
                 }
             },
@@ -375,11 +479,71 @@ impl Checker {
     fn check_condition(&mut self, cond: &Expr, kw: &str) {
         if let Some(t) = self.check_expr(cond, Some(Type::Bool)) {
             if t != Type::Bool {
+                let msg = format!("`{}` condition must be `bool`, found `{}`", kw, self.type_name(t));
+                self.error(cond.span(), "E0110", msg);
+            }
+        }
+    }
+
+    /// Resolve the type of an assignment place (a field-access chain) and
+    /// verify that its root is an assignable `var` local. Emits `E0167` if the
+    /// root is a `const`/parameter (or the place is not a chain), and
+    /// `E0165`/`E0166` for an ill-typed chain. Returns the place's type.
+    fn resolve_place(&mut self, place: &Expr) -> Option<Type> {
+        match place {
+            Expr::Ident { name, span } => match self.lookup(name) {
+                Some((ty, is_const)) => {
+                    if is_const {
+                        let msg = format!(
+                            "cannot assign through immutable binding `{}` (only `var` locals are assignable)",
+                            name
+                        );
+                        self.error(*span, "E0167", msg);
+                    }
+                    Some(ty)
+                }
+                None => {
+                    self.error(*span, "E0100", format!("unknown name `{}`", name));
+                    None
+                }
+            },
+            Expr::Field { base, field, span } => {
+                let bt = self.resolve_place(base)?;
+                self.field_type_of(bt, field, *span)
+            }
+            _ => {
                 self.error(
-                    cond.span(),
-                    "E0110",
-                    format!("`{}` condition must be `bool`, found `{}`", kw, t.name()),
+                    place.span(),
+                    "E0167",
+                    "assignment target must be a `var` local or a field of one",
                 );
+                self.check_expr(place, None);
+                None
+            }
+        }
+    }
+
+    /// Resolve `<base type>.field`, emitting `E0165` if `base` is not a struct
+    /// or `E0166` if it has no such field. Returns the field's type.
+    fn field_type_of(&mut self, base: Type, field: &str, span: Span) -> Option<Type> {
+        match base {
+            Type::Struct(id) => match self.structs.get(id).field_type(field) {
+                Some(t) => Some(t),
+                None => {
+                    let sname = self.structs.get(id).name.clone();
+                    let msg = format!("struct `{}` has no field `{}`", sname, field);
+                    self.error(span, "E0166", msg);
+                    None
+                }
+            },
+            other => {
+                let msg = format!(
+                    "cannot access field `{}` of non-struct type `{}`",
+                    field,
+                    self.type_name(other)
+                );
+                self.error(span, "E0165", msg);
+                None
             }
         }
     }
@@ -424,7 +588,66 @@ impl Checker {
                     }
                 }
             }
+            Expr::StructLit { name, fields, span } => self.check_struct_lit(name, fields, *span),
+            Expr::Field { base, field, span } => {
+                let bt = self.check_expr(base, None)?;
+                self.field_type_of(bt, field, *span)
+            }
         }
+    }
+
+    /// Type-check a struct literal `Name{ .f = e, ... }`.
+    fn check_struct_lit(&mut self, name: &str, inits: &[FieldInit], span: Span) -> Option<Type> {
+        let id = match self.structs.id_of(name) {
+            Some(id) => id,
+            None => {
+                self.error(span, "E0163", format!("`{}` is not a struct", name));
+                for fi in inits {
+                    self.check_expr(&fi.value, None);
+                }
+                return None;
+            }
+        };
+        // Own the field list so we may freely call `&mut self` checks below.
+        let decl_fields = self.structs.get(id).fields.clone();
+        let mut inited: HashSet<String> = HashSet::new();
+        for fi in inits {
+            match decl_fields.iter().find(|(n, _)| n == &fi.name) {
+                Some((_, fty)) => {
+                    let fty = *fty;
+                    if !inited.insert(fi.name.clone()) {
+                        let msg = format!(
+                            "field `{}` initialized more than once in `{}` literal",
+                            fi.name, name
+                        );
+                        self.error(fi.span, "E0164", msg);
+                    }
+                    if let Some(vt) = self.check_expr(&fi.value, Some(fty)) {
+                        if vt != fty {
+                            let msg = format!(
+                                "field `{}` type mismatch: expected `{}`, found `{}`",
+                                fi.name,
+                                self.type_name(fty),
+                                self.type_name(vt)
+                            );
+                            self.error(fi.value.span(), "E0110", msg);
+                        }
+                    }
+                }
+                None => {
+                    let msg = format!("`{}` has no field `{}`", name, fi.name);
+                    self.error(fi.span, "E0164", msg);
+                    self.check_expr(&fi.value, None);
+                }
+            }
+        }
+        for (fname, _) in &decl_fields {
+            if !inited.contains(fname) {
+                let msg = format!("missing field `{}` in `{}` literal", fname, name);
+                self.error(span, "E0164", msg);
+            }
+        }
+        Some(Type::Struct(id))
     }
 
     fn check_unary(
@@ -440,11 +663,11 @@ impl Checker {
                 if t.is_int() && t.is_signed() {
                     Some(t)
                 } else {
-                    self.error(
-                        span,
-                        "E0110",
-                        format!("unary `-` requires a signed integer, found `{}`", t.name()),
+                    let msg = format!(
+                        "unary `-` requires a signed integer, found `{}`",
+                        self.type_name(t)
                     );
+                    self.error(span, "E0110", msg);
                     None
                 }
             }
@@ -453,11 +676,8 @@ impl Checker {
                 if t == Type::Bool {
                     Some(Type::Bool)
                 } else {
-                    self.error(
-                        span,
-                        "E0110",
-                        format!("unary `!` requires a `bool`, found `{}`", t.name()),
-                    );
+                    let msg = format!("unary `!` requires a `bool`, found `{}`", self.type_name(t));
+                    self.error(span, "E0110", msg);
                     None
                 }
             }
@@ -478,50 +698,61 @@ impl Checker {
                 let lt = lt?;
                 let rt = rt?;
                 if !lt.is_int() {
-                    self.error(
-                        lhs.span(),
-                        "E0110",
-                        format!("arithmetic operand must be an integer, found `{}`", lt.name()),
+                    let msg = format!(
+                        "arithmetic operand must be an integer, found `{}`",
+                        self.type_name(lt)
                     );
+                    self.error(lhs.span(), "E0110", msg);
                     return None;
                 }
                 if !rt.is_int() {
-                    self.error(
-                        rhs.span(),
-                        "E0110",
-                        format!("arithmetic operand must be an integer, found `{}`", rt.name()),
+                    let msg = format!(
+                        "arithmetic operand must be an integer, found `{}`",
+                        self.type_name(rt)
                     );
+                    self.error(rhs.span(), "E0110", msg);
                     return None;
                 }
                 if lt != rt {
-                    self.error(
-                        span,
-                        "E0110",
-                        format!(
-                            "arithmetic operands must have the same type, found `{}` and `{}`",
-                            lt.name(),
-                            rt.name()
-                        ),
+                    let msg = format!(
+                        "arithmetic operands must have the same type, found `{}` and `{}`",
+                        self.type_name(lt),
+                        self.type_name(rt)
                     );
+                    self.error(span, "E0110", msg);
                     return None;
                 }
                 Some(lt)
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 // Operands may be int or bool, but must be the same type.
+                // Struct types are never comparable.
                 let (lt, rt) = self.check_int_operands(lhs, rhs, None);
                 let lt = lt?;
                 let rt = rt?;
+                if matches!(lt, Type::Struct(_)) || matches!(rt, Type::Struct(_)) {
+                    if matches!(op, BinOp::Eq | BinOp::Ne) {
+                        self.error(
+                            span,
+                            "E0168",
+                            "struct values do not support `==` / `!=` comparison",
+                        );
+                    } else {
+                        self.error(
+                            span,
+                            "E0110",
+                            "struct values do not support ordering comparisons",
+                        );
+                    }
+                    return None;
+                }
                 if lt != rt {
-                    self.error(
-                        span,
-                        "E0110",
-                        format!(
-                            "comparison operands must have the same type, found `{}` and `{}`",
-                            lt.name(),
-                            rt.name()
-                        ),
+                    let msg = format!(
+                        "comparison operands must have the same type, found `{}` and `{}`",
+                        self.type_name(lt),
+                        self.type_name(rt)
                     );
+                    self.error(span, "E0110", msg);
                     return None;
                 }
                 Some(Type::Bool)
@@ -533,19 +764,21 @@ impl Checker {
                 let rt = rt?;
                 let mut ok = true;
                 if lt != Type::Bool {
-                    self.error(
-                        lhs.span(),
-                        "E0110",
-                        format!("`{}` requires `bool` operands, found `{}`", op.c_op(), lt.name()),
+                    let msg = format!(
+                        "`{}` requires `bool` operands, found `{}`",
+                        op.c_op(),
+                        self.type_name(lt)
                     );
+                    self.error(lhs.span(), "E0110", msg);
                     ok = false;
                 }
                 if rt != Type::Bool {
-                    self.error(
-                        rhs.span(),
-                        "E0110",
-                        format!("`{}` requires `bool` operands, found `{}`", op.c_op(), rt.name()),
+                    let msg = format!(
+                        "`{}` requires `bool` operands, found `{}`",
+                        op.c_op(),
+                        self.type_name(rt)
                     );
+                    self.error(rhs.span(), "E0110", msg);
                     ok = false;
                 }
                 if ok {
@@ -604,11 +837,11 @@ impl Checker {
                 }
                 if let Some(t) = self.check_expr(&args[0], None) {
                     if !t.is_int() {
-                        self.error(
-                            args[0].span(),
-                            "E0110",
-                            format!("`print` requires an integer argument, found `{}`", t.name()),
+                        let msg = format!(
+                            "`print` requires an integer argument, found `{}`",
+                            self.type_name(t)
                         );
+                        self.error(args[0].span(), "E0110", msg);
                     }
                 }
                 Some(Type::Void)
@@ -634,11 +867,11 @@ impl Checker {
                 }
                 if let Some(t) = self.check_expr(&args[0], Some(Type::Bool)) {
                     if t != Type::Bool {
-                        self.error(
-                            args[0].span(),
-                            "E0110",
-                            format!("`expect` requires a `bool` argument, found `{}`", t.name()),
+                        let msg = format!(
+                            "`expect` requires a `bool` argument, found `{}`",
+                            self.type_name(t)
                         );
+                        self.error(args[0].span(), "E0110", msg);
                     }
                 }
                 Some(Type::Void)
@@ -664,15 +897,12 @@ impl Checker {
                     for (a, &pt) in args.iter().zip(sig.params.iter()) {
                         if let Some(at) = self.check_expr(a, Some(pt)) {
                             if at != pt {
-                                self.error(
-                                    a.span(),
-                                    "E0110",
-                                    format!(
-                                        "argument type mismatch: expected `{}`, found `{}`",
-                                        pt.name(),
-                                        at.name()
-                                    ),
+                                let msg = format!(
+                                    "argument type mismatch: expected `{}`, found `{}`",
+                                    self.type_name(pt),
+                                    self.type_name(at)
                                 );
+                                self.error(a.span(), "E0110", msg);
                             }
                         }
                     }
@@ -706,7 +936,7 @@ fn is_flex_int_literal(e: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{ConstDecl, Func, Param, TestBlock};
+    use crate::ast::{ConstDecl, FieldDecl, FieldInit, Func, Param, StructDecl, TestBlock};
 
     fn sp() -> Span {
         Span::DUMMY
@@ -780,6 +1010,49 @@ mod tests {
             span: sp(),
         })
     }
+    fn struct_item(name: &str, fields: Vec<(&str, &str)>) -> Item {
+        Item::Struct(StructDecl {
+            is_pub: false,
+            name: name.into(),
+            fields: fields
+                .into_iter()
+                .map(|(n, t)| FieldDecl {
+                    name: n.into(),
+                    ty: te(t),
+                    span: sp(),
+                })
+                .collect(),
+            span: sp(),
+        })
+    }
+    fn struct_lit(name: &str, inits: Vec<(&str, Expr)>) -> Expr {
+        Expr::StructLit {
+            name: name.into(),
+            fields: inits
+                .into_iter()
+                .map(|(n, v)| FieldInit {
+                    name: n.into(),
+                    value: v,
+                    span: sp(),
+                })
+                .collect(),
+            span: sp(),
+        }
+    }
+    fn field(base: Expr, f: &str) -> Expr {
+        Expr::Field {
+            base: Box::new(base),
+            field: f.into(),
+            span: sp(),
+        }
+    }
+    fn field_assign(place: Expr, value: Expr) -> Stmt {
+        Stmt::FieldAssign {
+            place,
+            value,
+            span: sp(),
+        }
+    }
     fn let_var(name: &str, ty: &str, value: Expr) -> Stmt {
         Stmt::Let {
             is_const: false,
@@ -812,7 +1085,7 @@ mod tests {
     fn codes(items: Vec<Item>) -> Vec<&'static str> {
         let m = Module { items };
         match check(&m) {
-            Ok(()) => vec![],
+            Ok(_) => vec![],
             Err(ds) => ds.iter().map(|d| d.code).collect(),
         }
     }
@@ -987,5 +1260,255 @@ mod tests {
             vec![Stmt::Expr(call("nope", vec![]))],
         )];
         assert!(codes(items).contains(&"E0100"));
+    }
+
+    // ---- struct tests (v0.112) -------------------------------------------
+
+    #[test]
+    fn good_struct_program_passes_and_returns_table() {
+        // const Point = struct { x: i32, y: i32 };
+        // fn make() Point { return Point{ .x = 1, .y = 2 }; }
+        // fn getx(p: Point) i32 { return p.x; }
+        // fn main() void {
+        //     var p: Point = make();
+        //     p.x = 5;
+        //     print(p.x);
+        //     print(getx(p));
+        // }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32"), ("y", "i32")]),
+            func(
+                "make",
+                vec![],
+                "Point",
+                vec![ret(Some(struct_lit(
+                    "Point",
+                    vec![("x", int(1)), ("y", int(2))],
+                )))],
+            ),
+            func(
+                "getx",
+                vec![param("p", "Point")],
+                "i32",
+                vec![ret(Some(field(ident("p"), "x")))],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("p", "Point", call("make", vec![])),
+                    field_assign(field(ident("p"), "x"), int(5)),
+                    Stmt::Expr(call("print", vec![field(ident("p"), "x")])),
+                    Stmt::Expr(call("print", vec![call("getx", vec![ident("p")])])),
+                ],
+            ),
+        ];
+        let m = Module { items };
+        let table = check(&m).expect("struct program should type-check");
+        let id = table.id_of("Point").expect("Point should be registered");
+        let info = table.get(id);
+        assert_eq!(info.name, "Point");
+        assert_eq!(
+            info.fields,
+            vec![
+                ("x".to_string(), Type::I32),
+                ("y".to_string(), Type::I32),
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_field_access_is_e0166() {
+        // const Point = struct { x: i32 };
+        // fn f(p: Point) i32 { return p.y; }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            func(
+                "f",
+                vec![param("p", "Point")],
+                "i32",
+                vec![ret(Some(field(ident("p"), "y")))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0166"));
+    }
+
+    #[test]
+    fn missing_field_in_literal_is_e0164() {
+        // const Point = struct { x: i32, y: i32 };
+        // fn f() Point { return Point{ .x = 1 }; }   // missing y
+        let items = vec![
+            struct_item("Point", vec![("x", "i32"), ("y", "i32")]),
+            func(
+                "f",
+                vec![],
+                "Point",
+                vec![ret(Some(struct_lit("Point", vec![("x", int(1))])))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0164"));
+    }
+
+    #[test]
+    fn extra_field_in_literal_is_e0164() {
+        // const Point = struct { x: i32 };
+        // fn f() Point { return Point{ .x = 1, .z = 2 }; }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            func(
+                "f",
+                vec![],
+                "Point",
+                vec![ret(Some(struct_lit(
+                    "Point",
+                    vec![("x", int(1)), ("z", int(2))],
+                )))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0164"));
+    }
+
+    #[test]
+    fn type_mismatch_in_field_is_e0110() {
+        // const Point = struct { x: i32 };
+        // fn f() Point { return Point{ .x = true }; }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            func(
+                "f",
+                vec![],
+                "Point",
+                vec![ret(Some(struct_lit("Point", vec![("x", boolean(true))])))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn forward_struct_ref_is_e0160() {
+        // const A = struct { b: B };   const B = struct { x: i32 };
+        let items = vec![
+            struct_item("A", vec![("b", "B")]),
+            struct_item("B", vec![("x", "i32")]),
+        ];
+        assert!(codes(items).contains(&"E0160"));
+    }
+
+    #[test]
+    fn back_reference_between_structs_is_ok() {
+        // const B = struct { x: i32 };   const A = struct { b: B };
+        let items = vec![
+            struct_item("B", vec![("x", "i32")]),
+            struct_item("A", vec![("b", "B")]),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn unknown_field_type_is_e0161() {
+        // const A = struct { x: Nope };
+        let items = vec![struct_item("A", vec![("x", "Nope")])];
+        assert!(codes(items).contains(&"E0161"));
+    }
+
+    #[test]
+    fn duplicate_field_decl_is_e0162() {
+        // const A = struct { x: i32, x: i32 };
+        let items = vec![struct_item("A", vec![("x", "i32"), ("x", "i32")])];
+        assert!(codes(items).contains(&"E0162"));
+    }
+
+    #[test]
+    fn literal_of_non_struct_is_e0163() {
+        // fn f() i32 { return Nope{ .x = 1 }; }
+        let items = vec![func(
+            "f",
+            vec![],
+            "i32",
+            vec![ret(Some(struct_lit("Nope", vec![("x", int(1))])))],
+        )];
+        assert!(codes(items).contains(&"E0163"));
+    }
+
+    #[test]
+    fn field_access_on_non_struct_is_e0165() {
+        // fn f(x: i32) i32 { return x.foo; }
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "i32",
+            vec![ret(Some(field(ident("x"), "foo")))],
+        )];
+        assert!(codes(items).contains(&"E0165"));
+    }
+
+    #[test]
+    fn assign_through_immutable_field_is_e0167() {
+        // const Point = struct { x: i32 };
+        // fn f(p: Point) void { p.x = 5; }   // p is a parameter (immutable)
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            func(
+                "f",
+                vec![param("p", "Point")],
+                "void",
+                vec![field_assign(field(ident("p"), "x"), int(5))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0167"));
+    }
+
+    #[test]
+    fn struct_eq_struct_is_e0168() {
+        // const Point = struct { x: i32 };
+        // fn f(p: Point, q: Point) bool { return p == q; }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            func(
+                "f",
+                vec![param("p", "Point"), param("q", "Point")],
+                "bool",
+                vec![ret(Some(bin(BinOp::Eq, ident("p"), ident("q"))))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0168"));
+    }
+
+    #[test]
+    fn field_assign_type_mismatch_is_e0110() {
+        // const Point = struct { x: i32 };
+        // fn f() void { var p: Point = Point{ .x = 1 }; p.x = true; }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            func(
+                "f",
+                vec![],
+                "void",
+                vec![
+                    let_var("p", "Point", struct_lit("Point", vec![("x", int(1))])),
+                    field_assign(field(ident("p"), "x"), boolean(true)),
+                ],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn nested_struct_field_access_ok() {
+        // const Inner = struct { v: i32 };
+        // const Outer = struct { inner: Inner };
+        // fn get(o: Outer) i32 { return o.inner.v; }
+        let items = vec![
+            struct_item("Inner", vec![("v", "i32")]),
+            struct_item("Outer", vec![("inner", "Inner")]),
+            func(
+                "get",
+                vec![param("o", "Outer")],
+                "i32",
+                vec![ret(Some(field(field(ident("o"), "inner"), "v")))],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
     }
 }

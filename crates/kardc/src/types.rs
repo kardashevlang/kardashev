@@ -1,11 +1,15 @@
 //! The type system.
 //!
-//! v1 (the Gen-2 reboot) ships the procedural core: fixed-width integers, a
-//! boolean and `void`. Optionals (`?T`), error unions (`!T`), structs, enums,
-//! slices and pointers arrive in later roadmap versions — each one explicit,
-//! with no hidden conversions, per Zig's philosophy.
+//! v0.111 shipped the procedural core: fixed-width integers, a boolean and
+//! `void`. v0.112 adds **structs** (`Type::Struct(id)` + the [`StructTable`]).
+//! Optionals (`?T`), error unions (`!T`), enums, slices and pointers arrive in
+//! later roadmap versions — each one explicit, per Zig's philosophy.
 
-/// A resolved type.
+use std::collections::HashMap;
+
+/// A resolved type. A `Struct(id)` indexes the [`StructTable`] produced by
+/// semantic analysis; the enum stays `Copy` and two struct types are equal iff
+/// they share an id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Type {
     I8,
@@ -19,6 +23,7 @@ pub enum Type {
     Usize,
     Bool,
     Void,
+    Struct(u32),
 }
 
 impl Type {
@@ -54,10 +59,16 @@ impl Type {
             Type::Usize => "usize",
             Type::Bool => "bool",
             Type::Void => "void",
+            // Struct names are dynamic; sema formats them via the StructTable.
+            Type::Struct(_) => "struct",
         }
     }
 
     /// The C type used to represent this type in the emitted backend code.
+    ///
+    /// Defined for primitives only: a `Struct` type's C name depends on the
+    /// [`StructTable`], so emit resolves it via `StructTable::c_name` and must
+    /// never call this on a `Struct`.
     pub fn c_name(self) -> &'static str {
         match self {
             Type::I8 => "int8_t",
@@ -71,6 +82,7 @@ impl Type {
             Type::Usize => "uintptr_t",
             Type::Bool => "bool",
             Type::Void => "void",
+            Type::Struct(_) => unreachable!("c_name on a struct type; use StructTable::c_name"),
         }
     }
 
@@ -91,5 +103,83 @@ impl Type {
 
     pub fn is_signed(self) -> bool {
         matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+    }
+}
+
+/// A resolved struct definition: its source name and its ordered fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructInfo {
+    pub name: String,
+    /// Fields in declaration order, each `(field_name, field_type)`.
+    pub fields: Vec<(String, Type)>,
+}
+
+impl StructInfo {
+    /// The type of field `name`, if present.
+    pub fn field_type(&self, name: &str) -> Option<Type> {
+        self.fields.iter().find(|(n, _)| n == name).map(|(_, t)| *t)
+    }
+}
+
+/// The table of all struct types in a program, built by semantic analysis and
+/// consumed by the backend. Ids are dense indices assigned in declaration
+/// order, so iterating `0..len()` yields structs in source order — exactly the
+/// order the backend must emit their C typedefs.
+#[derive(Clone, Debug, Default)]
+pub struct StructTable {
+    defs: Vec<StructInfo>,
+    by_name: HashMap<String, u32>,
+}
+
+impl StructTable {
+    pub fn new() -> StructTable {
+        StructTable::default()
+    }
+
+    /// Register a struct `name`, returning its id. If already interned, returns
+    /// the existing id (fields are filled later via [`set_fields`]).
+    pub fn intern(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.by_name.get(name) {
+            return id;
+        }
+        let id = self.defs.len() as u32;
+        self.defs.push(StructInfo {
+            name: name.to_string(),
+            fields: Vec::new(),
+        });
+        self.by_name.insert(name.to_string(), id);
+        id
+    }
+
+    /// The id of struct `name`, if registered.
+    pub fn id_of(&self, name: &str) -> Option<u32> {
+        self.by_name.get(name).copied()
+    }
+
+    pub fn get(&self, id: u32) -> &StructInfo {
+        &self.defs[id as usize]
+    }
+
+    /// Replace the fields of an already-interned struct.
+    pub fn set_fields(&mut self, id: u32, fields: Vec<(String, Type)>) {
+        self.defs[id as usize].fields = fields;
+    }
+
+    /// The C typedef name for a struct, e.g. `kd_struct_Point`.
+    pub fn c_name(&self, id: u32) -> String {
+        format!("kd_struct_{}", self.defs[id as usize].name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.defs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.defs.is_empty()
+    }
+
+    /// Structs in declaration (id) order, paired with their id.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &StructInfo)> {
+        self.defs.iter().enumerate().map(|(i, s)| (i as u32, s))
     }
 }

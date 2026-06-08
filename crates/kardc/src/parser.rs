@@ -12,7 +12,8 @@
 //! `Err` if any diagnostic was produced.
 
 use crate::ast::{
-    BinOp, Block, ConstDecl, Expr, Func, Item, Module, Param, Stmt, TestBlock, TypeExpr, UnOp,
+    BinOp, Block, ConstDecl, Expr, FieldDecl, FieldInit, Func, Item, Module, Param, Stmt,
+    StructDecl, TestBlock, TypeExpr, UnOp,
 };
 use crate::diag::Diagnostic;
 use crate::span::Span;
@@ -264,6 +265,12 @@ impl<'a> Parser<'a> {
     fn parse_const(&mut self, is_pub: bool, start: Span) -> PResult<Item> {
         self.bump(); // `const`
         let (name, _) = self.expect_ident()?;
+        // A `const IDENT =` (rather than `const IDENT :`) introduces a struct
+        // declaration (SPEC §9.1); a `const IDENT : type = expr;` is the
+        // ordinary value binding of §2.
+        if self.at_punct(&TokenKind::Eq) {
+            return self.parse_struct_decl(is_pub, name, start);
+        }
         self.expect_punct(&TokenKind::Colon, "`:`")?;
         let ty = self.parse_type()?;
         self.expect_punct(&TokenKind::Eq, "`=`")?;
@@ -276,6 +283,47 @@ impl<'a> Parser<'a> {
             ty,
             value,
             span,
+        }))
+    }
+
+    /// Parse the tail of a struct declaration, with `const IDENT` already
+    /// consumed and the cursor on the `=`:
+    /// `= "struct" "{" (field ("," field)* ","?)? "}" ";"` where
+    /// `field := IDENT ":" type` (SPEC §9.1). Supports an empty `struct {}`.
+    fn parse_struct_decl(&mut self, is_pub: bool, name: String, start: Span) -> PResult<Item> {
+        self.bump(); // `=`
+        if !self.eat_kw(Kw::Struct) {
+            return Err(self.expected("`struct`"));
+        }
+        self.expect_punct(&TokenKind::LBrace, "`{`")?;
+        let mut fields = Vec::new();
+        if !self.at_punct(&TokenKind::RBrace) {
+            loop {
+                let (fname, fname_span) = self.expect_ident()?;
+                self.expect_punct(&TokenKind::Colon, "`:`")?;
+                let ty = self.parse_type()?;
+                let span = fname_span.merge(ty.span);
+                fields.push(FieldDecl {
+                    name: fname,
+                    ty,
+                    span,
+                });
+                if self.eat_punct(&TokenKind::Comma) {
+                    if self.at_punct(&TokenKind::RBrace) {
+                        break; // trailing comma
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect_punct(&TokenKind::RBrace, "`}`")?;
+        let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
+        Ok(Item::Struct(StructDecl {
+            is_pub,
+            name,
+            fields,
+            span: start.merge(semi),
         }))
     }
 
@@ -468,6 +516,20 @@ impl<'a> Parser<'a> {
 
     fn parse_expr_stmt(&mut self) -> PResult<Stmt> {
         let expr = self.parse_expr()?;
+        // A field-access place followed by `=` is a field assignment
+        // (`a.b.c = e;`); a simple `name = e;` is handled by `parse_assign`
+        // earlier in `parse_stmt`. Anything else is an expression statement.
+        if matches!(expr, Expr::Field { .. }) && self.at_punct(&TokenKind::Eq) {
+            self.bump(); // `=`
+            let value = self.parse_expr()?;
+            let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
+            let span = expr.span().merge(semi);
+            return Ok(Stmt::FieldAssign {
+                place: expr,
+                value,
+                span,
+            });
+        }
         self.expect_punct(&TokenKind::Semicolon, "`;`")?;
         Ok(Stmt::Expr(expr))
     }
@@ -603,15 +665,33 @@ impl<'a> Parser<'a> {
         if self.at_kw(Kw::Comptime) {
             let start = self.peek_span();
             self.bump();
-            let inner = self.parse_primary()?;
+            let inner = self.parse_postfix()?;
             let span = start.merge(inner.span());
             Ok(Expr::Comptime {
                 expr: Box::new(inner),
                 span,
             })
         } else {
-            self.parse_primary()
+            self.parse_postfix()
         }
+    }
+
+    /// Postfix level (SPEC §9.1): a primary followed by zero or more `.field`
+    /// accesses, left-associative so `a.b.c` nests as `(a.b).c`. Sits between
+    /// `primary` and the `comptime`/`unary` levels.
+    fn parse_postfix(&mut self) -> PResult<Expr> {
+        let mut expr = self.parse_primary()?;
+        while self.at_punct(&TokenKind::Dot) {
+            self.bump(); // `.`
+            let (field, field_span) = self.expect_ident()?;
+            let span = expr.span().merge(field_span);
+            expr = Expr::Field {
+                base: Box::new(expr),
+                field,
+                span,
+            };
+        }
+        Ok(expr)
     }
 
     fn parse_primary(&mut self) -> PResult<Expr> {
@@ -649,6 +729,19 @@ impl<'a> Parser<'a> {
                         args,
                         span: tok.span.merge(rparen),
                     })
+                } else if self.at_punct(&TokenKind::LBrace) {
+                    // Struct literal `Name{ .f = e, ... }` (SPEC §9.1). Reached
+                    // only where an expression is expected, so it never collides
+                    // with `if`/`while` blocks (whose conditions are parenthesised
+                    // and whose `{` follows a `)`, not an identifier).
+                    self.bump(); // `{`
+                    let fields = self.parse_field_inits()?;
+                    let rbrace = self.expect_punct(&TokenKind::RBrace, "`}`")?;
+                    Ok(Expr::StructLit {
+                        name,
+                        fields,
+                        span: tok.span.merge(rbrace),
+                    })
                 } else {
                     Ok(Expr::Ident {
                         name,
@@ -683,6 +776,33 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(args)
+    }
+
+    /// Parse the `.f = e` initializers of a struct literal, with the opening
+    /// `{` already consumed and the cursor positioned just after it. Stops at
+    /// (without consuming) the closing `}`. Supports an empty initializer list
+    /// and an optional trailing comma (SPEC §9.1).
+    fn parse_field_inits(&mut self) -> PResult<Vec<FieldInit>> {
+        let mut fields = Vec::new();
+        if self.at_punct(&TokenKind::RBrace) {
+            return Ok(fields);
+        }
+        loop {
+            let dot = self.expect_punct(&TokenKind::Dot, "`.`")?;
+            let (name, _) = self.expect_ident()?;
+            self.expect_punct(&TokenKind::Eq, "`=`")?;
+            let value = self.parse_expr()?;
+            let span = dot.merge(value.span());
+            fields.push(FieldInit { name, value, span });
+            if self.eat_punct(&TokenKind::Comma) {
+                if self.at_punct(&TokenKind::RBrace) {
+                    break; // trailing comma
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(fields)
     }
 }
 
@@ -1057,5 +1177,261 @@ mod tests {
         .expect_err("should fail");
         assert!(!err.is_empty());
         assert!(err.iter().any(|d| d.code == "E0200"));
+    }
+
+    // ---- v0.112: structs --------------------------------------------------
+
+    #[test]
+    fn struct_decl_two_fields() {
+        // pub const Point = struct { x: i32, y: i32, };  (trailing comma)
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Pub),
+            TokenKind::Keyword(Kw::Const),
+            id("Point"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            id("x"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::Comma,
+            id("y"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::Comma,
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Struct(s) => {
+                assert!(s.is_pub);
+                assert_eq!(s.name, "Point");
+                assert_eq!(s.fields.len(), 2);
+                assert_eq!(s.fields[0].name, "x");
+                assert_eq!(s.fields[0].ty.name, "i32");
+                assert_eq!(s.fields[1].name, "y");
+                assert_eq!(s.fields[1].ty.name, "i32");
+                assert!(s.span.start < s.span.end);
+            }
+            other => panic!("expected struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn struct_decl_empty() {
+        // const Unit = struct {};
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("Unit"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Struct(s) => {
+                assert!(!s.is_pub);
+                assert_eq!(s.name, "Unit");
+                assert!(s.fields.is_empty());
+            }
+            other => panic!("expected empty struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn value_const_still_parses() {
+        // const MAX: i64 = 10;  — the `: type` form must remain a value const.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("MAX"),
+            TokenKind::Colon,
+            id("i64"),
+            TokenKind::Eq,
+            TokenKind::Int(10),
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        assert!(matches!(&m.items[0], Item::Const(c) if c.name == "MAX"));
+    }
+
+    #[test]
+    fn struct_literal() {
+        // x = Point{ .x = 1, .y = 2 };
+        let e = parse_assign_rhs(vec![
+            id("Point"),
+            TokenKind::LBrace,
+            TokenKind::Dot,
+            id("x"),
+            TokenKind::Eq,
+            TokenKind::Int(1),
+            TokenKind::Comma,
+            TokenKind::Dot,
+            id("y"),
+            TokenKind::Eq,
+            TokenKind::Int(2),
+            TokenKind::RBrace,
+        ]);
+        match e {
+            Expr::StructLit { name, fields, .. } => {
+                assert_eq!(name, "Point");
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name, "x");
+                assert!(matches!(fields[0].value, Expr::Int { value: 1, .. }));
+                assert_eq!(fields[1].name, "y");
+                assert!(matches!(fields[1].value, Expr::Int { value: 2, .. }));
+            }
+            other => panic!("expected struct literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn empty_struct_literal() {
+        // x = Unit{};
+        let e = parse_assign_rhs(vec![id("Unit"), TokenKind::LBrace, TokenKind::RBrace]);
+        match e {
+            Expr::StructLit { name, fields, .. } => {
+                assert_eq!(name, "Unit");
+                assert!(fields.is_empty());
+            }
+            other => panic!("expected empty struct literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nested_field_access() {
+        // x = a.b.c;  ==>  Field(Field(a, b), c)  (left-assoc)
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Dot,
+            id("b"),
+            TokenKind::Dot,
+            id("c"),
+        ]);
+        match e {
+            Expr::Field { base, field, .. } => {
+                assert_eq!(field, "c");
+                match *base {
+                    Expr::Field { base, field, .. } => {
+                        assert_eq!(field, "b");
+                        assert!(matches!(*base, Expr::Ident { ref name, .. } if name == "a"));
+                    }
+                    other => panic!("expected `a.b` on the left, got {:?}", other),
+                }
+            }
+            other => panic!("expected field access at the root, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn field_assign_statement() {
+        // fn f() void { a.b = 1; }
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            id("a"),
+            TokenKind::Dot,
+            id("b"),
+            TokenKind::Eq,
+            TokenKind::Int(1),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        let body = match &m.items[0] {
+            Item::Func(f) => &f.body,
+            other => panic!("expected func, got {:?}", other),
+        };
+        match &body.stmts[0] {
+            Stmt::FieldAssign { place, value, .. } => {
+                match place {
+                    Expr::Field { base, field, .. } => {
+                        assert_eq!(field, "b");
+                        assert!(matches!(**base, Expr::Ident { ref name, .. } if name == "a"));
+                    }
+                    other => panic!("expected field place `a.b`, got {:?}", other),
+                }
+                assert!(matches!(value, Expr::Int { value: 1, .. }));
+            }
+            other => panic!("expected field assign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn simple_assign_stays_assign() {
+        // fn f() void { a = 1; }  — bare-name assignment is still `Stmt::Assign`.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            id("a"),
+            TokenKind::Eq,
+            TokenKind::Int(1),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        let body = match &m.items[0] {
+            Item::Func(f) => &f.body,
+            other => panic!("expected func, got {:?}", other),
+        };
+        assert!(matches!(&body.stmts[0], Stmt::Assign { name, .. } if name == "a"));
+    }
+
+    #[test]
+    fn if_while_blocks_not_struct_literals() {
+        // fn f() void { if (x) { } while (y) { } }
+        // The `{` after each `)` opens a block, NOT a struct literal, so neither
+        // the `if` nor the `while` condition is misparsed as a struct literal.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::If),
+            TokenKind::LParen,
+            id("x"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Keyword(Kw::While),
+            TokenKind::LParen,
+            id("y"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        let body = match &m.items[0] {
+            Item::Func(f) => &f.body,
+            other => panic!("expected func, got {:?}", other),
+        };
+        assert_eq!(body.stmts.len(), 2);
+        match &body.stmts[0] {
+            Stmt::If { cond, then, .. } => {
+                assert!(matches!(cond, Expr::Ident { name, .. } if name == "x"));
+                assert!(then.stmts.is_empty());
+            }
+            other => panic!("expected if, got {:?}", other),
+        }
+        match &body.stmts[1] {
+            Stmt::While { cond, body, .. } => {
+                assert!(matches!(cond, Expr::Ident { name, .. } if name == "y"));
+                assert!(body.stmts.is_empty());
+            }
+            other => panic!("expected while, got {:?}", other),
+        }
     }
 }

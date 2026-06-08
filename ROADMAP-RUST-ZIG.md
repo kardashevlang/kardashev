@@ -54,37 +54,43 @@ The foundation everything else builds on.
 
 ## Planned
 
-### v0.112.0 — Aggregates: `struct`, field access, methods
-`struct` types, field access/assignment, struct-valued params/returns/locals,
-associated functions. Emit as C structs (by value).
+### v0.112.0 — Aggregates: `struct` (data) ✅
+`const Name = struct { … };` declarations, struct literals (`Name{ .f = e }`),
+field access (`a.b.c`), field assignment, struct-valued params/returns/locals,
+nested structs. Emitted as C structs (by value). Methods / associated functions
+are split out to v0.113 to keep each version complete and well-tested.
 
-### v0.113.0 — Optionals: `?T`, `orelse`, `.?`, `if (x) |v|` capture
+### v0.113.0 — Struct methods + associated functions
+Functions declared in a `struct` block; `Type.func(…)` and the `instance.method(…)`
+call sugar (self-prepend). Lowered to `kd_<Struct>_<method>(self, …)`.
+
+### v0.114.0 — Optionals: `?T`, `orelse`, `.?`, `if (x) |v|` capture
 Null-safety the Zig way; lower as a tagged value in C. No hidden nullability.
 
-### v0.114.0 — Error unions: `!T`, error sets, `try`, `catch`, `errdefer`
+### v0.115.0 — Error unions: `!T`, error sets, `try`, `catch`, `errdefer`
 Errors as values, explicit propagation. `errdefer` joins `defer` in the
 LIFO-flush machinery.
 
-### v0.115.0 — Enums & tagged unions; exhaustive `switch`
+### v0.116.0 — Enums & tagged unions; exhaustive `switch`
 `enum`, `union(enum)`, `switch` with exhaustiveness checking — no hidden
 fall-through.
 
-### v0.116.0 — Arrays, slices, pointers; the **Allocator** interface
+### v0.117.0 — Arrays, slices, pointers; the **Allocator** interface
 `[N]T`, `[]T`, `*T`, `[*]T`. Introduce the explicit `Allocator` interface —
 every heap allocation takes an allocator parameter. No global allocator.
 
-### v0.117.0 — `comptime` generics: `fn F(comptime T: type) type`
+### v0.118.0 — `comptime` generics: `fn F(comptime T: type) type`
 Real compile-time generics (containers, `ArrayList(T)`), monomorphised — Zig's
 metaprogramming model.
 
-### v0.118.0 — Type inference for `var`/`const`; the standard prelude
+### v0.119.0 — Type inference for `var`/`const`; the standard prelude
 Inferred local types; a small std built on the allocator interface.
 
-### v0.119.0 — The full in-language build graph (`build.ks`)
+### v0.120.0 — The full in-language build graph (`build.ks`)
 The imperative `build.zig`-style build description: steps, dependencies,
 install artifacts, declared dependencies — run by `kard build`.
 
-### v0.120.0 — First-class cross-compilation
+### v0.121.0 — First-class cross-compilation
 `kard build -target <triple>` producing binaries for foreign targets out of the
 box (bundled/located cross C toolchains), the way `zig build` cross-compiles
 trivially.

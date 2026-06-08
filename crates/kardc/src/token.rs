@@ -26,6 +26,7 @@ pub enum Kw {
     False,
     And,
     Or,
+    Struct,
 }
 
 impl Kw {
@@ -49,6 +50,7 @@ impl Kw {
             "false" => Kw::False,
             "and" => Kw::And,
             "or" => Kw::Or,
+            "struct" => Kw::Struct,
             _ => return None,
         })
     }
@@ -72,6 +74,7 @@ impl Kw {
             Kw::False => "false",
             Kw::And => "and",
             Kw::Or => "or",
+            Kw::Struct => "struct",
         }
     }
 }
