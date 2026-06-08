@@ -18,6 +18,23 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.122.0] — The build graph (`build.ks`)
+
+### Added
+- `build.ks` now describes a **build graph of named executable targets**:
+  `build { exe "app" { root = "src/app.ks"; } exe "tool" { root = ".."; } }`.
+  The legacy single-target `build { name = ..; root = ..; }` sugar still works.
+- CLI **target selection**: `kard build/run/test [TARGET]` selects a target by
+  name; with a single target the name is optional; `build` with no name builds
+  **all** targets. A positional ending in `.ks` is still a direct file.
+- `BuildSpec { targets: Vec<Target> }` + `BuildSpec::select`. CI smoke-tests a
+  two-target project end to end.
+- 473 unit + 21 e2e tests.
+
+### Deferred
+- The full imperative `build.zig` model (a kardashev program with a
+  `build(*Builder)` entry point, step dependencies, install artifacts).
+
 ## [0.121.0] — Type inference for `var`/`const`
 
 ### Added

@@ -241,18 +241,40 @@ kard help                                      # usage (also --help, -h, no args
   not yet preserved** by `fmt` (the code is reproduced faithfully and the
   result is idempotent). Comment-preserving formatting is a roadmap item.
 
-## 7. `build.ks` (v1 minimal form)
+## 7. `build.ks` — the build graph (v0.122)
+
+A `build.ks` describes a **build graph** of one or more named executable
+targets. Two forms are accepted:
 
 ```
+// Single-target sugar (legacy):
 build {
     name = "hello";
     root = "src/main.ks";
 }
+
+// Multi-target:
+build {
+    exe "app"  { root = "src/main.ks"; }
+    exe "tool" { root = "src/tool.ks"; }
+}
 ```
 
-`build_system::parse_build_kd` extracts `name` and `root`. The full imperative
-build graph (steps, dependencies, install targets — Zig's `build.zig` model) is
-a roadmap item.
+`build_system::parse_build_kd` returns a `BuildSpec { targets: Vec<Target> }`
+(`Target { name, root }`); `BuildSpec::select(name)` finds a target by name (or
+the sole target when unnamed). It is a tiny self-contained recursive parser
+(not the language lexer/parser), tolerant of whitespace and `//` comments; any
+malformed/missing field yields `E0300`.
+
+CLI (`build`/`run`/`test` with no `FILE`): read `./build.ks`; a positional
+**TARGET** name selects one target; with no name and a single target, that
+target is used; with no name and multiple targets, `build` builds **all** of
+them (and `run`/`test` require a target name → error otherwise). A positional
+argument ending in `.ks` is treated as a direct FILE, not a target name.
+
+The **full imperative** build graph (Zig's `build.zig` model — a kardashev
+program with a `build(*Builder)` entry point, step dependencies and install
+artifacts) remains a future item.
 
 ## 8. Honest deferrals (tracked in ROADMAP-RUST-ZIG.md)
 
