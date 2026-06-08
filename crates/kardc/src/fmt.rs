@@ -11,7 +11,9 @@
 //! - 4-space indentation, one statement per line.
 //! - Items separated by a single blank line; file ends with one newline.
 //! - `pub fn name(a: T, b: T) R { … }` — return type follows the parens, no
-//!   arrow (Zig style).
+//!   arrow (Zig style). A compile-time type parameter prints with a leading
+//!   `comptime ` keyword — `fn max(comptime T: type, a: T, b: T) T { … }`
+//!   (SPEC §17).
 //! - Spaces around every binary operator (`a + b`, `a and b`).
 //! - `if (cond) { … } else if (cond) { … } else { … }`.
 //! - `while (cond) { … }` / `while (cond) : (cont) { … }`.
@@ -113,6 +115,12 @@ impl Printer {
         for (i, param) in f.params.iter().enumerate() {
             if i > 0 {
                 self.out.push_str(", ");
+            }
+            // A compile-time type parameter (`comptime T: type`, SPEC §17.1)
+            // prints with a leading `comptime ` keyword; everything else about
+            // the parameter list is unchanged.
+            if param.is_comptime {
+                self.out.push_str("comptime ");
             }
             self.out.push_str(&param.name);
             self.out.push_str(": ");
@@ -973,11 +981,13 @@ mod tests {
                     Param {
                         name: "a".to_string(),
                         ty: ty("i32"),
+                        is_comptime: false,
                         span: D,
                     },
                     Param {
                         name: "b".to_string(),
                         ty: ty("i32"),
+                        is_comptime: false,
                         span: D,
                     },
                 ],
@@ -1282,6 +1292,7 @@ mod tests {
                 params: vec![Param {
                     name: "n".to_string(),
                     ty: ty("i64"),
+                    is_comptime: false,
                     span: D,
                 }],
                 ret: ty("i64"),
@@ -1461,6 +1472,7 @@ mod tests {
             params: vec![Param {
                 name: "self".to_string(),
                 ty: ty("Counter"),
+                is_comptime: false,
                 span: D,
             }],
             ret: ty("i32"),
@@ -1666,6 +1678,7 @@ mod tests {
             params: vec![Param {
                 name: "x".to_string(),
                 ty: opt_ty("i32"),
+                is_comptime: false,
                 span: D,
             }],
             ret: opt_ty("i32"),
@@ -1752,6 +1765,7 @@ mod tests {
                 params: vec![Param {
                     name: "x".to_string(),
                     ty: opt_ty("i32"),
+                    is_comptime: false,
                     span: D,
                 }],
                 ret: ty("i32"),
@@ -1879,6 +1893,7 @@ mod tests {
             params: vec![Param {
                 name: "x".to_string(),
                 ty: err_ty("i32"),
+                is_comptime: false,
                 span: D,
             }],
             ret: err_ty("i32"),
@@ -1925,6 +1940,7 @@ mod tests {
                 params: vec![Param {
                     name: "s".to_string(),
                     ty: ty("i32"),
+                    is_comptime: false,
                     span: D,
                 }],
                 ret: err_ty("i32"),
@@ -2048,6 +2064,7 @@ mod tests {
                 params: vec![Param {
                     name: "c".to_string(),
                     ty: ty("Color"),
+                    is_comptime: false,
                     span: D,
                 }],
                 ret: ty("void"),
@@ -2098,6 +2115,7 @@ mod tests {
                 params: vec![Param {
                     name: "c".to_string(),
                     ty: ty("Color"),
+                    is_comptime: false,
                     span: D,
                 }],
                 ret: ty("i32"),
@@ -2155,6 +2173,7 @@ mod tests {
                 params: vec![Param {
                     name: "n".to_string(),
                     ty: ty("i32"),
+                    is_comptime: false,
                     span: D,
                 }],
                 ret: ty("void"),
@@ -2257,6 +2276,7 @@ mod tests {
             params: vec![Param {
                 name: "a".to_string(),
                 ty: arr_ty("i32", 2),
+                is_comptime: false,
                 span: D,
             }],
             ret: arr_ty("i32", 2),
@@ -2455,6 +2475,7 @@ mod tests {
             params: vec![Param {
                 name: "p".to_string(),
                 ty: ptr_ty("i32"),
+                is_comptime: false,
                 span: D,
             }],
             ret: slice_ty("i32"),
@@ -2618,5 +2639,157 @@ mod tests {
         assert_eq!(printed, expected);
         // Idempotence as determinism: re-printing yields identical bytes.
         assert_eq!(print_module(&m), printed);
+    }
+
+    // ----- comptime generics (v0.120) --------------------------------------
+
+    /// A compile-time type parameter `comptime <name>: type` (SPEC §17.1).
+    fn comptime_param(name: &str) -> Param {
+        Param {
+            name: name.to_string(),
+            ty: ty("type"),
+            is_comptime: true,
+            span: D,
+        }
+    }
+
+    /// An ordinary runtime parameter `<name>: <ty>`.
+    fn param(name: &str, t: TypeExpr) -> Param {
+        Param {
+            name: name.to_string(),
+            ty: t,
+            is_comptime: false,
+            span: D,
+        }
+    }
+
+    #[test]
+    fn generic_fn_param_prints_comptime_prefix() {
+        // The SPEC §17 example: `fn max(comptime T: type, a: T, b: T) T { … }`.
+        // The leading comptime type parameter prints with a `comptime ` prefix;
+        // the runtime params that use `T` as their type are unchanged, and the
+        // type-parameter names appear bare wherever they are used as types
+        // (params and return).
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "max".to_string(),
+                params: vec![
+                    comptime_param("T"),
+                    param("a", ty("T")),
+                    param("b", ty("T")),
+                ],
+                ret: ty("T"),
+                body: Block {
+                    stmts: vec![Stmt::If {
+                        cond: bin(BinOp::Gt, ident("a"), ident("b")),
+                        then: Block {
+                            stmts: vec![Stmt::Return {
+                                value: Some(ident("a")),
+                                span: D,
+                            }],
+                            span: D,
+                        },
+                        els: None,
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn max(comptime T: type, a: T, b: T) T {\n",
+            "    if (a > b) {\n",
+            "        return a;\n",
+            "    }\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn pub_generic_fn_with_only_comptime_param() {
+        // A `pub` generic whose sole parameter is a comptime type parameter: the
+        // `pub`, the `comptime ` prefix and the `: type` annotation all print.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: true,
+                name: "sizeName".to_string(),
+                params: vec![comptime_param("T")],
+                ret: ty("usize"),
+                body: Block {
+                    stmts: vec![Stmt::Return {
+                        value: Some(int(0)),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        assert_eq!(
+            print_module(&m),
+            "pub fn sizeName(comptime T: type) usize {\n    return 0;\n}\n"
+        );
+    }
+
+    #[test]
+    fn multiple_comptime_params_each_get_prefix() {
+        // More than one comptime type parameter: each leading param prints with
+        // its own `comptime ` prefix, and the runtime params (which may use any
+        // of the bound type names, including composite forms like `[]T`) are
+        // unchanged.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "pair".to_string(),
+                params: vec![
+                    comptime_param("T"),
+                    comptime_param("U"),
+                    param("xs", slice_ty("T")),
+                    param("y", ty("U")),
+                ],
+                ret: ty("U"),
+                body: Block {
+                    stmts: vec![Stmt::Return {
+                        value: Some(ident("y")),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        assert_eq!(
+            print_module(&m),
+            "fn pair(comptime T: type, comptime U: type, xs: []T, y: U) U {\n    return y;\n}\n"
+        );
+    }
+
+    #[test]
+    fn normal_fn_has_no_comptime_prefix() {
+        // A function with only runtime parameters never gains a `comptime `
+        // prefix — existing (non-generic) formatting is preserved exactly.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "id".to_string(),
+                params: vec![param("x", ty("i32"))],
+                ret: ty("i32"),
+                body: Block {
+                    stmts: vec![Stmt::Return {
+                        value: Some(ident("x")),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        assert_eq!(print_module(&m), "fn id(x: i32) i32 {\n    return x;\n}\n");
     }
 }

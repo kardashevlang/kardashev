@@ -647,6 +647,58 @@ Error-returning `alloc` (`![]T`), custom allocators / a vtable interface,
 `realloc`, aligned allocation, and comptime-generic `alloc` (the type argument
 is a builtin special-case until comptime generics land in v0.120).
 
+## 17. `comptime` generics (v0.120)
+
+Compile-time **type parameters** + **monomorphisation**: a generic function is
+specialised into one concrete C function per distinct type argument. v0.120
+covers generic *functions* only (no generic structs / type-returning functions
+/ comptime value params yet).
+
+### 17.1 Syntax & AST
+- A parameter `comptime IDENT: type` is a compile-time type parameter:
+  `Param.is_comptime = true`, `ty.name = "type"`. Comptime type parameters must
+  precede all runtime parameters. A function with ≥1 such parameter is
+  **generic**.
+- The generic function's runtime parameter types, return type and body may use
+  the type-parameter names as types (including composite forms `?T`, `[]T`,
+  `[N]T`, `*T`, `!T`).
+- No new call syntax: a call `g(T1, …, Tk, a1, …)` to a generic `g` passes the
+  first `k` arguments as **type arguments** (identifiers naming concrete types),
+  the rest as values.
+
+### 17.2 Semantics (`sema`)
+- A generic function is **not** checked in the normal body pass; it is checked
+  per instantiation.
+- At a call to generic `g`: the leading args (one per comptime param) must be
+  `Ident`s naming concrete types (resolved via the usual rules — `E0251` if
+  not); bind `type_param_name → Type` into a substitution; check the remaining
+  args against the **substituted** parameter types (with coercion); the result
+  is the substituted return type. Record the instantiation
+  (`StructTable::intern_instantiation`); if newly added, type-check the instance
+  body under the substitution — which may discover further instantiations
+  (process transitively via a worklist).
+- **Substitution** maps a `TypeExpr` whose `name` is a bound type parameter to
+  the bound `Type`, recursively through `?`/`!`/`[N]`/`*`/`[]` forms; otherwise
+  normal resolution.
+- Diagnostics: a comptime param not of kind `type` → `E0250`; a non-type type
+  argument → `E0251`; too few type arguments for a generic call → `E0252`.
+
+### 17.3 Backend (`emit_c`)
+- A generic function is **not** emitted directly. For each recorded
+  instantiation emit a specialised C function named
+  `StructTable::instantiation_c_name` (e.g. `kd_max__int32_t`) with the
+  substitution active so every type-parameter use resolves to the concrete
+  type. Forward-declare instances alongside ordinary functions.
+- A call `g(T1, …, a1, …)` to a generic function lowers to a call of the
+  instance's C name with **only the runtime args** (type arguments dropped).
+- Instance bodies reuse all existing statement/expression lowering under the
+  active substitution (which drives `cty`/`resolve_ty`/`type_of_expr`).
+
+### 17.4 Deferred (honest)
+Comptime **value** parameters (`comptime n: usize`), generic structs /
+type-returning functions (`fn List(comptime T: type) type`), comptime control
+flow, and `anytype`.
+
 ### 13.3 Backend (`emit_c`)
 Emit each enum among the dependency-ordered type defs (enums have no
 dependencies):

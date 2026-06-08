@@ -444,3 +444,28 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "5\n50\n139\n");
 }
+
+// --- v0.120 comptime generics ----------------------------------------------
+
+#[test]
+fn comptime_generics_monomorphised() {
+    let src = r#"
+fn max(comptime T: type, a: T, b: T) T {
+    if (a > b) { return a; }
+    return b;
+}
+fn max3(comptime T: type, a: T, b: T, c: T) T {
+    return max(T, max(T, a, b), c);   // generic calling generic, forwarding T
+}
+fn id(comptime T: type, x: T) T { return x; }
+pub fn main() i32 {
+    print(max(i32, 3, 9));        // 9   (max instantiated at i32)
+    print(max3(i32, 4, 11, 7));   // 11  (transitive i32 instantiation)
+    print(id(i32, 42));           // 42
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "9\n11\n42\n");
+}

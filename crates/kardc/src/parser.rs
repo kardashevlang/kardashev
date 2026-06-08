@@ -262,11 +262,33 @@ impl<'a> Parser<'a> {
             return Ok(params);
         }
         loop {
+            // An optional leading `comptime` keyword marks a compile-time type
+            // parameter `comptime IDENT: type` (SPEC §17.1). The rest of the
+            // parameter — `IDENT : type` — is parsed identically; for a comptime
+            // type parameter the type name is the literal `type`, but it is just
+            // an ordinary Ident-named `TypeExpr` here (sema gives `type`, and the
+            // "comptime params precede runtime params" rule, their meaning). A
+            // plain parameter has `is_comptime = false`.
+            let comptime_span = if self.at_kw(Kw::Comptime) {
+                let sp = self.peek_span();
+                self.bump(); // `comptime`
+                Some(sp)
+            } else {
+                None
+            };
             let (name, name_span) = self.expect_ident()?;
             self.expect_punct(&TokenKind::Colon, "`:`")?;
             let ty = self.parse_type()?;
-            let span = name_span.merge(ty.span);
-            params.push(Param { name, ty, span });
+            // The span covers the `comptime` keyword when present, so diagnostics
+            // about a comptime type parameter point at the whole declaration.
+            let start = comptime_span.unwrap_or(name_span);
+            let span = start.merge(ty.span);
+            params.push(Param {
+                name,
+                ty,
+                is_comptime: comptime_span.is_some(),
+                span,
+            });
             if self.eat_punct(&TokenKind::Comma) {
                 if self.at_punct(&TokenKind::RParen) {
                     break; // trailing comma
@@ -1342,7 +1364,9 @@ mod tests {
                 assert_eq!(f.params.len(), 2);
                 assert_eq!(f.params[0].name, "a");
                 assert_eq!(f.params[0].ty.name, "i32");
+                assert!(!f.params[0].is_comptime);
                 assert_eq!(f.params[1].name, "b");
+                assert!(!f.params[1].is_comptime);
                 assert_eq!(f.ret.name, "i32");
                 assert!(f.span.start < f.span.end);
                 assert_eq!(f.body.stmts.len(), 1);
@@ -3869,5 +3893,111 @@ mod tests {
         ]))
         .expect_err("`[]?i32` should fail");
         assert!(err.iter().any(|d| d.code == "E0200"));
+    }
+
+    // ---- v0.120: comptime generics ---------------------------------------
+
+    #[test]
+    fn comptime_type_param() {
+        // fn id(comptime T: type, x: T) T { return x; }
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("id"),
+            TokenKind::LParen,
+            TokenKind::Keyword(Kw::Comptime),
+            id("T"),
+            TokenKind::Colon,
+            id("type"),
+            TokenKind::Comma,
+            id("x"),
+            TokenKind::Colon,
+            id("T"),
+            TokenKind::RParen,
+            id("T"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            id("x"),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert_eq!(f.name, "id");
+                assert_eq!(f.params.len(), 2);
+                // The leading `comptime` marks the first param as a compile-time
+                // type parameter; its `ty.name` is the literal `type`.
+                assert!(f.params[0].is_comptime);
+                assert_eq!(f.params[0].name, "T");
+                assert_eq!(f.params[0].ty.name, "type");
+                // The span covers the `comptime` keyword too.
+                assert!(f.params[0].span.start < f.params[0].span.end);
+                // The runtime param is ordinary; its type names the type param.
+                assert!(!f.params[1].is_comptime);
+                assert_eq!(f.params[1].name, "x");
+                assert_eq!(f.params[1].ty.name, "T");
+                assert_eq!(f.ret.name, "T");
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn non_generic_fn_has_no_comptime_params() {
+        // fn add(a: i32, b: i32) i32 { return a + b; } — every param runtime.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("add"),
+            TokenKind::LParen,
+            id("a"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::Comma,
+            id("b"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::RParen,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            id("a"),
+            TokenKind::Plus,
+            id("b"),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert_eq!(f.params.len(), 2);
+                assert!(f.params.iter().all(|p| !p.is_comptime));
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn generic_call_parses_as_plain_call() {
+        // A generic call `id(i32, 5)` needs no new call syntax: the type
+        // argument is an ordinary `Ident` arg, so it parses as `Expr::Call`
+        // with two args (SPEC §17.1). Binding the first arg as a *type* argument
+        // is a sema/backend concern, not the parser's.
+        let e = parse_assign_rhs(vec![
+            id("id"),
+            TokenKind::LParen,
+            id("i32"),
+            TokenKind::Comma,
+            TokenKind::Int(5),
+            TokenKind::RParen,
+        ]);
+        match e {
+            Expr::Call { callee, args, .. } => {
+                assert_eq!(callee, "id");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(&args[0], Expr::Ident { name, .. } if name == "i32"));
+                assert!(matches!(args[1], Expr::Int { value: 5, .. }));
+            }
+            other => panic!("expected a plain call, got {:?}", other),
+        }
     }
 }

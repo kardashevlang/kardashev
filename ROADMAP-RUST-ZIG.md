@@ -97,9 +97,11 @@ The explicit `Allocator` value (`c_allocator()`) + `alloc(a, T, n) -> []T` /
 allocator. (Error-returning alloc, custom allocators, comptime-generic alloc:
 later.)
 
-### v0.120.0 — `comptime` generics: `fn F(comptime T: type) type`
-Real compile-time generics (containers, `ArrayList(T)`), monomorphised — Zig's
-metaprogramming model.
+### v0.120.0 — `comptime` generics (generic functions) ✅
+Generic functions `fn f(comptime T: type, …)`, **monomorphised** (one C function
+per concrete type argument), with transitive instantiation and type-parameter
+forwarding. Generic structs / type-returning functions (`fn List(comptime T:
+type) type`) and comptime *value* params are a later item.
 
 ### v0.121.0 — Type inference for `var`/`const`; the standard prelude
 Inferred local types; a small std built on the allocator interface.

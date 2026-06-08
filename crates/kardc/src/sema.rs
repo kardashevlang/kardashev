@@ -63,12 +63,16 @@
 //! - `E0241` — `alloc`'s second argument is not an identifier naming a type
 //!   (a builtin, struct or enum) (SPEC §16.1).
 //! - `E0242` — `free`'s second argument is not a slice (`[]T`) (SPEC §16.1).
+//! - `E0250` — a `comptime` parameter whose annotation is not `type` (SPEC §17.2).
+//! - `E0251` — a type argument to a generic-function call that does not name a
+//!   concrete type (SPEC §17.2).
+//! - `E0252` — too few type arguments for a generic-function call (SPEC §17.2).
 
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    BinOp, Block, Expr, FieldInit, Func, Item, Module, Stmt, StructDecl, SwitchArm, TestBlock,
-    TypeExpr, UnOp,
+    BinOp, Block, Expr, FieldInit, Func, Item, Module, Param, Stmt, StructDecl, SwitchArm,
+    TestBlock, TypeExpr, UnOp,
 };
 use crate::const_eval::{self, ConstVal};
 use crate::diag::Diagnostic;
@@ -133,6 +137,16 @@ struct Checker {
     loop_depth: usize,
     /// Return type of the function/test currently being checked.
     ret_type: Type,
+    /// The active type-parameter substitution while checking a generic
+    /// function's instantiated body (v0.120, SPEC §17.2). Empty during the
+    /// normal pass; when non-empty, `resolve_type` / `resolve_type_opt` map a
+    /// bound type-parameter name to its concrete [`Type`].
+    subst: HashMap<String, Type>,
+    /// Generic function definitions (any `comptime`-typed parameter), keyed by
+    /// name. Stored as full ASTs because a generic function is type-checked per
+    /// concrete instantiation at its call sites rather than in the normal body
+    /// pass (SPEC §17.2).
+    generics: HashMap<String, Func>,
 }
 
 impl Checker {
@@ -148,6 +162,8 @@ impl Checker {
             in_test: false,
             loop_depth: 0,
             ret_type: Type::Void,
+            subst: HashMap::new(),
+            generics: HashMap::new(),
         }
     }
 
@@ -245,6 +261,11 @@ impl Checker {
         }
 
         // Pass 1: collect function signatures so calls can forward-reference.
+        // A function with any `comptime`-typed parameter is *generic* (SPEC
+        // §17): its parameter/return/body types may use type-parameter names, so
+        // it is neither resolved nor body-checked in the normal pass. Instead it
+        // is stored whole and type-checked per concrete instantiation discovered
+        // at each call site (`check_generic_call`).
         for item in &m.items {
             if let Item::Func(f) = item {
                 if matches!(
@@ -257,13 +278,28 @@ impl Checker {
                         format!("cannot redefine builtin `{}`", f.name),
                     );
                 }
-                let params = f
-                    .params
-                    .iter()
-                    .map(|p| self.resolve_type_opt(&p.ty).unwrap_or(Type::I64))
-                    .collect();
-                let ret = self.resolve_type_opt(&f.ret).unwrap_or(Type::Void);
-                self.funcs.insert(f.name.clone(), FuncSig { params, ret });
+                if is_generic(f) {
+                    // Each `comptime` parameter must be annotated `type` (E0250).
+                    for p in &f.params {
+                        if p.is_comptime && !is_type_kw(&p.ty) {
+                            let msg = format!(
+                                "`comptime` parameter `{}` must be a type parameter \
+                                 (annotated `type`), found `{}`",
+                                p.name, p.ty.name
+                            );
+                            self.error(p.span, "E0250", msg);
+                        }
+                    }
+                    self.generics.insert(f.name.clone(), f.clone());
+                } else {
+                    let params = f
+                        .params
+                        .iter()
+                        .map(|p| self.resolve_type_opt(&p.ty).unwrap_or(Type::I64))
+                        .collect();
+                    let ret = self.resolve_type_opt(&f.ret).unwrap_or(Type::Void);
+                    self.funcs.insert(f.name.clone(), FuncSig { params, ret });
+                }
             }
         }
 
@@ -363,6 +399,9 @@ impl Checker {
         // Pass 3: type-check function and test bodies.
         for item in &m.items {
             match item {
+                // A generic function's body is checked per instantiation (those
+                // are discovered through calls during this pass), never directly.
+                Item::Func(f) if is_generic(f) => {}
                 Item::Func(f) => self.check_func(f),
                 Item::Test(t) => self.check_test(t),
                 Item::Const(_) => {}
@@ -466,28 +505,64 @@ impl Checker {
     /// here; the result is still a valid (zero-length) array type so callers do
     /// not additionally flag the name as unknown.
     fn resolve_type_opt(&mut self, te: &TypeExpr) -> Option<Type> {
-        let inner = Type::from_name(&te.name)
-            .or_else(|| self.structs.id_of(&te.name).map(Type::Struct))
-            .or_else(|| self.structs.enum_id_of(&te.name).map(Type::Enum))?;
-        // `*T` and `[]T` (v0.118) wrap the resolved base type, interning the
-        // pointer / slice type the moment a signature, field or local mentions
-        // it (SPEC §15). They are not combined with `?`/`!`/`[N]` in this
-        // version, so they take precedence and return directly.
+        // A bound type parameter (under the active substitution, SPEC §17.2)
+        // takes priority over the ordinary name lookup; otherwise this is the
+        // normal builtin / struct / enum resolution. During the normal pass the
+        // substitution is empty, so behaviour is unchanged.
+        let inner = match self.subst.get(&te.name).copied() {
+            Some(t) => t,
+            None => self.resolve_base(&te.name)?,
+        };
+        Some(self.wrap_type(inner, te))
+    }
+
+    /// Like [`resolve_type_opt`], but consults an explicit substitution `subst`
+    /// instead of the (caller-context) `self.subst`. Used at a generic call site
+    /// to resolve the callee's runtime-parameter and return types under the
+    /// callee's freshly-built substitution while `self.subst` still holds the
+    /// caller's (SPEC §17.2).
+    fn resolve_type_opt_with(
+        &mut self,
+        te: &TypeExpr,
+        subst: &HashMap<String, Type>,
+    ) -> Option<Type> {
+        let inner = match subst.get(&te.name).copied() {
+            Some(t) => t,
+            None => self.resolve_base(&te.name)?,
+        };
+        Some(self.wrap_type(inner, te))
+    }
+
+    /// Resolve a bare type *name* (no `?`/`!`/`[N]`/`*`/`[]` wrappers) to a
+    /// builtin, a registered struct, or an enum, without consulting any
+    /// substitution. Returns `None` for an unknown name.
+    fn resolve_base(&self, name: &str) -> Option<Type> {
+        Type::from_name(name)
+            .or_else(|| self.structs.id_of(name).map(Type::Struct))
+            .or_else(|| self.structs.enum_id_of(name).map(Type::Enum))
+    }
+
+    /// Apply a [`TypeExpr`]'s composite wrappers around an already-resolved base
+    /// type `inner`, interning the resulting composite type. `*T` and `[]T`
+    /// (v0.118) take precedence and return directly (they are not combined with
+    /// `?`/`!`/`[N]` in v1); then `[N]T` (v0.117), then `?T` (v0.114) / `!T`
+    /// (v0.115); a bare name returns `inner` unchanged.
+    fn wrap_type(&mut self, inner: Type, te: &TypeExpr) -> Type {
         if te.pointer {
-            return Some(Type::Ptr(self.structs.intern_ptr(inner)));
+            return Type::Ptr(self.structs.intern_ptr(inner));
         }
         if te.slice {
-            return Some(Type::Slice(self.structs.intern_slice(inner)));
+            return Type::Slice(self.structs.intern_slice(inner));
         }
         if let Some(n) = te.array_len {
-            return Some(Type::Array(self.intern_array_len(inner, n, te.span)));
+            return Type::Array(self.intern_array_len(inner, n, te.span));
         }
         if te.optional {
-            Some(Type::Optional(self.structs.intern_optional(inner)))
+            Type::Optional(self.structs.intern_optional(inner))
         } else if te.error_union {
-            Some(Type::ErrorUnion(self.structs.intern_error_union(inner)))
+            Type::ErrorUnion(self.structs.intern_error_union(inner))
         } else {
-            Some(inner)
+            inner
         }
     }
 
@@ -544,25 +619,10 @@ impl Checker {
             self.error(te.span, "E0161", format!("unknown type `{}`", te.name));
             return None;
         };
-        // `*T` / `[]T` fields (v0.118): wrap the resolved base type. Like
-        // arrays, the base resolves under the same forward/cyclic-reference
-        // rules (`E0160`) used above.
-        if te.pointer {
-            return Some(Type::Ptr(self.structs.intern_ptr(inner)));
-        }
-        if te.slice {
-            return Some(Type::Slice(self.structs.intern_slice(inner)));
-        }
-        if let Some(n) = te.array_len {
-            return Some(Type::Array(self.intern_array_len(inner, n, te.span)));
-        }
-        if te.optional {
-            Some(Type::Optional(self.structs.intern_optional(inner)))
-        } else if te.error_union {
-            Some(Type::ErrorUnion(self.structs.intern_error_union(inner)))
-        } else {
-            Some(inner)
-        }
+        // Apply any `*T` / `[]T` / `[N]T` / `?T` / `!T` wrappers around the
+        // resolved base type (the base having passed the forward/cyclic-reference
+        // rules above). Identical to the wrapping in `resolve_type_opt`.
+        Some(self.wrap_type(inner, te))
     }
 
     // ---- statements -------------------------------------------------------
@@ -2333,6 +2393,13 @@ impl Checker {
                 Some(Type::Void)
             }
             _ => {
+                // A generic function (any `comptime` type parameter) resolves
+                // through monomorphisation, never the ordinary signature path
+                // (SPEC §17.2). Its first arguments are type arguments, not
+                // values, so this must precede the `funcs` lookup.
+                if let Some(gen) = self.generics.get(callee).cloned() {
+                    return self.check_generic_call(&gen, args, span);
+                }
                 if let Some(sig) = self.funcs.get(callee).cloned() {
                     if args.len() != sig.params.len() {
                         self.error(
@@ -2375,6 +2442,170 @@ impl Checker {
             }
         }
     }
+
+    // ---- comptime generics (v0.120) ---------------------------------------
+
+    /// Type-check a call `g(T1, …, Tk, a1, …)` to the generic function `gen`
+    /// (SPEC §17.2). The leading arguments — one per `comptime` type parameter —
+    /// must be identifiers naming concrete types; they build a substitution
+    /// under which the remaining (runtime) arguments are checked against the
+    /// substituted parameter types and which yields the substituted return type.
+    /// A newly-seen instantiation is recorded and its body type-checked under the
+    /// substitution, which may transitively discover further instantiations.
+    fn check_generic_call(&mut self, gen: &Func, args: &[Expr], span: Span) -> Option<Type> {
+        let comptime_params: Vec<&Param> = gen.params.iter().filter(|p| p.is_comptime).collect();
+        let runtime_params: Vec<&Param> = gen.params.iter().filter(|p| !p.is_comptime).collect();
+        let k = comptime_params.len();
+
+        // Too few arguments to bind every type parameter (E0252). The provided
+        // arguments are all (intended) type names, so they are not value-checked.
+        if args.len() < k {
+            let msg = format!(
+                "generic function `{}` needs {} type argument(s), found {}",
+                gen.name,
+                k,
+                args.len()
+            );
+            self.error(span, "E0252", msg);
+            return None;
+        }
+
+        // Resolve the leading type arguments and build the substitution. A type
+        // argument must be an identifier naming a concrete type (E0251).
+        let mut type_args: Vec<Type> = Vec::with_capacity(k);
+        let mut subst: HashMap<String, Type> = HashMap::new();
+        let mut subst_ok = true;
+        for (i, cp) in comptime_params.iter().enumerate() {
+            match self.resolve_type_arg_generic(&args[i]) {
+                Some(t) => {
+                    type_args.push(t);
+                    subst.insert(cp.name.clone(), t);
+                }
+                None => subst_ok = false,
+            }
+        }
+        let runtime_args = &args[k..];
+        if !subst_ok {
+            // A type argument failed to resolve (E0251 already emitted); still
+            // surface any errors in the runtime arguments, then bail to avoid
+            // cascading mismatches against an incomplete substitution.
+            for a in runtime_args {
+                self.check_expr(a, None);
+            }
+            return None;
+        }
+
+        // The runtime-parameter types and return type, resolved under `subst`.
+        let mut param_tys: Vec<Type> = Vec::with_capacity(runtime_params.len());
+        for p in &runtime_params {
+            param_tys.push(self.resolve_type_opt_with(&p.ty, &subst).unwrap_or(Type::I64));
+        }
+        let ret_ty = self.resolve_type_opt_with(&gen.ret, &subst).unwrap_or(Type::Void);
+
+        if runtime_args.len() != param_tys.len() {
+            let msg = format!(
+                "`{}` takes {} value argument(s) after {} type argument(s), found {}",
+                gen.name,
+                param_tys.len(),
+                k,
+                runtime_args.len()
+            );
+            self.error(span, "E0110", msg);
+            for a in runtime_args {
+                self.check_expr(a, None);
+            }
+            return Some(ret_ty);
+        }
+
+        // Check each runtime argument against its substituted parameter type,
+        // applying the usual optional / error-union coercions (§11.2, §12.2).
+        for (a, &pt) in runtime_args.iter().zip(param_tys.iter()) {
+            if let Some(at) = self.check_coerce(a, pt) {
+                if at != pt {
+                    let msg = format!(
+                        "argument type mismatch: expected `{}`, found `{}`",
+                        self.type_name(pt),
+                        self.type_name(at)
+                    );
+                    self.error(a.span(), "E0110", msg);
+                }
+            }
+        }
+
+        // Record the instantiation; if newly seen, type-check the body under the
+        // substitution (which may discover further instantiations through nested
+        // generic calls). The dedup in `intern_instantiation` bounds recursion
+        // for (mutually) recursive generics with identical type arguments.
+        if self.structs.intern_instantiation(&gen.name, type_args) {
+            self.check_instance_body(gen, subst);
+        }
+        Some(ret_ty)
+    }
+
+    /// Resolve a generic call's type argument (SPEC §17.2): it must be an
+    /// identifier naming a concrete type — a bound type parameter (via the active
+    /// substitution, for a generic calling another generic), a builtin, a
+    /// struct, or an enum. Anything else is `E0251`.
+    fn resolve_type_arg_generic(&mut self, arg: &Expr) -> Option<Type> {
+        match arg {
+            Expr::Ident { name, span } => {
+                let resolved = self.subst.get(name).copied().or_else(|| self.resolve_base(name));
+                match resolved {
+                    Some(t) => Some(t),
+                    None => {
+                        let msg = format!("type argument `{}` does not name a type", name);
+                        self.error(*span, "E0251", msg);
+                        None
+                    }
+                }
+            }
+            other => {
+                self.error(
+                    other.span(),
+                    "E0251",
+                    "a generic call's type argument must be an identifier naming a type",
+                );
+                None
+            }
+        }
+    }
+
+    /// Type-check one monomorphised instantiation of a generic function: its
+    /// body, under the substitution `subst` (SPEC §17.2). Saves and restores the
+    /// whole per-function checking context (substitution, return type, test /
+    /// loop state, scope stack) so this may be called re-entrantly from the
+    /// middle of checking another body (a generic call nested inside a body).
+    fn check_instance_body(&mut self, f: &Func, subst: HashMap<String, Type>) {
+        let saved_subst = std::mem::replace(&mut self.subst, subst);
+        let saved_ret = self.ret_type;
+        let saved_in_test = self.in_test;
+        let saved_loop = self.loop_depth;
+        let saved_scopes = std::mem::take(&mut self.scopes);
+
+        // With `self.subst` active, the return type and runtime-parameter types
+        // resolve their type-parameter uses to concrete types.
+        self.ret_type = self.resolve_type(&f.ret).unwrap_or(Type::Void);
+        self.in_test = false;
+        self.loop_depth = 0;
+        self.scopes.push(HashMap::new());
+        for p in &f.params {
+            // Comptime type parameters are not runtime values; only the runtime
+            // parameters become (immutable) locals.
+            if p.is_comptime {
+                continue;
+            }
+            let pt = self.resolve_type(&p.ty).unwrap_or(Type::I64);
+            self.define(&p.name, pt, true);
+        }
+        self.check_block(&f.body);
+        self.scopes.pop();
+
+        self.subst = saved_subst;
+        self.ret_type = saved_ret;
+        self.in_test = saved_in_test;
+        self.loop_depth = saved_loop;
+        self.scopes = saved_scopes;
+    }
 }
 
 /// A "flexible" integer literal whose type is determined solely by context: a
@@ -2399,6 +2630,25 @@ fn is_addressable_place(e: &Expr) -> bool {
         e,
         Expr::Ident { .. } | Expr::Field { .. } | Expr::Index { .. } | Expr::Deref { .. }
     )
+}
+
+/// Whether `f` is a generic function — one with at least one `comptime` type
+/// parameter (SPEC §17.1). Generic functions are monomorphised per concrete
+/// instantiation, not checked or emitted directly.
+fn is_generic(f: &Func) -> bool {
+    f.params.iter().any(|p| p.is_comptime)
+}
+
+/// Whether a [`TypeExpr`] is exactly the bare type keyword `type` — the only
+/// valid annotation for a `comptime` type parameter (SPEC §17.2). Any wrapper
+/// (`?`/`!`/`[N]`/`*`/`[]`) or other name makes it not a plain `type`.
+fn is_type_kw(te: &TypeExpr) -> bool {
+    te.name == "type"
+        && !te.optional
+        && !te.error_union
+        && te.array_len.is_none()
+        && !te.pointer
+        && !te.slice
 }
 
 #[cfg(test)]
@@ -2546,6 +2796,7 @@ mod tests {
         Param {
             name: name.into(),
             ty: te_arr(elem, len),
+            is_comptime: false,
             span: sp(),
         }
     }
@@ -2609,6 +2860,7 @@ mod tests {
         Param {
             name: name.into(),
             ty: te_opt(inner),
+            is_comptime: false,
             span: sp(),
         }
     }
@@ -2670,6 +2922,26 @@ mod tests {
         Param {
             name: name.into(),
             ty: te(ty),
+            is_comptime: false,
+            span: sp(),
+        }
+    }
+    /// A `comptime IDENT: type` type parameter (v0.120).
+    fn param_comptime(name: &str) -> Param {
+        Param {
+            name: name.into(),
+            ty: te("type"),
+            is_comptime: true,
+            span: sp(),
+        }
+    }
+    /// A `comptime IDENT: ty` parameter with a *non*-`type` annotation — only
+    /// used to exercise the `E0250` diagnostic.
+    fn param_comptime_bad(name: &str, ty: &str) -> Param {
+        Param {
+            name: name.into(),
+            ty: te(ty),
+            is_comptime: true,
             span: sp(),
         }
     }
@@ -2801,6 +3073,19 @@ mod tests {
         match check(&m) {
             Ok(_) => vec![],
             Err(ds) => ds.iter().map(|d| d.code).collect(),
+        }
+    }
+
+    /// Check a module that is expected to pass, returning the built
+    /// [`StructTable`] (so tests can inspect e.g. recorded instantiations).
+    fn check_ok(items: Vec<Item>) -> StructTable {
+        let m = Module { items };
+        match check(&m) {
+            Ok(table) => table,
+            Err(ds) => panic!(
+                "expected program to type-check, got diagnostics: {:?}",
+                ds.iter().map(|d| d.code).collect::<Vec<_>>()
+            ),
         }
     }
 
@@ -4608,6 +4893,7 @@ mod tests {
                 params: vec![Param {
                     name: "p".into(),
                     ty: te_ptr("i32"),
+                    is_comptime: false,
                     span: sp(),
                 }],
                 ret: te("i32"),
@@ -4800,6 +5086,7 @@ mod tests {
                 params: vec![Param {
                     name: "s".into(),
                     ty: te_slice("i32"),
+                    is_comptime: false,
                     span: sp(),
                 }],
                 ret: te("usize"),
@@ -5092,6 +5379,317 @@ mod tests {
             "void",
             vec![let_var("a", "Allocator", call("c_allocator", vec![int(5)]))],
         )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    // ---- comptime generics (v0.120) ---------------------------------------
+
+    /// `fn max(comptime T: type, a: T, b: T) T { if (a > b) { return a; } return b; }`
+    fn generic_max() -> Item {
+        func(
+            "max",
+            vec![param_comptime("T"), param("a", "T"), param("b", "T")],
+            "T",
+            vec![
+                Stmt::If {
+                    cond: bin(BinOp::Gt, ident("a"), ident("b")),
+                    then: block(vec![ret(Some(ident("a")))]),
+                    els: None,
+                    span: sp(),
+                },
+                ret(Some(ident("b"))),
+            ],
+        )
+    }
+
+    #[test]
+    fn generic_two_instantiations_recorded() {
+        // Calling `max` at i32 and i64 records exactly two instantiations, and
+        // its body type-checks under each substitution.
+        let items = vec![
+            generic_max(),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("x", "i32", call("max", vec![ident("i32"), int(1), int(2)])),
+                    let_var("y", "i64", call("max", vec![ident("i64"), int(3), int(4)])),
+                    Stmt::Expr(call("print", vec![ident("x")])),
+                ],
+            ),
+        ];
+        let table = check_ok(items);
+        let insts = table.instantiations();
+        assert_eq!(insts.len(), 2, "expected two instantiations: {:?}", insts);
+        assert!(insts
+            .iter()
+            .any(|i| i.fn_name == "max" && i.type_args == vec![Type::I32]));
+        assert!(insts
+            .iter()
+            .any(|i| i.fn_name == "max" && i.type_args == vec![Type::I64]));
+    }
+
+    #[test]
+    fn generic_returning_type_param_ok() {
+        // fn id(comptime T: type, a: T) T { return a; }
+        // fn main() void { var x: i32 = id(i32, 5); print(x); }
+        let items = vec![
+            func(
+                "id",
+                vec![param_comptime("T"), param("a", "T")],
+                "T",
+                vec![ret(Some(ident("a")))],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("x", "i32", call("id", vec![ident("i32"), int(5)])),
+                    Stmt::Expr(call("print", vec![ident("x")])),
+                ],
+            ),
+        ];
+        let table = check_ok(items);
+        assert_eq!(table.instantiations().len(), 1);
+        assert!(table
+            .instantiations()
+            .iter()
+            .any(|i| i.fn_name == "id" && i.type_args == vec![Type::I32]));
+    }
+
+    #[test]
+    fn generic_local_of_type_param_resolves_under_subst() {
+        // fn dup(comptime T: type, a: T) T { var b: T = a; return b; }
+        // The local `b: T` resolves to the concrete type via the substitution.
+        let items = vec![
+            func(
+                "dup",
+                vec![param_comptime("T"), param("a", "T")],
+                "T",
+                vec![
+                    let_var("b", "T", ident("a")),
+                    ret(Some(ident("b"))),
+                ],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("x", "i32", call("dup", vec![ident("i32"), int(7)]))],
+            ),
+        ];
+        let table = check_ok(items);
+        assert_eq!(table.instantiations().len(), 1);
+    }
+
+    #[test]
+    fn generic_body_type_checked_under_subst_is_e0110() {
+        // fn bad(comptime T: type, a: T) T { return true; }  — instantiated at
+        // i32, the body's `return true` mismatches the substituted return `i32`.
+        let items = vec![
+            func(
+                "bad",
+                vec![param_comptime("T"), param("a", "T")],
+                "T",
+                vec![ret(Some(boolean(true)))],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("x", "i32", call("bad", vec![ident("i32"), int(5)]))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn uninstantiated_generic_body_is_not_checked() {
+        // A generic function that is never called is never body-checked, so the
+        // unknown name in its body does not surface (no normal-pass check).
+        let items = vec![
+            func(
+                "neverused",
+                vec![param_comptime("T"), param("a", "T")],
+                "T",
+                vec![ret(Some(ident("undefined_name")))],
+            ),
+            func("main", vec![], "void", vec![]),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn generic_calling_generic_records_transitive_instantiation() {
+        // fn inner(comptime T: type, a: T) T { return a; }
+        // fn outer(comptime T: type, a: T) T { return inner(T, a); }
+        // fn main() void { var x: i32 = outer(i32, 5); print(x); }
+        let items = vec![
+            func(
+                "inner",
+                vec![param_comptime("T"), param("a", "T")],
+                "T",
+                vec![ret(Some(ident("a")))],
+            ),
+            func(
+                "outer",
+                vec![param_comptime("T"), param("a", "T")],
+                "T",
+                vec![ret(Some(call("inner", vec![ident("T"), ident("a")])))],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("x", "i32", call("outer", vec![ident("i32"), int(5)])),
+                    Stmt::Expr(call("print", vec![ident("x")])),
+                ],
+            ),
+        ];
+        let table = check_ok(items);
+        let insts = table.instantiations();
+        assert_eq!(insts.len(), 2, "expected outer + inner: {:?}", insts);
+        assert!(insts
+            .iter()
+            .any(|i| i.fn_name == "outer" && i.type_args == vec![Type::I32]));
+        assert!(insts
+            .iter()
+            .any(|i| i.fn_name == "inner" && i.type_args == vec![Type::I32]));
+    }
+
+    #[test]
+    fn recursive_generic_terminates() {
+        // A self-recursive generic at the same type argument records a single
+        // instantiation (the dedup in `intern_instantiation` bounds recursion).
+        // fn rec(comptime T: type, a: T) T { return rec(T, a); }
+        let items = vec![
+            func(
+                "rec",
+                vec![param_comptime("T"), param("a", "T")],
+                "T",
+                vec![ret(Some(call("rec", vec![ident("T"), ident("a")])))],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("x", "i32", call("rec", vec![ident("i32"), int(1)]))],
+            ),
+        ];
+        let table = check_ok(items);
+        assert_eq!(table.instantiations().len(), 1);
+    }
+
+    #[test]
+    fn non_type_argument_is_e0251() {
+        // fn id(comptime T: type, a: T) T { return a; }
+        // fn main() void { var x: i32 = id(5, 3); }  — `5` is not a type name.
+        let items = vec![
+            func(
+                "id",
+                vec![param_comptime("T"), param("a", "T")],
+                "T",
+                vec![ret(Some(ident("a")))],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("x", "i32", call("id", vec![int(5), int(3)]))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0251"));
+    }
+
+    #[test]
+    fn missing_type_argument_is_e0252() {
+        // fn id(comptime T: type, a: T) T { return a; }
+        // fn main() void { var x: i32 = id(); }  — no type argument supplied.
+        let items = vec![
+            func(
+                "id",
+                vec![param_comptime("T"), param("a", "T")],
+                "T",
+                vec![ret(Some(ident("a")))],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("x", "i32", call("id", vec![]))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0252"));
+    }
+
+    #[test]
+    fn comptime_non_type_annotation_is_e0250() {
+        // fn f(comptime x: i32) void { }  — a comptime param must be `type`.
+        let items = vec![func(
+            "f",
+            vec![param_comptime_bad("x", "i32")],
+            "void",
+            vec![],
+        )];
+        assert!(codes(items).contains(&"E0250"));
+    }
+
+    #[test]
+    fn generic_with_struct_type_argument_ok() {
+        // const Point = struct { x: i32, y: i32 };
+        // fn id(comptime T: type, a: T) T { return a; }
+        // fn main() void { var p: Point = Point{ .x = 1, .y = 2 }; var q: Point = id(Point, p); }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32"), ("y", "i32")]),
+            func(
+                "id",
+                vec![param_comptime("T"), param("a", "T")],
+                "T",
+                vec![ret(Some(ident("a")))],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var(
+                        "p",
+                        "Point",
+                        struct_lit("Point", vec![("x", int(1)), ("y", int(2))]),
+                    ),
+                    let_var("q", "Point", call("id", vec![ident("Point"), ident("p")])),
+                ],
+            ),
+        ];
+        let table = check_ok(items);
+        let pid = table.id_of("Point").expect("Point interned");
+        assert!(table
+            .instantiations()
+            .iter()
+            .any(|i| i.fn_name == "id" && i.type_args == vec![Type::Struct(pid)]));
+    }
+
+    #[test]
+    fn generic_argument_type_mismatch_is_e0110() {
+        // fn id(comptime T: type, a: T) T { return a; }
+        // fn main() void { var x: i32 = id(i32, true); }  — `true` is not i32.
+        let items = vec![
+            func(
+                "id",
+                vec![param_comptime("T"), param("a", "T")],
+                "T",
+                vec![ret(Some(ident("a")))],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("x", "i32", call("id", vec![ident("i32"), boolean(true)]))],
+            ),
+        ];
         assert!(codes(items).contains(&"E0110"));
     }
 }
