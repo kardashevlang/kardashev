@@ -1,6 +1,0 @@
-# Export the docs so //tests:smoke_test_doclint (the Phase 32 truth-pass guard)
-# can read them in the Bazel sandbox.
-exports_files(
-    glob(["*.md"]),
-    visibility = ["//visibility:public"],
-)

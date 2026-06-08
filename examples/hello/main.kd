@@ -1,7 +1,0 @@
-mod util;
-
-fn main() -> i64 ! { io } {
-    print(double(7));
-    print(quadruple(5));
-    0
-}

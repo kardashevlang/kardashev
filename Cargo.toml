@@ -1,0 +1,20 @@
+# kardashev — Gen 2.
+#
+# A ground-up Rust reimplementation of the kardashev toolchain, redesigned
+# around Zig's philosophy:
+#   * No hidden control flow and no hidden allocations.
+#   * Compile-time evaluation (`comptime`) instead of a macro preprocessor.
+#   * Explicit cleanup with `defer`.
+#   * Built-in tests as a first-class language construct.
+#   * A single self-contained toolchain binary (`kard`) that is the compiler,
+#     the build system, the test runner and the formatter all at once.
+#
+# The implementation itself is plain Rust with ZERO external dependencies — the
+# same self-contained spirit, applied to the compiler.
+[workspace]
+members = ["crates/kardc"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

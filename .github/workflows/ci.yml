@@ -35,58 +35,34 @@ jobs:
           echo "--- workspace contents ---"
           ls -la
 
-      - name: Install LLVM (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install llvm
-          echo "/opt/homebrew/opt/llvm/bin" >> "$GITHUB_PATH"
-
-      - name: Install LLVM (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y llvm-dev clang
-          LLVM_CFG=$(command -v llvm-config || ls /usr/bin/llvm-config* | head -1)
-          echo "LLVM_CONFIG=$LLVM_CFG" >> "$GITHUB_ENV"
-
-      - name: Install Bazelisk
+      # The kardashev toolchain is plain Rust (std only, zero crates) and shells
+      # out to the system C compiler for its backend. Both Rust and a C compiler
+      # are preinstalled on GitHub-hosted runners; we just confirm they exist.
+      - name: Toolchain versions
         shell: bash
         run: |
           set -euo pipefail
-          BAZELISK_VERSION="v1.29.0"
-          case "$RUNNER_OS" in
-            Linux)  ASSET="bazelisk-linux-amd64" ;;
-            macOS)  ASSET="bazelisk-darwin-arm64" ;;
-            *)      echo "Unsupported runner OS: $RUNNER_OS" >&2; exit 1 ;;
-          esac
-          URL="https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/${ASSET}"
-          echo "Downloading $URL"
-          sudo curl -fsSL -o /usr/local/bin/bazel "$URL"
-          sudo chmod +x /usr/local/bin/bazel
-          bazel --version
+          rustc --version
+          cargo --version
+          if command -v cc >/dev/null 2>&1; then cc --version | head -1
+          elif command -v clang >/dev/null 2>&1; then clang --version | head -1
+          elif command -v gcc >/dev/null 2>&1; then gcc --version | head -1
+          else echo "no C compiler found" >&2; exit 1; fi
 
-      - name: Bazel build
-        run: bazel build //...
+      - name: Build (release)
+        run: cargo build --release --workspace
 
-      - name: Bazel test
-        run: bazel test //... --test_output=errors
+      - name: Test
+        run: cargo test --workspace -- --nocapture
 
-      # Surface every failing test's captured log (Bazel keeps them under
-      # bazel-testlogs/ but an Aborted test prints nothing to the console with
-      # --test_output=errors). Lets a red CI be diagnosed from the run log alone.
-      - name: Dump failing test logs
-        if: failure()
+      # Smoke-test the real toolchain end-to-end: scaffold a project, build it,
+      # run it, and run its tests — exercising lex→parse→sema→emit-C→cc→native.
+      - name: Toolchain smoke test
         shell: bash
         run: |
-          echo "=== failing test logs (bazel-testlogs) ==="
-          if [ -d bazel-testlogs ]; then
-            find -L bazel-testlogs -name 'test.log' | while read -r log; do
-              # Only the failures: a passing test.log starts with a PASSED banner.
-              if ! grep -q 'PASSED' "$log" 2>/dev/null; then
-                echo "########## $log ##########"
-                tail -80 "$log" || true
-              fi
-            done
-          else
-            echo "(no bazel-testlogs directory)"
-          fi
+          set -euo pipefail
+          KARD="$(pwd)/target/release/kard"
+          "$KARD" version
+          tmp="$(mktemp -d)"
+          "$KARD" init "$tmp/demo"
+          ( cd "$tmp/demo" && "$KARD" build && "$KARD" run && "$KARD" test )

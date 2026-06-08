@@ -1,5 +1,0 @@
-# Root package. Exists so the `kard` shell wrapper (a source file at the repo
-# root) can be referenced as a label (`//:kard`) from test `data` — the
-# manifest smoke test drives `kard build` / `kard run`. `exports_files` is
-# purely declarative (no build actions), so it doesn't touch the C++ build.
-exports_files(["kard"])
