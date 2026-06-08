@@ -103,6 +103,9 @@ pub struct TypeExpr {
     /// True if written as `!T` (an error union). v0.115: implicit global error
     /// set; not combined with `optional`.
     pub error_union: bool,
+    /// `Some(N)` if written as `[N]T` (a fixed-size array of `N` elements);
+    /// `name` is then the element type. v0.117: not combined with `?`/`!`.
+    pub array_len: Option<i64>,
     pub span: Span,
 }
 
@@ -340,6 +343,19 @@ pub enum Expr {
     /// `.Variant` — an unqualified enum literal; its enum type comes from
     /// context. (The qualified form `Enum.Variant` reuses [`Expr::Field`].)
     EnumLit { variant: String, span: Span },
+    /// An array literal `[N]T{ e0, e1, … }` with exactly `N` elements.
+    ArrayLit {
+        elem: TypeExpr,
+        elems: Vec<Expr>,
+        span: Span,
+    },
+    /// Indexing `base[index]` (read). Index assignment reuses
+    /// [`Stmt::FieldAssign`] with an `Index` place.
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
     /// `try expr` — unwrap an error union `!T`, or propagate the error by
     /// returning it from the enclosing `!U` function. v0.115: statement-level.
     Try { expr: Box<Expr>, span: Span },
@@ -379,6 +395,8 @@ impl Expr {
             Expr::Try { span, .. } => *span,
             Expr::Catch { span, .. } => *span,
             Expr::EnumLit { span, .. } => *span,
+            Expr::ArrayLit { span, .. } => *span,
+            Expr::Index { span, .. } => *span,
         }
     }
 }

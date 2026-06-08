@@ -430,15 +430,19 @@ impl Printer {
 
 // ----- types ----------------------------------------------------------------
 
-/// Format a type reference (SPEC §11.1 / §12.1). An optional type
-/// (`TypeExpr.optional`) prints with a leading `?` — e.g. `?i32` — an error
-/// union (`TypeExpr.error_union`) prints with a leading `!` — e.g. `!i32` — and
-/// a plain type prints as its bare name. The two qualifiers are mutually
-/// exclusive (v0.115: `?` and `!` are never combined), so at most one prefix is
-/// emitted. Used wherever a type appears: params, return types, `var`/`const`
-/// annotations and struct fields.
+/// Format a type reference (SPEC §11.1 / §12.1 / §14.1). A fixed-size array
+/// (`TypeExpr.array_len = Some(N)`) prints with a leading `[N]` — e.g. `[3]i32`
+/// — an optional type (`TypeExpr.optional`) prints with a leading `?` — e.g.
+/// `?i32` — an error union (`TypeExpr.error_union`) prints with a leading `!` —
+/// e.g. `!i32` — and a plain type prints as its bare name. The three qualifiers
+/// are mutually exclusive (v0.115: `?` and `!` are never combined; v0.117: `[N]`
+/// is not combined with either), so at most one prefix is emitted. Used wherever
+/// a type appears: params, return types, `var`/`const` annotations and struct
+/// fields.
 fn fmt_type(ty: &TypeExpr) -> String {
-    if ty.optional {
+    if let Some(n) = ty.array_len {
+        format!("[{}]{}", n, ty.name)
+    } else if ty.optional {
         format!("?{}", ty.name)
     } else if ty.error_union {
         format!("!{}", ty.name)
@@ -467,6 +471,10 @@ fn expr_prec(e: &Expr) -> u8 {
         | Expr::ErrorLit { .. }
         // `.Variant` is atomic — an unqualified enum literal binds as a primary.
         | Expr::EnumLit { .. }
+        // An array literal `[N]T{ … }` is a primary; indexing `a[i]` is postfix.
+        // Both bind tightest (SPEC §14.1).
+        | Expr::ArrayLit { .. }
+        | Expr::Index { .. }
         | Expr::Unwrap { .. } => 8,
         Expr::Comptime { .. } => 7,
         // `try expr` is a prefix form (SPEC §12.1), at the same binding power as
@@ -661,6 +669,39 @@ fn fmt_expr(e: &Expr) -> String {
         // comes from context. The qualified form `Enum.Variant` is an
         // [`Expr::Field`] off an `Ident` base and prints there. Atomic.
         Expr::EnumLit { variant, .. } => format!(".{}", variant),
+        // An array literal `[N]T{ e0, e1, … }` (SPEC §14.1). The `elem` field is
+        // the array's own `[N]T` type expression, so its [`fmt_type`] rendering
+        // already carries the `[N]` prefix and the element name. Elements join
+        // with `, ` inside `{ … }`, mirroring struct-literal spacing; an empty
+        // literal collapses to `[N]T{}`.
+        Expr::ArrayLit { elem, elems, .. } => {
+            let head = fmt_type(elem);
+            if elems.is_empty() {
+                return format!("{}{{}}", head);
+            }
+            let mut s = String::new();
+            s.push_str(&head);
+            s.push_str("{ ");
+            for (i, e) in elems.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&fmt_expr(e));
+            }
+            s.push_str(" }");
+            s
+        }
+        // Indexing `base[index]` (SPEC §14.1). Indexing is postfix and binds as a
+        // primary, so a base that is not itself primary/postfix is parenthesised
+        // to stay total and idempotent; the parser never produces such a base.
+        // The index is a full expression and prints bare inside the brackets.
+        Expr::Index { base, index, .. } => {
+            if expr_prec(base) >= 8 {
+                format!("{}[{}]", fmt_expr(base), fmt_expr(index))
+            } else {
+                format!("({})[{}]", fmt_expr(base), fmt_expr(index))
+            }
+        }
         // `try expr` — statement-level error-union propagation (SPEC §12.1). The
         // operand stands at a value position, so a primary/postfix operand
         // prints bare (`try parse(s)`) while anything looser is parenthesised
@@ -736,6 +777,7 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: false,
+            array_len: None,
             span: D,
         }
     }
@@ -746,6 +788,7 @@ mod tests {
             name: name.to_string(),
             optional: true,
             error_union: false,
+            array_len: None,
             span: D,
         }
     }
@@ -756,6 +799,19 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: true,
+            array_len: None,
+            span: D,
+        }
+    }
+
+    /// A fixed-size array type `[len]name` (`TypeExpr.array_len = Some(len)`;
+    /// v0.117).
+    fn arr_ty(name: &str, len: i64) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: false,
+            error_union: false,
+            array_len: Some(len),
             span: D,
         }
     }
@@ -2055,6 +2111,189 @@ mod tests {
         );
         let printed = print_module(&m);
         assert_eq!(printed, expected);
+        assert_eq!(print_module(&m), printed);
+    }
+
+    // ----- fixed-size arrays (v0.117) --------------------------------------
+
+    /// An array literal `[len]elem{ e0, e1, … }`. The `elem` field carries the
+    /// array's own `[len]elem` type expression (SPEC §14.1).
+    fn array_lit(elem: &str, len: i64, elems: Vec<Expr>) -> Expr {
+        Expr::ArrayLit {
+            elem: arr_ty(elem, len),
+            elems,
+            span: D,
+        }
+    }
+
+    /// An index expression `base[index]`.
+    fn index(base: Expr, idx: Expr) -> Expr {
+        Expr::Index {
+            base: Box::new(base),
+            index: Box::new(idx),
+            span: D,
+        }
+    }
+
+    #[test]
+    fn array_type_prints_with_length_prefix() {
+        // The array helper renders `[N]T`; the bare/optional/error helpers are
+        // unaffected, and `[N]` is never combined with `?`/`!`.
+        assert_eq!(fmt_type(&arr_ty("i32", 3)), "[3]i32");
+        // A length-zero array still prints its prefix.
+        assert_eq!(fmt_type(&arr_ty("u8", 0)), "[0]u8");
+        // An array of a struct element prints the struct name after the prefix.
+        assert_eq!(fmt_type(&arr_ty("Point", 2)), "[2]Point");
+        // The other type forms are unchanged.
+        assert_eq!(fmt_type(&ty("i32")), "i32");
+        assert_eq!(fmt_type(&opt_ty("i32")), "?i32");
+        assert_eq!(fmt_type(&err_ty("i32")), "!i32");
+    }
+
+    #[test]
+    fn array_type_in_every_position() {
+        // `[N]T` must print wherever a type appears: a top-level `const`, a
+        // struct field, a function's params and return, and a `var`/`const`
+        // local annotation.
+        let const_decl = Item::Const(ConstDecl {
+            is_pub: true,
+            name: "ZEROS".to_string(),
+            ty: arr_ty("i32", 3),
+            value: array_lit("i32", 3, vec![int(0), int(0), int(0)]),
+            span: D,
+        });
+        let strukt = Item::Struct(StructDecl {
+            is_pub: false,
+            name: "Grid".to_string(),
+            fields: vec![FieldDecl {
+                name: "cells".to_string(),
+                ty: arr_ty("i32", 4),
+                span: D,
+            }],
+            methods: vec![],
+            span: D,
+        });
+        let func = Item::Func(Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![Param {
+                name: "a".to_string(),
+                ty: arr_ty("i32", 2),
+                span: D,
+            }],
+            ret: arr_ty("i32", 2),
+            body: Block {
+                stmts: vec![Stmt::Let {
+                    is_const: false,
+                    name: "b".to_string(),
+                    ty: arr_ty("i32", 2),
+                    value: array_lit("i32", 2, vec![int(1), int(2)]),
+                    span: D,
+                }],
+                span: D,
+            },
+            span: D,
+        });
+        let m = Module {
+            items: vec![const_decl, strukt, func],
+        };
+        let expected = concat!(
+            "pub const ZEROS: [3]i32 = [3]i32{ 0, 0, 0 };\n",
+            "\n",
+            "const Grid = struct {\n",
+            "    cells: [4]i32,\n",
+            "};\n",
+            "\n",
+            "fn f(a: [2]i32) [2]i32 {\n",
+            "    var b: [2]i32 = [2]i32{ 1, 2 };\n",
+            "}\n",
+        );
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn array_literal_index_and_len_expr_print() {
+        // An array literal prints its `[N]T` head and `, `-joined elements
+        // inside `{ … }`.
+        assert_eq!(
+            fmt_expr(&array_lit("i32", 3, vec![int(1), int(2), int(3)])),
+            "[3]i32{ 1, 2, 3 }"
+        );
+        // An empty array literal collapses to `[0]T{}`.
+        assert_eq!(fmt_expr(&array_lit("i32", 0, vec![])), "[0]i32{}");
+
+        // Indexing a simple base: `a[0]`.
+        assert_eq!(fmt_expr(&index(ident("a"), int(0))), "a[0]");
+
+        // The index is a full expression and prints bare inside the brackets.
+        assert_eq!(
+            fmt_expr(&index(ident("a"), bin(BinOp::Add, ident("i"), int(1)))),
+            "a[i + 1]"
+        );
+
+        // `a.len` reuses field access on an array (SPEC §14.1) and prints bare.
+        assert_eq!(fmt_expr(&field(ident("a"), "len")), "a.len");
+
+        // Indexing directly off an array literal needs no parentheses (both bind
+        // as primaries): `[2]i32{ 7, 8 }[0]`.
+        assert_eq!(
+            fmt_expr(&index(array_lit("i32", 2, vec![int(7), int(8)]), int(0))),
+            "[2]i32{ 7, 8 }[0]"
+        );
+
+        // Indexing a non-primary base parenthesises it to stay total: `(a orelse b)[0]`.
+        assert_eq!(
+            fmt_expr(&index(orelse(ident("a"), ident("b")), int(0))),
+            "(a orelse b)[0]"
+        );
+    }
+
+    #[test]
+    fn array_sample_is_idempotent() {
+        // A whole function exercising an array local, an array literal, an index
+        // read, an index assignment (`FieldAssign` with an `Index` place) and a
+        // `.len` read. The pure printer is deterministic, so idempotence here is
+        // checked as re-printing the same AST byte-identically (the parser is not
+        // involved in this isolated unit).
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![
+                        Stmt::Let {
+                            is_const: false,
+                            name: "a".to_string(),
+                            ty: arr_ty("i32", 3),
+                            value: array_lit("i32", 3, vec![int(1), int(2), int(3)]),
+                            span: D,
+                        },
+                        Stmt::FieldAssign {
+                            place: index(ident("a"), int(0)),
+                            value: int(5),
+                            span: D,
+                        },
+                        Stmt::Expr(call("print", vec![index(ident("a"), int(1))])),
+                        Stmt::Expr(call("print", vec![field(ident("a"), "len")])),
+                    ],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f() void {\n",
+            "    var a: [3]i32 = [3]i32{ 1, 2, 3 };\n",
+            "    a[0] = 5;\n",
+            "    print(a[1]);\n",
+            "    print(a.len);\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
         assert_eq!(print_module(&m), printed);
     }
 }

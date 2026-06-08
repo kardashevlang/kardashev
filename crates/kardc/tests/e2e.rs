@@ -329,3 +329,44 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "1\n0\n100\n200\n999\n");
 }
+
+// --- v0.117 fixed-size arrays ----------------------------------------------
+
+#[test]
+fn arrays_literal_index_assign_len_and_byvalue() {
+    let src = r#"
+fn sum(a: [4]i32) i32 {        // arrays pass by value
+    var total: i32 = 0;
+    var i: i32 = 0;
+    while (i < 4) : (i = i + 1) {
+        total = total + a[i];
+    }
+    return total;
+}
+pub fn main() i32 {
+    var nums: [4]i32 = [4]i32{ 10, 20, 30, 40 };
+    print(sum(nums));          // 100
+    nums[1] = 99;
+    print(nums[1]);            // 99
+    print(nums.len);           // 4
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "100\n99\n4\n");
+}
+
+#[test]
+fn array_index_out_of_bounds_panics_101() {
+    let src = r#"
+pub fn main() i32 {
+    var a: [3]i32 = [3]i32{ 1, 2, 3 };
+    var i: i32 = 5;
+    print(a[i]);
+    return 0;
+}
+"#;
+    let (code, _out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 101, "out-of-bounds index must panic with exit 101");
+}

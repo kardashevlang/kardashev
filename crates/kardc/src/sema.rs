@@ -49,6 +49,12 @@
 //! - `E0214` — a non-exhaustive `switch` on an integer type (no `else` arm).
 //! - `E0215` — an unqualified enum literal `.V` with no expected enum type at
 //!   its position.
+//! - `E0220` — indexing (`a[i]`) a value whose type is not a fixed-size array.
+//! - `E0221` — an array literal whose element count does not equal its length.
+//! - `E0223` — an index-assignment (`a[i] = e`) whose base is not a mutable
+//!   `var` array (a `const`/parameter root, or a non-array base).
+//! - `E0224` — a fixed-size array type `[N]T` with a negative (or otherwise
+//!   absurd) length `N`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -154,6 +160,11 @@ impl Checker {
                 format!("!{}", self.type_name(self.structs.error_union_payload(id)))
             }
             Type::Enum(id) => self.structs.enum_get(id).name.clone(),
+            Type::Array(id) => format!(
+                "[{}]{}",
+                self.structs.array_len(id),
+                self.type_name(self.structs.array_elem(id))
+            ),
             other => other.name().to_string(),
         }
     }
@@ -435,10 +446,19 @@ impl Checker {
     /// — so optional types are interned the moment a signature, field or local
     /// declaration mentions them (SPEC §11.1). Likewise `!T` (`error_union`)
     /// resolves to `Type::ErrorUnion(intern_error_union(payload))` (SPEC §12.1).
+    ///
+    /// A `[N]T` (`array_len`) resolves its element `T` by these same rules and
+    /// returns `Type::Array(intern_array(elem, N))`, interning the array type
+    /// (SPEC §14.1). A negative (or otherwise absurd) `N` is reported as `E0224`
+    /// here; the result is still a valid (zero-length) array type so callers do
+    /// not additionally flag the name as unknown.
     fn resolve_type_opt(&mut self, te: &TypeExpr) -> Option<Type> {
         let inner = Type::from_name(&te.name)
             .or_else(|| self.structs.id_of(&te.name).map(Type::Struct))
             .or_else(|| self.structs.enum_id_of(&te.name).map(Type::Enum))?;
+        if let Some(n) = te.array_len {
+            return Some(Type::Array(self.intern_array_len(inner, n, te.span)));
+        }
         if te.optional {
             Some(Type::Optional(self.structs.intern_optional(inner)))
         } else if te.error_union {
@@ -446,6 +466,18 @@ impl Checker {
         } else {
             Some(inner)
         }
+    }
+
+    /// Intern an array type `[len]elem`, validating `len`. A negative length is
+    /// `E0224` (SPEC §14.2); in that case the array is interned with length 0 so
+    /// resolution still yields a usable array type (avoiding cascade errors).
+    fn intern_array_len(&mut self, elem: Type, len: i64, span: Span) -> u32 {
+        if len < 0 {
+            let msg = format!("array length must be non-negative, found `{}`", len);
+            self.error(span, "E0224", msg);
+            return self.structs.intern_array(elem, 0);
+        }
+        self.structs.intern_array(elem, len as usize)
     }
 
     /// Resolve a type name to a builtin or a registered struct, emitting
@@ -489,6 +521,9 @@ impl Checker {
             self.error(te.span, "E0161", format!("unknown type `{}`", te.name));
             return None;
         };
+        if let Some(n) = te.array_len {
+            return Some(Type::Array(self.intern_array_len(inner, n, te.span)));
+        }
         if te.optional {
             Some(Type::Optional(self.structs.intern_optional(inner)))
         } else if te.error_union {
@@ -943,6 +978,32 @@ impl Checker {
                 let bt = self.resolve_place(base)?;
                 self.field_type_of(bt, field, *span)
             }
+            // `a[i] = e` (SPEC §14.2): the indexed base must be rooted in a
+            // mutable `var` and have an array type; either failure is `E0223`.
+            // The element type is the assignable place's type.
+            Expr::Index { base, index, span } => {
+                self.check_index_is_int(index);
+                let (bt, mutable) = self.resolve_index_base(base)?;
+                if !mutable {
+                    self.error(
+                        *span,
+                        "E0223",
+                        "cannot assign to an array element through an immutable binding \
+                         (only `var` arrays are assignable)",
+                    );
+                }
+                match bt {
+                    Type::Array(id) => Some(self.structs.array_elem(id)),
+                    other => {
+                        let msg = format!(
+                            "cannot index-assign into non-array type `{}`",
+                            self.type_name(other)
+                        );
+                        self.error(*span, "E0223", msg);
+                        None
+                    }
+                }
+            }
             _ => {
                 self.error(
                     place.span(),
@@ -950,6 +1011,55 @@ impl Checker {
                     "assignment target must be a `var` local or a field of one",
                 );
                 self.check_expr(place, None);
+                None
+            }
+        }
+    }
+
+    /// Resolve the base of an index-assignment place to its `(type, mutable)`,
+    /// where `mutable` is whether its root binding is an assignable `var` (not a
+    /// `const`/parameter). Emits structural diagnostics (unknown name `E0100`,
+    /// bad field `E0165`/`E0166`, indexing a non-array base `E0223`) but leaves
+    /// the mutability verdict to the caller, which reports it as `E0223` for an
+    /// index-assignment (distinct from the field-assignment `E0167`).
+    fn resolve_index_base(&mut self, base: &Expr) -> Option<(Type, bool)> {
+        match base {
+            Expr::Ident { name, span } => match self.lookup(name) {
+                Some((ty, is_const)) => Some((ty, !is_const)),
+                None => {
+                    self.error(*span, "E0100", format!("unknown name `{}`", name));
+                    None
+                }
+            },
+            Expr::Field { base: inner, field, span } => {
+                let (bt, mutable) = self.resolve_index_base(inner)?;
+                let ft = self.field_type_of(bt, field, *span)?;
+                Some((ft, mutable))
+            }
+            // A nested index base (`m[i][j] = e`); v0.117 has no array-of-array,
+            // so this generally lands on a non-array element (reported here).
+            Expr::Index { base: inner, index, span } => {
+                self.check_index_is_int(index);
+                let (bt, mutable) = self.resolve_index_base(inner)?;
+                match bt {
+                    Type::Array(id) => Some((self.structs.array_elem(id), mutable)),
+                    other => {
+                        let msg = format!(
+                            "cannot index-assign into non-array type `{}`",
+                            self.type_name(other)
+                        );
+                        self.error(*span, "E0223", msg);
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.error(
+                    base.span(),
+                    "E0223",
+                    "index-assignment base must be a `var` array or a field/element of one",
+                );
+                self.check_expr(base, None);
                 None
             }
         }
@@ -1036,6 +1146,12 @@ impl Checker {
                     }
                 }
                 let bt = self.check_expr(base, None)?;
+                // `a.len` on an array is its compile-time-constant length, a
+                // `usize` (SPEC §14.1). Any other field on an array falls through
+                // to `field_type_of`, which reports it as `E0165`.
+                if matches!(bt, Type::Array(_)) && field == "len" {
+                    return Some(Type::Usize);
+                }
                 self.field_type_of(bt, field, *span)
             }
             Expr::MethodCall {
@@ -1194,6 +1310,79 @@ impl Checker {
                         None
                     }
                 }
+            }
+            // An array literal `[N]T{ e0, … }` (SPEC §14.2): `elem` resolves to
+            // the array type `Type::Array(id)`; the literal must hold exactly
+            // `N` elements (`E0221`), each coercing to the element type
+            // (`E0110`). The result is `Type::Array(id)`.
+            Expr::ArrayLit { elem, elems, span } => {
+                match self.resolve_type(elem) {
+                    Some(Type::Array(id)) => {
+                        let elem_ty = self.structs.array_elem(id);
+                        let len = self.structs.array_len(id);
+                        if elems.len() != len {
+                            let msg = format!(
+                                "array literal has {} element(s), but type `{}` expects {}",
+                                elems.len(),
+                                self.type_name(Type::Array(id)),
+                                len
+                            );
+                            self.error(*span, "E0221", msg);
+                        }
+                        for e in elems {
+                            if let Some(et) = self.check_coerce(e, elem_ty) {
+                                if et != elem_ty {
+                                    let msg = format!(
+                                        "array element type mismatch: expected `{}`, found `{}`",
+                                        self.type_name(elem_ty),
+                                        self.type_name(et)
+                                    );
+                                    self.error(e.span(), "E0110", msg);
+                                }
+                            }
+                        }
+                        Some(Type::Array(id))
+                    }
+                    // `elem` did not resolve to an array (its element type is
+                    // unknown — already reported by `resolve_type`). Still check
+                    // the elements so their own errors surface.
+                    _ => {
+                        for e in elems {
+                            self.check_expr(e, None);
+                        }
+                        None
+                    }
+                }
+            }
+            // Indexing `base[index]` (read, SPEC §14.2): `base` must be an array
+            // (`E0220`) and `index` an integer; the result is the element type.
+            Expr::Index { base, index, span } => {
+                let bt = self.check_expr(base, None);
+                self.check_index_is_int(index);
+                match bt {
+                    Some(Type::Array(id)) => Some(self.structs.array_elem(id)),
+                    Some(other) => {
+                        let msg = format!(
+                            "cannot index into non-array type `{}`",
+                            self.type_name(other)
+                        );
+                        self.error(*span, "E0220", msg);
+                        None
+                    }
+                    None => None,
+                }
+            }
+        }
+    }
+
+    /// Type-check an array index expression and verify it is an integer type
+    /// (reusing `E0110`). Any non-integer index is reported; a flexible integer
+    /// literal index defaults to `i64`, which is accepted.
+    fn check_index_is_int(&mut self, index: &Expr) {
+        if let Some(it) = self.check_expr(index, None) {
+            if !it.is_int() {
+                let msg = format!("array index must be an integer, found `{}`", self.type_name(it));
+                self.error(index.span(), "E0110", msg);
             }
         }
     }
@@ -1886,6 +2075,7 @@ mod tests {
             name: name.into(),
             optional: false,
             error_union: false,
+            array_len: None,
             span: sp(),
         }
     }
@@ -1895,6 +2085,7 @@ mod tests {
             name: name.into(),
             optional: true,
             error_union: false,
+            array_len: None,
             span: sp(),
         }
     }
@@ -1904,6 +2095,51 @@ mod tests {
             name: name.into(),
             optional: false,
             error_union: true,
+            array_len: None,
+            span: sp(),
+        }
+    }
+    /// A fixed-size array type expression `[len]elem` (v0.117).
+    fn te_arr(elem: &str, len: i64) -> TypeExpr {
+        TypeExpr {
+            name: elem.into(),
+            optional: false,
+            error_union: false,
+            array_len: Some(len),
+            span: sp(),
+        }
+    }
+    /// An array literal `[len]elem{ elems... }`.
+    fn array_lit(elem: &str, len: i64, elems: Vec<Expr>) -> Expr {
+        Expr::ArrayLit {
+            elem: te_arr(elem, len),
+            elems,
+            span: sp(),
+        }
+    }
+    /// An index expression `base[idx]`.
+    fn index(base: Expr, idx: Expr) -> Expr {
+        Expr::Index {
+            base: Box::new(base),
+            index: Box::new(idx),
+            span: sp(),
+        }
+    }
+    /// A parameter of array type: `name: [len]elem`.
+    fn param_arr(name: &str, elem: &str, len: i64) -> Param {
+        Param {
+            name: name.into(),
+            ty: te_arr(elem, len),
+            span: sp(),
+        }
+    }
+    /// `var name: [len]elem = value;`
+    fn let_var_arr(name: &str, elem: &str, len: i64, value: Expr) -> Stmt {
+        Stmt::Let {
+            is_const: false,
+            name: name.into(),
+            ty: te_arr(elem, len),
+            value,
             span: sp(),
         }
     }
@@ -3544,5 +3780,218 @@ mod tests {
             ),
         ];
         assert!(codes(items).contains(&"E0215"));
+    }
+
+    // ---- fixed-size array tests (v0.117) ---------------------------------
+
+    #[test]
+    fn array_literal_param_return_and_len_ok_and_interned() {
+        // fn make() [3]i32 { return [3]i32{ 1, 2, 3 }; }
+        // fn first(a: [3]i32) i32 { return a[0]; }
+        // fn main() void { var a: [3]i32 = make(); print(first(a)); print(a.len); }
+        let items = vec![
+            func_te(
+                "make",
+                vec![],
+                te_arr("i32", 3),
+                vec![ret(Some(array_lit("i32", 3, vec![int(1), int(2), int(3)])))],
+            ),
+            func(
+                "first",
+                vec![param_arr("a", "i32", 3)],
+                "i32",
+                vec![ret(Some(index(ident("a"), int(0))))],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var_arr("a", "i32", 3, call("make", vec![])),
+                    Stmt::Expr(call("print", vec![call("first", vec![ident("a")])])),
+                    Stmt::Expr(call("print", vec![field(ident("a"), "len")])),
+                ],
+            ),
+        ];
+        let m = Module { items };
+        let table = check(&m).expect("array program should type-check");
+        // The `[3]i32` type was interned exactly once (deduplicated across the
+        // return type, the parameter, the local and the literal).
+        let arrs: Vec<(Type, usize)> = table.arrays().map(|(_, e, l)| (e, l)).collect();
+        assert_eq!(arrs, vec![(Type::I32, 3)]);
+    }
+
+    #[test]
+    fn array_literal_count_mismatch_is_e0221() {
+        // fn f() [3]i32 { return [3]i32{ 1, 2 }; }   // 2 elements, expected 3
+        let items = vec![func_te(
+            "f",
+            vec![],
+            te_arr("i32", 3),
+            vec![ret(Some(array_lit("i32", 3, vec![int(1), int(2)])))],
+        )];
+        assert!(codes(items).contains(&"E0221"));
+    }
+
+    #[test]
+    fn array_element_type_mismatch_is_e0110() {
+        // fn f() [2]i32 { return [2]i32{ 1, true }; }   // second element is bool
+        let items = vec![func_te(
+            "f",
+            vec![],
+            te_arr("i32", 2),
+            vec![ret(Some(array_lit("i32", 2, vec![int(1), boolean(true)])))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn index_yields_element_type_mismatch_is_e0110() {
+        // fn f(a: [4]i32) bool { return a[0]; }   // a[0] is i32, declared bool
+        let items = vec![func(
+            "f",
+            vec![param_arr("a", "i32", 4)],
+            "bool",
+            vec![ret(Some(index(ident("a"), int(0))))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn index_on_non_array_is_e0220() {
+        // fn f(x: i32) i32 { return x[0]; }   // x is not an array
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "i32",
+            vec![ret(Some(index(ident("x"), int(0))))],
+        )];
+        assert!(codes(items).contains(&"E0220"));
+    }
+
+    #[test]
+    fn array_len_is_usize_ok() {
+        // fn f(a: [3]i32) usize { return a.len; }   // a.len is a usize constant
+        let items = vec![func(
+            "f",
+            vec![param_arr("a", "i32", 3)],
+            "usize",
+            vec![ret(Some(field(ident("a"), "len")))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn index_assign_ok() {
+        // fn main() void { var a: [3]i32 = [3]i32{ 0, 0, 0 }; a[1] = 7; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_arr("a", "i32", 3, array_lit("i32", 3, vec![int(0), int(0), int(0)])),
+                field_assign(index(ident("a"), int(1)), int(7)),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn index_assign_into_immutable_param_is_e0223() {
+        // fn f(a: [3]i32) void { a[0] = 5; }   // a is an immutable parameter
+        let items = vec![func(
+            "f",
+            vec![param_arr("a", "i32", 3)],
+            "void",
+            vec![field_assign(index(ident("a"), int(0)), int(5))],
+        )];
+        assert!(codes(items).contains(&"E0223"));
+    }
+
+    #[test]
+    fn index_assign_into_non_array_is_e0223() {
+        // fn main() void { var x: i32 = 0; x[0] = 5; }   // x is not an array
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("x", "i32", int(0)),
+                field_assign(index(ident("x"), int(0)), int(5)),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0223"));
+    }
+
+    #[test]
+    fn index_assign_value_type_mismatch_is_e0110() {
+        // fn main() void { var a: [2]i32 = [2]i32{ 0, 0 }; a[0] = true; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_arr("a", "i32", 2, array_lit("i32", 2, vec![int(0), int(0)])),
+                field_assign(index(ident("a"), int(0)), boolean(true)),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn negative_array_length_is_e0224() {
+        // fn f(a: [-1]i32) void {}   // a negative array length
+        let items = vec![func(
+            "f",
+            vec![param_arr("a", "i32", -1)],
+            "void",
+            vec![],
+        )];
+        assert!(codes(items).contains(&"E0224"));
+    }
+
+    #[test]
+    fn array_of_struct_element_ok() {
+        // const Point = struct { x: i32 };
+        // fn f(a: [2]Point) i32 { return a[0].x; }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            func(
+                "f",
+                vec![param_arr("a", "Point", 2)],
+                "i32",
+                vec![ret(Some(field(index(ident("a"), int(0)), "x")))],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn array_struct_field_resolves_to_array_type() {
+        // const Row = struct { cells: [3]i32 };
+        // The field type resolves to a `[3]i32` array, interned in the table.
+        let row = Item::Struct(StructDecl {
+            is_pub: false,
+            name: "Row".into(),
+            fields: vec![FieldDecl {
+                name: "cells".into(),
+                ty: te_arr("i32", 3),
+                span: sp(),
+            }],
+            methods: Vec::new(),
+            span: sp(),
+        });
+        let m = Module { items: vec![row] };
+        let table = check(&m).expect("array-field struct should type-check");
+        let id = table.id_of("Row").unwrap();
+        let (fname, fty) = table.get(id).fields[0].clone();
+        assert_eq!(fname, "cells");
+        match fty {
+            Type::Array(aid) => {
+                assert_eq!(table.array_elem(aid), Type::I32);
+                assert_eq!(table.array_len(aid), 3);
+            }
+            other => panic!("expected an array field type, found {:?}", other),
+        }
     }
 }

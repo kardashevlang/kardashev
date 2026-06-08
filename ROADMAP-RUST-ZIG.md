@@ -79,22 +79,34 @@ Plain `enum` + `switch` with exhaustiveness checking (every variant or `else`;
 `else` required for integers) — no hidden fall-through. Lowered to C `enum` +
 `switch`. Tagged unions (`union(enum)`) + payload capture are a later item.
 
-### v0.117.0 — Arrays, slices, pointers; the **Allocator** interface
-`[N]T`, `[]T`, `*T`, `[*]T`. Introduce the explicit `Allocator` interface —
-every heap allocation takes an allocator parameter. No global allocator.
+The original "arrays + slices + pointers + Allocator" version is split into
+focused, fully-tested releases (quality over breadth):
 
-### v0.118.0 — `comptime` generics: `fn F(comptime T: type) type`
+### v0.117.0 — Fixed-size arrays `[N]T` ✅
+Array types, array literals `[N]T{ … }`, indexing `a[i]` (read + write,
+runtime-bounds-checked, panic on OOB), `a.len`, value semantics. Lowered to a
+by-value C struct wrapper with a bounds-checked accessor.
+
+### v0.118.0 — Pointers `*T` & slices `[]T`
+`&place`, `p.*`, `p.* = e`; slices as `{ ptr, len }` views with `a[i]` / `.len`
+and slicing `a[lo..hi]`.
+
+### v0.119.0 — The **Allocator** interface + heap
+The explicit `Allocator` (alloc/free); every heap allocation takes an allocator
+parameter — no global allocator. A small allocator-based stdlib.
+
+### v0.120.0 — `comptime` generics: `fn F(comptime T: type) type`
 Real compile-time generics (containers, `ArrayList(T)`), monomorphised — Zig's
 metaprogramming model.
 
-### v0.119.0 — Type inference for `var`/`const`; the standard prelude
+### v0.121.0 — Type inference for `var`/`const`; the standard prelude
 Inferred local types; a small std built on the allocator interface.
 
-### v0.120.0 — The full in-language build graph (`build.ks`)
+### v0.122.0 — The full in-language build graph (`build.ks`)
 The imperative `build.zig`-style build description: steps, dependencies,
 install artifacts, declared dependencies — run by `kard build`.
 
-### v0.121.0 — First-class cross-compilation
+### v0.123.0 — First-class cross-compilation
 `kard build -target <triple>` producing binaries for foreign targets out of the
 box (bundled/located cross C toolchains), the way `zig build` cross-compiles
 trivially.
