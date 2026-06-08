@@ -133,8 +133,11 @@ impl Printer {
         self.out.push_str(";\n");
     }
 
-    /// Print a struct declaration (SPEC §9). One `    field: Type,` per line
-    /// with a trailing comma on every field; an empty struct collapses to
+    /// Print a struct declaration (SPEC §9/§10). One `    field: Type,` per line
+    /// with a trailing comma on every field; then, after the fields, each
+    /// method / associated function (`pub? fn …`) printed one indent deep with
+    /// the ordinary function printer, separated by a single blank line (SPEC
+    /// §10). An empty struct — no fields *and* no methods — collapses to
     /// `const Name = struct {};` on a single line.
     fn print_struct(&mut self, s: &StructDecl) {
         self.write_indent();
@@ -144,7 +147,7 @@ impl Printer {
         self.out.push_str("const ");
         self.out.push_str(&s.name);
         self.out.push_str(" = struct {");
-        if s.fields.is_empty() {
+        if s.fields.is_empty() && s.methods.is_empty() {
             self.out.push_str("};\n");
             return;
         }
@@ -156,6 +159,17 @@ impl Printer {
             self.out.push_str(": ");
             self.out.push_str(&field.ty.name);
             self.out.push_str(",\n");
+        }
+        // Each method is a `pub? fn …` printed at the struct body's indent
+        // using the same printer as a top-level function. A single blank line
+        // separates the fields from the first method and each method from the
+        // next; the previous line already ends in `\n`, so one extra `\n`
+        // yields the blank line.
+        for (i, method) in s.methods.iter().enumerate() {
+            if i > 0 || !s.fields.is_empty() {
+                self.out.push('\n');
+            }
+            self.print_func(method);
         }
         self.indent -= 1;
         self.write_indent();
@@ -348,7 +362,8 @@ fn expr_prec(e: &Expr) -> u8 {
         | Expr::Ident { .. }
         | Expr::Call { .. }
         | Expr::StructLit { .. }
-        | Expr::Field { .. } => 8,
+        | Expr::Field { .. }
+        | Expr::MethodCall { .. } => 8,
         Expr::Comptime { .. } => 7,
         Expr::Unary { .. } => 6,
         Expr::Binary { op, .. } => match op {
@@ -471,6 +486,37 @@ fn fmt_expr(e: &Expr) -> String {
             } else {
                 format!("({}).{}", fmt_expr(base), field)
             }
+        }
+        Expr::MethodCall {
+            receiver,
+            method,
+            args,
+            ..
+        } => {
+            // `receiver.method(arg, ...)`. The receiver is a postfix base —
+            // either a struct value or an `Ident` naming a struct type
+            // (associated call). Parenthesise any non-primary/non-postfix
+            // receiver to stay total and idempotent; the parser never produces
+            // one.
+            let mut s = String::new();
+            if expr_prec(receiver) >= 8 {
+                s.push_str(&fmt_expr(receiver));
+            } else {
+                s.push('(');
+                s.push_str(&fmt_expr(receiver));
+                s.push(')');
+            }
+            s.push('.');
+            s.push_str(method);
+            s.push('(');
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&fmt_expr(arg));
+            }
+            s.push(')');
+            s
         }
     }
 }
@@ -918,6 +964,7 @@ mod tests {
                 is_pub: true,
                 name: "Point".to_string(),
                 fields: vec![field_decl("x", "i32"), field_decl("y", "i32")],
+                methods: vec![],
                 span: D,
             })],
         };
@@ -934,6 +981,7 @@ mod tests {
                 is_pub: false,
                 name: "Empty".to_string(),
                 fields: vec![],
+                methods: vec![],
                 span: D,
             })],
         };
@@ -955,6 +1003,7 @@ mod tests {
                     is_pub: false,
                     name: "Point".to_string(),
                     fields: vec![field_decl("x", "i32"), field_decl("y", "i32")],
+                    methods: vec![],
                     span: D,
                 }),
                 Item::Func(Func {
@@ -1028,5 +1077,179 @@ mod tests {
             span: D,
         };
         assert_eq!(fmt_expr(&field(lit, "x")), "Point{ .x = 1 }.x");
+    }
+
+    // ----- methods & associated functions (v0.113) -------------------------
+
+    /// `pub fn get(self: Counter) i32 { return self.<field>; }` helper.
+    fn method_get(field_name: &str) -> Func {
+        Func {
+            is_pub: true,
+            name: "get".to_string(),
+            params: vec![Param {
+                name: "self".to_string(),
+                ty: ty("Counter"),
+                span: D,
+            }],
+            ret: ty("i32"),
+            body: Block {
+                stmts: vec![Stmt::Return {
+                    value: Some(field(ident("self"), field_name)),
+                    span: D,
+                }],
+                span: D,
+            },
+            span: D,
+        }
+    }
+
+    #[test]
+    fn struct_with_method_canonical_form() {
+        // The SPEC §10 example: fields first, a blank line, then each method
+        // printed one indent deep with the ordinary `pub? fn …` printer.
+        let m = Module {
+            items: vec![Item::Struct(StructDecl {
+                is_pub: false,
+                name: "Counter".to_string(),
+                fields: vec![field_decl("n", "i32")],
+                methods: vec![method_get("n")],
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "const Counter = struct {\n",
+            "    n: i32,\n",
+            "\n",
+            "    pub fn get(self: Counter) i32 {\n",
+            "        return self.n;\n",
+            "    }\n",
+            "};\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence (as determinism): the pure printer re-prints identically.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn struct_with_field_and_two_methods_blank_lines() {
+        // A blank line separates fields from the first method and each method
+        // from the next. The second item is an associated function (no `self`,
+        // not `pub`) to exercise both flavours of the function printer.
+        let zero = Func {
+            is_pub: false,
+            name: "zero".to_string(),
+            params: vec![],
+            ret: ty("i32"),
+            body: Block {
+                stmts: vec![Stmt::Return {
+                    value: Some(int(0)),
+                    span: D,
+                }],
+                span: D,
+            },
+            span: D,
+        };
+        let m = Module {
+            items: vec![Item::Struct(StructDecl {
+                is_pub: false,
+                name: "Counter".to_string(),
+                fields: vec![field_decl("n", "i32")],
+                methods: vec![method_get("n"), zero],
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "const Counter = struct {\n",
+            "    n: i32,\n",
+            "\n",
+            "    pub fn get(self: Counter) i32 {\n",
+            "        return self.n;\n",
+            "    }\n",
+            "\n",
+            "    fn zero() i32 {\n",
+            "        return 0;\n",
+            "    }\n",
+            "};\n",
+        );
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn methods_only_struct_has_no_leading_blank_line() {
+        // With no fields, the first method follows the opening brace directly
+        // (no leading blank line), and the struct does not collapse to one
+        // line because it is not truly empty.
+        let zero = Func {
+            is_pub: true,
+            name: "zero".to_string(),
+            params: vec![],
+            ret: ty("i32"),
+            body: Block {
+                stmts: vec![Stmt::Return {
+                    value: Some(int(0)),
+                    span: D,
+                }],
+                span: D,
+            },
+            span: D,
+        };
+        let m = Module {
+            items: vec![Item::Struct(StructDecl {
+                is_pub: false,
+                name: "Util".to_string(),
+                fields: vec![],
+                methods: vec![zero],
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "const Util = struct {\n",
+            "    pub fn zero() i32 {\n",
+            "        return 0;\n",
+            "    }\n",
+            "};\n",
+        );
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn method_call_prints_receiver_method_args() {
+        // Method call on a value: receiver.method(arg, ...).
+        let mc = Expr::MethodCall {
+            receiver: Box::new(ident("c")),
+            method: "bumped".to_string(),
+            args: vec![int(1), int(2)],
+            span: D,
+        };
+        assert_eq!(fmt_expr(&mc), "c.bumped(1, 2)");
+
+        // No-argument method call: receiver.method().
+        let mc0 = Expr::MethodCall {
+            receiver: Box::new(ident("c")),
+            method: "get".to_string(),
+            args: vec![],
+            span: D,
+        };
+        assert_eq!(fmt_expr(&mc0), "c.get()");
+
+        // Associated-call form (receiver is an Ident naming the type):
+        // Counter.zero().
+        let assoc = Expr::MethodCall {
+            receiver: Box::new(ident("Counter")),
+            method: "zero".to_string(),
+            args: vec![],
+            span: D,
+        };
+        assert_eq!(fmt_expr(&assoc), "Counter.zero()");
+
+        // A method call directly off a field-access receiver: a.b.get().
+        let chained = Expr::MethodCall {
+            receiver: Box::new(field(ident("a"), "b")),
+            method: "get".to_string(),
+            args: vec![],
+            span: D,
+        };
+        assert_eq!(fmt_expr(&chained), "a.b.get()");
     }
 }

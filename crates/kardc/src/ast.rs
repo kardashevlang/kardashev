@@ -28,6 +28,10 @@ pub struct StructDecl {
     pub is_pub: bool,
     pub name: String,
     pub fields: Vec<FieldDecl>,
+    /// Methods and associated functions declared in the struct body (v0.113).
+    /// A function whose first parameter is named `self` is a method (callable
+    /// `instance.m(..)`); otherwise it is an associated function (`Name.f(..)`).
+    pub methods: Vec<Func>,
     pub span: Span,
 }
 
@@ -278,6 +282,15 @@ pub enum Expr {
         field: String,
         span: Span,
     },
+    /// A method / associated-function call: `receiver.method(args)`.
+    /// `receiver` is either a struct value (method; `self` is prepended) or an
+    /// `Ident` naming a struct type (associated call). Resolved in sema.
+    MethodCall {
+        receiver: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
 }
 
 /// One `.name = value` initializer inside a struct literal.
@@ -300,6 +313,7 @@ impl Expr {
             Expr::Comptime { span, .. } => *span,
             Expr::StructLit { span, .. } => *span,
             Expr::Field { span, .. } => *span,
+            Expr::MethodCall { span, .. } => *span,
         }
     }
 }

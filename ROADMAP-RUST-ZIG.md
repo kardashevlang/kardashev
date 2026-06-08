@@ -60,9 +60,9 @@ field access (`a.b.c`), field assignment, struct-valued params/returns/locals,
 nested structs. Emitted as C structs (by value). Methods / associated functions
 are split out to v0.113 to keep each version complete and well-tested.
 
-### v0.113.0 — Struct methods + associated functions
+### v0.113.0 — Struct methods + associated functions ✅
 Functions declared in a `struct` block; `Type.func(…)` and the `instance.method(…)`
-call sugar (self-prepend). Lowered to `kd_<Struct>_<method>(self, …)`.
+call sugar (self-prepend), chained calls. Lowered to `kd_<Struct>_<method>(self, …)`.
 
 ### v0.114.0 — Optionals: `?T`, `orelse`, `.?`, `if (x) |v|` capture
 Null-safety the Zig way; lower as a tagged value in C. No hidden nullability.

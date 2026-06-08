@@ -191,3 +191,30 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "33\n");
 }
+
+// --- v0.113 struct methods + associated functions --------------------------
+
+#[test]
+fn struct_methods_assoc_and_chaining() {
+    let src = r#"
+const Counter = struct {
+    n: i32,
+    pub fn get(self: Counter) i32 { return self.n; }
+    pub fn bumped(self: Counter, by: i32) Counter { return Counter{ .n = self.n + by }; }
+    pub fn zero() Counter { return Counter{ .n = 0 }; }
+};
+pub fn main() i32 {
+    var c: Counter = Counter.zero();   // associated fn
+    print(c.get());                    // 0  (method)
+    c = c.bumped(5);
+    print(c.get());                    // 5
+    var d: Counter = c.bumped(10).bumped(100);  // chained method calls
+    print(d.get());                    // 115
+    print(Counter.get(d));             // 115 (explicit-self static form)
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "0\n5\n115\n115\n");
+}

@@ -217,6 +217,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_func(&mut self, is_pub: bool, start: Span) -> PResult<Item> {
+        Ok(Item::Func(self.parse_func_decl(is_pub, start)?))
+    }
+
+    /// Parse a function definition with the optional `pub` already consumed and
+    /// the cursor positioned on the `fn` keyword. Shared by top-level functions
+    /// and struct methods / associated functions (SPEC §10), so both grow new
+    /// function-syntax features for free.
+    fn parse_func_decl(&mut self, is_pub: bool, start: Span) -> PResult<Func> {
         self.bump(); // `fn`
         let (name, _) = self.expect_ident()?;
         self.expect_punct(&TokenKind::LParen, "`(`")?;
@@ -225,14 +233,14 @@ impl<'a> Parser<'a> {
         let ret = self.parse_type()?;
         let body = self.parse_block()?;
         let span = start.merge(body.span);
-        Ok(Item::Func(Func {
+        Ok(Func {
             is_pub,
             name,
             params,
             ret,
             body,
             span,
-        }))
+        })
     }
 
     fn parse_params(&mut self) -> PResult<Vec<Param>> {
@@ -288,34 +296,48 @@ impl<'a> Parser<'a> {
 
     /// Parse the tail of a struct declaration, with `const IDENT` already
     /// consumed and the cursor on the `=`:
-    /// `= "struct" "{" (field ("," field)* ","?)? "}" ";"` where
-    /// `field := IDENT ":" type` (SPEC §9.1). Supports an empty `struct {}`.
+    /// `= "struct" "{" (field ("," field)* ","?)? (func)* "}" ";"` where
+    /// `field := IDENT ":" type` and `func := "pub"? "fn" ...` (SPEC §9.1,
+    /// §10). The struct body is fields first, then zero or more methods /
+    /// associated functions. Supports an empty `struct {}`.
     fn parse_struct_decl(&mut self, is_pub: bool, name: String, start: Span) -> PResult<Item> {
         self.bump(); // `=`
         if !self.eat_kw(Kw::Struct) {
             return Err(self.expected("`struct`"));
         }
         self.expect_punct(&TokenKind::LBrace, "`{`")?;
+        // Fields come first: `IDENT : type`, comma-separated with an optional
+        // trailing comma. A `pub`/`fn` keyword (the start of a method) or the
+        // closing `}` ends the field list. Field names are identifiers, so they
+        // never collide with the `pub`/`fn` keywords that introduce methods.
         let mut fields = Vec::new();
-        if !self.at_punct(&TokenKind::RBrace) {
-            loop {
-                let (fname, fname_span) = self.expect_ident()?;
-                self.expect_punct(&TokenKind::Colon, "`:`")?;
-                let ty = self.parse_type()?;
-                let span = fname_span.merge(ty.span);
-                fields.push(FieldDecl {
-                    name: fname,
-                    ty,
-                    span,
-                });
-                if self.eat_punct(&TokenKind::Comma) {
-                    if self.at_punct(&TokenKind::RBrace) {
-                        break; // trailing comma
-                    }
-                } else {
-                    break;
-                }
+        while !self.at_punct(&TokenKind::RBrace)
+            && !self.at_kw(Kw::Fn)
+            && !self.at_kw(Kw::Pub)
+        {
+            let (fname, fname_span) = self.expect_ident()?;
+            self.expect_punct(&TokenKind::Colon, "`:`")?;
+            let ty = self.parse_type()?;
+            let span = fname_span.merge(ty.span);
+            fields.push(FieldDecl {
+                name: fname,
+                ty,
+                span,
+            });
+            if !self.eat_punct(&TokenKind::Comma) {
+                break; // no separator → the field list is done
             }
+        }
+        // Then methods / associated functions: each is `pub? fn ...`, parsed
+        // with the shared function logic, until the closing `}` (SPEC §10).
+        let mut methods = Vec::new();
+        while !self.at_punct(&TokenKind::RBrace) {
+            let m_start = self.peek_span();
+            let m_pub = self.eat_kw(Kw::Pub);
+            if !self.at_kw(Kw::Fn) {
+                return Err(self.expected("`fn` or `}`"));
+            }
+            methods.push(self.parse_func_decl(m_pub, m_start)?);
         }
         self.expect_punct(&TokenKind::RBrace, "`}`")?;
         let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
@@ -323,6 +345,7 @@ impl<'a> Parser<'a> {
             is_pub,
             name,
             fields,
+            methods,
             span: start.merge(semi),
         }))
     }
@@ -676,20 +699,37 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Postfix level (SPEC §9.1): a primary followed by zero or more `.field`
-    /// accesses, left-associative so `a.b.c` nests as `(a.b).c`. Sits between
-    /// `primary` and the `comptime`/`unary` levels.
+    /// Postfix level (SPEC §9.1, §10): a primary followed by zero or more `.name`
+    /// accesses, left-associative so `a.b.c` nests as `(a.b).c`. When a `.name`
+    /// is immediately followed by `(`, it is a method / associated-function call
+    /// `Expr::MethodCall` instead of a plain field access; otherwise it stays
+    /// `Expr::Field`. This composes left-to-right, so chains like `a.m().n` and
+    /// `a.b.c(args)` parse naturally. Sits between `primary` and the
+    /// `comptime`/`unary` levels.
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let mut expr = self.parse_primary()?;
         while self.at_punct(&TokenKind::Dot) {
             self.bump(); // `.`
-            let (field, field_span) = self.expect_ident()?;
-            let span = expr.span().merge(field_span);
-            expr = Expr::Field {
-                base: Box::new(expr),
-                field,
-                span,
-            };
+            let (name, name_span) = self.expect_ident()?;
+            if self.at_punct(&TokenKind::LParen) {
+                self.bump(); // `(`
+                let args = self.parse_args()?;
+                let rparen = self.expect_punct(&TokenKind::RParen, "`)`")?;
+                let span = expr.span().merge(rparen);
+                expr = Expr::MethodCall {
+                    receiver: Box::new(expr),
+                    method: name,
+                    args,
+                    span,
+                };
+            } else {
+                let span = expr.span().merge(name_span);
+                expr = Expr::Field {
+                    base: Box::new(expr),
+                    field: name,
+                    span,
+                };
+            }
         }
         Ok(expr)
     }
@@ -1432,6 +1472,289 @@ mod tests {
                 assert!(body.stmts.is_empty());
             }
             other => panic!("expected while, got {:?}", other),
+        }
+    }
+
+    // ---- v0.113: struct methods & associated functions --------------------
+
+    #[test]
+    fn struct_with_method_and_assoc_fn() {
+        // const Counter = struct {
+        //     n: i32,
+        //     pub fn get(self: Counter) i32 { return self.n; }
+        //     pub fn zero() Counter { return Counter{ .n = 0 }; }
+        // };
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("Counter"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            // field: n: i32,
+            id("n"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::Comma,
+            // method: pub fn get(self: Counter) i32 { return self.n; }
+            TokenKind::Keyword(Kw::Pub),
+            TokenKind::Keyword(Kw::Fn),
+            id("get"),
+            TokenKind::LParen,
+            id("self"),
+            TokenKind::Colon,
+            id("Counter"),
+            TokenKind::RParen,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            id("self"),
+            TokenKind::Dot,
+            id("n"),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+            // assoc fn: pub fn zero() Counter { return Counter{ .n = 0 }; }
+            TokenKind::Keyword(Kw::Pub),
+            TokenKind::Keyword(Kw::Fn),
+            id("zero"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("Counter"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            id("Counter"),
+            TokenKind::LBrace,
+            TokenKind::Dot,
+            id("n"),
+            TokenKind::Eq,
+            TokenKind::Int(0),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+            // close struct
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Struct(s) => {
+                assert_eq!(s.name, "Counter");
+                assert_eq!(s.fields.len(), 1);
+                assert_eq!(s.fields[0].name, "n");
+                assert_eq!(s.methods.len(), 2);
+                // method `get` — first param is `self`.
+                let get = &s.methods[0];
+                assert!(get.is_pub);
+                assert_eq!(get.name, "get");
+                assert_eq!(get.params.len(), 1);
+                assert_eq!(get.params[0].name, "self");
+                assert_eq!(get.params[0].ty.name, "Counter");
+                assert_eq!(get.ret.name, "i32");
+                assert_eq!(get.body.stmts.len(), 1);
+                // associated fn `zero` — no params, no `self`.
+                let zero = &s.methods[1];
+                assert!(zero.is_pub);
+                assert_eq!(zero.name, "zero");
+                assert!(zero.params.is_empty());
+                assert_eq!(zero.ret.name, "Counter");
+            }
+            other => panic!("expected struct with methods, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn struct_method_no_trailing_comma_then_method() {
+        // A field with no trailing comma may still be followed by a method:
+        // const Wrap = struct { v: i32 fn id(self: Wrap) i32 { return self.v; } };
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("Wrap"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            id("v"),
+            TokenKind::Colon,
+            id("i32"),
+            // no comma here, method follows directly
+            TokenKind::Keyword(Kw::Fn),
+            id("id"),
+            TokenKind::LParen,
+            id("self"),
+            TokenKind::Colon,
+            id("Wrap"),
+            TokenKind::RParen,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            id("self"),
+            TokenKind::Dot,
+            id("v"),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Struct(s) => {
+                assert_eq!(s.fields.len(), 1);
+                assert_eq!(s.methods.len(), 1);
+                assert_eq!(s.methods[0].name, "id");
+                assert!(!s.methods[0].is_pub);
+            }
+            other => panic!("expected struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn struct_decl_two_fields_still_sets_empty_methods() {
+        // A v0.112-style struct with only fields must now carry an empty methods
+        // list (regression guard for the new field).
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("Point"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            id("x"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::Comma,
+            id("y"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Struct(s) => {
+                assert_eq!(s.fields.len(), 2);
+                assert!(s.methods.is_empty());
+            }
+            other => panic!("expected struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn method_call_with_arg() {
+        // x = c.bumped(1);  ==>  MethodCall { receiver: c, method: bumped, args: [1] }
+        let e = parse_assign_rhs(vec![
+            id("c"),
+            TokenKind::Dot,
+            id("bumped"),
+            TokenKind::LParen,
+            TokenKind::Int(1),
+            TokenKind::RParen,
+        ]);
+        match e {
+            Expr::MethodCall {
+                receiver,
+                method,
+                args,
+                ..
+            } => {
+                assert_eq!(method, "bumped");
+                assert!(matches!(*receiver, Expr::Ident { ref name, .. } if name == "c"));
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0], Expr::Int { value: 1, .. }));
+            }
+            other => panic!("expected method call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn associated_call_no_args() {
+        // x = Counter.zero();  ==>  MethodCall { receiver: Counter, method: zero, args: [] }
+        let e = parse_assign_rhs(vec![
+            id("Counter"),
+            TokenKind::Dot,
+            id("zero"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+        ]);
+        match e {
+            Expr::MethodCall {
+                receiver,
+                method,
+                args,
+                ..
+            } => {
+                assert_eq!(method, "zero");
+                assert!(matches!(*receiver, Expr::Ident { ref name, .. } if name == "Counter"));
+                assert!(args.is_empty());
+            }
+            other => panic!("expected associated call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn field_access_without_parens_stays_field() {
+        // x = a.b;  ==>  Field, NOT MethodCall (no `(` after `.b`).
+        let e = parse_assign_rhs(vec![id("a"), TokenKind::Dot, id("b")]);
+        match e {
+            Expr::Field { base, field, .. } => {
+                assert_eq!(field, "b");
+                assert!(matches!(*base, Expr::Ident { ref name, .. } if name == "a"));
+            }
+            other => panic!("expected field access, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn method_call_then_field_chain() {
+        // x = a.m().n;  ==>  Field { base: MethodCall { a, m }, field: n }  (left-assoc)
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Dot,
+            id("m"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::Dot,
+            id("n"),
+        ]);
+        match e {
+            Expr::Field { base, field, .. } => {
+                assert_eq!(field, "n");
+                match *base {
+                    Expr::MethodCall {
+                        receiver, method, ..
+                    } => {
+                        assert_eq!(method, "m");
+                        assert!(matches!(*receiver, Expr::Ident { ref name, .. } if name == "a"));
+                    }
+                    other => panic!("expected `a.m()` on the left, got {:?}", other),
+                }
+            }
+            other => panic!("expected field-of-method-call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn method_call_statement() {
+        // fn f() void { x.tick(); }  — a method call used as an expr statement.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            id("x"),
+            TokenKind::Dot,
+            id("tick"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        let body = match &m.items[0] {
+            Item::Func(f) => &f.body,
+            other => panic!("expected func, got {:?}", other),
+        };
+        match &body.stmts[0] {
+            Stmt::Expr(Expr::MethodCall { method, .. }) => assert_eq!(method, "tick"),
+            other => panic!("expected method-call statement, got {:?}", other),
         }
     }
 }
