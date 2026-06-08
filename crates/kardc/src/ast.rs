@@ -21,6 +21,16 @@ pub enum Item {
     Struct(StructDecl),
     Enum(EnumDecl),
     Union(UnionDecl),
+    /// `@import("path.ks");` — a top-level import (v0.126). Resolved and erased
+    /// by the module flattener before sema/emit; a residual one is an error.
+    Import(ImportDecl),
+}
+
+/// A `@import("path");` declaration (v0.126).
+#[derive(Clone, Debug)]
+pub struct ImportDecl {
+    pub path: String,
+    pub span: Span,
 }
 
 /// A tagged union: `pub? const Name = union(enum) { v: T, ... };` (v0.124).

@@ -143,6 +143,7 @@ pub enum TokenKind {
     Amp,      // &   (address-of)
     DotDot,   // ..  (slice ranges)
     Pipe,     // |   (switch / capture payload binding)
+    At,       // @   (builtins: @import)
 
     /// End of input. Always the final token.
     Eof,

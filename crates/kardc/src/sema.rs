@@ -469,6 +469,14 @@ impl Checker {
                 Item::Enum(_) => {}
                 // Unions are fully resolved in Pass 0c; they have no body either.
                 Item::Union(_) => {}
+                // Imports are resolved + erased by the module flattener before
+                // sema runs; a residual one means a single-file compile saw an
+                // `@import` with no path to resolve.
+                Item::Import(im) => self.error(
+                    im.span,
+                    "E0290",
+                    "`@import` requires building from a file (it is resolved by the build driver)",
+                ),
             }
         }
     }

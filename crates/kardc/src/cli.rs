@@ -511,8 +511,20 @@ fn target_lookup_note(name: &str) -> String {
 
 /// Lower one resolved [`Source`] to C, printing rendered diagnostics to stderr
 /// on failure.
+///
+/// Compilation is **path-based** ([`crate::compile_program`]) rather than
+/// text-based: the source's filename anchors the flattener so that any
+/// `@import("…")` declarations are resolved relative to it and the whole
+/// program is concatenated into one module before sema/emit (SPEC §22.3). For a
+/// direct `.ks` FILE the filename is that path; for a `build.ks` TARGET it is
+/// the target's `root`.
+///
+/// Diagnostics are rendered against the root source text for display, mirroring
+/// the previous single-file error path. A flattener `E0294` diagnostic already
+/// carries a pre-rendered sub-file block in its message, so rendering it against
+/// the root source is acceptable for v0.126.
 fn compile_one(src: &Source, mode: EmitMode) -> Result<String, ()> {
-    crate::compile_to_c(&src.text, mode)
+    crate::compile_program(Path::new(&src.filename), mode)
         .map_err(|diags| eprint!("{}", crate::diag::render_all(&diags, &src.filename, &src.text)))
 }
 

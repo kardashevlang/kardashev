@@ -166,6 +166,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diagnostic>> {
             }
             b'&' => (TokenKind::Amp, 1),
             b'|' => (TokenKind::Pipe, 1),
+            b'@' => (TokenKind::At, 1),
             b'+' => (TokenKind::Plus, 1),
             b'-' => (TokenKind::Minus, 1),
             b'*' => (TokenKind::Star, 1),
@@ -499,8 +500,9 @@ mod tests {
 
     #[test]
     fn unknown_char_is_e0001_and_collected() {
-        // Both `@` and `#` are unknown; `x` still lexes between them.
-        let err = lex("@ x #").expect_err("two unknown chars");
+        // Both `#` and `^` are unknown; `x` still lexes between them. (`@` is a
+        // valid token since v0.126 — `@import` — so it is not used here.)
+        let err = lex("# x ^").expect_err("two unknown chars");
         assert_eq!(err.len(), 2);
         assert!(err.iter().all(|d| d.code == "E0001"));
         assert_eq!(err[0].span, Span::new(0, 1));

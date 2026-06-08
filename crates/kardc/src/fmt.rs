@@ -79,6 +79,10 @@ pub fn print_module(module: &Module) -> String {
             Item::Struct(s) => p.print_struct(s),
             Item::Enum(e) => p.print_enum(e),
             Item::Union(u) => p.print_union(u),
+            Item::Import(im) => {
+                p.out
+                    .push_str(&format!("@import({});\n", escape_string(&im.path)));
+            }
         }
     }
     p.out

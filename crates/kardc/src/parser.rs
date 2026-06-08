@@ -12,8 +12,8 @@
 //! `Err` if any diagnostic was produced.
 
 use crate::ast::{
-    BinOp, Block, ConstDecl, EnumDecl, Expr, FieldDecl, FieldInit, Func, Item, Module, Param, Stmt,
-    StructDecl, SwitchArm, TestBlock, TypeExpr, UnOp, UnionDecl, UnionVariant,
+    BinOp, Block, ConstDecl, EnumDecl, Expr, FieldDecl, FieldInit, Func, ImportDecl, Item, Module,
+    Param, Stmt, StructDecl, SwitchArm, TestBlock, TypeExpr, UnOp, UnionDecl, UnionVariant,
 };
 use crate::diag::Diagnostic;
 use crate::span::Span;
@@ -184,7 +184,8 @@ impl<'a> Parser<'a> {
                 TokenKind::Keyword(Kw::Pub)
                 | TokenKind::Keyword(Kw::Fn)
                 | TokenKind::Keyword(Kw::Const)
-                | TokenKind::Keyword(Kw::Test) => return,
+                | TokenKind::Keyword(Kw::Test)
+                | TokenKind::At => return,
                 _ => self.bump(),
             }
         }
@@ -209,6 +210,12 @@ impl<'a> Parser<'a> {
 
     fn parse_item(&mut self) -> PResult<Item> {
         let start = self.peek_span();
+        // `@import("path");` — a top-level builtin item (SPEC §22). The leading
+        // `@` opens a builtin item form; it is never `pub`, so dispatch on it
+        // before consuming the optional `pub` keyword.
+        if self.at_punct(&TokenKind::At) {
+            return self.parse_import(start);
+        }
         let is_pub = self.eat_kw(Kw::Pub);
         let k = self.peek_kind().clone();
         match k {
@@ -227,6 +234,29 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.expected("`fn`, `const`, or `test`")),
         }
+    }
+
+    /// Parse a top-level `@import("path");` declaration (SPEC §22.1). The cursor
+    /// is on the `@` token. In v0.126 the only builtin item is `@import`, so the
+    /// identifier after `@` must be exactly `import` (else `E0200`); the path is
+    /// a string literal. The flattener (`modules::resolve`) resolves the path and
+    /// erases this item before sema/emit. `@import` is a top-level item form, not
+    /// an expression.
+    fn parse_import(&mut self, start: Span) -> PResult<Item> {
+        self.bump(); // `@`
+        // The builtin name; only `import` exists in v0.126. Check the spelling
+        // before consuming so a bad `@notimport(...)` reports `expected import`.
+        let is_import = matches!(self.peek_kind(), TokenKind::Ident(s) if s == "import");
+        if !is_import {
+            return Err(self.expected("`import`"));
+        }
+        self.bump(); // `import`
+        self.expect_punct(&TokenKind::LParen, "`(`")?;
+        let (path, _) = self.expect_str()?;
+        self.expect_punct(&TokenKind::RParen, "`)`")?;
+        let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
+        let span = start.merge(semi);
+        Ok(Item::Import(ImportDecl { path, span }))
     }
 
     fn parse_func(&mut self, is_pub: bool, start: Span) -> PResult<Item> {
@@ -1449,6 +1479,7 @@ fn describe_kind(kind: &TokenKind) -> String {
         TokenKind::Amp => "`&`".to_string(),
         TokenKind::DotDot => "`..`".to_string(),
         TokenKind::Pipe => "`|`".to_string(),
+        TokenKind::At => "`@`".to_string(),
         TokenKind::Eof => "end of input".to_string(),
     }
 }
@@ -4785,5 +4816,73 @@ mod tests {
             }
             other => panic!("expected switch, got {:?}", other),
         }
+    }
+
+    fn str(s: &str) -> TokenKind {
+        TokenKind::Str(s.to_string())
+    }
+
+    #[test]
+    fn import_item_parses() {
+        // @import("util.ks");
+        let m = parse(&toks(vec![
+            TokenKind::At,
+            id("import"),
+            TokenKind::LParen,
+            str("util.ks"),
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        assert_eq!(m.items.len(), 1);
+        match &m.items[0] {
+            Item::Import(imp) => assert_eq!(imp.path, "util.ks"),
+            other => panic!("expected import, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn import_and_fn_program() {
+        // @import("util.ks"); fn main() void { }
+        let m = parse(&toks(vec![
+            TokenKind::At,
+            id("import"),
+            TokenKind::LParen,
+            str("util.ks"),
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+            TokenKind::Keyword(Kw::Fn),
+            id("main"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        assert_eq!(m.items.len(), 2);
+        match &m.items[0] {
+            Item::Import(imp) => assert_eq!(imp.path, "util.ks"),
+            other => panic!("expected import, got {:?}", other),
+        }
+        match &m.items[1] {
+            Item::Func(f) => assert_eq!(f.name, "main"),
+            other => panic!("expected fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bad_builtin_item_reports_e0200() {
+        // @notimport("x");  — only `@import` is a builtin item in v0.126.
+        let err = parse(&toks(vec![
+            TokenKind::At,
+            id("notimport"),
+            TokenKind::LParen,
+            str("x"),
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+        ]))
+        .expect_err("should reject unknown builtin item");
+        assert!(err.iter().any(|d| d.code == "E0200"));
     }
 }

@@ -870,3 +870,35 @@ error-return** paths, in LIFO order, alongside regular `defer`s.
 `catch |e| { … }` capture (the block/expression handler binding the error) — the
 non-capturing `expr catch default` (§12) stays; the capturing form is a later
 version.
+
+## 22. Multi-file modules (`@import`) (v0.126)
+
+A program may span files. `@import("path.ks");` is a top-level **import
+declaration** (`Item::Import`, lexed via the new `@`/`At` token).
+
+### 22.1 The flattener (`modules::resolve`)
+`modules::resolve(root: &Path) -> Result<ast::Module, Vec<Diagnostic>>`:
+- Lex + parse `root`; for each `@import("p")` item, resolve `p` **relative to
+  the importing file's directory** and recurse.
+- Track visited (canonicalised) paths so a file imported twice is included
+  **once**; a missing/unreadable file is `E0291`; an import **cycle** is
+  `E0292`.
+- Concatenate **every** file's items into one flat `Module`, with the
+  `Item::Import`s erased. All top-level item names must be **globally unique**
+  across the whole program — a collision is `E0293`.
+- The flat module is fed to the existing `sema`/`emit_c` unchanged.
+- Sub-file lex/parse errors are rendered against that file's own source and
+  returned (the flattener owns each file's text); structural errors
+  (`E0291`/`E0292`/`E0293`) carry the path in their message.
+
+### 22.2 v0.126 limitations (honest)
+This is a `#include`-style flatten: there is **no `m.member` qualified access**
+(items are referenced by bare name), and `pub` is **not yet enforced across
+modules** (every flattened top-level item is globally visible). Proper
+namespacing, qualified access, and cross-module `pub` enforcement are future
+work, as is a package/std path resolver.
+
+### 22.3 CLI
+`kard build`/`run`/`test` compile via `compile_program(root_path)` (path-based)
+so `@import`s resolve. The string entry `compile_to_c(src)` remains for
+single-file compiles and errors (`E0290`) on a residual `@import`.
