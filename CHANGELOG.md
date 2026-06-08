@@ -18,6 +18,25 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.119.0] — The Allocator interface + heap
+
+Zig's law — no global allocator; heap memory is requested from an `Allocator`
+that is passed explicitly.
+
+### Added
+- **`Allocator`** type and three builtins: **`c_allocator()`** (the malloc/free
+  allocator), **`alloc(a, T, n) -> []T`** (heap-allocate a slice of `n`
+  elements; the type argument is an identifier; panics on OOM), and
+  **`free(a, s)`**.
+- Lowered with no new AST: each slice type gains a `_alloc` heap helper;
+  `Allocator` is a small C struct. Diagnostics `E0241`/`E0242` (+ `E0101` guards
+  the builtin names).
+- 400 unit + 19 e2e tests; `examples/heap.ks`.
+
+### Deferred
+- Error-returning `alloc` (`![]T`), custom allocators / a vtable interface,
+  `realloc`, aligned allocation, and comptime-generic `alloc`.
+
 ## [0.118.0] — Pointers `*T` & slices `[]T`
 
 ### Added

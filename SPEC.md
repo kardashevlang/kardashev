@@ -603,6 +603,50 @@ Slices are non-owning views — the backing array must outlive the slice (raw, n
 lifetime check). Many-item pointers `[*]T` and pointer arithmetic beyond
 slicing are deferred.
 
+## 16. The Allocator interface + heap (v0.119)
+
+Zig's law: **no global allocator** — heap memory is requested from an
+`Allocator` value that is **passed explicitly**. v0.119 ships the `Allocator`
+type and three builtins (no new AST: they are ordinary calls; `alloc`'s type
+argument is just an identifier).
+
+- **`Allocator`** — a first-class type (`Type::Allocator`). C:
+  `typedef struct { int _unused; } kd_allocator;` (emitted in the prelude).
+- **`c_allocator() -> Allocator`** — the `malloc`/`free`-backed allocator. C:
+  `((kd_allocator){0})`.
+- **`alloc(a: Allocator, T, n: usize) -> []T`** — allocate a slice of `n`
+  elements of type `T`. The **second argument is a type** (an identifier naming
+  a builtin/struct/enum; sema resolves it; misuse → `E0241`). Result `[]T`
+  (interned). Panics (exit 101) on OOM.
+- **`free(a: Allocator, s: []T) -> void`** — free a slice previously returned by
+  `alloc` (second argument must be a slice → `E0242`).
+
+### 16.1 Semantics (`sema`)
+Special-case the three builtins in call checking (alongside `print`/`expect`):
+arity/type-check `a` as `Allocator`; for `alloc`, the 2nd arg is an `Ident`
+resolved to a type `T`, the 3rd an integer, result `Slice(intern_slice(T))`;
+for `free`, the 2nd arg any `Slice`. A user `fn` may not be named
+`alloc`/`free`/`c_allocator` (reuse `E0101`).
+
+### 16.2 Backend (`emit_c`)
+Emit the `kd_allocator` typedef in the prelude. For each slice type, emit
+(beside its typedef/accessor) an allocator helper:
+```c
+static inline kd_slice_<tag> kd_slice_<tag>_alloc(uintptr_t n) {
+    kd_slice_<tag> s; s.ptr = malloc(n * sizeof(<elem cty>));
+    if (!s.ptr && n != 0) { fputs("panic: out of memory\n", stderr); exit(101); }
+    s.len = n; return s;
+}
+```
+Lower `c_allocator()` → `((kd_allocator){0})`; `alloc(a, T, n)` →
+`kd_slice_<tag>_alloc(<n>)` (the `a` argument is accepted but unused in v0.119);
+`free(a, s)` → `free((<s>).ptr)`.
+
+### 16.3 Deferred (honest)
+Error-returning `alloc` (`![]T`), custom allocators / a vtable interface,
+`realloc`, aligned allocation, and comptime-generic `alloc` (the type argument
+is a builtin special-case until comptime generics land in v0.120).
+
 ### 13.3 Backend (`emit_c`)
 Emit each enum among the dependency-ordered type defs (enums have no
 dependencies):

@@ -290,8 +290,14 @@ impl<'a> Emitter<'a> {
         self.out.push_str("#include <stdint.h>\n");
         self.out.push_str("#include <stdbool.h>\n");
         self.out.push_str("#include <stdio.h>\n");
-        // `<stdlib.h>` provides `exit`, used by the `?T` unwrap panic helper.
+        // `<stdlib.h>` provides `exit` (the `?T` unwrap panic helper) and, since
+        // v0.114, `malloc`/`free` (the allocator helpers + `free` builtin).
         self.out.push_str("#include <stdlib.h>\n");
+        // The `Allocator` interface value (SPEC §16). v0.119 ships a single,
+        // empty malloc/free-backed allocator (`c_allocator()`); the `int _unused`
+        // field exists only so the struct is non-empty and stays valid C.
+        self.out
+            .push_str("typedef struct { int _unused; } kd_allocator;\n");
         self.out
             .push_str("static void kd_print(long long v) { printf(\"%lld\\n\", v); }\n");
         self.blank();
@@ -547,6 +553,14 @@ impl<'a> Emitter<'a> {
         ));
         self.line(&format!(
             "static inline {ec} {sn}_get({sn} s, int64_t i) {{ if (i < 0 || (uint64_t)i >= s.len) {{ fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); }} return s.ptr[i]; }}",
+            ec = elem_cty,
+            sn = sname
+        ));
+        // The allocator helper for `[]T` (SPEC §16.2): `alloc(a, T, n)` lowers
+        // to `<sn>_alloc(n)`, which `malloc`s `n` elements (panicking with
+        // exit 101 on OOM for a non-zero `n`) and returns the owning view.
+        self.line(&format!(
+            "static inline {sn} {sn}_alloc(uintptr_t n) {{ {sn} s; s.ptr = malloc(n * sizeof({ec})); if (!s.ptr && n != 0) {{ fputs(\"panic: out of memory\\n\", stderr); exit(101); }} s.len = n; return s; }}",
             ec = elem_cty,
             sn = sname
         ));
@@ -1395,6 +1409,38 @@ impl<'a> Emitter<'a> {
                     // level; it can never legitimately appear as a value, but
                     // emit a harmless no-op so output stays well-formed.
                     "((void)0)".to_string()
+                } else if callee == "c_allocator" {
+                    // The malloc/free-backed allocator value (SPEC §16.2). The
+                    // struct carries no state in v0.119, so a zero-initialised
+                    // compound literal is the whole allocator.
+                    "((kd_allocator){0})".to_string()
+                } else if callee == "alloc" {
+                    // `alloc(a, T, n) -> []T` (SPEC §16.2). arg0 (the allocator)
+                    // is accepted but unused in v0.119; arg1 is an identifier
+                    // naming the element type `T` (resolved exactly as sema
+                    // resolves it); arg2 is the element count `n`. It lowers to
+                    // the slice's inline `_alloc` helper — the `[]T` typedef and
+                    // helper are emitted because sema interned the slice as the
+                    // call's result type.
+                    let elem = match args.get(1) {
+                        Some(Expr::Ident { name, .. }) => self.base_type(name),
+                        _ => Type::Void,
+                    };
+                    let tag = self.structs.type_mangle(elem);
+                    let n = match args.get(2) {
+                        Some(n) => self.emit_expr(n),
+                        None => "0".to_string(),
+                    };
+                    format!("kd_slice_{}_alloc((uintptr_t)({}))", tag, n)
+                } else if callee == "free" {
+                    // `free(a, s) -> void` (SPEC §16.2). arg0 (the allocator) is
+                    // unused; arg1 is the slice whose backing storage `malloc`
+                    // returned. Releasing `.ptr` mirrors the `_alloc` helper.
+                    let s = match args.get(1) {
+                        Some(s) => self.emit_expr(s),
+                        None => "0".to_string(),
+                    };
+                    format!("free(({}).ptr)", s)
                 } else {
                     // Coerce each argument to its parameter type, so a `T`/`null`
                     // argument widens to a `?T` parameter.
@@ -1832,7 +1878,27 @@ impl<'a> Emitter<'a> {
                     self.type_of_expr(lhs)
                 }
             }
-            Expr::Call { callee, .. } => self.fn_ret.get(callee).copied(),
+            Expr::Call { callee, args, .. } => {
+                // The allocator builtins have synthetic result types (SPEC §16):
+                // `c_allocator()` is an `Allocator`; `alloc(a, T, n)` is `[]T`,
+                // resolved from the type-name identifier (arg1) and mapped to its
+                // interned slice so a `var x = alloc(a, T, n);` infers `[]T`.
+                if callee == "c_allocator" {
+                    return Some(Type::Allocator);
+                }
+                if callee == "alloc" {
+                    let elem = match args.get(1) {
+                        Some(Expr::Ident { name, .. }) => self.base_type(name),
+                        _ => return None,
+                    };
+                    return self
+                        .structs
+                        .slices()
+                        .find(|(_, e)| *e == elem)
+                        .map(|(id, _)| Type::Slice(id));
+                }
+                self.fn_ret.get(callee).copied()
+            }
             Expr::Comptime { expr, .. } => self.type_of_expr(expr),
             Expr::StructLit { name, .. } => self.structs.id_of(name).map(Type::Struct),
             Expr::Field { base, field, .. } => {
@@ -4473,6 +4539,152 @@ mod tests {
         assert!(
             b_at < a_at,
             "pointee struct must be declared before the struct that points to it:\n{out}"
+        );
+    }
+
+    // -- the Allocator interface + heap (v0.119, SPEC §16) ------------------
+
+    #[test]
+    fn allocator_typedef_emitted_in_prelude() {
+        // The `kd_allocator` typedef is unconditional prelude (SPEC §16.2):
+        // it appears even when no slice/allocator is used in the program.
+        let m = Module { items: vec![] };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            out.contains("typedef struct { int _unused; } kd_allocator;"),
+            "kd_allocator typedef missing from prelude:\n{out}"
+        );
+    }
+
+    #[test]
+    fn slice_alloc_helper_emitted() {
+        // Each interned slice gets its inline `_alloc` heap helper (SPEC §16.2),
+        // beside the typedef + `_get` accessor.
+        let structs = slice_int_table();
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains(
+                "static inline kd_slice_int32_t kd_slice_int32_t_alloc(uintptr_t n) { kd_slice_int32_t s; s.ptr = malloc(n * sizeof(int32_t)); if (!s.ptr && n != 0) { fputs(\"panic: out of memory\\n\", stderr); exit(101); } s.len = n; return s; }"
+            ),
+            "slice _alloc helper missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn c_allocator_emits_compound_literal() {
+        // fn a() Allocator { return c_allocator(); }
+        let f = Func {
+            is_pub: false,
+            name: "a".to_string(),
+            params: vec![],
+            ret: ty("Allocator"),
+            body: block(vec![ret(call("c_allocator", vec![]))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        // The `Allocator` return type spells as the prelude typedef.
+        assert!(
+            out.contains("kd_allocator kd_a(void)"),
+            "allocator return type wrong:\n{out}"
+        );
+        // `c_allocator()` lowers to the zero-initialised compound literal.
+        assert!(
+            out.contains("((kd_allocator){0})"),
+            "c_allocator lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn alloc_emits_slice_alloc_call() {
+        // fn mk(a: Allocator, n: usize) []i32 { return alloc(a, i32, n); }
+        let structs = slice_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "mk".to_string(),
+            params: vec![param("a", "Allocator"), param("n", "usize")],
+            ret: slice_ty("i32"),
+            body: block(vec![ret(call(
+                "alloc",
+                vec![ident("a"), ident("i32"), ident("n")],
+            ))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // `alloc(a, i32, n)` lowers to the `[]i32` heap helper; the allocator
+        // argument is accepted but dropped (unused in v0.119), and `n` is cast.
+        assert!(
+            out.contains("kd_slice_int32_t_alloc((uintptr_t)(kd_n))"),
+            "alloc lowering wrong:\n{out}"
+        );
+        // The call's result type is `[]i32`, so the slice typedef is the return.
+        assert!(
+            out.contains("kd_slice_int32_t kd_mk("),
+            "alloc result (slice) type wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn free_emits_ptr_free() {
+        // fn fr(a: Allocator, s: []i32) void { free(a, s); }
+        let structs = slice_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "fr".to_string(),
+            params: vec![
+                param("a", "Allocator"),
+                Param {
+                    name: "s".to_string(),
+                    ty: slice_ty("i32"),
+                    span: Span::DUMMY,
+                },
+            ],
+            ret: ty("void"),
+            body: block(vec![Stmt::Expr(call("free", vec![ident("a"), ident("s")]))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // `free(a, s)` releases the slice's backing storage; the allocator arg
+        // is dropped.
+        assert!(
+            out.contains("free((kd_s).ptr);"),
+            "free lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn alloc_result_type_infers_slice() {
+        // `alloc(a, i32, 2).len` proves `type_of_expr` infers the slice type for
+        // an `alloc` call: the `.len` lowers to the slice's runtime `.len` field
+        // (it would not if the call's type were unknown).
+        let structs = slice_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "ln".to_string(),
+            params: vec![param("a", "Allocator")],
+            ret: ty("usize"),
+            body: block(vec![ret(field(
+                call("alloc", vec![ident("a"), ident("i32"), int(2)]),
+                "len",
+            ))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("(kd_slice_int32_t_alloc((uintptr_t)(2))).len"),
+            "alloc result type not inferred as a slice (`.len` not lowered):\n{out}"
         );
     }
 }

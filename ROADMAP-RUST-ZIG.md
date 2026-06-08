@@ -91,9 +91,11 @@ by-value C struct wrapper with a bounds-checked accessor.
 `&place`, `p.*`, `p.* = e`; slices as `{ ptr, len }` views with `a[i]` / `.len`
 and slicing `a[lo..hi]`, bounds-checked. Raw (no lifetime checking).
 
-### v0.119.0 — The **Allocator** interface + heap
-The explicit `Allocator` (alloc/free); every heap allocation takes an allocator
-parameter — no global allocator. A small allocator-based stdlib.
+### v0.119.0 — The **Allocator** interface + heap ✅
+The explicit `Allocator` value (`c_allocator()`) + `alloc(a, T, n) -> []T` /
+`free(a, s)` builtins; heap allocation takes an allocator parameter — no global
+allocator. (Error-returning alloc, custom allocators, comptime-generic alloc:
+later.)
 
 ### v0.120.0 — `comptime` generics: `fn F(comptime T: type) type`
 Real compile-time generics (containers, `ArrayList(T)`), monomorphised — Zig's

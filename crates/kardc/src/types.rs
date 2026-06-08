@@ -42,6 +42,9 @@ pub enum Type {
     /// `[]T` — a slice (`{ptr,len}` view, v0.118). The `u32` indexes the slice
     /// element table.
     Slice(u32),
+    /// The `Allocator` interface value (v0.119). A first-class, explicitly
+    /// passed allocator; `c_allocator()` constructs one backed by malloc/free.
+    Allocator,
 }
 
 impl Type {
@@ -59,6 +62,7 @@ impl Type {
             "usize" => Type::Usize,
             "bool" => Type::Bool,
             "void" => Type::Void,
+            "Allocator" => Type::Allocator,
             _ => return None,
         })
     }
@@ -86,6 +90,7 @@ impl Type {
             Type::Array(_) => "array",
             Type::Ptr(_) => "pointer",
             Type::Slice(_) => "slice",
+            Type::Allocator => "Allocator",
         }
     }
 
@@ -122,6 +127,7 @@ impl Type {
             Type::Slice(_) => {
                 unreachable!("c_name on a slice type; use StructTable::slice_c_name")
             }
+            Type::Allocator => "kd_allocator",
         }
     }
 
