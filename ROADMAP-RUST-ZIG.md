@@ -103,8 +103,10 @@ per concrete type argument), with transitive instantiation and type-parameter
 forwarding. Generic structs / type-returning functions (`fn List(comptime T:
 type) type`) and comptime *value* params are a later item.
 
-### v0.121.0 — Type inference for `var`/`const`; the standard prelude
-Inferred local types; a small std built on the allocator interface.
+### v0.121.0 — Type inference for `var`/`const` ✅
+The `: T` annotation on a binding is optional — inferred from the initializer
+(local `var`/`const` and top-level `const`). Inferred types are concrete (no
+implicit conversions). A standard prelude/std is a later item.
 
 ### v0.122.0 — The full in-language build graph (`build.ks`)
 The imperative `build.zig`-style build description: steps, dependencies,

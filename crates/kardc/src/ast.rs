@@ -84,7 +84,8 @@ pub struct Param {
 pub struct ConstDecl {
     pub is_pub: bool,
     pub name: String,
-    pub ty: TypeExpr,
+    /// Optional type annotation (v0.121); `None` infers from `value`.
+    pub ty: Option<TypeExpr>,
     pub value: Expr,
     pub span: Span,
 }
@@ -127,10 +128,12 @@ pub struct Block {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     /// `var name: T = expr;` (is_const = false) or `const name: T = expr;`.
+    /// The type annotation is optional (v0.121): `var name = expr;` infers the
+    /// type from `expr`.
     Let {
         is_const: bool,
         name: String,
-        ty: TypeExpr,
+        ty: Option<TypeExpr>,
         value: Expr,
         span: Span,
     },

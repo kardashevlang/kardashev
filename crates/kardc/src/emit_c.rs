@@ -278,7 +278,13 @@ impl<'a> Emitter<'a> {
                         self.note_func_ptrs(m);
                     }
                 }
-                Item::Const(c) => self.note_ptr_ty(&c.ty),
+                Item::Const(c) => {
+                    // A const's type annotation is optional (v0.121); an inferred
+                    // const carries no `*T` source type to register here.
+                    if let Some(t) = &c.ty {
+                        self.note_ptr_ty(t);
+                    }
+                }
                 Item::Test(t) => self.note_block_ptrs(&t.body),
                 Item::Enum(_) => {}
             }
@@ -301,7 +307,13 @@ impl<'a> Emitter<'a> {
 
     fn note_stmt_ptrs(&mut self, s: &Stmt) {
         match s {
-            Stmt::Let { ty, .. } => self.note_ptr_ty(ty),
+            Stmt::Let { ty, .. } => {
+                // The annotation is optional (v0.121); an inferred binding has no
+                // `*T` source type to register here.
+                if let Some(t) = ty {
+                    self.note_ptr_ty(t);
+                }
+            }
             Stmt::If { then, els, .. } => {
                 self.note_block_ptrs(then);
                 if let Some(e) = els {
@@ -641,7 +653,14 @@ impl<'a> Emitter<'a> {
                 // The module is validated, so this evaluation always succeeds;
                 // if it somehow does not we skip the const rather than panic.
                 if let Ok(v) = crate::const_eval::eval(&c.value, &self.consts) {
-                    let cty = self.cty(&c.ty);
+                    // The C declaration type: the annotation when present, else
+                    // the inferred type of the folded value (v0.121, SPEC §18.3).
+                    // A `ConstVal::Int` infers `i64` (`int64_t`), a
+                    // `ConstVal::Bool` infers `bool`.
+                    let cty = match &c.ty {
+                        Some(te) => self.cty(te),
+                        None => self.cty_of(const_val_type(v)),
+                    };
                     let lit = const_literal(v);
                     self.line(&format!("static const {} kd_{} = {};", cty, c.name, lit));
                     self.consts.insert(c.name.clone(), v);
@@ -1029,9 +1048,19 @@ impl<'a> Emitter<'a> {
                 value,
                 ..
             } => {
-                // Coerce the initializer to the declared type (a `T` value,
-                // `null` or `error.X` widens to `?T` / `!T` when annotated).
-                let lty = self.resolve_ty(ty);
+                // The binding's type: the annotation when present, else the
+                // inferred type of the initializer (v0.121, SPEC §18.3). A
+                // validated inferred binding always has an inferable initializer
+                // (`type_of_expr` returns `Some`); the `i64` fallback only guards
+                // the impossible un-inferable case so emission never panics.
+                let lty = match ty {
+                    Some(te) => self.resolve_ty(te),
+                    None => self.type_of_expr(value).unwrap_or(Type::I64),
+                };
+                // Coerce the initializer to that type (a `T` value, `null` or
+                // `error.X` widens to `?T` / `!T` when annotated). For an inferred
+                // binding the initializer already has type `lty`, so the coercion
+                // is a no-op.
                 let es = if let Expr::Try { expr, .. } = value {
                     // `var x = try e;` hoists the error propagation (which may
                     // early-return) and binds the unwrapped payload.
@@ -1040,7 +1069,12 @@ impl<'a> Emitter<'a> {
                 } else {
                     self.emit_coerced(value, lty)
                 };
-                let ct = self.cty(ty);
+                // The C declaration type mirrors `lty`: the annotation's spelling
+                // when present, else the inferred type's spelling.
+                let ct = match ty {
+                    Some(te) => self.cty(te),
+                    None => self.cty_of(lty),
+                };
                 let prefix = if *is_const { "const " } else { "" };
                 self.line(&format!("{}{} kd_{} = {};", prefix, ct, name, es));
                 // Record the local's type so a later method call / coercion on
@@ -2377,6 +2411,16 @@ impl<'a> Emitter<'a> {
     }
 }
 
+/// The inferred [`Type`] of a folded constant value (v0.121): an integer
+/// constant infers `i64`, a boolean constant infers `bool`. Used to pick the C
+/// declaration type of an un-annotated top-level `const` (SPEC §18.2/§18.3).
+fn const_val_type(v: ConstVal) -> Type {
+    match v {
+        ConstVal::Int(_) => Type::I64,
+        ConstVal::Bool(_) => Type::Bool,
+    }
+}
+
 /// Render a folded constant as a C literal.
 fn const_literal(v: ConstVal) -> String {
     match v {
@@ -2882,7 +2926,7 @@ mod tests {
                 Stmt::Let {
                     is_const: false,
                     name: "p".to_string(),
-                    ty: ty("Point"),
+                    ty: Some(ty("Point")),
                     value: lit,
                     span: Span::DUMMY,
                 },
@@ -3343,7 +3387,7 @@ mod tests {
             body: block(vec![Stmt::Let {
                 is_const: false,
                 name: "x".to_string(),
-                ty: opt_ty("i32"),
+                ty: Some(opt_ty("i32")),
                 value: Expr::Null { span: Span::DUMMY },
                 span: Span::DUMMY,
             }]),
@@ -3372,7 +3416,7 @@ mod tests {
             body: block(vec![Stmt::Let {
                 is_const: false,
                 name: "x".to_string(),
-                ty: opt_ty("i32"),
+                ty: Some(opt_ty("i32")),
                 value: int(7),
                 span: Span::DUMMY,
             }]),
@@ -3473,7 +3517,7 @@ mod tests {
             body: block(vec![Stmt::Let {
                 is_const: false,
                 name: "y".to_string(),
-                ty: opt_ty("i32"),
+                ty: Some(opt_ty("i32")),
                 value: ident("x"),
                 span: Span::DUMMY,
             }]),
@@ -3725,7 +3769,7 @@ mod tests {
                 Stmt::Let {
                     is_const: false,
                     name: "x".to_string(),
-                    ty: ty("i32"),
+                    ty: Some(ty("i32")),
                     value: try_expr(call("g", vec![])),
                     span: Span::DUMMY,
                 },
@@ -3963,7 +4007,7 @@ mod tests {
             body: block(vec![Stmt::Let {
                 is_const: false,
                 name: "c".to_string(),
-                ty: ty("Color"),
+                ty: Some(ty("Color")),
                 value: enum_lit("Blue"),
                 span: Span::DUMMY,
             }]),
@@ -4014,7 +4058,7 @@ mod tests {
                 Stmt::Let {
                     is_const: false,
                     name: "r".to_string(),
-                    ty: ty("i32"),
+                    ty: Some(ty("i32")),
                     value: int(0),
                     span: Span::DUMMY,
                 },
@@ -4120,7 +4164,7 @@ mod tests {
                 Stmt::Let {
                     is_const: false,
                     name: "r".to_string(),
-                    ty: ty("i32"),
+                    ty: Some(ty("i32")),
                     value: int(0),
                     span: Span::DUMMY,
                 },
@@ -4516,7 +4560,7 @@ mod tests {
                 Stmt::Let {
                     is_const: false,
                     name: "p".to_string(),
-                    ty: ptr_ty("i32"),
+                    ty: Some(ptr_ty("i32")),
                     value: addr_of(ident("x")),
                     span: Span::DUMMY,
                 },
@@ -5151,6 +5195,180 @@ mod tests {
                 "kd_first__int32_t(((kd_opt_int32_t){ .has = true, .val = kd_v }))"
             ),
             "runtime arg should widen to the substituted optional param:\n{out}"
+        );
+    }
+
+    // -- v0.121: type inference for `var` / `const` ------------------------
+
+    #[test]
+    fn inferred_var_int_emits_int64_decl() {
+        // fn f() void { var x = 42; }  — no annotation, inferred `i64`.
+        let f = func(
+            "f",
+            vec![],
+            "void",
+            vec![Stmt::Let {
+                is_const: false,
+                name: "x".to_string(),
+                ty: None,
+                value: int(42),
+                span: Span::DUMMY,
+            }],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            out.contains("int64_t kd_x = 42;"),
+            "inferred int var should emit an int64_t decl:\n{out}"
+        );
+    }
+
+    #[test]
+    fn inferred_var_bool_emits_bool_decl() {
+        // fn f() void { var b = true; }  — inferred `bool`.
+        let f = func(
+            "f",
+            vec![],
+            "void",
+            vec![Stmt::Let {
+                is_const: false,
+                name: "b".to_string(),
+                ty: None,
+                value: Expr::Bool {
+                    value: true,
+                    span: Span::DUMMY,
+                },
+                span: Span::DUMMY,
+            }],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            out.contains("bool kd_b = true;"),
+            "inferred bool var should emit a bool decl:\n{out}"
+        );
+    }
+
+    #[test]
+    fn inferred_var_struct_emits_typedef_name() {
+        // fn f() void { var p = Point{ .x = 1, .y = 2 }; }  — inferred `Point`,
+        // so the C declaration type is the struct typedef name.
+        let structs = point_table();
+        let lit = Expr::StructLit {
+            name: "Point".to_string(),
+            fields: vec![finit("x", int(1)), finit("y", int(2))],
+            span: Span::DUMMY,
+        };
+        let f = func(
+            "f",
+            vec![],
+            "void",
+            vec![Stmt::Let {
+                is_const: false,
+                name: "p".to_string(),
+                ty: None,
+                value: lit,
+                span: Span::DUMMY,
+            }],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains(
+                "kd_struct_Point kd_p = ((kd_struct_Point){ .kd_x = 1, .kd_y = 2 });"
+            ),
+            "inferred struct var should emit the struct typedef name:\n{out}"
+        );
+    }
+
+    #[test]
+    fn inferred_var_type_recorded_for_later_use() {
+        // fn f(o: ?i32) void { var x = o; x = null; }
+        // `x` is inferred `?i32` from `o`; the recorded inferred type must drive
+        // the later `null` re-assignment to widen to the empty optional (which
+        // proves the inferred type landed in `var_types`).
+        let structs = opt_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![Param {
+                name: "o".to_string(),
+                ty: opt_ty("i32"),
+                is_comptime: false,
+                span: Span::DUMMY,
+            }],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "x".to_string(),
+                    ty: None,
+                    value: ident("o"),
+                    span: Span::DUMMY,
+                },
+                Stmt::Assign {
+                    name: "x".to_string(),
+                    value: Expr::Null { span: Span::DUMMY },
+                    span: Span::DUMMY,
+                },
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The inferred declaration uses the optional typedef.
+        assert!(
+            out.contains("kd_opt_int32_t kd_x = kd_o;"),
+            "inferred optional var should use the optional typedef:\n{out}"
+        );
+        // The later `null` re-assignment widens using the recorded inferred type.
+        assert!(
+            out.contains("kd_x = ((kd_opt_int32_t){ .has = false });"),
+            "later use should resolve the inferred var's type:\n{out}"
+        );
+    }
+
+    #[test]
+    fn inferred_top_level_const_infers_c_type() {
+        // const N = 7;  /  const B = true;  — un-annotated top-level consts
+        // (v0.121) infer `i64` / `bool` from the folded comptime value.
+        let m = Module {
+            items: vec![
+                Item::Const(crate::ast::ConstDecl {
+                    is_pub: false,
+                    name: "N".to_string(),
+                    ty: None,
+                    value: int(7),
+                    span: Span::DUMMY,
+                }),
+                Item::Const(crate::ast::ConstDecl {
+                    is_pub: false,
+                    name: "B".to_string(),
+                    ty: None,
+                    value: Expr::Bool {
+                        value: true,
+                        span: Span::DUMMY,
+                    },
+                    span: Span::DUMMY,
+                }),
+            ],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            out.contains("static const int64_t kd_N = 7;"),
+            "inferred int const should be int64_t:\n{out}"
+        );
+        assert!(
+            out.contains("static const bool kd_B = true;"),
+            "inferred bool const should be bool:\n{out}"
         );
     }
 }

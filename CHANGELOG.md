@@ -18,6 +18,17 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.121.0] — Type inference for `var`/`const`
+
+### Added
+- The `: T` annotation on a binding is now **optional**: `var x = expr;` /
+  `const x = expr;` (and top-level `const X = expr;`) infer the type from the
+  initializer. `Stmt::Let.ty` / `ConstDecl.ty` became `Option<TypeExpr>`.
+- Inferred types are **concrete** (no implicit conversions): `var i = 0;` is
+  `i64`. A value with no context-free type (bare `null`, `error.X`, `.Variant`)
+  requires an annotation → `E0260`.
+- 458 unit + 21 e2e tests; `examples/inference.ks`.
+
 ## [0.120.0] — `comptime` generics (generic functions)
 
 Zig's metaprogramming model: compile-time type parameters + monomorphisation.

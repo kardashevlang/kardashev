@@ -401,16 +401,39 @@ impl<'a> Parser<'a> {
     fn parse_const(&mut self, is_pub: bool, start: Span) -> PResult<Item> {
         self.bump(); // `const`
         let (name, _) = self.expect_ident()?;
-        // A `const IDENT =` (rather than `const IDENT :`) introduces a struct
-        // declaration (SPEC §9.1) or an enum declaration (SPEC §13.1); a
-        // `const IDENT : type = expr;` is the ordinary value binding of §2.
-        // The `struct`/`enum` keyword after the `=` selects the form.
+        // After `const IDENT`, the next token selects the item form:
+        //   - `:` introduces a typed value binding `const IDENT : type = expr ;`
+        //     (SPEC §2), with an explicit annotation (`ty = Some`).
+        //   - `=` introduces either a *type declaration* — `= struct { … }`
+        //     (SPEC §9.1) / `= enum { … }` (SPEC §13.1), selected by the
+        //     keyword that follows the `=` — or, for any other following token,
+        //     an *inferred* value binding `const IDENT = expr ;` (SPEC §18.1)
+        //     whose type sema infers from the initializer (`ty = None`).
         if self.at_punct(&TokenKind::Eq) {
-            if matches!(self.peek2_kind(), TokenKind::Keyword(Kw::Enum)) {
-                return self.parse_enum_decl(is_pub, name, start);
+            match self.peek2_kind() {
+                TokenKind::Keyword(Kw::Struct) => {
+                    return self.parse_struct_decl(is_pub, name, start);
+                }
+                TokenKind::Keyword(Kw::Enum) => {
+                    return self.parse_enum_decl(is_pub, name, start);
+                }
+                _ => {
+                    // Inferred value const `const IDENT = expr ;` (no annotation).
+                    self.bump(); // `=`
+                    let value = self.parse_expr()?;
+                    let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
+                    let span = start.merge(semi);
+                    return Ok(Item::Const(ConstDecl {
+                        is_pub,
+                        name,
+                        ty: None,
+                        value,
+                        span,
+                    }));
+                }
             }
-            return self.parse_struct_decl(is_pub, name, start);
         }
+        // Annotated value const `const IDENT : type = expr ;`.
         self.expect_punct(&TokenKind::Colon, "`:`")?;
         let ty = self.parse_type()?;
         self.expect_punct(&TokenKind::Eq, "`=`")?;
@@ -420,7 +443,7 @@ impl<'a> Parser<'a> {
         Ok(Item::Const(ConstDecl {
             is_pub,
             name,
-            ty,
+            ty: Some(ty),
             value,
             span,
         }))
@@ -560,8 +583,15 @@ impl<'a> Parser<'a> {
         let is_const = matches!(self.peek_kind(), TokenKind::Keyword(Kw::Const));
         self.bump(); // `var` | `const`
         let (name, _) = self.expect_ident()?;
-        self.expect_punct(&TokenKind::Colon, "`:`")?;
-        let ty = self.parse_type()?;
+        // The type annotation is optional (SPEC §18.1): a `:` introduces an
+        // explicit `: type` (`ty = Some`); otherwise the binding's type is
+        // inferred from the initializer in sema (`ty = None`). Either way an
+        // `= expr ;` initializer follows.
+        let ty = if self.eat_punct(&TokenKind::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
         self.expect_punct(&TokenKind::Eq, "`=`")?;
         let value = self.parse_expr()?;
         let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
@@ -1399,7 +1429,8 @@ mod tests {
             Item::Const(c) => {
                 assert!(!c.is_pub);
                 assert_eq!(c.name, "MAX");
-                assert_eq!(c.ty.name, "i64");
+                let ty = c.ty.as_ref().expect("annotated const carries Some(ty)");
+                assert_eq!(ty.name, "i64");
                 match &c.value {
                     Expr::Int { value: 10, .. } => {}
                     other => panic!("expected int 10, got {:?}", other),
@@ -2268,6 +2299,7 @@ mod tests {
         match &body.stmts[0] {
             Stmt::Let { name, ty, value, .. } => {
                 assert_eq!(name, "x");
+                let ty = ty.as_ref().expect("annotated local carries Some(ty)");
                 assert_eq!(ty.name, "Point");
                 assert!(ty.optional, "`?Point` local must be optional");
                 assert!(matches!(value, Expr::Null { .. }));
@@ -2525,6 +2557,7 @@ mod tests {
                 assert!(!f.params[0].ty.optional);
                 match &f.body.stmts[0] {
                     Stmt::Let { ty, .. } => {
+                        let ty = ty.as_ref().expect("annotated local carries Some(ty)");
                         assert_eq!(ty.name, "bool");
                         assert!(ty.error_union, "`!bool` local must be an error union");
                         assert!(!ty.optional);
@@ -3187,6 +3220,7 @@ mod tests {
         match &body.stmts[0] {
             Stmt::Let { name, ty, value, .. } => {
                 assert_eq!(name, "a");
+                let ty = ty.as_ref().expect("annotated local carries Some(ty)");
                 assert_eq!(ty.name, "i32");
                 assert_eq!(ty.array_len, Some(2));
                 match value {
@@ -3557,6 +3591,7 @@ mod tests {
         match &body.stmts[0] {
             Stmt::Let { name, ty, value, .. } => {
                 assert_eq!(name, "s");
+                let ty = ty.as_ref().expect("annotated local carries Some(ty)");
                 assert_eq!(ty.name, "i32");
                 assert!(ty.slice, "`[]i32` local must set slice");
                 assert!(!ty.pointer);
@@ -3998,6 +4033,232 @@ mod tests {
                 assert!(matches!(args[1], Expr::Int { value: 5, .. }));
             }
             other => panic!("expected a plain call, got {:?}", other),
+        }
+    }
+
+    // ---- v0.121: type inference for var/const -----------------------------
+
+    /// Parse the kinds of a single statement by wrapping them in
+    /// `fn f() void { <stmt kinds> }` and returning the lone body statement.
+    fn parse_one_stmt(stmt_kinds: Vec<TokenKind>) -> Stmt {
+        let mut kinds = vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+        ];
+        kinds.extend(stmt_kinds);
+        kinds.push(TokenKind::RBrace);
+        let m = parse(&toks(kinds)).expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert_eq!(f.body.stmts.len(), 1, "expected exactly one statement");
+                f.body.stmts[0].clone()
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inferred_local_var_has_no_annotation() {
+        // var x = 5;  — no `: type`, so `Stmt::Let.ty` is `None` (SPEC §18.1).
+        let s = parse_one_stmt(vec![
+            TokenKind::Keyword(Kw::Var),
+            id("x"),
+            TokenKind::Eq,
+            TokenKind::Int(5),
+            TokenKind::Semicolon,
+        ]);
+        match s {
+            Stmt::Let {
+                is_const,
+                name,
+                ty,
+                value,
+                ..
+            } => {
+                assert!(!is_const, "`var` is not const");
+                assert_eq!(name, "x");
+                assert!(ty.is_none(), "an un-annotated `var` infers its type (ty == None)");
+                assert!(matches!(value, Expr::Int { value: 5, .. }));
+            }
+            other => panic!("expected let, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn annotated_local_var_keeps_some_ty() {
+        // var y: i32 = 5;  — the `: type` form keeps `ty == Some` (SPEC §18.1).
+        let s = parse_one_stmt(vec![
+            TokenKind::Keyword(Kw::Var),
+            id("y"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::Eq,
+            TokenKind::Int(5),
+            TokenKind::Semicolon,
+        ]);
+        match s {
+            Stmt::Let { name, ty, .. } => {
+                assert_eq!(name, "y");
+                let ty = ty.expect("annotated `var` carries Some(ty)");
+                assert_eq!(ty.name, "i32");
+                assert!(!ty.optional);
+                assert!(!ty.error_union);
+            }
+            other => panic!("expected let, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inferred_local_const_has_no_annotation() {
+        // const k = 7;  — a local `const` infers too (ty == None).
+        let s = parse_one_stmt(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("k"),
+            TokenKind::Eq,
+            TokenKind::Int(7),
+            TokenKind::Semicolon,
+        ]);
+        match s {
+            Stmt::Let {
+                is_const, name, ty, ..
+            } => {
+                assert!(is_const, "`const` local is const");
+                assert_eq!(name, "k");
+                assert!(ty.is_none(), "an un-annotated local `const` infers its type");
+            }
+            other => panic!("expected let, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inferred_top_level_const_has_no_annotation() {
+        // const Z = 7;  — a top-level inferred value const (ConstDecl.ty == None,
+        // SPEC §18.1). Before v0.121 this required a `: type` annotation.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("Z"),
+            TokenKind::Eq,
+            TokenKind::Int(7),
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Const(c) => {
+                assert!(!c.is_pub);
+                assert_eq!(c.name, "Z");
+                assert!(c.ty.is_none(), "inferred top-level const has ty == None");
+                assert!(matches!(c.value, Expr::Int { value: 7, .. }));
+            }
+            other => panic!("expected const, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn annotated_top_level_const_keeps_some_ty() {
+        // const W: i32 = 7;  — the annotated form keeps ConstDecl.ty == Some.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("W"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::Eq,
+            TokenKind::Int(7),
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Const(c) => {
+                assert_eq!(c.name, "W");
+                let ty = c.ty.as_ref().expect("annotated const carries Some(ty)");
+                assert_eq!(ty.name, "i32");
+            }
+            other => panic!("expected const, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inferred_const_from_expression() {
+        // const P = 1 + 2 * 3;  — the inferred initializer is a full expression,
+        // not just a literal, and still produces a value const (ty == None).
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("P"),
+            TokenKind::Eq,
+            TokenKind::Int(1),
+            TokenKind::Plus,
+            TokenKind::Int(2),
+            TokenKind::Star,
+            TokenKind::Int(3),
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Const(c) => {
+                assert_eq!(c.name, "P");
+                assert!(c.ty.is_none());
+                assert!(matches!(
+                    c.value,
+                    Expr::Binary { op: BinOp::Add, .. }
+                ));
+            }
+            other => panic!("expected const, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn struct_const_still_parses_after_inference_dispatch() {
+        // const P = struct { x: i32 };  — a `= struct` still becomes a struct
+        // declaration, not an inferred value const (SPEC §9.1, §18.1).
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("P"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            id("x"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Struct(s) => {
+                assert_eq!(s.name, "P");
+                assert_eq!(s.fields.len(), 1);
+                assert_eq!(s.fields[0].name, "x");
+            }
+            other => panic!("expected struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enum_const_still_parses_after_inference_dispatch() {
+        // const E = enum { A, B };  — a `= enum` still becomes an enum
+        // declaration, not an inferred value const (SPEC §13.1, §18.1).
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("E"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Enum),
+            TokenKind::LBrace,
+            id("A"),
+            TokenKind::Comma,
+            id("B"),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Enum(e) => {
+                assert_eq!(e.name, "E");
+                assert_eq!(e.variants, vec!["A", "B"]);
+            }
+            other => panic!("expected enum, got {:?}", other),
         }
     }
 }

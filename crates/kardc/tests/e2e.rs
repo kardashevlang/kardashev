@@ -469,3 +469,30 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "9\n11\n42\n");
 }
+
+// --- v0.121 type inference -------------------------------------------------
+
+#[test]
+fn type_inference_for_var_and_const() {
+    let src = r#"
+const MAX = 100;                          // inferred i64
+const Point = struct { x: i32, y: i32 };
+fn dist2(p: Point) i32 { return p.x * p.x + p.y * p.y; }
+pub fn main() i32 {
+    var n = 5;                            // inferred
+    var sum = 0;
+    var i = 0;
+    while (i < n) : (i = i + 1) { sum = sum + i; }
+    print(sum);                           // 10
+    var p = Point{ .x = 3, .y = 4 };      // inferred struct
+    print(dist2(p));                      // 25
+    print(MAX);                           // 100
+    var ok = true;                        // inferred bool
+    if (ok) { print(1); }                 // 1
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "10\n25\n100\n1\n");
+}

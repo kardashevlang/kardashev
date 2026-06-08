@@ -17,7 +17,9 @@
 //! - Spaces around every binary operator (`a + b`, `a and b`).
 //! - `if (cond) { … } else if (cond) { … } else { … }`.
 //! - `while (cond) { … }` / `while (cond) : (cont) { … }`.
-//! - `const NAME: T = expr;` / `var name: T = expr;` / `return expr;`.
+//! - `const NAME: T = expr;` / `var name: T = expr;` / `return expr;`. The type
+//!   annotation is optional (SPEC §18): an inferred binding prints with no
+//!   `: T` — `const NAME = expr;` / `var name = expr;`.
 //! - `defer <stmt>`; `test "name" { … }`.
 //! - `const Name = struct { f: T, … };` — one field per line, 4-space indent,
 //!   trailing comma on each; an empty struct prints `const Name = struct {};`.
@@ -141,8 +143,12 @@ impl Printer {
         }
         self.out.push_str("const ");
         self.out.push_str(&c.name);
-        self.out.push_str(": ");
-        self.out.push_str(&fmt_type(&c.ty));
+        // The type annotation is optional (SPEC §18): `const NAME: T = expr;`
+        // when present, `const NAME = expr;` when inferred from the initializer.
+        if let Some(ty) = &c.ty {
+            self.out.push_str(": ");
+            self.out.push_str(&fmt_type(ty));
+        }
         self.out.push_str(" = ");
         self.out.push_str(&fmt_expr(&c.value));
         self.out.push_str(";\n");
@@ -253,8 +259,12 @@ impl Printer {
                 self.write_indent();
                 self.out.push_str(if *is_const { "const " } else { "var " });
                 self.out.push_str(name);
-                self.out.push_str(": ");
-                self.out.push_str(&fmt_type(ty));
+                // The type annotation is optional (SPEC §18): `var name: T = …;`
+                // when present, `var name = …;` when inferred from the value.
+                if let Some(ty) = ty {
+                    self.out.push_str(": ");
+                    self.out.push_str(&fmt_type(ty));
+                }
                 self.out.push_str(" = ");
                 self.out.push_str(&fmt_expr(value));
                 self.out.push_str(";\n");
@@ -1031,14 +1041,14 @@ mod tests {
                 Item::Const(ConstDecl {
                     is_pub: true,
                     name: "MAX".to_string(),
-                    ty: ty("i32"),
+                    ty: Some(ty("i32")),
                     value: int(10),
                     span: D,
                 }),
                 Item::Const(ConstDecl {
                     is_pub: false,
                     name: "MIN".to_string(),
-                    ty: ty("i32"),
+                    ty: Some(ty("i32")),
                     value: int(0),
                     span: D,
                 }),
@@ -1063,7 +1073,7 @@ mod tests {
                         Stmt::Let {
                             is_const: false,
                             name: "x".to_string(),
-                            ty: ty("i64"),
+                            ty: Some(ty("i64")),
                             value: int(1),
                             span: D,
                         },
@@ -1399,7 +1409,7 @@ mod tests {
                             Stmt::Let {
                                 is_const: false,
                                 name: "p".to_string(),
-                                ty: ty("Point"),
+                                ty: Some(ty("Point")),
                                 value: lit,
                                 span: D,
                             },
@@ -1657,7 +1667,7 @@ mod tests {
         let const_decl = Item::Const(ConstDecl {
             is_pub: true,
             name: "NONE".to_string(),
-            ty: opt_ty("i32"),
+            ty: Some(opt_ty("i32")),
             value: null(),
             span: D,
         });
@@ -1686,7 +1696,7 @@ mod tests {
                 stmts: vec![Stmt::Let {
                     is_const: false,
                     name: "y".to_string(),
-                    ty: opt_ty("i32"),
+                    ty: Some(opt_ty("i32")),
                     value: null(),
                     span: D,
                 }],
@@ -1774,7 +1784,7 @@ mod tests {
                         Stmt::Let {
                             is_const: false,
                             name: "y".to_string(),
-                            ty: opt_ty("i32"),
+                            ty: Some(opt_ty("i32")),
                             value: null(),
                             span: D,
                         },
@@ -1872,7 +1882,7 @@ mod tests {
         let const_decl = Item::Const(ConstDecl {
             is_pub: true,
             name: "NIL".to_string(),
-            ty: err_ty("i32"),
+            ty: Some(err_ty("i32")),
             value: error_lit("Oops"),
             span: D,
         });
@@ -1901,7 +1911,7 @@ mod tests {
                 stmts: vec![Stmt::Let {
                     is_const: false,
                     name: "y".to_string(),
-                    ty: err_ty("i32"),
+                    ty: Some(err_ty("i32")),
                     value: error_lit("Bad"),
                     span: D,
                 }],
@@ -1949,14 +1959,14 @@ mod tests {
                         Stmt::Let {
                             is_const: true,
                             name: "x".to_string(),
-                            ty: ty("i32"),
+                            ty: Some(ty("i32")),
                             value: catch_(call("parse", vec![ident("s")]), int(0)),
                             span: D,
                         },
                         Stmt::Let {
                             is_const: true,
                             name: "y".to_string(),
-                            ty: ty("i32"),
+                            ty: Some(ty("i32")),
                             value: try_(call("parse", vec![ident("s")])),
                             span: D,
                         },
@@ -2255,7 +2265,7 @@ mod tests {
         let const_decl = Item::Const(ConstDecl {
             is_pub: true,
             name: "ZEROS".to_string(),
-            ty: arr_ty("i32", 3),
+            ty: Some(arr_ty("i32", 3)),
             value: array_lit("i32", 3, vec![int(0), int(0), int(0)]),
             span: D,
         });
@@ -2284,7 +2294,7 @@ mod tests {
                 stmts: vec![Stmt::Let {
                     is_const: false,
                     name: "b".to_string(),
-                    ty: arr_ty("i32", 2),
+                    ty: Some(arr_ty("i32", 2)),
                     value: array_lit("i32", 2, vec![int(1), int(2)]),
                     span: D,
                 }],
@@ -2364,7 +2374,7 @@ mod tests {
                         Stmt::Let {
                             is_const: false,
                             name: "a".to_string(),
-                            ty: arr_ty("i32", 3),
+                            ty: Some(arr_ty("i32", 3)),
                             value: array_lit("i32", 3, vec![int(1), int(2), int(3)]),
                             span: D,
                         },
@@ -2483,7 +2493,7 @@ mod tests {
                 stmts: vec![Stmt::Let {
                     is_const: false,
                     name: "q".to_string(),
-                    ty: ptr_ty("i32"),
+                    ty: Some(ptr_ty("i32")),
                     value: addr_of(ident("x")),
                     span: D,
                 }],
@@ -2592,14 +2602,14 @@ mod tests {
                         Stmt::Let {
                             is_const: false,
                             name: "a".to_string(),
-                            ty: arr_ty("i32", 3),
+                            ty: Some(arr_ty("i32", 3)),
                             value: array_lit("i32", 3, vec![int(1), int(2), int(3)]),
                             span: D,
                         },
                         Stmt::Let {
                             is_const: false,
                             name: "p".to_string(),
-                            ty: ptr_ty("i32"),
+                            ty: Some(ptr_ty("i32")),
                             value: addr_of(index(ident("a"), int(0))),
                             span: D,
                         },
@@ -2611,7 +2621,7 @@ mod tests {
                         Stmt::Let {
                             is_const: false,
                             name: "s".to_string(),
-                            ty: slice_ty("i32"),
+                            ty: Some(slice_ty("i32")),
                             value: slice_expr(ident("a"), int(0), int(2)),
                             span: D,
                         },
@@ -2791,5 +2801,192 @@ mod tests {
             })],
         };
         assert_eq!(print_module(&m), "fn id(x: i32) i32 {\n    return x;\n}\n");
+    }
+
+    // ----- type inference for var/const (v0.121) ---------------------------
+
+    #[test]
+    fn inferred_local_let_omits_type_annotation() {
+        // An inferred binding (`ty: None`) prints with no `: T`: `var x = …;` /
+        // `const y = …;`. The type is recovered from the initializer in sema;
+        // the formatter simply omits the annotation (SPEC §18.3).
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![
+                        Stmt::Let {
+                            is_const: false,
+                            name: "x".to_string(),
+                            ty: None,
+                            value: int(1),
+                            span: D,
+                        },
+                        Stmt::Let {
+                            is_const: true,
+                            name: "y".to_string(),
+                            ty: None,
+                            value: bin(BinOp::Add, ident("x"), int(2)),
+                            span: D,
+                        },
+                        Stmt::Expr(call("print", vec![ident("y")])),
+                    ],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f() void {\n",
+            "    var x = 1;\n",
+            "    const y = x + 2;\n",
+            "    print(y);\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn annotated_and_inferred_lets_coexist() {
+        // Annotated and inferred locals interleave: the annotated ones keep
+        // `: T`, the inferred ones drop it. Both `var` and `const` are covered,
+        // so the optional annotation is independent of the binding kind.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "g".to_string(),
+                params: vec![],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![
+                        Stmt::Let {
+                            is_const: false,
+                            name: "a".to_string(),
+                            ty: Some(ty("i64")),
+                            value: int(1),
+                            span: D,
+                        },
+                        Stmt::Let {
+                            is_const: false,
+                            name: "b".to_string(),
+                            ty: None,
+                            value: int(2),
+                            span: D,
+                        },
+                        Stmt::Let {
+                            is_const: true,
+                            name: "c".to_string(),
+                            ty: Some(ty("bool")),
+                            value: Expr::Bool {
+                                value: true,
+                                span: D,
+                            },
+                            span: D,
+                        },
+                        Stmt::Let {
+                            is_const: true,
+                            name: "d".to_string(),
+                            ty: None,
+                            value: Expr::Bool {
+                                value: false,
+                                span: D,
+                            },
+                            span: D,
+                        },
+                    ],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn g() void {\n",
+            "    var a: i64 = 1;\n",
+            "    var b = 2;\n",
+            "    const c: bool = true;\n",
+            "    const d = false;\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn inferred_top_level_const_omits_type_annotation() {
+        // A top-level inferred `const X = expr;` (`ty: None`) prints with no
+        // `: T`; the annotated form keeps it. `pub` is preserved on both, and a
+        // single blank line still separates the items.
+        let m = Module {
+            items: vec![
+                Item::Const(ConstDecl {
+                    is_pub: false,
+                    name: "A".to_string(),
+                    ty: None,
+                    value: int(10),
+                    span: D,
+                }),
+                Item::Const(ConstDecl {
+                    is_pub: true,
+                    name: "B".to_string(),
+                    ty: None,
+                    value: Expr::Bool {
+                        value: true,
+                        span: D,
+                    },
+                    span: D,
+                }),
+                Item::Const(ConstDecl {
+                    is_pub: true,
+                    name: "C".to_string(),
+                    ty: Some(ty("i32")),
+                    value: int(0),
+                    span: D,
+                }),
+            ],
+        };
+        let expected = concat!(
+            "const A = 10;\n",
+            "\n",
+            "pub const B = true;\n",
+            "\n",
+            "pub const C: i32 = 0;\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn inferred_and_annotated_forms_round_trip() {
+        // End-to-end (lex → parse → print): a source mixing inferred and
+        // annotated bindings — a top-level inferred `const`, an annotated
+        // top-level `const`, and inferred / annotated `var`/`const` locals — is
+        // already canonical, so formatting reproduces it byte-for-byte, and
+        // formatting that output again is byte-identical (idempotence, SPEC §18).
+        let src = concat!(
+            "const MAX = 10;\n",
+            "\n",
+            "pub const MIN: i32 = 0;\n",
+            "\n",
+            "fn f() void {\n",
+            "    var a = 1;\n",
+            "    const b: i64 = 2;\n",
+            "    var c = a + b;\n",
+            "    print(c);\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
     }
 }
