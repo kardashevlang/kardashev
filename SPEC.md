@@ -748,6 +748,35 @@ coercion) is as before.
 
 `kard fmt` omits the `: T` when a binding has no annotation.
 
+## 19. Cross-compilation (v0.123)
+
+`kard build FILE -target <TRIPLE>` cross-compiles, leaning on the C compiler's
+cross support (`clang --target=<triple>`). Because kardashev lowers to portable
+C, the only target-specific dependency is the C toolchain.
+
+- **`backend::BuildOptions { target: Option<String>, object_only: bool }`** is
+  threaded into `cc_build(c_src, out, &opts)`. When `target` is `Some`, the
+  backend selects a clang-family compiler and passes `--target=<triple>`; if no
+  clang is available it errors (gcc's `-target` is not equivalent), suggesting
+  clang or `-c`.
+- **`-c` / `--emit obj`** (`object_only`) compiles to an **object file** only,
+  skipping the link step. Default OUT for object mode is `FILE` minus `.ks` plus
+  `.o`.
+- **Honest limitation.** Because the emitted runtime uses the C standard library
+  (`<stdio.h>`/`<stdlib.h>`/`<stdint.h>` for `print`/alloc/panic), even
+  `-c` cross-compilation needs the **target's C headers** present, and a fully
+  *linked* foreign executable needs the target's libc too. So out of the box
+  only the **host triple** (and multi-arch SDKs such as macOS x86_64 ↔ arm64)
+  build without extra setup; other triples require that target's C
+  toolchain/sysroot installed. **Bundling cross sysroots** — Zig's
+  "cross-compile anything out of the box" — is the headline future item: the
+  `-target`/`-c`/`kard targets` mechanism is in place; the bundled sysroots are
+  not yet.
+- **`kard targets`** prints a list of common, known-good triples (informational).
+
+CLI: `kard build [FILE] [-o OUT] [-target TRIPLE] [-c | --emit obj]`. `run`/`test`
+always build for the host.
+
 ### 13.3 Backend (`emit_c`)
 Emit each enum among the dependency-ordered type defs (enums have no
 dependencies):

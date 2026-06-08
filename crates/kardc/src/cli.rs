@@ -6,7 +6,8 @@
 //! step (one `cmd_*` function per subcommand). The split keeps argument parsing
 //! unit-testable without ever invoking the C compiler.
 //!
-//! Subcommands: `build`, `run`, `test`, `fmt`, `init`, `version`, `help`.
+//! Subcommands: `build`, `run`, `test`, `fmt`, `init`, `targets`, `version`,
+//! `help`.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -23,13 +24,17 @@ Usage:
     kard <command> [options]
 
 Commands:
-    build [FILE|TARGET] [-o OUT] [-target TRIPLE]
+    build [FILE|TARGET] [-o OUT] [-target TRIPLE] [-c | --emit obj]
             Compile a program to a native executable. A `.ks` (or existing)
             argument is a source FILE; any other argument names a build.ks
             TARGET. With no argument, reads ./build.ks: a single target is
             built, and a multi-target graph builds every target (each to its
             own name). OUT defaults to the target name (or, for a direct FILE,
             the filename without its `.ks` extension).
+            `-target TRIPLE` cross-compiles via the C compiler's `--target=`
+            (clang). `-c` / `--emit obj` emits an object file only (no link),
+            which cross-compiles without a target sysroot; its default OUT is
+            the source/target name with a `.o` extension. See `targets`.
 
     run   [FILE|TARGET] [-- ARGS...]
             Build to a temporary executable, run it, and propagate its exit
@@ -51,6 +56,10 @@ Commands:
             Scaffold a new project. With NAME, creates ./NAME; otherwise
             scaffolds into the current directory.
 
+    targets
+            List common, known-good cross-compilation target triples (for
+            use with `build -target TRIPLE`).
+
     version
             Print the toolchain version. (also --version, -V)
 
@@ -62,11 +71,13 @@ Commands:
 /// [`run`]; carrying no I/O lets the parser be tested in isolation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
-    /// `build [FILE] [-o OUT] [-target TRIPLE]`
+    /// `build [FILE] [-o OUT] [-target TRIPLE] [-c | --emit obj]`
     Build {
         file: Option<String>,
         out: Option<String>,
         target: Option<String>,
+        /// `-c` / `--emit obj`: compile to an object file only (no link).
+        object_only: bool,
     },
     /// `run [FILE] [-- ARGS...]`
     Run {
@@ -79,6 +90,8 @@ enum Command {
     Fmt { file: String, mode: FmtMode },
     /// `init [NAME]`
     Init { name: Option<String> },
+    /// `targets` — list known cross-compilation target triples.
+    Targets,
     /// `version` / `--version` / `-V`
     Version,
     /// `help` / `--help` / `-h` / no arguments
@@ -118,11 +131,17 @@ pub fn run(args: Vec<String>) -> ExitCode {
             println!("kardashev {}", crate::VERSION);
             ExitCode::SUCCESS
         }
-        Command::Build { file, out, target } => cmd_build(file, out, target),
+        Command::Build {
+            file,
+            out,
+            target,
+            object_only,
+        } => cmd_build(file, out, target, object_only),
         Command::Run { file, args } => cmd_run(file, args),
         Command::Test { file } => cmd_test(file),
         Command::Fmt { file, mode } => cmd_fmt(file, mode),
         Command::Init { name } => cmd_init(name),
+        Command::Targets => cmd_targets(),
     }
 }
 
@@ -146,6 +165,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "test" => parse_test(&rest),
         "fmt" => parse_fmt(&rest),
         "init" => parse_init(&rest),
+        "targets" => parse_targets(&rest),
         "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown subcommand `{other}`")),
@@ -156,6 +176,7 @@ fn parse_build(rest: &[&str]) -> Result<Command, String> {
     let mut file: Option<String> = None;
     let mut out: Option<String> = None;
     let mut target: Option<String> = None;
+    let mut object_only = false;
 
     let mut i = 0;
     while i < rest.len() {
@@ -175,6 +196,23 @@ fn parse_build(rest: &[&str]) -> Result<Command, String> {
                     .ok_or_else(|| "flag `-target` requires an argument".to_string())?;
                 target = Some((*v).to_string());
             }
+            "-c" => {
+                object_only = true;
+            }
+            "--emit" => {
+                i += 1;
+                let v = rest
+                    .get(i)
+                    .ok_or_else(|| "flag `--emit` requires an argument (`obj`)".to_string())?;
+                match *v {
+                    "obj" => object_only = true,
+                    other => {
+                        return Err(format!(
+                            "unknown `--emit` mode `{other}` for `build` (expected `obj`)"
+                        ));
+                    }
+                }
+            }
             "-h" | "--help" => return Ok(Command::Help),
             _ if a.starts_with('-') => {
                 return Err(format!("unknown flag `{a}` for `build`"));
@@ -189,7 +227,12 @@ fn parse_build(rest: &[&str]) -> Result<Command, String> {
         i += 1;
     }
 
-    Ok(Command::Build { file, out, target })
+    Ok(Command::Build {
+        file,
+        out,
+        target,
+        object_only,
+    })
 }
 
 fn parse_run(rest: &[&str]) -> Result<Command, String> {
@@ -290,6 +333,16 @@ fn parse_init(rest: &[&str]) -> Result<Command, String> {
         name = Some(a.to_string());
     }
     Ok(Command::Init { name })
+}
+
+fn parse_targets(rest: &[&str]) -> Result<Command, String> {
+    for &a in rest {
+        if a == "-h" || a == "--help" {
+            return Ok(Command::Help);
+        }
+        return Err(format!("unexpected argument `{a}` for `targets`"));
+    }
+    Ok(Command::Targets)
 }
 
 // ---------------------------------------------------------------------------
@@ -482,13 +535,12 @@ fn compile_source(file: Option<String>, mode: EmitMode) -> Result<(Source, Strin
 // Subcommand execution.
 // ---------------------------------------------------------------------------
 
-fn cmd_build(file: Option<String>, out: Option<String>, target: Option<String>) -> ExitCode {
-    if let Some(t) = &target {
-        eprintln!(
-            "note: `-target {t}` is accepted, but the cross-compilation matrix is a roadmap item; building for the host target"
-        );
-    }
-
+fn cmd_build(
+    file: Option<String>,
+    out: Option<String>,
+    target: Option<String>,
+    object_only: bool,
+) -> ExitCode {
     let sources = match resolve_build_sources(file.as_deref()) {
         Ok(s) => s,
         Err(msg) => {
@@ -506,16 +558,45 @@ fn cmd_build(file: Option<String>, out: Option<String>, target: Option<String>) 
         return ExitCode::FAILURE;
     }
 
+    // Cross-compilation / object-emit options are uniform across every target
+    // in the build, so the backend options are built once.
+    let opts = crate::backend::BuildOptions {
+        target,
+        object_only,
+    };
+
     for src in &sources {
         let c = match compile_one(src, EmitMode::Program) {
             Ok(c) => c,
             Err(()) => return ExitCode::FAILURE,
         };
-        let out_path = out.clone().unwrap_or_else(|| src.default_out.clone());
-        if let Err(e) = crate::backend::cc_build(&c, Path::new(&out_path)) {
+        // In object mode the default OUT is the program name with a `.o`
+        // extension (SPEC §19); an explicit `-o OUT` always wins.
+        let out_path = out
+            .clone()
+            .unwrap_or_else(|| default_build_out(&src.default_out, object_only));
+        if let Err(e) = crate::backend::cc_build(&c, Path::new(&out_path), &opts) {
             eprintln!("error: C compilation failed:\n{e}");
             return ExitCode::FAILURE;
         }
+    }
+    ExitCode::SUCCESS
+}
+
+/// The default output path for a `build`: the executable name as-is, or, in
+/// object-only mode (`-c` / `--emit obj`), that name with a `.o` extension.
+fn default_build_out(default_out: &str, object_only: bool) -> String {
+    if object_only {
+        format!("{default_out}.o")
+    } else {
+        default_out.to_string()
+    }
+}
+
+/// Print every known cross-compilation target triple, one per line (SPEC §19).
+fn cmd_targets() -> ExitCode {
+    for triple in crate::backend::known_targets() {
+        println!("{triple}");
     }
     ExitCode::SUCCESS
 }
@@ -683,6 +764,7 @@ mod tests {
                 file: Some("main.ks".to_string()),
                 out: None,
                 target: None,
+                object_only: false,
             }
         );
     }
@@ -695,6 +777,7 @@ mod tests {
                 file: None,
                 out: None,
                 target: None,
+                object_only: false,
             }
         );
     }
@@ -707,6 +790,7 @@ mod tests {
                 file: Some("src.ks".to_string()),
                 out: Some("prog".to_string()),
                 target: Some("x86_64-linux".to_string()),
+                object_only: false,
             }
         );
         // Flags may also follow the positional.
@@ -716,8 +800,75 @@ mod tests {
                 file: Some("src.ks".to_string()),
                 out: Some("prog".to_string()),
                 target: None,
+                object_only: false,
             }
         );
+    }
+
+    #[test]
+    fn build_target_is_captured() {
+        assert_eq!(
+            parse(&["build", "f.ks", "-target", "aarch64-linux-gnu"]).unwrap(),
+            Command::Build {
+                file: Some("f.ks".to_string()),
+                out: None,
+                target: Some("aarch64-linux-gnu".to_string()),
+                object_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn build_dash_c_sets_object_only() {
+        assert_eq!(
+            parse(&["build", "f.ks", "-c"]).unwrap(),
+            Command::Build {
+                file: Some("f.ks".to_string()),
+                out: None,
+                target: None,
+                object_only: true,
+            }
+        );
+    }
+
+    #[test]
+    fn build_emit_obj_sets_object_only() {
+        assert_eq!(
+            parse(&["build", "--emit", "obj", "f.ks"]).unwrap(),
+            Command::Build {
+                file: Some("f.ks".to_string()),
+                out: None,
+                target: None,
+                object_only: true,
+            }
+        );
+    }
+
+    #[test]
+    fn build_object_only_with_target_and_out() {
+        assert_eq!(
+            parse(&["build", "f.ks", "-target", "aarch64-linux-gnu", "-c", "-o", "f.o"]).unwrap(),
+            Command::Build {
+                file: Some("f.ks".to_string()),
+                out: Some("f.o".to_string()),
+                target: Some("aarch64-linux-gnu".to_string()),
+                object_only: true,
+            }
+        );
+    }
+
+    #[test]
+    fn build_emit_requires_value_and_rejects_unknown() {
+        assert!(parse(&["build", "--emit"]).is_err());
+        assert!(parse(&["build", "--emit", "asm"]).is_err());
+    }
+
+    #[test]
+    fn default_build_out_appends_o_only_in_object_mode() {
+        assert_eq!(default_build_out("main", false), "main");
+        assert_eq!(default_build_out("main", true), "main.o");
+        // Build-graph target names (no `.ks` to strip) get a plain `.o`.
+        assert_eq!(default_build_out("app", true), "app.o");
     }
 
     #[test]
@@ -822,6 +973,15 @@ mod tests {
             }
         );
         assert_eq!(parse(&["init"]).unwrap(), Command::Init { name: None });
+    }
+
+    #[test]
+    fn targets_parses() {
+        assert_eq!(parse(&["targets"]).unwrap(), Command::Targets);
+        // `-h`/`--help` short-circuit to Help, like the other subcommands.
+        assert_eq!(parse(&["targets", "--help"]).unwrap(), Command::Help);
+        // Stray positional arguments are rejected.
+        assert!(parse(&["targets", "x86_64-linux"]).is_err());
     }
 
     #[test]

@@ -72,3 +72,13 @@ jobs:
           printf 'pub fn main() i32 { print(1); return 0; }\n' > "$mt/src/app.ks"
           printf 'pub fn main() i32 { print(2); return 0; }\n' > "$mt/src/tool.ks"
           ( cd "$mt" && "$KARD" build && [ "$("$KARD" run app)" = "1" ] && [ "$("$KARD" run tool)" = "2" ] )
+          # Cross-compilation plumbing (v0.123): `targets` lists triples, and
+          # `-target <host triple>` exercises clang's --target end to end (the
+          # host triple always has its sysroot, so it links + runs).
+          "$KARD" targets | grep -q x86_64
+          if command -v clang >/dev/null 2>&1; then
+            ht="$(clang -dumpmachine)"
+            xc="$(mktemp -d)"
+            printf 'pub fn main() i32 { print(7); return 0; }\n' > "$xc/m.ks"
+            "$KARD" build "$xc/m.ks" -target "$ht" -o "$xc/m" && [ "$("$xc/m")" = "7" ]
+          fi

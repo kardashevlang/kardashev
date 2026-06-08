@@ -29,7 +29,8 @@ fn build_and_capture(src: &str, mode: EmitMode) -> (i32, String) {
         )
     });
     let exe = temp_path("exe");
-    kardc::backend::cc_build(&c, &exe).expect("cc should build the emitted program");
+    kardc::backend::cc_build(&c, &exe, &kardc::backend::BuildOptions::default())
+        .expect("cc should build the emitted program");
     let output = Command::new(&exe).output().expect("should run the program");
     let _ = std::fs::remove_file(&exe);
     let code = output.status.code().unwrap_or(-1);
