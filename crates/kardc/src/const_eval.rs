@@ -71,6 +71,13 @@ pub fn eval(expr: &Expr, consts: &HashMap<String, ConstVal>) -> Result<ConstVal,
             "E0130",
             "method calls are not allowed in a constant expression",
         )),
+        Expr::Null { span } | Expr::Orelse { span, .. } | Expr::Unwrap { span, .. } => {
+            Err(Diagnostic::error(
+                *span,
+                "E0130",
+                "optionals are not allowed in a constant expression",
+            ))
+        }
     }
 }
 

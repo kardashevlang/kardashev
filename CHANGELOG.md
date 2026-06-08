@@ -18,6 +18,24 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.114.0] — Optionals (`?T`, `null`, `orelse`, `.?`)
+
+Explicit, checked nullability — the Zig way.
+
+### Added
+- **`?T`** optional types (inner: a primitive or struct), with implicit `T → ?T`
+  coercion at typed positions (initializers, assignment, return, args, fields).
+- **`null`** (the empty optional), **`x orelse default`** (unwrap-or-default),
+  and **`x.?`** (force-unwrap; panics with exit 101 if null).
+- Type system: `Type::Optional(id)` + an interned optional-inner table; lexer
+  `?`/`orelse`/`null`. Lowered to a tagged C struct `{ bool has; T val; }` with
+  per-optional `_orelse`/`_unwrap` helpers. Composite C typedefs are now emitted
+  in **dependency order**. Diagnostics `E0180`–`E0182`.
+- 204 unit + 12 e2e tests; `examples/optional.ks`.
+
+### Deferred
+- `if (opt) |v| { … }` payload capture (a later increment).
+
 ## [0.113.0] — Struct methods & associated functions
 
 Completes structs: functions declared inside a `struct` body.

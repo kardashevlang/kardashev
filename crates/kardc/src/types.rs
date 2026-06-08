@@ -24,6 +24,10 @@ pub enum Type {
     Bool,
     Void,
     Struct(u32),
+    /// `?T` — an optional. The `u32` indexes the optional-inner table in
+    /// [`StructTable`] (`optional_inner`). v0.114: inner is never itself
+    /// optional (no `??T`).
+    Optional(u32),
 }
 
 impl Type {
@@ -59,8 +63,10 @@ impl Type {
             Type::Usize => "usize",
             Type::Bool => "bool",
             Type::Void => "void",
-            // Struct names are dynamic; sema formats them via the StructTable.
+            // Struct / optional names are dynamic; sema formats them via the
+            // StructTable.
             Type::Struct(_) => "struct",
+            Type::Optional(_) => "optional",
         }
     }
 
@@ -83,6 +89,9 @@ impl Type {
             Type::Bool => "bool",
             Type::Void => "void",
             Type::Struct(_) => unreachable!("c_name on a struct type; use StructTable::c_name"),
+            Type::Optional(_) => {
+                unreachable!("c_name on an optional type; use StructTable::optional_c_name")
+            }
         }
     }
 
@@ -129,6 +138,10 @@ impl StructInfo {
 pub struct StructTable {
     defs: Vec<StructInfo>,
     by_name: HashMap<String, u32>,
+    /// Inner types of `?T` optionals, indexed by the id in `Type::Optional(id)`.
+    /// Despite the name, this table holds the program's *composite* types too,
+    /// not only structs.
+    optional_inners: Vec<Type>,
 }
 
 impl StructTable {
@@ -181,5 +194,46 @@ impl StructTable {
     /// Structs in declaration (id) order, paired with their id.
     pub fn iter(&self) -> impl Iterator<Item = (u32, &StructInfo)> {
         self.defs.iter().enumerate().map(|(i, s)| (i as u32, s))
+    }
+
+    // --- optionals (`?T`) --------------------------------------------------
+
+    /// Intern an optional whose inner type is `inner`, returning the id used in
+    /// `Type::Optional(id)`. Deduplicates structurally-equal optionals.
+    pub fn intern_optional(&mut self, inner: Type) -> u32 {
+        if let Some(i) = self.optional_inners.iter().position(|t| *t == inner) {
+            return i as u32;
+        }
+        let id = self.optional_inners.len() as u32;
+        self.optional_inners.push(inner);
+        id
+    }
+
+    /// The inner type `T` of `?T` for `Type::Optional(id)`.
+    pub fn optional_inner(&self, id: u32) -> Type {
+        self.optional_inners[id as usize]
+    }
+
+    /// The C typedef name for `?T`, e.g. `kd_opt_int32_t` / `kd_opt_struct_Point`.
+    pub fn optional_c_name(&self, id: u32) -> String {
+        format!("kd_opt_{}", self.type_mangle(self.optional_inners[id as usize]))
+    }
+
+    /// A C-identifier-safe tag for a type, used to build composite type names.
+    pub fn type_mangle(&self, t: Type) -> String {
+        match t {
+            Type::Struct(sid) => format!("struct_{}", self.defs[sid as usize].name),
+            Type::Optional(oid) => format!("opt_{}", self.type_mangle(self.optional_inner(oid))),
+            other => other.c_name().to_string(),
+        }
+    }
+
+    /// All interned optionals, paired with their id, in interning order — the
+    /// order the backend should emit their C typedefs.
+    pub fn optionals(&self) -> impl Iterator<Item = (u32, Type)> + '_ {
+        self.optional_inners
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i as u32, *t))
     }
 }

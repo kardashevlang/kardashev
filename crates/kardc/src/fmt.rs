@@ -28,7 +28,7 @@
 //! canonical output produces byte-identical text.
 
 use crate::ast::{
-    BinOp, Block, ConstDecl, Expr, Func, Item, Module, Stmt, StructDecl, TestBlock, UnOp,
+    BinOp, Block, ConstDecl, Expr, Func, Item, Module, Stmt, StructDecl, TestBlock, TypeExpr, UnOp,
 };
 use crate::diag::Diagnostic;
 
@@ -109,10 +109,10 @@ impl Printer {
             }
             self.out.push_str(&param.name);
             self.out.push_str(": ");
-            self.out.push_str(&param.ty.name);
+            self.out.push_str(&fmt_type(&param.ty));
         }
         self.out.push_str(") ");
-        self.out.push_str(&f.ret.name);
+        self.out.push_str(&fmt_type(&f.ret));
         self.out.push_str(" {\n");
         self.print_block_body(&f.body);
         self.write_indent();
@@ -127,7 +127,7 @@ impl Printer {
         self.out.push_str("const ");
         self.out.push_str(&c.name);
         self.out.push_str(": ");
-        self.out.push_str(&c.ty.name);
+        self.out.push_str(&fmt_type(&c.ty));
         self.out.push_str(" = ");
         self.out.push_str(&fmt_expr(&c.value));
         self.out.push_str(";\n");
@@ -157,7 +157,7 @@ impl Printer {
             self.write_indent();
             self.out.push_str(&field.name);
             self.out.push_str(": ");
-            self.out.push_str(&field.ty.name);
+            self.out.push_str(&fmt_type(&field.ty));
             self.out.push_str(",\n");
         }
         // Each method is a `pub? fn …` printed at the struct body's indent
@@ -211,7 +211,7 @@ impl Printer {
                 self.out.push_str(if *is_const { "const " } else { "var " });
                 self.out.push_str(name);
                 self.out.push_str(": ");
-                self.out.push_str(&ty.name);
+                self.out.push_str(&fmt_type(ty));
                 self.out.push_str(" = ");
                 self.out.push_str(&fmt_expr(value));
                 self.out.push_str(";\n");
@@ -349,21 +349,37 @@ impl Printer {
     }
 }
 
+// ----- types ----------------------------------------------------------------
+
+/// Format a type reference (SPEC §11.1). An optional type (`TypeExpr.optional`)
+/// prints with a leading `?` — e.g. `?i32` — and a plain type prints as its bare
+/// name. Used wherever a type appears: params, return types, `var`/`const`
+/// annotations and struct fields.
+fn fmt_type(ty: &TypeExpr) -> String {
+    if ty.optional {
+        format!("?{}", ty.name)
+    } else {
+        ty.name.clone()
+    }
+}
+
 // ----- expressions ---------------------------------------------------------
 
 /// Binding-power of an expression, used to insert minimal parentheses. Higher
-/// binds tighter. Mirrors the grammar in SPEC §2.
+/// binds tighter. Mirrors the grammar in SPEC §2 / §11.
 fn expr_prec(e: &Expr) -> u8 {
     match e {
-        // Primaries and postfix forms (calls, struct literals, field access)
-        // bind tightest.
+        // Primaries and postfix forms (calls, struct literals, field access,
+        // `null`, and the `.?` unwrap) bind tightest.
         Expr::Int { .. }
         | Expr::Bool { .. }
         | Expr::Ident { .. }
         | Expr::Call { .. }
         | Expr::StructLit { .. }
         | Expr::Field { .. }
-        | Expr::MethodCall { .. } => 8,
+        | Expr::MethodCall { .. }
+        | Expr::Null { .. }
+        | Expr::Unwrap { .. } => 8,
         Expr::Comptime { .. } => 7,
         Expr::Unary { .. } => 6,
         Expr::Binary { op, .. } => match op {
@@ -373,6 +389,10 @@ fn expr_prec(e: &Expr) -> u8 {
             BinOp::And => 2,
             BinOp::Or => 1,
         },
+        // `orelse` is the loosest operator: its right-hand fallback is an
+        // ordinary `T` expression, so `head orelse a + b` reads as
+        // `head orelse (a + b)` with no parentheses.
+        Expr::Orelse { .. } => 0,
     }
 }
 
@@ -518,6 +538,29 @@ fn fmt_expr(e: &Expr) -> String {
             s.push(')');
             s
         }
+        // The `null` literal (SPEC §11.1). Its `?T` type comes from context.
+        Expr::Null { .. } => "null".to_string(),
+        // `lhs orelse rhs` (SPEC §11.1). `orelse` is the loosest operator, so
+        // its left operand never needs parentheses and only a right operand of
+        // equal precedence (another `orelse`) does — yielding the left-
+        // associative `a orelse b orelse c` and the explicit
+        // `a orelse (b orelse c)`.
+        Expr::Orelse { lhs, rhs, .. } => {
+            let p = expr_prec(e);
+            let l = fmt_operand(lhs, p, false);
+            let r = fmt_operand(rhs, p, true);
+            format!("{} orelse {}", l, r)
+        }
+        // `expr.?` — postfix force-unwrap (SPEC §11.1). Like field access it
+        // binds as a primary, so a non-primary/non-postfix operand (e.g. an
+        // `orelse`) is parenthesised to stay total and idempotent.
+        Expr::Unwrap { expr, .. } => {
+            if expr_prec(expr) >= 8 {
+                format!("{}.?", fmt_expr(expr))
+            } else {
+                format!("({}).?", fmt_expr(expr))
+            }
+        }
     }
 }
 
@@ -567,6 +610,35 @@ mod tests {
     fn ty(name: &str) -> TypeExpr {
         TypeExpr {
             name: name.to_string(),
+            optional: false,
+            span: D,
+        }
+    }
+
+    /// An optional type `?name` (`TypeExpr.optional = true`).
+    fn opt_ty(name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: true,
+            span: D,
+        }
+    }
+
+    fn null() -> Expr {
+        Expr::Null { span: D }
+    }
+
+    fn orelse(lhs: Expr, rhs: Expr) -> Expr {
+        Expr::Orelse {
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+            span: D,
+        }
+    }
+
+    fn unwrap(expr: Expr) -> Expr {
+        Expr::Unwrap {
+            expr: Box::new(expr),
             span: D,
         }
     }
@@ -1251,5 +1323,166 @@ mod tests {
             span: D,
         };
         assert_eq!(fmt_expr(&chained), "a.b.get()");
+    }
+
+    // ----- optionals (v0.114) ----------------------------------------------
+
+    #[test]
+    fn optional_type_prints_with_leading_question() {
+        // The bare type helper still formats as the plain name; the optional
+        // helper prepends `?`.
+        assert_eq!(fmt_type(&ty("i32")), "i32");
+        assert_eq!(fmt_type(&opt_ty("i32")), "?i32");
+        // A struct optional formats the same way: `?Point`.
+        assert_eq!(fmt_type(&opt_ty("Point")), "?Point");
+    }
+
+    #[test]
+    fn optional_type_in_every_position() {
+        // `?T` must print wherever a type appears: a top-level `const`, a
+        // function's params and return, a `var`/`const` local annotation, and a
+        // struct field.
+        let const_decl = Item::Const(ConstDecl {
+            is_pub: true,
+            name: "NONE".to_string(),
+            ty: opt_ty("i32"),
+            value: null(),
+            span: D,
+        });
+        let strukt = Item::Struct(StructDecl {
+            is_pub: false,
+            name: "Node".to_string(),
+            fields: vec![FieldDecl {
+                name: "next".to_string(),
+                ty: opt_ty("i32"),
+                span: D,
+            }],
+            methods: vec![],
+            span: D,
+        });
+        let func = Item::Func(Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![Param {
+                name: "x".to_string(),
+                ty: opt_ty("i32"),
+                span: D,
+            }],
+            ret: opt_ty("i32"),
+            body: Block {
+                stmts: vec![Stmt::Let {
+                    is_const: false,
+                    name: "y".to_string(),
+                    ty: opt_ty("i32"),
+                    value: null(),
+                    span: D,
+                }],
+                span: D,
+            },
+            span: D,
+        });
+        let m = Module {
+            items: vec![const_decl, strukt, func],
+        };
+        let expected = concat!(
+            "pub const NONE: ?i32 = null;\n",
+            "\n",
+            "const Node = struct {\n",
+            "    next: ?i32,\n",
+            "};\n",
+            "\n",
+            "fn f(x: ?i32) ?i32 {\n",
+            "    var y: ?i32 = null;\n",
+            "}\n",
+        );
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn null_orelse_unwrap_expr_print() {
+        // The bare `null` literal.
+        assert_eq!(fmt_expr(&null()), "null");
+
+        // `x orelse y`: both operands are primaries, so no parentheses.
+        assert_eq!(fmt_expr(&orelse(ident("x"), ident("y"))), "x orelse y");
+
+        // `x.?`: postfix unwrap of a primary.
+        assert_eq!(fmt_expr(&unwrap(ident("x"))), "x.?");
+
+        // `null orelse 0`: the fallback follows `orelse`.
+        assert_eq!(fmt_expr(&orelse(null(), int(0))), "null orelse 0");
+    }
+
+    #[test]
+    fn orelse_precedence_and_associativity() {
+        // `orelse` is the loosest operator: the fallback `a + b` needs no
+        // parentheses — `head orelse a + b`.
+        let e = orelse(ident("head"), bin(BinOp::Add, ident("a"), ident("b")));
+        assert_eq!(fmt_expr(&e), "head orelse a + b");
+
+        // Left-associative chain prints without parentheses.
+        let left = orelse(orelse(ident("a"), ident("b")), ident("c"));
+        assert_eq!(fmt_expr(&left), "a orelse b orelse c");
+
+        // A right-nested `orelse` keeps its parentheses (equal precedence on the
+        // right of a left-associative operator).
+        let right = orelse(ident("a"), orelse(ident("b"), ident("c")));
+        assert_eq!(fmt_expr(&right), "a orelse (b orelse c)");
+
+        // Unwrapping an `orelse` parenthesises it: `(a orelse b).?`.
+        let uw = unwrap(orelse(ident("a"), ident("b")));
+        assert_eq!(fmt_expr(&uw), "(a orelse b).?");
+
+        // `.?` binds tightest, so an `orelse` over an unwrap needs no parens on
+        // the unwrap: `x.? orelse 0`.
+        let chained = orelse(unwrap(ident("x")), int(0));
+        assert_eq!(fmt_expr(&chained), "x.? orelse 0");
+    }
+
+    #[test]
+    fn optional_sample_is_idempotent() {
+        // A whole function exercising an optional local, `orelse` and `.?`. The
+        // pure printer is deterministic (idempotence here is checked as
+        // re-printing the same AST byte-identically, since the parser is not
+        // involved in this isolated unit).
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![Param {
+                    name: "x".to_string(),
+                    ty: opt_ty("i32"),
+                    span: D,
+                }],
+                ret: ty("i32"),
+                body: Block {
+                    stmts: vec![
+                        Stmt::Let {
+                            is_const: false,
+                            name: "y".to_string(),
+                            ty: opt_ty("i32"),
+                            value: null(),
+                            span: D,
+                        },
+                        Stmt::Return {
+                            value: Some(orelse(ident("x"), unwrap(ident("y")))),
+                            span: D,
+                        },
+                    ],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f(x: ?i32) i32 {\n",
+            "    var y: ?i32 = null;\n",
+            "    return x orelse y.?;\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
     }
 }

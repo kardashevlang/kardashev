@@ -87,6 +87,8 @@ pub struct TestBlock {
 #[derive(Clone, Debug)]
 pub struct TypeExpr {
     pub name: String,
+    /// True if written as `?T` (an optional). v0.114: no nesting (`??T`).
+    pub optional: bool,
     pub span: Span,
 }
 
@@ -291,6 +293,16 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    /// The `null` literal (the empty optional). Its `?T` type comes from context.
+    Null { span: Span },
+    /// `lhs orelse rhs` — unwrap the optional `lhs`, or evaluate `rhs` if null.
+    Orelse {
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+        span: Span,
+    },
+    /// `expr.?` — force-unwrap an optional; panics (exit 101) if null.
+    Unwrap { expr: Box<Expr>, span: Span },
 }
 
 /// One `.name = value` initializer inside a struct literal.
@@ -314,6 +326,9 @@ impl Expr {
             Expr::StructLit { span, .. } => *span,
             Expr::Field { span, .. } => *span,
             Expr::MethodCall { span, .. } => *span,
+            Expr::Null { span } => *span,
+            Expr::Orelse { span, .. } => *span,
+            Expr::Unwrap { span, .. } => *span,
         }
     }
 }

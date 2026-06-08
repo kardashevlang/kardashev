@@ -265,9 +265,29 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
+    /// Parse a type reference (SPEC §11.1). A leading `?` marks an optional
+    /// type `?T`: the parser records `optional = true` and parses the inner
+    /// type name. v0.114 forbids nesting (`??T`), which sema rejects; the
+    /// parser only ever consumes a single leading `?`. A type with no `?` has
+    /// `optional = false`. The node's span covers the `?` when present.
     fn parse_type(&mut self) -> PResult<TypeExpr> {
-        let (name, span) = self.expect_ident()?;
-        Ok(TypeExpr { name, span })
+        let opt_span = if self.at_punct(&TokenKind::Question) {
+            let sp = self.peek_span();
+            self.bump();
+            Some(sp)
+        } else {
+            None
+        };
+        let (name, name_span) = self.expect_ident()?;
+        let span = match opt_span {
+            Some(q) => q.merge(name_span),
+            None => name_span,
+        };
+        Ok(TypeExpr {
+            name,
+            optional: opt_span.is_some(),
+            span,
+        })
     }
 
     fn parse_const(&mut self, is_pub: bool, start: Span) -> PResult<Item> {
@@ -560,7 +580,26 @@ impl<'a> Parser<'a> {
     // ---- expressions (precedence climbing) -------------------------------
 
     fn parse_expr(&mut self) -> PResult<Expr> {
-        self.parse_or()
+        self.parse_orelse()
+    }
+
+    /// The lowest expression level (SPEC §11.1): `orelse` binds looser than
+    /// every other operator, including `or`. Left-associative, so
+    /// `a orelse b orelse c` nests as `(a orelse b) orelse c`. Each operand is
+    /// a full `or`-expression.
+    fn parse_orelse(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_or()?;
+        while self.at_kw(Kw::Orelse) {
+            self.bump();
+            let rhs = self.parse_or()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Orelse {
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
@@ -710,6 +749,21 @@ impl<'a> Parser<'a> {
         let mut expr = self.parse_primary()?;
         while self.at_punct(&TokenKind::Dot) {
             self.bump(); // `.`
+            // `.?` force-unwraps an optional (SPEC §11.1): a `?` immediately
+            // after the `.` is `Expr::Unwrap`, panicking on null. Otherwise a
+            // `.name` is a field access or — when followed by `(` — a method /
+            // associated-function call. This composes left-to-right, so chains
+            // like `a.b.?`, `f().?`, and `a.?.b` parse naturally.
+            if self.at_punct(&TokenKind::Question) {
+                let q = self.peek_span();
+                self.bump(); // `?`
+                let span = expr.span().merge(q);
+                expr = Expr::Unwrap {
+                    expr: Box::new(expr),
+                    span,
+                };
+                continue;
+            }
             let (name, name_span) = self.expect_ident()?;
             if self.at_punct(&TokenKind::LParen) {
                 self.bump(); // `(`
@@ -757,6 +811,12 @@ impl<'a> Parser<'a> {
                     value: false,
                     span: tok.span,
                 })
+            }
+            TokenKind::Keyword(Kw::Null) => {
+                // The `null` literal (SPEC §11.1): the empty optional. Its `?T`
+                // type is taken from the expected type at its position in sema.
+                self.bump();
+                Ok(Expr::Null { span: tok.span })
             }
             TokenKind::Ident(name) => {
                 self.bump();
@@ -876,6 +936,7 @@ fn describe_kind(kind: &TokenKind) -> String {
         TokenKind::Slash => "`/`".to_string(),
         TokenKind::Percent => "`%`".to_string(),
         TokenKind::Bang => "`!`".to_string(),
+        TokenKind::Question => "`?`".to_string(),
         TokenKind::Eof => "end of input".to_string(),
     }
 }
@@ -1755,6 +1816,261 @@ mod tests {
         match &body.stmts[0] {
             Stmt::Expr(Expr::MethodCall { method, .. }) => assert_eq!(method, "tick"),
             other => panic!("expected method-call statement, got {:?}", other),
+        }
+    }
+
+    // ---- v0.114: optionals (`?T`, `null`, `orelse`, `.?`) -----------------
+
+    #[test]
+    fn optional_param_type() {
+        // fn f(a: ?i32) void { }  — the `?` marks the param type optional.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            id("a"),
+            TokenKind::Colon,
+            TokenKind::Question,
+            id("i32"),
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert_eq!(f.params.len(), 1);
+                assert_eq!(f.params[0].ty.name, "i32");
+                assert!(f.params[0].ty.optional, "`?i32` param must be optional");
+                // The non-optional return type stays optional = false.
+                assert_eq!(f.ret.name, "void");
+                assert!(!f.ret.optional);
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn optional_struct_local_type() {
+        // fn f() void { var x: ?Point = null; }  — `?Point` local is optional,
+        // and its initializer is the `null` literal.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Var),
+            id("x"),
+            TokenKind::Colon,
+            TokenKind::Question,
+            id("Point"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Null),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        let body = match &m.items[0] {
+            Item::Func(f) => &f.body,
+            other => panic!("expected func, got {:?}", other),
+        };
+        match &body.stmts[0] {
+            Stmt::Let { name, ty, value, .. } => {
+                assert_eq!(name, "x");
+                assert_eq!(ty.name, "Point");
+                assert!(ty.optional, "`?Point` local must be optional");
+                assert!(matches!(value, Expr::Null { .. }));
+            }
+            other => panic!("expected let, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn non_optional_type_has_optional_false() {
+        // fn f(a: i32) i32 { return a; }  — no `?`, so both types are non-optional.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            id("a"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::RParen,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            id("a"),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert!(!f.params[0].ty.optional);
+                assert!(!f.ret.optional);
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn null_literal() {
+        // x = null;
+        let e = parse_assign_rhs(vec![TokenKind::Keyword(Kw::Null)]);
+        assert!(matches!(e, Expr::Null { .. }), "expected null, got {:?}", e);
+    }
+
+    #[test]
+    fn orelse_expression() {
+        // x = y orelse 0;  ==>  Orelse { lhs: Ident y, rhs: Int 0 }
+        let e = parse_assign_rhs(vec![
+            id("y"),
+            TokenKind::Keyword(Kw::Orelse),
+            TokenKind::Int(0),
+        ]);
+        match e {
+            Expr::Orelse { lhs, rhs, .. } => {
+                assert!(matches!(*lhs, Expr::Ident { ref name, .. } if name == "y"));
+                assert!(matches!(*rhs, Expr::Int { value: 0, .. }));
+            }
+            other => panic!("expected orelse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn orelse_is_left_associative() {
+        // a orelse b orelse c  ==>  ((a orelse b) orelse c)
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Keyword(Kw::Orelse),
+            id("b"),
+            TokenKind::Keyword(Kw::Orelse),
+            id("c"),
+        ]);
+        match e {
+            Expr::Orelse { lhs, rhs, .. } => {
+                assert!(matches!(*rhs, Expr::Ident { ref name, .. } if name == "c"));
+                assert!(matches!(*lhs, Expr::Orelse { .. }), "left operand should nest");
+            }
+            other => panic!("expected orelse at the root, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn orelse_binds_looser_than_or() {
+        // a or b orelse c  ==>  ((a or b) orelse c)  — `orelse` is the loosest.
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Keyword(Kw::Or),
+            id("b"),
+            TokenKind::Keyword(Kw::Orelse),
+            id("c"),
+        ]);
+        match e {
+            Expr::Orelse { lhs, rhs, .. } => {
+                assert!(matches!(*rhs, Expr::Ident { ref name, .. } if name == "c"));
+                assert!(
+                    matches!(*lhs, Expr::Binary { op: BinOp::Or, .. }),
+                    "left operand should be the `or`, got {:?}",
+                    lhs
+                );
+            }
+            other => panic!("expected orelse at the root, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unwrap_postfix() {
+        // x = y.?;  ==>  Unwrap { expr: Ident y }
+        let e = parse_assign_rhs(vec![id("y"), TokenKind::Dot, TokenKind::Question]);
+        match e {
+            Expr::Unwrap { expr, .. } => {
+                assert!(matches!(*expr, Expr::Ident { ref name, .. } if name == "y"));
+            }
+            other => panic!("expected unwrap, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unwrap_composes_with_field_access() {
+        // x = a.b.?;  ==>  Unwrap { expr: Field { base: Ident a, field: b } }
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Dot,
+            id("b"),
+            TokenKind::Dot,
+            TokenKind::Question,
+        ]);
+        match e {
+            Expr::Unwrap { expr, .. } => match *expr {
+                Expr::Field { base, field, .. } => {
+                    assert_eq!(field, "b");
+                    assert!(matches!(*base, Expr::Ident { ref name, .. } if name == "a"));
+                }
+                other => panic!("expected `a.b` inside the unwrap, got {:?}", other),
+            },
+            other => panic!("expected unwrap at the root, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unwrap_composes_with_call() {
+        // x = f().?;  ==>  Unwrap { expr: Call f }
+        let e = parse_assign_rhs(vec![
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::Dot,
+            TokenKind::Question,
+        ]);
+        match e {
+            Expr::Unwrap { expr, .. } => {
+                assert!(matches!(*expr, Expr::Call { ref callee, .. } if callee == "f"));
+            }
+            other => panic!("expected unwrap of a call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unwrap_then_field_chain() {
+        // x = a.?.b;  ==>  Field { base: Unwrap { expr: a }, field: b }
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Dot,
+            TokenKind::Question,
+            TokenKind::Dot,
+            id("b"),
+        ]);
+        match e {
+            Expr::Field { base, field, .. } => {
+                assert_eq!(field, "b");
+                assert!(matches!(*base, Expr::Unwrap { .. }));
+            }
+            other => panic!("expected field-of-unwrap, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unwrap_then_orelse() {
+        // x = a.? orelse b;  ==>  Orelse { lhs: Unwrap { a }, rhs: Ident b }
+        // `.?` is postfix (tightest), `orelse` the loosest, so the unwrap is the
+        // left operand of the `orelse`.
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Dot,
+            TokenKind::Question,
+            TokenKind::Keyword(Kw::Orelse),
+            id("b"),
+        ]);
+        match e {
+            Expr::Orelse { lhs, rhs, .. } => {
+                assert!(matches!(*lhs, Expr::Unwrap { .. }));
+                assert!(matches!(*rhs, Expr::Ident { ref name, .. } if name == "b"));
+            }
+            other => panic!("expected orelse at the root, got {:?}", other),
         }
     }
 }

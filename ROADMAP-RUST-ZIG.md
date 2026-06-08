@@ -64,8 +64,10 @@ are split out to v0.113 to keep each version complete and well-tested.
 Functions declared in a `struct` block; `Type.func(…)` and the `instance.method(…)`
 call sugar (self-prepend), chained calls. Lowered to `kd_<Struct>_<method>(self, …)`.
 
-### v0.114.0 — Optionals: `?T`, `orelse`, `.?`, `if (x) |v|` capture
-Null-safety the Zig way; lower as a tagged value in C. No hidden nullability.
+### v0.114.0 — Optionals: `?T`, `null`, `orelse`, `.?` ✅
+Null-safety the Zig way; lowered as a tagged `{ bool has; T val; }` value in C
+with `T → ?T` coercion. `if (x) |v|` payload capture is deferred to a later
+increment.
 
 ### v0.115.0 — Error unions: `!T`, error sets, `try`, `catch`, `errdefer`
 Errors as values, explicit propagation. `errdefer` joins `defer` in the

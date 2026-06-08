@@ -394,3 +394,51 @@ const Counter = struct {
   `kd_<Struct>_<method>(<receiver-as-self-if-method>, <args>)`. Method bodies
   reuse all existing statement/expr/`defer` lowering. Forward-declare struct
   functions alongside ordinary functions.
+
+## 11. Optionals (v0.114)
+
+`?T` makes nullability explicit and checked. v0.114: `T` is a primitive or a
+struct; no nesting (`??T`).
+
+### 11.1 Syntax & AST
+- Type `?T`: `TypeExpr.optional = true` (the `?` precedes the type name in
+  params/returns/`var`/`const`/struct fields). Resolves to
+  `Type::Optional(StructTable::intern_optional(inner))`.
+- `null` — `Expr::Null`. Its type is `?T` taken from the expected type at its
+  position; a `null` with no expected optional type is `E0180`.
+- `x orelse y` — `Expr::Orelse{lhs,rhs}`: `lhs` must be `?T` (else `E0181`),
+  `rhs` must be `T`; result `T`.
+- `x.?` — `Expr::Unwrap{expr}`: `expr` must be `?T` (else `E0182`); result `T`;
+  **panics (stderr message + exit 101) if null**. Lexes as `Dot` then
+  `Question`.
+
+### 11.2 Coercion
+A value of type `T` **coerces implicitly to `?T`** at positions with a known
+expected optional type: `var`/`const` initializers with a `?T` annotation,
+assignment to a `?T` place, `return` in a `?T` function, a call argument whose
+param is `?T`, and a struct field-init whose field is `?T`. `null` also takes
+the expected `?T`. (This widening is explicit in intent and has no hidden
+control flow.) Type mismatches are `E0110`.
+
+### 11.3 Backend (`emit_c`)
+For each interned optional (`StructTable::optionals()`), after the struct
+typedefs emit:
+```c
+typedef struct { bool has; <inner cty> val; } kd_opt_<tag>;          // tag = type_mangle
+static inline <inner cty> kd_opt_<tag>_orelse(kd_opt_<tag> o, <inner cty> d) { return o.has ? o.val : d; }
+static inline <inner cty> kd_opt_<tag>_unwrap(kd_opt_<tag> o) { if (!o.has) { fputs("panic: unwrapped a null optional\n", stderr); exit(101); } return o.val; }
+```
+(Add `<stdlib.h>` to the prelude for `exit`.) Lowerings: `null` (expected `?T`)
+→ `((kd_opt_<tag>){ .has = false })`; a coerced `T` value → `((kd_opt_<tag>){
+.has = true, .val = <e> })`; `x orelse y` → `kd_opt_<tag>_orelse(<x>, <y>)`
+(`y` is evaluated eagerly in v0.114); `x.?` → `kd_opt_<tag>_unwrap(<x>)`. `cty`
+maps `Type::Optional(id)` → `StructTable::optional_c_name(id)`.
+
+emit decides coercion with a `type_of_expr` helper over an environment it
+maintains while emitting a function (param + local types) plus the
+`StructTable` (struct field types, optional inners) and the module (fn / method
+return types, struct-literal names): at a known-expected-`?T` position, if the
+source is `null` or its `type_of_expr` is the inner `T`, wrap it; if it is
+already `?T`, pass it through.
+
+Deferred to a later increment (honest): `if (opt) |v| { … }` payload capture.
