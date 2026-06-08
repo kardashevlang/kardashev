@@ -18,6 +18,20 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.124.0] — Tagged unions `union(enum)` + `switch` capture
+
+First version of **Arc 2** (completing the language surface).
+
+### Added
+- **Tagged unions**: `pub? const Name = union(enum) { v: T, … };`. Construction
+  reuses struct-literal syntax (`Name{ .v = e }`, exactly one variant).
+- **`switch` payload capture**: `.v => |x| { … }` binds the active variant's
+  payload (`x`) in the arm; exhaustiveness checked as for enums.
+- Type system: `Type::Union(id)` + a union table; lexer `union` keyword and `|`.
+  Lowered to a tagged C struct `{ int32_t tag; union { … } data; }` emitted in
+  dependency order. Diagnostics `E0270`–`E0272`.
+- 519 unit + 22 e2e tests; `examples/unions.ks`.
+
 ## [0.123.0] — Cross-compilation
 
 Completes the numbered Gen-2 roadmap (v0.112 – v0.123).

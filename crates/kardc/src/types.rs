@@ -45,6 +45,9 @@ pub enum Type {
     /// The `Allocator` interface value (v0.119). A first-class, explicitly
     /// passed allocator; `c_allocator()` constructs one backed by malloc/free.
     Allocator,
+    /// A tagged union `union(enum) { … }` (v0.124). The `u32` indexes the union
+    /// table (`union_info`: variant names + payload types).
+    Union(u32),
 }
 
 impl Type {
@@ -91,6 +94,7 @@ impl Type {
             Type::Ptr(_) => "pointer",
             Type::Slice(_) => "slice",
             Type::Allocator => "Allocator",
+            Type::Union(_) => "union",
         }
     }
 
@@ -128,6 +132,7 @@ impl Type {
                 unreachable!("c_name on a slice type; use StructTable::slice_c_name")
             }
             Type::Allocator => "kd_allocator",
+            Type::Union(_) => unreachable!("c_name on a union type; use StructTable::union_c_name"),
         }
     }
 
@@ -180,6 +185,25 @@ impl EnumInfo {
     }
 }
 
+/// A resolved tagged-union definition: name + ordered `(variant, payload type)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnionInfo {
+    pub name: String,
+    pub variants: Vec<(String, Type)>,
+}
+
+impl UnionInfo {
+    /// The 0-based tag index of `variant`, if present.
+    pub fn variant_index(&self, variant: &str) -> Option<usize> {
+        self.variants.iter().position(|(n, _)| n == variant)
+    }
+
+    /// The payload type of `variant`, if present.
+    pub fn payload_type(&self, variant: &str) -> Option<Type> {
+        self.variants.iter().find(|(n, _)| n == variant).map(|(_, t)| *t)
+    }
+}
+
 /// The table of all struct types in a program, built by semantic analysis and
 /// consumed by the backend. Ids are dense indices assigned in declaration
 /// order, so iterating `0..len()` yields structs in source order — exactly the
@@ -200,6 +224,9 @@ pub struct StructTable {
     /// Plain enum definitions, indexed by the id in `Type::Enum(id)`.
     enum_defs: Vec<EnumInfo>,
     enum_by_name: HashMap<String, u32>,
+    /// Tagged-union definitions, indexed by the id in `Type::Union(id)` (v0.124).
+    union_defs: Vec<UnionInfo>,
+    union_by_name: HashMap<String, u32>,
     /// Array types `(element, length)`, indexed by the id in `Type::Array(id)`.
     array_info: Vec<(Type, usize)>,
     /// Pointee types, indexed by the id in `Type::Ptr(id)` (v0.118).
@@ -302,6 +329,7 @@ impl StructTable {
                 format!("err_{}", self.type_mangle(self.error_union_payload(eid)))
             }
             Type::Enum(eid) => format!("enum_{}", self.enum_defs[eid as usize].name),
+            Type::Union(uid) => format!("union_{}", self.union_defs[uid as usize].name),
             Type::Array(aid) => {
                 let (elem, len) = self.array_info[aid as usize];
                 format!("arr_{}_{}", self.type_mangle(elem), len)
@@ -356,6 +384,43 @@ impl StructTable {
     /// Enums in declaration (id) order, paired with their id.
     pub fn enums(&self) -> impl Iterator<Item = (u32, &EnumInfo)> {
         self.enum_defs.iter().enumerate().map(|(i, e)| (i as u32, e))
+    }
+
+    // --- tagged unions (v0.124) -------------------------------------------
+
+    pub fn intern_union(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.union_by_name.get(name) {
+            return id;
+        }
+        let id = self.union_defs.len() as u32;
+        self.union_defs.push(UnionInfo {
+            name: name.to_string(),
+            variants: Vec::new(),
+        });
+        self.union_by_name.insert(name.to_string(), id);
+        id
+    }
+
+    pub fn union_id_of(&self, name: &str) -> Option<u32> {
+        self.union_by_name.get(name).copied()
+    }
+
+    pub fn union_get(&self, id: u32) -> &UnionInfo {
+        &self.union_defs[id as usize]
+    }
+
+    pub fn set_union_variants(&mut self, id: u32, variants: Vec<(String, Type)>) {
+        self.union_defs[id as usize].variants = variants;
+    }
+
+    /// The C typedef name for a union, e.g. `kd_union_Shape`.
+    pub fn union_c_name(&self, id: u32) -> String {
+        format!("kd_union_{}", self.union_defs[id as usize].name)
+    }
+
+    /// Unions in declaration (id) order, paired with their id.
+    pub fn unions(&self) -> impl Iterator<Item = (u32, &UnionInfo)> {
+        self.union_defs.iter().enumerate().map(|(i, u)| (i as u32, u))
     }
 
     // --- arrays `[N]T` (v0.117) -------------------------------------------

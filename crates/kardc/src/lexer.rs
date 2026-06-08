@@ -165,6 +165,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diagnostic>> {
                 }
             }
             b'&' => (TokenKind::Amp, 1),
+            b'|' => (TokenKind::Pipe, 1),
             b'+' => (TokenKind::Plus, 1),
             b'-' => (TokenKind::Minus, 1),
             b'*' => (TokenKind::Star, 1),

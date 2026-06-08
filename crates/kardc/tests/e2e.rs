@@ -497,3 +497,32 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "10\n25\n100\n1\n");
 }
+
+// --- v0.124 tagged unions + switch capture ---------------------------------
+
+#[test]
+fn tagged_unions_with_switch_capture() {
+    let src = r#"
+const Point = struct { x: i64, y: i64 };
+const Shape = union(enum) {
+    circle: i64,
+    rect: Point,
+};
+fn area(s: Shape) i64 {
+    switch (s) {
+        .circle => |r| { return 3 * r * r; },   // capture the i64 payload
+        .rect => |p| { return p.x * p.y; },      // capture the struct payload
+    }
+}
+pub fn main() i32 {
+    var c: Shape = Shape{ .circle = 10 };
+    print(area(c));                              // 300
+    var r: Shape = Shape{ .rect = Point{ .x = 4, .y = 5 } };
+    print(area(r));                              // 20
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "300\n20\n");
+}
