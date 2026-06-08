@@ -18,6 +18,21 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.117.0] — Fixed-size arrays `[N]T`
+
+### Added
+- **`[N]T`** fixed-size arrays with **value semantics** (copied on assign /
+  pass / return). Array literals `[N]T{ e0, … }`, indexing `a[i]` (read and
+  write), and `a.len`.
+- **Runtime bounds checking**: an out-of-range index panics with exit 101.
+- Type system: `Type::Array(id)` + an array table; lowered to a by-value C
+  struct wrapper `{ T data[N]; }` with a bounds-checked accessor, emitted in
+  dependency order. Diagnostics `E0220`–`E0224`.
+- 321 unit + 16 e2e tests; `examples/arrays.ks`.
+
+The original "arrays + slices + pointers + Allocator" roadmap item is split
+into focused releases (v0.118 pointers & slices, v0.119 the Allocator + heap).
+
 ## [0.116.0] — Enums & exhaustive `switch`
 
 ### Added

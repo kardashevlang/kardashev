@@ -150,6 +150,19 @@ impl<'a> Parser<'a> {
         Ok((s, span))
     }
 
+    /// Consume an integer literal, returning its value and span. Used for the
+    /// array length `N` in a `[N]T` type (SPEC §14.1); a negative or absurd `N`
+    /// is a sema concern (`E0224`), not the parser's.
+    fn expect_int(&mut self) -> PResult<(i64, Span)> {
+        let span = self.peek_span();
+        let v = match self.peek_kind() {
+            TokenKind::Int(v) => *v,
+            _ => return Err(self.expected("integer literal")),
+        };
+        self.bump();
+        Ok((v, span))
+    }
+
     /// Push an `E0200` "expected X, found Y" diagnostic at the current token.
     fn expected(&mut self, what: &str) -> ParseError {
         let found = describe_kind(self.peek_kind());
@@ -265,14 +278,34 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
-    /// Parse a type reference (SPEC §11.1, §12.1). A leading `?` marks an
+    /// Parse a type reference (SPEC §11.1, §12.1, §14.1). A leading `?` marks an
     /// optional type `?T` (`optional = true`); a leading `!` marks an error
     /// union `!T` (`error_union = true`). The two prefixes are **mutually
     /// exclusive** in v0.115 and the parser consumes at most one: after a `?`
     /// or `!` it requires the inner type name, so `?!T` / `!?T` fail with an
     /// "expected identifier" diagnostic. A bare type has both flags `false`.
-    /// The node's span covers the prefix when present.
+    ///
+    /// A leading `[N]` marks a fixed-size array `[N]T` (`array_len = Some(N)`,
+    /// `name = T`): the `[`, an integer length, `]`, then the element type
+    /// name. Per SPEC §14.1 the array prefix is **not** combined with `?`/`!` in
+    /// v0.117, so it is a distinct leading form — after the `]` the parser
+    /// requires a plain element type name (`[N]?T` fails with "expected
+    /// identifier"). The node's span covers the prefix when present.
     fn parse_type(&mut self) -> PResult<TypeExpr> {
+        if self.at_punct(&TokenKind::LBracket) {
+            let start = self.peek_span();
+            self.bump(); // `[`
+            let (len, _) = self.expect_int()?;
+            self.expect_punct(&TokenKind::RBracket, "`]`")?;
+            let (name, name_span) = self.expect_ident()?;
+            return Ok(TypeExpr {
+                name,
+                optional: false,
+                error_union: false,
+                array_len: Some(len),
+                span: start.merge(name_span),
+            });
+        }
         let opt_span = if self.at_punct(&TokenKind::Question) {
             let sp = self.peek_span();
             self.bump();
@@ -298,6 +331,7 @@ impl<'a> Parser<'a> {
             name,
             optional: opt_span.is_some(),
             error_union: err_span.is_some(),
+            array_len: None,
             span,
         })
     }
@@ -659,10 +693,14 @@ impl<'a> Parser<'a> {
 
     fn parse_expr_stmt(&mut self) -> PResult<Stmt> {
         let expr = self.parse_expr()?;
-        // A field-access place followed by `=` is a field assignment
-        // (`a.b.c = e;`); a simple `name = e;` is handled by `parse_assign`
+        // A field-access place (`a.b.c = e;`) or an index place (`a[i] = e;`,
+        // SPEC §14.1) followed by `=` is a place assignment, reusing
+        // `Stmt::FieldAssign`; a simple `name = e;` is handled by `parse_assign`
         // earlier in `parse_stmt`. Anything else is an expression statement.
-        if matches!(expr, Expr::Field { .. }) && self.at_punct(&TokenKind::Eq) {
+        // Composites like `a[i].x = e;` / `m.data[i] = e;` parse here too, since
+        // their place is a `Field`/`Index` chain.
+        if matches!(expr, Expr::Field { .. } | Expr::Index { .. }) && self.at_punct(&TokenKind::Eq)
+        {
             self.bump(); // `=`
             let value = self.parse_expr()?;
             let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
@@ -876,42 +914,61 @@ impl<'a> Parser<'a> {
     /// `comptime`/`unary` levels.
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let mut expr = self.parse_primary()?;
-        while self.at_punct(&TokenKind::Dot) {
-            self.bump(); // `.`
-            // `.?` force-unwraps an optional (SPEC §11.1): a `?` immediately
-            // after the `.` is `Expr::Unwrap`, panicking on null. Otherwise a
-            // `.name` is a field access or — when followed by `(` — a method /
-            // associated-function call. This composes left-to-right, so chains
-            // like `a.b.?`, `f().?`, and `a.?.b` parse naturally.
-            if self.at_punct(&TokenKind::Question) {
-                let q = self.peek_span();
-                self.bump(); // `?`
-                let span = expr.span().merge(q);
-                expr = Expr::Unwrap {
-                    expr: Box::new(expr),
-                    span,
-                };
-                continue;
-            }
-            let (name, name_span) = self.expect_ident()?;
-            if self.at_punct(&TokenKind::LParen) {
-                self.bump(); // `(`
-                let args = self.parse_args()?;
-                let rparen = self.expect_punct(&TokenKind::RParen, "`)`")?;
-                let span = expr.span().merge(rparen);
-                expr = Expr::MethodCall {
-                    receiver: Box::new(expr),
-                    method: name,
-                    args,
+        loop {
+            if self.at_punct(&TokenKind::Dot) {
+                self.bump(); // `.`
+                // `.?` force-unwraps an optional (SPEC §11.1): a `?` immediately
+                // after the `.` is `Expr::Unwrap`, panicking on null. Otherwise a
+                // `.name` is a field access or — when followed by `(` — a method /
+                // associated-function call. This composes left-to-right, so chains
+                // like `a.b.?`, `f().?`, and `a.?.b` parse naturally.
+                if self.at_punct(&TokenKind::Question) {
+                    let q = self.peek_span();
+                    self.bump(); // `?`
+                    let span = expr.span().merge(q);
+                    expr = Expr::Unwrap {
+                        expr: Box::new(expr),
+                        span,
+                    };
+                    continue;
+                }
+                let (name, name_span) = self.expect_ident()?;
+                if self.at_punct(&TokenKind::LParen) {
+                    self.bump(); // `(`
+                    let args = self.parse_args()?;
+                    let rparen = self.expect_punct(&TokenKind::RParen, "`)`")?;
+                    let span = expr.span().merge(rparen);
+                    expr = Expr::MethodCall {
+                        receiver: Box::new(expr),
+                        method: name,
+                        args,
+                        span,
+                    };
+                } else {
+                    let span = expr.span().merge(name_span);
+                    expr = Expr::Field {
+                        base: Box::new(expr),
+                        field: name,
+                        span,
+                    };
+                }
+            } else if self.at_punct(&TokenKind::LBracket) {
+                // Indexing `base[index]` (SPEC §14.1): a postfix `[` after an
+                // operand parses a full index expression then `]`, yielding
+                // `Expr::Index`. It composes left-to-right with `.field` /
+                // calls / `.?`, so `a[i]`, `a[i].x`, `m.data[i]`, and `a[i][j]`
+                // all parse naturally.
+                self.bump(); // `[`
+                let index = self.parse_expr()?;
+                let rbracket = self.expect_punct(&TokenKind::RBracket, "`]`")?;
+                let span = expr.span().merge(rbracket);
+                expr = Expr::Index {
+                    base: Box::new(expr),
+                    index: Box::new(index),
                     span,
                 };
             } else {
-                let span = expr.span().merge(name_span);
-                expr = Expr::Field {
-                    base: Box::new(expr),
-                    field: name,
-                    span,
-                };
+                break;
             }
         }
         Ok(expr)
@@ -1010,8 +1067,50 @@ impl<'a> Parser<'a> {
                 self.expect_punct(&TokenKind::RParen, "`)`")?;
                 Ok(inner)
             }
+            TokenKind::LBracket => {
+                // An array literal `[N]T{ e0, e1, … }` (SPEC §14.1). A leading
+                // `[` in expression-start position is always an array literal:
+                // parse the array type `[N]T` (which consumes the `[`, length,
+                // `]`, and element type name), then require `{` and a
+                // comma-separated element list `}`. This is the only way `[`
+                // starts a primary; a postfix `[` (indexing) is handled in
+                // `parse_postfix` after an operand.
+                let elem = self.parse_type()?;
+                self.expect_punct(&TokenKind::LBrace, "`{`")?;
+                let elems = self.parse_array_elems()?;
+                let rbrace = self.expect_punct(&TokenKind::RBrace, "`}`")?;
+                Ok(Expr::ArrayLit {
+                    elem,
+                    elems,
+                    span: tok.span.merge(rbrace),
+                })
+            }
             _ => Err(self.expected("an expression")),
         }
+    }
+
+    /// Parse the comma-separated element expressions of an array literal, with
+    /// the opening `{` already consumed and the cursor positioned just after
+    /// it. Stops at (without consuming) the closing `}`. Supports an empty list
+    /// and an optional trailing comma. Element count vs. the declared length
+    /// `N` is a sema concern (`E0221`), not the parser's.
+    fn parse_array_elems(&mut self) -> PResult<Vec<Expr>> {
+        let mut elems = Vec::new();
+        if self.at_punct(&TokenKind::RBrace) {
+            return Ok(elems);
+        }
+        loop {
+            let e = self.parse_expr()?;
+            elems.push(e);
+            if self.eat_punct(&TokenKind::Comma) {
+                if self.at_punct(&TokenKind::RBrace) {
+                    break; // trailing comma
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(elems)
     }
 
     fn parse_args(&mut self) -> PResult<Vec<Expr>> {
@@ -2866,5 +2965,399 @@ mod tests {
             }
             other => panic!("expected switch, got {:?}", other),
         }
+    }
+
+    // ---- v0.117: fixed-size arrays (`[N]T`) -------------------------------
+
+    #[test]
+    fn array_type_in_param() {
+        // fn f(a: [3]i32) void { }  — `[3]i32` sets array_len=Some(3), name=i32.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            id("a"),
+            TokenKind::Colon,
+            TokenKind::LBracket,
+            TokenKind::Int(3),
+            TokenKind::RBracket,
+            id("i32"),
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert_eq!(f.params.len(), 1);
+                let ty = &f.params[0].ty;
+                assert_eq!(ty.name, "i32");
+                assert_eq!(ty.array_len, Some(3), "`[3]i32` must set array_len");
+                assert!(!ty.optional, "an array type is not optional");
+                assert!(!ty.error_union, "an array type is not an error union");
+                assert!(ty.span.start < ty.span.end, "span should cover `[3]i32`");
+                // The non-array return type carries `array_len = None`.
+                assert_eq!(f.ret.name, "void");
+                assert_eq!(f.ret.array_len, None);
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn non_array_type_has_array_len_none() {
+        // A plain `i32` carries `array_len = None` (regression guard for the new
+        // field — every TypeExpr construction must set it).
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            id("a"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::RParen,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            id("a"),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert_eq!(f.params[0].ty.array_len, None);
+                assert_eq!(f.ret.array_len, None);
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn array_local_type() {
+        // fn f() void { var a: [2]i32 = [2]i32{ 1, 2 }; }  — `[2]i32` local type
+        // plus an array-literal initializer.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Var),
+            id("a"),
+            TokenKind::Colon,
+            TokenKind::LBracket,
+            TokenKind::Int(2),
+            TokenKind::RBracket,
+            id("i32"),
+            TokenKind::Eq,
+            TokenKind::LBracket,
+            TokenKind::Int(2),
+            TokenKind::RBracket,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::Int(1),
+            TokenKind::Comma,
+            TokenKind::Int(2),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        let body = match &m.items[0] {
+            Item::Func(f) => &f.body,
+            other => panic!("expected func, got {:?}", other),
+        };
+        match &body.stmts[0] {
+            Stmt::Let { name, ty, value, .. } => {
+                assert_eq!(name, "a");
+                assert_eq!(ty.name, "i32");
+                assert_eq!(ty.array_len, Some(2));
+                match value {
+                    Expr::ArrayLit { elem, elems, .. } => {
+                        assert_eq!(elem.name, "i32");
+                        assert_eq!(elem.array_len, Some(2));
+                        assert_eq!(elems.len(), 2);
+                        assert!(matches!(elems[0], Expr::Int { value: 1, .. }));
+                        assert!(matches!(elems[1], Expr::Int { value: 2, .. }));
+                    }
+                    other => panic!("expected array literal, got {:?}", other),
+                }
+            }
+            other => panic!("expected let, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn array_literal_three_elems() {
+        // x = [3]i32{ 1, 2, 3 };  ==>  ArrayLit { elem: [3]i32, elems: [1,2,3] }
+        let e = parse_assign_rhs(vec![
+            TokenKind::LBracket,
+            TokenKind::Int(3),
+            TokenKind::RBracket,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::Int(1),
+            TokenKind::Comma,
+            TokenKind::Int(2),
+            TokenKind::Comma,
+            TokenKind::Int(3),
+            TokenKind::RBrace,
+        ]);
+        match e {
+            Expr::ArrayLit { elem, elems, span } => {
+                assert_eq!(elem.name, "i32");
+                assert_eq!(elem.array_len, Some(3));
+                assert_eq!(elems.len(), 3);
+                assert!(matches!(elems[2], Expr::Int { value: 3, .. }));
+                assert!(span.start < span.end, "span should cover the literal");
+            }
+            other => panic!("expected array literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn array_literal_empty_and_trailing_comma() {
+        // x = [0]i32{};  — an empty element list is accepted by the parser
+        // (the count-vs-N check is a sema concern).
+        let e = parse_assign_rhs(vec![
+            TokenKind::LBracket,
+            TokenKind::Int(0),
+            TokenKind::RBracket,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]);
+        match e {
+            Expr::ArrayLit { elems, .. } => assert!(elems.is_empty()),
+            other => panic!("expected empty array literal, got {:?}", other),
+        }
+        // x = [2]i32{ 1, 2, };  — a trailing comma after the last element.
+        let e = parse_assign_rhs(vec![
+            TokenKind::LBracket,
+            TokenKind::Int(2),
+            TokenKind::RBracket,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::Int(1),
+            TokenKind::Comma,
+            TokenKind::Int(2),
+            TokenKind::Comma,
+            TokenKind::RBrace,
+        ]);
+        match e {
+            Expr::ArrayLit { elems, .. } => assert_eq!(elems.len(), 2),
+            other => panic!("expected array literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn index_expression() {
+        // x = a[0];  ==>  Index { base: Ident a, index: Int 0 }
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::LBracket,
+            TokenKind::Int(0),
+            TokenKind::RBracket,
+        ]);
+        match e {
+            Expr::Index { base, index, .. } => {
+                assert!(matches!(*base, Expr::Ident { ref name, .. } if name == "a"));
+                assert!(matches!(*index, Expr::Int { value: 0, .. }));
+            }
+            other => panic!("expected index, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn index_then_field_composition() {
+        // x = a[i].x;  ==>  Field { base: Index { a, i }, field: "x" }  (left-assoc)
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::LBracket,
+            id("i"),
+            TokenKind::RBracket,
+            TokenKind::Dot,
+            id("x"),
+        ]);
+        match e {
+            Expr::Field { base, field, .. } => {
+                assert_eq!(field, "x");
+                match *base {
+                    Expr::Index { base, index, .. } => {
+                        assert!(matches!(*base, Expr::Ident { ref name, .. } if name == "a"));
+                        assert!(matches!(*index, Expr::Ident { ref name, .. } if name == "i"));
+                    }
+                    other => panic!("expected `a[i]` on the left, got {:?}", other),
+                }
+            }
+            other => panic!("expected field-of-index, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn field_then_index_composition() {
+        // x = m.data[i];  ==>  Index { base: Field { m, data }, index: i }
+        let e = parse_assign_rhs(vec![
+            id("m"),
+            TokenKind::Dot,
+            id("data"),
+            TokenKind::LBracket,
+            id("i"),
+            TokenKind::RBracket,
+        ]);
+        match e {
+            Expr::Index { base, index, .. } => {
+                assert!(matches!(*index, Expr::Ident { ref name, .. } if name == "i"));
+                match *base {
+                    Expr::Field { base, field, .. } => {
+                        assert_eq!(field, "data");
+                        assert!(matches!(*base, Expr::Ident { ref name, .. } if name == "m"));
+                    }
+                    other => panic!("expected `m.data` base, got {:?}", other),
+                }
+            }
+            other => panic!("expected index-of-field, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nested_index_composition() {
+        // x = a[i][j];  ==>  Index { base: Index { a, i }, index: j }  (left-assoc)
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::LBracket,
+            id("i"),
+            TokenKind::RBracket,
+            TokenKind::LBracket,
+            id("j"),
+            TokenKind::RBracket,
+        ]);
+        match e {
+            Expr::Index { base, index, .. } => {
+                assert!(matches!(*index, Expr::Ident { ref name, .. } if name == "j"));
+                assert!(matches!(*base, Expr::Index { .. }), "left operand should nest");
+            }
+            other => panic!("expected nested index, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn index_assign_statement() {
+        // fn f() void { a[1] = 5; }  — index-assign reuses Stmt::FieldAssign with
+        // an `Index` place.
+        let body = parse_fn_body(vec![
+            id("a"),
+            TokenKind::LBracket,
+            TokenKind::Int(1),
+            TokenKind::RBracket,
+            TokenKind::Eq,
+            TokenKind::Int(5),
+            TokenKind::Semicolon,
+        ]);
+        match &body.stmts[0] {
+            Stmt::FieldAssign { place, value, .. } => {
+                match place {
+                    Expr::Index { base, index, .. } => {
+                        assert!(matches!(**base, Expr::Ident { ref name, .. } if name == "a"));
+                        assert!(matches!(**index, Expr::Int { value: 1, .. }));
+                    }
+                    other => panic!("expected index place `a[1]`, got {:?}", other),
+                }
+                assert!(matches!(value, Expr::Int { value: 5, .. }));
+            }
+            other => panic!("expected index assign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn index_field_assign_statement() {
+        // fn f() void { a[i].x = 5; }  — a composite place (`Field` of `Index`)
+        // routes to Stmt::FieldAssign too.
+        let body = parse_fn_body(vec![
+            id("a"),
+            TokenKind::LBracket,
+            id("i"),
+            TokenKind::RBracket,
+            TokenKind::Dot,
+            id("x"),
+            TokenKind::Eq,
+            TokenKind::Int(5),
+            TokenKind::Semicolon,
+        ]);
+        match &body.stmts[0] {
+            Stmt::FieldAssign { place, .. } => {
+                assert!(
+                    matches!(place, Expr::Field { base, .. } if matches!(**base, Expr::Index { .. })),
+                    "expected `Field` of `Index` place, got {:?}",
+                    place
+                );
+            }
+            other => panic!("expected field/index assign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn array_len_is_field_access() {
+        // x = a.len;  ==>  Field { base: Ident a, field: "len" } — `a.len` parses
+        // as an ordinary field access (no new parser code; sema treats `len` on
+        // an array specially).
+        let e = parse_assign_rhs(vec![id("a"), TokenKind::Dot, id("len")]);
+        match e {
+            Expr::Field { base, field, .. } => {
+                assert_eq!(field, "len");
+                assert!(matches!(*base, Expr::Ident { ref name, .. } if name == "a"));
+            }
+            other => panic!("expected field access `a.len`, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn array_type_not_combined_with_optional() {
+        // `[2]?i32` is rejected: after `]` the parser requires a plain element
+        // type name and finds `?`, reporting E0200 (SPEC §14.1: arrays are not
+        // combined with `?`/`!` in v0.117).
+        let err = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            id("a"),
+            TokenKind::Colon,
+            TokenKind::LBracket,
+            TokenKind::Int(2),
+            TokenKind::RBracket,
+            TokenKind::Question,
+            id("i32"),
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect_err("`[2]?i32` should fail");
+        assert!(err.iter().any(|d| d.code == "E0200"));
+    }
+
+    #[test]
+    fn array_type_missing_length_is_rejected() {
+        // `[]i32` (no length) is a syntax error: the parser requires an integer
+        // length after `[`.
+        let err = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            id("a"),
+            TokenKind::Colon,
+            TokenKind::LBracket,
+            TokenKind::RBracket,
+            id("i32"),
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect_err("`[]i32` should fail");
+        assert!(err.iter().any(|d| d.code == "E0200"));
     }
 }

@@ -119,6 +119,10 @@ struct Emitter<'a> {
     /// numbering stays small and deterministic; names never collide because
     /// distinct functions are distinct C blocks.
     try_counter: usize,
+    /// Monotonic counter for the `__kd_idxN` temporaries that lower a
+    /// bounds-checked array index-assignment (SPEC §14.3). Reset per
+    /// function/test body, exactly like `try_counter`.
+    idx_counter: usize,
 }
 
 impl<'a> Emitter<'a> {
@@ -136,6 +140,7 @@ impl<'a> Emitter<'a> {
             fn_params: HashMap::new(),
             method_params: HashMap::new(),
             try_counter: 0,
+            idx_counter: 0,
         }
     }
 
@@ -212,6 +217,7 @@ impl<'a> Emitter<'a> {
             && structs.optionals().next().is_none()
             && structs.error_unions().next().is_none()
             && structs.enums().next().is_none()
+            && structs.arrays().next().is_none()
         {
             return;
         }
@@ -225,6 +231,7 @@ impl<'a> Emitter<'a> {
             Opt(u32),
             ErrU(u32),
             Enum(u32),
+            Array(u32),
         }
         fn dep_of(t: Type) -> Option<Node> {
             match t {
@@ -232,6 +239,7 @@ impl<'a> Emitter<'a> {
                 Type::Optional(o) => Some(Node::Opt(o)),
                 Type::ErrorUnion(e) => Some(Node::ErrU(e)),
                 Type::Enum(e) => Some(Node::Enum(e)),
+                Type::Array(a) => Some(Node::Array(a)),
                 _ => None,
             }
         }
@@ -264,6 +272,12 @@ impl<'a> Emitter<'a> {
                 }
                 // A plain enum embeds nothing by value: it is a graph leaf.
                 Node::Enum(_) => {}
+                // An array `[N]T` embeds its element type `T` by value.
+                Node::Array(a) => {
+                    if let Some(d) = dep_of(structs.array_elem(a)) {
+                        visit(d, structs, seen, order);
+                    }
+                }
             }
             order.push(n);
         }
@@ -285,6 +299,9 @@ impl<'a> Emitter<'a> {
         for (id, _) in structs.error_unions() {
             visit(Node::ErrU(id), structs, &mut seen, &mut order);
         }
+        for (id, _, _) in structs.arrays() {
+            visit(Node::Array(id), structs, &mut seen, &mut order);
+        }
 
         for n in order {
             match n {
@@ -292,6 +309,7 @@ impl<'a> Emitter<'a> {
                 Node::Opt(id) => self.emit_one_optional(id),
                 Node::ErrU(id) => self.emit_one_error_union(id),
                 Node::Enum(id) => self.emit_one_enum(id),
+                Node::Array(id) => self.emit_one_array(id),
             }
         }
         self.blank();
@@ -372,6 +390,29 @@ impl<'a> Emitter<'a> {
         self.line(&format!(
             "static inline {} {}_catch({} e, {} d) {{ return e.err == 0 ? e.val : d; }}",
             payload_cty, ename, ename, payload_cty
+        ));
+    }
+
+    /// Emit one `kd_arr_<tag>_<N>` fixed-size-array typedef plus its inline
+    /// bounds-checked `_get` helper, per SPEC §14.3. The array is a value type:
+    /// wrapping the C array in a `struct { T data[N]; }` gives it C struct
+    /// copy/pass/return semantics (so assignment, parameters and returns copy
+    /// the whole array). `_get` panics (stderr + `exit(101)`) on an
+    /// out-of-bounds index.
+    fn emit_one_array(&mut self, id: u32) {
+        let structs = self.structs;
+        let elem_cty = self.cty_of(structs.array_elem(id));
+        let len = structs.array_len(id);
+        let cname = structs.array_c_name(id);
+        self.line(&format!(
+            "typedef struct {{ {} data[{}]; }} {};",
+            elem_cty, len, cname
+        ));
+        self.line(&format!(
+            "static inline {ec} {cn}_get({cn} a, int64_t i) {{ if (i < 0 || (uint64_t)i >= {n}) {{ fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); }} return a.data[i]; }}",
+            ec = elem_cty,
+            cn = cname,
+            n = len
         ));
     }
 
@@ -469,7 +510,17 @@ impl<'a> Emitter<'a> {
             .or_else(|| self.structs.id_of(&t.name).map(Type::Struct))
             .or_else(|| self.structs.enum_id_of(&t.name).map(Type::Enum))
             .unwrap_or(Type::Void);
-        if t.optional {
+        if let Some(n) = t.array_len {
+            // sema interned every `[N]T`; map the (element, length) pair back to
+            // its `Type::Array(id)`. (`base` is the element type — `t.name` is
+            // the element name when `array_len` is set.)
+            let len = n as usize;
+            self.structs
+                .arrays()
+                .find(|(_, elem, l)| *elem == base && *l == len)
+                .map(|(id, _, _)| Type::Array(id))
+                .unwrap_or(base)
+        } else if t.optional {
             // sema interned every `?T` that appears, so the table holds it; map
             // the base inner type back to its `Type::Optional(id)`.
             self.structs
@@ -499,6 +550,7 @@ impl<'a> Emitter<'a> {
             Type::Optional(id) => self.structs.optional_c_name(id),
             Type::ErrorUnion(id) => self.structs.error_union_c_name(id),
             Type::Enum(id) => self.structs.enum_c_name(id),
+            Type::Array(id) => self.structs.array_c_name(id),
             other => other.c_name().to_string(),
         }
     }
@@ -517,7 +569,11 @@ impl<'a> Emitter<'a> {
         } else {
             Type::I64
         };
-        if t.optional {
+        if let Some(n) = t.array_len {
+            // Matches `array_c_name(id)` (`kd_arr_<type_mangle(elem)>_<N>`)
+            // without needing the interned id; `base` is the element type.
+            format!("kd_arr_{}_{}", self.structs.type_mangle(base), n as usize)
+        } else if t.optional {
             // Matches `optional_c_name(id)` (`kd_opt_<type_mangle(inner)>`)
             // without needing the interned id.
             format!("kd_opt_{}", self.structs.type_mangle(base))
@@ -545,6 +601,7 @@ impl<'a> Emitter<'a> {
     fn emit_func_named(&mut self, f: &Func, c_name: &str) {
         self.scopes.clear();
         self.try_counter = 0;
+        self.idx_counter = 0;
         self.current_ret = self.resolve_ty(&f.ret);
         let ret = self.cty(&f.ret);
         let params = self.format_params(&f.params);
@@ -643,16 +700,46 @@ impl<'a> Emitter<'a> {
                 false
             }
             Stmt::FieldAssign { place, value, .. } => {
-                // `place` is a field-access chain (`a.b.c`); lowering it yields a
-                // C lvalue, so the assignment is a plain `(<place>) = (<value>);`.
-                // Coerce the RHS to the field's type (widening to `?T` if it is
-                // an optional field).
-                let ps = self.emit_expr(place);
-                let es = match self.type_of_expr(place) {
-                    Some(t) => self.emit_coerced(value, t),
-                    None => self.emit_expr(value),
-                };
-                self.line(&format!("({}) = ({});", ps, es));
+                if let Expr::Index { base, index, .. } = place {
+                    // Index-assignment `a[i] = e;` → a bounds-checked block
+                    // (SPEC §14.3): the index is hoisted into a fresh temporary,
+                    // checked against the array length, then stored. The value is
+                    // coerced to the element type so a `T`-coercible value widens.
+                    let k = self.idx_counter;
+                    self.idx_counter += 1;
+                    let idx = self.emit_expr(index);
+                    let base_str = self.emit_expr(base);
+                    let (len, elem_ty) = match self.type_of_expr(base) {
+                        Some(Type::Array(aid)) => {
+                            (self.structs.array_len(aid), Some(self.structs.array_elem(aid)))
+                        }
+                        // Unreachable for validated input (`base` is an array).
+                        _ => (0, None),
+                    };
+                    let val = match elem_ty {
+                        Some(t) => self.emit_coerced(value, t),
+                        None => self.emit_expr(value),
+                    };
+                    self.line(&format!(
+                        "{{ int64_t __kd_idx{k} = ({idx}); if (__kd_idx{k} < 0 || (uint64_t)__kd_idx{k} >= {len}) {{ fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); }} ({base}).data[__kd_idx{k}] = ({val}); }}",
+                        k = k,
+                        idx = idx,
+                        len = len,
+                        base = base_str,
+                        val = val
+                    ));
+                } else {
+                    // `place` is a field-access chain (`a.b.c`); lowering it
+                    // yields a C lvalue, so the assignment is a plain
+                    // `(<place>) = (<value>);`. Coerce the RHS to the field's type
+                    // (widening to `?T` if it is an optional field).
+                    let ps = self.emit_expr(place);
+                    let es = match self.type_of_expr(place) {
+                        Some(t) => self.emit_coerced(value, t),
+                        None => self.emit_expr(value),
+                    };
+                    self.line(&format!("({}) = ({});", ps, es));
+                }
                 false
             }
             Stmt::Expr(e) => self.emit_expr_stmt(e),
@@ -1129,6 +1216,14 @@ impl<'a> Emitter<'a> {
                         return self.structs.enum_variant_c_name(eid, field);
                     }
                 }
+                // `a.len` on an array → the compile-time length as a `usize`
+                // constant (SPEC §14.3). This precedes ordinary field access so
+                // an array never falls through to a `.kd_len` member access.
+                if field == "len" {
+                    if let Some(Type::Array(aid)) = self.type_of_expr(base) {
+                        return format!("((uintptr_t){})", self.structs.array_len(aid));
+                    }
+                }
                 // Field access: `(<base>).kd_<field>`. The base is parenthesized
                 // so a compound base expression (e.g. a literal or another access)
                 // composes correctly: `((p).kd_a).kd_b`.
@@ -1214,6 +1309,51 @@ impl<'a> Emitter<'a> {
                 // rejects (E0215); emit a harmless `0` so output stays valid C.
                 let _ = variant;
                 "0".to_string()
+            }
+            Expr::ArrayLit { elem, elems, .. } => {
+                // `[N]T{ e0, e1, … }` → `((kd_arr_<tag>_<N>){ .data = { e0, … } })`
+                // (SPEC §14.3). `elem` is the *full* array type `[N]T`, so
+                // `resolve_ty` yields `Type::Array(id)` directly; each element is
+                // coerced to the element type (so a `T`-coercible element widens).
+                match self.resolve_ty(elem) {
+                    Type::Array(aid) => {
+                        let cname = self.structs.array_c_name(aid);
+                        let elem_ty = self.structs.array_elem(aid);
+                        if elems.is_empty() {
+                            // A zero-length array: a designated-init with no
+                            // elements is not valid C, so zero-initialise.
+                            format!("(({}){{0}})", cname)
+                        } else {
+                            let inits: Vec<String> = elems
+                                .iter()
+                                .map(|e| self.emit_coerced(e, elem_ty))
+                                .collect();
+                            format!("(({}){{ .data = {{ {} }} }})", cname, inits.join(", "))
+                        }
+                    }
+                    // Unreachable for validated input (the literal's type is
+                    // always an interned array). Emit a brace-init so the output
+                    // stays syntactically plausible.
+                    _ => {
+                        let inits: Vec<String> =
+                            elems.iter().map(|e| self.emit_expr(e)).collect();
+                        format!("{{ {} }}", inits.join(", "))
+                    }
+                }
+            }
+            Expr::Index { base, index, .. } => {
+                // `a[i]` (read) → `kd_arr_<tag>_<N>_get(<a>, <i>)` — a
+                // bounds-checked inline helper call (SPEC §14.3).
+                let b = self.emit_expr(base);
+                let i = self.emit_expr(index);
+                match self.type_of_expr(base) {
+                    Some(Type::Array(aid)) => {
+                        let cname = self.structs.array_c_name(aid);
+                        format!("{}_get({}, {})", cname, b, i)
+                    }
+                    // Unreachable for validated input (`base` is always an array).
+                    _ => format!("({})[{}]", b, i),
+                }
             }
             Expr::Try { expr, .. } => {
                 // `try` is statement-level (SPEC §12.1) and is lowered by the
@@ -1337,6 +1477,15 @@ impl<'a> Emitter<'a> {
                 }
             }
             Expr::StructLit { name, .. } => Some(name.clone()),
+            // A struct-typed array element: `a[i]` where the array's element is
+            // a struct, so `a[i].method()` resolves to the element's struct.
+            Expr::Index { base, .. } => match self.type_of_expr(base)? {
+                Type::Array(aid) => match self.structs.array_elem(aid) {
+                    Type::Struct(sid) => Some(self.structs.get(sid).name.clone()),
+                    _ => None,
+                },
+                _ => None,
+            },
             Expr::Call { callee, .. } => match self.fn_ret.get(callee)? {
                 Type::Struct(id) => Some(self.structs.get(*id).name.clone()),
                 _ => None,
@@ -1418,6 +1567,8 @@ impl<'a> Emitter<'a> {
                 }
                 match self.type_of_expr(base)? {
                     Type::Struct(id) => self.structs.get(id).field_type(field),
+                    // `a.len` on an array is a `usize` constant (SPEC §14.3).
+                    Type::Array(_) if field == "len" => Some(Type::Usize),
                     _ => None,
                 }
             }
@@ -1447,6 +1598,17 @@ impl<'a> Emitter<'a> {
             // A bare `.Variant` has no intrinsic type — its enum comes from
             // context (the expected type or the `switch` scrutinee).
             Expr::EnumLit { .. } => None,
+            // An array literal `[N]T{ … }` has the array type of its full `elem`
+            // (`[N]T`); `resolve_ty` yields `Type::Array(id)` directly.
+            Expr::ArrayLit { elem, .. } => match self.resolve_ty(elem) {
+                t @ Type::Array(_) => Some(t),
+                _ => None,
+            },
+            // `a[i]` yields the element type of the indexed array.
+            Expr::Index { base, .. } => match self.type_of_expr(base)? {
+                Type::Array(id) => Some(self.structs.array_elem(id)),
+                _ => None,
+            },
             // `try` / `catch` both produce the payload `T` of the `!T` operand.
             Expr::Try { expr, .. } => match self.type_of_expr(expr)? {
                 Type::ErrorUnion(id) => Some(self.structs.error_union_payload(id)),
@@ -1573,6 +1735,7 @@ impl<'a> Emitter<'a> {
     fn emit_test_fn(&mut self, idx: usize, t: &TestBlock) {
         self.scopes.clear();
         self.try_counter = 0;
+        self.idx_counter = 0;
         self.current_ret = Type::I32; // the harness test functions return `int`
         self.line(&format!("static int kd_test_{}(void) {{", idx));
         self.indent += 1;
@@ -1639,6 +1802,7 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: false,
+            array_len: None,
             span: Span::DUMMY,
         }
     }
@@ -1648,6 +1812,7 @@ mod tests {
             name: name.to_string(),
             optional: true,
             error_union: false,
+            array_len: None,
             span: Span::DUMMY,
         }
     }
@@ -1657,6 +1822,19 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: true,
+            array_len: None,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A fixed-size array type `[len]name` (`array_len = Some(len)`, the element
+    /// type name in `name`).
+    fn arr_ty(name: &str, len: i64) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: false,
+            error_union: false,
+            array_len: Some(len),
             span: Span::DUMMY,
         }
     }
@@ -3361,6 +3539,244 @@ mod tests {
         assert!(
             enum_at < struct_at,
             "enum typedef must precede the struct that embeds it:\n{out}"
+        );
+    }
+
+    // -- fixed-size arrays (v0.117) ----------------------------------------
+
+    /// A `StructTable` with a single interned `[3]i32` (`kd_arr_int32_t_3`).
+    fn arr_int_table() -> StructTable {
+        let mut t = StructTable::new();
+        t.intern_array(Type::I32, 3);
+        t
+    }
+
+    fn index(base: Expr, idx: Expr) -> Expr {
+        Expr::Index {
+            base: Box::new(base),
+            index: Box::new(idx),
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn array_typedef_and_get_emitted() {
+        // The typedef + inline bounds-checked `_get` come straight off the
+        // interned array table.
+        let structs = arr_int_table();
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("typedef struct { int32_t data[3]; } kd_arr_int32_t_3;"),
+            "array typedef missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "static inline int32_t kd_arr_int32_t_3_get(kd_arr_int32_t_3 a, int64_t i) { if (i < 0 || (uint64_t)i >= 3) { fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); } return a.data[i]; }"
+            ),
+            "array _get helper missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn array_literal_emits_compound_literal() {
+        // fn make() [3]i32 { return [3]i32{ 1, 2, 3 }; }
+        let structs = arr_int_table();
+        let lit = Expr::ArrayLit {
+            elem: arr_ty("i32", 3),
+            elems: vec![int(1), int(2), int(3)],
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "make".to_string(),
+            params: vec![],
+            ret: arr_ty("i32", 3),
+            body: block(vec![ret(lit)]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The array return type uses the array typedef (by value).
+        assert!(
+            out.contains("kd_arr_int32_t_3 kd_make(void)"),
+            "array return type wrong:\n{out}"
+        );
+        // C99 compound literal initialising the wrapped `data` member.
+        assert!(
+            out.contains("((kd_arr_int32_t_3){ .data = { 1, 2, 3 } })"),
+            "array literal lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn index_read_emits_get_call() {
+        // fn at(a: [3]i32, i: i32) i32 { return a[i]; }
+        let structs = arr_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "at".to_string(),
+            params: vec![
+                Param {
+                    name: "a".to_string(),
+                    ty: arr_ty("i32", 3),
+                    span: Span::DUMMY,
+                },
+                param("i", "i32"),
+            ],
+            ret: ty("i32"),
+            body: block(vec![ret(index(ident("a"), ident("i")))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The array param is by value, typed with the array typedef.
+        assert!(
+            out.contains("kd_arr_int32_t_3 kd_a"),
+            "array param type wrong:\n{out}"
+        );
+        // Indexing lowers to the bounds-checked `_get` helper call.
+        assert!(
+            out.contains("kd_arr_int32_t_3_get(kd_a, kd_i)"),
+            "index read lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn array_len_emits_uintptr_constant() {
+        // fn n(a: [3]i32) usize { return a.len; }
+        let structs = arr_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "n".to_string(),
+            params: vec![Param {
+                name: "a".to_string(),
+                ty: arr_ty("i32", 3),
+                span: Span::DUMMY,
+            }],
+            ret: ty("usize"),
+            body: block(vec![ret(field(ident("a"), "len"))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // `a.len` is the compile-time length as a `usize` constant — not a
+        // `.kd_len` member access.
+        assert!(
+            out.contains("return (((uintptr_t)3));"),
+            "array len lowering wrong:\n{out}"
+        );
+        assert!(
+            !out.contains(".kd_len"),
+            "array len must not lower to a struct field access:\n{out}"
+        );
+    }
+
+    #[test]
+    fn index_assign_emits_bounds_checked_block() {
+        // fn set(a: [3]i32) void { a[0] = 5; }
+        let structs = arr_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "set".to_string(),
+            params: vec![Param {
+                name: "a".to_string(),
+                ty: arr_ty("i32", 3),
+                span: Span::DUMMY,
+            }],
+            ret: ty("void"),
+            body: block(vec![Stmt::FieldAssign {
+                place: index(ident("a"), int(0)),
+                value: int(5),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains(
+                "{ int64_t __kd_idx0 = (0); if (__kd_idx0 < 0 || (uint64_t)__kd_idx0 >= 3) { fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); } (kd_a).data[__kd_idx0] = (5); }"
+            ),
+            "index assign lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn empty_array_literal_uses_zero_init() {
+        // fn make() [0]i32 { return [0]i32{}; }  — a zero-length array.
+        let mut structs = StructTable::new();
+        structs.intern_array(Type::I32, 0);
+        let f = Func {
+            is_pub: false,
+            name: "make".to_string(),
+            params: vec![],
+            ret: arr_ty("i32", 0),
+            body: block(vec![ret(Expr::ArrayLit {
+                elem: arr_ty("i32", 0),
+                elems: vec![],
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("((kd_arr_int32_t_0){0})"),
+            "empty array literal lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn struct_field_array_typedef_orders_array_first() {
+        // const Buf = struct { xs: [2]i32 };  — a struct embedding an array.
+        // The array typedef must precede the struct typedef that embeds it.
+        let mut structs = StructTable::new();
+        let aid = structs.intern_array(Type::I32, 2);
+        let bid = structs.intern("Buf");
+        structs.set_fields(bid, vec![("xs".to_string(), Type::Array(aid))]);
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        let arr_at = out
+            .find("typedef struct { int32_t data[2]; } kd_arr_int32_t_2;")
+            .expect("array typedef missing");
+        let struct_at = out
+            .find("typedef struct { kd_arr_int32_t_2 kd_xs; } kd_struct_Buf;")
+            .expect("struct-with-array-field typedef missing/wrong");
+        assert!(
+            arr_at < struct_at,
+            "array typedef must precede the struct that embeds it:\n{out}"
+        );
+    }
+
+    #[test]
+    fn array_of_struct_orders_struct_first() {
+        // A `[2]Point` array of a struct: the struct typedef must precede the
+        // array typedef that embeds it by value.
+        let mut structs = point_table();
+        let pid = structs.id_of("Point").unwrap();
+        structs.intern_array(Type::Struct(pid), 2);
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        let struct_at = out
+            .find("kd_struct_Point;")
+            .expect("Point struct typedef missing");
+        let arr_at = out
+            .find("typedef struct { kd_struct_Point data[2]; } kd_arr_struct_Point_2;")
+            .expect("array-of-struct typedef missing/wrong");
+        assert!(
+            struct_at < arr_at,
+            "struct typedef must precede the array that embeds it:\n{out}"
         );
     }
 }

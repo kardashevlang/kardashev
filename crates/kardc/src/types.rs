@@ -34,6 +34,9 @@ pub enum Type {
     /// A plain (C-like) enum, v0.116. The `u32` indexes the enum table
     /// (`enum_info`).
     Enum(u32),
+    /// `[N]T` — a fixed-size array (v0.117). The `u32` indexes the array table
+    /// (`array_info`: element type + length).
+    Array(u32),
 }
 
 impl Type {
@@ -75,6 +78,7 @@ impl Type {
             Type::Optional(_) => "optional",
             Type::ErrorUnion(_) => "error union",
             Type::Enum(_) => "enum",
+            Type::Array(_) => "array",
         }
     }
 
@@ -104,6 +108,9 @@ impl Type {
                 unreachable!("c_name on an error-union type; use StructTable::error_union_c_name")
             }
             Type::Enum(_) => unreachable!("c_name on an enum type; use StructTable::enum_c_name"),
+            Type::Array(_) => {
+                unreachable!("c_name on an array type; use StructTable::array_c_name")
+            }
         }
     }
 
@@ -176,6 +183,8 @@ pub struct StructTable {
     /// Plain enum definitions, indexed by the id in `Type::Enum(id)`.
     enum_defs: Vec<EnumInfo>,
     enum_by_name: HashMap<String, u32>,
+    /// Array types `(element, length)`, indexed by the id in `Type::Array(id)`.
+    array_info: Vec<(Type, usize)>,
 }
 
 impl StructTable {
@@ -262,6 +271,10 @@ impl StructTable {
                 format!("err_{}", self.type_mangle(self.error_union_payload(eid)))
             }
             Type::Enum(eid) => format!("enum_{}", self.enum_defs[eid as usize].name),
+            Type::Array(aid) => {
+                let (elem, len) = self.array_info[aid as usize];
+                format!("arr_{}_{}", self.type_mangle(elem), len)
+            }
             other => other.c_name().to_string(),
         }
     }
@@ -308,6 +321,42 @@ impl StructTable {
     /// Enums in declaration (id) order, paired with their id.
     pub fn enums(&self) -> impl Iterator<Item = (u32, &EnumInfo)> {
         self.enum_defs.iter().enumerate().map(|(i, e)| (i as u32, e))
+    }
+
+    // --- arrays `[N]T` (v0.117) -------------------------------------------
+
+    /// Intern array type `[len]elem`, returning its id (deduplicated).
+    pub fn intern_array(&mut self, elem: Type, len: usize) -> u32 {
+        if let Some(i) = self.array_info.iter().position(|&(e, l)| e == elem && l == len) {
+            return i as u32;
+        }
+        let id = self.array_info.len() as u32;
+        self.array_info.push((elem, len));
+        id
+    }
+
+    /// The element type of `Type::Array(id)`.
+    pub fn array_elem(&self, id: u32) -> Type {
+        self.array_info[id as usize].0
+    }
+
+    /// The length of `Type::Array(id)`.
+    pub fn array_len(&self, id: u32) -> usize {
+        self.array_info[id as usize].1
+    }
+
+    /// The C typedef name for `[N]T`, e.g. `kd_arr_int32_t_3`.
+    pub fn array_c_name(&self, id: u32) -> String {
+        let (elem, len) = self.array_info[id as usize];
+        format!("kd_arr_{}_{}", self.type_mangle(elem), len)
+    }
+
+    /// All interned arrays, paired with id, in interning order.
+    pub fn arrays(&self) -> impl Iterator<Item = (u32, Type, usize)> + '_ {
+        self.array_info
+            .iter()
+            .enumerate()
+            .map(|(i, &(e, l))| (i as u32, e, l))
     }
 
     // --- error unions (`!T`) + the implicit global error set --------------

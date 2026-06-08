@@ -523,6 +523,50 @@ Plain (C-like) enums plus an exhaustive `switch`. Tagged-union payloads
   `else` (`E0210` if neither). For an **integer** scrutinee an `else` is
   required (`E0214`). Each arm body is checked as a block.
 
+## 14. Fixed-size arrays `[N]T` (v0.117)
+
+Value-semantics arrays of a compile-time-constant length. Element type is a
+primitive or struct in v0.117 (not itself an array/optional/error-union).
+
+### 14.1 Syntax & AST
+- Type `[N]T`: `TypeExpr.array_len = Some(N)`, `name = T`. `N` is a
+  non-negative integer literal. Resolves to
+  `Type::Array(StructTable::intern_array(elem, N))`.
+- Array literal `[N]T{ e0, e1, … }` → `Expr::ArrayLit{elem, elems}` with exactly
+  `N` elements, each coercible to `T`. Result `Type::Array(id)`.
+- Indexing `a[i]` → `Expr::Index{base, index}` (postfix, composes with
+  `.field`/calls). `base` must be an array; `index` an integer; result `T`.
+- Index assignment `a[i] = e` reuses `Stmt::FieldAssign` with an `Index` place.
+- `a.len` reuses `Expr::Field` with field `len` on an array → a `usize` constant.
+- Arrays are **value types** — assignment / parameter / return copy the whole
+  array.
+
+### 14.2 Semantics (`sema`)
+`a[i]`: `base` must be `Array(id)` (`E0220`); `index` an integer; result is the
+element type. ArrayLit: element count must equal `N` (`E0221`); each element
+coerces to the element type (`E0110`). `a.len`: only on arrays (else fall back
+to struct field rules); type `usize`. Index-assign: the indexed place must be a
+mutable `var` array (`E0223`); value coerces to the element type. A negative or
+absurd `N` is `E0224`.
+
+### 14.3 Backend (`emit_c`)
+Emit arrays among the dependency-ordered type defs (an array depends on its
+element type):
+```c
+typedef struct { <elem cty> data[N]; } kd_arr_<tag>_<N>;
+static inline <elem cty> kd_arr_<tag>_<N>_get(kd_arr_<tag>_<N> a, int64_t i) {
+    if (i < 0 || (uint64_t)i >= N) { fputs("panic: array index out of bounds\n", stderr); exit(101); }
+    return a.data[i];
+}
+```
+Lowerings: `[N]T{ … }` → `((kd_arr_<tag>_<N>){ .data = { e0, e1, … } })`; `a[i]`
+(read) → `kd_arr_<tag>_<N>_get(<a>, <i>)`; `a.len` → `((uintptr_t)N)`. An
+index-assign `a[i] = e;` lowers to a bounds-checked block:
+```c
+{ int64_t __kd_idxK = (<i>); if (__kd_idxK < 0 || (uint64_t)__kd_idxK >= N) { fputs("panic: array index out of bounds\n", stderr); exit(101); } (<a>).data[__kd_idxK] = (<e>); }
+```
+`cty(Type::Array(id))` → `StructTable::array_c_name(id)`.
+
 ### 13.3 Backend (`emit_c`)
 Emit each enum among the dependency-ordered type defs (enums have no
 dependencies):
