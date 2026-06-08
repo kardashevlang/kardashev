@@ -66,6 +66,11 @@ pub fn eval(expr: &Expr, consts: &HashMap<String, ConstVal>) -> Result<ConstVal,
             "E0130",
             "field access is not allowed in a constant expression",
         )),
+        Expr::MethodCall { span, .. } => Err(Diagnostic::error(
+            *span,
+            "E0130",
+            "method calls are not allowed in a constant expression",
+        )),
     }
 }
 

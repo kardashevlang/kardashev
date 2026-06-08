@@ -18,6 +18,20 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.113.0] — Struct methods & associated functions
+
+Completes structs: functions declared inside a `struct` body.
+
+### Added
+- **Methods** — a function whose first parameter is `self` is callable as
+  `instance.method(args)` (self is prepended); **associated functions** (no
+  `self`) are callable as `Type.func(args)`. The explicit-self form
+  `Type.method(instance, args)` is also accepted, and method calls **chain**
+  (`c.bumped(1).bumped(2)`).
+- AST: `StructDecl.methods: Vec<Func>` and `Expr::MethodCall`. Lowered to free C
+  functions `kd_<Struct>_<method>(self, …)`. Diagnostics `E0170`–`E0172`.
+- 168 unit + 10 e2e tests; `examples/counter.ks`.
+
 ## [0.112.0] — Structs (data aggregates)
 
 The first roadmap version of the Gen-2 arc: **structs**, the foundational

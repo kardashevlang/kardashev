@@ -25,11 +25,15 @@
 //! - `E0166` — access of a field the struct does not have.
 //! - `E0167` — field-assignment target not rooted in an assignable `var`.
 //! - `E0168` — `==` / `!=` on struct types.
+//! - `E0170` — call of a method / associated function the struct does not have.
+//! - `E0171` — wrong number of arguments to a method / associated function.
+//! - `E0172` — calling a method statically without the `self` argument, or an
+//!   associated function on a value.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    BinOp, Block, Expr, FieldInit, Func, Item, Module, Stmt, TestBlock, TypeExpr, UnOp,
+    BinOp, Block, Expr, FieldInit, Func, Item, Module, Stmt, StructDecl, TestBlock, TypeExpr, UnOp,
 };
 use crate::const_eval::{self, ConstVal};
 use crate::diag::Diagnostic;
@@ -55,6 +59,20 @@ struct FuncSig {
     ret: Type,
 }
 
+/// A resolved signature for a struct's method or associated function (SPEC §10).
+///
+/// `params` lists every parameter type in declaration order — including the
+/// leading `self` (whose type is the enclosing struct) when `is_method` is true.
+/// `is_method` records whether the first parameter is named `self`, which
+/// decides whether the function may be invoked on a value (`v.m(..)`) or only
+/// statically (`Name.f(..)`).
+#[derive(Clone)]
+struct StructFn {
+    params: Vec<Type>,
+    ret: Type,
+    is_method: bool,
+}
+
 /// A lexical binding: its type and whether it is immutable (a `const` or a
 /// parameter — only `var` locals may be assigned to).
 type Binding = (Type, bool);
@@ -69,6 +87,9 @@ struct Checker {
     const_types: HashMap<String, Type>,
     /// All user function signatures (collected up front).
     funcs: HashMap<String, FuncSig>,
+    /// Per-struct method / associated-function signatures, keyed by struct id
+    /// then function name (collected up front, so method calls resolve).
+    struct_funcs: HashMap<u32, HashMap<String, StructFn>>,
     /// Lexical scope stack; the back is the innermost scope.
     scopes: Vec<HashMap<String, Binding>>,
     /// Whether we are currently inside a `test` block (gates `expect`).
@@ -87,6 +108,7 @@ impl Checker {
             consts: HashMap::new(),
             const_types: HashMap::new(),
             funcs: HashMap::new(),
+            struct_funcs: HashMap::new(),
             scopes: Vec::new(),
             in_test: false,
             loop_depth: 0,
@@ -171,6 +193,48 @@ impl Checker {
             }
         }
 
+        // Pass 1b: collect struct method / associated-function signatures so
+        // that method calls resolve regardless of declaration order. `self`'s
+        // type is always the enclosing struct (SPEC §10); other parameter and
+        // return types resolve to builtins or any interned struct (diagnostics
+        // for ill-typed parameters are raised when the body is checked).
+        for item in &m.items {
+            if let Item::Struct(s) = item {
+                let id = match self.structs.id_of(&s.name) {
+                    Some(id) => id,
+                    None => continue, // unreachable: interned in pass 0a
+                };
+                let mut map: HashMap<String, StructFn> = HashMap::new();
+                for f in &s.methods {
+                    let is_method = f.params.first().map_or(false, |p| p.name == "self");
+                    let params = f
+                        .params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| {
+                            if i == 0 && is_method {
+                                Type::Struct(id)
+                            } else {
+                                self.resolve_type_opt(&p.ty).unwrap_or(Type::I64)
+                            }
+                        })
+                        .collect();
+                    let ret = self.resolve_type_opt(&f.ret).unwrap_or(Type::Void);
+                    // A duplicate function name keeps the last declaration; the
+                    // grammar does not define a diagnostic for it.
+                    map.insert(
+                        f.name.clone(),
+                        StructFn {
+                            params,
+                            ret,
+                            is_method,
+                        },
+                    );
+                }
+                self.struct_funcs.insert(id, map);
+            }
+        }
+
         // Pass 2: fold top-level consts in source order.
         for item in &m.items {
             if let Item::Const(c) = item {
@@ -228,7 +292,7 @@ impl Checker {
                 Item::Func(f) => self.check_func(f),
                 Item::Test(t) => self.check_test(t),
                 Item::Const(_) => {}
-                Item::Struct(_) => {}
+                Item::Struct(s) => self.check_struct_methods(s),
             }
         }
     }
@@ -241,6 +305,42 @@ impl Checker {
         for p in &f.params {
             let pt = self.resolve_type(&p.ty).unwrap_or(Type::I64);
             // Parameters are immutable bindings.
+            self.define(&p.name, pt, true);
+        }
+        self.check_block(&f.body);
+        self.scopes.pop();
+    }
+
+    /// Type-check every method / associated-function body of a struct (SPEC
+    /// §10). Each body is checked exactly like a free function, except that a
+    /// leading `self` parameter is bound to the enclosing struct type.
+    fn check_struct_methods(&mut self, s: &StructDecl) {
+        let id = match self.structs.id_of(&s.name) {
+            Some(id) => id,
+            None => return, // unreachable: interned in pass 0a
+        };
+        for f in &s.methods {
+            self.check_struct_func(f, id);
+        }
+    }
+
+    /// Type-check one struct function body. `struct_id` is the enclosing struct,
+    /// used as the type of a leading `self` parameter.
+    fn check_struct_func(&mut self, f: &Func, struct_id: u32) {
+        self.ret_type = self.resolve_type(&f.ret).unwrap_or(Type::Void);
+        self.in_test = false;
+        self.loop_depth = 0;
+        self.scopes.push(HashMap::new());
+        let is_method = f.params.first().map_or(false, |p| p.name == "self");
+        for (i, p) in f.params.iter().enumerate() {
+            // The receiver `self` always has the enclosing struct type; other
+            // parameters resolve normally (emitting `E0100` for unknown types).
+            let pt = if i == 0 && is_method {
+                Type::Struct(struct_id)
+            } else {
+                self.resolve_type(&p.ty).unwrap_or(Type::I64)
+            };
+            // Parameters (including `self`) are immutable bindings.
             self.define(&p.name, pt, true);
         }
         self.check_block(&f.body);
@@ -593,7 +693,209 @@ impl Checker {
                 let bt = self.check_expr(base, None)?;
                 self.field_type_of(bt, field, *span)
             }
+            Expr::MethodCall {
+                receiver,
+                method,
+                args,
+                span,
+            } => self.check_method_call(receiver, method, args, *span),
         }
+    }
+
+    /// Type-check a method / associated-function call `receiver.method(args)`
+    /// (SPEC §10). Resolution has two shapes:
+    ///
+    /// - **(b) associated/static call** — `receiver` is an [`Expr::Ident`] that
+    ///   names a struct *type* and is not a value in scope: bind `args` to *all*
+    ///   of the function's parameters (so `Counter.get(c)` is the explicit-self
+    ///   form and `Counter.zero()` the static form).
+    /// - **(a) method call** — otherwise `receiver` is evaluated as a value; it
+    ///   must have a struct type, the resolved function must be a method (first
+    ///   parameter `self`), and `args` bind to the parameters *after* `self`.
+    fn check_method_call(
+        &mut self,
+        receiver: &Expr,
+        method: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<Type> {
+        // Case (b): an identifier that names a struct type and is not shadowed
+        // by a value in scope → associated / static call.
+        if let Expr::Ident { name, .. } = receiver {
+            if self.lookup(name).is_none() {
+                if let Some(id) = self.structs.id_of(name) {
+                    return self.check_static_call(id, name, method, args, span);
+                }
+            }
+        }
+        // Case (a): evaluate the receiver as a value; it must be a struct.
+        let recv_ty = self.check_expr(receiver, None)?;
+        let id = match recv_ty {
+            Type::Struct(id) => id,
+            other => {
+                let msg = format!(
+                    "type `{}` has no method `{}` (method calls require a struct receiver)",
+                    self.type_name(other),
+                    method
+                );
+                self.error(span, "E0170", msg);
+                for a in args {
+                    self.check_expr(a, None);
+                }
+                return None;
+            }
+        };
+        self.check_value_method_call(id, method, args, span)
+    }
+
+    /// Resolve `value.method(args)` — a method call on a struct value (case a).
+    fn check_value_method_call(
+        &mut self,
+        id: u32,
+        method: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<Type> {
+        let sf = match self.struct_func(id, method) {
+            Some(sf) => sf,
+            None => {
+                let sname = self.structs.get(id).name.clone();
+                self.error(
+                    span,
+                    "E0170",
+                    format!("struct `{}` has no method `{}`", sname, method),
+                );
+                for a in args {
+                    self.check_expr(a, None);
+                }
+                return None;
+            }
+        };
+        if !sf.is_method {
+            // An associated function (no `self`) cannot be invoked on a value.
+            let sname = self.structs.get(id).name.clone();
+            let msg = format!(
+                "`{}` is an associated function of `{}`; call it as `{}.{}(...)`, not on a value",
+                method, sname, sname, method
+            );
+            self.error(span, "E0172", msg);
+            for a in args {
+                self.check_expr(a, None);
+            }
+            return None;
+        }
+        // The receiver supplies `self`; the remaining parameters bind `args`.
+        let expected: Vec<Type> = sf.params[1..].to_vec();
+        if args.len() != expected.len() {
+            let sname = self.structs.get(id).name.clone();
+            self.error(
+                span,
+                "E0171",
+                format!(
+                    "method `{}` of `{}` takes {} argument(s), found {}",
+                    method,
+                    sname,
+                    expected.len(),
+                    args.len()
+                ),
+            );
+            for a in args {
+                self.check_expr(a, None);
+            }
+            return Some(sf.ret);
+        }
+        self.check_arg_types(args, &expected);
+        Some(sf.ret)
+    }
+
+    /// Resolve `Name.method(args)` — an associated / static call (case b).
+    fn check_static_call(
+        &mut self,
+        id: u32,
+        sname: &str,
+        method: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<Type> {
+        let sf = match self.struct_func(id, method) {
+            Some(sf) => sf,
+            None => {
+                self.error(
+                    span,
+                    "E0170",
+                    format!(
+                        "struct `{}` has no method or associated function `{}`",
+                        sname, method
+                    ),
+                );
+                for a in args {
+                    self.check_expr(a, None);
+                }
+                return None;
+            }
+        };
+        // The static form binds `args` to *all* parameters (including an
+        // explicit `self` for methods).
+        let params: Vec<Type> = sf.params.clone();
+        if args.len() != params.len() {
+            // A method invoked statically with all of its post-`self` arguments
+            // but no explicit `self` receiver is the dedicated `E0172`; any other
+            // count is a plain arity error.
+            if sf.is_method && args.len() == params.len().saturating_sub(1) {
+                self.error(
+                    span,
+                    "E0172",
+                    format!(
+                        "method `{}` of `{}` called statically without the `self` argument; \
+                         pass the receiver explicitly, e.g. `{}.{}(value, ...)`",
+                        method, sname, sname, method
+                    ),
+                );
+            } else {
+                self.error(
+                    span,
+                    "E0171",
+                    format!(
+                        "`{}.{}` takes {} argument(s), found {}",
+                        sname,
+                        method,
+                        params.len(),
+                        args.len()
+                    ),
+                );
+            }
+            for a in args {
+                self.check_expr(a, None);
+            }
+            return Some(sf.ret);
+        }
+        self.check_arg_types(args, &params);
+        Some(sf.ret)
+    }
+
+    /// Type-check each argument against its expected parameter type, reusing the
+    /// general type-mismatch code `E0110`. Caller guarantees equal lengths.
+    fn check_arg_types(&mut self, args: &[Expr], params: &[Type]) {
+        for (a, &pt) in args.iter().zip(params.iter()) {
+            if let Some(at) = self.check_expr(a, Some(pt)) {
+                if at != pt {
+                    let msg = format!(
+                        "argument type mismatch: expected `{}`, found `{}`",
+                        self.type_name(pt),
+                        self.type_name(at)
+                    );
+                    self.error(a.span(), "E0110", msg);
+                }
+            }
+        }
+    }
+
+    /// Look up a struct's method / associated function by id and name.
+    fn struct_func(&self, id: u32, method: &str) -> Option<StructFn> {
+        self.struct_funcs
+            .get(&id)
+            .and_then(|m| m.get(method))
+            .cloned()
     }
 
     /// Type-check a struct literal `Name{ .f = e, ... }`.
@@ -984,15 +1286,18 @@ mod tests {
             span: sp(),
         }
     }
-    fn func(name: &str, params: Vec<Param>, ret: &str, body: Vec<Stmt>) -> Item {
-        Item::Func(Func {
+    fn raw_func(name: &str, params: Vec<Param>, ret: &str, body: Vec<Stmt>) -> Func {
+        Func {
             is_pub: false,
             name: name.into(),
             params,
             ret: te(ret),
             body: block(body),
             span: sp(),
-        })
+        }
+    }
+    fn func(name: &str, params: Vec<Param>, ret: &str, body: Vec<Stmt>) -> Item {
+        Item::Func(raw_func(name, params, ret, body))
     }
     fn const_item(name: &str, ty: &str, value: Expr) -> Item {
         Item::Const(ConstDecl {
@@ -1010,20 +1315,42 @@ mod tests {
             span: sp(),
         })
     }
+    fn field_decls(fields: Vec<(&str, &str)>) -> Vec<FieldDecl> {
+        fields
+            .into_iter()
+            .map(|(n, t)| FieldDecl {
+                name: n.into(),
+                ty: te(t),
+                span: sp(),
+            })
+            .collect()
+    }
     fn struct_item(name: &str, fields: Vec<(&str, &str)>) -> Item {
         Item::Struct(StructDecl {
             is_pub: false,
             name: name.into(),
-            fields: fields
-                .into_iter()
-                .map(|(n, t)| FieldDecl {
-                    name: n.into(),
-                    ty: te(t),
-                    span: sp(),
-                })
-                .collect(),
+            fields: field_decls(fields),
+            methods: Vec::new(),
             span: sp(),
         })
+    }
+    /// A struct with both fields and methods / associated functions (v0.113).
+    fn struct_item_m(name: &str, fields: Vec<(&str, &str)>, methods: Vec<Func>) -> Item {
+        Item::Struct(StructDecl {
+            is_pub: false,
+            name: name.into(),
+            fields: field_decls(fields),
+            methods,
+            span: sp(),
+        })
+    }
+    fn method_call(receiver: Expr, method: &str, args: Vec<Expr>) -> Expr {
+        Expr::MethodCall {
+            receiver: Box::new(receiver),
+            method: method.into(),
+            args,
+            span: sp(),
+        }
     }
     fn struct_lit(name: &str, inits: Vec<(&str, Expr)>) -> Expr {
         Expr::StructLit {
@@ -1509,6 +1836,233 @@ mod tests {
                 vec![ret(Some(field(field(ident("o"), "inner"), "v")))],
             ),
         ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    // ---- method / associated-function tests (v0.113) ---------------------
+
+    /// The canonical `Counter` struct from SPEC §10:
+    /// ```text
+    /// const Counter = struct {
+    ///     n: i32,
+    ///     fn get(self: Counter) i32 { return self.n; }
+    ///     fn bumped(self: Counter, by: i32) Counter { return Counter{ .n = self.n + by }; }
+    ///     fn zero() Counter { return Counter{ .n = 0 }; }   // associated (no self)
+    /// };
+    /// ```
+    fn counter_struct() -> Item {
+        let get = raw_func(
+            "get",
+            vec![param("self", "Counter")],
+            "i32",
+            vec![ret(Some(field(ident("self"), "n")))],
+        );
+        let bumped = raw_func(
+            "bumped",
+            vec![param("self", "Counter"), param("by", "i32")],
+            "Counter",
+            vec![ret(Some(struct_lit(
+                "Counter",
+                vec![(
+                    "n",
+                    bin(BinOp::Add, field(ident("self"), "n"), ident("by")),
+                )],
+            )))],
+        );
+        let zero = raw_func(
+            "zero",
+            vec![],
+            "Counter",
+            vec![ret(Some(struct_lit("Counter", vec![("n", int(0))])))],
+        );
+        struct_item_m("Counter", vec![("n", "i32")], vec![get, bumped, zero])
+    }
+
+    #[test]
+    fn method_and_assoc_calls_typecheck_with_result_types() {
+        // fn main() void {
+        //     var c: Counter = Counter.zero();   // associated fn  -> Counter
+        //     var d: Counter = c.bumped(5);      // method + arg   -> Counter
+        //     var r: i32 = d.get();              // method         -> i32
+        //     print(r);
+        // }
+        // The `var T = ...` declarations pin each call's result type, so a
+        // clean run also proves the inferred result types.
+        let items = vec![
+            counter_struct(),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("c", "Counter", method_call(ident("Counter"), "zero", vec![])),
+                    let_var("d", "Counter", method_call(ident("c"), "bumped", vec![int(5)])),
+                    let_var("r", "i32", method_call(ident("d"), "get", vec![])),
+                    Stmt::Expr(call("print", vec![ident("r")])),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn associated_and_explicit_self_static_calls_ok() {
+        // fn main() void {
+        //     var c: Counter = Counter.zero();   // static form
+        //     var r: i32 = Counter.get(c);       // explicit-self static form
+        //     print(r);
+        // }
+        let items = vec![
+            counter_struct(),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("c", "Counter", method_call(ident("Counter"), "zero", vec![])),
+                    let_var(
+                        "r",
+                        "i32",
+                        method_call(ident("Counter"), "get", vec![ident("c")]),
+                    ),
+                    Stmt::Expr(call("print", vec![ident("r")])),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn unknown_method_is_e0170() {
+        // fn f(c: Counter) i32 { return c.nope(); }
+        let items = vec![
+            counter_struct(),
+            func(
+                "f",
+                vec![param("c", "Counter")],
+                "i32",
+                vec![ret(Some(method_call(ident("c"), "nope", vec![])))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0170"));
+    }
+
+    #[test]
+    fn unknown_static_method_is_e0170() {
+        // fn f() void { Counter.nope(); }
+        let items = vec![
+            counter_struct(),
+            func(
+                "f",
+                vec![],
+                "void",
+                vec![Stmt::Expr(method_call(ident("Counter"), "nope", vec![]))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0170"));
+    }
+
+    #[test]
+    fn method_on_non_struct_value_is_e0170() {
+        // fn f(x: i32) i32 { return x.foo(); }
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "i32",
+            vec![ret(Some(method_call(ident("x"), "foo", vec![])))],
+        )];
+        assert!(codes(items).contains(&"E0170"));
+    }
+
+    #[test]
+    fn method_arity_mismatch_is_e0171() {
+        // fn f(c: Counter) Counter { return c.bumped(); }   // bumped needs 1 arg
+        let items = vec![
+            counter_struct(),
+            func(
+                "f",
+                vec![param("c", "Counter")],
+                "Counter",
+                vec![ret(Some(method_call(ident("c"), "bumped", vec![])))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0171"));
+    }
+
+    #[test]
+    fn assoc_fn_called_on_value_is_e0172() {
+        // fn f(c: Counter) Counter { return c.zero(); }   // zero is associated
+        let items = vec![
+            counter_struct(),
+            func(
+                "f",
+                vec![param("c", "Counter")],
+                "Counter",
+                vec![ret(Some(method_call(ident("c"), "zero", vec![])))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0172"));
+    }
+
+    #[test]
+    fn method_called_statically_without_self_is_e0172() {
+        // fn f() i32 { return Counter.get(); }   // get is a method, no self passed
+        let items = vec![
+            counter_struct(),
+            func(
+                "f",
+                vec![],
+                "i32",
+                vec![ret(Some(method_call(ident("Counter"), "get", vec![])))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0172"));
+    }
+
+    #[test]
+    fn method_arg_type_mismatch_is_e0110() {
+        // fn f(c: Counter) Counter { return c.bumped(true); }   // bumped wants i32
+        let items = vec![
+            counter_struct(),
+            func(
+                "f",
+                vec![param("c", "Counter")],
+                "Counter",
+                vec![ret(Some(method_call(
+                    ident("c"),
+                    "bumped",
+                    vec![boolean(true)],
+                )))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn method_body_return_type_is_checked_e0110() {
+        // const Counter = struct { n: i32, fn bad(self: Counter) bool { return self.n; } };
+        // The body returns `self.n` (i32) where `bool` is declared.
+        let bad = raw_func(
+            "bad",
+            vec![param("self", "Counter")],
+            "bool",
+            vec![ret(Some(field(ident("self"), "n")))],
+        );
+        let items = vec![struct_item_m("Counter", vec![("n", "i32")], vec![bad])];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn method_body_self_field_access_ok() {
+        // A method body type-checks `self.<field>` against the enclosing struct.
+        // const Counter = struct { n: i32, fn get(self: Counter) i32 { return self.n; } };
+        let get = raw_func(
+            "get",
+            vec![param("self", "Counter")],
+            "i32",
+            vec![ret(Some(field(ident("self"), "n")))],
+        );
+        let items = vec![struct_item_m("Counter", vec![("n", "i32")], vec![get])];
         assert_eq!(codes(items), Vec::<&str>::new());
     }
 }

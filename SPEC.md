@@ -359,3 +359,38 @@ field access `e.f` → `(<e>).kd_<f>`; struct literal → `((kd_struct_<Name>){
 `(<place>) = (<e>);`. Struct-typed locals/params/returns use the typedef'd type
 (`cty` maps `Struct(id)` → `structs.c_name(id)`). C passes/returns structs by
 value, matching the language semantics. Output stays deterministic.
+
+## 10. Struct methods & associated functions (v0.113)
+
+Functions may be declared inside a `struct` body, after the fields:
+
+```
+const Counter = struct {
+    n: i32,
+    pub fn get(self: Counter) i32 { return self.n; }
+    pub fn bumped(self: Counter, by: i32) Counter { return Counter{ .n = self.n + by }; }
+    pub fn zero() Counter { return Counter{ .n = 0 }; }   // associated (no self)
+};
+```
+
+- **Grammar:** the struct body is `(field ",")* (func)*` (fields first, then
+  `pub? fn …` items). `StructDecl` gains `methods: Vec<Func>`.
+- A function whose **first parameter is named `self`** is a *method*; otherwise
+  it is an *associated function*.
+- **Call:** `receiver.method(args)` parses to `Expr::MethodCall{receiver,
+  method, args}` (the postfix `.name` followed by `(`). sema resolves:
+  - receiver is a **struct value** → method call: look up `method` in that
+    struct's functions (must be a method); the receiver becomes `self`; the
+    remaining params bind `args`.
+  - receiver is an **`Ident` naming a struct type** → associated call: look up
+    `method`; bind `args` to *all* its params (so `Counter.get(c)` is the
+    explicit-self form, `Counter.zero()` the static form).
+  - Diagnostics: unknown method `E0170`; arity mismatch `E0171`; calling a
+    method statically without the self arg, or an assoc fn on a value,
+    `E0172`; method/arg type mismatch reuses `E0110`.
+- **Lowering:** each struct function emits a free C function
+  `kd_<Struct>_<method>(<params>)` (the `self` param is an ordinary by-value
+  `kd_struct_<Struct>` parameter). A `MethodCall` emits
+  `kd_<Struct>_<method>(<receiver-as-self-if-method>, <args>)`. Method bodies
+  reuse all existing statement/expr/`defer` lowering. Forward-declare struct
+  functions alongside ordinary functions.
