@@ -29,7 +29,7 @@ pub fn emit(module: &Module, structs: &crate::types::StructTable, mode: EmitMode
     let mut em = Emitter::new(mode, structs);
     em.collect_signatures(module);
     em.emit_prelude();
-    em.emit_structs();
+    em.emit_type_defs();
     em.emit_consts(module);
     em.emit_forward_decls(module);
     em.emit_func_defs(module);
@@ -49,12 +49,12 @@ struct Scope {
     defers: Vec<Stmt>,
     is_loop_body: bool,
     cont: Option<Stmt>,
-    /// Names of struct-typed locals/params introduced in this scope, mapped to
-    /// their struct's source name. Used to resolve a method call's receiver to
-    /// the struct whose function is being invoked (`kd_<Struct>_<method>`).
-    /// Scoped, so a shadowing inner binding masks an outer one and is forgotten
-    /// when the scope pops.
-    var_structs: HashMap<String, String>,
+    /// Types of locals/params introduced in this scope, keyed by source name.
+    /// Used both to resolve a method call's receiver to the struct whose
+    /// function is invoked (`kd_<Struct>_<method>`) and to decide optional
+    /// coercion (see [`Emitter::type_of_expr`]). Scoped, so a shadowing inner
+    /// binding masks an outer one and is forgotten when the scope pops.
+    var_types: HashMap<String, Type>,
 }
 
 impl Scope {
@@ -63,7 +63,7 @@ impl Scope {
             defers: Vec::new(),
             is_loop_body: false,
             cont: None,
-            var_structs: HashMap::new(),
+            var_types: HashMap::new(),
         }
     }
 
@@ -78,7 +78,7 @@ impl Scope {
             defers: Vec::new(),
             is_loop_body: true,
             cont,
-            var_structs: HashMap::new(),
+            var_types: HashMap::new(),
         }
     }
 }
@@ -105,6 +105,13 @@ struct Emitter<'a> {
     /// Resolved return type of every top-level `fn`, keyed by name. Lets a
     /// method call whose receiver is a free-function call resolve the struct.
     fn_ret: HashMap<String, Type>,
+    /// Resolved parameter types of every top-level `fn`, keyed by name. Drives
+    /// optional coercion of call arguments.
+    fn_params: HashMap<String, Vec<Type>>,
+    /// Resolved parameter types of every struct function (including any leading
+    /// `self`), keyed by `(struct_name, method_name)`. Drives optional coercion
+    /// of method/associated-call arguments.
+    method_params: HashMap<(String, String), Vec<Type>>,
 }
 
 impl<'a> Emitter<'a> {
@@ -119,6 +126,8 @@ impl<'a> Emitter<'a> {
             structs,
             method_ret: HashMap::new(),
             fn_ret: HashMap::new(),
+            fn_params: HashMap::new(),
+            method_params: HashMap::new(),
         }
     }
 
@@ -132,11 +141,17 @@ impl<'a> Emitter<'a> {
                 Item::Func(f) => {
                     let ret = self.resolve_ty(&f.ret);
                     self.fn_ret.insert(f.name.clone(), ret);
+                    let ptys: Vec<Type> = f.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
+                    self.fn_params.insert(f.name.clone(), ptys);
                 }
                 Item::Struct(s) => {
                     for m in &s.methods {
                         let ret = self.resolve_ty(&m.ret);
                         self.method_ret.insert((s.name.clone(), m.name.clone()), ret);
+                        let ptys: Vec<Type> =
+                            m.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
+                        self.method_params
+                            .insert((s.name.clone(), m.name.clone()), ptys);
                     }
                 }
                 _ => {}
@@ -165,6 +180,8 @@ impl<'a> Emitter<'a> {
         self.out.push_str("#include <stdint.h>\n");
         self.out.push_str("#include <stdbool.h>\n");
         self.out.push_str("#include <stdio.h>\n");
+        // `<stdlib.h>` provides `exit`, used by the `?T` unwrap panic helper.
+        self.out.push_str("#include <stdlib.h>\n");
         self.out
             .push_str("static void kd_print(long long v) { printf(\"%lld\\n\", v); }\n");
         self.blank();
@@ -174,27 +191,110 @@ impl<'a> Emitter<'a> {
     /// declaration (id) order — exactly the table's iteration order, so a
     /// field of a previously-declared struct type is always already in scope.
     /// An empty struct gets a `char _unused;` member so it stays valid C.
-    fn emit_structs(&mut self) {
-        // Copy the reference so the iteration borrows the table (lifetime `'a`)
-        // rather than `self`, leaving `self` free for `cty_of` / `line`.
+    /// Emit every aggregate/composite C typedef (structs and optionals) in
+    /// **dependency order**: a definition is emitted only after the definitions
+    /// of every type it embeds by value. A struct embeds its struct/optional
+    /// field types; an optional `?T` embeds `T` when `T` is a struct/optional.
+    /// (Recursive value embedding is impossible without pointers, so the
+    /// dependency graph is acyclic in v0.114.)
+    fn emit_type_defs(&mut self) {
+        use std::collections::HashSet;
         let structs = self.structs;
-        if structs.is_empty() {
+        if structs.is_empty() && structs.optionals().next().is_none() {
             return;
         }
-        for (id, info) in structs.iter() {
-            let body = if info.fields.is_empty() {
-                "char _unused;".to_string()
-            } else {
-                info.fields
-                    .iter()
-                    .map(|(fname, fty)| format!("{} kd_{};", self.cty_of(*fty), fname))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
-            let cname = structs.c_name(id);
-            self.line(&format!("typedef struct {{ {} }} {};", body, cname));
+
+        // A definition node: either a struct or an interned optional.
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum Node {
+            Struct(u32),
+            Opt(u32),
+        }
+        fn dep_of(t: Type) -> Option<Node> {
+            match t {
+                Type::Struct(s) => Some(Node::Struct(s)),
+                Type::Optional(o) => Some(Node::Opt(o)),
+                _ => None,
+            }
+        }
+        fn visit(
+            n: Node,
+            structs: &crate::types::StructTable,
+            seen: &mut HashSet<Node>,
+            order: &mut Vec<Node>,
+        ) {
+            if !seen.insert(n) {
+                return;
+            }
+            match n {
+                Node::Struct(s) => {
+                    for (_, fty) in &structs.get(s).fields {
+                        if let Some(d) = dep_of(*fty) {
+                            visit(d, structs, seen, order);
+                        }
+                    }
+                }
+                Node::Opt(o) => {
+                    if let Some(d) = dep_of(structs.optional_inner(o)) {
+                        visit(d, structs, seen, order);
+                    }
+                }
+            }
+            order.push(n);
+        }
+
+        let mut seen = HashSet::new();
+        let mut order = Vec::new();
+        for (id, _) in structs.iter() {
+            visit(Node::Struct(id), structs, &mut seen, &mut order);
+        }
+        for (id, _) in structs.optionals() {
+            visit(Node::Opt(id), structs, &mut seen, &mut order);
+        }
+
+        for n in order {
+            match n {
+                Node::Struct(id) => self.emit_one_struct(id),
+                Node::Opt(id) => self.emit_one_optional(id),
+            }
         }
         self.blank();
+    }
+
+    fn emit_one_struct(&mut self, id: u32) {
+        let structs = self.structs;
+        let info = structs.get(id);
+        let body = if info.fields.is_empty() {
+            "char _unused;".to_string()
+        } else {
+            info.fields
+                .iter()
+                .map(|(fname, fty)| format!("{} kd_{};", self.cty_of(*fty), fname))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let cname = structs.c_name(id);
+        self.line(&format!("typedef struct {{ {} }} {};", body, cname));
+    }
+
+    /// Emit one `kd_opt_<tag>` typedef plus its inline `_orelse` / `_unwrap`
+    /// helpers. `_unwrap` panics (stderr + `exit(101)`) on null, per SPEC §11.3.
+    fn emit_one_optional(&mut self, id: u32) {
+        let structs = self.structs;
+        let oname = structs.optional_c_name(id);
+        let inner_cty = self.cty_of(structs.optional_inner(id));
+        self.line(&format!(
+            "typedef struct {{ bool has; {} val; }} {};",
+            inner_cty, oname
+        ));
+        self.line(&format!(
+            "static inline {} {}_orelse({} o, {} d) {{ return o.has ? o.val : d; }}",
+            inner_cty, oname, oname, inner_cty
+        ));
+        self.line(&format!(
+            "static inline {} {}_unwrap({} o) {{ if (!o.has) {{ fputs(\"panic: unwrapped a null optional\\n\", stderr); exit(101); }} return o.val; }}",
+            inner_cty, oname, oname
+        ));
     }
 
     /// Fold each top-level `const` initializer to a literal (C does not treat
@@ -287,17 +387,29 @@ impl<'a> Emitter<'a> {
     /// [`Type::from_name`], else a struct via the table, else `Void` for the
     /// impossible unresolved case so emission can never panic.
     fn resolve_ty(&self, t: &TypeExpr) -> Type {
-        Type::from_name(&t.name)
+        let base = Type::from_name(&t.name)
             .or_else(|| self.structs.id_of(&t.name).map(Type::Struct))
-            .unwrap_or(Type::Void)
+            .unwrap_or(Type::Void);
+        if t.optional {
+            // sema interned every `?T` that appears, so the table holds it; map
+            // the base inner type back to its `Type::Optional(id)`.
+            self.structs
+                .optionals()
+                .find(|(_, inner)| *inner == base)
+                .map(|(id, _)| Type::Optional(id))
+                .unwrap_or(base)
+        } else {
+            base
+        }
     }
 
     /// The C type spelling for a resolved [`Type`]: a struct resolves through
-    /// the table (`Type::c_name` would panic on it); primitives use their
-    /// builtin C name.
+    /// the table (`Type::c_name` would panic on it), an optional through
+    /// `optional_c_name`; primitives use their builtin C name.
     fn cty_of(&self, t: Type) -> String {
         match t {
             Type::Struct(id) => self.structs.c_name(id),
+            Type::Optional(id) => self.structs.optional_c_name(id),
             other => other.c_name().to_string(),
         }
     }
@@ -307,12 +419,19 @@ impl<'a> Emitter<'a> {
     /// table; an unresolvable name (never reached for a validated module) falls
     /// back to `int64_t`.
     fn cty(&self, t: &TypeExpr) -> String {
-        if let Some(prim) = Type::from_name(&t.name) {
-            prim.c_name().to_string()
+        let base = if let Some(prim) = Type::from_name(&t.name) {
+            prim
         } else if let Some(id) = self.structs.id_of(&t.name) {
-            self.structs.c_name(id)
+            Type::Struct(id)
         } else {
-            "int64_t".to_string()
+            Type::I64
+        };
+        if t.optional {
+            // Matches `optional_c_name(id)` (`kd_opt_<type_mangle(inner)>`)
+            // without needing the interned id.
+            format!("kd_opt_{}", self.structs.type_mangle(base))
+        } else {
+            self.cty_of(base)
         }
     }
 
@@ -337,11 +456,8 @@ impl<'a> Emitter<'a> {
         self.line(&format!("{} {}({}) {{", ret, c_name, params));
         let mut scope = Scope::function();
         for p in &f.params {
-            if let Type::Struct(id) = self.resolve_ty(&p.ty) {
-                scope
-                    .var_structs
-                    .insert(p.name.clone(), self.structs.get(id).name.clone());
-            }
+            let pty = self.resolve_ty(&p.ty);
+            scope.var_types.insert(p.name.clone(), pty);
         }
         self.emit_block(&f.body, scope);
         self.line("}");
@@ -400,30 +516,40 @@ impl<'a> Emitter<'a> {
                 value,
                 ..
             } => {
-                let es = self.emit_expr(value);
+                // Coerce the initializer to the declared type (a `T` value or
+                // `null` widens to `?T` when the annotation is optional).
+                let lty = self.resolve_ty(ty);
+                let es = self.emit_coerced(value, lty);
                 let ct = self.cty(ty);
                 let prefix = if *is_const { "const " } else { "" };
                 self.line(&format!("{}{} kd_{} = {};", prefix, ct, name, es));
-                // Record a struct-typed local so a later method call on it can
-                // resolve the struct whose function it invokes.
-                if let Type::Struct(id) = self.resolve_ty(ty) {
-                    let sname = self.structs.get(id).name.clone();
-                    if let Some(scope) = self.scopes.last_mut() {
-                        scope.var_structs.insert(name.clone(), sname);
-                    }
+                // Record the local's type so a later method call / coercion on
+                // it resolves correctly.
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.var_types.insert(name.clone(), lty);
                 }
                 false
             }
             Stmt::Assign { name, value, .. } => {
-                let es = self.emit_expr(value);
+                // The target is an assignable `var` local; coerce the RHS to its
+                // declared type (so a `T`/`null` RHS widens to a `?T` target).
+                let es = match self.lookup_var_type(name) {
+                    Some(t) => self.emit_coerced(value, t),
+                    None => self.emit_expr(value),
+                };
                 self.line(&format!("kd_{} = {};", name, es));
                 false
             }
             Stmt::FieldAssign { place, value, .. } => {
                 // `place` is a field-access chain (`a.b.c`); lowering it yields a
                 // C lvalue, so the assignment is a plain `(<place>) = (<value>);`.
+                // Coerce the RHS to the field's type (widening to `?T` if it is
+                // an optional field).
                 let ps = self.emit_expr(place);
-                let es = self.emit_expr(value);
+                let es = match self.type_of_expr(place) {
+                    Some(t) => self.emit_coerced(value, t),
+                    None => self.emit_expr(value),
+                };
                 self.line(&format!("({}) = ({});", ps, es));
                 false
             }
@@ -479,7 +605,10 @@ impl<'a> Emitter<'a> {
     fn emit_cont(&mut self, c: &Stmt) {
         match c {
             Stmt::Assign { name, value, .. } => {
-                let es = self.emit_expr(value);
+                let es = match self.lookup_var_type(name) {
+                    Some(t) => self.emit_coerced(value, t),
+                    None => self.emit_expr(value),
+                };
                 self.line(&format!("kd_{} = {};", name, es));
             }
             Stmt::Expr(e) => {
@@ -520,16 +649,18 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_return(&mut self, value: &Option<Expr>) {
-        let non_void = self.current_ret != Type::Void;
+        let ret_ty = self.current_ret;
+        let non_void = ret_ty != Type::Void;
         let active = self.any_defer_active();
         if active && non_void {
             // Evaluate the value into a temporary *before* running the defers,
-            // since the defers may mutate state the value depends on.
+            // since the defers may mutate state the value depends on. Coerce it
+            // to the (possibly optional) return type first.
             let es = match value {
-                Some(e) => self.emit_expr(e),
+                Some(e) => self.emit_coerced(e, ret_ty),
                 None => "0".to_string(),
             };
-            let ret = self.cty_of(self.current_ret);
+            let ret = self.cty_of(ret_ty);
             self.line(&format!("{} __kd_ret = ({});", ret, es));
             self.flush_all_reversed();
             self.line("return __kd_ret;");
@@ -539,7 +670,7 @@ impl<'a> Emitter<'a> {
             }
             match value {
                 Some(e) => {
-                    let es = self.emit_expr(e);
+                    let es = self.emit_coerced(e, ret_ty);
                     self.line(&format!("return ({});", es));
                 }
                 None => self.line("return;"),
@@ -704,12 +835,19 @@ impl<'a> Emitter<'a> {
                     // emit a harmless no-op so output stays well-formed.
                     "((void)0)".to_string()
                 } else {
-                    let a = args
-                        .iter()
-                        .map(|x| self.emit_expr(x))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("kd_{}({})", callee, a)
+                    // Coerce each argument to its parameter type, so a `T`/`null`
+                    // argument widens to a `?T` parameter.
+                    let params = self.fn_params.get(callee).cloned();
+                    let mut arg_strs = Vec::with_capacity(args.len());
+                    for (i, x) in args.iter().enumerate() {
+                        let expected = params.as_ref().and_then(|p| p.get(i).copied());
+                        let s = match expected {
+                            Some(t) => self.emit_coerced(x, t),
+                            None => self.emit_expr(x),
+                        };
+                        arg_strs.push(s);
+                    }
+                    format!("kd_{}({})", callee, arg_strs.join(", "))
                 }
             }
             Expr::Comptime { expr, .. } => {
@@ -730,24 +868,28 @@ impl<'a> Emitter<'a> {
             }
             Expr::StructLit { name, fields, .. } => {
                 // C99 compound literal: `((kd_struct_<Name>){ .kd_<f> = <v>, ... })`.
-                let cname = match self.structs.id_of(name) {
-                    Some(id) => self.structs.c_name(id),
+                let (cname, sid) = match self.structs.id_of(name) {
+                    Some(id) => (self.structs.c_name(id), Some(id)),
                     // Validated input always resolves; fall back to the canonical
                     // spelling so emission stays well-formed even if it does not.
-                    None => format!("kd_struct_{}", name),
+                    None => (format!("kd_struct_{}", name), None),
                 };
                 if fields.is_empty() {
                     format!("(({}){{0}})", cname)
                 } else {
-                    let inits = fields
-                        .iter()
-                        .map(|fi| {
-                            let v = self.emit_expr(&fi.value);
-                            format!(".kd_{} = {}", fi.name, v)
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("(({}){{ {} }})", cname, inits)
+                    // Coerce each initializer to its field type (widening a
+                    // `T`/`null` value to a `?T` field).
+                    let mut inits = Vec::with_capacity(fields.len());
+                    for fi in fields {
+                        let expected =
+                            sid.and_then(|id| self.structs.get(id).field_type(&fi.name));
+                        let v = match expected {
+                            Some(t) => self.emit_coerced(&fi.value, t),
+                            None => self.emit_expr(&fi.value),
+                        };
+                        inits.push(format!(".kd_{} = {}", fi.name, v));
+                    }
+                    format!("(({}){{ {} }})", cname, inits.join(", "))
                 }
             }
             Expr::MethodCall {
@@ -756,6 +898,37 @@ impl<'a> Emitter<'a> {
                 args,
                 ..
             } => self.emit_method_call(receiver, method, args),
+            Expr::Null { .. } => {
+                // A bare `null` with no expected `?T` type is rejected by sema
+                // (E0180); coercion handles every legitimate `null`. This arm is
+                // unreachable for validated input — emit a harmless placeholder.
+                "0".to_string()
+            }
+            Expr::Orelse { lhs, rhs, .. } => {
+                // `x orelse y` → `kd_opt_<tag>_orelse(<x>, <y>)`; `y` is eager.
+                let l = self.emit_expr(lhs);
+                let r = self.emit_expr(rhs);
+                match self.type_of_expr(lhs) {
+                    Some(Type::Optional(oid)) => {
+                        let oname = self.structs.optional_c_name(oid);
+                        format!("{}_orelse({}, {})", oname, l, r)
+                    }
+                    // Unreachable for validated input (`lhs` is always `?T`).
+                    _ => format!("({})", l),
+                }
+            }
+            Expr::Unwrap { expr, .. } => {
+                // `x.?` → `kd_opt_<tag>_unwrap(<x>)` (panics + exit 101 if null).
+                let inner = self.emit_expr(expr);
+                match self.type_of_expr(expr) {
+                    Some(Type::Optional(oid)) => {
+                        let oname = self.structs.optional_c_name(oid);
+                        format!("{}_unwrap({})", oname, inner)
+                    }
+                    // Unreachable for validated input (`expr` is always `?T`).
+                    _ => format!("({})", inner),
+                }
+            }
         }
     }
 
@@ -773,22 +946,54 @@ impl<'a> Emitter<'a> {
             Expr::Ident { name, .. } => self.structs.id_of(name).map(|_| name.clone()),
             _ => None,
         };
-        let arg_strs: Vec<String> = args.iter().map(|a| self.emit_expr(a)).collect();
         if let Some(struct_name) = assoc {
             // Associated call: args bind to *all* params (including an explicit
             // `self` in the `Counter.get(c)` form), so the receiver itself is
-            // not passed.
+            // not passed. Coerce each arg against its parameter type.
+            let params = self
+                .method_params
+                .get(&(struct_name.clone(), method.to_string()))
+                .cloned();
+            let arg_strs = self.emit_coerced_args(args, params.as_deref(), 0);
             format!("kd_{}_{}({})", struct_name, method, arg_strs.join(", "))
         } else {
             // Method call on a value: the receiver becomes the leading `self`
-            // argument, then the remaining args.
+            // argument, then the remaining args (coerced against params[1..],
+            // skipping the `self` parameter).
             let self_str = self.emit_expr(receiver);
             let struct_name = self.struct_of_expr(receiver).unwrap_or_default();
+            let params = self
+                .method_params
+                .get(&(struct_name.clone(), method.to_string()))
+                .cloned();
+            let arg_strs = self.emit_coerced_args(args, params.as_deref(), 1);
             let mut all = Vec::with_capacity(1 + arg_strs.len());
             all.push(self_str);
             all.extend(arg_strs);
             format!("kd_{}_{}({})", struct_name, method, all.join(", "))
         }
+    }
+
+    /// Lower `args`, coercing arg `i` to `params[i + offset]` when that
+    /// parameter type is known (so a `T`/`null` argument widens to a `?T`
+    /// parameter). `offset` is `1` for a method call on a value (to skip the
+    /// `self` parameter) and `0` otherwise.
+    fn emit_coerced_args(
+        &mut self,
+        args: &[Expr],
+        params: Option<&[Type]>,
+        offset: usize,
+    ) -> Vec<String> {
+        let mut out = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let expected = params.and_then(|p| p.get(i + offset).copied());
+            let s = match expected {
+                Some(t) => self.emit_coerced(a, t),
+                None => self.emit_expr(a),
+            };
+            out.push(s);
+        }
+        out
     }
 
     /// The source name of the struct an expression evaluates to, or `None` if it
@@ -834,12 +1039,102 @@ impl<'a> Emitter<'a> {
     }
 
     /// Find the struct name a (struct-typed) variable was recorded with,
-    /// searching scopes innermost-first so a shadowing binding wins.
+    /// searching scopes innermost-first so a shadowing binding wins. A variable
+    /// whose type is not a struct (a primitive or an optional) yields `None`.
     fn lookup_var_struct(&self, name: &str) -> Option<String> {
+        match self.lookup_var_type(name)? {
+            Type::Struct(id) => Some(self.structs.get(id).name.clone()),
+            _ => None,
+        }
+    }
+
+    /// The recorded type of a local/param, searching scopes innermost-first so
+    /// a shadowing binding wins.
+    fn lookup_var_type(&self, name: &str) -> Option<Type> {
         self.scopes
             .iter()
             .rev()
-            .find_map(|s| s.var_structs.get(name).cloned())
+            .find_map(|s| s.var_types.get(name).copied())
+    }
+
+    // -- optional coercion --------------------------------------------------
+
+    /// Best-effort static type of `e`, used to decide optional coercion. Returns
+    /// `None` when it cannot be determined (e.g. a bare `null`); int literals are
+    /// reported as `i64` (their default), which is sufficient because coercion
+    /// only needs to tell "already an optional" apart from "a `T` value".
+    ///
+    /// Resolves identifiers via the scope's `var_types`, struct-literal /
+    /// field-access types via the `StructTable`, call/method return types via
+    /// the collected signatures, and `orelse` / `.?` as the inner `T`.
+    fn type_of_expr(&self, e: &Expr) -> Option<Type> {
+        match e {
+            Expr::Int { .. } => Some(Type::I64),
+            Expr::Bool { .. } => Some(Type::Bool),
+            Expr::Ident { name, .. } => self.lookup_var_type(name),
+            Expr::Unary { op, expr, .. } => match op {
+                UnOp::Not => Some(Type::Bool),
+                UnOp::Neg => self.type_of_expr(expr),
+            },
+            Expr::Binary { op, lhs, .. } => {
+                if op.is_bool_result() {
+                    Some(Type::Bool)
+                } else {
+                    // Arithmetic yields the (shared) operand type.
+                    self.type_of_expr(lhs)
+                }
+            }
+            Expr::Call { callee, .. } => self.fn_ret.get(callee).copied(),
+            Expr::Comptime { expr, .. } => self.type_of_expr(expr),
+            Expr::StructLit { name, .. } => self.structs.id_of(name).map(Type::Struct),
+            Expr::Field { base, field, .. } => match self.type_of_expr(base)? {
+                Type::Struct(id) => self.structs.get(id).field_type(field),
+                _ => None,
+            },
+            Expr::MethodCall {
+                receiver, method, ..
+            } => {
+                let recv_struct = match receiver.as_ref() {
+                    Expr::Ident { name, .. } if self.structs.id_of(name).is_some() => name.clone(),
+                    _ => self.struct_of_expr(receiver)?,
+                };
+                self.method_ret.get(&(recv_struct, method.clone())).copied()
+            }
+            // A bare `null` has no intrinsic type — its `?T` comes from context.
+            Expr::Null { .. } => None,
+            // `orelse` / `.?` both produce the inner `T` of the optional operand.
+            Expr::Orelse { lhs, .. } => match self.type_of_expr(lhs)? {
+                Type::Optional(id) => Some(self.structs.optional_inner(id)),
+                other => Some(other),
+            },
+            Expr::Unwrap { expr, .. } => match self.type_of_expr(expr)? {
+                Type::Optional(id) => Some(self.structs.optional_inner(id)),
+                other => Some(other),
+            },
+        }
+    }
+
+    /// Lower `e` to a C string, coercing it to `expected`. When `expected` is an
+    /// optional `?T`, a `null` source widens to `{ .has = false }`, a value
+    /// already of type `?T` passes through unchanged, and any other (`T`) value
+    /// widens to `{ .has = true, .val = <e> }`. When `expected` is not an
+    /// optional this is just [`Emitter::emit_expr`].
+    fn emit_coerced(&mut self, e: &Expr, expected: Type) -> String {
+        if let Type::Optional(oid) = expected {
+            let oname = self.structs.optional_c_name(oid);
+            if matches!(e, Expr::Null { .. }) {
+                return format!("(({}){{ .has = false }})", oname);
+            }
+            // Already an optional value? Pass it through. (A struct-equal but
+            // differently-interned optional cannot occur — sema dedups them.)
+            if matches!(self.type_of_expr(e), Some(Type::Optional(_))) {
+                return self.emit_expr(e);
+            }
+            // Otherwise it is a `T` value being widened to `?T`.
+            let inner = self.emit_expr(e);
+            return format!("(({}){{ .has = true, .val = {} }})", oname, inner);
+        }
+        self.emit_expr(e)
     }
 
     // -- program / test entry points ---------------------------------------
@@ -971,6 +1266,15 @@ mod tests {
     fn ty(name: &str) -> TypeExpr {
         TypeExpr {
             name: name.to_string(),
+            optional: false,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn opt_ty(name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: true,
             span: Span::DUMMY,
         }
     }
@@ -1770,6 +2074,271 @@ mod tests {
         assert!(
             out.contains("kd_Counter_get((kd_p).kd_a)"),
             "method call on a struct field should resolve the field's struct:\n{out}"
+        );
+    }
+
+    // -- optionals (v0.114) -------------------------------------------------
+
+    /// A `StructTable` with a single interned `?i32` (`kd_opt_int32_t`, id 0).
+    fn opt_int_table() -> StructTable {
+        let mut t = StructTable::new();
+        t.intern_optional(Type::I32);
+        t
+    }
+
+    #[test]
+    fn optional_typedef_and_helpers_emitted() {
+        // The typedef + inline helpers come straight off `StructTable::optionals`.
+        let structs = opt_int_table();
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // `<stdlib.h>` is in the prelude for `exit`.
+        assert!(out.contains("#include <stdlib.h>"), "stdlib include missing:\n{out}");
+        assert!(
+            out.contains("typedef struct { bool has; int32_t val; } kd_opt_int32_t;"),
+            "optional typedef missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "static inline int32_t kd_opt_int32_t_orelse(kd_opt_int32_t o, int32_t d) { return o.has ? o.val : d; }"
+            ),
+            "orelse helper missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "static inline int32_t kd_opt_int32_t_unwrap(kd_opt_int32_t o) { if (!o.has) { fputs(\"panic: unwrapped a null optional\\n\", stderr); exit(101); } return o.val; }"
+            ),
+            "unwrap helper missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn null_coerces_to_empty_optional() {
+        // fn f() void { var x: ?i32 = null; }
+        let structs = opt_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![Stmt::Let {
+                is_const: false,
+                name: "x".to_string(),
+                ty: opt_ty("i32"),
+                value: Expr::Null { span: Span::DUMMY },
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The local uses the optional typedef, and `null` widens to `.has = false`.
+        assert!(
+            out.contains("kd_opt_int32_t kd_x = ((kd_opt_int32_t){ .has = false });"),
+            "null coercion wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn value_coerces_to_present_optional() {
+        // fn f() void { var x: ?i32 = 7; }  — a `T` value widens to `.has = true`.
+        let structs = opt_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![Stmt::Let {
+                is_const: false,
+                name: "x".to_string(),
+                ty: opt_ty("i32"),
+                value: int(7),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_opt_int32_t kd_x = ((kd_opt_int32_t){ .has = true, .val = 7 });"),
+            "value coercion wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn orelse_emits_helper_call() {
+        // fn f(x: ?i32) i32 { return x orelse 0; }
+        let structs = opt_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![Param {
+                name: "x".to_string(),
+                ty: opt_ty("i32"),
+                span: Span::DUMMY,
+            }],
+            ret: ty("i32"),
+            body: block(vec![ret(Expr::Orelse {
+                lhs: Box::new(ident("x")),
+                rhs: Box::new(int(0)),
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The `?i32` param is typed with the optional typedef.
+        assert!(
+            out.contains("int32_t kd_f(kd_opt_int32_t kd_x)"),
+            "optional param type wrong:\n{out}"
+        );
+        // `orelse` lowers to the inline helper call.
+        assert!(
+            out.contains("kd_opt_int32_t_orelse(kd_x, 0)"),
+            "orelse lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn unwrap_emits_helper_call() {
+        // fn f(x: ?i32) i32 { return x.?; }
+        let structs = opt_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![Param {
+                name: "x".to_string(),
+                ty: opt_ty("i32"),
+                span: Span::DUMMY,
+            }],
+            ret: ty("i32"),
+            body: block(vec![ret(Expr::Unwrap {
+                expr: Box::new(ident("x")),
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_opt_int32_t_unwrap(kd_x)"),
+            "unwrap lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn already_optional_value_passes_through() {
+        // fn f(x: ?i32) void { var y: ?i32 = x; }
+        // An expression already of type `?i32` is not re-wrapped.
+        let structs = opt_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![Param {
+                name: "x".to_string(),
+                ty: opt_ty("i32"),
+                span: Span::DUMMY,
+            }],
+            ret: ty("void"),
+            body: block(vec![Stmt::Let {
+                is_const: false,
+                name: "y".to_string(),
+                ty: opt_ty("i32"),
+                value: ident("x"),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_opt_int32_t kd_y = kd_x;"),
+            "already-optional value should pass through unchanged:\n{out}"
+        );
+    }
+
+    #[test]
+    fn optional_struct_field_coerces_in_literal() {
+        // const Box = struct { v: ?i32 };
+        // fn make() Box { return Box{ .v = 5 }; }
+        // The field-init value `5` widens to the field's `?i32` type.
+        let mut structs = StructTable::new();
+        let oid = structs.intern_optional(Type::I32);
+        let bid = structs.intern("Box");
+        structs.set_fields(bid, vec![("v".to_string(), Type::Optional(oid))]);
+
+        let f = Func {
+            is_pub: false,
+            name: "make".to_string(),
+            params: vec![],
+            ret: ty("Box"),
+            body: block(vec![ret(Expr::StructLit {
+                name: "Box".to_string(),
+                fields: vec![finit("v", int(5))],
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+        let box_decl = Item::Struct(StructDecl {
+            is_pub: false,
+            name: "Box".to_string(),
+            fields: vec![FieldDecl {
+                name: "v".to_string(),
+                ty: opt_ty("i32"),
+                span: Span::DUMMY,
+            }],
+            methods: vec![],
+            span: Span::DUMMY,
+        });
+        let m = Module {
+            items: vec![box_decl, Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The struct typedef uses the optional typedef for the field.
+        assert!(
+            out.contains("typedef struct { kd_opt_int32_t kd_v; } kd_struct_Box;"),
+            "optional struct field typedef wrong:\n{out}"
+        );
+        // The literal initializer is widened.
+        assert!(
+            out.contains(".kd_v = ((kd_opt_int32_t){ .has = true, .val = 5 })"),
+            "optional field-init coercion wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn optional_return_coerces_value() {
+        // fn f() ?i32 { return 9; }  — the `T` return value widens to `?i32`.
+        let structs = opt_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: opt_ty("i32"),
+            body: block(vec![ret(int(9))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_opt_int32_t kd_f(void)"),
+            "optional return type wrong:\n{out}"
+        );
+        assert!(
+            out.contains("return (((kd_opt_int32_t){ .has = true, .val = 9 }));"),
+            "optional return coercion wrong:\n{out}"
         );
     }
 }

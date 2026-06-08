@@ -218,3 +218,43 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "0\n5\n115\n115\n");
 }
+
+// --- v0.114 optionals ------------------------------------------------------
+
+#[test]
+fn optionals_coercion_orelse_unwrap_and_field() {
+    let src = r#"
+const Box = struct { v: ?i32 };
+fn maybe(b: bool) ?i32 {
+    if (b) { return 42; }
+    return null;
+}
+pub fn main() i32 {
+    var x: ?i32 = 5;                 // T -> ?T coercion
+    print(x orelse 0);               // 5
+    var y: ?i32 = null;
+    print(y orelse 99);              // 99
+    print(maybe(true).?);            // 42
+    print(maybe(false) orelse 7);    // 7
+    var bx: Box = Box{ .v = 10 };    // field coercion
+    print(bx.v orelse 0);            // 10
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "5\n99\n42\n7\n10\n");
+}
+
+#[test]
+fn unwrapping_null_panics_with_exit_101() {
+    let src = r#"
+pub fn main() i32 {
+    var z: ?i32 = null;
+    print(z.?);
+    return 0;
+}
+"#;
+    let (code, _out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 101, "unwrapping null must panic with exit code 101");
+}

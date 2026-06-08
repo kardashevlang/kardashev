@@ -29,6 +29,9 @@
 //! - `E0171` — wrong number of arguments to a method / associated function.
 //! - `E0172` — calling a method statically without the `self` argument, or an
 //!   associated function on a value.
+//! - `E0180` — a bare `null` with no expected optional type at its position.
+//! - `E0181` — `orelse` whose left operand is not an optional (`?T`).
+//! - `E0182` — `.?` (force-unwrap) whose operand is not an optional (`?T`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -126,6 +129,9 @@ impl Checker {
     fn type_name(&self, t: Type) -> String {
         match t {
             Type::Struct(id) => self.structs.get(id).name.clone(),
+            Type::Optional(id) => {
+                format!("?{}", self.type_name(self.structs.optional_inner(id)))
+            }
             other => other.name().to_string(),
         }
     }
@@ -377,8 +383,19 @@ impl Checker {
 
     /// Resolve a type name to a builtin or a registered struct, without
     /// emitting a diagnostic. Returns `None` for an unknown name.
-    fn resolve_type_opt(&self, te: &TypeExpr) -> Option<Type> {
-        Type::from_name(&te.name).or_else(|| self.structs.id_of(&te.name).map(Type::Struct))
+    ///
+    /// When the [`TypeExpr`] is written `?T` (`optional`), the inner type is
+    /// resolved first and the result is `Type::Optional(intern_optional(inner))`
+    /// — so optional types are interned the moment a signature, field or local
+    /// declaration mentions them (SPEC §11.1).
+    fn resolve_type_opt(&mut self, te: &TypeExpr) -> Option<Type> {
+        let inner =
+            Type::from_name(&te.name).or_else(|| self.structs.id_of(&te.name).map(Type::Struct))?;
+        if te.optional {
+            Some(Type::Optional(self.structs.intern_optional(inner)))
+        } else {
+            Some(inner)
+        }
     }
 
     /// Resolve a type name to a builtin or a registered struct, emitting
@@ -396,28 +413,37 @@ impl Checker {
     /// Resolve a *struct field* type: a builtin, or a struct declared earlier
     /// (tracked by `declared`). A reference to a struct not yet declared is a
     /// forward/cyclic reference (`E0160`); an unknown name is `E0161`.
+    ///
+    /// A field written `?T` resolves its inner `T` by these same rules and
+    /// returns `Type::Optional(intern_optional(inner))` (SPEC §11.1).
     fn resolve_field_type(
         &mut self,
         te: &TypeExpr,
         declared: &HashSet<String>,
         owner: &str,
     ) -> Option<Type> {
-        if let Some(t) = Type::from_name(&te.name) {
-            return Some(t);
-        }
-        if let Some(id) = self.structs.id_of(&te.name) {
+        let inner = if let Some(t) = Type::from_name(&te.name) {
+            t
+        } else if let Some(id) = self.structs.id_of(&te.name) {
             if declared.contains(&te.name) {
-                return Some(Type::Struct(id));
+                Type::Struct(id)
+            } else {
+                let msg = format!(
+                    "field of struct `{}` refers to struct `{}` before it is declared (forward or cyclic reference)",
+                    owner, te.name
+                );
+                self.error(te.span, "E0160", msg);
+                return None;
             }
-            let msg = format!(
-                "field of struct `{}` refers to struct `{}` before it is declared (forward or cyclic reference)",
-                owner, te.name
-            );
-            self.error(te.span, "E0160", msg);
+        } else {
+            self.error(te.span, "E0161", format!("unknown type `{}`", te.name));
             return None;
+        };
+        if te.optional {
+            Some(Type::Optional(self.structs.intern_optional(inner)))
+        } else {
+            Some(inner)
         }
-        self.error(te.span, "E0161", format!("unknown type `{}`", te.name));
-        None
     }
 
     // ---- statements -------------------------------------------------------
@@ -440,7 +466,12 @@ impl Checker {
                 ..
             } => {
                 let declared = self.resolve_type(ty);
-                let vt = self.check_expr(value, declared);
+                // With a known annotation, apply optional coercion (§11.2): a
+                // `T` value or `null` widens to an expected `?T`.
+                let vt = match declared {
+                    Some(dt) => self.check_coerce(value, dt),
+                    None => self.check_expr(value, None),
+                };
                 if let (Some(dt), Some(vt)) = (declared, vt) {
                     if dt != vt {
                         let msg = format!(
@@ -464,7 +495,9 @@ impl Checker {
                         );
                         self.check_expr(value, Some(ty));
                     } else {
-                        let vt = self.check_expr(value, Some(ty));
+                        // Optional coercion (§11.2): assigning a `T` value or
+                        // `null` to a `?T` place widens implicitly.
+                        let vt = self.check_coerce(value, ty);
                         if let Some(vt) = vt {
                             if vt != ty {
                                 let msg = format!(
@@ -485,7 +518,8 @@ impl Checker {
             },
             Stmt::FieldAssign { place, value, .. } => {
                 if let Some(pt) = self.resolve_place(place) {
-                    if let Some(vt) = self.check_expr(value, Some(pt)) {
+                    // Optional coercion (§11.2): a `T`/`null` widens to a `?T` field.
+                    if let Some(vt) = self.check_coerce(value, pt) {
                         if vt != pt {
                             let msg = format!(
                                 "cannot assign value of type `{}` to field of type `{}`",
@@ -513,7 +547,9 @@ impl Checker {
                         self.check_expr(e, None);
                     } else {
                         let expected = self.ret_type;
-                        let vt = self.check_expr(e, Some(expected));
+                        // Optional coercion (§11.2): `return e` widens `T`/`null`
+                        // to a `?T` function return type.
+                        let vt = self.check_coerce(e, expected);
                         if let Some(vt) = vt {
                             if vt != expected {
                                 let msg = format!(
@@ -699,6 +735,115 @@ impl Checker {
                 args,
                 span,
             } => self.check_method_call(receiver, method, args, *span),
+            // `null` takes its `?T` type from the expected type at this position
+            // (SPEC §11.1); with no expected optional type it is `E0180`.
+            Expr::Null { span } => match expected {
+                Some(Type::Optional(id)) => Some(Type::Optional(id)),
+                _ => {
+                    self.error(
+                        *span,
+                        "E0180",
+                        "`null` has no expected optional type here; annotate the target as `?T`",
+                    );
+                    None
+                }
+            },
+            // `lhs orelse rhs`: `lhs` must be `?T` (else `E0181`); `rhs` must be
+            // `T`; the result is `T` (SPEC §11.1).
+            Expr::Orelse { lhs, rhs, span } => {
+                let lhs_expected = self.as_optional_expectation(expected);
+                match self.check_expr(lhs, lhs_expected) {
+                    Some(Type::Optional(id)) => {
+                        let inner = self.structs.optional_inner(id);
+                        if let Some(rt) = self.check_expr(rhs, Some(inner)) {
+                            if rt != inner {
+                                let msg = format!(
+                                    "`orelse` alternative type mismatch: expected `{}`, found `{}`",
+                                    self.type_name(inner),
+                                    self.type_name(rt)
+                                );
+                                self.error(rhs.span(), "E0110", msg);
+                            }
+                        }
+                        Some(inner)
+                    }
+                    Some(other) => {
+                        let msg = format!(
+                            "`orelse` requires an optional (`?T`) left operand, found `{}`",
+                            self.type_name(other)
+                        );
+                        self.error(*span, "E0181", msg);
+                        // Still check the alternative to surface its own errors.
+                        self.check_expr(rhs, None);
+                        None
+                    }
+                    None => {
+                        self.check_expr(rhs, None);
+                        None
+                    }
+                }
+            }
+            // `expr.?`: `expr` must be `?T` (else `E0182`); the result is `T`
+            // (a null unwrap panics at run time — that is the backend's job).
+            Expr::Unwrap { expr: inner, span } => {
+                let inner_expected = self.as_optional_expectation(expected);
+                match self.check_expr(inner, inner_expected) {
+                    Some(Type::Optional(id)) => Some(self.structs.optional_inner(id)),
+                    Some(other) => {
+                        let msg = format!(
+                            "`.?` requires an optional (`?T`) operand, found `{}`",
+                            self.type_name(other)
+                        );
+                        self.error(*span, "E0182", msg);
+                        None
+                    }
+                    None => None,
+                }
+            }
+        }
+    }
+
+    /// Derive the optional type a sub-expression should be checked against when
+    /// its *result* is expected to be `T`. For `x orelse y` and `x.?` the
+    /// operand is `?T`: an expected inner `T` becomes `?T` (interning it if
+    /// necessary), an already-optional expectation is kept, and no expectation
+    /// stays `None`. This lets a bare `null` operand (whose type comes from
+    /// context) resolve, e.g. `var v: i32 = (null orelse 0);`.
+    fn as_optional_expectation(&mut self, expected: Option<Type>) -> Option<Type> {
+        match expected {
+            Some(t @ Type::Optional(_)) => Some(t),
+            Some(other) => Some(Type::Optional(self.structs.intern_optional(other))),
+            None => None,
+        }
+    }
+
+    /// Type-check `expr` against an expected type, applying optional coercion
+    /// (SPEC §11.2). When `expected` is `?T`, this accepts:
+    /// - a `null` literal (which adopts `?T`),
+    /// - a value whose type is the inner `T` (which widens to `?T`), or
+    /// - a value already of type `?T`,
+    /// returning the expected `?T` in each accepting case so the caller's
+    /// equality check passes. Any other type is returned unchanged for the
+    /// caller to report as `E0110`. For a non-optional `expected`, this is just
+    /// [`check_expr`] with that expectation.
+    fn check_coerce(&mut self, expr: &Expr, expected: Type) -> Option<Type> {
+        if let Type::Optional(id) = expected {
+            // `null` adopts the optional type directly.
+            if matches!(expr, Expr::Null { .. }) {
+                return self.check_expr(expr, Some(expected));
+            }
+            // Otherwise check against the inner `T` so that integer literals and
+            // nested constructs adopt it, then accept either `T` (coerces) or an
+            // already-`?T` value.
+            let inner = self.structs.optional_inner(id);
+            let vt = self.check_expr(expr, Some(inner))?;
+            if vt == inner || vt == expected {
+                Some(expected)
+            } else {
+                Some(vt)
+            }
+        } else {
+            self.check_expr(expr, Some(expected))
         }
     }
 
@@ -877,7 +1022,8 @@ impl Checker {
     /// general type-mismatch code `E0110`. Caller guarantees equal lengths.
     fn check_arg_types(&mut self, args: &[Expr], params: &[Type]) {
         for (a, &pt) in args.iter().zip(params.iter()) {
-            if let Some(at) = self.check_expr(a, Some(pt)) {
+            // Optional coercion (§11.2): a `T`/`null` argument widens to a `?T` param.
+            if let Some(at) = self.check_coerce(a, pt) {
                 if at != pt {
                     let msg = format!(
                         "argument type mismatch: expected `{}`, found `{}`",
@@ -924,7 +1070,8 @@ impl Checker {
                         );
                         self.error(fi.span, "E0164", msg);
                     }
-                    if let Some(vt) = self.check_expr(&fi.value, Some(fty)) {
+                    // Optional coercion (§11.2): a `T`/`null` widens to a `?T` field.
+                    if let Some(vt) = self.check_coerce(&fi.value, fty) {
                         if vt != fty {
                             let msg = format!(
                                 "field `{}` type mismatch: expected `{}`, found `{}`",
@@ -1197,7 +1344,9 @@ impl Checker {
                         return Some(sig.ret);
                     }
                     for (a, &pt) in args.iter().zip(sig.params.iter()) {
-                        if let Some(at) = self.check_expr(a, Some(pt)) {
+                        // Optional coercion (§11.2): a `T`/`null` argument widens
+                        // to a `?T` parameter.
+                        if let Some(at) = self.check_coerce(a, pt) {
                             if at != pt {
                                 let msg = format!(
                                     "argument type mismatch: expected `{}`, found `{}`",
@@ -1246,8 +1395,64 @@ mod tests {
     fn te(name: &str) -> TypeExpr {
         TypeExpr {
             name: name.into(),
+            optional: false,
             span: sp(),
         }
+    }
+    /// An optional type expression `?name`.
+    fn te_opt(name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.into(),
+            optional: true,
+            span: sp(),
+        }
+    }
+    fn null_lit() -> Expr {
+        Expr::Null { span: sp() }
+    }
+    fn orelse(lhs: Expr, rhs: Expr) -> Expr {
+        Expr::Orelse {
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+            span: sp(),
+        }
+    }
+    fn unwrap(e: Expr) -> Expr {
+        Expr::Unwrap {
+            expr: Box::new(e),
+            span: sp(),
+        }
+    }
+    fn param_opt(name: &str, inner: &str) -> Param {
+        Param {
+            name: name.into(),
+            ty: te_opt(inner),
+            span: sp(),
+        }
+    }
+    /// `var name: ?inner = value;`
+    fn let_var_opt(name: &str, inner: &str, value: Expr) -> Stmt {
+        Stmt::Let {
+            is_const: false,
+            name: name.into(),
+            ty: te_opt(inner),
+            value,
+            span: sp(),
+        }
+    }
+    /// A struct with a single optional field `field: ?inner`.
+    fn struct_item_optfield(name: &str, field: &str, inner: &str) -> Item {
+        Item::Struct(StructDecl {
+            is_pub: false,
+            name: name.into(),
+            fields: vec![FieldDecl {
+                name: field.into(),
+                ty: te_opt(inner),
+                span: sp(),
+            }],
+            methods: Vec::new(),
+            span: sp(),
+        })
     }
     fn int(v: i64) -> Expr {
         Expr::Int { value: v, span: sp() }
@@ -2063,6 +2268,197 @@ mod tests {
             vec![ret(Some(field(ident("self"), "n")))],
         );
         let items = vec![struct_item_m("Counter", vec![("n", "i32")], vec![get])];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    // ---- optional tests (v0.114) -----------------------------------------
+
+    #[test]
+    fn optional_null_and_coercion_ok() {
+        // fn main() void { var x: ?i32 = null; x = 5; }
+        // `null` adopts `?i32`; the bare `5` coerces `i32 -> ?i32` on assign.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_opt("x", "i32", null_lit()),
+                assign("x", int(5)),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn optional_value_initializer_coerces_ok() {
+        // fn main() void { var x: ?i32 = 7; }  (T coerces to ?T)
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_opt("x", "i32", int(7))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn orelse_yields_inner_type_ok() {
+        // fn f(opt: ?i32) void { var v: i32 = opt orelse 0; print(v); }
+        let items = vec![func(
+            "f",
+            vec![param_opt("opt", "i32")],
+            "void",
+            vec![
+                let_var("v", "i32", orelse(ident("opt"), int(0))),
+                Stmt::Expr(call("print", vec![ident("v")])),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn unwrap_yields_inner_type_ok() {
+        // fn f(opt: ?i32) void { var v: i32 = opt.?; print(v); }
+        let items = vec![func(
+            "f",
+            vec![param_opt("opt", "i32")],
+            "void",
+            vec![
+                let_var("v", "i32", unwrap(ident("opt"))),
+                Stmt::Expr(call("print", vec![ident("v")])),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn orelse_alternative_type_mismatch_is_e0110() {
+        // fn f(opt: ?i32) void { var v: i32 = opt orelse true; }  // alt is bool
+        let items = vec![func(
+            "f",
+            vec![param_opt("opt", "i32")],
+            "void",
+            vec![let_var("v", "i32", orelse(ident("opt"), boolean(true)))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn bare_null_without_expected_optional_is_e0180() {
+        // fn main() void { var x: i32 = null; }  // i32 is not optional
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var("x", "i32", null_lit())],
+        )];
+        assert!(codes(items).contains(&"E0180"));
+    }
+
+    #[test]
+    fn orelse_on_non_optional_is_e0181() {
+        // fn f(x: i32) void { var v: i32 = x orelse 0; }  // x is not optional
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "void",
+            vec![let_var("v", "i32", orelse(ident("x"), int(0)))],
+        )];
+        assert!(codes(items).contains(&"E0181"));
+    }
+
+    #[test]
+    fn unwrap_on_non_optional_is_e0182() {
+        // fn f(x: i32) void { var v: i32 = x.?; }  // x is not optional
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "void",
+            vec![let_var("v", "i32", unwrap(ident("x")))],
+        )];
+        assert!(codes(items).contains(&"E0182"));
+    }
+
+    #[test]
+    fn optional_struct_field_ok_and_interned() {
+        // const Box = struct { val: ?i32 };
+        // fn mk() Box { return Box{ .val = null }; }       // null in field
+        // fn set() Box { return Box{ .val = 9 }; }         // T coerces in field
+        // fn get(b: Box) i32 { return b.val orelse 0; }    // field is ?i32
+        let items = vec![
+            struct_item_optfield("Box", "val", "i32"),
+            func(
+                "mk",
+                vec![],
+                "Box",
+                vec![ret(Some(struct_lit("Box", vec![("val", null_lit())])))],
+            ),
+            func(
+                "set",
+                vec![],
+                "Box",
+                vec![ret(Some(struct_lit("Box", vec![("val", int(9))])))],
+            ),
+            func(
+                "get",
+                vec![param("b", "Box")],
+                "i32",
+                vec![ret(Some(orelse(field(ident("b"), "val"), int(0))))],
+            ),
+        ];
+        let m = Module { items };
+        let table = check(&m).expect("optional-field program should type-check");
+        // The `?i32` field interned exactly one optional whose inner is `i32`.
+        let opts: Vec<Type> = table.optionals().map(|(_, t)| t).collect();
+        assert_eq!(opts, vec![Type::I32]);
+        let id = table.id_of("Box").unwrap();
+        assert_eq!(
+            table.get(id).fields,
+            vec![("val".to_string(), Type::Optional(0))]
+        );
+    }
+
+    #[test]
+    fn return_value_coerces_to_optional_ok() {
+        // fn f() ?i32 { return 3; }   // T coerces to ?T on return
+        // fn g() ?i32 { return null; }
+        let items = vec![
+            Item::Func(Func {
+                is_pub: false,
+                name: "f".into(),
+                params: vec![],
+                ret: te_opt("i32"),
+                body: block(vec![ret(Some(int(3)))]),
+                span: sp(),
+            }),
+            Item::Func(Func {
+                is_pub: false,
+                name: "g".into(),
+                params: vec![],
+                ret: te_opt("i32"),
+                body: block(vec![ret(Some(null_lit()))]),
+                span: sp(),
+            }),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn optional_arg_coercion_to_param_ok() {
+        // fn takes(o: ?i32) void {}
+        // fn main() void { takes(5); takes(null); }
+        let items = vec![
+            func("takes", vec![param_opt("o", "i32")], "void", vec![]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    Stmt::Expr(call("takes", vec![int(5)])),
+                    Stmt::Expr(call("takes", vec![null_lit()])),
+                ],
+            ),
+        ];
         assert_eq!(codes(items), Vec::<&str>::new());
     }
 }

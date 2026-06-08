@@ -163,6 +163,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diagnostic>> {
             b'*' => (TokenKind::Star, 1),
             b'/' => (TokenKind::Slash, 1),
             b'%' => (TokenKind::Percent, 1),
+            b'?' => (TokenKind::Question, 1),
             b'=' => {
                 if next == Some(b'=') {
                     (TokenKind::EqEq, 2)

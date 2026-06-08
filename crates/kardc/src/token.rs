@@ -27,6 +27,8 @@ pub enum Kw {
     And,
     Or,
     Struct,
+    Orelse,
+    Null,
 }
 
 impl Kw {
@@ -51,6 +53,8 @@ impl Kw {
             "and" => Kw::And,
             "or" => Kw::Or,
             "struct" => Kw::Struct,
+            "orelse" => Kw::Orelse,
+            "null" => Kw::Null,
             _ => return None,
         })
     }
@@ -75,6 +79,8 @@ impl Kw {
             Kw::And => "and",
             Kw::Or => "or",
             Kw::Struct => "struct",
+            Kw::Orelse => "orelse",
+            Kw::Null => "null",
         }
     }
 }
@@ -109,8 +115,9 @@ pub enum TokenKind {
     Minus,   // -
     Star,    // *
     Slash,   // /
-    Percent, // %
-    Bang,    // !
+    Percent,  // %
+    Bang,     // !
+    Question, // ?
 
     /// End of input. Always the final token.
     Eof,
