@@ -106,6 +106,10 @@ pub struct TypeExpr {
     /// `Some(N)` if written as `[N]T` (a fixed-size array of `N` elements);
     /// `name` is then the element type. v0.117: not combined with `?`/`!`.
     pub array_len: Option<i64>,
+    /// True if written as `*T` (a single pointer to `T`). v0.118.
+    pub pointer: bool,
+    /// True if written as `[]T` (a slice of `T`). v0.118.
+    pub slice: bool,
     pub span: Span,
 }
 
@@ -356,6 +360,18 @@ pub enum Expr {
         index: Box<Expr>,
         span: Span,
     },
+    /// `&place` — address-of an lvalue, yielding `*T` (v0.118).
+    AddrOf { place: Box<Expr>, span: Span },
+    /// `expr.*` — pointer dereference (read). Deref assignment reuses
+    /// [`Stmt::FieldAssign`] with a `Deref` place.
+    Deref { expr: Box<Expr>, span: Span },
+    /// `base[lo..hi]` — slice an array (or slice), yielding `[]T` (v0.118).
+    SliceExpr {
+        base: Box<Expr>,
+        lo: Box<Expr>,
+        hi: Box<Expr>,
+        span: Span,
+    },
     /// `try expr` — unwrap an error union `!T`, or propagate the error by
     /// returning it from the enclosing `!U` function. v0.115: statement-level.
     Try { expr: Box<Expr>, span: Span },
@@ -397,6 +413,9 @@ impl Expr {
             Expr::EnumLit { span, .. } => *span,
             Expr::ArrayLit { span, .. } => *span,
             Expr::Index { span, .. } => *span,
+            Expr::AddrOf { span, .. } => *span,
+            Expr::Deref { span, .. } => *span,
+            Expr::SliceExpr { span, .. } => *span,
         }
     }
 }

@@ -37,6 +37,11 @@ pub enum Type {
     /// `[N]T` — a fixed-size array (v0.117). The `u32` indexes the array table
     /// (`array_info`: element type + length).
     Array(u32),
+    /// `*T` — a single pointer (v0.118). The `u32` indexes the pointee table.
+    Ptr(u32),
+    /// `[]T` — a slice (`{ptr,len}` view, v0.118). The `u32` indexes the slice
+    /// element table.
+    Slice(u32),
 }
 
 impl Type {
@@ -79,6 +84,8 @@ impl Type {
             Type::ErrorUnion(_) => "error union",
             Type::Enum(_) => "enum",
             Type::Array(_) => "array",
+            Type::Ptr(_) => "pointer",
+            Type::Slice(_) => "slice",
         }
     }
 
@@ -110,6 +117,10 @@ impl Type {
             Type::Enum(_) => unreachable!("c_name on an enum type; use StructTable::enum_c_name"),
             Type::Array(_) => {
                 unreachable!("c_name on an array type; use StructTable::array_c_name")
+            }
+            Type::Ptr(_) => unreachable!("c_name on a pointer type; use StructTable::ptr_c_name"),
+            Type::Slice(_) => {
+                unreachable!("c_name on a slice type; use StructTable::slice_c_name")
             }
         }
     }
@@ -185,6 +196,10 @@ pub struct StructTable {
     enum_by_name: HashMap<String, u32>,
     /// Array types `(element, length)`, indexed by the id in `Type::Array(id)`.
     array_info: Vec<(Type, usize)>,
+    /// Pointee types, indexed by the id in `Type::Ptr(id)` (v0.118).
+    ptr_pointees: Vec<Type>,
+    /// Slice element types, indexed by the id in `Type::Slice(id)` (v0.118).
+    slice_elems: Vec<Type>,
 }
 
 impl StructTable {
@@ -275,6 +290,10 @@ impl StructTable {
                 let (elem, len) = self.array_info[aid as usize];
                 format!("arr_{}_{}", self.type_mangle(elem), len)
             }
+            Type::Ptr(pid) => format!("ptr_{}", self.type_mangle(self.ptr_pointees[pid as usize])),
+            Type::Slice(sid) => {
+                format!("slice_{}", self.type_mangle(self.slice_elems[sid as usize]))
+            }
             other => other.c_name().to_string(),
         }
     }
@@ -357,6 +376,53 @@ impl StructTable {
             .iter()
             .enumerate()
             .map(|(i, &(e, l))| (i as u32, e, l))
+    }
+
+    // --- pointers `*T` & slices `[]T` (v0.118) ----------------------------
+
+    pub fn intern_ptr(&mut self, pointee: Type) -> u32 {
+        if let Some(i) = self.ptr_pointees.iter().position(|t| *t == pointee) {
+            return i as u32;
+        }
+        let id = self.ptr_pointees.len() as u32;
+        self.ptr_pointees.push(pointee);
+        id
+    }
+
+    pub fn ptr_pointee(&self, id: u32) -> Type {
+        self.ptr_pointees[id as usize]
+    }
+
+    /// The C name for `*T`, e.g. `int32_t*`. (Pointers need no typedef.)
+    pub fn ptr_c_name(&self, id: u32, base_cty: &str) -> String {
+        let _ = id;
+        format!("{}*", base_cty)
+    }
+
+    pub fn intern_slice(&mut self, elem: Type) -> u32 {
+        if let Some(i) = self.slice_elems.iter().position(|t| *t == elem) {
+            return i as u32;
+        }
+        let id = self.slice_elems.len() as u32;
+        self.slice_elems.push(elem);
+        id
+    }
+
+    pub fn slice_elem(&self, id: u32) -> Type {
+        self.slice_elems[id as usize]
+    }
+
+    /// The C typedef name for `[]T`, e.g. `kd_slice_int32_t`.
+    pub fn slice_c_name(&self, id: u32) -> String {
+        format!("kd_slice_{}", self.type_mangle(self.slice_elems[id as usize]))
+    }
+
+    /// All interned slices, paired with id + element, in interning order.
+    pub fn slices(&self) -> impl Iterator<Item = (u32, Type)> + '_ {
+        self.slice_elems
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i as u32, *t))
     }
 
     // --- error unions (`!T`) + the implicit global error set --------------

@@ -14,6 +14,18 @@ use crate::ast::{
 use crate::const_eval::ConstVal;
 use crate::types::{StructTable, Type};
 
+/// Id-space base for emit-local pointer types (v0.118). The [`StructTable`]
+/// interns slices (and exposes a `slices()` iterator) but pointers carry no
+/// typedef and there is no `pointers()` iterator to map a `*T` source type back
+/// to its `Type::Ptr(id)`. So emission maintains its own small pointee registry
+/// ([`Emitter::local_ptr_pointees`]) for the `*T` types written in signatures /
+/// locals; ids into it are offset by this base so they never collide with the
+/// table's own (small) pointer ids. Pointer ids that come *out of* the table
+/// (e.g. a struct field of type `*T`) stay below the base and are resolved
+/// against the table; emit-local ids are resolved against the registry. See
+/// [`Emitter::ptr_pointee_any`].
+const PTR_LOCAL_BASE: u32 = 0x4000_0000;
+
 /// What kind of program to emit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmitMode {
@@ -123,6 +135,13 @@ struct Emitter<'a> {
     /// bounds-checked array index-assignment (SPEC §14.3). Reset per
     /// function/test body, exactly like `try_counter`.
     idx_counter: usize,
+    /// Pointee types of the `*T` pointer types written in this module's
+    /// signatures / locals, in first-seen order (SPEC §15.1). Pointers have no
+    /// typedef and the table exposes no `pointers()` iterator, so emit keeps
+    /// this registry to map a `*T` source type back to a `Type::Ptr` it can
+    /// resolve (ids are offset by [`PTR_LOCAL_BASE`]). Populated in
+    /// [`Emitter::collect_signatures`] before any type is resolved.
+    local_ptr_pointees: Vec<Type>,
 }
 
 impl<'a> Emitter<'a> {
@@ -141,6 +160,7 @@ impl<'a> Emitter<'a> {
             method_params: HashMap::new(),
             try_counter: 0,
             idx_counter: 0,
+            local_ptr_pointees: Vec::new(),
         }
     }
 
@@ -149,6 +169,11 @@ impl<'a> Emitter<'a> {
     /// receiver chain that passes through a call to find the struct whose
     /// function a method call invokes. Pure bookkeeping — emits nothing.
     fn collect_signatures(&mut self, module: &Module) {
+        // Pre-pass: register every `*T` written in a signature or local so
+        // `resolve_ty` can map those pointer types to a `Type::Ptr` id. Must run
+        // before any `resolve_ty` call below (which already resolves return /
+        // parameter types into the signature tables).
+        self.collect_ptr_types(module);
         for item in &module.items {
             match item {
                 Item::Func(f) => {
@@ -168,6 +193,78 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// Walk every `TypeExpr` written in a signature or local declaration and
+    /// register the pointee of each `*T` into [`Emitter::local_ptr_pointees`]
+    /// (deduplicated, first-seen order). This gives `resolve_ty` a stable id to
+    /// hand back for pointer types, which the table cannot supply (pointers have
+    /// no typedef and no `pointers()` iterator). Struct **field** pointer types
+    /// are excluded on purpose: those are stored resolved in the table already
+    /// (with the table's own pointer ids) and are resolved against it.
+    fn collect_ptr_types(&mut self, module: &Module) {
+        for item in &module.items {
+            match item {
+                Item::Func(f) => self.note_func_ptrs(f),
+                Item::Struct(s) => {
+                    for m in &s.methods {
+                        self.note_func_ptrs(m);
+                    }
+                }
+                Item::Const(c) => self.note_ptr_ty(&c.ty),
+                Item::Test(t) => self.note_block_ptrs(&t.body),
+                Item::Enum(_) => {}
+            }
+        }
+    }
+
+    fn note_func_ptrs(&mut self, f: &Func) {
+        self.note_ptr_ty(&f.ret);
+        for p in &f.params {
+            self.note_ptr_ty(&p.ty);
+        }
+        self.note_block_ptrs(&f.body);
+    }
+
+    fn note_block_ptrs(&mut self, b: &Block) {
+        for s in &b.stmts {
+            self.note_stmt_ptrs(s);
+        }
+    }
+
+    fn note_stmt_ptrs(&mut self, s: &Stmt) {
+        match s {
+            Stmt::Let { ty, .. } => self.note_ptr_ty(ty),
+            Stmt::If { then, els, .. } => {
+                self.note_block_ptrs(then);
+                if let Some(e) = els {
+                    self.note_stmt_ptrs(e);
+                }
+            }
+            Stmt::While { body, .. } => self.note_block_ptrs(body),
+            Stmt::Block(b) => self.note_block_ptrs(b),
+            Stmt::Defer { stmt, .. } => self.note_stmt_ptrs(stmt),
+            Stmt::Switch { arms, default, .. } => {
+                for a in arms {
+                    self.note_block_ptrs(&a.body);
+                }
+                if let Some(d) = default {
+                    self.note_block_ptrs(d);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Register `t`'s pointee if `t` is a `*T` (the pointee is `t.name` resolved
+    /// as a base type; v0.118 does not combine `*` with `?`/`!`/`[N]`).
+    fn note_ptr_ty(&mut self, t: &TypeExpr) {
+        if t.pointer {
+            let pointee = self.base_type(&t.name);
+            if !self.local_ptr_pointees.contains(&pointee) {
+                self.local_ptr_pointees.push(pointee);
             }
         }
     }
@@ -218,13 +315,14 @@ impl<'a> Emitter<'a> {
             && structs.error_unions().next().is_none()
             && structs.enums().next().is_none()
             && structs.arrays().next().is_none()
+            && structs.slices().next().is_none()
         {
             return;
         }
 
         // A definition node: a struct, an interned optional, an interned error
-        // union, or a plain enum. An enum has no by-value dependencies, so it
-        // is always a leaf of the dependency graph.
+        // union, a plain enum, an array, or a slice. An enum has no by-value
+        // dependencies, so it is always a leaf of the dependency graph.
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         enum Node {
             Struct(u32),
@@ -232,14 +330,22 @@ impl<'a> Emitter<'a> {
             ErrU(u32),
             Enum(u32),
             Array(u32),
+            Slice(u32),
         }
-        fn dep_of(t: Type) -> Option<Node> {
+        fn dep_of(t: Type, structs: &crate::types::StructTable) -> Option<Node> {
             match t {
                 Type::Struct(s) => Some(Node::Struct(s)),
                 Type::Optional(o) => Some(Node::Opt(o)),
                 Type::ErrorUnion(e) => Some(Node::ErrU(e)),
                 Type::Enum(e) => Some(Node::Enum(e)),
                 Type::Array(a) => Some(Node::Array(a)),
+                Type::Slice(s) => Some(Node::Slice(s)),
+                // A pointer needs no typedef of its own, but the type it points
+                // to must still be declared first — the C `T*` spelling names
+                // that typedef — so a `*T` field's dependency is `T`'s. (A
+                // self/mutually-recursive pointer is broken by the `seen` set;
+                // genuinely recursive types are out of scope for v0.118.)
+                Type::Ptr(p) => dep_of(structs.ptr_pointee(p), structs),
                 _ => None,
             }
         }
@@ -255,18 +361,18 @@ impl<'a> Emitter<'a> {
             match n {
                 Node::Struct(s) => {
                     for (_, fty) in &structs.get(s).fields {
-                        if let Some(d) = dep_of(*fty) {
+                        if let Some(d) = dep_of(*fty, structs) {
                             visit(d, structs, seen, order);
                         }
                     }
                 }
                 Node::Opt(o) => {
-                    if let Some(d) = dep_of(structs.optional_inner(o)) {
+                    if let Some(d) = dep_of(structs.optional_inner(o), structs) {
                         visit(d, structs, seen, order);
                     }
                 }
                 Node::ErrU(e) => {
-                    if let Some(d) = dep_of(structs.error_union_payload(e)) {
+                    if let Some(d) = dep_of(structs.error_union_payload(e), structs) {
                         visit(d, structs, seen, order);
                     }
                 }
@@ -274,7 +380,13 @@ impl<'a> Emitter<'a> {
                 Node::Enum(_) => {}
                 // An array `[N]T` embeds its element type `T` by value.
                 Node::Array(a) => {
-                    if let Some(d) = dep_of(structs.array_elem(a)) {
+                    if let Some(d) = dep_of(structs.array_elem(a), structs) {
+                        visit(d, structs, seen, order);
+                    }
+                }
+                // A slice `[]T` embeds (the C name of) its element type `T`.
+                Node::Slice(s) => {
+                    if let Some(d) = dep_of(structs.slice_elem(s), structs) {
                         visit(d, structs, seen, order);
                     }
                 }
@@ -302,6 +414,9 @@ impl<'a> Emitter<'a> {
         for (id, _, _) in structs.arrays() {
             visit(Node::Array(id), structs, &mut seen, &mut order);
         }
+        for (id, _) in structs.slices() {
+            visit(Node::Slice(id), structs, &mut seen, &mut order);
+        }
 
         for n in order {
             match n {
@@ -310,6 +425,7 @@ impl<'a> Emitter<'a> {
                 Node::ErrU(id) => self.emit_one_error_union(id),
                 Node::Enum(id) => self.emit_one_enum(id),
                 Node::Array(id) => self.emit_one_array(id),
+                Node::Slice(id) => self.emit_one_slice(id),
             }
         }
         self.blank();
@@ -416,6 +532,26 @@ impl<'a> Emitter<'a> {
         ));
     }
 
+    /// Emit one `kd_slice_<tag>` slice typedef plus its inline bounds-checked
+    /// `_get` helper, per SPEC §15.2. A slice is a non-owning `{ptr, len}` view
+    /// over a backing array (or another slice); the backing storage's lifetime
+    /// is the programmer's responsibility (raw, no borrow check). `_get` panics
+    /// (stderr + `exit(101)`) on an out-of-bounds index.
+    fn emit_one_slice(&mut self, id: u32) {
+        let structs = self.structs;
+        let elem_cty = self.cty_of(structs.slice_elem(id));
+        let sname = structs.slice_c_name(id);
+        self.line(&format!(
+            "typedef struct {{ {} *ptr; uintptr_t len; }} {};",
+            elem_cty, sname
+        ));
+        self.line(&format!(
+            "static inline {ec} {sn}_get({sn} s, int64_t i) {{ if (i < 0 || (uint64_t)i >= s.len) {{ fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); }} return s.ptr[i]; }}",
+            ec = elem_cty,
+            sn = sname
+        ));
+    }
+
     /// Fold each top-level `const` initializer to a literal (C does not treat
     /// `const` objects as constant expressions) and emit it. Constants are
     /// processed in source order so later ones may reference earlier ones.
@@ -506,10 +642,7 @@ impl<'a> Emitter<'a> {
     /// [`Type::from_name`], else a struct via the table, else `Void` for the
     /// impossible unresolved case so emission can never panic.
     fn resolve_ty(&self, t: &TypeExpr) -> Type {
-        let base = Type::from_name(&t.name)
-            .or_else(|| self.structs.id_of(&t.name).map(Type::Struct))
-            .or_else(|| self.structs.enum_id_of(&t.name).map(Type::Enum))
-            .unwrap_or(Type::Void);
+        let base = self.base_type(&t.name);
         if let Some(n) = t.array_len {
             // sema interned every `[N]T`; map the (element, length) pair back to
             // its `Type::Array(id)`. (`base` is the element type — `t.name` is
@@ -536,8 +669,50 @@ impl<'a> Emitter<'a> {
                 .find(|(_, payload)| *payload == base)
                 .map(|(id, _)| Type::ErrorUnion(id))
                 .unwrap_or(base)
+        } else if t.pointer {
+            // `*T`: the pointee `base` was registered by `collect_ptr_types`, so
+            // map it to a `Type::Ptr` with an emit-local id (offset by
+            // `PTR_LOCAL_BASE` so it never collides with the table's ids).
+            self.local_ptr_pointees
+                .iter()
+                .position(|x| *x == base)
+                .map(|i| Type::Ptr(PTR_LOCAL_BASE + i as u32))
+                .unwrap_or(Type::Ptr(PTR_LOCAL_BASE))
+        } else if t.slice {
+            // `[]T`: sema interned every slice, so map the element `base` back to
+            // its `Type::Slice(id)` (mirrors the array/optional/error machinery).
+            self.structs
+                .slices()
+                .find(|(_, elem)| *elem == base)
+                .map(|(id, _)| Type::Slice(id))
+                .unwrap_or(base)
         } else {
             base
+        }
+    }
+
+    /// Resolve a bare source type name to a [`Type`]: a builtin via
+    /// [`Type::from_name`], else a struct, else an enum, else `Void` for the
+    /// impossible unresolved case. Shared by `resolve_ty` (for the base of a
+    /// composite type) and by the pointer pre-pass.
+    fn base_type(&self, name: &str) -> Type {
+        Type::from_name(name)
+            .or_else(|| self.structs.id_of(name).map(Type::Struct))
+            .or_else(|| self.structs.enum_id_of(name).map(Type::Enum))
+            .unwrap_or(Type::Void)
+    }
+
+    /// The pointee of a `Type::Ptr(id)`, whether `id` is an emit-local id (from
+    /// `resolve_ty` / `&place`) or a table id (from a struct field, slice
+    /// element, …). See [`PTR_LOCAL_BASE`].
+    fn ptr_pointee_any(&self, id: u32) -> Type {
+        if id >= PTR_LOCAL_BASE {
+            self.local_ptr_pointees
+                .get((id - PTR_LOCAL_BASE) as usize)
+                .copied()
+                .unwrap_or(Type::Void)
+        } else {
+            self.structs.ptr_pointee(id)
         }
     }
 
@@ -551,6 +726,9 @@ impl<'a> Emitter<'a> {
             Type::ErrorUnion(id) => self.structs.error_union_c_name(id),
             Type::Enum(id) => self.structs.enum_c_name(id),
             Type::Array(id) => self.structs.array_c_name(id),
+            // `*T` has no typedef: its C spelling is `<pointee cty>*`.
+            Type::Ptr(id) => format!("{}*", self.cty_of(self.ptr_pointee_any(id))),
+            Type::Slice(id) => self.structs.slice_c_name(id),
             other => other.c_name().to_string(),
         }
     }
@@ -580,6 +758,14 @@ impl<'a> Emitter<'a> {
         } else if t.error_union {
             // Matches `error_union_c_name(id)` (`kd_err_<type_mangle(payload)>`).
             format!("kd_err_{}", self.structs.type_mangle(base))
+        } else if t.pointer {
+            // `*T` needs no typedef — its C spelling is `<pointee cty>*` and the
+            // id is irrelevant to the name (`base` is the pointee here).
+            format!("{}*", self.cty_of(base))
+        } else if t.slice {
+            // Matches `slice_c_name(id)` (`kd_slice_<type_mangle(elem)>`) without
+            // needing the interned id; `base` is the element type.
+            format!("kd_slice_{}", self.structs.type_mangle(base))
         } else {
             self.cty_of(base)
         }
@@ -700,45 +886,72 @@ impl<'a> Emitter<'a> {
                 false
             }
             Stmt::FieldAssign { place, value, .. } => {
-                if let Expr::Index { base, index, .. } = place {
-                    // Index-assignment `a[i] = e;` → a bounds-checked block
-                    // (SPEC §14.3): the index is hoisted into a fresh temporary,
-                    // checked against the array length, then stored. The value is
-                    // coerced to the element type so a `T`-coercible value widens.
-                    let k = self.idx_counter;
-                    self.idx_counter += 1;
-                    let idx = self.emit_expr(index);
-                    let base_str = self.emit_expr(base);
-                    let (len, elem_ty) = match self.type_of_expr(base) {
-                        Some(Type::Array(aid)) => {
-                            (self.structs.array_len(aid), Some(self.structs.array_elem(aid)))
+                match place {
+                    Expr::Index { base, index, .. } => {
+                        // Index-assignment → a bounds-checked block: the index is
+                        // hoisted into a fresh temporary, checked, then stored.
+                        // The value is coerced to the element type so a
+                        // `T`-coercible value widens. An array writes through
+                        // `.data` and a fixed length (SPEC §14.3); a slice writes
+                        // through `.ptr` and the runtime `.len` (SPEC §15.2).
+                        let k = self.idx_counter;
+                        self.idx_counter += 1;
+                        let idx = self.emit_expr(index);
+                        let base_str = self.emit_expr(base);
+                        if let Some(Type::Slice(sid)) = self.type_of_expr(base) {
+                            let val = self.emit_coerced(value, self.structs.slice_elem(sid));
+                            self.line(&format!(
+                                "{{ int64_t __kd_idx{k} = ({idx}); if (__kd_idx{k} < 0 || (uint64_t)__kd_idx{k} >= ({base}).len) {{ fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); }} ({base}).ptr[__kd_idx{k}] = ({val}); }}",
+                                k = k,
+                                idx = idx,
+                                base = base_str,
+                                val = val
+                            ));
+                        } else {
+                            let (len, elem_ty) = match self.type_of_expr(base) {
+                                Some(Type::Array(aid)) => {
+                                    (self.structs.array_len(aid), Some(self.structs.array_elem(aid)))
+                                }
+                                // Unreachable for validated input (`base` is an array).
+                                _ => (0, None),
+                            };
+                            let val = match elem_ty {
+                                Some(t) => self.emit_coerced(value, t),
+                                None => self.emit_expr(value),
+                            };
+                            self.line(&format!(
+                                "{{ int64_t __kd_idx{k} = ({idx}); if (__kd_idx{k} < 0 || (uint64_t)__kd_idx{k} >= {len}) {{ fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); }} ({base}).data[__kd_idx{k}] = ({val}); }}",
+                                k = k,
+                                idx = idx,
+                                len = len,
+                                base = base_str,
+                                val = val
+                            ));
                         }
-                        // Unreachable for validated input (`base` is an array).
-                        _ => (0, None),
-                    };
-                    let val = match elem_ty {
-                        Some(t) => self.emit_coerced(value, t),
-                        None => self.emit_expr(value),
-                    };
-                    self.line(&format!(
-                        "{{ int64_t __kd_idx{k} = ({idx}); if (__kd_idx{k} < 0 || (uint64_t)__kd_idx{k} >= {len}) {{ fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); }} ({base}).data[__kd_idx{k}] = ({val}); }}",
-                        k = k,
-                        idx = idx,
-                        len = len,
-                        base = base_str,
-                        val = val
-                    ));
-                } else {
-                    // `place` is a field-access chain (`a.b.c`); lowering it
-                    // yields a C lvalue, so the assignment is a plain
-                    // `(<place>) = (<value>);`. Coerce the RHS to the field's type
-                    // (widening to `?T` if it is an optional field).
-                    let ps = self.emit_expr(place);
-                    let es = match self.type_of_expr(place) {
-                        Some(t) => self.emit_coerced(value, t),
-                        None => self.emit_expr(value),
-                    };
-                    self.line(&format!("({}) = ({});", ps, es));
+                    }
+                    Expr::Deref { expr, .. } => {
+                        // Deref-assignment `p.* = e;` → `*(<p>) = (<e>);` (SPEC
+                        // §15.1). Coerce the RHS to the pointee type (the type of
+                        // the `Deref` place).
+                        let inner = self.emit_expr(expr);
+                        let es = match self.type_of_expr(place) {
+                            Some(t) => self.emit_coerced(value, t),
+                            None => self.emit_expr(value),
+                        };
+                        self.line(&format!("*({}) = ({});", inner, es));
+                    }
+                    _ => {
+                        // `place` is a field-access chain (`a.b.c`); lowering it
+                        // yields a C lvalue, so the assignment is a plain
+                        // `(<place>) = (<value>);`. Coerce the RHS to the field's
+                        // type (widening to `?T` if it is an optional field).
+                        let ps = self.emit_expr(place);
+                        let es = match self.type_of_expr(place) {
+                            Some(t) => self.emit_coerced(value, t),
+                            None => self.emit_expr(value),
+                        };
+                        self.line(&format!("({}) = ({});", ps, es));
+                    }
                 }
                 false
             }
@@ -1223,6 +1436,11 @@ impl<'a> Emitter<'a> {
                     if let Some(Type::Array(aid)) = self.type_of_expr(base) {
                         return format!("((uintptr_t){})", self.structs.array_len(aid));
                     }
+                    // `s.len` on a slice → its runtime `.len` field (SPEC §15.2).
+                    if let Some(Type::Slice(_)) = self.type_of_expr(base) {
+                        let b = self.emit_expr(base);
+                        return format!("({}).len", b);
+                    }
                 }
                 // Field access: `(<base>).kd_<field>`. The base is parenthesized
                 // so a compound base expression (e.g. a literal or another access)
@@ -1342,8 +1560,9 @@ impl<'a> Emitter<'a> {
                 }
             }
             Expr::Index { base, index, .. } => {
-                // `a[i]` (read) → `kd_arr_<tag>_<N>_get(<a>, <i>)` — a
-                // bounds-checked inline helper call (SPEC §14.3).
+                // `a[i]` / `s[i]` (read) → a bounds-checked inline helper call:
+                // `kd_arr_<tag>_<N>_get` for an array (SPEC §14.3) or
+                // `kd_slice_<tag>_get` for a slice (SPEC §15.2).
                 let b = self.emit_expr(base);
                 let i = self.emit_expr(index);
                 match self.type_of_expr(base) {
@@ -1351,10 +1570,26 @@ impl<'a> Emitter<'a> {
                         let cname = self.structs.array_c_name(aid);
                         format!("{}_get({}, {})", cname, b, i)
                     }
-                    // Unreachable for validated input (`base` is always an array).
+                    Some(Type::Slice(sid)) => {
+                        let cname = self.structs.slice_c_name(sid);
+                        format!("{}_get({}, {})", cname, b, i)
+                    }
+                    // Unreachable for validated input (`base` is an array/slice).
                     _ => format!("({})[{}]", b, i),
                 }
             }
+            Expr::AddrOf { place, .. } => {
+                // `&place` → `(&(<place>))` (SPEC §15.1). The place is an lvalue
+                // (a `var`, field chain, index or deref); sema guarantees it.
+                let p = self.emit_expr(place);
+                format!("(&({}))", p)
+            }
+            Expr::Deref { expr, .. } => {
+                // `p.*` (read) → `(*(<p>))` (SPEC §15.1).
+                let inner = self.emit_expr(expr);
+                format!("(*({}))", inner)
+            }
+            Expr::SliceExpr { base, lo, hi, .. } => self.emit_slice_expr(base, lo, hi),
             Expr::Try { expr, .. } => {
                 // `try` is statement-level (SPEC §12.1) and is lowered by the
                 // statement emitters (`emit_try`); sema rejects it in any other
@@ -1378,6 +1613,49 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+    }
+
+    /// Lower a slice expression `base[lo..hi]` (SPEC §15.2). The result is a
+    /// `{ptr, len}` view (`kd_slice_<tag>`): from an array it points at `.data +
+    /// lo`, from a slice at `.ptr + lo`, with `len = hi - lo`. The bounds
+    /// (`0 <= lo <= hi <= cap`) are checked at runtime — a violation prints a
+    /// panic and `exit(101)`. Because this is an *expression* (no statement
+    /// context to host an `if`), the check is folded into a portable conditional
+    /// whose failing branch never returns (`exit` is `_Noreturn`).
+    fn emit_slice_expr(&mut self, base: &Expr, lo: &Expr, hi: &Expr) -> String {
+        let base_str = self.emit_expr(base);
+        let lo_str = self.emit_expr(lo);
+        let hi_str = self.emit_expr(hi);
+        // `(data_expr, cap_expr, elem)`: how to reach the backing storage and
+        // its capacity, and the element type, for an array vs a slice base.
+        let (data_expr, cap_expr, elem) = match self.type_of_expr(base) {
+            Some(Type::Array(aid)) => (
+                format!("({}).data", base_str),
+                self.structs.array_len(aid).to_string(),
+                self.structs.array_elem(aid),
+            ),
+            Some(Type::Slice(sid)) => (
+                format!("({}).ptr", base_str),
+                format!("({}).len", base_str),
+                self.structs.slice_elem(sid),
+            ),
+            // Unreachable for validated input (`base` is an array or a slice).
+            _ => (format!("({})", base_str), "0".to_string(), Type::Void),
+        };
+        let sname = self
+            .structs
+            .slices()
+            .find(|(_, e)| *e == elem)
+            .map(|(id, _)| self.structs.slice_c_name(id))
+            .unwrap_or_else(|| format!("kd_slice_{}", self.structs.type_mangle(elem)));
+        format!(
+            "(( ({lo}) < 0 || ({hi}) < ({lo}) || ({hi}) > ({cap}) ) ? (fputs(\"panic: slice bounds out of range\\n\", stderr), exit(101), ({sn}){{0}}) : ({sn}){{ .ptr = {data} + ({lo}), .len = ({hi}) - ({lo}) }})",
+            lo = lo_str,
+            hi = hi_str,
+            cap = cap_expr,
+            sn = sname,
+            data = data_expr
+        )
     }
 
     /// Lower one operand of a binary expression. This is ordinarily just
@@ -1569,6 +1847,8 @@ impl<'a> Emitter<'a> {
                     Type::Struct(id) => self.structs.get(id).field_type(field),
                     // `a.len` on an array is a `usize` constant (SPEC §14.3).
                     Type::Array(_) if field == "len" => Some(Type::Usize),
+                    // `s.len` on a slice is a `usize` (SPEC §15.2).
+                    Type::Slice(_) if field == "len" => Some(Type::Usize),
                     _ => None,
                 }
             }
@@ -1604,9 +1884,10 @@ impl<'a> Emitter<'a> {
                 t @ Type::Array(_) => Some(t),
                 _ => None,
             },
-            // `a[i]` yields the element type of the indexed array.
+            // `a[i]` / `s[i]` yields the element type of the array / slice.
             Expr::Index { base, .. } => match self.type_of_expr(base)? {
                 Type::Array(id) => Some(self.structs.array_elem(id)),
+                Type::Slice(id) => Some(self.structs.slice_elem(id)),
                 _ => None,
             },
             // `try` / `catch` both produce the payload `T` of the `!T` operand.
@@ -1618,6 +1899,34 @@ impl<'a> Emitter<'a> {
                 Type::ErrorUnion(id) => Some(self.structs.error_union_payload(id)),
                 other => Some(other),
             },
+            // `&place` is `*T` where `T` is the place's type. Map that pointee to
+            // an emit-local `Type::Ptr` id (`None` if the pointee is unknown or
+            // the `*T` was never written as a source type, so not registered).
+            Expr::AddrOf { place, .. } => {
+                let pointee = self.type_of_expr(place)?;
+                self.local_ptr_pointees
+                    .iter()
+                    .position(|x| *x == pointee)
+                    .map(|i| Type::Ptr(PTR_LOCAL_BASE + i as u32))
+            }
+            // `p.*` yields the pointee type of the `*T` operand.
+            Expr::Deref { expr, .. } => match self.type_of_expr(expr)? {
+                Type::Ptr(id) => Some(self.ptr_pointee_any(id)),
+                other => Some(other),
+            },
+            // `base[lo..hi]` yields `[]T` where `T` is the element of the sliced
+            // array / slice.
+            Expr::SliceExpr { base, .. } => {
+                let elem = match self.type_of_expr(base)? {
+                    Type::Array(aid) => self.structs.array_elem(aid),
+                    Type::Slice(sid) => self.structs.slice_elem(sid),
+                    _ => return None,
+                };
+                self.structs
+                    .slices()
+                    .find(|(_, e)| *e == elem)
+                    .map(|(id, _)| Type::Slice(id))
+            }
         }
     }
 
@@ -1803,6 +2112,8 @@ mod tests {
             optional: false,
             error_union: false,
             array_len: None,
+            pointer: false,
+            slice: false,
             span: Span::DUMMY,
         }
     }
@@ -1813,6 +2124,8 @@ mod tests {
             optional: true,
             error_union: false,
             array_len: None,
+            pointer: false,
+            slice: false,
             span: Span::DUMMY,
         }
     }
@@ -1823,6 +2136,8 @@ mod tests {
             optional: false,
             error_union: true,
             array_len: None,
+            pointer: false,
+            slice: false,
             span: Span::DUMMY,
         }
     }
@@ -1835,6 +2150,34 @@ mod tests {
             optional: false,
             error_union: false,
             array_len: Some(len),
+            pointer: false,
+            slice: false,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A pointer type `*name` (v0.118).
+    fn ptr_ty(name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: false,
+            error_union: false,
+            array_len: None,
+            pointer: true,
+            slice: false,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A slice type `[]name` (v0.118).
+    fn slice_ty(name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: false,
+            error_union: false,
+            array_len: None,
+            pointer: false,
+            slice: true,
             span: Span::DUMMY,
         }
     }
@@ -3777,6 +4120,359 @@ mod tests {
         assert!(
             struct_at < arr_at,
             "struct typedef must precede the array that embeds it:\n{out}"
+        );
+    }
+
+    // -- pointers & slices (v0.118) ----------------------------------------
+
+    fn addr_of(place: Expr) -> Expr {
+        Expr::AddrOf {
+            place: Box::new(place),
+            span: Span::DUMMY,
+        }
+    }
+
+    fn deref(e: Expr) -> Expr {
+        Expr::Deref {
+            expr: Box::new(e),
+            span: Span::DUMMY,
+        }
+    }
+
+    fn slice_expr(base: Expr, lo: Expr, hi: Expr) -> Expr {
+        Expr::SliceExpr {
+            base: Box::new(base),
+            lo: Box::new(lo),
+            hi: Box::new(hi),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A `StructTable` with a single interned `[]i32` (`kd_slice_int32_t`).
+    fn slice_int_table() -> StructTable {
+        let mut t = StructTable::new();
+        t.intern_slice(Type::I32);
+        t
+    }
+
+    #[test]
+    fn pointer_param_cty_is_pointer_to_elem() {
+        // fn f(p: *i32) i32 { return p.*; }
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![Param {
+                name: "p".to_string(),
+                ty: ptr_ty("i32"),
+                span: Span::DUMMY,
+            }],
+            ret: ty("i32"),
+            body: block(vec![ret(deref(ident("p")))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        // `*i32` spells as `int32_t*` (pointers need no typedef).
+        assert!(out.contains("int32_t* kd_p"), "pointer param cty wrong:\n{out}");
+        // `p.*` (read) lowers to `(*(<p>))`.
+        assert!(out.contains("(*(kd_p))"), "deref read lowering wrong:\n{out}");
+    }
+
+    #[test]
+    fn addr_of_lowers_to_ampersand() {
+        // fn g(x: i32) i32 { var p: *i32 = &x; return p.*; }
+        let f = Func {
+            is_pub: false,
+            name: "g".to_string(),
+            params: vec![param("x", "i32")],
+            ret: ty("i32"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "p".to_string(),
+                    ty: ptr_ty("i32"),
+                    value: addr_of(ident("x")),
+                    span: Span::DUMMY,
+                },
+                ret(deref(ident("p"))),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        // The pointer local uses the `T*` spelling; `&x` lowers to `(&(<x>))`.
+        assert!(
+            out.contains("int32_t* kd_p = (&(kd_x));"),
+            "addr-of lowering wrong:\n{out}"
+        );
+        assert!(out.contains("(*(kd_p))"), "deref lowering wrong:\n{out}");
+    }
+
+    #[test]
+    fn deref_assign_lowers_to_star_assignment() {
+        // fn s(p: *i32) void { p.* = 5; }
+        let f = Func {
+            is_pub: false,
+            name: "s".to_string(),
+            params: vec![Param {
+                name: "p".to_string(),
+                ty: ptr_ty("i32"),
+                span: Span::DUMMY,
+            }],
+            ret: ty("void"),
+            body: block(vec![Stmt::FieldAssign {
+                place: deref(ident("p")),
+                value: int(5),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            out.contains("*(kd_p) = (5);"),
+            "deref-assign lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn slice_typedef_and_get_emitted() {
+        // The typedef + inline bounds-checked `_get` come straight off the
+        // interned slice table.
+        let structs = slice_int_table();
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("typedef struct { int32_t *ptr; uintptr_t len; } kd_slice_int32_t;"),
+            "slice typedef missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "static inline int32_t kd_slice_int32_t_get(kd_slice_int32_t s, int64_t i) { if (i < 0 || (uint64_t)i >= s.len) { fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); } return s.ptr[i]; }"
+            ),
+            "slice _get helper missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn slice_from_array_emits_compound_literal() {
+        // fn sl(a: [3]i32) []i32 { return a[0..2]; }
+        let mut structs = StructTable::new();
+        structs.intern_array(Type::I32, 3);
+        structs.intern_slice(Type::I32);
+        let f = Func {
+            is_pub: false,
+            name: "sl".to_string(),
+            params: vec![Param {
+                name: "a".to_string(),
+                ty: arr_ty("i32", 3),
+                span: Span::DUMMY,
+            }],
+            ret: slice_ty("i32"),
+            body: block(vec![ret(slice_expr(ident("a"), int(0), int(2)))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The slice return type uses the slice typedef.
+        assert!(
+            out.contains("kd_slice_int32_t kd_sl("),
+            "slice return type wrong:\n{out}"
+        );
+        // The slice points into the array's `.data` with `len = hi - lo`.
+        assert!(
+            out.contains("(kd_slice_int32_t){ .ptr = (kd_a).data + (0), .len = (2) - (0) }"),
+            "slice-from-array lowering wrong:\n{out}"
+        );
+        // The bounds check is against the array's fixed length.
+        assert!(
+            out.contains("(2) > (3)"),
+            "slice bounds check (vs array length) missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn slice_from_slice_points_through_ptr() {
+        // fn re(s: []i32) []i32 { return s[1..2]; }  — slicing a slice reads `.ptr`.
+        let structs = slice_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "re".to_string(),
+            params: vec![Param {
+                name: "s".to_string(),
+                ty: slice_ty("i32"),
+                span: Span::DUMMY,
+            }],
+            ret: slice_ty("i32"),
+            body: block(vec![ret(slice_expr(ident("s"), int(1), int(2)))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // A slice-of-a-slice points through `.ptr` and bounds-checks against `.len`.
+        assert!(
+            out.contains("(kd_slice_int32_t){ .ptr = (kd_s).ptr + (1), .len = (2) - (1) }"),
+            "slice-from-slice lowering wrong:\n{out}"
+        );
+        assert!(
+            out.contains("(2) > ((kd_s).len)"),
+            "slice-from-slice bounds check (vs .len) missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn slice_index_read_emits_get_call() {
+        // fn at(s: []i32, i: i32) i32 { return s[i]; }
+        let structs = slice_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "at".to_string(),
+            params: vec![
+                Param {
+                    name: "s".to_string(),
+                    ty: slice_ty("i32"),
+                    span: Span::DUMMY,
+                },
+                param("i", "i32"),
+            ],
+            ret: ty("i32"),
+            body: block(vec![ret(index(ident("s"), ident("i")))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The slice param is typed with the slice typedef.
+        assert!(
+            out.contains("kd_slice_int32_t kd_s"),
+            "slice param type wrong:\n{out}"
+        );
+        // Indexing lowers to the bounds-checked `_get` helper call.
+        assert!(
+            out.contains("kd_slice_int32_t_get(kd_s, kd_i)"),
+            "slice index read lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn slice_len_emits_dot_len() {
+        // fn n(s: []i32) usize { return s.len; }
+        let structs = slice_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "n".to_string(),
+            params: vec![Param {
+                name: "s".to_string(),
+                ty: slice_ty("i32"),
+                span: Span::DUMMY,
+            }],
+            ret: ty("usize"),
+            body: block(vec![ret(field(ident("s"), "len"))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // `s.len` reads the slice's runtime `.len` field — not a `.kd_len` member.
+        assert!(
+            out.contains("return ((kd_s).len);"),
+            "slice len lowering wrong:\n{out}"
+        );
+        assert!(
+            !out.contains(".kd_len"),
+            "slice len must not lower to a struct field access:\n{out}"
+        );
+    }
+
+    #[test]
+    fn slice_index_assign_emits_bounds_checked_block() {
+        // fn set(s: []i32) void { s[0] = 9; }
+        let structs = slice_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "set".to_string(),
+            params: vec![Param {
+                name: "s".to_string(),
+                ty: slice_ty("i32"),
+                span: Span::DUMMY,
+            }],
+            ret: ty("void"),
+            body: block(vec![Stmt::FieldAssign {
+                place: index(ident("s"), int(0)),
+                value: int(9),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains(
+                "{ int64_t __kd_idx0 = (0); if (__kd_idx0 < 0 || (uint64_t)__kd_idx0 >= (kd_s).len) { fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); } (kd_s).ptr[__kd_idx0] = (9); }"
+            ),
+            "slice index assign lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn slice_typedef_orders_after_element_struct() {
+        // A `[]Point` slice of a struct: the struct typedef must precede the
+        // slice typedef that names its element by value.
+        let mut structs = point_table();
+        let pid = structs.id_of("Point").unwrap();
+        structs.intern_slice(Type::Struct(pid));
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        let struct_at = out
+            .find("kd_struct_Point;")
+            .expect("Point struct typedef missing");
+        let slice_at = out
+            .find("typedef struct { kd_struct_Point *ptr; uintptr_t len; } kd_slice_struct_Point;")
+            .expect("slice-of-struct typedef missing/wrong");
+        assert!(
+            struct_at < slice_at,
+            "struct typedef must precede the slice that names it:\n{out}"
+        );
+    }
+
+    #[test]
+    fn struct_pointer_field_orders_pointee_first() {
+        // const A = struct { b: *B };  const B = struct { v: i32 };
+        // Even though A is interned first, B's typedef must precede A's: A's
+        // definition names `kd_struct_B*`, so that typedef must be in scope.
+        let mut structs = StructTable::new();
+        let aid = structs.intern("A");
+        let bid = structs.intern("B");
+        let pb = structs.intern_ptr(Type::Struct(bid));
+        structs.set_fields(aid, vec![("b".to_string(), Type::Ptr(pb))]);
+        structs.set_fields(bid, vec![("v".to_string(), Type::I32)]);
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // A pointer field spells `kd_struct_B*` (a table pointer id, resolved
+        // through the table — not the emit-local registry).
+        assert!(
+            out.contains("typedef struct { kd_struct_B* kd_b; } kd_struct_A;"),
+            "pointer field typedef wrong:\n{out}"
+        );
+        let b_at = out.find("} kd_struct_B;").expect("B typedef missing");
+        let a_at = out.find("} kd_struct_A;").expect("A typedef missing");
+        assert!(
+            b_at < a_at,
+            "pointee struct must be declared before the struct that points to it:\n{out}"
         );
     }
 }

@@ -370,3 +370,48 @@ pub fn main() i32 {
     let (code, _out) = build_and_capture(src, EmitMode::Program);
     assert_eq!(code, 101, "out-of-bounds index must panic with exit 101");
 }
+
+// --- v0.118 pointers & slices ----------------------------------------------
+
+#[test]
+fn pointers_and_slices() {
+    let src = r#"
+fn bump(p: *i32) void { p.* = p.* + 1; }
+fn sumSlice(s: []i32) i32 {
+    var total: i32 = 0;
+    var i: usize = 0;
+    while (i < s.len) : (i = i + 1) { total = total + s[i]; }
+    return total;
+}
+pub fn main() i32 {
+    var x: i32 = 10;
+    bump(&x);
+    print(x);                 // 11  (mutation through *i32)
+    var a: [5]i32 = [5]i32{ 1, 2, 3, 4, 5 };
+    var s: []i32 = a[1..4];   // view of {2,3,4}
+    print(s.len);             // 3
+    print(sumSlice(s));       // 9
+    s[0] = 100;               // writes through to the backing array
+    print(a[1]);              // 100
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "11\n3\n9\n100\n");
+}
+
+#[test]
+fn slice_index_out_of_bounds_panics_101() {
+    let src = r#"
+pub fn main() i32 {
+    var a: [3]i32 = [3]i32{ 1, 2, 3 };
+    var s: []i32 = a[0..2];
+    var i: usize = 9;
+    print(s[i]);
+    return 0;
+}
+"#;
+    let (code, _out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 101, "out-of-bounds slice index must panic with exit 101");
+}

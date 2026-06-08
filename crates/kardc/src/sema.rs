@@ -55,6 +55,10 @@
 //!   `var` array (a `const`/parameter root, or a non-array base).
 //! - `E0224` — a fixed-size array type `[N]T` with a negative (or otherwise
 //!   absurd) length `N`.
+//! - `E0230` — `.*` (dereference) of a value whose type is not a pointer (`*T`).
+//! - `E0231` — `&` (address-of) applied to a non-lvalue expression.
+//! - `E0232` — slicing (`a[lo..hi]`) a value that is neither a (addressable)
+//!   array nor a slice.
 
 use std::collections::{HashMap, HashSet};
 
@@ -165,6 +169,8 @@ impl Checker {
                 self.structs.array_len(id),
                 self.type_name(self.structs.array_elem(id))
             ),
+            Type::Ptr(id) => format!("*{}", self.type_name(self.structs.ptr_pointee(id))),
+            Type::Slice(id) => format!("[]{}", self.type_name(self.structs.slice_elem(id))),
             other => other.name().to_string(),
         }
     }
@@ -456,6 +462,16 @@ impl Checker {
         let inner = Type::from_name(&te.name)
             .or_else(|| self.structs.id_of(&te.name).map(Type::Struct))
             .or_else(|| self.structs.enum_id_of(&te.name).map(Type::Enum))?;
+        // `*T` and `[]T` (v0.118) wrap the resolved base type, interning the
+        // pointer / slice type the moment a signature, field or local mentions
+        // it (SPEC §15). They are not combined with `?`/`!`/`[N]` in this
+        // version, so they take precedence and return directly.
+        if te.pointer {
+            return Some(Type::Ptr(self.structs.intern_ptr(inner)));
+        }
+        if te.slice {
+            return Some(Type::Slice(self.structs.intern_slice(inner)));
+        }
         if let Some(n) = te.array_len {
             return Some(Type::Array(self.intern_array_len(inner, n, te.span)));
         }
@@ -521,6 +537,15 @@ impl Checker {
             self.error(te.span, "E0161", format!("unknown type `{}`", te.name));
             return None;
         };
+        // `*T` / `[]T` fields (v0.118): wrap the resolved base type. Like
+        // arrays, the base resolves under the same forward/cyclic-reference
+        // rules (`E0160`) used above.
+        if te.pointer {
+            return Some(Type::Ptr(self.structs.intern_ptr(inner)));
+        }
+        if te.slice {
+            return Some(Type::Slice(self.structs.intern_slice(inner)));
+        }
         if let Some(n) = te.array_len {
             return Some(Type::Array(self.intern_array_len(inner, n, te.span)));
         }
@@ -978,22 +1003,26 @@ impl Checker {
                 let bt = self.resolve_place(base)?;
                 self.field_type_of(bt, field, *span)
             }
-            // `a[i] = e` (SPEC §14.2): the indexed base must be rooted in a
-            // mutable `var` and have an array type; either failure is `E0223`.
-            // The element type is the assignable place's type.
+            // `a[i] = e`: for an array (SPEC §14.2) the base must be rooted in a
+            // mutable `var` (`E0223`); for a slice (SPEC §15.2) the element is
+            // always an assignable place — a slice is a mutable view, so the
+            // binding's mutability is irrelevant. The result is the element type.
             Expr::Index { base, index, span } => {
                 self.check_index_is_int(index);
                 let (bt, mutable) = self.resolve_index_base(base)?;
-                if !mutable {
-                    self.error(
-                        *span,
-                        "E0223",
-                        "cannot assign to an array element through an immutable binding \
-                         (only `var` arrays are assignable)",
-                    );
-                }
                 match bt {
-                    Type::Array(id) => Some(self.structs.array_elem(id)),
+                    Type::Array(id) => {
+                        if !mutable {
+                            self.error(
+                                *span,
+                                "E0223",
+                                "cannot assign to an array element through an immutable binding \
+                                 (only `var` arrays are assignable)",
+                            );
+                        }
+                        Some(self.structs.array_elem(id))
+                    }
+                    Type::Slice(id) => Some(self.structs.slice_elem(id)),
                     other => {
                         let msg = format!(
                             "cannot index-assign into non-array type `{}`",
@@ -1004,6 +1033,22 @@ impl Checker {
                     }
                 }
             }
+            // `p.* = e` (SPEC §15.1): the deref target must be a pointer; the
+            // pointee is always an assignable place (writing through a `*T` is
+            // allowed regardless of the binding's mutability). A non-pointer
+            // target is `E0230`.
+            Expr::Deref { expr, span } => match self.check_expr(expr, None) {
+                Some(Type::Ptr(id)) => Some(self.structs.ptr_pointee(id)),
+                Some(other) => {
+                    let msg = format!(
+                        "`.*` requires a pointer (`*T`) operand, found `{}`",
+                        self.type_name(other)
+                    );
+                    self.error(*span, "E0230", msg);
+                    None
+                }
+                None => None,
+            },
             _ => {
                 self.error(
                     place.span(),
@@ -1043,6 +1088,7 @@ impl Checker {
                 let (bt, mutable) = self.resolve_index_base(inner)?;
                 match bt {
                     Type::Array(id) => Some((self.structs.array_elem(id), mutable)),
+                    Type::Slice(id) => Some((self.structs.slice_elem(id), mutable)),
                     other => {
                         let msg = format!(
                             "cannot index-assign into non-array type `{}`",
@@ -1085,6 +1131,65 @@ impl Checker {
                     self.type_name(other)
                 );
                 self.error(span, "E0165", msg);
+                None
+            }
+        }
+    }
+
+    /// Resolve the type of an lvalue place for `&place` (SPEC §15.1). A place is
+    /// a value identifier, a field chain, an index (into an array or slice), or
+    /// a deref. Unlike [`resolve_place`], address-of does **not** require
+    /// mutability — a pointer to an immutable binding is allowed — so a `const`
+    /// / parameter root is accepted. Anything that is not a place is `E0231`.
+    fn resolve_lvalue_type(&mut self, place: &Expr) -> Option<Type> {
+        match place {
+            Expr::Ident { name, span } => match self.lookup(name) {
+                Some((ty, _)) => Some(ty),
+                None => {
+                    self.error(*span, "E0100", format!("unknown name `{}`", name));
+                    None
+                }
+            },
+            Expr::Field { base, field, span } => {
+                let bt = self.resolve_lvalue_type(base)?;
+                self.field_type_of(bt, field, *span)
+            }
+            Expr::Index { base, index, span } => {
+                self.check_index_is_int(index);
+                let bt = self.resolve_lvalue_type(base)?;
+                match bt {
+                    Type::Array(id) => Some(self.structs.array_elem(id)),
+                    Type::Slice(id) => Some(self.structs.slice_elem(id)),
+                    other => {
+                        let msg = format!(
+                            "cannot index into non-array type `{}`",
+                            self.type_name(other)
+                        );
+                        self.error(*span, "E0220", msg);
+                        None
+                    }
+                }
+            }
+            Expr::Deref { expr, span } => match self.check_expr(expr, None) {
+                Some(Type::Ptr(id)) => Some(self.structs.ptr_pointee(id)),
+                Some(other) => {
+                    let msg = format!(
+                        "`.*` requires a pointer (`*T`) operand, found `{}`",
+                        self.type_name(other)
+                    );
+                    self.error(*span, "E0230", msg);
+                    None
+                }
+                None => None,
+            },
+            _ => {
+                self.error(
+                    place.span(),
+                    "E0231",
+                    "`&` requires an lvalue (a variable, a field, an array/slice element, \
+                     or a pointer dereference)",
+                );
+                self.check_expr(place, None);
                 None
             }
         }
@@ -1146,10 +1251,11 @@ impl Checker {
                     }
                 }
                 let bt = self.check_expr(base, None)?;
-                // `a.len` on an array is its compile-time-constant length, a
-                // `usize` (SPEC §14.1). Any other field on an array falls through
-                // to `field_type_of`, which reports it as `E0165`.
-                if matches!(bt, Type::Array(_)) && field == "len" {
+                // `.len` on an array is its compile-time-constant length and on a
+                // slice its runtime length — both `usize` (SPEC §14.1, §15.2).
+                // Any other field on an array/slice falls through to
+                // `field_type_of`, which reports it as `E0165`.
+                if field == "len" && matches!(bt, Type::Array(_) | Type::Slice(_)) {
                     return Some(Type::Usize);
                 }
                 self.field_type_of(bt, field, *span)
@@ -1354,19 +1460,76 @@ impl Checker {
                     }
                 }
             }
-            // Indexing `base[index]` (read, SPEC §14.2): `base` must be an array
-            // (`E0220`) and `index` an integer; the result is the element type.
+            // Indexing `base[index]` (read): `base` must be an array (SPEC
+            // §14.2) or a slice (SPEC §15.2, `E0220` otherwise) and `index` an
+            // integer; the result is the element type.
             Expr::Index { base, index, span } => {
                 let bt = self.check_expr(base, None);
                 self.check_index_is_int(index);
                 match bt {
                     Some(Type::Array(id)) => Some(self.structs.array_elem(id)),
+                    Some(Type::Slice(id)) => Some(self.structs.slice_elem(id)),
                     Some(other) => {
                         let msg = format!(
-                            "cannot index into non-array type `{}`",
+                            "cannot index into non-array, non-slice type `{}`",
                             self.type_name(other)
                         );
                         self.error(*span, "E0220", msg);
+                        None
+                    }
+                    None => None,
+                }
+            }
+            // `&place` (SPEC §15.1): `place` must be an lvalue (`E0231`); the
+            // result is a pointer to its type.
+            Expr::AddrOf { place, .. } => {
+                let pt = self.resolve_lvalue_type(place)?;
+                Some(Type::Ptr(self.structs.intern_ptr(pt)))
+            }
+            // `expr.*` (SPEC §15.1): `expr` must be a pointer (`E0230`); the
+            // result is its pointee.
+            Expr::Deref { expr: inner, span } => match self.check_expr(inner, None)? {
+                Type::Ptr(id) => Some(self.structs.ptr_pointee(id)),
+                other => {
+                    let msg = format!(
+                        "`.*` requires a pointer (`*T`) operand, found `{}`",
+                        self.type_name(other)
+                    );
+                    self.error(*span, "E0230", msg);
+                    None
+                }
+            },
+            // Slicing `base[lo..hi]` (SPEC §15.2): `base` is an array — which
+            // must be an addressable place, since the slice borrows its storage
+            // — or a slice; `lo`/`hi` are integers; the result is `[]T`. Any
+            // other base is `E0232`.
+            Expr::SliceExpr { base, lo, hi, span } => {
+                let bt = self.check_expr(base, None);
+                self.check_slice_bound(lo);
+                self.check_slice_bound(hi);
+                match bt {
+                    Some(Type::Array(id)) => {
+                        if !is_addressable_place(base) {
+                            self.error(
+                                *span,
+                                "E0232",
+                                "can only slice an addressable array (a variable, or a \
+                                 field/element of one)",
+                            );
+                        }
+                        let elem = self.structs.array_elem(id);
+                        Some(Type::Slice(self.structs.intern_slice(elem)))
+                    }
+                    Some(Type::Slice(id)) => {
+                        let elem = self.structs.slice_elem(id);
+                        Some(Type::Slice(self.structs.intern_slice(elem)))
+                    }
+                    Some(other) => {
+                        let msg = format!(
+                            "cannot slice non-array, non-slice type `{}`",
+                            self.type_name(other)
+                        );
+                        self.error(*span, "E0232", msg);
                         None
                     }
                     None => None,
@@ -1383,6 +1546,17 @@ impl Checker {
             if !it.is_int() {
                 let msg = format!("array index must be an integer, found `{}`", self.type_name(it));
                 self.error(index.span(), "E0110", msg);
+            }
+        }
+    }
+
+    /// Type-check a slice-bound expression (`lo` / `hi` in `a[lo..hi]`) and
+    /// verify it is an integer type (reusing `E0110`, SPEC §15.2).
+    fn check_slice_bound(&mut self, bound: &Expr) {
+        if let Some(bt) = self.check_expr(bound, None) {
+            if !bt.is_int() {
+                let msg = format!("slice bound must be an integer, found `{}`", self.type_name(bt));
+                self.error(bound.span(), "E0110", msg);
             }
         }
     }
@@ -2060,6 +2234,16 @@ fn is_flex_int_literal(e: &Expr) -> bool {
     }
 }
 
+/// Whether `e` denotes an addressable place — a variable, a field chain, an
+/// array/slice index, or a pointer dereference (SPEC §15.1/§15.2). Slicing an
+/// array requires this, because the slice borrows the array's storage.
+fn is_addressable_place(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Ident { .. } | Expr::Field { .. } | Expr::Index { .. } | Expr::Deref { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2076,6 +2260,8 @@ mod tests {
             optional: false,
             error_union: false,
             array_len: None,
+            pointer: false,
+            slice: false,
             span: sp(),
         }
     }
@@ -2086,6 +2272,8 @@ mod tests {
             optional: true,
             error_union: false,
             array_len: None,
+            pointer: false,
+            slice: false,
             span: sp(),
         }
     }
@@ -2096,6 +2284,8 @@ mod tests {
             optional: false,
             error_union: true,
             array_len: None,
+            pointer: false,
+            slice: false,
             span: sp(),
         }
     }
@@ -2106,6 +2296,75 @@ mod tests {
             optional: false,
             error_union: false,
             array_len: Some(len),
+            pointer: false,
+            slice: false,
+            span: sp(),
+        }
+    }
+    /// A pointer type expression `*name` (v0.118).
+    fn te_ptr(name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.into(),
+            optional: false,
+            error_union: false,
+            array_len: None,
+            pointer: true,
+            slice: false,
+            span: sp(),
+        }
+    }
+    /// A slice type expression `[]name` (v0.118).
+    fn te_slice(name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.into(),
+            optional: false,
+            error_union: false,
+            array_len: None,
+            pointer: false,
+            slice: true,
+            span: sp(),
+        }
+    }
+    /// `&place` — address-of (v0.118).
+    fn addr_of(place: Expr) -> Expr {
+        Expr::AddrOf {
+            place: Box::new(place),
+            span: sp(),
+        }
+    }
+    /// `expr.*` — pointer dereference (v0.118).
+    fn deref(expr: Expr) -> Expr {
+        Expr::Deref {
+            expr: Box::new(expr),
+            span: sp(),
+        }
+    }
+    /// `base[lo..hi]` — slice expression (v0.118).
+    fn slice_expr(base: Expr, lo: Expr, hi: Expr) -> Expr {
+        Expr::SliceExpr {
+            base: Box::new(base),
+            lo: Box::new(lo),
+            hi: Box::new(hi),
+            span: sp(),
+        }
+    }
+    /// `var name: *elem = value;`
+    fn let_var_ptr(name: &str, elem: &str, value: Expr) -> Stmt {
+        Stmt::Let {
+            is_const: false,
+            name: name.into(),
+            ty: te_ptr(elem),
+            value,
+            span: sp(),
+        }
+    }
+    /// `var name: []elem = value;`
+    fn let_var_slice(name: &str, elem: &str, value: Expr) -> Stmt {
+        Stmt::Let {
+            is_const: false,
+            name: name.into(),
+            ty: te_slice(elem),
+            value,
             span: sp(),
         }
     }
@@ -3992,6 +4251,476 @@ mod tests {
                 assert_eq!(table.array_len(aid), 3);
             }
             other => panic!("expected an array field type, found {:?}", other),
+        }
+    }
+
+    // ---- pointer & slice tests (v0.118) ----------------------------------
+
+    /// Build a fresh array `var a: [3]i32 = [3]i32{1,2,3};`.
+    fn arr3_decl(name: &str) -> Stmt {
+        let_var_arr(
+            name,
+            "i32",
+            3,
+            array_lit("i32", 3, vec![int(1), int(2), int(3)]),
+        )
+    }
+
+    #[test]
+    fn addr_of_var_yields_pointer() {
+        // fn main() void { var x: i32 = 5; var p: *i32 = &x; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("x", "i32", int(5)),
+                let_var_ptr("p", "i32", addr_of(ident("x"))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn addr_of_wrong_pointee_is_e0110() {
+        // var x: i32 = 5; var p: *bool = &x;  → *i32 is not *bool
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("x", "i32", int(5)),
+                let_var_ptr("p", "bool", addr_of(ident("x"))),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn addr_of_const_or_param_is_ok() {
+        // `&` does not require mutability — addressing a parameter is allowed.
+        // fn f(x: i32) i32 { var p: *i32 = &x; return p.*; }
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "i32",
+            vec![
+                let_var_ptr("p", "i32", addr_of(ident("x"))),
+                ret(Some(deref(ident("p")))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn addr_of_field_yields_pointer() {
+        // const Point = struct { x: i32 };
+        // fn main() void { var pt: Point = Point{.x=1}; var p: *i32 = &pt.x; }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("pt", "Point", struct_lit("Point", vec![("x", int(1))])),
+                    let_var_ptr("p", "i32", addr_of(field(ident("pt"), "x"))),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn addr_of_array_element_yields_pointer() {
+        // fn main() void { var a: [3]i32 = ...; var p: *i32 = &a[0]; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                arr3_decl("a"),
+                let_var_ptr("p", "i32", addr_of(index(ident("a"), int(0)))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn addr_of_non_lvalue_is_e0231() {
+        // var p: *i32 = &(1 + 1);  → a value, not an lvalue
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_ptr(
+                "p",
+                "i32",
+                addr_of(bin(BinOp::Add, int(1), int(1))),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0231"));
+    }
+
+    #[test]
+    fn deref_yields_pointee() {
+        // var x: i32 = 5; var p: *i32 = &x; var y: i32 = p.*;
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("x", "i32", int(5)),
+                let_var_ptr("p", "i32", addr_of(ident("x"))),
+                let_var("y", "i32", deref(ident("p"))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn deref_non_pointer_is_e0230() {
+        // var x: i32 = 5; var y: i32 = x.*;
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("x", "i32", int(5)),
+                let_var("y", "i32", deref(ident("x"))),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0230"));
+    }
+
+    #[test]
+    fn deref_assign_through_pointer() {
+        // var x: i32 = 5; var p: *i32 = &x; p.* = 10;
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("x", "i32", int(5)),
+                let_var_ptr("p", "i32", addr_of(ident("x"))),
+                field_assign(deref(ident("p")), int(10)),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn deref_assign_type_mismatch_is_e0110() {
+        // var x: i32 = 5; var p: *i32 = &x; p.* = true;
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("x", "i32", int(5)),
+                let_var_ptr("p", "i32", addr_of(ident("x"))),
+                field_assign(deref(ident("p")), boolean(true)),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn deref_assign_through_non_pointer_is_e0230() {
+        // var x: i32 = 5; x.* = 1;
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("x", "i32", int(5)),
+                field_assign(deref(ident("x")), int(1)),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0230"));
+    }
+
+    #[test]
+    fn pointer_param_and_return() {
+        // fn get(p: *i32) i32 { return p.*; }
+        // fn main() void { var x: i32 = 5; var y: i32 = get(&x); }
+        let items = vec![
+            Item::Func(Func {
+                is_pub: false,
+                name: "get".into(),
+                params: vec![Param {
+                    name: "p".into(),
+                    ty: te_ptr("i32"),
+                    span: sp(),
+                }],
+                ret: te("i32"),
+                body: block(vec![ret(Some(deref(ident("p"))))]),
+                span: sp(),
+            }),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("x", "i32", int(5)),
+                    let_var("y", "i32", call("get", vec![addr_of(ident("x"))])),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn slice_of_array_yields_slice() {
+        // var a: [3]i32 = ...; var s: []i32 = a[0..2];
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                arr3_decl("a"),
+                let_var_slice("s", "i32", slice_expr(ident("a"), int(0), int(2))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn slice_of_non_array_is_e0232() {
+        // var x: i32 = 5; var s: []i32 = x[0..1];
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("x", "i32", int(5)),
+                let_var_slice("s", "i32", slice_expr(ident("x"), int(0), int(1))),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0232"));
+    }
+
+    #[test]
+    fn slice_of_array_literal_is_e0232() {
+        // Slicing a non-addressable array (a literal) is rejected.
+        // var s: []i32 = [3]i32{1,2,3}[0..2];
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_slice(
+                "s",
+                "i32",
+                slice_expr(
+                    array_lit("i32", 3, vec![int(1), int(2), int(3)]),
+                    int(0),
+                    int(2),
+                ),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0232"));
+    }
+
+    #[test]
+    fn slice_of_slice_yields_slice() {
+        // var a: [3]i32 = ...; var s: []i32 = a[0..3]; var s2: []i32 = s[0..2];
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                arr3_decl("a"),
+                let_var_slice("s", "i32", slice_expr(ident("a"), int(0), int(3))),
+                let_var_slice("s2", "i32", slice_expr(ident("s"), int(0), int(2))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn slice_bound_must_be_integer_e0110() {
+        // var a: [3]i32 = ...; var s: []i32 = a[true..2];
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                arr3_decl("a"),
+                let_var_slice("s", "i32", slice_expr(ident("a"), boolean(true), int(2))),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn slice_index_yields_element_type() {
+        // var a: [3]i32 = ...; var s: []i32 = a[0..3]; var v: i32 = s[0];
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                arr3_decl("a"),
+                let_var_slice("s", "i32", slice_expr(ident("a"), int(0), int(3))),
+                let_var("v", "i32", index(ident("s"), int(0))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn slice_index_wrong_element_type_is_e0110() {
+        // var s: []i32 = ...; var b: bool = s[0];
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                arr3_decl("a"),
+                let_var_slice("s", "i32", slice_expr(ident("a"), int(0), int(3))),
+                let_var("b", "bool", index(ident("s"), int(0))),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn slice_len_is_usize() {
+        // var s: []i32 = ...; var n: usize = s.len;
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                arr3_decl("a"),
+                let_var_slice("s", "i32", slice_expr(ident("a"), int(0), int(3))),
+                let_var("n", "usize", field(ident("s"), "len")),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn slice_index_assign() {
+        // var a: [3]i32 = ...; var s: []i32 = a[0..3]; s[0] = 9;
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                arr3_decl("a"),
+                let_var_slice("s", "i32", slice_expr(ident("a"), int(0), int(3))),
+                field_assign(index(ident("s"), int(0)), int(9)),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn slice_index_assign_wrong_type_is_e0110() {
+        // var s: []i32 = ...; s[0] = true;
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                arr3_decl("a"),
+                let_var_slice("s", "i32", slice_expr(ident("a"), int(0), int(3))),
+                field_assign(index(ident("s"), int(0)), boolean(true)),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn slice_param_and_len() {
+        // fn count(s: []i32) usize { return s.len; }
+        // fn main() void { var a: [2]i32 = [2]i32{1,2}; var n: usize = count(a[0..2]); }
+        let items = vec![
+            Item::Func(Func {
+                is_pub: false,
+                name: "count".into(),
+                params: vec![Param {
+                    name: "s".into(),
+                    ty: te_slice("i32"),
+                    span: sp(),
+                }],
+                ret: te("usize"),
+                body: block(vec![ret(Some(field(ident("s"), "len")))]),
+                span: sp(),
+            }),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var_arr("a", "i32", 2, array_lit("i32", 2, vec![int(1), int(2)])),
+                    let_var(
+                        "n",
+                        "usize",
+                        call("count", vec![slice_expr(ident("a"), int(0), int(2))]),
+                    ),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn pointer_struct_field_resolves_to_ptr_type() {
+        // const Point = struct { x: i32 };
+        // const Holder = struct { p: *Point };  → field `p` resolves to `*Point`.
+        let point = struct_item("Point", vec![("x", "i32")]);
+        let holder = Item::Struct(StructDecl {
+            is_pub: false,
+            name: "Holder".into(),
+            fields: vec![FieldDecl {
+                name: "p".into(),
+                ty: te_ptr("Point"),
+                span: sp(),
+            }],
+            methods: Vec::new(),
+            span: sp(),
+        });
+        let m = Module {
+            items: vec![point, holder],
+        };
+        let table = check(&m).expect("pointer-field struct should type-check");
+        let id = table.id_of("Holder").unwrap();
+        let (fname, fty) = table.get(id).fields[0].clone();
+        assert_eq!(fname, "p");
+        match fty {
+            Type::Ptr(pid) => {
+                let pointee = table.ptr_pointee(pid);
+                let sid = table.id_of("Point").unwrap();
+                assert_eq!(pointee, Type::Struct(sid));
+            }
+            other => panic!("expected a pointer field type, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn slice_struct_field_resolves_to_slice_type() {
+        // const Row = struct { cells: []i32 };  → field `cells` resolves to `[]i32`.
+        let row = Item::Struct(StructDecl {
+            is_pub: false,
+            name: "Row".into(),
+            fields: vec![FieldDecl {
+                name: "cells".into(),
+                ty: te_slice("i32"),
+                span: sp(),
+            }],
+            methods: Vec::new(),
+            span: sp(),
+        });
+        let m = Module { items: vec![row] };
+        let table = check(&m).expect("slice-field struct should type-check");
+        let id = table.id_of("Row").unwrap();
+        let (fname, fty) = table.get(id).fields[0].clone();
+        assert_eq!(fname, "cells");
+        match fty {
+            Type::Slice(sid) => assert_eq!(table.slice_elem(sid), Type::I32),
+            other => panic!("expected a slice field type, found {:?}", other),
         }
     }
 }

@@ -134,6 +134,8 @@ pub enum TokenKind {
     Bang,     // !
     Question, // ?
     FatArrow, // =>  (switch arms)
+    Amp,      // &   (address-of)
+    DotDot,   // ..  (slice ranges)
 
     /// End of input. Always the final token.
     Eof,

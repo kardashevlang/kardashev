@@ -95,6 +95,13 @@ pub fn eval(expr: &Expr, consts: &HashMap<String, ConstVal>) -> Result<ConstVal,
             "E0130",
             "arrays are not allowed in a constant expression",
         )),
+        Expr::AddrOf { span, .. } | Expr::Deref { span, .. } | Expr::SliceExpr { span, .. } => {
+            Err(Diagnostic::error(
+                *span,
+                "E0130",
+                "pointers and slices are not allowed in a constant expression",
+            ))
+        }
     }
 }
 
