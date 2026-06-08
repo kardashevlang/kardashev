@@ -55,6 +55,17 @@ pub fn eval(expr: &Expr, consts: &HashMap<String, ConstVal>) -> Result<ConstVal,
             "E0130",
             "function calls are not allowed in a constant expression",
         )),
+        // Structs are not compile-time constant values in v0.112.
+        Expr::StructLit { span, .. } => Err(Diagnostic::error(
+            *span,
+            "E0130",
+            "struct literals are not allowed in a constant expression",
+        )),
+        Expr::Field { span, .. } => Err(Diagnostic::error(
+            *span,
+            "E0130",
+            "field access is not allowed in a constant expression",
+        )),
     }
 }
 

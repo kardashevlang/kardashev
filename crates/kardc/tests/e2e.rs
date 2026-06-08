@@ -146,3 +146,48 @@ test "trivial" { expect(true); }
     let (code, _) = build_and_capture(src, EmitMode::Test);
     assert_eq!(code, 0);
 }
+
+// --- v0.112 structs --------------------------------------------------------
+
+#[test]
+fn structs_literals_fields_and_nesting() {
+    // Struct literal, field access, by-value param, field assignment, and
+    // nested structs with nested field access + nested field assignment.
+    let src = r#"
+const Point = struct { x: i32, y: i32 };
+const Line = struct { a: Point, b: Point };
+
+fn manhattan(p: Point) i32 { return p.x + p.y; }
+
+pub fn main() i32 {
+    var p: Point = Point{ .x = 3, .y = 4 };
+    print(manhattan(p));
+    p.x = 10;
+    print(p.x);
+    var l: Line = Line{ .a = Point{ .x = 1, .y = 2 }, .b = Point{ .x = 5, .y = 6 } };
+    print(l.a.y);
+    l.b.x = 99;
+    print(l.b.x);
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "7\n10\n2\n99\n");
+}
+
+#[test]
+fn struct_returned_by_value() {
+    let src = r#"
+const Pair = struct { lo: i32, hi: i32 };
+fn make(a: i32, b: i32) Pair { return Pair{ .lo = a, .hi = b }; }
+pub fn main() i32 {
+    var pr: Pair = make(11, 22);
+    print(pr.lo + pr.hi);
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "33\n");
+}

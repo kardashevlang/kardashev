@@ -18,6 +18,28 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.112.0] — Structs (data aggregates)
+
+The first roadmap version of the Gen-2 arc: **structs**, the foundational
+product type. Data only — methods / associated functions are v0.113, kept
+separate so each version ships complete and well-tested.
+
+### Added
+- **Struct declarations** (Zig syntax): `pub? const Name = struct { x: i32, y:
+  i32 };`, including empty structs and nested structs.
+- **Struct literals**: `Name{ .x = 1, .y = 2 }` — every declared field
+  initialised exactly once, order-free.
+- **Field access** `a.b.c` and **field assignment** `a.b.c = e;`.
+- **Struct-valued** parameters, returns and locals — passed/returned **by
+  value** (lowered to C structs and C99 compound literals).
+- Type system: `Type::Struct(id)` + a `StructTable` (built by `sema`, consumed
+  by `emit_c`); `sema::check` now returns the table.
+- Diagnostics `E0160`–`E0168` for struct misuse (forward/cyclic field
+  reference, unknown field type, duplicate field, non-struct literal/access,
+  missing/extra field, immutable-place field assignment, struct equality).
+- Formatter, 36 new unit tests, 2 end-to-end struct tests, and
+  `examples/point.ks`.
+
 ## [0.111.1] — Source extension `.kd` → `.ks` ("Kardashev Scale")
 
 ### Changed

@@ -256,9 +256,106 @@ a roadmap item.
 
 ## 8. Honest deferrals (tracked in ROADMAP-RUST-ZIG.md)
 
-Optionals `?T`, error unions `!T` + `try`/`catch`/`errdefer`, structs, enums,
+Optionals `?T`, error unions `!T` + `try`/`catch`/`errdefer`, struct **methods /
+associated functions** (struct *data* lands in v0.112 — see §9), enums,
 tagged unions, arrays/slices/pointers, the allocator interface and an
 allocator-based stdlib, generics via `comptime T: type`, type inference for
 `var`/`const`, the full imperative `build.ks`, the real cross-compilation
 matrix, comment-preserving `fmt`, and re-self-hosting. None of these are stubbed
-in v1 — they are absent and scheduled.
+— they are absent and scheduled.
+
+## 9. Structs (v0.112) — data aggregates
+
+A struct is a named, by-value product type. v0.112 ships struct **data**;
+methods / associated functions are v0.113.
+
+### 9.1 Syntax (grammar additions)
+
+```
+item        := func | const_decl | test_block | struct_decl
+struct_decl := "pub"? "const" IDENT "=" "struct" "{" field ("," field)* ","? "}" ";"
+             | "pub"? "const" IDENT "=" "struct" "{" "}" ";"        // empty struct
+field       := IDENT ":" type
+
+primary     := ... | struct_lit
+struct_lit  := IDENT "{" (field_init ("," field_init)* ","?)? "}"
+field_init  := "." IDENT "=" expr
+postfix     := primary ("." IDENT)*          // field access chains
+```
+
+- `const Point = struct { x: i32, y: i32 };` — a struct declaration. It is a
+  top-level item (parsed when a `const`'s `=` is followed by the `struct`
+  keyword; otherwise `const` is the ordinary value binding of §2).
+- `Point{ .x = 1, .y = 2 }` — a struct literal. Every declared field must be
+  initialised exactly once; order is free.
+- `p.x` — field access (`postfix`). Chains: `a.b.c`.
+- `p.x = e;` — field assignment (`Stmt::FieldAssign`); the place may be a chain
+  `a.b.c`. Simple `name = e;` remains `Stmt::Assign`.
+
+The `IDENT {` struct-literal form is unambiguous: bare blocks never start an
+expression, and `if`/`while` conditions are parenthesised, so a `{` following an
+identifier in expression position always opens a struct literal.
+
+### 9.2 AST additions (`ast.rs`)
+
+```
+Item::Struct(StructDecl)
+StructDecl { is_pub: bool, name: String, fields: Vec<FieldDecl>, span }
+FieldDecl  { name: String, ty: TypeExpr, span }
+Expr::StructLit { name: String, fields: Vec<FieldInit>, span }
+FieldInit  { name: String, value: Expr, span }
+Expr::Field { base: Box<Expr>, field: String, span }
+Stmt::FieldAssign { place: Expr /* a Field */, value: Expr, span }
+```
+
+### 9.3 Types (`types.rs`)
+
+`Type` gains `Struct(u32)` (an id into the `StructTable`; stays `Copy`; two
+struct types are equal iff same id). `Type::name()` returns `"struct"` for a
+struct (sema formats real names via the table); `Type::c_name()` is
+`unreachable!()` for `Struct` — emit resolves struct C names through the table.
+
+```
+StructInfo  { name: String, fields: Vec<(String, Type)> }
+StructTable { /* id <-> name, field lists */ }
+  ::new(), ::intern(name)->u32, ::id_of(name)->Option<u32>,
+  ::get(id)->&StructInfo, ::set_fields(id, fields),
+  ::c_name(id)->String  // "kd_struct_<Name>",  ::iter() in declaration order
+```
+
+### 9.4 Semantics (`sema`) — new signature
+
+`sema::check(&Module) -> Result<StructTable, Vec<Diagnostic>>`. In a pre-pass,
+collect struct declarations in source order, intern ids, then resolve each
+field's type (a field type name resolves via `Type::from_name` or a *previously
+declared* struct — a forward/cyclic struct reference is `E0160`; an unknown type
+is `E0161`; a duplicate field name is `E0162`). Then check bodies:
+
+- **Struct literal** `Name{…}`: `Name` must be a struct (`E0163` otherwise);
+  every field present exactly once with a matching type, none missing/extra/
+  duplicated (`E0164`); result type `Struct(id)`.
+- **Field access** `e.f`: `e` must be a struct (`E0165`); `f` must be a field
+  (`E0166`); result is the field's type.
+- **`FieldAssign`** `place = e`: `place` must be a field-access chain rooted in
+  an assignable `var` (not a `const`/param) (`E0167`); `e`'s type must match the
+  field type (`E0110`).
+- Struct-typed params/locals/returns are allowed; assignment/return type checks
+  compare struct ids. `==`/`!=` on structs is `E0168`. `print`/`expect` reject
+  struct arguments (still int/bool).
+
+### 9.5 Backend (`emit_c`) — new signature
+
+`emit_c::emit(&Module, &StructTable, mode) -> String`. Emit, after the prelude
+and before function forward-decls, one C typedef per struct **in declaration
+order**:
+
+```c
+typedef struct { <cty(f.ty)> kd_<f.name>; ... } kd_struct_<Name>;
+```
+
+(An empty struct gets a `char _unused;` member so it is valid C.) Lowerings:
+field access `e.f` → `(<e>).kd_<f>`; struct literal → `((kd_struct_<Name>){
+.kd_<f> = <e>, ... })` (C99 compound literal); `FieldAssign place = e;` →
+`(<place>) = (<e>);`. Struct-typed locals/params/returns use the typedef'd type
+(`cty` maps `Struct(id)` → `structs.c_name(id)`). C passes/returns structs by
+value, matching the language semantics. Output stays deterministic.

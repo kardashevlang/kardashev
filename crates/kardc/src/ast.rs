@@ -18,6 +18,24 @@ pub enum Item {
     Func(Func),
     Const(ConstDecl),
     Test(TestBlock),
+    Struct(StructDecl),
+}
+
+/// A struct declaration: `pub? const Name = struct { f: T, ... };` (v0.112).
+/// Data only — methods / associated functions are a later roadmap version.
+#[derive(Clone, Debug)]
+pub struct StructDecl {
+    pub is_pub: bool,
+    pub name: String,
+    pub fields: Vec<FieldDecl>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct FieldDecl {
+    pub name: String,
+    pub ty: TypeExpr,
+    pub span: Span,
 }
 
 /// A function definition: `pub fn name(params) RetType { body }`.
@@ -91,6 +109,13 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    /// `place = expr;` where `place` is a field-access chain (`a.b.c`).
+    /// Simple `name = expr;` uses [`Stmt::Assign`] instead.
+    FieldAssign {
+        place: Expr,
+        value: Expr,
+        span: Span,
+    },
     /// An expression evaluated for its effect, e.g. `print(x);`.
     Expr(Expr),
     /// `return expr;` or `return;`
@@ -134,6 +159,7 @@ impl Stmt {
         match self {
             Stmt::Let { span, .. } => *span,
             Stmt::Assign { span, .. } => *span,
+            Stmt::FieldAssign { span, .. } => *span,
             Stmt::Expr(e) => e.span(),
             Stmt::Return { span, .. } => *span,
             Stmt::If { span, .. } => *span,
@@ -240,6 +266,26 @@ pub enum Expr {
         expr: Box<Expr>,
         span: Span,
     },
+    /// A struct literal: `Name{ .f1 = e1, .f2 = e2 }`.
+    StructLit {
+        name: String,
+        fields: Vec<FieldInit>,
+        span: Span,
+    },
+    /// Field access: `base.field`.
+    Field {
+        base: Box<Expr>,
+        field: String,
+        span: Span,
+    },
+}
+
+/// One `.name = value` initializer inside a struct literal.
+#[derive(Clone, Debug)]
+pub struct FieldInit {
+    pub name: String,
+    pub value: Expr,
+    pub span: Span,
 }
 
 impl Expr {
@@ -252,6 +298,8 @@ impl Expr {
             Expr::Binary { span, .. } => *span,
             Expr::Call { span, .. } => *span,
             Expr::Comptime { span, .. } => *span,
+            Expr::StructLit { span, .. } => *span,
+            Expr::Field { span, .. } => *span,
         }
     }
 }
