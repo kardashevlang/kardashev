@@ -1,2 +1,0 @@
-# Package marker for the LLVM detection module extension.
-# Targets are not declared here; the extension generates an @llvm// repo.

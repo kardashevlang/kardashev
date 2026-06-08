@@ -1,0 +1,257 @@
+//! The abstract syntax tree.
+//!
+//! This is the central contract between the compiler stages: the parser
+//! produces it, semantic analysis validates it, and the C backend / formatter
+//! consume it. Keep it stable — every other module depends on these shapes.
+
+use crate::span::Span;
+
+/// A whole source file.
+#[derive(Clone, Debug)]
+pub struct Module {
+    pub items: Vec<Item>,
+}
+
+/// A top-level item.
+#[derive(Clone, Debug)]
+pub enum Item {
+    Func(Func),
+    Const(ConstDecl),
+    Test(TestBlock),
+}
+
+/// A function definition: `pub fn name(params) RetType { body }`.
+///
+/// Note the Zig-style return type: it follows the parameter list directly,
+/// with no `->` arrow.
+#[derive(Clone, Debug)]
+pub struct Func {
+    pub is_pub: bool,
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: TypeExpr,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct Param {
+    pub name: String,
+    pub ty: TypeExpr,
+    pub span: Span,
+}
+
+/// A `const NAME: T = <comptime-expr>;` declaration. Valid at the top level
+/// and (without `pub`) inside a function body.
+#[derive(Clone, Debug)]
+pub struct ConstDecl {
+    pub is_pub: bool,
+    pub name: String,
+    pub ty: TypeExpr,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// A `test "name" { ... }` block — a first-class testing construct.
+#[derive(Clone, Debug)]
+pub struct TestBlock {
+    pub name: String,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// A named type reference, e.g. `i32`. Resolved to a [`crate::types::Type`]
+/// during semantic analysis.
+#[derive(Clone, Debug)]
+pub struct TypeExpr {
+    pub name: String,
+    pub span: Span,
+}
+
+/// A brace-delimited sequence of statements that introduces a new scope.
+#[derive(Clone, Debug)]
+pub struct Block {
+    pub stmts: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum Stmt {
+    /// `var name: T = expr;` (is_const = false) or `const name: T = expr;`.
+    Let {
+        is_const: bool,
+        name: String,
+        ty: TypeExpr,
+        value: Expr,
+        span: Span,
+    },
+    /// `name = expr;`
+    Assign {
+        name: String,
+        value: Expr,
+        span: Span,
+    },
+    /// An expression evaluated for its effect, e.g. `print(x);`.
+    Expr(Expr),
+    /// `return expr;` or `return;`
+    Return {
+        value: Option<Expr>,
+        span: Span,
+    },
+    /// `if (cond) then [else els]`. `els` is another statement so that
+    /// `else if` chains and `else { ... }` blocks are both representable.
+    If {
+        cond: Expr,
+        then: Block,
+        els: Option<Box<Stmt>>,
+        span: Span,
+    },
+    /// `while (cond) { body }` or `while (cond) : (cont) { body }`.
+    ///
+    /// The continue-clause `cont` is a *statement* — typically an assignment
+    /// like `i = i + 1` — because assignment is a statement, not an expression,
+    /// in this language. The parser restricts it to an assignment or an
+    /// expression statement.
+    While {
+        cond: Expr,
+        cont: Option<Box<Stmt>>,
+        body: Block,
+        span: Span,
+    },
+    Break(Span),
+    Continue(Span),
+    /// `defer stmt;` — runs `stmt` at scope exit, in LIFO order.
+    Defer {
+        stmt: Box<Stmt>,
+        span: Span,
+    },
+    /// A bare nested block `{ ... }`.
+    Block(Block),
+}
+
+impl Stmt {
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::Let { span, .. } => *span,
+            Stmt::Assign { span, .. } => *span,
+            Stmt::Expr(e) => e.span(),
+            Stmt::Return { span, .. } => *span,
+            Stmt::If { span, .. } => *span,
+            Stmt::While { span, .. } => *span,
+            Stmt::Break(s) => *s,
+            Stmt::Continue(s) => *s,
+            Stmt::Defer { span, .. } => *span,
+            Stmt::Block(b) => b.span,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnOp {
+    Neg, // -x
+    Not, // !x
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+}
+
+impl BinOp {
+    /// True for comparison/logical operators (which yield `bool`).
+    pub fn is_bool_result(self) -> bool {
+        matches!(
+            self,
+            BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::And
+                | BinOp::Or
+        )
+    }
+
+    /// The C operator spelling.
+    pub fn c_op(self) -> &'static str {
+        match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Rem => "%",
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            BinOp::And => "&&",
+            BinOp::Or => "||",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Expr {
+    Int {
+        value: i64,
+        span: Span,
+    },
+    Bool {
+        value: bool,
+        span: Span,
+    },
+    Ident {
+        name: String,
+        span: Span,
+    },
+    Unary {
+        op: UnOp,
+        expr: Box<Expr>,
+        span: Span,
+    },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+        span: Span,
+    },
+    Call {
+        callee: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
+    /// `comptime <expr>` — must be evaluable at compile time.
+    Comptime {
+        expr: Box<Expr>,
+        span: Span,
+    },
+}
+
+impl Expr {
+    pub fn span(&self) -> Span {
+        match self {
+            Expr::Int { span, .. } => *span,
+            Expr::Bool { span, .. } => *span,
+            Expr::Ident { span, .. } => *span,
+            Expr::Unary { span, .. } => *span,
+            Expr::Binary { span, .. } => *span,
+            Expr::Call { span, .. } => *span,
+            Expr::Comptime { span, .. } => *span,
+        }
+    }
+}

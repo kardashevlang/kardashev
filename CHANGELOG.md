@@ -10,13 +10,61 @@ each completed **roadmap** is a `MINOR` bump (Roadmap v9 → `0.9.0`, v10 →
 `0.10.0`) and bug-fix releases bump `PATCH`. Per SemVer's 0.x rule anything may
 change between minors until 1.0. `1.0.0` is reserved for a language-surface
 **stability commitment**; after it the language evolves via opt-in **editions**
-(the Rust model) rather than `MAJOR` bumps. The version lives in
-`compiler/include/kardashev/version.hpp` (reported by `kardc --version`),
-`MODULE.bazel`, and here.
+(the Rust model) rather than `MAJOR` bumps. From `0.111.0` on, the version lives
+in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
+`kard version`), and here.
 
 `0.9.0` is the first tagged release; the entries below `0.9.0` document the
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
+
+## [0.111.0] — Generation 2: ground-up Rust rewrite, Zig-philosophy reboot
+
+**A complete change of direction.** Generations 1 (`0.1.0`–`0.110.0`) was a
+C++/LLVM compiler for a Rust-flavoured language with an affine borrow checker
+and effect system, built with Bazel. It is preserved in git history and
+releases. **Generation 2 is a ground-up reset**: the compiler is reimplemented
+in **Rust** (every implementation file is `.rs`, zero external crates) and the
+language is redesigned around **Zig's philosophy** — no hidden control flow, no
+hidden allocations, `comptime` instead of macros, explicit `defer`, first-class
+tests, and a single self-contained `kard` toolchain whose build is written in
+the language itself. See `SPEC.md` and `ROADMAP-RUST-ZIG.md`.
+
+### Added
+- **New compiler in Rust** (`crates/kardc/`): `lexer`, `parser`, `sema` +
+  `const_eval`, `emit_c`, `backend`, `cli`, `build_system`, `scaffold`, `fmt`,
+  over the shared `ast`/`types`/`token`/`span`/`diag` contract. Pipeline:
+  `source → lex → parse → sema → emit C → cc → native binary`.
+- **Language v1 (the procedural core):** functions with Zig-style return types
+  and recursion; fixed-width integers `i8…u64`, `usize`, `bool`, `void`;
+  `var`/`const` bindings and comptime-evaluated top-level `const`;
+  arithmetic/comparison/logical operators with no overloading; `if`/`else`,
+  `while` (incl. `while (c) : (cont)`), `break`, `continue`, `return`;
+  **`defer`** with correct LIFO flushing across fall-through, `return`, `break`
+  and `continue`; **`comptime`** expression folding; built-in **`test`** blocks
+  with `expect`; and a `print` builtin.
+- **The `kard` toolchain:** `build`, `run`, `test`, `fmt`, `init`, `version`,
+  `help`. `build.kd` minimal declarative build manifest; `kard init`
+  scaffolding; diagnostics with filename, line/column and a source caret.
+- **Tests:** 101 unit tests + 7 end-to-end compile-and-run tests (108 total),
+  green on Ubuntu and macOS via `cargo test`.
+
+### Changed
+- CI now builds and tests with **cargo** (replacing Bazel + LLVM); a toolchain
+  smoke step scaffolds, builds, runs and tests a project end-to-end.
+
+### Removed
+- The entire Generation-1 C++/LLVM/Bazel codebase: `compiler/` (C++), `bazel/`,
+  `BUILD.bazel`/`MODULE.bazel*`/`.bazelrc`/`.bazelversion`, `Makefile.local`, the
+  `kard` shell driver, the Gen-1 `tests/`, `examples/`, `docs/`, `bench/` and
+  roadmaps. (All recoverable from git history and the `v0.110.0` release.)
+
+### Deferred (honestly; tracked in `ROADMAP-RUST-ZIG.md`)
+Optionals `?T`, error unions `!T`/`try`/`catch`/`errdefer`, structs, enums,
+slices/arrays/pointers, the allocator interface + stdlib, comptime generics,
+type inference, the full imperative `build.kd`, the real cross-compilation
+matrix, comment-preserving `fmt`, and re-self-hosting. None are stubbed —
+absent and scheduled.
 
 ## [0.110.0] — Bound-satisfaction diagnostics + LSP code actions (closes ARC D; completes the v101–v110 arc)
 

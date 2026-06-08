@@ -1,19 +1,11 @@
-# Bazel
-bazel-*
-# MODULE.bazel.lock is committed for reproducible dependency resolution.
+# Rust build artifacts (Cargo.lock IS committed — this is a toolchain binary).
+/target/
 
-# Build artifacts
-build/
-build.local/
-Makefile.local
+# Native artifacts the C backend may leave behind locally.
 *.o
 *.a
 *.so
 *.dylib
-
-# LLVM intermediates
-*.bc
-*.ll
 
 # macOS
 .DS_Store
@@ -23,13 +15,6 @@ Makefile.local
 .idea/
 *.swp
 *.swo
-
-# mdBook output (docs site is built in CI; see .github/workflows/docs.yml)
-/book/
-
-# build artifacts (local Makefile.local copies)
-compiler/kard-lsp
-compiler/kardfmt
 
 # Claude Code worktrees / local agent state
 .claude/
