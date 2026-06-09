@@ -705,3 +705,31 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "10\n81\n285\n");
 }
+
+// --- v0.131 compound assignment --------------------------------------------
+
+#[test]
+fn compound_assignment_operators() {
+    let src = r#"
+pub fn main() i32 {
+    var x: i32 = 10;
+    x += 5;   print(x);     // 15
+    x -= 3;   print(x);     // 12
+    x *= 4;   print(x);     // 48
+    x /= 5;   print(x);     // 9
+    x %= 4;   print(x);     // 1
+    var a: [3]i32 = [3]i32{ 10, 20, 30 };
+    var i: usize = 1;
+    a[i] += 100;            // a[1] = 120
+    print(a[1]);            // 120
+    var sum: i32 = 0;
+    var k: i32 = 0;
+    while (k < 5) : (k += 1) { sum += k; }  // compound in the continue-clause + body
+    print(sum);             // 10
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "15\n12\n48\n9\n1\n120\n10\n");
+}

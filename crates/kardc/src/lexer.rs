@@ -167,10 +167,17 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diagnostic>> {
             b'&' => (TokenKind::Amp, 1),
             b'|' => (TokenKind::Pipe, 1),
             b'@' => (TokenKind::At, 1),
+            // `+ - * / %` and their compound-assignment forms `+= -= *= /= %=`
+            // (v0.131): a trailing `=` makes the two-char compound token.
+            b'+' if next == Some(b'=') => (TokenKind::PlusEq, 2),
             b'+' => (TokenKind::Plus, 1),
+            b'-' if next == Some(b'=') => (TokenKind::MinusEq, 2),
             b'-' => (TokenKind::Minus, 1),
+            b'*' if next == Some(b'=') => (TokenKind::StarEq, 2),
             b'*' => (TokenKind::Star, 1),
+            b'/' if next == Some(b'=') => (TokenKind::SlashEq, 2),
             b'/' => (TokenKind::Slash, 1),
+            b'%' if next == Some(b'=') => (TokenKind::PercentEq, 2),
             b'%' => (TokenKind::Percent, 1),
             b'?' => (TokenKind::Question, 1),
             b'=' => {

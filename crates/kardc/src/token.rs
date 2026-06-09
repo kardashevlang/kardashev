@@ -126,6 +126,11 @@ pub enum TokenKind {
     Colon,
     Dot,
     Eq,      // =
+    PlusEq,    // +=
+    MinusEq,   // -=
+    StarEq,    // *=
+    SlashEq,   // /=
+    PercentEq, // %=
     EqEq,    // ==
     BangEq,  // !=
     Lt,      // <

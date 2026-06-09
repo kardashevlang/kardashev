@@ -178,13 +178,61 @@ alloc+copy+free) — ships as `examples/arraylist.ks`, the first allocator-based
 std container. **This completes the numbered roadmap v0.112–v0.130.** (Value-
 semantics `self`; pointer receivers / multiple type params are later work.)
 
-### Beyond (Arc 3+, each multi-session)
-**Bundled cross-compilation sysroots** (Zig's "cross-compile anything out of the
-box"); the full imperative `build.zig` build graph (a kardashev program with a
-`build(*Builder)` entry point); named error sets `error{…}`; a richer std
-(`HashMap`, I/O, formatting); re-self-hosting (the compiler in kardashev); a
-package registry; an LSP + formatter-parity pass; and a mechanized spec → 1.0
-stability commitment.
+## Arc 3 (v0.131–v0.140) — toward 1.0: ergonomics, mutation, richer generics
+
+With the language surface complete (Arc 1 + Arc 2), Arc 3 rounds it out toward a
+practical 1.0: imperative ergonomics, real in-place mutation, multi-parameter
+generics, comptime reflection, named error sets, and a second std container.
+Ordered by tractability so momentum stays high; each ships via the standard
+cadence (SPEC+contract → workflow → integrate → test → PR → CI both → release).
+
+### v0.131.0 — Compound assignment operators ✅
+`+= -= *= /= %=` on any assignable place (`x`, `s.f`, `a[i]`) — `place = place op
+rhs`, evaluating the place once (an index compound reads `i` once). `Stmt::Assign`
+/ `Stmt::FieldAssign` carry `op: Option<BinOp>`.
+
+### v0.132.0 — Bitwise & shift operators
+`& | ^ << >> ~` on integers. Binary `&`/`|` disambiguate from address-of /
+capture by position (infix vs prefix / capture context).
+
+### v0.133.0 — `for` loops over arrays & slices
+`for (xs) |x| { … }` and `for (xs, 0..) |x, i| { … }` — element (and index)
+capture, lowered to an indexed `while`. Works for `[]T` and `[N]T`.
+
+### v0.134.0 — Pointer-receiver methods (true mutation)
+`fn push(self: *Self, …) …` with auto-ref at the call site (`list.push(x)`
+passes `&list`), so methods mutate the receiver in place — no value-return dance.
+
+### v0.135.0 — Multiple type parameters
+Generic functions and type-constructors with more than one `comptime T: type`
+(`fn Map(comptime K: type, comptime V: type) type`), monomorphised on the tuple
+of arguments.
+
+### v0.136.0 — comptime reflection builtins
+`@This()` (the enclosing struct type, replacing the `Self` convention),
+`@sizeOf(T)`, and `@typeName(T)`.
+
+### v0.137.0 — Named error sets
+`const FileErr = error{ NotFound, Denied };`, `FileErr!T`, and set membership /
+merging — replacing the single implicit global error set with named ones.
+
+### v0.138.0 — `inline for` + `comptime { }` blocks
+Compile-time-unrolled `inline for` over a comptime range/tuple, and `comptime {
+… }` blocks that force compile-time evaluation — rounding out comptime.
+
+### v0.139.0 — `HashMap(K, V)` std container
+A real open-addressing hash map on the `Allocator` (`put`/`get`/`remove`/`len`),
+built on multi-parameter generics (v0.135) + pointer receivers (v0.134).
+
+### v0.140.0 — Doc comments + `kard doc`
+`/// …` doc comments parsed onto items, and `kard doc` to extract a module's
+public API into Markdown — the DX capstone of Arc 3.
+
+### Beyond (Arc 4+, each multi-session)
+Bundled cross-compilation sysroots; the full imperative `build.ks` graph (a
+`build(*Builder)` entry point); richer std (I/O, formatting); re-self-hosting
+(the compiler in kardashev); a package registry; an LSP; and a mechanized spec →
+1.0 stability commitment.
 
 ---
 
