@@ -746,31 +746,46 @@ fn fmt_expr(e: &Expr) -> String {
             s.push_str(" }");
             s
         }
-        // An anonymous `struct { f: T, … }` **type value** (SPEC §25) — the body
-        // of a type-returning function `fn F(comptime T: type) type`, e.g.
-        // `return struct { v: T };`. Prints inline on a single line, mirroring the
-        // struct-literal spacing: `struct { f1: T1, f2: T2 }` with one space just
-        // inside the braces and `, ` between fields; an empty struct type collapses
-        // to `struct {}`. Each field is `name: Type` (the field-decl spelling),
-        // not the per-line / trailing-comma layout a *top-level* `const Name =
-        // struct {…};` declaration uses, because this is an inline expression in
-        // value/return position. The printed form re-lexes to the same
-        // `Expr::StructType`, so re-formatting is idempotent.
-        Expr::StructType { fields, .. } => {
-            if fields.is_empty() {
+        // An anonymous `struct { f: T, …, fn m(…) … { … } }` **type value** (SPEC
+        // §25/§26) — the body of a type-returning function `fn F(comptime T:
+        // type) type`, e.g. `return struct { v: T };` or, with methods (v0.130),
+        // `return struct { v: T, fn get(self: Self) T { return self.v; } };`.
+        // Prints inline on a single line, mirroring the struct-literal spacing:
+        // one space just inside the braces, then the fields THEN the methods,
+        // matching a named struct's field-then-method order (SPEC §10/§26). Each
+        // field is `name: Type` (the field-decl spelling) and the fields are
+        // joined with `, `; each method is the ordinary `pub? fn …` spelling laid
+        // out inline by [`fmt_func_inline`] and the methods are joined with a
+        // single space (the parser accepts an optional trailing comma after the
+        // fields but **no** comma between methods, so a comma separates the field
+        // block from the first method while the methods themselves are
+        // space-separated). An anonymous struct type with neither fields nor
+        // methods collapses to `struct {}`; a fields-only one (no methods) prints
+        // exactly as in v0.129. The per-line / trailing-comma layout a
+        // *top-level* `const Name = struct {…};` declaration uses is not used here
+        // because this is an inline expression in value/return position. The
+        // printed form re-lexes to the same `Expr::StructType`, so re-formatting
+        // is idempotent.
+        Expr::StructType {
+            fields, methods, ..
+        } => {
+            if fields.is_empty() && methods.is_empty() {
                 return "struct {}".to_string();
             }
-            let mut s = String::from("struct { ");
-            for (i, f) in fields.iter().enumerate() {
-                if i > 0 {
-                    s.push_str(", ");
-                }
-                s.push_str(&f.name);
-                s.push_str(": ");
-                s.push_str(&fmt_type(&f.ty));
+            let field_parts: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, fmt_type(&f.ty)))
+                .collect();
+            let method_parts: Vec<String> = methods.iter().map(fmt_func_inline).collect();
+            // Fields are comma-separated; methods are space-separated; a comma
+            // (the optional trailing comma after the last field) joins the two
+            // blocks when both are present.
+            let mut inner = field_parts.join(", ");
+            if !field_parts.is_empty() && !method_parts.is_empty() {
+                inner.push_str(", ");
             }
-            s.push_str(" }");
-            s
+            inner.push_str(&method_parts.join(" "));
+            format!("struct {{ {} }}", inner)
         }
         Expr::Field { base, field, .. } => {
             // `base.field` with no spaces. Field access is postfix (binds as a
@@ -953,6 +968,221 @@ fn fmt_operand(e: &Expr, parent_prec: u8, is_right: bool) -> String {
         format!("({})", fmt_expr(e))
     } else {
         fmt_expr(e)
+    }
+}
+
+// ----- inline function / statement printing (SPEC §26) ---------------------
+//
+// A generic-struct method (a `Func` inside an `Expr::StructType` type value,
+// v0.130) is printed **inline** — on the single line of the enclosing anonymous
+// struct-type value — rather than with the multi-line, indentation-driven
+// [`Printer`] layout used for top-level / named-struct functions. This keeps the
+// `struct { … }` type value a single expression (matching the inline v0.129
+// fields-only form) and keeps `fmt_expr` — the one total entry point for every
+// expression, including a nested `StructType` — free of any indent context. The
+// spelling of every construct (the `pub? fn name(params) ret` signature with a
+// `comptime ` prefix, `name: Type` fields, `if`/`while`/`switch`/`defer`/…
+// statements) matches the multi-line printers exactly; only the whitespace
+// differs, so the inline form re-lexes to the same AST and re-formatting is
+// idempotent.
+
+/// Format a function on a single line (SPEC §26): `pub? fn name(params) ret {
+/// body }`, mirroring [`Printer::print_func`]'s spelling — a `comptime ` prefix
+/// on compile-time parameters, `name: Type` parameters joined with `, `, the
+/// Zig-style return type after the parens — but laid out inline. Used for the
+/// methods of an [`Expr::StructType`] type value.
+fn fmt_func_inline(f: &Func) -> String {
+    let mut s = String::new();
+    if f.is_pub {
+        s.push_str("pub ");
+    }
+    s.push_str("fn ");
+    s.push_str(&f.name);
+    s.push('(');
+    for (i, param) in f.params.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        if param.is_comptime {
+            s.push_str("comptime ");
+        }
+        s.push_str(&param.name);
+        s.push_str(": ");
+        s.push_str(&fmt_type(&param.ty));
+    }
+    s.push_str(") ");
+    s.push_str(&fmt_type(&f.ret));
+    s.push(' ');
+    s.push_str(&fmt_block_inline(&f.body));
+    s
+}
+
+/// Format a block inline (SPEC §26): `{}` when empty, else `{ <stmt> <stmt> … }`
+/// with each statement in its own inline form (terminated by `;`, or `}` for a
+/// nested block / control-flow statement) and a single space separating them.
+fn fmt_block_inline(block: &Block) -> String {
+    if block.stmts.is_empty() {
+        return "{}".to_string();
+    }
+    let parts: Vec<String> = block.stmts.iter().map(fmt_stmt_inline).collect();
+    format!("{{ {} }}", parts.join(" "))
+}
+
+/// Format a single statement inline (SPEC §26) — no leading indent and no
+/// trailing newline. Mirrors [`Printer::print_stmt`] construct-for-construct,
+/// differing only in whitespace, so the result re-lexes to the same `Stmt`.
+fn fmt_stmt_inline(stmt: &Stmt) -> String {
+    match stmt {
+        Stmt::Let {
+            is_const,
+            name,
+            ty,
+            value,
+            ..
+        } => {
+            let mut s = String::new();
+            s.push_str(if *is_const { "const " } else { "var " });
+            s.push_str(name);
+            if let Some(ty) = ty {
+                s.push_str(": ");
+                s.push_str(&fmt_type(ty));
+            }
+            s.push_str(" = ");
+            s.push_str(&fmt_expr(value));
+            s.push(';');
+            s
+        }
+        Stmt::Assign { name, value, .. } => format!("{} = {};", name, fmt_expr(value)),
+        Stmt::FieldAssign { place, value, .. } => {
+            format!("{} = {};", fmt_expr(place), fmt_expr(value))
+        }
+        Stmt::Expr(e) => format!("{};", fmt_expr(e)),
+        Stmt::Return { value, .. } => match value {
+            Some(e) => format!("return {};", fmt_expr(e)),
+            None => "return;".to_string(),
+        },
+        Stmt::If {
+            cond,
+            capture,
+            then,
+            els,
+            ..
+        } => fmt_if_inline(cond, capture, then, els),
+        Stmt::While {
+            cond, cont, body, ..
+        } => {
+            let mut s = String::from("while (");
+            s.push_str(&fmt_expr(cond));
+            s.push(')');
+            if let Some(c) = cont {
+                s.push_str(" : (");
+                s.push_str(&fmt_cont(c));
+                s.push(')');
+            }
+            s.push(' ');
+            s.push_str(&fmt_block_inline(body));
+            s
+        }
+        Stmt::Break(_) => "break;".to_string(),
+        Stmt::Continue(_) => "continue;".to_string(),
+        Stmt::Defer { stmt, .. } => format!("defer {}", fmt_stmt_inline(stmt)),
+        Stmt::ErrDefer { stmt, .. } => format!("errdefer {}", fmt_stmt_inline(stmt)),
+        Stmt::Block(b) => fmt_block_inline(b),
+        Stmt::Switch {
+            scrutinee,
+            arms,
+            default,
+            ..
+        } => {
+            let mut s = String::from("switch (");
+            s.push_str(&fmt_expr(scrutinee));
+            s.push_str(") {");
+            for arm in arms {
+                s.push(' ');
+                let labels: Vec<String> = arm.labels.iter().map(fmt_expr).collect();
+                s.push_str(&labels.join(", "));
+                match &arm.capture {
+                    Some(cap) => {
+                        s.push_str(" => |");
+                        s.push_str(cap);
+                        s.push_str("| ");
+                    }
+                    None => s.push_str(" => "),
+                }
+                s.push_str(&fmt_block_inline(&arm.body));
+                s.push(',');
+            }
+            if let Some(block) = default {
+                s.push_str(" else => ");
+                s.push_str(&fmt_block_inline(block));
+                s.push(',');
+            }
+            s.push_str(" }");
+            s
+        }
+    }
+}
+
+/// Format an `if`/`else if`/`else` chain inline (SPEC §26). With a capture the
+/// header is `if (<cond>) |<name>| { … }`; without one it is `if (<cond>) { …
+/// }`. Mirrors [`Printer::print_if`]'s chaining (`} else if …` / `} else …`),
+/// inline.
+fn fmt_if_inline(
+    cond: &Expr,
+    capture: &Option<String>,
+    then: &Block,
+    els: &Option<Box<Stmt>>,
+) -> String {
+    let mut s = String::from("if (");
+    s.push_str(&fmt_expr(cond));
+    s.push(')');
+    if let Some(name) = capture {
+        s.push_str(" |");
+        s.push_str(name);
+        s.push('|');
+    }
+    s.push(' ');
+    s.push_str(&fmt_block_inline(then));
+
+    let mut els = els;
+    loop {
+        match els {
+            None => return s,
+            Some(boxed) => match boxed.as_ref() {
+                Stmt::If {
+                    cond: c2,
+                    capture: cap2,
+                    then: t2,
+                    els: e2,
+                    ..
+                } => {
+                    s.push_str(" else if (");
+                    s.push_str(&fmt_expr(c2));
+                    s.push(')');
+                    if let Some(name) = cap2 {
+                        s.push_str(" |");
+                        s.push_str(name);
+                        s.push('|');
+                    }
+                    s.push(' ');
+                    s.push_str(&fmt_block_inline(t2));
+                    els = e2;
+                }
+                Stmt::Block(b) => {
+                    s.push_str(" else ");
+                    s.push_str(&fmt_block_inline(b));
+                    return s;
+                }
+                // The AST only ever stores an `If` or a `Block` here, but stay
+                // total: wrap any other statement in an inline else block.
+                other => {
+                    s.push_str(" else { ");
+                    s.push_str(&fmt_stmt_inline(other));
+                    s.push_str(" }");
+                    return s;
+                }
+            },
+        }
     }
 }
 
@@ -3668,9 +3898,10 @@ mod tests {
         // An anonymous `struct { … }` type value (SPEC §25.1) prints inline as a
         // single line, mirroring struct-literal spacing.
 
-        // Empty anonymous struct type → `struct {}`.
+        // Empty anonymous struct type (no fields *and* no methods) → `struct {}`.
         let empty = Expr::StructType {
             fields: vec![],
+            methods: vec![],
             span: D,
         };
         assert_eq!(fmt_expr(&empty), "struct {}");
@@ -3678,6 +3909,7 @@ mod tests {
         // Single field → `struct { v: T }` (the field-decl `name: Type` style).
         let one = Expr::StructType {
             fields: vec![field_decl("v", "T")],
+            methods: vec![],
             span: D,
         };
         assert_eq!(fmt_expr(&one), "struct { v: T }");
@@ -3693,6 +3925,7 @@ mod tests {
                 },
                 field_decl("len", "usize"),
             ],
+            methods: vec![],
             span: D,
         };
         assert_eq!(fmt_expr(&many), "struct { items: []T, len: usize }");
@@ -3721,6 +3954,7 @@ mod tests {
                     stmts: vec![Stmt::Return {
                         value: Some(Expr::StructType {
                             fields: vec![field_decl("v", "T")],
+                            methods: vec![],
                             span: D,
                         }),
                         span: D,
@@ -3771,6 +4005,222 @@ mod tests {
             "}\n",
             "\n",
             "const IL = Box(i32);\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    // ----- generic-struct methods (v0.130) ---------------------------------
+
+    /// A method `fn get(self: Self) T { return self.v; }` — a `self: Self`
+    /// receiver whose body returns a field. `Self` is an ordinary type name to
+    /// the formatter (resolved in sema/emit); it prints via [`fmt_type`].
+    fn self_method_get() -> Func {
+        Func {
+            is_pub: false,
+            name: "get".to_string(),
+            params: vec![Param {
+                name: "self".to_string(),
+                ty: ty("Self"),
+                is_comptime: false,
+                span: D,
+            }],
+            ret: ty("T"),
+            body: Block {
+                stmts: vec![Stmt::Return {
+                    value: Some(field(ident("self"), "v")),
+                    span: D,
+                }],
+                span: D,
+            },
+            span: D,
+        }
+    }
+
+    #[test]
+    fn struct_type_with_field_and_method_inline() {
+        // An anonymous struct type with a field THEN a method (SPEC §26) prints
+        // inline: the field block, a `, `, then the method's inline `pub? fn …`
+        // spelling. `self: Self` and the return field access print through the
+        // ordinary helpers.
+        let st = Expr::StructType {
+            fields: vec![field_decl("v", "T")],
+            methods: vec![self_method_get()],
+            span: D,
+        };
+        assert_eq!(
+            fmt_expr(&st),
+            "struct { v: T, fn get(self: Self) T { return self.v; } }"
+        );
+        // Idempotence as determinism: the pure printer re-prints identically.
+        assert_eq!(fmt_expr(&st), fmt_expr(&st));
+    }
+
+    #[test]
+    fn struct_type_multiple_methods_space_separated() {
+        // Two methods are separated by a single space with **no** comma between
+        // them (the parser rejects a comma between methods); only the field block
+        // is comma-terminated before the first method.
+        let set = Func {
+            is_pub: true,
+            name: "withV".to_string(),
+            params: vec![
+                Param {
+                    name: "self".to_string(),
+                    ty: ty("Self"),
+                    is_comptime: false,
+                    span: D,
+                },
+                Param {
+                    name: "x".to_string(),
+                    ty: ty("T"),
+                    is_comptime: false,
+                    span: D,
+                },
+            ],
+            ret: ty("Self"),
+            body: Block {
+                stmts: vec![Stmt::Return {
+                    value: Some(Expr::StructLit {
+                        name: "Self".to_string(),
+                        fields: vec![field_init("v", ident("x"))],
+                        span: D,
+                    }),
+                    span: D,
+                }],
+                span: D,
+            },
+            span: D,
+        };
+        let st = Expr::StructType {
+            fields: vec![field_decl("v", "T")],
+            methods: vec![self_method_get(), set],
+            span: D,
+        };
+        assert_eq!(
+            fmt_expr(&st),
+            "struct { v: T, fn get(self: Self) T { return self.v; } \
+             pub fn withV(self: Self, x: T) Self { return Self{ .v = x }; } }"
+        );
+    }
+
+    #[test]
+    fn struct_type_methods_only_no_leading_comma() {
+        // A method-only anonymous struct type (e.g. an associated function with no
+        // `self`) has no fields, so there is no leading comma before the first
+        // method.
+        let zero = Func {
+            is_pub: false,
+            name: "zero".to_string(),
+            params: vec![],
+            ret: ty("Self"),
+            body: Block {
+                stmts: vec![Stmt::Return {
+                    value: Some(Expr::StructLit {
+                        name: "Self".to_string(),
+                        fields: vec![field_init("v", int(0))],
+                        span: D,
+                    }),
+                    span: D,
+                }],
+                span: D,
+            },
+            span: D,
+        };
+        let st = Expr::StructType {
+            fields: vec![],
+            methods: vec![zero],
+            span: D,
+        };
+        assert_eq!(
+            fmt_expr(&st),
+            "struct { fn zero() Self { return Self{ .v = 0 }; } }"
+        );
+    }
+
+    #[test]
+    fn struct_type_pointer_self_receiver() {
+        // A `*Self` (pointer) receiver prints with the `*` prefix via `fmt_type`.
+        let bump = Func {
+            is_pub: false,
+            name: "bump".to_string(),
+            params: vec![Param {
+                name: "self".to_string(),
+                ty: ptr_ty("Self"),
+                is_comptime: false,
+                span: D,
+            }],
+            ret: ty("void"),
+            body: Block {
+                stmts: vec![],
+                span: D,
+            },
+            span: D,
+        };
+        let st = Expr::StructType {
+            fields: vec![field_decl("v", "T")],
+            methods: vec![bump],
+            span: D,
+        };
+        assert_eq!(
+            fmt_expr(&st),
+            "struct { v: T, fn bump(self: *Self) void {} }"
+        );
+    }
+
+    #[test]
+    fn fields_only_struct_type_unchanged_from_v0_129() {
+        // A fields-only `Expr::StructType` (methods empty) prints exactly as in
+        // v0.129 — the v0.130 `methods` field, when empty, adds nothing.
+        let st = Expr::StructType {
+            fields: vec![field_decl("v", "T"), field_decl("n", "usize")],
+            methods: vec![],
+            span: D,
+        };
+        assert_eq!(fmt_expr(&st), "struct { v: T, n: usize }");
+
+        let empty = Expr::StructType {
+            fields: vec![],
+            methods: vec![],
+            span: D,
+        };
+        assert_eq!(fmt_expr(&empty), "struct {}");
+    }
+
+    #[test]
+    fn type_constructor_with_method_source_round_trip() {
+        // End-to-end (lex → parse → print), SPEC §26: a type-constructor whose
+        // returned `struct` type value carries a method round-trips in canonical
+        // form byte-for-byte (the method prints inline on the `return` line), and
+        // re-formatting the output is byte-identical (idempotence).
+        let src = concat!(
+            "fn Box(comptime T: type) type {\n",
+            "    return struct { v: T, fn get(self: Self) T { return self.v; } };\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn struct_type_method_with_control_flow_round_trip() {
+        // A method body with control flow (a `while` loop with a continue clause
+        // and an `if`) prints inline and round-trips, exercising the inline
+        // statement printers (SPEC §26). A generic-struct method like
+        // `ArrayList(T).append` relies on this staying idempotent.
+        let src = concat!(
+            "fn Counter(comptime T: type) type {\n",
+            "    return struct { n: T, ",
+            "fn run(self: Self) T { ",
+            "var i: T = 0; ",
+            "while (i < self.n) : (i = i + 1) { ",
+            "if (i == 0) { print(i); } else { print(self.n); } } ",
+            "return i; } };\n",
+            "}\n",
         );
         let once = format_source(src).expect("source formats");
         assert_eq!(once, src);

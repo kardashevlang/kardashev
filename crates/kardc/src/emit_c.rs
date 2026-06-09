@@ -276,6 +276,51 @@ impl<'a> Emitter<'a> {
         self.value_subst.clear();
     }
 
+    /// The type-constructor `Func` (cloned) that produced generic-struct
+    /// instance `inst`, if present in this module (v0.130, SPEC §26.3). It is
+    /// the `fn Name(comptime T: type) type` whose `return struct {…};` body
+    /// carries the methods to monomorphise for this instance.
+    fn instance_ctor(module: &Module, inst: &crate::types::StructInstance) -> Option<Func> {
+        module.items.iter().find_map(|it| match it {
+            Item::Func(f) if f.name == inst.ctor && Self::is_type_ctor(f) => Some(f.clone()),
+            _ => None,
+        })
+    }
+
+    /// The methods (cloned) declared inside a type-constructor's `struct {…}`
+    /// body (v0.130, SPEC §26.1). A conforming constructor body is `return
+    /// struct {…};`; the `Expr::StructType`'s `methods` are returned. An empty
+    /// vector for the v0.129 fields-only shape (or any non-canonical body —
+    /// impossible for validated input), so a fields-only generic struct keeps
+    /// behaving exactly as v0.129.
+    fn ctor_methods(ctor: &Func) -> Vec<Func> {
+        for s in &ctor.body.stmts {
+            if let Stmt::Return {
+                value: Some(Expr::StructType { methods, .. }),
+                ..
+            } = s
+            {
+                return methods.clone();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Set the active substitution for emitting a generic-struct instance's
+    /// methods (v0.130, SPEC §26.3): the constructor's comptime type
+    /// parameter(s) → the concrete argument `arg`, plus the contextual `Self`
+    /// → the instantiated struct `Struct(struct_id)`. Mirrors
+    /// [`Emitter::set_subst_for`] but adds the `Self` binding (a type-constructor
+    /// in v0.130 has a single comptime *type* parameter, never a value one).
+    fn set_instance_subst(&mut self, ctor: &Func, arg: Type, struct_id: u32) {
+        self.subst.clear();
+        self.value_subst.clear();
+        for p in ctor.params.iter().filter(|p| p.is_comptime) {
+            self.subst.insert(p.name.clone(), arg);
+        }
+        self.subst.insert("Self".to_string(), Type::Struct(struct_id));
+    }
+
     /// Pre-pass: record the resolved return type of every top-level function and
     /// every struct function. These let [`Emitter::struct_of_expr`] follow a
     /// receiver chain that passes through a call to find the struct whose
@@ -310,6 +355,22 @@ impl<'a> Emitter<'a> {
                 self.clear_subst();
             }
         }
+        // Register the `*T` / `*Self` pointee types used inside each
+        // generic-struct instance's methods, under that instance's substitution
+        // (v0.130, SPEC §26.3) — so a pointer receiver (`self: *Self`) or local
+        // resolves to a real pointee, mirroring the generic-function pre-pass
+        // above. By-value methods register no pointers, so this is a no-op for
+        // the common case.
+        let sinsts = structs.struct_instances().to_vec();
+        for inst in &sinsts {
+            if let Some(ctor) = Self::instance_ctor(module, inst) {
+                self.set_instance_subst(&ctor, inst.arg, inst.struct_id);
+                for m in Self::ctor_methods(&ctor) {
+                    self.note_func_ptrs(&m);
+                }
+                self.clear_subst();
+            }
+        }
         for item in &module.items {
             match item {
                 Item::Func(f) => {
@@ -335,6 +396,30 @@ impl<'a> Emitter<'a> {
                 }
                 _ => {}
             }
+        }
+        // Register the return + parameter types of every monomorphised
+        // generic-struct instance method (v0.130, SPEC §26.3), resolved under
+        // the instance substitution `{ type-param → arg, Self → Struct(id) }`,
+        // keyed by the instantiated struct's source name. These let a method
+        // call on an instance value resolve its return type (`type_of_expr` /
+        // `struct_of_expr`) and coerce its arguments, exactly as for an
+        // ordinary struct method (SPEC §10).
+        for inst in &sinsts {
+            let ctor = match Self::instance_ctor(module, inst) {
+                Some(c) => c,
+                None => continue,
+            };
+            let sname = self.structs.get(inst.struct_id).name.clone();
+            self.set_instance_subst(&ctor, inst.arg, inst.struct_id);
+            for m in Self::ctor_methods(&ctor) {
+                let ret = self.resolve_ty(&m.ret);
+                self.method_ret.insert((sname.clone(), m.name.clone()), ret);
+                let ptys: Vec<Type> =
+                    m.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
+                self.method_params
+                    .insert((sname.clone(), m.name.clone()), ptys);
+            }
+            self.clear_subst();
         }
     }
 
@@ -854,9 +939,49 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+        // Finally every generic-struct instance's methods (v0.130, SPEC §26.3),
+        // forward-declared alongside ordinary struct methods so call order never
+        // matters.
+        if self.emit_struct_instance_forward_decls(module) {
+            any = true;
+        }
         if any {
             self.blank();
         }
+    }
+
+    /// Forward-declare every monomorphised generic-struct instance's methods
+    /// (v0.130, SPEC §26.3). For each recorded [`crate::types::StructInstance`],
+    /// the type-constructor's methods are declared under the substitution
+    /// `{ type-param → arg, Self → Struct(id) }` (so their parameter / return
+    /// types resolve to concrete types) and named `kd_<struct-name>_<method>` —
+    /// matching the §10 struct-method lowering and [`Emitter::emit_method_call`].
+    /// Mirrors [`Emitter::emit_instance_forward_decls`] for generic functions.
+    /// Returns `true` if any were emitted. A fields-only instance (v0.129)
+    /// declares no methods, so nothing is emitted for it.
+    fn emit_struct_instance_forward_decls(&mut self, module: &Module) -> bool {
+        let insts = self.structs.struct_instances().to_vec();
+        let mut any = false;
+        for inst in &insts {
+            let ctor = match Self::instance_ctor(module, inst) {
+                Some(c) => c,
+                None => continue,
+            };
+            let methods = Self::ctor_methods(&ctor);
+            if methods.is_empty() {
+                continue;
+            }
+            let sname = self.structs.get(inst.struct_id).name.clone();
+            self.set_instance_subst(&ctor, inst.arg, inst.struct_id);
+            for m in &methods {
+                let ret = self.cty(&m.ret);
+                let params = self.format_params(&m.params);
+                self.line(&format!("{} kd_{}_{}({});", ret, sname, m.name, params));
+                any = true;
+            }
+            self.clear_subst();
+        }
+        any
     }
 
     fn emit_func_defs(&mut self, module: &Module) {
@@ -886,6 +1011,39 @@ impl<'a> Emitter<'a> {
         // Emit one specialised C function per recorded instantiation (SPEC
         // §17.3), each under its concrete type-parameter substitution.
         self.emit_instance_defs();
+        // Then one C function per generic-struct instance method (SPEC §26.3),
+        // each under `{ type-param → arg, Self → Struct(id) }`.
+        self.emit_struct_instance_defs(module);
+    }
+
+    /// Emit one C function per generic-struct instance method (v0.130, SPEC
+    /// §26.3). For each recorded [`crate::types::StructInstance`], the
+    /// type-constructor's methods are emitted via [`Emitter::emit_func_named`]
+    /// (the §10 struct-method lowering) under the substitution `{ type-param →
+    /// arg, Self → Struct(id) }`, so `Self` and the type parameter resolve to
+    /// concrete types in the signature and body. A by-value `self: Self`
+    /// parameter is an ordinary by-value struct parameter; the body reuses every
+    /// existing statement / expression / `defer` lowering. The C name is
+    /// `kd_<struct-name>_<method>`, matching the forward declaration and the
+    /// call lowering. Mirrors [`Emitter::emit_instance_defs`] for generic
+    /// functions; the type-constructor itself is never emitted (SPEC §25.3).
+    fn emit_struct_instance_defs(&mut self, module: &Module) {
+        let insts = self.structs.struct_instances().to_vec();
+        for inst in &insts {
+            let ctor = match Self::instance_ctor(module, inst) {
+                Some(c) => c,
+                None => continue,
+            };
+            let methods = Self::ctor_methods(&ctor);
+            let sname = self.structs.get(inst.struct_id).name.clone();
+            for m in &methods {
+                self.set_instance_subst(&ctor, inst.arg, inst.struct_id);
+                let cname = format!("kd_{}_{}", sname, m.name);
+                self.emit_func_named(m, &cname);
+                self.clear_subst();
+                self.blank();
+            }
+        }
     }
 
     /// Forward-declare every recorded generic instantiation (SPEC §17.3), each
@@ -2135,11 +2293,21 @@ impl<'a> Emitter<'a> {
                 }
                 // C99 compound literal: `((kd_struct_<Name>){ .kd_<f> = <v>, ... })`.
                 // A type-alias name (`IL{ ... }` where `const IL = List(i32);`,
-                // v0.129) resolves to the aliased monomorphised struct's id.
-                let resolved_id = self.structs.id_of(name).or_else(|| match self.structs.alias_of(name) {
-                    Some(Type::Struct(id)) => Some(id),
-                    _ => None,
-                });
+                // v0.129) resolves to the aliased monomorphised struct's id; a
+                // name bound in the active substitution — `Self` (or a type
+                // parameter) inside a generic-struct instance method (v0.130) —
+                // resolves to its substituted struct id.
+                let resolved_id = self
+                    .structs
+                    .id_of(name)
+                    .or_else(|| match self.subst.get(name) {
+                        Some(Type::Struct(id)) => Some(*id),
+                        _ => None,
+                    })
+                    .or_else(|| match self.structs.alias_of(name) {
+                        Some(Type::Struct(id)) => Some(id),
+                        _ => None,
+                    });
                 let (cname, sid) = match resolved_id {
                     Some(id) => (self.structs.c_name(id), Some(id)),
                     // Validated input always resolves; fall back to the canonical
@@ -2506,7 +2674,16 @@ impl<'a> Emitter<'a> {
     /// `kd_<Struct>_<method>`.
     fn emit_method_call(&mut self, receiver: &Expr, method: &str, args: &[Expr]) -> String {
         let assoc = match receiver {
-            Expr::Ident { name, .. } => self.structs.id_of(name).map(|_| name.clone()),
+            // A direct struct name, or a type-alias name (`IntList.init(a)` where
+            // `const IntList = ArrayList(i32);`, v0.130) → the struct's source
+            // name, so the call lowers to `kd_<struct>_<method>` matching the
+            // emitted instance method.
+            Expr::Ident { name, .. } => self.structs.id_of(name).map(|_| name.clone()).or_else(
+                || match self.structs.alias_of(name) {
+                    Some(Type::Struct(id)) => Some(self.structs.get(id).name.clone()),
+                    _ => None,
+                },
+            ),
             _ => None,
         };
         if let Some(struct_name) = assoc {
@@ -2578,7 +2755,20 @@ impl<'a> Emitter<'a> {
                     _ => None,
                 }
             }
-            Expr::StructLit { name, .. } => Some(name.clone()),
+            Expr::StructLit { name, .. } => {
+                // `Self` / a type parameter inside a generic-struct instance
+                // method (v0.130), or a type-alias name (v0.129), names the
+                // monomorphised struct — resolve it so a method call on the
+                // literal uses the real `kd_<struct>_<method>` name. An ordinary
+                // struct literal already carries its own struct name.
+                if let Some(Type::Struct(id)) = self.subst.get(name) {
+                    return Some(self.structs.get(*id).name.clone());
+                }
+                if let Some(Type::Struct(id)) = self.structs.alias_of(name) {
+                    return Some(self.structs.get(id).name.clone());
+                }
+                Some(name.clone())
+            }
             // A struct-typed array element: `a[i]` where the array's element is
             // a struct, so `a[i].method()` resolves to the element's struct.
             Expr::Index { base, .. } => match self.type_of_expr(base)? {
@@ -2709,6 +2899,9 @@ impl<'a> Emitter<'a> {
                 .union_id_of(name)
                 .map(Type::Union)
                 .or_else(|| self.structs.id_of(name).map(Type::Struct))
+                // `Self` / a type parameter inside a generic-struct instance
+                // method (v0.130) → its substituted struct.
+                .or_else(|| self.subst.get(name).copied())
                 // A type-alias name (`IL{ ... }`, v0.129) → the aliased struct.
                 .or_else(|| self.structs.alias_of(name)),
             Expr::Field { base, field, .. } => {
@@ -6613,6 +6806,7 @@ mod tests {
                     ty: ty("T"),
                     span: Span::DUMMY,
                 }],
+                methods: vec![],
                 span: Span::DUMMY,
             })]),
             span: Span::DUMMY,
@@ -6701,6 +6895,7 @@ mod tests {
             ret: ty("type"),
             body: block(vec![ret(Expr::StructType {
                 fields: vec![],
+                methods: vec![],
                 span: Span::DUMMY,
             })]),
             span: Span::DUMMY,
@@ -6724,6 +6919,251 @@ mod tests {
         assert!(
             !out.contains("type kd_F"),
             "a `type` return type leaked into the C output:\n{out}"
+        );
+    }
+
+    // -- generic-struct methods + container foundation (v0.130) --------------
+
+    /// The post-sema shape of:
+    /// ```text
+    /// fn Box(comptime T: type) type {
+    ///     return struct {
+    ///         v: T,
+    ///         fn get(self: Self) T { return self.v; }
+    ///         fn replaced(self: Self, nv: T) Self { return Self{ .v = nv }; }
+    ///     };
+    /// }
+    /// const IB = Box(i32);
+    /// fn main() void {
+    ///     var b: IB = IB{ .v = 7 };
+    ///     print(b.get());            // 7
+    ///     var c: IB = b.replaced(9);
+    ///     print(c.get());            // 9
+    /// }
+    /// ```
+    /// sema interns the monomorphised struct `Box__int32_t` (field `v: i32`),
+    /// records it as a generic-struct instance of `Box` at `i32`, and binds the
+    /// alias `IB` to it. The backend must emit the constructor's methods per
+    /// instance under `{ T → i32, Self → Struct(Box__int32_t) }` as free C
+    /// functions `kd_Box__int32_t_<method>` (SPEC §26.3), while the
+    /// type-constructor `Box` itself stays compile-time only (§25.3).
+    fn box_with_methods_program() -> (Module, StructTable) {
+        let mut structs = StructTable::new();
+        let sid = structs.intern("Box__int32_t");
+        structs.set_fields(sid, vec![("v".to_string(), Type::I32)]);
+        structs.record_struct_instance(sid, "Box", Type::I32);
+        structs.add_alias("IB", Type::Struct(sid));
+
+        let get = Func {
+            is_pub: false,
+            name: "get".to_string(),
+            params: vec![param("self", "Self")],
+            ret: ty("T"),
+            body: block(vec![ret(field(ident("self"), "v"))]),
+            span: Span::DUMMY,
+        };
+        let replaced = Func {
+            is_pub: false,
+            name: "replaced".to_string(),
+            params: vec![param("self", "Self"), param("nv", "T")],
+            ret: ty("Self"),
+            body: block(vec![ret(Expr::StructLit {
+                name: "Self".to_string(),
+                fields: vec![finit("v", ident("nv"))],
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+
+        let box_ctor = Func {
+            is_pub: false,
+            name: "Box".to_string(),
+            params: vec![Param {
+                name: "T".to_string(),
+                ty: type_kw(),
+                is_comptime: true,
+                span: Span::DUMMY,
+            }],
+            ret: type_kw(),
+            body: block(vec![ret(Expr::StructType {
+                fields: vec![FieldDecl {
+                    name: "v".to_string(),
+                    ty: ty("T"),
+                    span: Span::DUMMY,
+                }],
+                methods: vec![get, replaced],
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+
+        let alias = Item::Const(ConstDecl {
+            is_pub: false,
+            name: "IB".to_string(),
+            ty: None,
+            value: Expr::Call {
+                callee: "Box".to_string(),
+                args: vec![ident("i32")],
+                span: Span::DUMMY,
+            },
+            span: Span::DUMMY,
+        });
+
+        let main = Func {
+            is_pub: false,
+            name: "main".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "b".to_string(),
+                    ty: Some(ty("IB")),
+                    value: Expr::StructLit {
+                        name: "IB".to_string(),
+                        fields: vec![finit("v", int(7))],
+                        span: Span::DUMMY,
+                    },
+                    span: Span::DUMMY,
+                },
+                print(method_call(ident("b"), "get", vec![])),
+                Stmt::Let {
+                    is_const: false,
+                    name: "c".to_string(),
+                    ty: Some(ty("IB")),
+                    value: method_call(ident("b"), "replaced", vec![int(9)]),
+                    span: Span::DUMMY,
+                },
+                print(method_call(ident("c"), "get", vec![])),
+            ]),
+            span: Span::DUMMY,
+        };
+
+        let m = Module {
+            items: vec![Item::Func(box_ctor), alias, Item::Func(main)],
+        };
+        (m, structs)
+    }
+
+    #[test]
+    fn generic_struct_method_emits_instance_function_and_lowers_call() {
+        let (m, structs) = box_with_methods_program();
+        let out = emit(&m, &structs, EmitMode::Program);
+
+        // The monomorphised struct still emits as an ordinary C typedef (§25.3).
+        assert!(
+            out.contains("typedef struct { int32_t kd_v; } kd_struct_Box__int32_t;"),
+            "monomorphised struct typedef missing/wrong:\n{out}"
+        );
+        // The instance's `get` is forward-declared and defined as a free C
+        // function returning the substituted `T` (= int32_t), with a by-value
+        // `self: Self` (= the instantiated struct) parameter (§26.3, §10).
+        assert!(
+            out.contains("int32_t kd_Box__int32_t_get(kd_struct_Box__int32_t kd_self);"),
+            "instance method forward-decl missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains("int32_t kd_Box__int32_t_get(kd_struct_Box__int32_t kd_self) {"),
+            "instance method definition missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains("return ((kd_self).kd_v);"),
+            "instance method body wrong:\n{out}"
+        );
+        // `replaced` returns `Self` (= the instantiated struct) and constructs a
+        // `Self{…}` literal — `Self` resolves to the struct in both positions.
+        assert!(
+            out.contains(
+                "kd_struct_Box__int32_t kd_Box__int32_t_replaced(kd_struct_Box__int32_t kd_self, int32_t kd_nv) {"
+            ),
+            "Self return / param type did not resolve:\n{out}"
+        );
+        assert!(
+            out.contains("return (((kd_struct_Box__int32_t){ .kd_v = kd_nv }));"),
+            "Self{{…}} literal in a method body did not resolve:\n{out}"
+        );
+        // The method call lowers to the instance C function; `self` is the
+        // receiver, extra args follow it.
+        assert!(
+            out.contains("kd_print((long long)(kd_Box__int32_t_get(kd_b)))"),
+            "method call did not lower to the instance function:\n{out}"
+        );
+        assert!(
+            out.contains("kd_Box__int32_t_replaced(kd_b, 9)"),
+            "method-with-arg call did not lower correctly:\n{out}"
+        );
+        // The type-constructor itself is never emitted to C (§25.3).
+        assert!(
+            !out.contains("kd_Box("),
+            "type-constructor was emitted as a C function:\n{out}"
+        );
+        assert!(
+            !out.contains(") type") && !out.contains("type kd_"),
+            "a `type` return type leaked into the C output:\n{out}"
+        );
+        // `Self` must never leak into the C name space.
+        assert!(
+            !out.contains("kd_struct_Self") && !out.contains("kd_Self_"),
+            "the contextual `Self` leaked into the emitted C:\n{out}"
+        );
+    }
+
+    #[test]
+    fn fields_only_generic_struct_instance_emits_no_methods() {
+        // Preservation (v0.129): a recorded instance whose constructor declares
+        // *no* methods (the fields-only generic struct) emits exactly what
+        // v0.129 did — the struct typedef and nothing else. The empty-`methods`
+        // iteration is a no-op.
+        let mut structs = StructTable::new();
+        let sid = structs.intern("Box__int32_t");
+        structs.set_fields(sid, vec![("v".to_string(), Type::I32)]);
+        structs.record_struct_instance(sid, "Box", Type::I32);
+
+        let box_ctor = Func {
+            is_pub: false,
+            name: "Box".to_string(),
+            params: vec![Param {
+                name: "T".to_string(),
+                ty: type_kw(),
+                is_comptime: true,
+                span: Span::DUMMY,
+            }],
+            ret: type_kw(),
+            body: block(vec![ret(Expr::StructType {
+                fields: vec![FieldDecl {
+                    name: "v".to_string(),
+                    ty: ty("T"),
+                    span: Span::DUMMY,
+                }],
+                methods: vec![],
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+        let main = Func {
+            is_pub: false,
+            name: "main".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(box_ctor), Item::Func(main)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+
+        assert!(
+            out.contains("typedef struct { int32_t kd_v; } kd_struct_Box__int32_t;"),
+            "monomorphised struct typedef missing:\n{out}"
+        );
+        assert!(
+            !out.contains("kd_Box__int32_t_"),
+            "a fields-only instance must emit no method functions:\n{out}"
+        );
+        assert!(
+            !out.contains("kd_Box("),
+            "type-constructor was emitted:\n{out}"
         );
     }
 }

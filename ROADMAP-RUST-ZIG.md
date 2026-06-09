@@ -170,9 +170,13 @@ monomorphised; used via a type-alias `const IP = Pair(i32);` (memoised). Unlocks
 generic containers. (Single type param, fields-only struct in v0.129; multiple
 params / methods / direct `Name(T)` in type position are later work.)
 
-### v0.130.0 — Standard prelude: `ArrayList(T)`
-A growable list built on the `Allocator` + generic structs (`append`, `get`,
-`len`, `deinit`) — the first piece of an allocator-based std.
+### v0.130.0 — Generic-struct methods + `ArrayList(T)` ✅
+A type-constructor's `struct` may declare **methods** (using `Self` + the type
+parameter), monomorphised per instantiation. On that, `ArrayList(T)` — a growable
+list on the `Allocator` (`init`/`append`/`get`/`len`/`deinit`, grows by
+alloc+copy+free) — ships as `examples/arraylist.ks`, the first allocator-based
+std container. **This completes the numbered roadmap v0.112–v0.130.** (Value-
+semantics `self`; pointer receivers / multiple type params are later work.)
 
 ### Beyond (Arc 3+, each multi-session)
 **Bundled cross-compilation sysroots** (Zig's "cross-compile anything out of the

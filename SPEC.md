@@ -999,6 +999,46 @@ functions); `Expr::StructType` therefore never reaches the backend. Type-alias
 ordinary C struct typedefs (in dependency order) and used like any struct.
 
 ### 25.4 Deferred (honest)
-Multiple type parameters, comptime-value type-constructor params, methods inside
-a generic struct, and direct `Name(T)` / `Name(T){…}` in type / literal position
-(use a `const` type alias) — all later work.
+Multiple type parameters, comptime-value type-constructor params, and direct
+`Name(T)` / `Name(T){…}` in type / literal position (use a `const` type alias) —
+all later work. (Methods inside a generic struct land in v0.130.)
+
+## 26. Generic-struct methods + `ArrayList(T)` (v0.130)
+
+The final Arc-2 piece: a type-constructor's `struct` may declare **methods**, so
+a generic struct is a real container. This is the foundation of the std
+`ArrayList(T)`.
+
+### 26.1 Syntax & AST
+- `Expr::StructType` now carries `methods: Vec<Func>`: `fn Name(comptime T:
+  type) type { return struct { f: …, fn m(self: Self, …) … { … } }; }`. Methods
+  follow the fields, exactly like a named struct's methods (SPEC §10).
+- `Self` is a contextual type name available in a type-constructor method's
+  signature/body; it denotes the enclosing struct. `*Self` is a pointer to it.
+  The type parameter `T` is also in scope.
+
+### 26.2 Semantics (`sema`)
+- When a `const Alias = Name(C);` instantiates a type-constructor (SPEC §25.2),
+  in addition to the fields the methods are **monomorphised**: each method is
+  checked under the substitution `{ <type param> → C, Self → Struct(id) }` and
+  registered on the instantiated struct via the existing struct-method table
+  (SPEC §10), so `x.m(args)` resolves like any method call. The instance is
+  recorded (`StructTable::record_struct_instance(id, Name, C)`) for the backend.
+- `Self` (and `*Self`) resolve to the instantiated struct (`Struct(id)`).
+
+### 26.3 Backend (`emit_c`)
+For each recorded struct instance, the emitter emits the constructor's methods
+under `{ type-param → C, Self → Struct(id) }`, named `kd_<struct-c-name>_<method>`
+(reusing the struct-method lowering, SPEC §10.2) — mirroring how generic-function
+instantiations are emitted. The type-constructor function itself is still not
+emitted.
+
+### 26.4 `ArrayList(T)` (std prelude)
+A growable list built on the `Allocator` (SPEC §16): `init`, `append` (grows by
+allocating a larger buffer, copying, freeing the old — there is no `realloc`),
+`get`, `len`, and `deinit`. Shipped as `examples/arraylist.ks` and exercised by
+tests.
+
+### 26.5 Deferred (honest)
+Still one type parameter and `Self` only (no `@This()`); multiple type
+parameters remain later work.

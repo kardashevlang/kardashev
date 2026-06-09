@@ -18,6 +18,27 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.130.0] — Generic-struct methods + `ArrayList(T)`
+
+The final piece of the numbered roadmap (**v0.112–v0.130 complete**).
+
+### Added
+- **Generic-struct methods**: a type-constructor's `struct { … }` may declare
+  methods that use `Self` (the instantiated struct) and the type parameter
+  (`Expr::StructType.methods`). Each method is monomorphised per instantiation
+  and registered/emitted like a struct method (`kd_<Struct>_<method>`); the
+  backend emits them by iterating `StructTable::struct_instances`.
+- **`ArrayList(T)`** — a generic growable list on the `Allocator`
+  (`init`/`append`/`get`/`len`/`deinit`, grows by alloc+copy+free), shipped as
+  `examples/arraylist.ks` — the first allocator-based std container.
+- `alloc(a, T, n)` now resolves `T` through the active substitution (works
+  inside a generic body); associated calls resolve type-alias receivers
+  (`IntList.init(a)`). 636 unit + 28 e2e tests.
+
+### Limitations (honest, v0.130)
+Value-semantics `self` (no true pointer receivers); one type parameter; `Self`
+only (no `@This()`).
+
 ## [0.129.0] — Generic structs (type-returning functions)
 
 ### Added
