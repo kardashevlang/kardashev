@@ -14,6 +14,8 @@
 //!   `alloc` / `free`).
 //! - `E0110` — a type mismatch (the general sema type-error code).
 //! - `E0120` — `break` / `continue` outside a loop.
+//! - `E0121` — a labeled `break :name` / `continue :name` whose `name` does not
+//!   match any enclosing loop's label (SPEC §40.1).
 //! - `E0130` / `E0131` / `E0132` — non-constant / unknown-const / type error
 //!   in a `comptime` or top-level `const` initializer (raised by `const_eval`).
 //! - `E0140` — `expect` called outside a `test` block.
@@ -162,6 +164,11 @@ struct Checker {
     in_test: bool,
     /// Nesting depth of enclosing `while` loops (gates `break`/`continue`).
     loop_depth: usize,
+    /// Stack of enclosing loop labels (v0.147, SPEC §40.1), innermost at the
+    /// back, parallel to `loop_depth`. Each entry is the loop's `label`
+    /// (`None` for an unlabeled loop). A labeled `break`/`continue :name` must
+    /// find `Some(name)` somewhere in this stack (else `E0121`).
+    loop_labels: Vec<Option<String>>,
     /// Return type of the function/test currently being checked.
     ret_type: Type,
     /// The active type-parameter substitution while checking a generic
@@ -221,6 +228,7 @@ impl Checker {
             scopes: Vec::new(),
             in_test: false,
             loop_depth: 0,
+            loop_labels: Vec::new(),
             ret_type: Type::Void,
             subst: HashMap::new(),
             value_subst: HashMap::new(),
@@ -704,6 +712,7 @@ impl Checker {
         self.ret_error_set = f.ret.error_set.clone();
         self.in_test = false;
         self.loop_depth = 0;
+        self.loop_labels.clear();
         self.scopes.push(HashMap::new());
         for p in &f.params {
             let pt = self.resolve_type(&p.ty).unwrap_or(Type::I64);
@@ -741,6 +750,7 @@ impl Checker {
         self.ret_error_set = f.ret.error_set.clone();
         self.in_test = false;
         self.loop_depth = 0;
+        self.loop_labels.clear();
         self.scopes.push(HashMap::new());
         let struct_name = self.structs.get(struct_id).name.clone();
         let is_method = f.params.first().map_or(false, |p| p.name == "self");
@@ -775,6 +785,7 @@ impl Checker {
         self.ret_error_set = None;
         self.in_test = true;
         self.loop_depth = 0;
+        self.loop_labels.clear();
         self.check_block(&t.body);
         self.in_test = false;
     }
@@ -1317,6 +1328,7 @@ impl Checker {
         let saved_ret_error_set = self.ret_error_set.take();
         let saved_in_test = self.in_test;
         let saved_loop = self.loop_depth;
+        let saved_loop_labels = std::mem::take(&mut self.loop_labels);
         let saved_scopes = std::mem::take(&mut self.scopes);
 
         // With `self.subst` active, the return type resolves `Self` / the type
@@ -1357,6 +1369,7 @@ impl Checker {
         self.ret_error_set = saved_ret_error_set;
         self.in_test = saved_in_test;
         self.loop_depth = saved_loop;
+        self.loop_labels = saved_loop_labels;
         self.scopes = saved_scopes;
     }
 
@@ -1606,15 +1619,23 @@ impl Checker {
                 }
             },
             Stmt::While {
-                cond, cont, body, ..
+                cond,
+                cont,
+                body,
+                label,
+                ..
             } => {
                 self.check_condition(cond, "while");
                 // The continue-clause statement runs in the loop's outer scope.
                 if let Some(c) = cont {
                     self.check_stmt(c);
                 }
+                // Track this loop's label (v0.147, SPEC §40.1) alongside the
+                // depth so an enclosed `break`/`continue :name` can find it.
                 self.loop_depth += 1;
+                self.loop_labels.push(label.clone());
                 self.check_block(body);
+                self.loop_labels.pop();
                 self.loop_depth -= 1;
             }
             // `for (iter) |elem| { … }` / `for (iter, 0..) |elem, index| { … }`
@@ -1631,6 +1652,7 @@ impl Checker {
                 elem,
                 index,
                 body,
+                label,
                 ..
             } => {
                 // The element type is `T` for `[]T`/`[N]T`; any other iterable is
@@ -1662,19 +1684,20 @@ impl Checker {
                     self.define(index_name, Type::Usize, true);
                 }
                 self.loop_depth += 1;
+                self.loop_labels.push(label.clone());
                 self.check_block(body);
+                self.loop_labels.pop();
                 self.loop_depth -= 1;
                 self.scopes.pop();
             }
-            Stmt::Break(span) => {
-                if self.loop_depth == 0 {
-                    self.error(*span, "E0120", "`break` is only valid inside a loop");
-                }
+            // `break;` / `break :label;` (v0.147, SPEC §40.1). Unlabeled: valid
+            // only inside a loop (`E0120`, unchanged). Labeled: `label` must
+            // name some enclosing loop's label (`E0121`).
+            Stmt::Break { target, span } => {
+                self.check_loop_target(target.as_deref(), *span, "break");
             }
-            Stmt::Continue(span) => {
-                if self.loop_depth == 0 {
-                    self.error(*span, "E0120", "`continue` is only valid inside a loop");
-                }
+            Stmt::Continue { target, span } => {
+                self.check_loop_target(target.as_deref(), *span, "continue");
             }
             Stmt::Defer { stmt, .. } => {
                 self.check_stmt(stmt);
@@ -1705,6 +1728,33 @@ impl Checker {
             if t != Type::Bool {
                 let msg = format!("`{}` condition must be `bool`, found `{}`", kw, self.type_name(t));
                 self.error(cond.span(), "E0110", msg);
+            }
+        }
+    }
+
+    /// Validate a `break`/`continue` target (v0.147, SPEC §40.1). `kw` is the
+    /// keyword for diagnostics. An unlabeled jump (`target == None`) is valid
+    /// only inside some loop (`E0120`, unchanged from v0.111). A labeled jump
+    /// (`break :name`) must name some **enclosing** loop's label, i.e. `name`
+    /// must appear in `loop_labels`; otherwise it is `E0121` (this also covers a
+    /// labeled jump that is outside every loop, since the stack is then empty).
+    fn check_loop_target(&mut self, target: Option<&str>, span: Span, kw: &str) {
+        match target {
+            None => {
+                if self.loop_depth == 0 {
+                    let msg = format!("`{}` is only valid inside a loop", kw);
+                    self.error(span, "E0120", msg);
+                }
+            }
+            Some(name) => {
+                let found = self
+                    .loop_labels
+                    .iter()
+                    .any(|l| l.as_deref() == Some(name));
+                if !found {
+                    let msg = format!("no enclosing loop labeled `{}`", name);
+                    self.error(span, "E0121", msg);
+                }
             }
         }
     }
@@ -4343,6 +4393,7 @@ impl Checker {
         let saved_ret_error_set = self.ret_error_set.take();
         let saved_in_test = self.in_test;
         let saved_loop = self.loop_depth;
+        let saved_loop_labels = std::mem::take(&mut self.loop_labels);
         let saved_scopes = std::mem::take(&mut self.scopes);
 
         // With `self.subst` / `self.value_subst` active, the return type and
@@ -4377,6 +4428,7 @@ impl Checker {
         self.ret_error_set = saved_ret_error_set;
         self.in_test = saved_in_test;
         self.loop_depth = saved_loop;
+        self.loop_labels = saved_loop_labels;
         self.scopes = saved_scopes;
     }
 }
@@ -5033,6 +5085,7 @@ mod tests {
             elem: elem.into(),
             index: index.map(|s| s.into()),
             body: block(body),
+            label: None,
             span: sp(),
         }
     }
@@ -5252,7 +5305,7 @@ mod tests {
             "main",
             vec![],
             "void",
-            vec![Stmt::Break(sp())],
+            vec![Stmt::Break { target: None, span: sp() }],
         )];
         assert!(codes(items).contains(&"E0120"));
     }
@@ -5640,7 +5693,7 @@ mod tests {
             "main",
             vec![],
             "void",
-            vec![Stmt::Continue(sp())],
+            vec![Stmt::Continue { target: None, span: sp() }],
         )];
         assert!(codes(items).contains(&"E0120"));
     }
@@ -5655,11 +5708,153 @@ mod tests {
             vec![Stmt::While {
                 cond: boolean(true),
                 cont: None,
-                body: block(vec![Stmt::Break(sp())]),
+                body: block(vec![Stmt::Break { target: None, span: sp() }]),
+                label: None,
                 span: sp(),
             }],
         )];
         assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    // ---- labeled break / continue (v0.147, SPEC §40) ----------------------
+
+    /// `name: while (true) { body }` for the labeled-loop tests.
+    fn labeled_while(label: &str, body: Vec<Stmt>) -> Stmt {
+        Stmt::While {
+            cond: boolean(true),
+            cont: None,
+            body: block(body),
+            label: Some(label.into()),
+            span: sp(),
+        }
+    }
+
+    /// `while (true) { body }` (unlabeled).
+    fn plain_while(body: Vec<Stmt>) -> Stmt {
+        Stmt::While {
+            cond: boolean(true),
+            cont: None,
+            body: block(body),
+            label: None,
+            span: sp(),
+        }
+    }
+
+    #[test]
+    fn break_outer_label_from_nested_while_is_ok() {
+        // fn main() void { outer: while (true) { while (true) { break :outer; } } }
+        let inner = plain_while(vec![Stmt::Break {
+            target: Some("outer".into()),
+            span: sp(),
+        }]);
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![labeled_while("outer", vec![inner])],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn continue_outer_label_from_nested_while_is_ok() {
+        // fn main() void { outer: while (true) { while (true) { continue :outer; } } }
+        let inner = plain_while(vec![Stmt::Continue {
+            target: Some("outer".into()),
+            span: sp(),
+        }]);
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![labeled_while("outer", vec![inner])],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn break_unknown_label_is_e0121() {
+        // fn main() void { while (true) { break :nope; } }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![plain_while(vec![Stmt::Break {
+                target: Some("nope".into()),
+                span: sp(),
+            }])],
+        )];
+        assert!(codes(items).contains(&"E0121"));
+    }
+
+    #[test]
+    fn continue_unknown_label_is_e0121() {
+        // fn main() void { while (true) { continue :nope; } }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![plain_while(vec![Stmt::Continue {
+                target: Some("nope".into()),
+                span: sp(),
+            }])],
+        )];
+        assert!(codes(items).contains(&"E0121"));
+    }
+
+    #[test]
+    fn labeled_break_outside_any_loop_is_e0121() {
+        // fn main() void { break :outer; }  — no loop at all.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![Stmt::Break {
+                target: Some("outer".into()),
+                span: sp(),
+            }],
+        )];
+        // A labeled jump with no enclosing labeled loop is E0121, not E0120.
+        assert!(codes(items.clone()).contains(&"E0121"));
+        assert!(!codes(items).contains(&"E0120"));
+    }
+
+    #[test]
+    fn labeled_loop_body_with_unlabeled_break_typechecks() {
+        // fn main() void { outer: while (true) { break; } }  — an unlabeled
+        // break inside a *labeled* loop still targets the innermost loop and is
+        // accepted with no diagnostics.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![labeled_while(
+                "outer",
+                vec![Stmt::Break { target: None, span: sp() }],
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn label_only_visible_inside_its_loop() {
+        // fn main() void {
+        //   outer: while (true) {}     // label scope ends with the loop
+        //   while (true) { break :outer; }   // `outer` not in scope here
+        // }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                labeled_while("outer", vec![]),
+                plain_while(vec![Stmt::Break {
+                    target: Some("outer".into()),
+                    span: sp(),
+                }]),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0121"));
     }
 
     // ---- for loops over arrays & slices (v0.133, SPEC §29) ----------------
@@ -5768,7 +5963,10 @@ mod tests {
                     ident("a"),
                     "x",
                     None,
-                    vec![Stmt::Break(sp()), Stmt::Continue(sp())],
+                    vec![
+                        Stmt::Break { target: None, span: sp() },
+                        Stmt::Continue { target: None, span: sp() },
+                    ],
                 ),
             ],
         )];

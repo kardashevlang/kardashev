@@ -1358,3 +1358,35 @@ matches nothing.
 A range label lowers to a GNU C case-range `case <lo> ... <hi>:` (supported by
 the `cc`/`clang` backend), beside the ordinary `case <label>:` lines for value
 labels. The rest of the `switch` lowering is unchanged.
+
+## 40. Labeled `break` / `continue` (v0.147)
+
+A loop may carry a **label**, and `break`/`continue` may **target** it:
+
+```
+outer: while (a) {
+    while (b) {
+        if (done) { break :outer; }     // leaves BOTH loops
+        if (skip) { continue :outer; }  // next iteration of the OUTER loop
+    }
+}
+```
+
+- `Stmt::While`/`Stmt::For` gain `label: Option<String>` (a `name:` before the
+  loop keyword). `Stmt::Break`/`Stmt::Continue` gain `target: Option<String>`
+  (`None` = innermost loop, unchanged; `Some(name)` = the enclosing loop with
+  that label).
+
+### 40.1 Semantics (`sema`)
+A labeled `break`/`continue` must name an **enclosing loop's label** (else an
+error); an unlabeled one still requires being inside a loop. Track the stack of
+enclosing loop labels alongside the existing loop-depth check.
+
+### 40.2 Backend (`emit_c`)
+A labeled loop emits a trailing C break-label `__kd_brk_<label>:;` after it and a
+continue-label `__kd_cont_<label>:;` at its continue point. `break :L` flushes
+`defer`s out to **and including** loop `L`'s scope, then `goto __kd_brk_L;`;
+`continue :L` flushes to loop `L`, runs `L`'s continue-clause, then `goto
+__kd_cont_L;`. Unlabeled `break`/`continue` are unchanged (innermost loop). The
+emitter's loop-body `Scope` records the loop's label so the flush walks to the
+right scope.

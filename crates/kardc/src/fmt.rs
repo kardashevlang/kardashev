@@ -17,7 +17,11 @@
 //! - Spaces around every binary operator (`a + b`, `a and b`).
 //! - `if (cond) { … } else if (cond) { … } else { … }`. The optional-payload
 //!   form binds the unwrapped value: `if (opt) |v| { … } else { … }` (SPEC §21).
-//! - `while (cond) { … }` / `while (cond) : (cont) { … }`.
+//! - `while (cond) { … }` / `while (cond) : (cont) { … }`. A loop may carry a
+//!   label (SPEC §40): `label: while (cond) { … }` / `label: for (…) |x| { … }`
+//!   print the `label: ` before the loop keyword. `break;` / `continue;` are the
+//!   unlabeled forms; `break :label;` / `continue :label;` target the named
+//!   enclosing loop. An unlabeled loop or break/continue is unchanged.
 //! - `const NAME: T = expr;` / `var name: T = expr;` / `return expr;`. The type
 //!   annotation is optional (SPEC §18): an inferred binding prints with no
 //!   `: T` — `const NAME = expr;` / `var name = expr;`.
@@ -425,10 +429,20 @@ impl Printer {
                 els,
                 ..
             } => self.print_if(cond, capture, then, els),
+            // `while (cond) { … }` / `while (cond) : (cont) { … }`, optionally
+            // labeled (SPEC §40): a `Some(name)` label prints `name: ` before
+            // the `while` keyword — `outer: while (cond) { … }` — and is then
+            // targetable by `break :name` / `continue :name`. An unlabeled loop
+            // (`label == None`) is byte-for-byte the pre-v0.147 form.
             Stmt::While {
-                cond, cont, body, ..
+                cond,
+                cont,
+                body,
+                label,
+                ..
             } => {
                 self.write_indent();
+                self.out.push_str(&fmt_loop_label(label));
                 self.out.push_str("while (");
                 self.out.push_str(&fmt_expr(cond));
                 self.out.push(')');
@@ -448,15 +462,20 @@ impl Printer {
             // { … }`: the `, 0..` follows the iterable inside the parens and a
             // second `, index` capture is appended between the pipes. `index =
             // None` is the plain form, exactly `for (<iter>) |elem| { … }`. The
-            // body prints one indent deeper, like `while`.
+            // body prints one indent deeper, like `while`. A `Some(name)` label
+            // (SPEC §40) prints `name: ` before the `for` keyword — `outer: for
+            // (<iter>) |elem| { … }` — exactly as for a labeled `while`; an
+            // unlabeled loop (`label == None`) is unchanged.
             Stmt::For {
                 iter,
                 elem,
                 index,
                 body,
+                label,
                 ..
             } => {
                 self.write_indent();
+                self.out.push_str(&fmt_loop_label(label));
                 self.out.push_str("for (");
                 self.out.push_str(&fmt_expr(iter));
                 if index.is_some() {
@@ -473,13 +492,20 @@ impl Printer {
                 self.write_indent();
                 self.out.push_str("}\n");
             }
-            Stmt::Break(_) => {
+            // `break;` / `break :label;` (SPEC §40). An unlabeled `break`
+            // (`target == None`) is the unchanged bare `break;`; a labeled one
+            // (`target == Some(label)`) targets the named enclosing loop and
+            // prints `break :label;`. (See [`fmt_break`].)
+            Stmt::Break { target, .. } => {
                 self.write_indent();
-                self.out.push_str("break;\n");
+                self.out.push_str(&fmt_break(target));
+                self.out.push('\n');
             }
-            Stmt::Continue(_) => {
+            // `continue;` / `continue :label;` (SPEC §40), mirroring `break`.
+            Stmt::Continue { target, .. } => {
                 self.write_indent();
-                self.out.push_str("continue;\n");
+                self.out.push_str(&fmt_continue(target));
+                self.out.push('\n');
             }
             Stmt::Defer { stmt, .. } => {
                 self.write_indent();
@@ -846,6 +872,42 @@ fn fmt_cont(s: &Stmt) -> String {
         Stmt::Expr(e) => fmt_expr(e),
         // The parser only produces Assign/Expr in this position.
         _ => String::new(),
+    }
+}
+
+/// The source prefix for a loop's optional label (SPEC §40). A labeled loop
+/// (`Some(name)`) prints `name: ` before the `while`/`for` keyword — e.g.
+/// `outer: while (…) { … }` — so the loop can be targeted by `break :name` /
+/// `continue :name`. An unlabeled loop (`None`) yields the empty string, leaving
+/// the pre-v0.147 form byte-for-byte unchanged. Shared by the multi-line and
+/// inline printers, and re-lexes to the same `label` so re-formatting is
+/// idempotent.
+fn fmt_loop_label(label: &Option<String>) -> String {
+    match label {
+        Some(name) => format!("{}: ", name),
+        None => String::new(),
+    }
+}
+
+/// The source spelling of a `break` statement (SPEC §40), including its trailing
+/// `;` but no newline. An unlabeled `break` (`target == None`) prints the bare
+/// `break;`, unchanged from pre-v0.147; a labeled one (`target == Some(label)`)
+/// targets the named enclosing loop and prints `break :label;`. Shared by the
+/// multi-line and inline printers; re-lexes to the same `target`.
+fn fmt_break(target: &Option<String>) -> String {
+    match target {
+        Some(label) => format!("break :{};", label),
+        None => "break;".to_string(),
+    }
+}
+
+/// The source spelling of a `continue` statement (SPEC §40), mirroring
+/// [`fmt_break`]: `continue;` when unlabeled, `continue :label;` when targeting
+/// the named enclosing loop.
+fn fmt_continue(target: &Option<String>) -> String {
+    match target {
+        Some(label) => format!("continue :{};", label),
+        None => "continue;".to_string(),
     }
 }
 
@@ -1303,9 +1365,16 @@ fn fmt_stmt_inline(stmt: &Stmt) -> String {
             ..
         } => fmt_if_inline(cond, capture, then, els),
         Stmt::While {
-            cond, cont, body, ..
+            cond,
+            cont,
+            body,
+            label,
+            ..
         } => {
-            let mut s = String::from("while (");
+            // A `Some(name)` label (SPEC §40) prints `name: ` before `while`,
+            // exactly as in the multi-line printer; unlabeled is unchanged.
+            let mut s = fmt_loop_label(label);
+            s.push_str("while (");
             s.push_str(&fmt_expr(cond));
             s.push(')');
             if let Some(c) = cont {
@@ -1326,9 +1395,13 @@ fn fmt_stmt_inline(stmt: &Stmt) -> String {
             elem,
             index,
             body,
+            label,
             ..
         } => {
-            let mut s = String::from("for (");
+            // A `Some(name)` label (SPEC §40) prints `name: ` before `for`,
+            // exactly as in the multi-line printer; unlabeled is unchanged.
+            let mut s = fmt_loop_label(label);
+            s.push_str("for (");
             s.push_str(&fmt_expr(iter));
             if index.is_some() {
                 s.push_str(", 0..");
@@ -1343,8 +1416,10 @@ fn fmt_stmt_inline(stmt: &Stmt) -> String {
             s.push_str(&fmt_block_inline(body));
             s
         }
-        Stmt::Break(_) => "break;".to_string(),
-        Stmt::Continue(_) => "continue;".to_string(),
+        // `break;` / `break :label;` and `continue;` / `continue :label;`
+        // (SPEC §40), inline — the same spelling as the multi-line printer.
+        Stmt::Break { target, .. } => fmt_break(target),
+        Stmt::Continue { target, .. } => fmt_continue(target),
         Stmt::Defer { stmt, .. } => format!("defer {}", fmt_stmt_inline(stmt)),
         Stmt::ErrDefer { stmt, .. } => format!("errdefer {}", fmt_stmt_inline(stmt)),
         Stmt::Block(b) => fmt_block_inline(b),
@@ -1876,7 +1951,10 @@ mod tests {
                     })),
                     span: D,
                 },
-                Stmt::Break(D),
+                Stmt::Break {
+                    target: None,
+                    span: D,
+                },
             ],
             span: D,
         };
@@ -1896,6 +1974,7 @@ mod tests {
                             span: D,
                         })),
                         body,
+                        label: None,
                         span: D,
                     }],
                     span: D,
@@ -5289,6 +5368,7 @@ mod tests {
                             stmts: vec![Stmt::Expr(call("print", vec![ident("x")]))],
                             span: D,
                         },
+                        label: None,
                         span: D,
                     }],
                     span: D,
@@ -5334,6 +5414,7 @@ mod tests {
                             ],
                             span: D,
                         },
+                        label: None,
                         span: D,
                     }],
                     span: D,
@@ -5386,6 +5467,208 @@ mod tests {
         assert_eq!(once, src);
         let twice = format_source(&once).expect("canonical source re-formats");
         assert_eq!(twice, once);
+    }
+
+    // ----- labeled break/continue (v0.147, SPEC §40) -----------------------
+
+    #[test]
+    fn loop_label_and_target_helpers() {
+        // The shared spelling helpers, independent of the parser. A `None` label
+        // prints nothing (unlabeled loop unchanged); a `Some` prints `name: `.
+        assert_eq!(fmt_loop_label(&None), "");
+        assert_eq!(fmt_loop_label(&Some("outer".to_string())), "outer: ");
+        // `break`/`continue` print the bare keyword when unlabeled, and the
+        // `:label` target when labeled — each with a trailing `;`, no newline.
+        assert_eq!(fmt_break(&None), "break;");
+        assert_eq!(fmt_break(&Some("outer".to_string())), "break :outer;");
+        assert_eq!(fmt_continue(&None), "continue;");
+        assert_eq!(fmt_continue(&Some("lp".to_string())), "continue :lp;");
+    }
+
+    #[test]
+    fn labeled_while_with_break_prints() {
+        // `outer: while (c) { break :outer; }` — a labeled `while` with a
+        // labeled `break` (SPEC §40). The label prints `outer: ` before the
+        // `while` keyword and the break prints `break :outer;`. Built directly
+        // from the AST so the printer is exercised independently of the parser.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::While {
+                        cond: ident("c"),
+                        cont: None,
+                        body: Block {
+                            stmts: vec![Stmt::Break {
+                                target: Some("outer".to_string()),
+                                span: D,
+                            }],
+                            span: D,
+                        },
+                        label: Some("outer".to_string()),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f() void {\n",
+            "    outer: while (c) {\n",
+            "        break :outer;\n",
+            "    }\n",
+            "}\n",
+        );
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn labeled_for_with_continue_prints() {
+        // `outer: for (xs) |x| { continue :outer; }` — a labeled `for` with a
+        // labeled `continue` (SPEC §40). The label prints before `for`.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![Param {
+                    name: "xs".to_string(),
+                    ty: slice_ty("i32"),
+                    is_comptime: false,
+                    span: D,
+                }],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::For {
+                        iter: ident("xs"),
+                        elem: "x".to_string(),
+                        index: None,
+                        body: Block {
+                            stmts: vec![Stmt::Continue {
+                                target: Some("outer".to_string()),
+                                span: D,
+                            }],
+                            span: D,
+                        },
+                        label: Some("outer".to_string()),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f(xs: []i32) void {\n",
+            "    outer: for (xs) |x| {\n",
+            "        continue :outer;\n",
+            "    }\n",
+            "}\n",
+        );
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn labeled_while_break_round_trips() {
+        // End-to-end (lex → parse → print), SPEC §40: a labeled `while` with a
+        // labeled `break` is already canonical, so formatting reproduces the
+        // source byte-for-byte and re-formatting is byte-identical (idempotent).
+        let src = concat!(
+            "fn f() void {\n",
+            "    outer: while (c) {\n",
+            "        break :outer;\n",
+            "    }\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn labeled_continue_round_trips() {
+        // SPEC §40: `continue :lp;` targeting a labeled `for` round-trips and is
+        // idempotent. Exercises the `for` label + `continue :label` together.
+        let src = concat!(
+            "fn f(xs: []i32) void {\n",
+            "    lp: for (xs) |x| {\n",
+            "        continue :lp;\n",
+            "    }\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn unlabeled_break_continue_unchanged() {
+        // SPEC §40: an unlabeled `break;` / `continue;` inside an unlabeled loop
+        // prints exactly as before v0.147 (regression guard for the `None`
+        // target / `None` label paths). Round-trips and is idempotent.
+        let src = concat!(
+            "fn f() void {\n",
+            "    while (c) {\n",
+            "        continue;\n",
+            "        break;\n",
+            "    }\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn labeled_break_continue_inline() {
+        // The inline statement printer (SPEC §26/§40), used inside a
+        // generic-struct method's `struct { … }` type value, spells labeled
+        // loops and break/continue identically to the multi-line printer.
+        let labeled_while = Stmt::While {
+            cond: ident("c"),
+            cont: None,
+            body: Block {
+                stmts: vec![Stmt::Break {
+                    target: Some("outer".to_string()),
+                    span: D,
+                }],
+                span: D,
+            },
+            label: Some("outer".to_string()),
+            span: D,
+        };
+        assert_eq!(
+            fmt_stmt_inline(&labeled_while),
+            "outer: while (c) { break :outer; }"
+        );
+        assert_eq!(
+            fmt_stmt_inline(&Stmt::Continue {
+                target: Some("lp".to_string()),
+                span: D,
+            }),
+            "continue :lp;"
+        );
+        // The unlabeled inline forms are unchanged.
+        assert_eq!(
+            fmt_stmt_inline(&Stmt::Break {
+                target: None,
+                span: D,
+            }),
+            "break;"
+        );
+        assert_eq!(
+            fmt_stmt_inline(&Stmt::Continue {
+                target: None,
+                span: D,
+            }),
+            "continue;"
+        );
     }
 
     // ----- comptime reflection builtins (v0.136, SPEC §32) -----------------

@@ -291,9 +291,11 @@ case-ranges), combinable with value labels in one arm. Multi-label arms
 (`1, 2, 3 =>`, `.A, .B =>`) already worked (labels are a `Vec`), so this added
 the range form.
 
-### v0.147.0 — Block expressions + labeled `break`
-`blk: { … break :blk v; }` value blocks and labeled `break`/`continue`, so a
-computation can yield a value.
+### v0.147.0 — Labeled `break` / `continue`
+Loops may carry a label (`outer: while (…) { … }`) and `break :outer` /
+`continue :outer` target an enclosing loop, lowered with C `goto` (defers flush
+to the targeted loop). Value-yielding block expressions (`blk: { break :blk v;
+}`) are a larger AST change, deferred.
 
 ### v0.148.0 — stdin / file I/O (`std.io`)
 Read a line from stdin and read a whole file into a `[]u8` — minimal I/O on the

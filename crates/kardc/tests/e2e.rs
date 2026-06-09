@@ -1189,3 +1189,48 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "4\n2\n0\n100\n200\n300\n300\n0\n");
 }
+
+// --- v0.147 labeled break / continue ---------------------------------------
+
+#[test]
+fn labeled_break_and_continue() {
+    let src = r#"
+fn find_product(target: i32) i32 {
+    var i: i32 = 1;
+    var found: i32 = 0 - 1;
+    outer: while (i <= 9) : (i += 1) {
+        var j: i32 = 1;
+        while (j <= 9) : (j += 1) {
+            if (i * j == target) {
+                found = i * 10 + j;
+                break :outer;        // leaves BOTH loops
+            }
+        }
+    }
+    return found;
+}
+fn count_below_diag() i32 {
+    var count: i32 = 0;
+    var i: i32 = 0;
+    outer: while (i < 4) : (i += 1) {
+        var j: i32 = 0;
+        while (j < 4) : (j += 1) {
+            if (j >= i) {
+                continue :outer;     // skip the rest of this row
+            }
+            count += 1;
+        }
+    }
+    return count;
+}
+pub fn main() i32 {
+    print(find_product(12));    // 26  (2*6, row-major first)
+    print(find_product(81));    // 99  (9*9)
+    print(count_below_diag());  // 6   (0+1+2+3)
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "26\n99\n6\n");
+}

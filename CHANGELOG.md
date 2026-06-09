@@ -18,6 +18,22 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.147.0] — Labeled `break` / `continue`
+
+### Added
+- **Loop labels + targeted `break`/`continue`**: `outer: while (…) { … }` (and
+  `for`), with `break :outer` (leaves both loops) / `continue :outer` (next
+  outer iteration). Lowered with C `goto`, flushing `defer`s out to the targeted
+  loop. `Stmt::While`/`For` gain `label`; `Stmt::Break`/`Continue` become struct
+  variants with `target`.
+- Unlabeled `break`/`continue` are unchanged (innermost loop); an unknown label
+  is `E0121`.
+- 944 unit + 44 e2e tests; `examples/labeled_loops.ks`.
+
+### Deferred (honest)
+Value-yielding block expressions (`blk: { break :blk v; }`) — a larger AST
+change — are deferred.
+
 ## [0.146.0] — `switch` ranges + multi-label arms
 
 ### Added
