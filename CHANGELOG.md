@@ -18,6 +18,19 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.135.0] — Multiple type parameters
+
+### Added
+- **Type-constructors with more than one type parameter**: `fn Pair(comptime A:
+  type, comptime B: type) type { return struct { … }; }`, instantiated via a
+  type alias (`const E = Pair(i32, i64);`), monomorphised on the argument tuple
+  (order matters — `Pair(i32,i64)` ≠ `Pair(i64,i32)`). Fields and methods
+  substitute all type parameters + `Self`. (Single-parameter constructors are
+  unchanged; generic *functions* already accepted N comptime params.)
+- `StructInstance.args: Vec<Type>`; arg-count mismatch is `E0311`, a non-type
+  comptime parameter in a type-constructor is `E0310`.
+- 752 unit + 34 e2e tests; `examples/multi_typeparam.ks`.
+
 ## [0.134.0] — Pointer-receiver methods (true mutation)
 
 ### Added

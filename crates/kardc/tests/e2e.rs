@@ -870,3 +870,39 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "6\n25\n");
 }
+
+// --- v0.135 multiple type parameters ---------------------------------------
+
+#[test]
+fn multiple_type_parameters() {
+    let src = r#"
+fn Pair(comptime A: type, comptime B: type) type {
+    return struct {
+        first: A,
+        second: B,
+        fn set(self: *Self, a: A, b: B) void {   // a method using BOTH type params
+            self.first = a;
+            self.second = b;
+        }
+        fn fst(self: Self) A { return self.first; }
+        fn snd(self: Self) B { return self.second; }
+    };
+}
+const IL = Pair(i32, i64);
+const LB = Pair(i64, i32);   // distinct instantiation (argument order)
+pub fn main() i32 {
+    var p: IL = IL{ .first = 5, .second = 9 };
+    print(p.fst());          // 5
+    print(p.snd());          // 9
+    p.set(7, 11);            // pointer-receiver mutation
+    print(p.fst());          // 7
+    print(p.snd());          // 11
+    var q: LB = LB{ .first = 100, .second = 3 };
+    print(q.snd());          // 3
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "5\n9\n7\n11\n3\n");
+}

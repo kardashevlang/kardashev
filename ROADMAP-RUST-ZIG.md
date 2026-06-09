@@ -207,10 +207,11 @@ behave, and `continue` still advances the index). Works for `[]T` and `[N]T`.
 methods mutate the receiver in place — no value-return dance. Field read/assign
 on any `*Struct` writes through the pointer. (No contract change — sema + emit.)
 
-### v0.135.0 — Multiple type parameters
-Generic functions and type-constructors with more than one `comptime T: type`
-(`fn Map(comptime K: type, comptime V: type) type`), monomorphised on the tuple
-of arguments.
+### v0.135.0 — Multiple type parameters ✅
+Type-constructors with more than one `comptime T: type` (`fn Pair(comptime A:
+type, comptime B: type) type`), monomorphised on the tuple of arguments
+(argument order matters; single-param unchanged). Generic *functions* already
+supported N comptime params (v0.120/v0.128). `StructInstance.args: Vec<Type>`.
 
 ### v0.136.0 — comptime reflection builtins
 `@This()` (the enclosing struct type, replacing the `Self` convention),
