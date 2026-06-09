@@ -896,9 +896,12 @@ impl<'a> Emitter<'a> {
     }
 
     /// Emit one `kd_enum_<Name>` typedef. Each variant becomes a C enumerator
-    /// `kd_enum_<Name>_<Variant>` with its explicit 0-based index, so the C
-    /// value matches the variant's declaration order regardless of how the
-    /// typedef is later reordered. An enum carries no by-value dependencies.
+    /// `kd_enum_<Name>_<Variant>` carrying its resolved integer value — the
+    /// explicit `= N` from the source or, for a value-less variant, the
+    /// auto-incremented value sema computed (the C rule: first defaults to 0,
+    /// later ones are previous + 1, SPEC §37). Because the C enumerator names
+    /// carry the values, enum literals, `switch` labels and comparisons are
+    /// value-based automatically. An enum carries no by-value dependencies.
     fn emit_one_enum(&mut self, id: u32) {
         let structs = self.structs;
         let info = structs.enum_get(id);
@@ -912,7 +915,14 @@ impl<'a> Emitter<'a> {
             info.variants
                 .iter()
                 .enumerate()
-                .map(|(i, v)| format!("{} = {}", structs.enum_variant_c_name(id, v), i))
+                .map(|(i, v)| {
+                    // The resolved value for variant `i`; fall back to the index
+                    // for the impossible case where values were never set (no
+                    // value-less behaviour change, since auto-increment from 0
+                    // reproduces the old 0,1,2,… indices).
+                    let val = info.values.get(i).copied().unwrap_or(i as i64);
+                    format!("{} = {}", structs.enum_variant_c_name(id, v), val)
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -2633,6 +2643,30 @@ impl<'a> Emitter<'a> {
                         };
                         format!("(({})({}))", self.cty_of(ty), val)
                     }
+                    // `@intFromEnum(e)` → the variant's integer value as an
+                    // `i64` (SPEC §37.2). The C enum's enumerators already carry
+                    // their values, so a plain cast of the enum expression to
+                    // `int64_t` yields the right number. The first arg here is a
+                    // value (not a type), so `arg_name`/`ty` above are unused.
+                    "intFromEnum" => {
+                        let v = match args.first() {
+                            Some(e) => self.emit_expr(e),
+                            None => "0".to_string(),
+                        };
+                        format!("((int64_t)({}))", v)
+                    }
+                    // `@enumFromInt(E, n)` → the enum value for integer `n`
+                    // (SPEC §37.2). The first arg names the enum type `E`
+                    // (resolved into `ty` above → `kd_enum_E`); the second is the
+                    // integer value. Lowers to a C cast `((kd_enum_E)(n))`.
+                    "enumFromInt" => {
+                        let cty = self.cty_of(ty);
+                        let v = match args.get(1) {
+                            Some(e) => self.emit_expr(e),
+                            None => "0".to_string(),
+                        };
+                        format!("(({})({}))", cty, v)
+                    }
                     "sizeOf" => format!("sizeof({})", self.cty_of(ty)),
                     "typeName" => {
                         // Print the bound type's name for a type parameter, else
@@ -3465,6 +3499,13 @@ impl<'a> Emitter<'a> {
                     .map(|(id, _)| Type::Slice(id)),
                 // `@as(T, e)` has type `T` (the cast target).
                 "as" => match args.first() {
+                    Some(Expr::Ident { name, .. }) => Some(self.base_type(name)),
+                    _ => None,
+                },
+                // `@intFromEnum(e)` → `i64`; `@enumFromInt(E, n)` → the enum
+                // type `E` named by its first argument (SPEC §37.2).
+                "intFromEnum" => Some(Type::I64),
+                "enumFromInt" => match args.first() {
                     Some(Expr::Ident { name, .. }) => Some(self.base_type(name)),
                     _ => None,
                 },
@@ -6063,6 +6104,8 @@ mod tests {
         t.set_enum_variants(
             id,
             vec!["Red".to_string(), "Green".to_string(), "Blue".to_string()],
+            // No explicit values → the auto-incremented 0,1,2 (regression).
+            vec![0, 1, 2],
         );
         t
     }
@@ -6078,6 +6121,201 @@ mod tests {
                 "typedef enum { kd_enum_Color_Red = 0, kd_enum_Color_Green = 1, kd_enum_Color_Blue = 2 } kd_enum_Color;"
             ),
             "enum typedef missing/wrong:\n{out}"
+        );
+    }
+
+    // -- enum explicit values + conversions (v0.143) ------------------------
+
+    /// A `StructTable` with `E = enum { A = 1, B, C = 10 }` (values [1, 2, 10])
+    /// at enum id 0 — sema would auto-increment `B` to `2`.
+    fn valued_enum_table() -> StructTable {
+        let mut t = StructTable::new();
+        let id = t.intern_enum("E");
+        t.set_enum_variants(
+            id,
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            vec![1, 2, 10],
+        );
+        t
+    }
+
+    /// `@intFromEnum(e)` — an `Expr::Builtin { name: "intFromEnum" }` (SPEC §37).
+    fn int_from_enum(e: Expr) -> Expr {
+        Expr::Builtin {
+            name: "intFromEnum".to_string(),
+            args: vec![e],
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `@enumFromInt(E, n)` — an `Expr::Builtin { name: "enumFromInt" }`.
+    fn enum_from_int(enum_name: &str, n: Expr) -> Expr {
+        Expr::Builtin {
+            name: "enumFromInt".to_string(),
+            args: vec![ident(enum_name), n],
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn enum_typedef_carries_explicit_values() {
+        // E = enum { A = 1, B, C = 10 } → the C enumerators carry [1, 2, 10].
+        let structs = valued_enum_table();
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains(
+                "typedef enum { kd_enum_E_A = 1, kd_enum_E_B = 2, kd_enum_E_C = 10 } kd_enum_E;"
+            ),
+            "explicit-valued enum typedef wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn no_value_enum_keeps_zero_based_indices_regression() {
+        // A value-less enum must still emit 0,1,2 (unchanged v0.116 behaviour).
+        let structs = color_enum_table();
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains(
+                "typedef enum { kd_enum_Color_Red = 0, kd_enum_Color_Green = 1, kd_enum_Color_Blue = 2 } kd_enum_Color;"
+            ),
+            "no-value enum regression:\n{out}"
+        );
+    }
+
+    #[test]
+    fn int_from_enum_lowers_to_int64_cast() {
+        // fn f() i64 { return @intFromEnum(E.C); }
+        // `E.C` lowers to its enumerator (which carries the value 10), then a
+        // plain `(int64_t)` cast yields the integer value.
+        let structs = valued_enum_table();
+        let m = Module {
+            items: vec![Item::Func(func(
+                "f",
+                vec![],
+                "i64",
+                vec![ret(int_from_enum(field(ident("E"), "C")))],
+            ))],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The `return` statement wraps the value in its own parens; the builtin
+        // itself lowers to the SPEC §37.2 `((int64_t)(<enumerator>))`.
+        assert!(
+            out.contains("((int64_t)(kd_enum_E_C))"),
+            "@intFromEnum lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn enum_from_int_lowers_to_enum_cast() {
+        // fn f() E { return @enumFromInt(E, 10); }
+        // The first arg names the enum type → a C cast to its `kd_enum_E` cty.
+        let structs = valued_enum_table();
+        let m = Module {
+            items: vec![Item::Func(func(
+                "f",
+                vec![],
+                "E",
+                vec![ret(enum_from_int("E", int(10)))],
+            ))],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The function's return type uses the enum typedef.
+        assert!(
+            out.contains("kd_enum_E kd_f(void)"),
+            "enum return type wrong:\n{out}"
+        );
+        assert!(
+            out.contains("((kd_enum_E)(10))"),
+            "@enumFromInt lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn enum_from_int_over_runtime_value() {
+        // @enumFromInt(E, n) where `n` is a runtime i64 parameter.
+        let structs = valued_enum_table();
+        let m = Module {
+            items: vec![Item::Func(func(
+                "f",
+                vec![param("n", "i64")],
+                "E",
+                vec![ret(enum_from_int("E", ident("n")))],
+            ))],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("((kd_enum_E)(kd_n))"),
+            "@enumFromInt over a runtime value wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn int_from_enum_infers_i64_result_type() {
+        // `var x = @intFromEnum(E.A);` infers `int64_t` for the local (via
+        // `type_of_expr` reporting `i64`).
+        let structs = valued_enum_table();
+        let m = Module {
+            items: vec![Item::Func(func(
+                "f",
+                vec![],
+                "void",
+                vec![Stmt::Let {
+                    is_const: false,
+                    name: "x".to_string(),
+                    ty: None,
+                    value: int_from_enum(field(ident("E"), "A")),
+                    span: Span::DUMMY,
+                }],
+            ))],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("int64_t kd_x = ((int64_t)(kd_enum_E_A));"),
+            "@intFromEnum result-type inference wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn enum_from_int_round_trips_into_a_switch() {
+        // fn f(n: i64) i32 {
+        //     switch (@enumFromInt(E, n)) {
+        //         .A => { return 1; } .B => { return 2; } .C => { return 3; }
+        //     }
+        // }
+        // The scrutinee is an `E`, so `type_of_expr(@enumFromInt(E,n))` must be
+        // `Enum(id)` for the enum-label lowering to fire (value-based cases).
+        let structs = valued_enum_table();
+        let sw = Stmt::Switch {
+            scrutinee: enum_from_int("E", ident("n")),
+            arms: vec![
+                arm(vec![enum_lit("A")], vec![ret(int(1))]),
+                arm(vec![enum_lit("B")], vec![ret(int(2))]),
+                arm(vec![enum_lit("C")], vec![ret(int(3))]),
+            ],
+            default: None,
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(func(
+                "f",
+                vec![param("n", "i64")],
+                "i32",
+                vec![sw],
+            ))],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The switch dispatches on the cast enum value.
+        assert!(
+            out.contains("switch (((kd_enum_E)(kd_n)))") || out.contains("((kd_enum_E)(kd_n))"),
+            "switch over @enumFromInt missing the enum cast:\n{out}"
+        );
+        // Enum labels lower to their value-carrying C enumerators.
+        assert!(
+            out.contains("case kd_enum_E_C: {"),
+            "enum-label switch case missing:\n{out}"
         );
     }
 

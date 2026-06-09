@@ -1290,3 +1290,28 @@ else { __kd_catchN = __kd_euN.val; }
 and the expression yields `__kd_catchN` — so `default` runs only on the error
 path, with `e` in scope. The non-capturing form keeps its existing
 (eager-`default`) lowering.
+
+## 37. Enum explicit values + conversions (v0.143)
+
+Enum variants may carry an explicit integer value, and convert to/from integers:
+
+- `const Color = enum { Red = 1, Green, Blue = 10 };` — a variant with `= N`
+  takes value `N`; a variant without one **auto-increments** from the previous
+  (the first defaults to 0), the C rule. `EnumVariant{ name, value:
+  Option<i64> }`; `EnumInfo` stores the resolved `values`.
+- `@intFromEnum(e)` → `i64`: the variant's integer value.
+- `@enumFromInt(E, n)` → `E`: the enum value for integer `n` (no range check in
+  v0.143).
+
+### 37.1 Semantics (`sema`)
+sema resolves each variant's value (explicit, else previous + 1, else 0) and
+stores them via `set_enum_variants(id, names, values)`. `@intFromEnum`'s argument
+must be an enum (→ `i64`); `@enumFromInt`'s first argument names an enum type and
+the second is an integer (→ that enum). (An explicit value is an integer literal
+in v0.143.)
+
+### 37.2 Backend (`emit_c`)
+The C `enum` carries the values — `enum kd_enum_Color { kd_enum_Color_Red = 1,
+kd_enum_Color_Green = 2, kd_enum_Color_Blue = 10 }` — so enum literals, `switch`
+labels and comparisons are value-based automatically. `@intFromEnum(e)` →
+`((int64_t)(e))`; `@enumFromInt(E, n)` → `((<enum cty>)(n))`.

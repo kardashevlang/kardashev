@@ -28,10 +28,15 @@
 //!   Struct literals print `Name{ .f = e, … }` and field access `base.field`
 //!   (SPEC §9).
 //! - `const Name = enum { A, B, … };` — one variant per line, 4-space indent,
-//!   trailing comma on each; an empty enum prints `const Name = enum {};`. An
-//!   unqualified enum literal prints `.Variant`; the qualified form reuses field
-//!   access (`Enum.Variant`). A `switch` prints with each arm `labels => { … }`
-//!   indented one level, arms comma-terminated, an `else` arm last (SPEC §13).
+//!   trailing comma on each; an empty enum prints `const Name = enum {};`. A
+//!   variant carrying an explicit integer value prints `A = N,` (SPEC §37); a
+//!   variant without one keeps the bare `A,`. An unqualified enum literal prints
+//!   `.Variant`; the qualified form reuses field access (`Enum.Variant`). A
+//!   `switch` prints with each arm `labels => { … }` indented one level, arms
+//!   comma-terminated, an `else` arm last (SPEC §13). The `@intFromEnum(e)` /
+//!   `@enumFromInt(E, n)` conversions (SPEC §37) are `Expr::Builtin`s and print
+//!   through the shared builtin printer as `@intFromEnum(<e>)` /
+//!   `@enumFromInt(<E>, <n>)`.
 //! - `const Name = union(enum) { v: T, … };` — a tagged union, one `v: T` per
 //!   line, 4-space indent, trailing comma on each, mirroring the struct form;
 //!   an empty union prints `const Name = union(enum) {};`. Union construction
@@ -220,10 +225,15 @@ impl Printer {
         self.out.push_str("};\n");
     }
 
-    /// Print an enum declaration (SPEC §13). One `    Variant,` per line with a
-    /// 4-space indent and a trailing comma on every variant, then `};` to close.
-    /// An empty enum — no variants — collapses to `const Name = enum {};` on a
-    /// single line. A `pub` enum keeps its leading `pub`.
+    /// Print an enum declaration (SPEC §13/§37). One `    Variant,` per line with
+    /// a 4-space indent and a trailing comma on every variant, then `};` to close.
+    /// A variant carrying an explicit integer value (`EnumVariant.value =
+    /// Some(N)`, SPEC §37) prints `    Variant = N,`; a variant without one
+    /// (`None`, the auto-incrementing case) prints the bare `    Variant,`,
+    /// exactly as in v0.116. An empty enum — no variants — collapses to
+    /// `const Name = enum {};` on a single line. A `pub` enum keeps its leading
+    /// `pub`. The printed form re-lexes to the same `EnumDecl` (the parser reads
+    /// the optional `= N` per variant), so re-formatting is idempotent.
     fn print_enum(&mut self, e: &EnumDecl) {
         self.write_indent();
         if e.is_pub {
@@ -240,7 +250,14 @@ impl Printer {
         self.indent += 1;
         for variant in &e.variants {
             self.write_indent();
-            self.out.push_str(variant);
+            self.out.push_str(&variant.name);
+            // An explicit value (`= N`, SPEC §37) prints after the variant name
+            // with single spaces around the `=`; a `None` value (auto-increment)
+            // prints nothing extra, leaving the v0.116 bare-`Variant` form.
+            if let Some(n) = variant.value {
+                self.out.push_str(" = ");
+                self.out.push_str(&n.to_string());
+            }
             self.out.push_str(",\n");
         }
         self.indent -= 1;
@@ -1443,7 +1460,7 @@ fn escape_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{FieldDecl, FieldInit, Param, TypeExpr, UnionVariant};
+    use crate::ast::{EnumVariant, FieldDecl, FieldInit, Param, TypeExpr, UnionVariant};
     use crate::span::Span;
 
     const D: Span = Span::DUMMY;
@@ -2891,6 +2908,17 @@ mod tests {
         }
     }
 
+    /// An enum variant for an [`EnumDecl`] (SPEC §13/§37): `name` with an
+    /// optional explicit integer value (`Some(N)` → `name = N`, `None` → the
+    /// bare auto-incrementing `name`).
+    fn enum_variant(name: &str, value: Option<i64>) -> EnumVariant {
+        EnumVariant {
+            name: name.to_string(),
+            value,
+            span: D,
+        }
+    }
+
     fn arm(labels: Vec<Expr>, body: Vec<Stmt>) -> SwitchArm {
         SwitchArm {
             labels,
@@ -2923,7 +2951,11 @@ mod tests {
             items: vec![Item::Enum(EnumDecl {
                 is_pub: true,
                 name: "Color".to_string(),
-                variants: vec!["Red".to_string(), "Green".to_string(), "Blue".to_string()],
+                variants: vec![
+                    enum_variant("Red", None),
+                    enum_variant("Green", None),
+                    enum_variant("Blue", None),
+                ],
                 span: D,
             })],
         };
@@ -2945,6 +2977,85 @@ mod tests {
             })],
         };
         assert_eq!(print_module(&m), "const Never = enum {};\n");
+    }
+
+    #[test]
+    fn enum_decl_explicit_values_print() {
+        // Explicit values (SPEC §37): a variant with `value = Some(N)` prints
+        // `Variant = N,`; one with `value = None` (auto-increment) keeps the
+        // bare `Variant,`. Mixed forms in one enum print each per its own value.
+        let m = Module {
+            items: vec![Item::Enum(EnumDecl {
+                is_pub: false,
+                name: "Color".to_string(),
+                variants: vec![
+                    enum_variant("Red", Some(1)),
+                    enum_variant("Green", None),
+                    enum_variant("Blue", Some(10)),
+                ],
+                span: D,
+            })],
+        };
+        let expected = "const Color = enum {\n    Red = 1,\n    Green,\n    Blue = 10,\n};\n";
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn enum_decl_no_values_round_trips() {
+        // End-to-end (lex → parse → print), SPEC §13/§37: an enum whose variants
+        // carry no explicit value is canonical as the bare-`Variant` form,
+        // exactly as in v0.116 — formatting reproduces the source byte-for-byte
+        // and re-formatting is idempotent (no spurious `= 0,1,2`).
+        let src = "const Dir = enum {\n    A,\n    B,\n};\n";
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn enum_decl_explicit_values_round_trip_preserves_values() {
+        // End-to-end (lex → parse → print), SPEC §37: explicit values survive a
+        // format round-trip — `A = 1` and `C = 10` keep their `= N`, while the
+        // value-less `B` stays bare (it auto-increments at the semantic layer,
+        // not in the printed surface). The canonical form is already minimal, so
+        // formatting is byte-stable and re-formatting is idempotent.
+        let src = "const Color = enum {\n    A = 1,\n    B,\n    C = 10,\n};\n";
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn int_from_enum_builtin_prints_and_round_trips() {
+        // `@intFromEnum(e)` (SPEC §37) is an `Expr::Builtin` and prints through
+        // the shared builtin printer: `@` + name + parenthesised args. A single
+        // ident argument prints bare, so `@intFromEnum(x)` reproduces exactly.
+        assert_eq!(
+            fmt_expr(&builtin("intFromEnum", vec![ident("x")])),
+            "@intFromEnum(x)"
+        );
+        // End-to-end round-trip: the builtin form is already canonical.
+        let src = "fn f() void {\n    var n = @intFromEnum(x);\n}\n";
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn enum_from_int_builtin_prints() {
+        // `@enumFromInt(E, n)` (SPEC §37) — a two-argument `Expr::Builtin`. The
+        // shared builtin printer joins the type-naming ident and the integer
+        // value with `, ` inside the parens: `@enumFromInt(Color, n)`.
+        assert_eq!(
+            fmt_expr(&builtin("enumFromInt", vec![ident("Color"), ident("n")])),
+            "@enumFromInt(Color, n)"
+        );
     }
 
     #[test]

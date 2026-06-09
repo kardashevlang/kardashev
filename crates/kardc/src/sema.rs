@@ -288,16 +288,28 @@ impl Checker {
             if let Item::Enum(e) = item {
                 let id = self.structs.intern_enum(&e.name);
                 let mut variants: Vec<String> = Vec::new();
+                let mut values: Vec<i64> = Vec::new();
                 let mut seen: HashSet<String> = HashSet::new();
+                // Resolve each variant's integer value (v0.143, SPEC §37.1): an
+                // explicit `= N` sets the running counter to `N` and is used;
+                // a variant without one takes the counter's current value. After
+                // each variant the counter advances to `used + 1` — so the first
+                // un-annotated variant is 0 and the sequence auto-increments (the
+                // C rule). `values` stays parallel to `variants`.
+                let mut counter: i64 = 0;
                 for v in &e.variants {
-                    if !seen.insert(v.clone()) {
-                        let msg = format!("duplicate variant `{}` in enum `{}`", v, e.name);
+                    let used = v.value.unwrap_or(counter);
+                    counter = used.wrapping_add(1);
+                    if !seen.insert(v.name.clone()) {
+                        let msg =
+                            format!("duplicate variant `{}` in enum `{}`", v.name, e.name);
                         self.error(e.span, "E0211", msg);
                         continue;
                     }
-                    variants.push(v.clone());
+                    variants.push(v.name.clone());
+                    values.push(used);
                 }
-                self.structs.set_enum_variants(id, variants);
+                self.structs.set_enum_variants(id, variants, values);
             }
         }
 
@@ -2841,9 +2853,88 @@ impl Checker {
                     }
                     Some(expected.unwrap_or(Type::Void))
                 }
+                "intFromEnum" => {
+                    // `@intFromEnum(e)` (v0.143, SPEC §37) — the integer value of
+                    // an enum value `e`. Exactly one argument, which must itself be
+                    // an enum value (`Type::Enum`); the result is `i64`. A wrong
+                    // argument count is `E0320`; a non-enum argument is `E0321`.
+                    if args.len() != 1 {
+                        self.error(
+                            *span,
+                            "E0320",
+                            format!(
+                                "`@intFromEnum` takes exactly 1 argument (an enum value), found {}",
+                                args.len()
+                            ),
+                        );
+                        return None;
+                    }
+                    if let Some(at) = self.check_expr(&args[0], None) {
+                        if !matches!(at, Type::Enum(_)) {
+                            self.error(
+                                args[0].span(),
+                                "E0321",
+                                format!(
+                                    "`@intFromEnum` requires an enum value, found `{}`",
+                                    self.type_name(at)
+                                ),
+                            );
+                        }
+                    }
+                    Some(Type::I64)
+                }
+                "enumFromInt" => {
+                    // `@enumFromInt(E, n)` (v0.143, SPEC §37) — the value of enum
+                    // type `E` whose integer value is `n` (no range check in
+                    // v0.143). Two arguments: the first *names* an enum type `E`
+                    // (resolved like `alloc`'s type argument — substitution-aware),
+                    // the second is an integer; the result type is `E`. A wrong
+                    // argument count is `E0320`; a first argument that does not name
+                    // an enum type, or a non-integer value, is `E0321`.
+                    if args.len() != 2 {
+                        self.error(
+                            *span,
+                            "E0320",
+                            format!(
+                                "`@enumFromInt` takes an enum type and an integer, found {} arguments",
+                                args.len()
+                            ),
+                        );
+                        return None;
+                    }
+                    let result = match self.resolve_type_arg(&args[0]) {
+                        Some(Type::Enum(id)) => Some(Type::Enum(id)),
+                        Some(other_ty) => {
+                            self.error(
+                                args[0].span(),
+                                "E0321",
+                                format!(
+                                    "`@enumFromInt`'s first argument must name an enum type, found `{}`",
+                                    self.type_name(other_ty)
+                                ),
+                            );
+                            None
+                        }
+                        // `resolve_type_arg` already reported that it names no type.
+                        None => None,
+                    };
+                    if let Some(vt) = self.check_expr(&args[1], None) {
+                        if !vt.is_int() {
+                            self.error(
+                                args[1].span(),
+                                "E0321",
+                                format!(
+                                    "`@enumFromInt`'s value must be an integer, found `{}`",
+                                    self.type_name(vt)
+                                ),
+                            );
+                        }
+                    }
+                    result
+                }
                 other => {
                     let msg = format!(
-                        "unknown `@`-builtin `@{}` (expected `@sizeOf`, `@typeName`, `@as`, or `@panic`)",
+                        "unknown `@`-builtin `@{}` (expected `@sizeOf`, `@typeName`, `@as`, `@panic`, `@intFromEnum`, or `@enumFromInt`)",
                         other
                     );
                     self.error(*span, "E0320", msg);
@@ -4339,8 +4430,8 @@ fn needs_inference_context(e: &Expr) -> bool {
 mod tests {
     use super::*;
     use crate::ast::{
-        ConstDecl, EnumDecl, ErrorSetDecl, FieldDecl, FieldInit, Func, Param, StructDecl,
-        TestBlock, UnionDecl, UnionVariant,
+        ConstDecl, EnumDecl, EnumVariant, ErrorSetDecl, FieldDecl, FieldInit, Func, Param,
+        StructDecl, TestBlock, UnionDecl, UnionVariant,
     };
 
     fn sp() -> Span {
@@ -6857,7 +6948,32 @@ mod tests {
         Item::Enum(EnumDecl {
             is_pub: false,
             name: name.into(),
-            variants: variants.into_iter().map(|v| v.into()).collect(),
+            variants: variants
+                .into_iter()
+                .map(|v| EnumVariant {
+                    name: v.into(),
+                    value: None,
+                    span: sp(),
+                })
+                .collect(),
+            span: sp(),
+        })
+    }
+    /// An enum item whose variants carry explicit values (`A = 1`), for the
+    /// v0.143 explicit-value tests. Each `(name, Some(n))` is `name = n`; a
+    /// `(name, None)` auto-increments.
+    fn enum_item_valued(name: &str, variants: Vec<(&str, Option<i64>)>) -> Item {
+        Item::Enum(EnumDecl {
+            is_pub: false,
+            name: name.into(),
+            variants: variants
+                .into_iter()
+                .map(|(n, v)| EnumVariant {
+                    name: n.into(),
+                    value: v,
+                    span: sp(),
+                })
+                .collect(),
             span: sp(),
         })
     }
@@ -8880,7 +8996,10 @@ mod tests {
             Item::Enum(EnumDecl {
                 is_pub: false,
                 name: "Color".into(),
-                variants: vec!["Red".into(), "Green".into()],
+                variants: vec![
+                    EnumVariant { name: "Red".into(), value: None, span: sp() },
+                    EnumVariant { name: "Green".into(), value: None, span: sp() },
+                ],
                 span: sp(),
             }),
             func(
@@ -8918,7 +9037,10 @@ mod tests {
             Item::Enum(EnumDecl {
                 is_pub: false,
                 name: "Color".into(),
-                variants: vec!["Red".into(), "Green".into()],
+                variants: vec![
+                    EnumVariant { name: "Red".into(), value: None, span: sp() },
+                    EnumVariant { name: "Green".into(), value: None, span: sp() },
+                ],
                 span: sp(),
             }),
             func(
@@ -10878,6 +11000,120 @@ mod tests {
             vec![],
             "void",
             vec![Stmt::Expr(builtin("panic", vec![str_lit("a"), str_lit("b")]))],
+        )];
+        assert!(codes(items).contains(&"E0320"));
+    }
+
+    // ---- enum explicit values + conversions (v0.143, SPEC §37) ------------
+
+    #[test]
+    fn enum_explicit_values_recorded() {
+        // const E = enum { A = 1, B, C = 10 };  => values [1, 2, 10]
+        // (an explicit value sets the counter; the gap auto-increments).
+        let table = check_ok(vec![enum_item_valued(
+            "E",
+            vec![("A", Some(1)), ("B", None), ("C", Some(10))],
+        )]);
+        let id = table.enum_id_of("E").expect("E should be registered");
+        assert_eq!(table.enum_get(id).values, vec![1, 2, 10]);
+        // The convenience accessor agrees.
+        assert_eq!(table.enum_get(id).variant_value("C"), Some(10));
+    }
+
+    #[test]
+    fn enum_no_explicit_values_auto_increment() {
+        // const E = enum { A, B, C };  => values [0, 1, 2] (unchanged behaviour).
+        let table = check_ok(vec![enum_item("E", vec!["A", "B", "C"])]);
+        let id = table.enum_id_of("E").expect("E should be registered");
+        assert_eq!(table.enum_get(id).values, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn enum_explicit_value_can_lower_counter() {
+        // const E = enum { A = 5, B, C = 0, D };  => values [5, 6, 0, 1].
+        let table = check_ok(vec![enum_item_valued(
+            "E",
+            vec![("A", Some(5)), ("B", None), ("C", Some(0)), ("D", None)],
+        )]);
+        let id = table.enum_id_of("E").expect("E should be registered");
+        assert_eq!(table.enum_get(id).values, vec![5, 6, 0, 1]);
+    }
+
+    #[test]
+    fn int_from_enum_is_i64() {
+        // const Color = enum { Red, Green, Blue };
+        // fn main() void { var x: i64 = @intFromEnum(Color.Red); }
+        let items = vec![
+            enum_item("Color", vec!["Red", "Green", "Blue"]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var(
+                    "x",
+                    "i64",
+                    builtin("intFromEnum", vec![field(ident("Color"), "Red")]),
+                )],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn enum_from_int_is_the_enum_type() {
+        // const Color = enum { Red, Green, Blue };
+        // fn main() void { var c: Color = @enumFromInt(Color, 2); }
+        let items = vec![
+            enum_item("Color", vec!["Red", "Green", "Blue"]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var(
+                    "c",
+                    "Color",
+                    builtin("enumFromInt", vec![ident("Color"), int(2)]),
+                )],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn int_from_enum_of_non_enum_is_error() {
+        // fn main() void { var x: i64 = @intFromEnum(5); }  — 5 is not an enum.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var("x", "i64", builtin("intFromEnum", vec![int(5)]))],
+        )];
+        assert!(codes(items).contains(&"E0321"));
+    }
+
+    #[test]
+    fn enum_from_int_non_enum_type_first_arg_is_error() {
+        // fn main() void { var c = @enumFromInt(i32, 2); }  — i32 is not an enum.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_infer(
+                "c",
+                builtin("enumFromInt", vec![ident("i32"), int(2)]),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0321"));
+    }
+
+    #[test]
+    fn int_from_enum_wrong_arity_is_e0320() {
+        // fn main() void { var x: i64 = @intFromEnum(); }  — wrong arity.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var("x", "i64", builtin("intFromEnum", vec![]))],
         )];
         assert!(codes(items).contains(&"E0320"));
     }

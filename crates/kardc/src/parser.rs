@@ -12,9 +12,9 @@
 //! `Err` if any diagnostic was produced.
 
 use crate::ast::{
-    ArraySize, BinOp, Block, ConstDecl, EnumDecl, ErrorSetDecl, Expr, FieldDecl, FieldInit, Func,
-    ImportDecl, Item, Module, Param, Stmt, StructDecl, SwitchArm, TestBlock, TypeExpr, UnOp,
-    UnionDecl, UnionVariant,
+    ArraySize, BinOp, Block, ConstDecl, EnumDecl, EnumVariant, ErrorSetDecl, Expr, FieldDecl,
+    FieldInit, Func, ImportDecl, Item, Module, Param, Stmt, StructDecl, SwitchArm, TestBlock,
+    TypeExpr, UnOp, UnionDecl, UnionVariant,
 };
 use crate::diag::Diagnostic;
 use crate::span::Span;
@@ -690,8 +690,23 @@ impl<'a> Parser<'a> {
         self.expect_punct(&TokenKind::LBrace, "`{`")?;
         let mut variants = Vec::new();
         while !self.at_punct(&TokenKind::RBrace) {
-            let (vname, _) = self.expect_ident()?;
-            variants.push(vname);
+            let (vname, vspan) = self.expect_ident()?;
+            // Optional explicit integer value: `A = N` (v0.143, SPEC §37). A
+            // missing value (`None`) auto-increments in sema (C rules: first 0).
+            // The value is an integer literal here; range/negativity is a sema
+            // concern, so we reuse `expect_int` and merge its span into the
+            // variant's.
+            let (value, span) = if self.eat_punct(&TokenKind::Eq) {
+                let (n, ispan) = self.expect_int()?;
+                (Some(n), vspan.merge(ispan))
+            } else {
+                (None, vspan)
+            };
+            variants.push(EnumVariant {
+                name: vname,
+                value,
+                span,
+            });
             if !self.eat_punct(&TokenKind::Comma) {
                 break; // no separator → the variant list is done
             }
@@ -4645,7 +4660,10 @@ mod tests {
             Item::Enum(e) => {
                 assert!(e.is_pub);
                 assert_eq!(e.name, "Color");
-                assert_eq!(e.variants, vec!["Red", "Green", "Blue"]);
+                let names: Vec<&str> = e.variants.iter().map(|v| v.name.as_str()).collect();
+                assert_eq!(names, vec!["Red", "Green", "Blue"]);
+                // No `= N` anywhere → every value is `None` (auto-increment).
+                assert!(e.variants.iter().all(|v| v.value.is_none()));
                 assert!(e.span.start < e.span.end);
             }
             other => panic!("expected enum, got {:?}", other),
@@ -4671,10 +4689,128 @@ mod tests {
             Item::Enum(e) => {
                 assert!(!e.is_pub);
                 assert_eq!(e.name, "E");
-                assert_eq!(e.variants, vec!["A"]);
+                assert_eq!(e.variants.len(), 1);
+                assert_eq!(e.variants[0].name, "A");
+                assert_eq!(e.variants[0].value, None);
             }
             other => panic!("expected enum, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn enum_decl_explicit_values() {
+        // const E = enum { A = 1, B, C = 10 };  — explicit values are captured as
+        // `Some(n)`; a bare variant carries `None` (sema auto-increments it).
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("E"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Enum),
+            TokenKind::LBrace,
+            id("A"),
+            TokenKind::Eq,
+            TokenKind::Int(1),
+            TokenKind::Comma,
+            id("B"),
+            TokenKind::Comma,
+            id("C"),
+            TokenKind::Eq,
+            TokenKind::Int(10),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Enum(e) => {
+                assert_eq!(e.name, "E");
+                assert_eq!(e.variants.len(), 3);
+                assert_eq!(e.variants[0].name, "A");
+                assert_eq!(e.variants[0].value, Some(1));
+                assert_eq!(e.variants[1].name, "B");
+                assert_eq!(e.variants[1].value, None);
+                assert_eq!(e.variants[2].name, "C");
+                assert_eq!(e.variants[2].value, Some(10));
+                // The `A = 1` variant's span must cover both the name and the
+                // value literal (merged), so it is wider than one token.
+                assert!(e.variants[0].span.start < e.variants[0].span.end);
+            }
+            other => panic!("expected enum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enum_decl_explicit_value_pub_const() {
+        // pub const E = enum { X = 5 };  — a single explicitly-valued variant on
+        // a `pub` enum still parses.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Pub),
+            TokenKind::Keyword(Kw::Const),
+            id("E"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Enum),
+            TokenKind::LBrace,
+            id("X"),
+            TokenKind::Eq,
+            TokenKind::Int(5),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Enum(e) => {
+                assert!(e.is_pub);
+                assert_eq!(e.name, "E");
+                assert_eq!(e.variants.len(), 1);
+                assert_eq!(e.variants[0].name, "X");
+                assert_eq!(e.variants[0].value, Some(5));
+            }
+            other => panic!("expected enum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enum_decl_explicit_value_trailing_comma() {
+        // const E = enum { A = 1, };  — trailing comma after an explicit value.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("E"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Enum),
+            TokenKind::LBrace,
+            id("A"),
+            TokenKind::Eq,
+            TokenKind::Int(1),
+            TokenKind::Comma,
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Enum(e) => {
+                assert_eq!(e.variants.len(), 1);
+                assert_eq!(e.variants[0].name, "A");
+                assert_eq!(e.variants[0].value, Some(1));
+            }
+            other => panic!("expected enum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enum_decl_missing_value_after_eq_is_error() {
+        // const E = enum { A = };  — `=` not followed by an integer literal is a
+        // parse error (the parser demands `expect_int`).
+        let r = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("E"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Enum),
+            TokenKind::LBrace,
+            id("A"),
+            TokenKind::Eq,
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]));
+        assert!(r.is_err(), "missing value after `=` should not parse");
     }
 
     #[test]
@@ -6182,7 +6318,8 @@ mod tests {
         match &m.items[0] {
             Item::Enum(e) => {
                 assert_eq!(e.name, "E");
-                assert_eq!(e.variants, vec!["A", "B"]);
+                let names: Vec<&str> = e.variants.iter().map(|v| v.name.as_str()).collect();
+                assert_eq!(names, vec!["A", "B"]);
             }
             other => panic!("expected enum, got {:?}", other),
         }

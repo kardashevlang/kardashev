@@ -1090,3 +1090,34 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "7\n101\n99\n1\n");
 }
+
+// --- v0.143 enum explicit values + @intFromEnum / @enumFromInt --------------
+
+#[test]
+fn enum_explicit_values_and_conversions() {
+    let src = r#"
+const Color = enum { Red = 1, Green, Blue = 10, Cyan };
+fn describe(c: Color) i32 {
+    switch (c) {
+        Color.Red => { return 100; },
+        Color.Green => { return 200; },
+        Color.Blue => { return 300; },
+        else => { return 0; },
+    }
+}
+pub fn main() i32 {
+    print(@intFromEnum(Color.Red));    // 1
+    print(@intFromEnum(Color.Green));  // 2  (auto-increment)
+    print(@intFromEnum(Color.Blue));   // 10
+    print(@intFromEnum(Color.Cyan));   // 11 (auto from 10)
+    var c: Color = @enumFromInt(Color, 10);   // Blue
+    print(describe(c));                // 300
+    var g: Color = @enumFromInt(Color, 2);    // Green
+    print(@intFromEnum(g));            // 2
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "1\n2\n10\n11\n300\n2\n");
+}
