@@ -18,6 +18,17 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.133.0] — `for` loops over arrays & slices
+
+### Added
+- **`for (xs) |x| { … }`** iterates the elements of an array (`[N]T`) or slice
+  (`[]T`); `x` binds each element by value. **`for (xs, 0..) |x, i| { … }`** also
+  binds a 0-based `usize` index. Lowered to an indexed `while` (a loop-body
+  scope), so `break`/`continue` behave — and `continue` still advances the index.
+- `for`/`Kw::For`; `Stmt::For{ iter, elem, index, body }`. The iterable is
+  evaluated once. Capture-count must match the `, 0..` form.
+- 719 unit + 31 e2e tests; `examples/for_loops.ks`.
+
 ## [0.132.0] — Bitwise & shift operators
 
 ### Added

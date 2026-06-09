@@ -197,6 +197,17 @@ impl<'a> Parser<'a> {
         ParseError
     }
 
+    /// Push a custom `E0200` diagnostic at `span` and return the unwind
+    /// sentinel. Used where the failure is a *semantic* shape constraint on the
+    /// surrounding form rather than an unexpected token — e.g. a `for` index
+    /// range that does not start at `0`, or a capture-arity mismatch — so the
+    /// message can describe the real problem instead of "expected X, found Y".
+    fn error_at(&mut self, span: Span, msg: impl Into<String>) -> ParseError {
+        self.diags
+            .push(Diagnostic::error(span, "E0200", msg.into()));
+        ParseError
+    }
+
     // ---- recovery ---------------------------------------------------------
 
     /// Skip tokens until the next top-level item keyword (or `Eof`).
@@ -698,6 +709,7 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Kw::Return) => self.parse_return(),
             TokenKind::Keyword(Kw::If) => self.parse_if(),
             TokenKind::Keyword(Kw::While) => self.parse_while(),
+            TokenKind::Keyword(Kw::For) => self.parse_for(),
             TokenKind::Keyword(Kw::Break) => self.parse_break(),
             TokenKind::Keyword(Kw::Continue) => self.parse_continue(),
             TokenKind::Keyword(Kw::Defer) => self.parse_defer(),
@@ -879,6 +891,85 @@ impl<'a> Parser<'a> {
             let e = self.parse_expr()?;
             Ok(Stmt::Expr(e))
         }
+    }
+
+    /// Parse a `for` loop (SPEC §29.1):
+    /// `for "(" iter ("," 0 "..")? ")" "|" elem ("," index)? "|" block`.
+    ///
+    /// The iterable is a full expression. An optional `, 0 ..` after it (a
+    /// `Comma`, an `Int` literal that must be `0`, then a `DotDot`) selects the
+    /// **index form** `for (xs, 0..) |x, i| { … }`, which additionally binds a
+    /// 0-based `usize` index. The literal is required to be exactly `0` (else
+    /// `E0200` "for index range must start at 0"). After `)`, a `| elem |` (or
+    /// `| elem, index |`) capture list names the loop bindings.
+    ///
+    /// The capture count must agree with the presence of the index range
+    /// (`E0200` otherwise): the `, 0..` form requires **two** captures (the
+    /// element and the index), and the plain form requires **exactly one**.
+    /// `index` is `Some(name)` iff the index form was written. That the iterable
+    /// is actually an array/slice is a sema concern (SPEC §29.1), not the
+    /// parser's. The body is an ordinary braced block (a loop-body scope, so
+    /// `break`/`continue`/`defer` behave; the lowering to an indexed `while` is
+    /// an emit concern, SPEC §29.2).
+    fn parse_for(&mut self) -> PResult<Stmt> {
+        let start = self.peek_span();
+        self.bump(); // `for`
+        self.expect_punct(&TokenKind::LParen, "`(`")?;
+        let iter = self.parse_expr()?;
+        // An optional `, 0 ..` marks the index form. The integer between the
+        // comma and the `..` must be exactly `0` — the index always counts from
+        // zero (SPEC §29.1) — so a non-zero start is rejected here.
+        let index_form = if self.eat_punct(&TokenKind::Comma) {
+            let (lo, lo_span) = self.expect_int()?;
+            if lo != 0 {
+                return Err(self.error_at(lo_span, "for index range must start at 0"));
+            }
+            self.expect_punct(&TokenKind::DotDot, "`..`")?;
+            true
+        } else {
+            false
+        };
+        self.expect_punct(&TokenKind::RParen, "`)`")?;
+        // The capture list: `| elem |` or `| elem, index |`.
+        let pipe_span = self.expect_punct(&TokenKind::Pipe, "`|`")?;
+        let (elem, _) = self.expect_ident()?;
+        let second = if self.eat_punct(&TokenKind::Comma) {
+            let (name, _) = self.expect_ident()?;
+            Some(name)
+        } else {
+            None
+        };
+        let close_pipe = self.expect_punct(&TokenKind::Pipe, "`|`")?;
+        // The capture arity must match the index form (SPEC §29.1): the
+        // `, 0..` form binds an element *and* an index (exactly two captures);
+        // the plain form binds only the element (exactly one).
+        let index = if index_form {
+            match second {
+                Some(name) => Some(name),
+                None => {
+                    return Err(self.error_at(
+                        pipe_span.merge(close_pipe),
+                        "a `for (.., 0..)` index loop requires two captures `|elem, index|`",
+                    ));
+                }
+            }
+        } else if second.is_some() {
+            return Err(self.error_at(
+                pipe_span.merge(close_pipe),
+                "a `for` without `, 0..` takes exactly one capture `|elem|`",
+            ));
+        } else {
+            None
+        };
+        let body = self.parse_block()?;
+        let span = start.merge(body.span);
+        Ok(Stmt::For {
+            iter,
+            elem,
+            index,
+            body,
+            span,
+        })
     }
 
     fn parse_break(&mut self) -> PResult<Stmt> {
@@ -6374,6 +6465,220 @@ mod tests {
                 other => panic!("expected struct-type return, got {:?}", other),
             },
             other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    // ---- v0.133: for loops over arrays & slices ---------------------------
+
+    #[test]
+    fn for_simple_no_index() {
+        // for (xs) |x| {}  →  Stmt::For { elem: x, index: None }.
+        match first_stmt(vec![
+            TokenKind::Keyword(Kw::For),
+            TokenKind::LParen,
+            id("xs"),
+            TokenKind::RParen,
+            TokenKind::Pipe,
+            id("x"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]) {
+            Stmt::For {
+                iter,
+                elem,
+                index,
+                body,
+                ..
+            } => {
+                assert!(matches!(iter, Expr::Ident { ref name, .. } if name == "xs"));
+                assert_eq!(elem, "x");
+                assert_eq!(index, None, "no `, 0..` → no index binding");
+                assert!(body.stmts.is_empty());
+            }
+            other => panic!("expected for loop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn for_with_index_range() {
+        // for (xs, 0..) |x, i| {}  →  Stmt::For { elem: x, index: Some(i) }.
+        match first_stmt(vec![
+            TokenKind::Keyword(Kw::For),
+            TokenKind::LParen,
+            id("xs"),
+            TokenKind::Comma,
+            TokenKind::Int(0),
+            TokenKind::DotDot,
+            TokenKind::RParen,
+            TokenKind::Pipe,
+            id("x"),
+            TokenKind::Comma,
+            id("i"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]) {
+            Stmt::For {
+                elem, index, ..
+            } => {
+                assert_eq!(elem, "x");
+                assert_eq!(index.as_deref(), Some("i"), "`, 0..` binds the index");
+            }
+            other => panic!("expected for loop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn for_two_captures_without_range_is_error() {
+        // for (xs) |x, i| {}  — two captures but no `, 0..` → E0200.
+        let err = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::For),
+            TokenKind::LParen,
+            id("xs"),
+            TokenKind::RParen,
+            TokenKind::Pipe,
+            id("x"),
+            TokenKind::Comma,
+            id("i"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect_err("two captures without `, 0..` should fail");
+        assert!(err.iter().any(|d| d.code == "E0200"));
+    }
+
+    #[test]
+    fn for_index_range_with_one_capture_is_error() {
+        // for (xs, 0..) |x| {}  — index range but only one capture → E0200.
+        let err = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::For),
+            TokenKind::LParen,
+            id("xs"),
+            TokenKind::Comma,
+            TokenKind::Int(0),
+            TokenKind::DotDot,
+            TokenKind::RParen,
+            TokenKind::Pipe,
+            id("x"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect_err("index range with one capture should fail");
+        assert!(err.iter().any(|d| d.code == "E0200"));
+    }
+
+    #[test]
+    fn for_index_range_must_start_at_zero() {
+        // for (xs, 1..) |x, i| {}  — range must start at 0 → E0200.
+        let err = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::For),
+            TokenKind::LParen,
+            id("xs"),
+            TokenKind::Comma,
+            TokenKind::Int(1),
+            TokenKind::DotDot,
+            TokenKind::RParen,
+            TokenKind::Pipe,
+            id("x"),
+            TokenKind::Comma,
+            id("i"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect_err("a non-zero index range start should fail");
+        assert!(
+            err.iter()
+                .any(|d| d.code == "E0200" && d.message.contains("must start at 0")),
+            "expected the `must start at 0` diagnostic, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn for_iterates_a_slice_expression() {
+        // for (xs[0..n]) |x| {}  — the iterable is a full (slice) expression.
+        match first_stmt(vec![
+            TokenKind::Keyword(Kw::For),
+            TokenKind::LParen,
+            id("xs"),
+            TokenKind::LBracket,
+            TokenKind::Int(0),
+            TokenKind::DotDot,
+            id("n"),
+            TokenKind::RBracket,
+            TokenKind::RParen,
+            TokenKind::Pipe,
+            id("x"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]) {
+            Stmt::For { iter, index, .. } => {
+                assert!(
+                    matches!(iter, Expr::SliceExpr { .. }),
+                    "iterable parses as a full slice expression, got {:?}",
+                    iter
+                );
+                assert_eq!(index, None);
+            }
+            other => panic!("expected for loop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn for_body_holds_statements() {
+        // for (xs, 0..) |x, i| { print(x); }  — body block carries its stmts.
+        match first_stmt(vec![
+            TokenKind::Keyword(Kw::For),
+            TokenKind::LParen,
+            id("xs"),
+            TokenKind::Comma,
+            TokenKind::Int(0),
+            TokenKind::DotDot,
+            TokenKind::RParen,
+            TokenKind::Pipe,
+            id("x"),
+            TokenKind::Comma,
+            id("i"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            id("print"),
+            TokenKind::LParen,
+            id("x"),
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]) {
+            Stmt::For { body, index, .. } => {
+                assert_eq!(index.as_deref(), Some("i"));
+                assert_eq!(body.stmts.len(), 1, "the loop body keeps its statement");
+            }
+            other => panic!("expected for loop, got {:?}", other),
         }
     }
 }

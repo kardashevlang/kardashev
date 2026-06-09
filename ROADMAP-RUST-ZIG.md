@@ -196,9 +196,10 @@ rhs`, evaluating the place once (an index compound reads `i` once). `Stmt::Assig
 disambiguate from address-of / capture by position (infix vs prefix / capture
 context). (Bitwise compound assignments `|= &= ^= <<= >>=` are later work.)
 
-### v0.133.0 — `for` loops over arrays & slices
-`for (xs) |x| { … }` and `for (xs, 0..) |x, i| { … }` — element (and index)
-capture, lowered to an indexed `while`. Works for `[]T` and `[N]T`.
+### v0.133.0 — `for` loops over arrays & slices ✅
+`for (xs) |x| { … }` and `for (xs, 0..) |x, i| { … }` — element (and 0-based
+`usize` index) capture, lowered to an indexed `while` (so `break`/`continue`
+behave, and `continue` still advances the index). Works for `[]T` and `[N]T`.
 
 ### v0.134.0 — Pointer-receiver methods (true mutation)
 `fn push(self: *Self, …) …` with auto-ref at the call site (`list.push(x)`
