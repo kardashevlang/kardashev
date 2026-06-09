@@ -285,8 +285,9 @@ impl Stmt {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnOp {
-    Neg, // -x
-    Not, // !x
+    Neg,    // -x
+    Not,    // !x
+    BitNot, // ~x  (bitwise complement, v0.132)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,6 +305,12 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    // Bitwise / shift (v0.132); integer operands, integer result.
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 impl BinOp {
@@ -338,6 +345,11 @@ impl BinOp {
             BinOp::Ge => ">=",
             BinOp::And => "&&",
             BinOp::Or => "||",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
         }
     }
 }

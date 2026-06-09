@@ -2891,6 +2891,23 @@ impl Checker {
                     None
                 }
             }
+            // Bitwise complement (v0.132, SPEC §28.2): the operand must be an
+            // integer and the result is that integer type. Mirrors `UnOp::Neg`,
+            // but accepts any integer (signed or unsigned). An integer-literal
+            // operand adopts `expected` when it is an integer type.
+            UnOp::BitNot => {
+                let t = self.check_expr(inner, expected.filter(|t| t.is_int()))?;
+                if t.is_int() {
+                    Some(t)
+                } else {
+                    let msg = format!(
+                        "unary `~` requires an integer, found `{}`",
+                        self.type_name(t)
+                    );
+                    self.error(span, "E0110", msg);
+                    None
+                }
+            }
         }
     }
 
@@ -3006,6 +3023,48 @@ impl Checker {
                 } else {
                     None
                 }
+            }
+            // Bitwise & shift (v0.132, SPEC §28.2): both operands must be the
+            // **same integer type** and the result is that integer type
+            // (`is_bool_result` is false for these). A shift's right operand is
+            // also an integer; the result is the left operand's type. This reuses
+            // the same operand rule as the arithmetic operators (the result is
+            // never `bool`), so an integer-literal operand adopts the other
+            // operand's concrete type. A non-integer operand / type mismatch is
+            // the usual binop type error (`E0110`).
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+                let (lt, rt) = self.check_int_operands(lhs, rhs, expected.filter(|t| t.is_int()));
+                let lt = lt?;
+                let rt = rt?;
+                if !lt.is_int() {
+                    let msg = format!(
+                        "`{}` requires integer operands, found `{}`",
+                        op.c_op(),
+                        self.type_name(lt)
+                    );
+                    self.error(lhs.span(), "E0110", msg);
+                    return None;
+                }
+                if !rt.is_int() {
+                    let msg = format!(
+                        "`{}` requires integer operands, found `{}`",
+                        op.c_op(),
+                        self.type_name(rt)
+                    );
+                    self.error(rhs.span(), "E0110", msg);
+                    return None;
+                }
+                if lt != rt {
+                    let msg = format!(
+                        "`{}` operands must have the same type, found `{}` and `{}`",
+                        op.c_op(),
+                        self.type_name(lt),
+                        self.type_name(rt)
+                    );
+                    self.error(span, "E0110", msg);
+                    return None;
+                }
+                Some(lt)
             }
         }
     }
@@ -4017,6 +4076,13 @@ mod tests {
             span: sp(),
         }
     }
+    fn unary(op: UnOp, e: Expr) -> Expr {
+        Expr::Unary {
+            op,
+            expr: Box::new(e),
+            span: sp(),
+        }
+    }
     fn block(stmts: Vec<Stmt>) -> Block {
         Block { stmts, span: sp() }
     }
@@ -4402,6 +4468,121 @@ mod tests {
             vec![let_const("c", "i32", int(5)), assign("c", int(6))],
         )];
         assert!(codes(items).contains(&"E0110"));
+    }
+
+    // ---- bitwise & shift operators (v0.132, SPEC §28) ---------------------
+
+    #[test]
+    fn bitwise_and_shift_ops_yield_int_type() {
+        // fn f(a: i32, b: i32) i32 {
+        //   var w: i32 = a & b; var x: i32 = a | b; var y: i32 = a ^ b;
+        //   var z: i32 = a << b; return a >> b;
+        // }
+        // Each `let_var` asserts the operator result coerces to i32, and the
+        // final `return` asserts `a >> b` is i32 — so every op yields i32.
+        let items = vec![func(
+            "f",
+            vec![param("a", "i32"), param("b", "i32")],
+            "i32",
+            vec![
+                let_var("w", "i32", bin(BinOp::BitAnd, ident("a"), ident("b"))),
+                let_var("x", "i32", bin(BinOp::BitOr, ident("a"), ident("b"))),
+                let_var("y", "i32", bin(BinOp::BitXor, ident("a"), ident("b"))),
+                let_var("z", "i32", bin(BinOp::Shl, ident("a"), ident("b"))),
+                ret(Some(bin(BinOp::Shr, ident("a"), ident("b")))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn bitnot_yields_int_type() {
+        // fn f(a: i32) i32 { return ~a; }
+        let items = vec![func(
+            "f",
+            vec![param("a", "i32")],
+            "i32",
+            vec![ret(Some(unary(UnOp::BitNot, ident("a"))))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn bitwise_ops_on_unsigned_ok() {
+        // Bitwise ops (and `~`, unlike `-`) accept unsigned integers.
+        // fn f(a: u8, b: u8) u8 { var x: u8 = a & b; return ~a; }
+        let items = vec![func(
+            "f",
+            vec![param("a", "u8"), param("b", "u8")],
+            "u8",
+            vec![
+                let_var("x", "u8", bin(BinOp::BitAnd, ident("a"), ident("b"))),
+                ret(Some(unary(UnOp::BitNot, ident("a")))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn bitwise_literal_operand_adopts_type() {
+        // A flexible integer literal adopts the other operand's type:
+        // fn f(a: i32) i32 { return a & 255; }
+        let items = vec![func(
+            "f",
+            vec![param("a", "i32")],
+            "i32",
+            vec![ret(Some(bin(BinOp::BitAnd, ident("a"), int(255))))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn bitwise_on_bool_is_e0110() {
+        // fn f(a: bool, b: bool) void { var r: i32 = a & b; }
+        let items = vec![func(
+            "f",
+            vec![param("a", "bool"), param("b", "bool")],
+            "void",
+            vec![let_var("r", "i32", bin(BinOp::BitAnd, ident("a"), ident("b")))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn bitnot_on_bool_is_e0110() {
+        // fn f() i32 { return ~true; }
+        let items = vec![func(
+            "f",
+            vec![],
+            "i32",
+            vec![ret(Some(unary(UnOp::BitNot, boolean(true))))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn bitwise_mixed_int_types_is_e0110() {
+        // fn f(a: i32, b: i64) i32 { return a & b; } — same-type rule fails.
+        let items = vec![func(
+            "f",
+            vec![param("a", "i32"), param("b", "i64")],
+            "i32",
+            vec![ret(Some(bin(BinOp::BitAnd, ident("a"), ident("b"))))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn comparison_still_yields_bool() {
+        // A comparison is unaffected by the bitwise additions: still `bool`.
+        // fn f(a: i32, b: i32) bool { return a < b; }
+        let items = vec![func(
+            "f",
+            vec![param("a", "i32"), param("b", "i32")],
+            "bool",
+            vec![ret(Some(bin(BinOp::Lt, ident("a"), ident("b"))))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
     }
 
     // ---- compound assignment (v0.131, SPEC §27) ---------------------------

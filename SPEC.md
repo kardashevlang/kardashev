@@ -1069,3 +1069,28 @@ result type matches the place. A plain `=` is unchanged.
 `Stmt::FieldAssign` evaluates the place **once** — reusing the existing index
 hoist for `a[i]` (so `a[i] += e` reads `i` once) — then `<place> = <place>
 <c-op> (<rhs>);`.
+
+## 28. Bitwise & shift operators (v0.132)
+
+Integer operators: binary `&` `|` `^` `<<` `>>` (`BinOp::BitAnd`/`BitOr`/
+`BitXor`/`Shl`/`Shr`) and unary prefix `~` (`UnOp::BitNot`). Tokens: `&` = `Amp`
+(prefix → address-of §15, infix → bitand), `|` = `Pipe` (infix → bitor; a
+capture `|x|` is a distinct grammar position §11/§21), `^` = `Caret`, `~` =
+`Tilde`, `<<` = `Shl`, `>>` = `Shr`.
+
+### 28.1 Precedence (low → high)
+`or` < `and` < `|` < `^` < `&` < equality (`== !=`) < relational (`< <= > >=`) <
+shift (`<< >>`) < additive (`+ -`) < multiplicative (`* / %`) < unary (`- ! ~`
+and prefix `&`/`*`) < postfix. (C-like; `or`/`and` are keywords so `&`/`|` are
+unambiguously bitwise.)
+
+### 28.2 Semantics (`sema`)
+`& | ^ << >>` require **both operands to be the same integer type** and yield
+that type; `~x` requires an integer and yields its type. (A shift's right
+operand is also an integer; the result type is the left operand's.) Non-integer
+operands are the usual binop type error.
+
+### 28.3 Backend (`emit_c`)
+Direct C lowering: `a & b`, `a | b`, `a ^ b`, `a << b`, `a >> b`, `~a` (the
+operands keep their C integer types). `const_eval` folds all of them (and `~`)
+on integer constants, so `const MASK = (1 << 8) - 1;` works.
