@@ -532,12 +532,7 @@ impl Printer {
         self.indent += 1;
         for arm in arms {
             self.write_indent();
-            for (i, label) in arm.labels.iter().enumerate() {
-                if i > 0 {
-                    self.out.push_str(", ");
-                }
-                self.out.push_str(&fmt_expr(label));
-            }
+            self.out.push_str(&fmt_arm_labels(arm));
             match &arm.capture {
                 Some(cap) => {
                     self.out.push_str(" => |");
@@ -1364,8 +1359,7 @@ fn fmt_stmt_inline(stmt: &Stmt) -> String {
             s.push_str(") {");
             for arm in arms {
                 s.push(' ');
-                let labels: Vec<String> = arm.labels.iter().map(fmt_expr).collect();
-                s.push_str(&labels.join(", "));
+                s.push_str(&fmt_arm_labels(arm));
                 match &arm.capture {
                     Some(cap) => {
                         s.push_str(" => |");
@@ -1386,6 +1380,21 @@ fn fmt_stmt_inline(stmt: &Stmt) -> String {
             s
         }
     }
+}
+
+/// Render the label list of one `switch` arm (everything before `=>`), per
+/// SPEC §39. Value labels (`SwitchArm.labels` — enum literals / integer
+/// literals) print first, then inclusive integer-range labels
+/// (`SwitchArm.ranges`) as `lo..hi`; all parts are joined with `, ` in this
+/// stable order. With no ranges this is byte-for-byte the pre-v0.146 output
+/// (value labels joined with `, `), so value- and multi-label switches are
+/// unchanged and round-tripping stays idempotent.
+fn fmt_arm_labels(arm: &SwitchArm) -> String {
+    let mut parts: Vec<String> = arm.labels.iter().map(fmt_expr).collect();
+    for &(lo, hi) in &arm.ranges {
+        parts.push(format!("{lo}..{hi}"));
+    }
+    parts.join(", ")
 }
 
 /// Format an `if`/`else if`/`else` chain inline (SPEC §26). With a capture the
@@ -2933,6 +2942,20 @@ mod tests {
     fn arm(labels: Vec<Expr>, body: Vec<Stmt>) -> SwitchArm {
         SwitchArm {
             labels,
+            ranges: vec![],
+            capture: None,
+            body: Block { stmts: body, span: D },
+            span: D,
+        }
+    }
+
+    /// A switch arm carrying inclusive integer-range labels `lo..hi` (SPEC §39),
+    /// optionally alongside value `labels`. Value labels print first, then the
+    /// ranges, joined with `, `.
+    fn arm_ranges(labels: Vec<Expr>, ranges: Vec<(i64, i64)>, body: Vec<Stmt>) -> SwitchArm {
+        SwitchArm {
+            labels,
+            ranges,
             capture: None,
             body: Block { stmts: body, span: D },
             span: D,
@@ -2944,6 +2967,7 @@ mod tests {
     fn arm_capture(labels: Vec<Expr>, capture: &str, body: Vec<Stmt>) -> SwitchArm {
         SwitchArm {
             labels,
+            ranges: vec![],
             capture: Some(capture.to_string()),
             body: Block { stmts: body, span: D },
             span: D,
@@ -3242,6 +3266,133 @@ mod tests {
         let printed = print_module(&m);
         assert_eq!(printed, expected);
         assert_eq!(print_module(&m), printed);
+    }
+
+    // ----- switch range labels (v0.146, SPEC §39) --------------------------
+
+    #[test]
+    fn switch_single_range_label_round_trips() {
+        // SPEC §39: an inclusive integer-range label `lo..hi` prints in the
+        // label slot before `=>`. A range alone (no value labels) prints just
+        // the range; an integer switch still requires an `else` arm.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "h".to_string(),
+                params: vec![Param {
+                    name: "n".to_string(),
+                    ty: ty("i32"),
+                    is_comptime: false,
+                    span: D,
+                }],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::Switch {
+                        scrutinee: ident("n"),
+                        arms: vec![arm_ranges(
+                            vec![],
+                            vec![(1, 5)],
+                            vec![call_stmt("print", vec![ident("n")])],
+                        )],
+                        default: Some(Block {
+                            stmts: vec![],
+                            span: D,
+                        }),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn h(n: i32) void {\n",
+            "    switch (n) {\n",
+            "        1..5 => {\n",
+            "            print(n);\n",
+            "        },\n",
+            "        else => {\n",
+            "        },\n",
+            "    }\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn switch_value_and_range_labels_round_trips() {
+        // SPEC §39: value labels and ranges combine in one arm. Value labels
+        // print first, then ranges, joined with `, ` — here `0, 10..20`.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "h".to_string(),
+                params: vec![Param {
+                    name: "n".to_string(),
+                    ty: ty("i32"),
+                    is_comptime: false,
+                    span: D,
+                }],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::Switch {
+                        scrutinee: ident("n"),
+                        arms: vec![arm_ranges(
+                            vec![int(0)],
+                            vec![(10, 20)],
+                            vec![call_stmt("print", vec![ident("n")])],
+                        )],
+                        default: Some(Block {
+                            stmts: vec![],
+                            span: D,
+                        }),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn h(n: i32) void {\n",
+            "    switch (n) {\n",
+            "        0, 10..20 => {\n",
+            "            print(n);\n",
+            "        },\n",
+            "        else => {\n",
+            "        },\n",
+            "    }\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn switch_label_list_helper_handles_ranges_and_plain_labels() {
+        // With no ranges the label list is byte-for-byte the pre-v0.146 output:
+        // value labels joined with `, `, nothing extra (regression guard for
+        // value- and multi-label switches).
+        assert_eq!(fmt_arm_labels(&arm(vec![int(0), int(1)], vec![])), "0, 1");
+        assert_eq!(fmt_arm_labels(&arm(vec![ident("x")], vec![])), "x");
+        // A range arm appends `lo..hi` after the value labels, comma-joined.
+        assert_eq!(
+            fmt_arm_labels(&arm_ranges(vec![int(0)], vec![(10, 20)], vec![])),
+            "0, 10..20"
+        );
+        // A range alone prints just the range.
+        assert_eq!(fmt_arm_labels(&arm_ranges(vec![], vec![(1, 5)], vec![])), "1..5");
+        // Multiple ranges keep their order after the value labels.
+        assert_eq!(
+            fmt_arm_labels(&arm_ranges(vec![], vec![(1, 5), (8, 9)], vec![])),
+            "1..5, 8..9"
+        );
+        // Negative bounds print verbatim.
+        assert_eq!(fmt_arm_labels(&arm_ranges(vec![], vec![(-3, -1)], vec![])), "-3..-1");
     }
 
     // ----- tagged unions & capture (v0.124) --------------------------------

@@ -285,9 +285,11 @@ int↔float mixing; float `const`s are deferred — floats are runtime-only.)
 `iabs` — flattened into the program by bare name. Programs reuse the containers
 instead of copying them.
 
-### v0.146.0 — `switch` ranges + multi-label arms
-`switch` arms matching a range (`1..10 =>`) or several labels (`.A, .B =>`),
-rounding out pattern matching.
+### v0.146.0 — `switch` ranges + multi-label arms ✅
+Inclusive integer-range arms `lo..hi =>` (`SwitchArm.ranges`, lowered to GNU C
+case-ranges), combinable with value labels in one arm. Multi-label arms
+(`1, 2, 3 =>`, `.A, .B =>`) already worked (labels are a `Vec`), so this added
+the range form.
 
 ### v0.147.0 — Block expressions + labeled `break`
 `blk: { … break :blk v; }` value blocks and labeled `break`/`continue`, so a

@@ -1154,6 +1154,33 @@ impl<'a> Parser<'a> {
     /// matched tagged-union variant's payload as a local in the arm body
     /// (`SwitchArm.capture`); a capture on a non-union switch (or a union arm
     /// missing one) is a sema concern (`E0272`), not the parser's.
+    /// Parse one `switch`-arm label item (SPEC §39), appending it to either
+    /// `labels` (an ordinary value label) or `ranges` (an inclusive integer
+    /// range `lo..hi`). A range is recognised when the parsed label is an
+    /// integer literal and the next token is `..` (`TokenKind::DotDot`); the
+    /// upper bound must then also be an integer literal. Everything else — enum
+    /// literals `.V` / `Enum.V`, plain integer values, etc. — is a value label,
+    /// exactly as before v0.146. Whether a range is valid for the scrutinee
+    /// type (integer only) and whether `hi >= lo` are sema concerns, not the
+    /// parser's.
+    fn parse_switch_label(
+        &mut self,
+        labels: &mut Vec<Expr>,
+        ranges: &mut Vec<(i64, i64)>,
+    ) -> PResult<()> {
+        let label = self.parse_expr()?;
+        if let Expr::Int { value: lo, .. } = label {
+            if self.at_punct(&TokenKind::DotDot) {
+                self.bump(); // `..`
+                let (hi, _) = self.expect_int()?;
+                ranges.push((lo, hi));
+                return Ok(());
+            }
+        }
+        labels.push(label);
+        Ok(())
+    }
+
     fn parse_switch(&mut self) -> PResult<Stmt> {
         let start = self.peek_span();
         self.bump(); // `switch`
@@ -1172,13 +1199,18 @@ impl<'a> Parser<'a> {
                 default = Some(self.parse_block()?);
             } else {
                 let arm_start = self.peek_span();
-                let mut labels = vec![self.parse_expr()?];
+                // A comma-separated list of labels, each either a value label or
+                // an inclusive integer range `lo..hi` (SPEC §39). Value labels
+                // accumulate in `labels`; ranges accumulate in `ranges`.
+                let mut labels = Vec::new();
+                let mut ranges = Vec::new();
+                self.parse_switch_label(&mut labels, &mut ranges)?;
                 while self.eat_punct(&TokenKind::Comma) {
                     // Tolerate a trailing `,` before the `=>` in a label list.
                     if self.at_punct(&TokenKind::FatArrow) {
                         break;
                     }
-                    labels.push(self.parse_expr()?);
+                    self.parse_switch_label(&mut labels, &mut ranges)?;
                 }
                 self.expect_punct(&TokenKind::FatArrow, "`=>`")?;
                 // An optional `| IDENT |` payload capture (SPEC §20.1) binds the
@@ -1196,6 +1228,7 @@ impl<'a> Parser<'a> {
                 let span = arm_start.merge(body.span);
                 arms.push(SwitchArm {
                     labels,
+                    ranges,
                     capture,
                     body,
                     span,
@@ -5054,6 +5087,157 @@ mod tests {
                     }
                     other => panic!("expected `Color.Red` field label, got {:?}", other),
                 }
+            }
+            other => panic!("expected switch, got {:?}", other),
+        }
+    }
+
+    // ---- v0.146: switch range labels (`lo..hi`) ---------------------------
+
+    #[test]
+    fn switch_single_range_label() {
+        // switch (n) { 1..5 => { } else => { } }  — an inclusive integer range
+        // `1..5` records `ranges == [(1, 5)]` and leaves `labels` empty.
+        let body = parse_fn_body(vec![
+            TokenKind::Keyword(Kw::Switch),
+            TokenKind::LParen,
+            id("n"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::Int(1),
+            TokenKind::DotDot,
+            TokenKind::Int(5),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Keyword(Kw::Else),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace, // close switch
+        ]);
+        match &body.stmts[0] {
+            Stmt::Switch { arms, default, .. } => {
+                assert_eq!(arms.len(), 1);
+                assert!(arms[0].labels.is_empty(), "a pure range arm has no value labels");
+                assert_eq!(arms[0].ranges, vec![(1, 5)]);
+                assert!(default.is_some(), "an int switch needs an `else`");
+            }
+            other => panic!("expected switch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn switch_mixed_labels_and_range() {
+        // switch (n) { 0, 10..20, 99 => { } else => { } }  — one arm mixing two
+        // value labels (`0`, `99`) with an inclusive range (`10..20`): the value
+        // labels land in `labels`, the range in `ranges`, preserving order.
+        let body = parse_fn_body(vec![
+            TokenKind::Keyword(Kw::Switch),
+            TokenKind::LParen,
+            id("n"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::Int(0),
+            TokenKind::Comma,
+            TokenKind::Int(10),
+            TokenKind::DotDot,
+            TokenKind::Int(20),
+            TokenKind::Comma,
+            TokenKind::Int(99),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Keyword(Kw::Else),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace, // close switch
+        ]);
+        match &body.stmts[0] {
+            Stmt::Switch { arms, .. } => {
+                assert_eq!(arms.len(), 1);
+                assert_eq!(arms[0].labels.len(), 2);
+                assert!(matches!(&arms[0].labels[0], Expr::Int { value: 0, .. }));
+                assert!(matches!(&arms[0].labels[1], Expr::Int { value: 99, .. }));
+                assert_eq!(arms[0].ranges, vec![(10, 20)]);
+            }
+            other => panic!("expected switch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn switch_plain_multi_label_has_no_ranges() {
+        // switch (n) { 1, 2 => { } else => { } }  — a plain multi-value-label arm
+        // (no `..`) keeps `ranges` empty: the new field never spuriously fills.
+        let body = parse_fn_body(vec![
+            TokenKind::Keyword(Kw::Switch),
+            TokenKind::LParen,
+            id("n"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::Int(1),
+            TokenKind::Comma,
+            TokenKind::Int(2),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Keyword(Kw::Else),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace, // close switch
+        ]);
+        match &body.stmts[0] {
+            Stmt::Switch { arms, .. } => {
+                assert_eq!(arms.len(), 1);
+                assert_eq!(arms[0].labels.len(), 2);
+                assert!(
+                    arms[0].ranges.is_empty(),
+                    "a non-range arm must have an empty `ranges`"
+                );
+            }
+            other => panic!("expected switch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn switch_two_range_arms() {
+        // switch (n) { 0..9 => { } 10..19 => { } else => { } }  — two separate
+        // range arms, each carrying exactly one range and no value labels; the
+        // `else` arm is unaffected.
+        let body = parse_fn_body(vec![
+            TokenKind::Keyword(Kw::Switch),
+            TokenKind::LParen,
+            id("n"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::Int(0),
+            TokenKind::DotDot,
+            TokenKind::Int(9),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Int(10),
+            TokenKind::DotDot,
+            TokenKind::Int(19),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Keyword(Kw::Else),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace, // close switch
+        ]);
+        match &body.stmts[0] {
+            Stmt::Switch { arms, default, .. } => {
+                assert_eq!(arms.len(), 2);
+                assert_eq!(arms[0].ranges, vec![(0, 9)]);
+                assert!(arms[0].labels.is_empty());
+                assert_eq!(arms[1].ranges, vec![(10, 19)]);
+                assert!(arms[1].labels.is_empty());
+                assert!(default.is_some());
             }
             other => panic!("expected switch, got {:?}", other),
         }

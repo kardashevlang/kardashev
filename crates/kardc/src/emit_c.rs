@@ -1896,19 +1896,35 @@ impl<'a> Emitter<'a> {
         self.indent += 1;
         let mut all_diverge = true;
         for arm in arms {
-            let n = arm.labels.len();
+            // An arm matches any of its value labels OR any of its inclusive
+            // integer ranges (v0.146, SPEC §39). Emit a `case` per value label
+            // first, then a GNU C `case <lo> ... <hi>:` per range; the *last*
+            // case overall opens the shared body block. Range labels never
+            // appear on enum/union scrutinees (sema rejects them), so this loop
+            // is byte-identical to before whenever `arm.ranges` is empty.
+            let nl = arm.labels.len();
+            let total = nl + arm.ranges.len();
             for (i, label) in arm.labels.iter().enumerate() {
                 let lc = self.emit_switch_label(label, scrut_ty);
-                // The final label of the arm opens the shared body block.
-                if i + 1 < n {
+                if i + 1 < total {
                     self.line(&format!("case {}:", lc));
                 } else {
                     self.line(&format!("case {}: {{", lc));
                 }
             }
-            // A label-less arm cannot be produced by the parser; guard so the
-            // emitted C stays brace-balanced if one ever appears.
-            if n == 0 {
+            for (j, (lo, hi)) in arm.ranges.iter().enumerate() {
+                let i = nl + j;
+                // The spaces around `...` are required by GNU C case-range
+                // syntax (`case 1 ... 5:`).
+                if i + 1 < total {
+                    self.line(&format!("case {} ... {}:", lo, hi));
+                } else {
+                    self.line(&format!("case {} ... {}: {{", lo, hi));
+                }
+            }
+            // A label-less, range-less arm cannot be produced by the parser;
+            // guard so the emitted C stays brace-balanced if one ever appears.
+            if total == 0 {
                 self.line("{");
             }
             let d = self.emit_block(&arm.body, Scope::plain());
@@ -6147,6 +6163,19 @@ mod tests {
     fn arm(labels: Vec<Expr>, body: Vec<Stmt>) -> SwitchArm {
         SwitchArm {
             labels,
+            ranges: vec![],
+            capture: None,
+            body: block(body),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A `lo..hi, ... => body` arm carrying inclusive integer ranges (v0.146),
+    /// optionally alongside value labels.
+    fn range_arm(labels: Vec<Expr>, ranges: Vec<(i64, i64)>, body: Vec<Stmt>) -> SwitchArm {
+        SwitchArm {
+            labels,
+            ranges,
             capture: None,
             body: block(body),
             span: Span::DUMMY,
@@ -6158,6 +6187,7 @@ mod tests {
     fn cap_arm(labels: Vec<Expr>, cap: &str, body: Vec<Stmt>) -> SwitchArm {
         SwitchArm {
             labels,
+            ranges: vec![],
             capture: Some(cap.to_string()),
             body: block(body),
             span: Span::DUMMY,
@@ -6601,6 +6631,163 @@ mod tests {
         assert!(out.contains("case 2:"), "shared int label missing:\n{out}");
         assert!(out.contains("case 3: {"), "int case 3 (body) missing:\n{out}");
         assert!(out.contains("default: {"), "int switch default missing:\n{out}");
+    }
+
+    #[test]
+    fn switch_range_arm_emits_gnu_case_range() {
+        // fn f(n: i32) i32 {
+        //     switch (n) { 1..5 => { return 1; } else => { return 0; } }
+        // }
+        // A range label lowers to a single GNU C `case <lo> ... <hi>:` that
+        // opens the arm body (it is the only/last case of the arm).
+        let structs = StructTable::new();
+        let sw = Stmt::Switch {
+            scrutinee: ident("n"),
+            arms: vec![range_arm(vec![], vec![(1, 5)], vec![ret(int(1))])],
+            default: Some(block(vec![ret(int(0))])),
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![param("n", "i32")],
+            ret: ty("i32"),
+            body: block(vec![sw]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(out.contains("switch (kd_n) {"), "switch header missing:\n{out}");
+        // The required spaces around `...` are part of the GNU case-range syntax.
+        assert!(
+            out.contains("case 1 ... 5: {"),
+            "range case (body) missing:\n{out}"
+        );
+        assert!(out.contains("default: {"), "range switch default missing:\n{out}");
+    }
+
+    #[test]
+    fn switch_mixed_labels_and_range_in_one_arm() {
+        // fn f(n: i32) i32 {
+        //     switch (n) { 0, 99, 10..20 => { return 1; } else => { return 0; } }
+        // }
+        // An arm combines value labels and a range: each value label is its own
+        // plain `case`, the range is a `case <lo> ... <hi>:`, and the *last*
+        // case overall opens the shared body block.
+        let structs = StructTable::new();
+        let sw = Stmt::Switch {
+            scrutinee: ident("n"),
+            arms: vec![range_arm(
+                vec![int(0), int(99)],
+                vec![(10, 20)],
+                vec![ret(int(1))],
+            )],
+            default: Some(block(vec![ret(int(0))])),
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![param("n", "i32")],
+            ret: ty("i32"),
+            body: block(vec![sw]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // Value labels stay plain `case`s (they are not the last case).
+        assert!(out.contains("case 0:"), "value label 0 missing:\n{out}");
+        assert!(out.contains("case 99:"), "value label 99 missing:\n{out}");
+        // The range is last → it opens the body block.
+        assert!(
+            out.contains("case 10 ... 20: {"),
+            "range case (body) missing:\n{out}"
+        );
+        // Neither value label opens a body block of its own.
+        assert!(
+            !out.contains("case 0: {") && !out.contains("case 99: {"),
+            "a value label must not open the body when a range follows:\n{out}"
+        );
+    }
+
+    #[test]
+    fn value_only_switch_unchanged_by_range_support() {
+        // Regression: a switch whose arms carry no ranges must lower exactly as
+        // before — value labels only, no `...` case-ranges anywhere.
+        let structs = StructTable::new();
+        let sw = Stmt::Switch {
+            scrutinee: ident("n"),
+            arms: vec![
+                arm(vec![int(1)], vec![ret(int(10))]),
+                arm(vec![int(2), int(3)], vec![ret(int(20))]),
+            ],
+            default: Some(block(vec![ret(int(0))])),
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![param("n", "i32")],
+            ret: ty("i32"),
+            body: block(vec![sw]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(out.contains("case 1: {"), "int case 1 missing:\n{out}");
+        assert!(out.contains("case 2:"), "shared int label missing:\n{out}");
+        assert!(out.contains("case 3: {"), "int case 3 (body) missing:\n{out}");
+        assert!(
+            !out.contains("..."),
+            "a range-free switch must not emit any case-range:\n{out}"
+        );
+    }
+
+    #[test]
+    fn switch_ranges_compile_and_run_end_to_end() {
+        // fn main() i32 {
+        //     switch (n) { 1..3 => return 10; 4..6 => return 20; else => return 0; }
+        // }
+        // Built once per scrutinee value (a literal `n`), compiled with the real
+        // `cc` backend, and run — the process exit code is `main`'s return.
+        let cases: &[(i64, i32)] = &[
+            (0, 0),
+            (1, 10),
+            (2, 10),
+            (3, 10),
+            (4, 20),
+            (5, 20),
+            (6, 20),
+            (7, 0),
+            (-1, 0),
+        ];
+        for &(n, expected) in cases {
+            let sw = Stmt::Switch {
+                scrutinee: int(n),
+                arms: vec![
+                    range_arm(vec![], vec![(1, 3)], vec![ret(int(10))]),
+                    range_arm(vec![], vec![(4, 6)], vec![ret(int(20))]),
+                ],
+                default: Some(block(vec![ret(int(0))])),
+                span: Span::DUMMY,
+            };
+            let m = Module {
+                items: vec![Item::Func(func("main", vec![], "i32", vec![sw]))],
+            };
+            let c = emit(&m, &StructTable::new(), EmitMode::Program);
+            let code = crate::backend::cc_build_and_run(&c, &[])
+                .expect("a switch-range program should compile and run");
+            assert_eq!(
+                code, expected,
+                "switch range for n={n} returned {code}, expected {expected}\n{c}"
+            );
+        }
     }
 
     #[test]
@@ -9695,6 +9882,7 @@ mod tests {
                     scrutinee: int(0),
                     arms: vec![SwitchArm {
                         labels: vec![int(0)],
+                        ranges: vec![],
                         capture: None,
                         body: block(vec![Stmt::Return {
                             value: None,
