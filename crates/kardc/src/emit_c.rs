@@ -153,6 +153,7 @@ fn expr_uses_panic(e: &Expr) -> bool {
         Expr::Catch { expr, default, .. } => expr_uses_panic(expr) || expr_uses_panic(default),
         Expr::StructType { methods, .. } => methods.iter().any(|m| block_uses_panic(&m.body)),
         Expr::Int { .. }
+        | Expr::Float { .. }
         | Expr::Bool { .. }
         | Expr::Ident { .. }
         | Expr::StrLit { .. }
@@ -719,6 +720,12 @@ impl<'a> Emitter<'a> {
             .push_str("typedef struct { int _unused; } kd_allocator;\n");
         self.out
             .push_str("static void kd_print(long long v) { printf(\"%lld\\n\", v); }\n");
+        // v0.144 floating-point print helper (SPEC §38.1): `print(x: f64)` lowers
+        // to `kd_print_f64(<x>)`, which writes the `double` with `%g` (the
+        // shortest faithful decimal) plus a newline. Always emitted alongside the
+        // integer `kd_print`; an unused `static` helper is harmless.
+        self.out
+            .push_str("static void kd_print_f64(double x) { printf(\"%g\\n\", x); }\n");
         // v0.141 runtime-safety traps (SPEC §35.2). `kd_unreachable` has no type
         // dependency, so it lives here in the prelude and is emitted
         // unconditionally — a never-called `_Noreturn` function is harmless (no
@@ -2605,6 +2612,10 @@ impl<'a> Emitter<'a> {
     fn emit_expr(&mut self, e: &Expr) -> String {
         match e {
             Expr::Int { value, .. } => value.to_string(),
+            // A floating-point literal `3.14` (SPEC §38.1): a C `double` literal
+            // that always carries a decimal point (or exponent) so C parses it as
+            // `double`, not `int`. See [`c_double_literal`].
+            Expr::Float { value, .. } => c_double_literal(*value),
             Expr::Bool { value, .. } => {
                 if *value {
                     "true".to_string()
@@ -2746,6 +2757,13 @@ impl<'a> Emitter<'a> {
                                     s = s
                                 );
                             }
+                        }
+                        // `print` of an `f64` routes through the `double` helper
+                        // (SPEC §38.1) — `kd_print_f64(<x>)`, `printf("%g\n", …)`.
+                        // Integers keep the `kd_print((long long)(…))` path below.
+                        if self.type_of_expr(arg) == Some(Type::F64) {
+                            let a = self.emit_expr(arg);
+                            return format!("kd_print_f64({})", a);
                         }
                     }
                     let a = match args.first() {
@@ -3479,6 +3497,8 @@ impl<'a> Emitter<'a> {
     fn type_of_expr(&self, e: &Expr) -> Option<Type> {
         match e {
             Expr::Int { .. } => Some(Type::I64),
+            // A float literal has type `f64` (SPEC §38), the only float type.
+            Expr::Float { .. } => Some(Type::F64),
             Expr::Bool { .. } => Some(Type::Bool),
             // A string literal has type `[]u8` (SPEC §23.1). The struct table is
             // immutable here, but sema already interned the `[]u8` slice (a
@@ -3915,6 +3935,28 @@ fn c_string_literal(s: &str) -> String {
     o
 }
 
+/// Render an `f64` literal as a C `double` literal (SPEC §38.1).
+///
+/// C reads `3` as an `int` but `3.0` as a `double`, so the spelling must always
+/// carry a decimal point (or an exponent) to be parsed as `double`. Rust's
+/// `{:?}` (Debug) formatting of a *finite* `f64` is the shortest round-tripping
+/// form and always includes one of those — `3.0`, `3.14`, `100.0`, or `1e16` —
+/// every one of which is a valid C floating literal. A source literal is always
+/// finite, but a non-finite value is guarded defensively (`inf`/`nan` have no C
+/// literal spelling) and the belt-and-suspenders branch appends `.0` should some
+/// future formatting ever yield a bare integer.
+fn c_double_literal(v: f64) -> String {
+    if !v.is_finite() {
+        return "0.0".to_string();
+    }
+    let s = format!("{:?}", v);
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        s
+    } else {
+        format!("{}.0", s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4050,6 +4092,31 @@ mod tests {
     fn int(v: i64) -> Expr {
         Expr::Int {
             value: v,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn float(v: f64) -> Expr {
+        Expr::Float {
+            value: v,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `@as(<ty>, <e>)` — the numeric-cast builtin (v0.137 / v0.144).
+    fn as_cast(ty_name: &str, e: Expr) -> Expr {
+        Expr::Builtin {
+            name: "as".to_string(),
+            args: vec![ident(ty_name), e],
+            span: Span::DUMMY,
+        }
+    }
+
+    fn binary(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
+        Expr::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
             span: Span::DUMMY,
         }
     }
@@ -9659,5 +9726,232 @@ mod tests {
         crate::backend::cc_build(&c, &exe, &crate::backend::BuildOptions::default())
             .expect("a switch with an `else => unreachable` arm should compile");
         let _ = std::fs::remove_file(&exe);
+    }
+
+    // ---- v0.144: floating point `f64` ------------------------------------
+
+    #[test]
+    fn c_double_literal_always_carries_a_decimal_point() {
+        // SPEC §38.1: a `Float` literal emits a C `double` literal that C cannot
+        // mistake for an `int` — it always carries a decimal point (or exponent).
+        assert_eq!(c_double_literal(3.14), "3.14");
+        assert_eq!(c_double_literal(3.0), "3.0");
+        assert_eq!(c_double_literal(100.0), "100.0");
+        assert_eq!(c_double_literal(0.0), "0.0");
+        assert_eq!(c_double_literal(-2.5), "-2.5");
+        assert_eq!(c_double_literal(1.5), "1.5");
+        // A non-finite value (never produced by a source literal) is guarded.
+        assert_eq!(c_double_literal(f64::INFINITY), "0.0");
+        assert_eq!(c_double_literal(f64::NAN), "0.0");
+        // Every result is a valid C floating literal: it has a '.' or an exponent.
+        for v in [3.14_f64, 3.0, 100.0, 0.0, -2.5, 1e16] {
+            let s = c_double_literal(v);
+            assert!(
+                s.contains('.') || s.contains('e') || s.contains('E'),
+                "`{s}` is not recognisably a C double literal"
+            );
+        }
+    }
+
+    #[test]
+    fn float_literal_emits_double_in_expr() {
+        // `Expr::Float` lowers to the C double spelling directly via `emit_expr`.
+        let structs = StructTable::new();
+        let mut em = Emitter::new(EmitMode::Program, &structs);
+        assert_eq!(em.emit_expr(&float(3.14)), "3.14");
+        assert_eq!(em.emit_expr(&float(3.0)), "3.0");
+        assert_eq!(em.emit_expr(&float(100.0)), "100.0");
+        // `type_of_expr` reports `f64` for a float literal.
+        assert_eq!(em.type_of_expr(&float(3.14)), Some(Type::F64));
+    }
+
+    #[test]
+    fn f64_local_emits_double_decl_and_float_literal() {
+        // fn f() void { var x: f64 = 1.5; }  → `double kd_x = 1.5;`
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![Stmt::Let {
+                is_const: false,
+                name: "x".to_string(),
+                ty: Some(ty("f64")),
+                value: float(1.5),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            out.contains("double kd_x = 1.5;"),
+            "f64 local decl wrong:\n{out}"
+        );
+        // The prelude carries the double print helper.
+        assert!(
+            out.contains("static void kd_print_f64(double x) { printf(\"%g\\n\", x); }"),
+            "kd_print_f64 prelude helper missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn print_of_f64_uses_double_helper() {
+        // fn f() void { var x: f64 = 1.5; print(x); }  → `kd_print_f64(kd_x);`
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "x".to_string(),
+                    ty: Some(ty("f64")),
+                    value: float(1.5),
+                    span: Span::DUMMY,
+                },
+                print(ident("x")),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            out.contains("kd_print_f64(kd_x);"),
+            "print of an f64 should route through kd_print_f64:\n{out}"
+        );
+        // It must NOT use the integer print path.
+        assert!(
+            !out.contains("kd_print((long long)(kd_x))"),
+            "print of an f64 must not use the integer kd_print path:\n{out}"
+        );
+    }
+
+    #[test]
+    fn as_cast_to_and_from_f64_lowers_to_c_cast() {
+        // `@as(f64, 7)` → `((double)(7))`; `@as(i32, 3.9)` → `((int32_t)(3.9))`.
+        let structs = StructTable::new();
+        let mut em = Emitter::new(EmitMode::Program, &structs);
+        assert_eq!(em.emit_expr(&as_cast("f64", int(7))), "((double)(7))");
+        assert_eq!(em.emit_expr(&as_cast("i32", float(3.9))), "((int32_t)(3.9))");
+        // `@as(f64, n)` reports type `f64`; `@as(i32, x)` reports `i32`.
+        assert_eq!(em.type_of_expr(&as_cast("f64", int(7))), Some(Type::F64));
+        assert_eq!(em.type_of_expr(&as_cast("i32", float(3.9))), Some(Type::I32));
+    }
+
+    #[test]
+    fn integer_print_unchanged_no_float_helper_call() {
+        // fn f() void { print(7); }  — the integer print path is untouched.
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![print(int(7))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            out.contains("kd_print((long long)(7));"),
+            "integer print path regressed:\n{out}"
+        );
+        // No `kd_print_f64` *call* is emitted — the only occurrence of the token
+        // is the prelude helper *definition* (`kd_print_f64(double x)`).
+        assert_eq!(
+            out.matches("kd_print_f64(").count(),
+            1,
+            "an integer-only program must emit no kd_print_f64 call:\n{out}"
+        );
+    }
+
+    #[test]
+    fn f64_program_compiles_and_prints_expected_values() {
+        // End-to-end through the backend: a program that adds two f64 locals,
+        // divides two int→f64 casts, and truncates an f64→i32 cast, then prints
+        // each — compile with `cc`, run, and assert the printed output.
+        //   fn main() void {
+        //       var x: f64 = 1.5; var y: f64 = 2.0;
+        //       print(x + y);                 // 3.5
+        //       print(@as(f64, 7) / @as(f64, 2)); // 3.5
+        //       print(@as(i32, 3.9));         // 3 (trunc)
+        //   }
+        let main = Func {
+            is_pub: false,
+            name: "main".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "x".to_string(),
+                    ty: Some(ty("f64")),
+                    value: float(1.5),
+                    span: Span::DUMMY,
+                },
+                Stmt::Let {
+                    is_const: false,
+                    name: "y".to_string(),
+                    ty: Some(ty("f64")),
+                    value: float(2.0),
+                    span: Span::DUMMY,
+                },
+                print(binary(BinOp::Add, ident("x"), ident("y"))),
+                print(binary(
+                    BinOp::Div,
+                    as_cast("f64", int(7)),
+                    as_cast("f64", int(2)),
+                )),
+                print(as_cast("i32", float(3.9))),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(main)],
+        };
+        let c = emit(&m, &StructTable::new(), EmitMode::Program);
+
+        // The two f64 prints route through the helper; the i32 print does not.
+        assert!(
+            c.contains("kd_print_f64((kd_x + kd_y));"),
+            "f64 arithmetic print wrong:\n{c}"
+        );
+        assert!(
+            c.contains("kd_print_f64((((double)(7)) / ((double)(2))));"),
+            "f64 division print wrong:\n{c}"
+        );
+        assert!(
+            c.contains("kd_print((long long)(((int32_t)(3.9))));"),
+            "f64->i32 truncating print wrong:\n{c}"
+        );
+
+        let exe = std::env::temp_dir().join(format!(
+            "kardc_emit_v144_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        crate::backend::cc_build(&c, &exe, &crate::backend::BuildOptions::default())
+            .expect("emitted C for an f64 program should compile");
+        let output = std::process::Command::new(&exe)
+            .output()
+            .expect("the compiled f64 program should run");
+        let _ = std::fs::remove_file(&exe);
+
+        assert!(output.status.success(), "program exited non-zero:\n{c}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout, "3.5\n3.5\n3\n",
+            "f64 program printed wrong values:\nstdout={stdout}\n--- C ---\n{c}"
+        );
     }
 }

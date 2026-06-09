@@ -2389,6 +2389,10 @@ impl Checker {
                 Some(t) if t.is_int() => t,
                 _ => Type::I64,
             }),
+            // A floating-point literal `3.14` is always `f64` (v0.144, SPEC §38).
+            // Unlike integer literals it is not polymorphic — `f64` is the only
+            // float type, and there is no implicit int↔float mixing.
+            Expr::Float { .. } => Some(Type::F64),
             Expr::Bool { .. } => Some(Type::Bool),
             // A string literal `"…"` is a value of type `[]u8` — a slice over
             // static bytes (SPEC §23.1). It reuses the slice machinery, so the
@@ -2780,8 +2784,11 @@ impl Checker {
                     }
                 }
                 "as" => {
-                    // `@as(T, e)` casts an integer value `e` to integer type `T`
-                    // (v0.137, SPEC §33). Both must be integers in v0.137.
+                    // `@as(T, e)` casts a numeric value `e` to numeric type `T`
+                    // (SPEC §33, extended for `f64` in v0.144). Both the target and
+                    // the value may now be any numeric type — an integer or `f64` —
+                    // so `@as(f64, n)` (int→float) and `@as(i32, x)` (float→int)
+                    // both type-check; a non-numeric target/value is `E0321`.
                     if args.len() != 2 {
                         self.error(
                             *span,
@@ -2792,20 +2799,20 @@ impl Checker {
                     }
                     let target = self.resolve_type_arg(&args[0]);
                     if let Some(t) = target {
-                        if !t.is_int() {
+                        if !t.is_numeric() {
                             self.error(
                                 args[0].span(),
                                 "E0321",
-                                format!("`@as` target must be an integer type, found `{}`", self.type_name(t)),
+                                format!("`@as` target must be a numeric type (an integer or `f64`), found `{}`", self.type_name(t)),
                             );
                         }
                     }
                     if let Some(et) = self.check_expr(&args[1], None) {
-                        if !et.is_int() {
+                        if !et.is_numeric() {
                             self.error(
                                 args[1].span(),
                                 "E0321",
-                                format!("`@as` value must be an integer, found `{}`", self.type_name(et)),
+                                format!("`@as` value must be a number (an integer or `f64`), found `{}`", self.type_name(et)),
                             );
                         }
                     }
@@ -3575,31 +3582,65 @@ impl Checker {
     ) -> Option<Type> {
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                // Integer-literal polymorphism is anchored only on an *integer*
+                // expectation; `f64` literals are concrete (not flexible), so the
+                // helper resolves an `f64 + f64` to `(F64, F64)` on its own (the
+                // operands anchor each other). `%` stays integer-only (no float
+                // modulo in v0.144, SPEC §38).
                 let (lt, rt) = self.check_int_operands(lhs, rhs, expected.filter(|t| t.is_int()));
                 let lt = lt?;
                 let rt = rt?;
-                if !lt.is_int() {
-                    let msg = format!(
-                        "arithmetic operand must be an integer, found `{}`",
-                        self.type_name(lt)
-                    );
+                // `+ - * /` accept two `f64`s as well as two same-type integers;
+                // `%` is integer-only.
+                let float_ok = !matches!(op, BinOp::Rem);
+                let operand_ok = |t: Type| t.is_int() || (float_ok && t.is_float());
+                if !operand_ok(lt) {
+                    let msg = if float_ok {
+                        format!(
+                            "arithmetic operand must be a number (an integer or `f64`), found `{}`",
+                            self.type_name(lt)
+                        )
+                    } else {
+                        format!(
+                            "arithmetic operand must be an integer, found `{}`",
+                            self.type_name(lt)
+                        )
+                    };
                     self.error(lhs.span(), "E0110", msg);
                     return None;
                 }
-                if !rt.is_int() {
-                    let msg = format!(
-                        "arithmetic operand must be an integer, found `{}`",
-                        self.type_name(rt)
-                    );
+                if !operand_ok(rt) {
+                    let msg = if float_ok {
+                        format!(
+                            "arithmetic operand must be a number (an integer or `f64`), found `{}`",
+                            self.type_name(rt)
+                        )
+                    } else {
+                        format!(
+                            "arithmetic operand must be an integer, found `{}`",
+                            self.type_name(rt)
+                        )
+                    };
                     self.error(rhs.span(), "E0110", msg);
                     return None;
                 }
                 if lt != rt {
-                    let msg = format!(
-                        "arithmetic operands must have the same type, found `{}` and `{}`",
-                        self.type_name(lt),
-                        self.type_name(rt)
-                    );
+                    // A mix of `f64` and an integer is never implicitly converted:
+                    // point the programmer at `@as` (SPEC §38).
+                    let msg = if lt.is_float() != rt.is_float() {
+                        format!(
+                            "no implicit conversion between integer and float; \
+                             cast with `@as`, found `{}` and `{}`",
+                            self.type_name(lt),
+                            self.type_name(rt)
+                        )
+                    } else {
+                        format!(
+                            "arithmetic operands must have the same type, found `{}` and `{}`",
+                            self.type_name(lt),
+                            self.type_name(rt)
+                        )
+                    };
                     self.error(span, "E0110", msg);
                     return None;
                 }
@@ -3868,15 +3909,16 @@ impl Checker {
                     return Some(Type::Void);
                 }
                 if let Some(t) = self.check_expr(&args[0], None) {
-                    // `print` accepts an integer or a string — a `[]u8` slice
-                    // (SPEC §23.1). Any other type is rejected.
+                    // `print` accepts an integer, an `f64` (v0.144, SPEC §38), or a
+                    // string — a `[]u8` slice (SPEC §23.1). Any other type is
+                    // rejected.
                     let is_string = match t {
                         Type::Slice(id) => self.structs.slice_elem(id) == Type::U8,
                         _ => false,
                     };
-                    if !t.is_int() && !is_string {
+                    if !t.is_int() && !t.is_float() && !is_string {
                         let msg = format!(
-                            "`print` requires an integer or string (`[]u8`) argument, found `{}`",
+                            "`print` requires an integer, `f64`, or string (`[]u8`) argument, found `{}`",
                             self.type_name(t)
                         );
                         self.error(args[0].span(), "E0110", msg);
@@ -11252,5 +11294,186 @@ mod tests {
             ),
         ];
         assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    // ---- floating point `f64` (v0.144, SPEC §38) --------------------------
+
+    /// A floating-point literal `3.14` of type `f64`.
+    fn float(v: f64) -> Expr {
+        Expr::Float { value: v, span: sp() }
+    }
+
+    #[test]
+    fn float_literal_is_f64() {
+        let mut cx = Checker::new();
+        assert_eq!(cx.check_expr(&float(3.14), None), Some(Type::F64));
+        // A contextual integer expectation does NOT coerce a float literal.
+        assert_eq!(cx.check_expr(&float(3.14), Some(Type::I32)), Some(Type::F64));
+    }
+
+    #[test]
+    fn float_var_decl_ok() {
+        // fn main() void { var x: f64 = 3.14; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var("x", "f64", float(3.14))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn float_arithmetic_yields_f64() {
+        // fn f(a: f64, b: f64) f64 { return a + b; }   (also - * / via vars)
+        let items = vec![func(
+            "f",
+            vec![param("a", "f64"), param("b", "f64")],
+            "f64",
+            vec![
+                let_var("s", "f64", bin(BinOp::Add, ident("a"), ident("b"))),
+                let_var("d", "f64", bin(BinOp::Sub, ident("a"), ident("b"))),
+                let_var("m", "f64", bin(BinOp::Mul, ident("a"), ident("b"))),
+                ret(Some(bin(BinOp::Div, ident("a"), ident("b")))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn float_comparison_yields_bool() {
+        // fn lt(a: f64, b: f64) bool { return a < b; }   (and == via a let)
+        let items = vec![func(
+            "lt",
+            vec![param("a", "f64"), param("b", "f64")],
+            "bool",
+            vec![
+                let_var("e", "bool", bin(BinOp::Eq, ident("a"), ident("b"))),
+                ret(Some(bin(BinOp::Lt, ident("a"), ident("b")))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn float_plus_int_is_e0110() {
+        // fn f(a: f64, b: i32) f64 { return a + b; }   — no implicit int↔float.
+        let items = vec![func(
+            "f",
+            vec![param("a", "f64"), param("b", "i32")],
+            "f64",
+            vec![ret(Some(bin(BinOp::Add, ident("a"), ident("b"))))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn float_modulo_is_rejected() {
+        // fn f(a: f64, b: f64) f64 { return a % b; }   — `%` stays integer-only.
+        let items = vec![func(
+            "f",
+            vec![param("a", "f64"), param("b", "f64")],
+            "f64",
+            vec![ret(Some(bin(BinOp::Rem, ident("a"), ident("b"))))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn as_int_to_float_is_f64() {
+        // fn main() void { var x: f64 = @as(f64, 5); }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var(
+                "x",
+                "f64",
+                builtin("as", vec![ident("f64"), int(5)]),
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn as_float_to_int_is_int() {
+        // fn main() void { var x: i32 = @as(i32, 3.5); }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var(
+                "x",
+                "i32",
+                builtin("as", vec![ident("i32"), float(3.5)]),
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn print_accepts_f64() {
+        // fn f(a: f64) void { print(a); }
+        let items = vec![func(
+            "f",
+            vec![param("a", "f64")],
+            "void",
+            vec![Stmt::Expr(call("print", vec![ident("a")]))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn integer_arithmetic_and_compare_unchanged() {
+        // fn add(a: i32, b: i32) i32 { return a + b; }
+        // fn cmp(a: i32, b: i32) bool { return a < b; }
+        // Integer arithmetic still anchors literal polymorphism: `1 + 2` is i64.
+        let items = vec![
+            func(
+                "add",
+                vec![param("a", "i32"), param("b", "i32")],
+                "i32",
+                vec![ret(Some(bin(BinOp::Add, ident("a"), ident("b"))))],
+            ),
+            func(
+                "cmp",
+                vec![param("a", "i32"), param("b", "i32")],
+                "bool",
+                vec![ret(Some(bin(BinOp::Lt, ident("a"), ident("b"))))],
+            ),
+            func(
+                "lit",
+                vec![],
+                "i64",
+                vec![ret(Some(bin(BinOp::Add, int(1), int(2))))],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn integer_plus_bool_still_errors() {
+        // fn f(a: i32, b: bool) i32 { return a + b; }  — non-numeric operand.
+        let items = vec![func(
+            "f",
+            vec![param("a", "i32"), param("b", "bool")],
+            "i32",
+            vec![ret(Some(bin(BinOp::Add, ident("a"), ident("b"))))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn float_const_is_e0130() {
+        // const P = 3.14;   — floats are runtime-only in v0.144.
+        let items = vec![const_item_infer("P", float(3.14))];
+        assert!(codes(items).contains(&"E0130"));
+    }
+
+    #[test]
+    fn float_const_with_annotation_is_e0130() {
+        // const P: f64 = 3.14;   — still rejected (const_eval cannot fold a float).
+        let items = vec![const_item("P", "f64", float(3.14))];
+        assert!(codes(items).contains(&"E0130"));
     }
 }

@@ -21,6 +21,8 @@ pub enum Type {
     U32,
     U64,
     Usize,
+    /// `f64` — a 64-bit IEEE-754 float (v0.144). The first non-integer scalar.
+    F64,
     Bool,
     Void,
     Struct(u32),
@@ -63,6 +65,7 @@ impl Type {
             "u32" => Type::U32,
             "u64" => Type::U64,
             "usize" => Type::Usize,
+            "f64" => Type::F64,
             "bool" => Type::Bool,
             "void" => Type::Void,
             "Allocator" => Type::Allocator,
@@ -82,6 +85,7 @@ impl Type {
             Type::U32 => "u32",
             Type::U64 => "u64",
             Type::Usize => "usize",
+            Type::F64 => "f64",
             Type::Bool => "bool",
             Type::Void => "void",
             // Struct / optional names are dynamic; sema formats them via the
@@ -114,6 +118,7 @@ impl Type {
             Type::U32 => "uint32_t",
             Type::U64 => "uint64_t",
             Type::Usize => "uintptr_t",
+            Type::F64 => "double",
             Type::Bool => "bool",
             Type::Void => "void",
             Type::Struct(_) => unreachable!("c_name on a struct type; use StructTable::c_name"),
@@ -153,6 +158,16 @@ impl Type {
 
     pub fn is_signed(self) -> bool {
         matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+    }
+
+    /// True for `f64` (the only float type, v0.144).
+    pub fn is_float(self) -> bool {
+        matches!(self, Type::F64)
+    }
+
+    /// True for any numeric scalar — an integer or a float (v0.144).
+    pub fn is_numeric(self) -> bool {
+        self.is_int() || self.is_float()
     }
 }
 
