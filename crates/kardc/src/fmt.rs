@@ -384,6 +384,37 @@ impl Printer {
                 self.write_indent();
                 self.out.push_str("}\n");
             }
+            // `for (<iter>) |elem| { … }` — iterate an array/slice, binding each
+            // element by value (SPEC §29). The `, 0..` index form additionally
+            // binds a 0-based `usize` and prints `for (<iter>, 0..) |elem, index|
+            // { … }`: the `, 0..` follows the iterable inside the parens and a
+            // second `, index` capture is appended between the pipes. `index =
+            // None` is the plain form, exactly `for (<iter>) |elem| { … }`. The
+            // body prints one indent deeper, like `while`.
+            Stmt::For {
+                iter,
+                elem,
+                index,
+                body,
+                ..
+            } => {
+                self.write_indent();
+                self.out.push_str("for (");
+                self.out.push_str(&fmt_expr(iter));
+                if index.is_some() {
+                    self.out.push_str(", 0..");
+                }
+                self.out.push_str(") |");
+                self.out.push_str(elem);
+                if let Some(idx) = index {
+                    self.out.push_str(", ");
+                    self.out.push_str(idx);
+                }
+                self.out.push_str("| {\n");
+                self.print_block_body(body);
+                self.write_indent();
+                self.out.push_str("}\n");
+            }
             Stmt::Break(_) => {
                 self.write_indent();
                 self.out.push_str("break;\n");
@@ -1156,6 +1187,32 @@ fn fmt_stmt_inline(stmt: &Stmt) -> String {
                 s.push(')');
             }
             s.push(' ');
+            s.push_str(&fmt_block_inline(body));
+            s
+        }
+        // `for (<iter>) |elem| { … }` / `for (<iter>, 0..) |elem, index| { … }`
+        // (SPEC §29), inline. Mirrors the multi-line printer construct-for-
+        // construct, differing only in whitespace, so the result re-lexes to the
+        // same `Stmt::For`.
+        Stmt::For {
+            iter,
+            elem,
+            index,
+            body,
+            ..
+        } => {
+            let mut s = String::from("for (");
+            s.push_str(&fmt_expr(iter));
+            if index.is_some() {
+                s.push_str(", 0..");
+            }
+            s.push_str(") |");
+            s.push_str(elem);
+            if let Some(idx) = index {
+                s.push_str(", ");
+                s.push_str(idx);
+            }
+            s.push_str("| ");
             s.push_str(&fmt_block_inline(body));
             s
         }
@@ -4566,6 +4623,132 @@ mod tests {
             "        c = c | v;\n",
             "    }\n",
             "    return ~c;\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    // ----- for loops over arrays & slices (v0.133) -------------------------
+
+    #[test]
+    fn for_loop_basic_form_prints() {
+        // `for (xs) |x| { print(x); }` — element-by-value iteration with no index
+        // capture (SPEC §29). The plain `for (<iter>) |elem| { … }` form prints,
+        // with the body one indent deeper, like `while`.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![Param {
+                    name: "xs".to_string(),
+                    ty: slice_ty("i32"),
+                    is_comptime: false,
+                    span: D,
+                }],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::For {
+                        iter: ident("xs"),
+                        elem: "x".to_string(),
+                        index: None,
+                        body: Block {
+                            stmts: vec![Stmt::Expr(call("print", vec![ident("x")]))],
+                            span: D,
+                        },
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f(xs: []i32) void {\n",
+            "    for (xs) |x| {\n",
+            "        print(x);\n",
+            "    }\n",
+            "}\n",
+        );
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn for_loop_index_form_prints() {
+        // `for (xs, 0..) |x, i| { … }` — the index-capture form (SPEC §29): the
+        // `, 0..` follows the iterable inside the parens and a second `, i`
+        // capture is appended between the pipes.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![Param {
+                    name: "xs".to_string(),
+                    ty: slice_ty("i32"),
+                    is_comptime: false,
+                    span: D,
+                }],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::For {
+                        iter: ident("xs"),
+                        elem: "x".to_string(),
+                        index: Some("i".to_string()),
+                        body: Block {
+                            stmts: vec![
+                                Stmt::Expr(call("print", vec![ident("x")])),
+                                Stmt::Expr(call("print", vec![ident("i")])),
+                            ],
+                            span: D,
+                        },
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f(xs: []i32) void {\n",
+            "    for (xs, 0..) |x, i| {\n",
+            "        print(x);\n",
+            "        print(i);\n",
+            "    }\n",
+            "}\n",
+        );
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn for_loop_source_round_trips() {
+        // End-to-end (lex → parse → print), SPEC §29: `for (xs) |x| { print(x); }`
+        // is already canonical, so formatting reproduces the source byte-for-byte
+        // and re-formatting that output is byte-identical (idempotence).
+        let src = concat!(
+            "fn f(xs: []i32) void {\n",
+            "    for (xs) |x| {\n",
+            "        print(x);\n",
+            "    }\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn for_loop_index_source_round_trips() {
+        // End-to-end, SPEC §29: the `, 0..` index-capture form
+        // `for (xs, 0..) |x, i| { … }` round-trips and is idempotent.
+        let src = concat!(
+            "fn f(xs: []i32) void {\n",
+            "    for (xs, 0..) |x, i| {\n",
+            "        print(x);\n",
+            "        print(i);\n",
+            "    }\n",
             "}\n",
         );
         let once = format_source(src).expect("source formats");

@@ -67,6 +67,13 @@ struct Scope {
     defers: Vec<(bool, Stmt)>,
     is_loop_body: bool,
     cont: Option<Stmt>,
+    /// A raw C continue-clause emitted verbatim at every loop edge (fall-through
+    /// off the body end and before each `continue`), beside any `cont`
+    /// (SPEC §29.2). A `for` loop uses this for its index increment
+    /// `__kd_fi{N} += 1;`, which is not expressible as an AST `Stmt` (the index
+    /// temp is not a `kd_`-prefixed source binding). `None` for `while`/plain
+    /// scopes, so their lowering is unchanged.
+    cont_raw: Option<String>,
     /// Types of locals/params introduced in this scope, keyed by source name.
     /// Used both to resolve a method call's receiver to the struct whose
     /// function is invoked (`kd_<Struct>_<method>`) and to decide optional
@@ -81,6 +88,7 @@ impl Scope {
             defers: Vec::new(),
             is_loop_body: false,
             cont: None,
+            cont_raw: None,
             var_types: HashMap::new(),
         }
     }
@@ -96,6 +104,7 @@ impl Scope {
             defers: Vec::new(),
             is_loop_body: true,
             cont,
+            cont_raw: None,
             var_types: HashMap::new(),
         }
     }
@@ -146,6 +155,10 @@ struct Emitter<'a> {
     /// a `print(s)` where `s: []u8` (a string), so the slice expression is only
     /// evaluated once before `fwrite` (SPEC §23.2). Reset per function/test body.
     str_counter: usize,
+    /// Monotonic counter for the `__kd_for{N}` iterable temporary and `__kd_fi{N}`
+    /// walking index of a `for` loop (SPEC §29.2). Reset per function/test body,
+    /// exactly like the other temp counters.
+    for_counter: usize,
     /// Pointee types of the `*T` pointer types written in this module's
     /// signatures / locals, in first-seen order (SPEC §15.1). Pointers have no
     /// typedef and the table exposes no `pointers()` iterator, so emit keeps
@@ -192,6 +205,7 @@ impl<'a> Emitter<'a> {
             idx_counter: 0,
             if_counter: 0,
             str_counter: 0,
+            for_counter: 0,
             local_ptr_pointees: Vec::new(),
             subst: HashMap::new(),
             value_subst: HashMap::new(),
@@ -496,6 +510,9 @@ impl<'a> Emitter<'a> {
                 }
             }
             Stmt::While { body, .. } => self.note_block_ptrs(body),
+            // A `for` body may contain `*T` source types to register, exactly
+            // like a `while` body (SPEC §29).
+            Stmt::For { body, .. } => self.note_block_ptrs(body),
             Stmt::Block(b) => self.note_block_ptrs(b),
             Stmt::Defer { stmt, .. } => self.note_stmt_ptrs(stmt),
             Stmt::ErrDefer { stmt, .. } => self.note_stmt_ptrs(stmt),
@@ -1328,6 +1345,7 @@ impl<'a> Emitter<'a> {
         self.idx_counter = 0;
         self.if_counter = 0;
         self.str_counter = 0;
+        self.for_counter = 0;
         self.current_ret = self.resolve_ty(&f.ret);
         let ret = self.cty(&f.ret);
         let params = self.format_params(&f.params);
@@ -1377,16 +1395,9 @@ impl<'a> Emitter<'a> {
             self.flush_current_reversed(false);
             // A loop body runs its continue-clause at the end of each iteration
             // (the fall-through edge), after the body's defers.
-            let cont = {
-                let top = self.scopes.last().expect("scope present");
-                if top.is_loop_body {
-                    top.cont.clone()
-                } else {
-                    None
-                }
-            };
-            if let Some(c) = cont {
-                self.emit_cont(&c);
+            if self.scopes.last().map(|s| s.is_loop_body).unwrap_or(false) {
+                let idx = self.scopes.len() - 1;
+                self.emit_loop_cont(idx);
             }
         }
         self.scopes.pop();
@@ -1597,6 +1608,13 @@ impl<'a> Emitter<'a> {
                 // statement itself never diverges.
                 false
             }
+            Stmt::For {
+                iter,
+                elem,
+                index,
+                body,
+                ..
+            } => self.emit_for(iter, elem, index, body),
             Stmt::Break(_) => {
                 self.flush_to_loop_reversed();
                 self.line("break;");
@@ -1604,9 +1622,7 @@ impl<'a> Emitter<'a> {
             }
             Stmt::Continue(_) => {
                 if let Some(i) = self.flush_to_loop_reversed() {
-                    if let Some(c) = self.scopes[i].cont.clone() {
-                        self.emit_cont(&c);
-                    }
+                    self.emit_loop_cont(i);
                 }
                 self.line("continue;");
                 true
@@ -1830,6 +1846,126 @@ impl<'a> Emitter<'a> {
                 self.line(&dbg);
             }
         }
+    }
+
+    /// Emit the continue-clause(s) of the loop-body scope at `idx`: the AST
+    /// `cont` of a `while (..) : (cont)` and/or the raw C `cont_raw` of a `for`
+    /// (its index increment, SPEC §29.2). Run on every loop edge — fall-through
+    /// off the body end and before each `continue` — so a `for`'s index always
+    /// advances even when the iteration `continue`s. A `while` has only `cont`
+    /// and a `for` only `cont_raw`, so this never double-emits.
+    fn emit_loop_cont(&mut self, idx: usize) {
+        if let Some(c) = self.scopes[idx].cont.clone() {
+            self.emit_cont(&c);
+        }
+        if let Some(raw) = self.scopes[idx].cont_raw.clone() {
+            self.line(&raw);
+        }
+    }
+
+    /// Lower a `for (iter) |elem| { … }` / `for (iter, 0..) |elem, index| { … }`
+    /// over an array (`[N]T`) or slice (`[]T`) to an indexed `while` (SPEC
+    /// §29.2). The iterable is evaluated **once** into `__kd_for{N}`; a `usize`
+    /// index `__kd_fi{N}` walks `0 .. <len>` (`<len>` is the runtime `.len` of a
+    /// slice / the compile-time length of an array). Each iteration first binds
+    /// the element **by value** (`<T> kd_<elem> = <access>;`) and, for the index
+    /// form, `usize kd_<index> = __kd_fi{N};`, then the body.
+    ///
+    /// The body runs in a loop-body [`Scope`] (so `defer`/`break`/`continue`
+    /// behave) whose `cont_raw` is the index increment, so a `continue` still
+    /// advances the index. A `for` may iterate zero times, so it never diverges
+    /// (returns `false`).
+    fn emit_for(
+        &mut self,
+        iter: &Expr,
+        elem: &str,
+        index: &Option<String>,
+        body: &Block,
+    ) -> bool {
+        // The iterable's type selects the element access (`.ptr[i]` for a slice,
+        // `.data[i]` for an array) and the length form (the runtime `.len` of a
+        // slice / the literal length of an array). Validated input is always an
+        // array or slice; an unexpected shape emits nothing so emission never
+        // panics on a malformed AST.
+        let (iter_cty, elem_ty, array_len, access_member) = match self.type_of_expr(iter) {
+            Some(Type::Slice(sid)) => (
+                self.structs.slice_c_name(sid),
+                self.structs.slice_elem(sid),
+                None,
+                "ptr",
+            ),
+            Some(Type::Array(aid)) => (
+                self.structs.array_c_name(aid),
+                self.structs.array_elem(aid),
+                Some(self.structs.array_len(aid)),
+                "data",
+            ),
+            _ => return false,
+        };
+
+        let n = self.for_counter;
+        self.for_counter += 1;
+        let temp = format!("__kd_for{}", n);
+        let iv = format!("__kd_fi{}", n);
+        let usize_cty = self.cty_of(Type::Usize);
+        let elem_cty = self.cty_of(elem_ty);
+        let iter_str = self.emit_expr(iter);
+
+        // Outer block: evaluate the iterable once, then declare the walking index.
+        self.line("{");
+        self.indent += 1;
+        self.line(&format!("{} {} = {};", iter_cty, temp, iter_str));
+        self.line(&format!("{} {} = 0;", usize_cty, iv));
+        let len = match array_len {
+            Some(l) => l.to_string(),
+            None => format!("{}.len", temp),
+        };
+        self.line(&format!("while ({} < {}) {{", iv, len));
+
+        // The loop body is a loop-body scope (so `defer`/`break`/`continue`
+        // behave); its `cont_raw` is the index increment, so `continue` still
+        // advances the index (SPEC §29.2). Record the element/index binding
+        // types so body uses (method calls, coercion) resolve correctly.
+        let mut scope = Scope::loop_body(None);
+        scope.cont_raw = Some(format!("{} += 1;", iv));
+        scope.var_types.insert(elem.to_string(), elem_ty);
+        if let Some(ix) = index {
+            scope.var_types.insert(ix.clone(), Type::Usize);
+        }
+        self.scopes.push(scope);
+        self.indent += 1;
+
+        // First the by-value element binding, then (the index form) the index.
+        self.line(&format!(
+            "{} kd_{} = {}.{}[{}];",
+            elem_cty, elem, temp, access_member, iv
+        ));
+        if let Some(ix) = index {
+            self.line(&format!("{} kd_{} = {};", usize_cty, ix, iv));
+        }
+
+        // Emit the body statements; on fall-through flush the body's defers and
+        // run the index increment (mirroring `emit_block`'s loop handling).
+        let mut diverged = false;
+        for s in &body.stmts {
+            diverged = self.emit_stmt(s);
+            if diverged {
+                break;
+            }
+        }
+        if !diverged {
+            self.flush_current_reversed(false);
+            let idx = self.scopes.len() - 1;
+            self.emit_loop_cont(idx);
+        }
+        self.scopes.pop();
+
+        self.indent -= 1;
+        self.line("}"); // close the `while` body
+        self.indent -= 1;
+        self.line("}"); // close the outer block
+        // A `for` may iterate zero times, so the loop statement never diverges.
+        false
     }
 
     fn emit_expr_stmt(&mut self, e: &Expr) -> bool {
@@ -3183,6 +3319,7 @@ impl<'a> Emitter<'a> {
         self.try_counter = 0;
         self.idx_counter = 0;
         self.if_counter = 0;
+        self.for_counter = 0;
         self.current_ret = Type::I32; // the harness test functions return `int`
         self.line(&format!("static int kd_test_{}(void) {{", idx));
         self.indent += 1;
@@ -7553,6 +7690,183 @@ mod tests {
         assert!(
             out.contains("(((kd_a << 4) | (kd_b & 7)) ^ (~kd_c))"),
             "bit-twiddle expression lowering wrong:\n{out}"
+        );
+    }
+
+    // -- v0.133 `for` loops over arrays & slices (SPEC §29.2) ---------------
+
+    /// A `for (iter) |elem| { body }` / `for (iter, 0..) |elem, index| { body }`
+    /// statement.
+    fn for_stmt(iter: Expr, elem: &str, index: Option<&str>, body: Vec<Stmt>) -> Stmt {
+        Stmt::For {
+            iter,
+            elem: elem.to_string(),
+            index: index.map(|s| s.to_string()),
+            body: block(body),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A `fn name(p: <pty>) void { <body> }` with a single (possibly composite)
+    /// parameter type.
+    fn fn_one_param(name: &str, p: &str, pty: TypeExpr, body: Vec<Stmt>) -> Func {
+        Func {
+            is_pub: false,
+            name: name.to_string(),
+            params: vec![Param {
+                name: p.to_string(),
+                ty: pty,
+                is_comptime: false,
+                span: Span::DUMMY,
+            }],
+            ret: ty("void"),
+            body: block(body),
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn for_over_array_emits_indexed_while_with_byvalue_elem() {
+        // fn go(a: [3]i32) void { for (a) |x| { print(x); } }
+        let structs = arr_int_table();
+        let f = fn_one_param(
+            "go",
+            "a",
+            arr_ty("i32", 3),
+            vec![for_stmt(ident("a"), "x", None, vec![print(ident("x"))])],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The iterable is copied once into the `__kd_for0` temp; a `usize`
+        // (`uintptr_t`) index walks `0 .. 3` (the array's literal length).
+        assert!(
+            out.contains("kd_arr_int32_t_3 __kd_for0 = kd_a;"),
+            "iterable temp wrong:\n{out}"
+        );
+        assert!(
+            out.contains("uintptr_t __kd_fi0 = 0;"),
+            "index var wrong:\n{out}"
+        );
+        assert!(
+            out.contains("while (__kd_fi0 < 3) {"),
+            "loop condition wrong:\n{out}"
+        );
+        // The element binds by value through `.data[i]`.
+        assert!(
+            out.contains("int32_t kd_x = __kd_for0.data[__kd_fi0];"),
+            "by-value element binding wrong:\n{out}"
+        );
+        // The index is incremented at the end of the body (fall-through edge).
+        assert!(
+            out.contains("__kd_fi0 += 1;"),
+            "index increment missing:\n{out}"
+        );
+        // No index capture was written, so no `kd_` index local is emitted.
+        assert!(
+            !out.contains("kd_i = __kd_fi0;"),
+            "unexpected index binding for the non-index form:\n{out}"
+        );
+        // The body lowering is unchanged (`print(x)` over the element copy).
+        assert!(
+            out.contains("kd_print((long long)(kd_x));"),
+            "body lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn for_index_form_binds_usize_index() {
+        // fn go(a: [3]i32) void { for (a, 0..) |x, i| { print(i); } }
+        let structs = arr_int_table();
+        let f = fn_one_param(
+            "go",
+            "a",
+            arr_ty("i32", 3),
+            vec![for_stmt(ident("a"), "x", Some("i"), vec![print(ident("i"))])],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The index form binds a `usize` (`uintptr_t`) local to the walking index.
+        assert!(
+            out.contains("uintptr_t kd_i = __kd_fi0;"),
+            "index capture binding wrong:\n{out}"
+        );
+        // The element still binds by value before the index.
+        assert!(
+            out.contains("int32_t kd_x = __kd_for0.data[__kd_fi0];"),
+            "element binding wrong:\n{out}"
+        );
+        let elem_at = out.find("kd_x = __kd_for0.data").expect("elem binding present");
+        let idx_at = out.find("kd_i = __kd_fi0;").expect("index binding present");
+        assert!(elem_at < idx_at, "element must bind before index:\n{out}");
+    }
+
+    #[test]
+    fn for_over_slice_uses_ptr_and_runtime_len() {
+        // fn go(s: []i32) void { for (s) |x| { print(x); } }
+        let structs = slice_int_table();
+        let f = fn_one_param(
+            "go",
+            "s",
+            slice_ty("i32"),
+            vec![for_stmt(ident("s"), "x", None, vec![print(ident("x"))])],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // A slice iterable is copied once; the bound is the runtime `.len`.
+        assert!(
+            out.contains("kd_slice_int32_t __kd_for0 = kd_s;"),
+            "slice iterable temp wrong:\n{out}"
+        );
+        assert!(
+            out.contains("while (__kd_fi0 < __kd_for0.len) {"),
+            "slice loop condition must use the runtime `.len`:\n{out}"
+        );
+        // The element binds by value through `.ptr[i]`.
+        assert!(
+            out.contains("int32_t kd_x = __kd_for0.ptr[__kd_fi0];"),
+            "slice element binding must use `.ptr[i]`:\n{out}"
+        );
+    }
+
+    #[test]
+    fn for_continue_still_increments_index() {
+        // fn go(a: [3]i32) void { for (a) |x| { continue; } }
+        // A `continue` must advance the index, so the increment is emitted on
+        // the `continue` edge, immediately before the C `continue;`.
+        let structs = arr_int_table();
+        let f = fn_one_param(
+            "go",
+            "a",
+            arr_ty("i32", 3),
+            vec![for_stmt(
+                ident("a"),
+                "x",
+                None,
+                vec![Stmt::Continue(Span::DUMMY)],
+            )],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        let inc_at = out.find("__kd_fi0 += 1;").expect("increment present");
+        let cont_at = out.find("continue;").expect("continue present");
+        assert!(
+            inc_at < cont_at,
+            "the index increment must run before `continue;`:\n{out}"
+        );
+        // The unconditional `continue` diverges, so the fall-through increment is
+        // suppressed — exactly one increment is emitted (the `continue` edge).
+        assert_eq!(
+            out.matches("__kd_fi0 += 1;").count(),
+            1,
+            "exactly one increment expected (no duplicate on a diverging body):\n{out}"
         );
     }
 }

@@ -761,3 +761,41 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "8\n14\n6\n48\n6\n-13\n255\n12\n99\n");
 }
+
+// --- v0.133 for-loops over arrays & slices ---------------------------------
+
+#[test]
+fn for_loops_over_arrays_and_slices() {
+    let src = r#"
+fn sum(xs: []i32) i32 {
+    var total: i32 = 0;
+    for (xs) |x| { total += x; }
+    return total;
+}
+pub fn main() i32 {
+    var a: [5]i32 = [5]i32{ 10, 20, 30, 40, 50 };
+    print(sum(a[0..5]));          // 150 (for over a slice)
+    var found: usize = 99;
+    for (a, 0..) |x, i| {          // index form
+        if (x > 25) {
+            if (found == 99) { found = i; }
+        }
+    }
+    print(found);                 // 2
+    var evens: i32 = 0;
+    for (a) |x| {
+        if (x % 20 != 0) { continue; }   // continue must still advance the index
+        evens += 1;
+    }
+    print(evens);                 // 2
+    var product: i32 = 1;
+    var small: [3]i32 = [3]i32{ 2, 3, 4 };
+    for (small) |x| { product *= x; }    // for over an array directly
+    print(product);               // 24
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "150\n2\n2\n24\n");
+}

@@ -1094,3 +1094,32 @@ operands are the usual binop type error.
 Direct C lowering: `a & b`, `a | b`, `a ^ b`, `a << b`, `a >> b`, `~a` (the
 operands keep their C integer types). `const_eval` folds all of them (and `~`)
 on integer constants, so `const MASK = (1 << 8) - 1;` works.
+
+## 29. `for` loops over arrays & slices (v0.133)
+
+`for (iter) |elem| { … }` iterates the elements of an array (`[N]T`) or slice
+(`[]T`); `elem` binds each element **by value**. `for (iter, 0..) |elem, index|
+{ … }` additionally binds a 0-based `usize` `index`. (`for`/`Kw::For` is a new
+keyword; `Stmt::For{ iter, elem, index, body }`.)
+
+### 29.1 Semantics (`sema`)
+`iter` must be a `[]T` or `[N]T` (else an error); `elem` is bound (immutable, a
+copy) to the element type `T`, and `index` — present iff the `, 0..` index form
+was written — to `usize`. The body is checked in a new loop scope with those
+bindings (so `break`/`continue` work). A capture-count that disagrees with the
+presence of `, 0..` is an error.
+
+### 29.2 Backend (`emit_c`)
+Lowered to an indexed `while` (a loop-body scope, so `defer`/`break`/`continue`
+behave). The iterable is evaluated **once** into a temp:
+```c
+{ <iter cty> __kd_for{N} = (<iter>); usize __kd_fi{N} = 0;
+  while (__kd_fi{N} < <len>) {
+      <T cty> kd_<elem> = <elem-access>;     // by-value copy
+      usize kd_<index> = __kd_fi{N};         // only if the index form
+      <body>
+      __kd_fi{N} += 1; } }
+```
+where `<len>` is `__kd_forN.len` for a slice / the literal `N` for an array, and
+`<elem-access>` is `__kd_forN.ptr[__kd_fiN]` (slice) / `__kd_forN.data[__kd_fiN]`
+(array).

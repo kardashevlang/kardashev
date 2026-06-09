@@ -1353,6 +1353,55 @@ impl Checker {
                 self.check_block(body);
                 self.loop_depth -= 1;
             }
+            // `for (iter) |elem| { … }` / `for (iter, 0..) |elem, index| { … }`
+            // (v0.133, SPEC §29.1). The iterable must be an array (`[N]T`) or a
+            // slice (`[]T`); `elem` binds each element **by value** (an immutable
+            // local of element type `T`), and — only for the `, 0..` index form
+            // — `index` binds a `usize`. The body is checked in a new loop scope
+            // holding those bindings, so `break`/`continue` are valid and the
+            // bindings are visible only inside the body. The capture-count vs
+            // `, 0..` agreement is enforced by the parser (it decides whether
+            // `index` is `Some`), so it is not re-checked here.
+            Stmt::For {
+                iter,
+                elem,
+                index,
+                body,
+                ..
+            } => {
+                // The element type is `T` for `[]T`/`[N]T`; any other iterable is
+                // an error (we still bind `elem` to a fallback so the body keeps
+                // checking, avoiding a cascade of unknown-name errors on `elem`).
+                let elem_ty = match self.check_expr(iter, None) {
+                    Some(Type::Array(id)) => self.structs.array_elem(id),
+                    Some(Type::Slice(id)) => self.structs.slice_elem(id),
+                    Some(other) => {
+                        let msg = format!(
+                            "`for` requires an array (`[N]T`) or slice (`[]T`), found `{}`",
+                            self.type_name(other)
+                        );
+                        self.error(iter.span(), "E0300", msg);
+                        Type::I64
+                    }
+                    // The iterable expression already reported its own error;
+                    // bind a fallback so the body still checks.
+                    None => Type::I64,
+                };
+                // A scope wrapping the body holds the capture bindings (mirroring
+                // the optional-`if` capture above); `check_block` nests its own
+                // scope inside, so the captures live throughout the body — and
+                // only there. `elem` (and `index`) are immutable (`is_const`),
+                // matching other capture bindings: `elem` is a by-value copy.
+                self.scopes.push(HashMap::new());
+                self.define(elem, elem_ty, true);
+                if let Some(index_name) = index {
+                    self.define(index_name, Type::Usize, true);
+                }
+                self.loop_depth += 1;
+                self.check_block(body);
+                self.loop_depth -= 1;
+                self.scopes.pop();
+            }
             Stmt::Break(span) => {
                 if self.loop_depth == 0 {
                     self.error(*span, "E0120", "`break` is only valid inside a loop");
@@ -4237,6 +4286,17 @@ mod tests {
             span: sp(),
         }
     }
+    /// `for (iter) |elem| { body }` (no index) or, when `index` is `Some`,
+    /// `for (iter, 0..) |elem, index| { body }` (v0.133, SPEC §29).
+    fn for_stmt(iter: Expr, elem: &str, index: Option<&str>, body: Vec<Stmt>) -> Stmt {
+        Stmt::For {
+            iter,
+            elem: elem.into(),
+            index: index.map(|s| s.into()),
+            body: block(body),
+            span: sp(),
+        }
+    }
     fn let_var(name: &str, ty: &str, value: Expr) -> Stmt {
         Stmt::Let {
             is_const: false,
@@ -4861,6 +4921,178 @@ mod tests {
             }],
         )];
         assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    // ---- for loops over arrays & slices (v0.133, SPEC §29) ----------------
+
+    /// Build a `var a: [3]i32 = [3]i32{0,0,0};` binding for the for-loop tests.
+    fn let_arr3() -> Stmt {
+        let_var_arr(
+            "a",
+            "i32",
+            3,
+            array_lit("i32", 3, vec![int(0), int(0), int(0)]),
+        )
+    }
+
+    #[test]
+    fn for_over_array_binds_elem_to_element_type() {
+        // fn main() void {
+        //   var a: [3]i32 = [3]i32{0,0,0};
+        //   for (a) |x| { var y: i32 = x; }   // `x` is i32, so `y: i32 = x` ok
+        // }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_arr3(),
+                for_stmt(
+                    ident("a"),
+                    "x",
+                    None,
+                    vec![let_var("y", "i32", ident("x"))],
+                ),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn for_index_form_binds_index_to_usize() {
+        // fn main() void {
+        //   var a: [3]i32 = [3]i32{0,0,0};
+        //   for (a, 0..) |x, i| { var j: usize = i; var y: i32 = x; }
+        // }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_arr3(),
+                for_stmt(
+                    ident("a"),
+                    "x",
+                    Some("i"),
+                    vec![
+                        let_var("j", "usize", ident("i")),
+                        let_var("y", "i32", ident("x")),
+                    ],
+                ),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn for_over_slice_binds_elem_to_element_type() {
+        // fn f(xs: []i32) void { for (xs) |x| { var y: i32 = x; } }
+        let items = vec![func(
+            "f",
+            vec![param_slice("xs", "i32")],
+            "void",
+            vec![for_stmt(
+                ident("xs"),
+                "x",
+                None,
+                vec![let_var("y", "i32", ident("x"))],
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn for_over_non_iterable_is_e0300() {
+        // fn f(n: i32) void { for (n) |x| {} }   // `n` is neither array nor slice
+        let items = vec![func(
+            "f",
+            vec![param("n", "i32")],
+            "void",
+            vec![for_stmt(ident("n"), "x", None, vec![])],
+        )];
+        assert!(codes(items).contains(&"E0300"));
+    }
+
+    #[test]
+    fn break_and_continue_inside_for_are_ok() {
+        // fn main() void {
+        //   var a: [3]i32 = [3]i32{0,0,0};
+        //   for (a) |x| { break; continue; }
+        // }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_arr3(),
+                for_stmt(
+                    ident("a"),
+                    "x",
+                    None,
+                    vec![Stmt::Break(sp()), Stmt::Continue(sp())],
+                ),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn for_elem_out_of_scope_after_loop_is_e0100() {
+        // fn main() void {
+        //   var a: [3]i32 = [3]i32{0,0,0};
+        //   for (a) |x| {}
+        //   var y: i32 = x;   // `x` is out of scope here
+        // }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_arr3(),
+                for_stmt(ident("a"), "x", None, vec![]),
+                let_var("y", "i32", ident("x")),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0100"));
+    }
+
+    #[test]
+    fn for_elem_is_immutable_binding() {
+        // fn main() void {
+        //   var a: [3]i32 = [3]i32{0,0,0};
+        //   for (a) |x| { x = 5; }   // `x` is an immutable copy
+        // }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_arr3(),
+                for_stmt(ident("a"), "x", None, vec![assign("x", int(5))]),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn for_index_is_out_of_scope_after_loop() {
+        // The index capture, like `elem`, lives only inside the body.
+        // fn main() void {
+        //   var a: [3]i32 = [3]i32{0,0,0};
+        //   for (a, 0..) |x, i| {}
+        //   var j: usize = i;   // `i` is out of scope here
+        // }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_arr3(),
+                for_stmt(ident("a"), "x", Some("i"), vec![]),
+                let_var("j", "usize", ident("i")),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0100"));
     }
 
     #[test]

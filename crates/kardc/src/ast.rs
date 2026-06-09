@@ -225,6 +225,16 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    /// `for (iter) |elem| { body }` or `for (iter, 0..) |elem, index| { body }`
+    /// (v0.133) — iterate the elements of an array/slice. `index` is `Some(name)`
+    /// for the `, 0..` index-capture form. Lowered to an indexed `while`.
+    For {
+        iter: Expr,
+        elem: String,
+        index: Option<String>,
+        body: Block,
+        span: Span,
+    },
     Break(Span),
     Continue(Span),
     /// `defer stmt;` — runs `stmt` at scope exit, in LIFO order.
@@ -273,6 +283,7 @@ impl Stmt {
             Stmt::Return { span, .. } => *span,
             Stmt::If { span, .. } => *span,
             Stmt::While { span, .. } => *span,
+            Stmt::For { span, .. } => *span,
             Stmt::Break(s) => *s,
             Stmt::Continue(s) => *s,
             Stmt::Defer { span, .. } => *span,
