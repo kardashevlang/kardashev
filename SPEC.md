@@ -1241,3 +1241,28 @@ over a named set — `FileErr!T` — alongside the implicit global `!T` (§12).
 A named error union `Set!T` lowers **identically** to `!T` (the same `{ int32_t
 err; <T> val; }`, interned by payload) — the set is purely a sema constraint, so
 codegen is unchanged. `Item::ErrorSet` emits nothing (compile-time only).
+
+## 35. `@panic` and `unreachable` (v0.141)
+
+Runtime-safety primitives that **diverge** (never return):
+
+- `@panic(msg)` — `Expr::Builtin{ name: "panic" }` with one `[]u8` argument:
+  write `msg` to stderr and `exit(101)` (the panic convention).
+- `unreachable` — `Expr::Unreachable` (the `unreachable` keyword): write
+  `reached unreachable code` to stderr and `exit(101)` if control reaches it.
+
+### 35.1 Semantics (`sema`)
+Both diverge, so in a value position they **adopt the expected type** (they
+type-check anywhere a value is expected — e.g. `else => unreachable`,
+`x orelse @panic("…")`); with no expected type (a statement) they are `void`.
+`@panic`'s argument must be a `[]u8` (else an error); a wrong argument count is
+`E0320` (the `@`-builtin arity code).
+
+### 35.2 Backend (`emit_c`)
+Two `_Noreturn` runtime helpers in the prelude: `kd_panic(<slice> msg)` (writes
+the bytes + newline to stderr, `exit(101)`) and `kd_unreachable(void)` (writes a
+fixed message, `exit(101)`). A statement (or arm) lowers to `kd_panic(<msg>);` /
+`kd_unreachable();` and **diverges** (suppresses the fall-through). In an
+expression position the lowering is `(kd_panic(<msg>), 0)` / `(kd_unreachable(),
+0)` — the helper exits, so the trailing `0` is dead (works where an integer is
+expected; a non-integer value position is a later refinement).

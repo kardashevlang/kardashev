@@ -1734,6 +1734,19 @@ impl<'a> Parser<'a> {
                     span: tok.span.merge(rbrace),
                 })
             }
+            TokenKind::Keyword(Kw::Unreachable) => {
+                // The `unreachable` keyword (SPEC §35) — a diverging primary
+                // that asserts a path is impossible. It is a single keyword
+                // with no operands, so it is its own primary expression. As a
+                // statement it reaches here via the expr-statement path
+                // (`unreachable;`); in a value position (`var x = unreachable;`,
+                // a `switch`/`if` arm tail) it adopts the expected type in sema
+                // and diverges. `@panic("…")` needs no parser arm — it already
+                // parses through the `@ IDENT ( args )` rule below as
+                // `Expr::Builtin{ name: "panic", args: [StrLit] }`.
+                self.bump(); // `unreachable`
+                Ok(Expr::Unreachable { span: tok.span })
+            }
             TokenKind::Dot => {
                 // A leading `.Variant` in expression-start position is an
                 // unqualified enum literal (SPEC §13.1); its enum type comes
@@ -7222,6 +7235,123 @@ mod tests {
         match &m.items[0] {
             Item::Import(imp) => assert_eq!(imp.path, "x.ks"),
             other => panic!("expected an @import item, got {:?}", other),
+        }
+    }
+
+    // ---- v0.141: `unreachable` and `@panic` (SPEC §35) -------------------
+
+    #[test]
+    fn unreachable_as_statement() {
+        // fn f() void { unreachable; }
+        // The `unreachable` keyword parses as a primary `Expr::Unreachable`,
+        // reaching here through the expr-statement path → `Stmt::Expr`.
+        let stmt = parse_one_stmt(vec![
+            TokenKind::Keyword(Kw::Unreachable),
+            TokenKind::Semicolon,
+        ]);
+        match stmt {
+            Stmt::Expr(Expr::Unreachable { span }) => {
+                assert!(span.start < span.end, "carries its keyword span");
+            }
+            other => panic!("expected `unreachable;` as an expr statement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unreachable_in_value_position() {
+        // fn f() void { var x = unreachable; }
+        // In a value position `unreachable` is the binding's initialiser
+        // expression (it adopts the expected type in sema and diverges).
+        let stmt = parse_one_stmt(vec![
+            TokenKind::Keyword(Kw::Var),
+            id("x"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Unreachable),
+            TokenKind::Semicolon,
+        ]);
+        match stmt {
+            Stmt::Let { name, ty, value, .. } => {
+                assert_eq!(name, "x");
+                assert!(ty.is_none(), "inferred binding has no annotation");
+                assert!(
+                    matches!(value, Expr::Unreachable { .. }),
+                    "the initialiser is `Expr::Unreachable`, got {:?}",
+                    value
+                );
+            }
+            other => panic!("expected `var x = unreachable;`, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn panic_builtin_with_string_arg() {
+        // fn f() void { @panic("boom"); }
+        // `@panic("…")` needs no dedicated parser arm: it parses through the
+        // existing `@ IDENT ( args )` rule as `Expr::Builtin{ name: "panic",
+        // args: [StrLit] }`, reaching here as an expr statement.
+        let stmt = parse_one_stmt(vec![
+            TokenKind::At,
+            id("panic"),
+            TokenKind::LParen,
+            TokenKind::Str("boom".to_string()),
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+        ]);
+        match stmt {
+            Stmt::Expr(Expr::Builtin { name, args, .. }) => {
+                assert_eq!(name, "panic");
+                assert_eq!(args.len(), 1, "`@panic` takes exactly one argument");
+                match &args[0] {
+                    Expr::StrLit { value, .. } => assert_eq!(value, "boom"),
+                    other => panic!("expected a `[]u8` string-literal arg, got {:?}", other),
+                }
+            }
+            other => panic!("expected `@panic(\"boom\");` as a builtin, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unreachable_in_switch_else_arm() {
+        // switch (c) { .Red => { return; } else => { unreachable; } }
+        // A `switch` arm body is a block (SPEC §13/§20), so the diverging
+        // `else => unreachable` arm is written `else => { unreachable; }`; the
+        // `unreachable` parses as the block's single expr statement.
+        let body = parse_fn_body(vec![
+            TokenKind::Keyword(Kw::Switch),
+            TokenKind::LParen,
+            id("c"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            // .Red => { return; }
+            TokenKind::Dot,
+            id("Red"),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+            TokenKind::Comma,
+            // else => { unreachable; }
+            TokenKind::Keyword(Kw::Else),
+            TokenKind::FatArrow,
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Unreachable),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+            TokenKind::RBrace, // close switch
+        ]);
+        match &body.stmts[0] {
+            Stmt::Switch { arms, default, .. } => {
+                assert_eq!(arms.len(), 1);
+                let def = default.as_ref().expect("the `else` arm sets `default`");
+                assert_eq!(def.stmts.len(), 1, "the default arm body holds `unreachable;`");
+                assert!(
+                    matches!(def.stmts[0], Stmt::Expr(Expr::Unreachable { .. })),
+                    "the `else` arm body is `unreachable;`, got {:?}",
+                    def.stmts[0]
+                );
+            }
+            other => panic!("expected switch, got {:?}", other),
         }
     }
 }

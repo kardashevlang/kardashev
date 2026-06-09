@@ -37,6 +37,7 @@ pub enum Kw {
     Union,
     Errdefer,
     For,
+    Unreachable,
 }
 
 impl Kw {
@@ -71,6 +72,7 @@ impl Kw {
             "union" => Kw::Union,
             "errdefer" => Kw::Errdefer,
             "for" => Kw::For,
+            "unreachable" => Kw::Unreachable,
             _ => return None,
         })
     }
@@ -105,6 +107,7 @@ impl Kw {
             Kw::Union => "union",
             Kw::Errdefer => "errdefer",
             Kw::For => "for",
+            Kw::Unreachable => "unreachable",
         }
     }
 }

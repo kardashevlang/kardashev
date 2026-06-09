@@ -430,6 +430,9 @@ pub enum Expr {
     /// A string literal `"…"` as a value of type `[]u8` (v0.127): a slice over
     /// static bytes. `value` is the decoded (unescaped) contents.
     StrLit { value: String, span: Span },
+    /// `unreachable` (v0.141) — a diverging expression/statement asserting a
+    /// path is impossible; traps (exit 101) if reached.
+    Unreachable { span: Span },
     /// A comptime builtin call `@name(args)` in expression position (v0.136):
     /// `@sizeOf(T)` → `usize`, `@typeName(T)` → `[]u8`. (`@This()` is a *type*,
     /// handled in `TypeExpr`, and `@import` is a top-level item.)
@@ -539,6 +542,7 @@ impl Expr {
             Expr::Index { span, .. } => *span,
             Expr::StrLit { span, .. } => *span,
             Expr::Builtin { span, .. } => *span,
+            Expr::Unreachable { span } => *span,
             Expr::StructType { span, .. } => *span,
             Expr::AddrOf { span, .. } => *span,
             Expr::Deref { span, .. } => *span,

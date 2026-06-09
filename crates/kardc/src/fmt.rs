@@ -43,6 +43,10 @@
 //!   just inside each brace, no trailing comma); an empty set prints `const Name
 //!   = error{};`. A named error union over such a set prints the set name before
 //!   the `!` — `E!i32` — while the implicit global `!i32` is unchanged.
+//! - `unreachable` (SPEC §35) — the diverging runtime-safety primitive prints as
+//!   the bare keyword, both as a statement (`unreachable;`) and in a switch arm
+//!   body. `@panic(msg)` is an `Expr::Builtin` and prints through the shared
+//!   builtin printer as `@panic(<msg>)`, its `[]u8` argument a string literal.
 //!
 //! ## Idempotence
 //!
@@ -733,6 +737,10 @@ fn expr_prec(e: &Expr) -> u8 {
         // A string literal `"…"` is an atomic primary — a `[]u8` value over
         // static bytes (SPEC §23). It binds tightest, like an integer literal.
         | Expr::StrLit { .. }
+        // `unreachable` (SPEC §35) — a diverging runtime-safety primitive that
+        // adopts the expected type and never returns. It is a bare keyword
+        // primary, so it binds tightest like a literal.
+        | Expr::Unreachable { .. }
         // `expr.*` (deref) and `base[lo..hi]` (slice) are postfix forms and bind
         // as primaries, like `.?` and `a[i]` (SPEC §15).
         | Expr::Deref { .. }
@@ -837,6 +845,14 @@ fn fmt_expr(e: &Expr) -> String {
         // other special characters) via the same [`escape_string`] helper used
         // for `test` names, so the printed form re-lexes to the same bytes.
         Expr::StrLit { value, .. } => escape_string(value),
+        // `unreachable` (SPEC §35) — a diverging runtime-safety primitive that
+        // asserts a path is impossible (traps with `exit(101)` if reached) and
+        // adopts the expected type in a value position. It prints as the bare
+        // `unreachable` keyword and re-lexes to the same `Expr::Unreachable`,
+        // both as a statement (`unreachable;`) and inside a switch arm, so
+        // re-formatting is idempotent. (`@panic(msg)` is an `Expr::Builtin` and
+        // prints via the builtin arm below as `@panic(<msg>)`.)
+        Expr::Unreachable { .. } => "unreachable".to_string(),
         Expr::Unary { op, expr, .. } => {
             let ops = match op {
                 UnOp::Neg => "-",
@@ -5168,5 +5184,178 @@ mod tests {
         assert_eq!(once, src);
         let twice = format_source(&once).expect("canonical source re-formats");
         assert_eq!(twice, once);
+    }
+
+    // ----- @panic / unreachable (v0.141, SPEC §35) -------------------------
+
+    /// `unreachable` (`Expr::Unreachable`) prints as the bare keyword.
+    fn unreachable_expr() -> Expr {
+        Expr::Unreachable { span: D }
+    }
+
+    /// `@panic(<arg>)` — an `Expr::Builtin { name: "panic" }` with one argument
+    /// (SPEC §32/§35); reuses the existing builtin printer.
+    fn panic_call(arg: Expr) -> Expr {
+        Expr::Builtin {
+            name: "panic".to_string(),
+            args: vec![arg],
+            span: D,
+        }
+    }
+
+    #[test]
+    fn unreachable_expr_prints_bare_keyword() {
+        // The bare expression prints as `unreachable` (no parens, no args).
+        assert_eq!(fmt_expr(&unreachable_expr()), "unreachable");
+    }
+
+    #[test]
+    fn unreachable_statement_prints_with_semicolon() {
+        // As a statement (`Stmt::Expr`), it prints `unreachable;` one indent deep
+        // inside the function body, like any other expression statement.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::Expr(unreachable_expr())],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = "fn f() void {\n    unreachable;\n}\n";
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn unreachable_in_switch_else_arm_prints() {
+        // `unreachable` as the (only) statement of a switch `else` arm body:
+        // `else => { unreachable; },` — the canonical arm layout (SPEC §13/§35).
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "g".to_string(),
+                params: vec![Param {
+                    name: "c".to_string(),
+                    ty: ty("Color"),
+                    is_comptime: false,
+                    span: D,
+                }],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::Switch {
+                        scrutinee: ident("c"),
+                        arms: vec![arm(
+                            vec![enum_lit("Red")],
+                            vec![call_stmt("print", vec![int(1)])],
+                        )],
+                        default: Some(Block {
+                            stmts: vec![Stmt::Expr(unreachable_expr())],
+                            span: D,
+                        }),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn g(c: Color) void {\n",
+            "    switch (c) {\n",
+            "        .Red => {\n",
+            "            print(1);\n",
+            "        },\n",
+            "        else => {\n",
+            "            unreachable;\n",
+            "        },\n",
+            "    }\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn panic_builtin_prints_via_builtin_printer() {
+        // `@panic("boom")` round-trips through the existing `Expr::Builtin`
+        // printer: `@` + name + parenthesised args, the single `[]u8` argument
+        // printed as a re-escaped string literal.
+        assert_eq!(fmt_expr(&panic_call(str_lit("boom"))), "@panic(\"boom\")");
+        // A message with escapes re-escapes correctly inside the literal.
+        assert_eq!(
+            fmt_expr(&panic_call(str_lit("a\nb"))),
+            "@panic(\"a\\nb\")"
+        );
+    }
+
+    #[test]
+    fn panic_statement_prints_with_semicolon() {
+        // `@panic("x");` as a statement, one indent deep in the function body.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::Expr(panic_call(str_lit("x")))],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = "fn f() void {\n    @panic(\"x\");\n}\n";
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn unreachable_and_panic_round_trip_via_source() {
+        // Full lex → parse → print round-trip (`format_source`): a function with
+        // an `unreachable;` statement and an `@panic("x");` statement is already
+        // canonical, so formatting reproduces the source byte-for-byte and
+        // re-formatting is idempotent (SPEC §35).
+        let src = concat!(
+            "fn f() void {\n",
+            "    unreachable;\n",
+            "    @panic(\"x\");\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src, "unreachable + @panic reach canonical form");
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once, "re-formatting is idempotent");
+    }
+
+    #[test]
+    fn unreachable_in_arm_round_trips_via_source() {
+        // `unreachable` inside a switch `else` arm body, full source round-trip.
+        let src = concat!(
+            "fn g(c: Color) void {\n",
+            "    switch (c) {\n",
+            "        .Red => {\n",
+            "            print(1);\n",
+            "        },\n",
+            "        else => {\n",
+            "            unreachable;\n",
+            "        },\n",
+            "    }\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src, "unreachable in an arm reaches canonical form");
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once, "re-formatting is idempotent");
     }
 }
