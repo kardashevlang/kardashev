@@ -159,9 +159,10 @@ String literals evaluate to `[]u8` slices (over static bytes), with length /
 indexing / sub-slicing (via the slice machinery) and `print` for strings.
 Reuses slices, so no new type.
 
-### v0.128.0 — `comptime` value params
-`comptime n: usize` parameters — array-size generics (`fn zeros(comptime n:
-usize) [n]i32`), monomorphised per concrete value, extending v0.120.
+### v0.128.0 — `comptime` value params ✅
+`comptime n: usize` parameters — array-size generics (`[n]T`) + comptime values,
+monomorphised per concrete value, extending v0.120. Array sizes are now
+`ArraySize::{Lit, Param}`; instantiations key on `ComptimeArg::{Type, Value}`.
 
 ### v0.129.0 — Generic structs / type-returning functions
 `fn List(comptime T: type) type { return struct { … }; }` — comptime functions

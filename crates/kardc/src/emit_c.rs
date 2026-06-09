@@ -9,10 +9,10 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    Block, Expr, Func, Item, Module, Param, Stmt, SwitchArm, TestBlock, TypeExpr, UnOp,
+    ArraySize, Block, Expr, Func, Item, Module, Param, Stmt, SwitchArm, TestBlock, TypeExpr, UnOp,
 };
 use crate::const_eval::ConstVal;
-use crate::types::{Instantiation, StructTable, Type};
+use crate::types::{ComptimeArg, Instantiation, StructTable, Type};
 
 /// Id-space base for emit-local pointer types (v0.118). The [`StructTable`]
 /// interns slices (and exposes a `slices()` iterator) but pointers carry no
@@ -158,6 +158,13 @@ struct Emitter<'a> {
     /// in the current instance. Empty everywhere else, so `resolve_ty` / `cty`
     /// behave exactly as before for non-generic code.
     subst: HashMap<String, Type>,
+    /// The active comptime **value**-parameter substitution while emitting a
+    /// generic instance (v0.128, SPEC §24.3). Maps a comptime value-parameter
+    /// name (e.g. `"n"`) to the concrete `i64` it stands for in the current
+    /// instance — used to resolve an `ArraySize::Param(n)` (so `[n]i32` becomes
+    /// `[5]i32`) and to emit a body reference to `n` as the bound literal. Empty
+    /// everywhere else, so non-generic code is unaffected.
+    value_subst: HashMap<String, i64>,
     /// Every generic top-level function (one with ≥1 `comptime` type
     /// parameter), keyed by name. A generic function is never emitted under its
     /// plain name — only one specialised C function per recorded instantiation
@@ -186,24 +193,50 @@ impl<'a> Emitter<'a> {
             str_counter: 0,
             local_ptr_pointees: Vec::new(),
             subst: HashMap::new(),
+            value_subst: HashMap::new(),
             generics: HashMap::new(),
         }
     }
 
-    /// True if `f` is a generic function: it has at least one `comptime` type
-    /// parameter (SPEC §17.1). Such a function is checked + emitted only per
-    /// instantiation, never under its plain name.
+    /// True if `f` is a generic function: it has at least one `comptime`
+    /// parameter — a type parameter (`comptime T: type`, v0.120) or a value
+    /// parameter (`comptime n: usize`, v0.128). Such a function is checked +
+    /// emitted only per instantiation, never under its plain name.
     fn is_generic(f: &Func) -> bool {
         f.params.iter().any(|p| p.is_comptime)
     }
 
-    /// Set [`Emitter::subst`] to map `f`'s comptime type parameters (in order)
-    /// to `type_args` — the substitution active while emitting one instance.
-    fn set_subst_for(&mut self, f: &Func, type_args: &[Type]) {
+    /// True if `p` is a comptime **value** parameter (`comptime n: usize`,
+    /// v0.128): a comptime parameter whose annotation is not the `type` kind.
+    /// (A `comptime T: type` parameter is a type parameter, v0.120.)
+    fn is_value_param(p: &Param) -> bool {
+        p.is_comptime && p.ty.name != "type"
+    }
+
+    /// Set the active substitutions to map `f`'s comptime parameters (in order)
+    /// to `args` — the substitution active while emitting one instance (SPEC
+    /// §24.3). A `type` parameter binds a [`Type`] into [`Emitter::subst`]; a
+    /// value parameter binds an `i64` into [`Emitter::value_subst`].
+    fn set_subst_for(&mut self, f: &Func, args: &[ComptimeArg]) {
         self.subst.clear();
-        for (p, t) in f.params.iter().filter(|p| p.is_comptime).zip(type_args.iter()) {
-            self.subst.insert(p.name.clone(), *t);
+        self.value_subst.clear();
+        for (p, a) in f.params.iter().filter(|p| p.is_comptime).zip(args.iter()) {
+            match a {
+                ComptimeArg::Type(t) => {
+                    self.subst.insert(p.name.clone(), *t);
+                }
+                ComptimeArg::Value(v) => {
+                    self.value_subst.insert(p.name.clone(), *v);
+                }
+            }
         }
+    }
+
+    /// Clear both the type and value substitutions after emitting an instance,
+    /// so subsequent non-generic emission is unaffected.
+    fn clear_subst(&mut self) {
+        self.subst.clear();
+        self.value_subst.clear();
     }
 
     /// Pre-pass: record the resolved return type of every top-level function and
@@ -235,9 +268,9 @@ impl<'a> Emitter<'a> {
         let insts = structs.instantiations().to_vec();
         for inst in &insts {
             if let Some(f) = self.generics.get(&inst.fn_name).cloned() {
-                self.set_subst_for(&f, &inst.type_args);
+                self.set_subst_for(&f, &inst.args);
                 self.note_func_ptrs(&f);
-                self.subst.clear();
+                self.clear_subst();
             }
         }
         for item in &module.items {
@@ -820,12 +853,12 @@ impl<'a> Emitter<'a> {
                 // this module cannot occur for validated input; skip it.
                 None => continue,
             };
-            self.set_subst_for(&f, &inst.type_args);
+            self.set_subst_for(&f, &inst.args);
             let ret = self.cty(&f.ret);
             let params = self.format_params(&f.params);
             let cname = self.structs.instantiation_c_name(inst);
             self.line(&format!("{} {}({});", ret, cname, params));
-            self.subst.clear();
+            self.clear_subst();
             any = true;
         }
         any
@@ -843,10 +876,10 @@ impl<'a> Emitter<'a> {
                 Some(f) => f,
                 None => continue,
             };
-            self.set_subst_for(&f, &inst.type_args);
+            self.set_subst_for(&f, &inst.args);
             let cname = self.structs.instantiation_c_name(inst);
             self.emit_func_named(&f, &cname);
-            self.subst.clear();
+            self.clear_subst();
             self.blank();
         }
     }
@@ -874,19 +907,45 @@ impl<'a> Emitter<'a> {
     /// [`Type::from_name`], else a struct via the table, else `Void` for the
     /// impossible unresolved case so emission can never panic.
     fn resolve_ty(&self, t: &TypeExpr) -> Type {
-        self.resolve_ty_in(t, &self.subst)
+        self.resolve_ty_in(t, &self.subst, &self.value_subst)
     }
 
-    /// Like [`Emitter::resolve_ty`] but consults an explicit `subst` for the
-    /// base type name (used by the immutable `type_of_expr` to resolve a
-    /// generic call's substituted types without touching `self.subst`).
-    fn resolve_ty_in(&self, t: &TypeExpr, subst: &HashMap<String, Type>) -> Type {
+    /// Resolve an array-size form to a concrete length, consulting `vsubst` for
+    /// a comptime value-parameter size (`ArraySize::Param`, v0.128). A literal
+    /// size resolves directly; an unbound parameter (impossible for validated
+    /// input) falls back to `0` so emission never panics.
+    fn array_size_in(&self, sz: &ArraySize, vsubst: &HashMap<String, i64>) -> usize {
+        match sz {
+            ArraySize::Lit(n) => *n as usize,
+            ArraySize::Param(name) => vsubst.get(name).copied().unwrap_or(0) as usize,
+        }
+    }
+
+    /// [`Emitter::array_size_in`] against the active value substitution. Used
+    /// wherever an `ArraySize` is resolved under the current instance (e.g.
+    /// `cty`), which is empty for non-generic code (so a literal size only).
+    fn array_size(&self, sz: &ArraySize) -> usize {
+        self.array_size_in(sz, &self.value_subst)
+    }
+
+    /// Like [`Emitter::resolve_ty`] but consults explicit substitutions: `subst`
+    /// for the base type name (a comptime type parameter, v0.120) and `vsubst`
+    /// for a comptime value-parameter array size (`[n]T`, v0.128). Used by the
+    /// immutable `type_of_expr` / generic-call lowering to resolve a generic
+    /// call's substituted types without touching `self.subst`/`self.value_subst`.
+    fn resolve_ty_in(
+        &self,
+        t: &TypeExpr,
+        subst: &HashMap<String, Type>,
+        vsubst: &HashMap<String, i64>,
+    ) -> Type {
         let base = self.base_type_in(&t.name, subst);
-        if let Some(n) = t.array_len {
+        if let Some(sz) = &t.array_len {
             // sema interned every `[N]T`; map the (element, length) pair back to
             // its `Type::Array(id)`. (`base` is the element type — `t.name` is
-            // the element name when `array_len` is set.)
-            let len = n as usize;
+            // the element name when `array_len` is set.) A `[n]T` size resolves
+            // through `vsubst` to the bound value first (SPEC §24.2).
+            let len = self.array_size_in(sz, vsubst);
             self.structs
                 .arrays()
                 .find(|(_, elem, l)| *elem == base && *l == len)
@@ -1005,10 +1064,16 @@ impl<'a> Emitter<'a> {
         } else {
             Type::I64
         };
-        if let Some(n) = t.array_len {
+        if let Some(sz) = &t.array_len {
             // Matches `array_c_name(id)` (`kd_arr_<type_mangle(elem)>_<N>`)
-            // without needing the interned id; `base` is the element type.
-            format!("kd_arr_{}_{}", self.structs.type_mangle(base), n as usize)
+            // without needing the interned id; `base` is the element type. A
+            // `[n]T` size resolves through the active value substitution (SPEC
+            // §24.3) so an instance's `[n]i32` spells `kd_arr_int32_t_<value>`.
+            format!(
+                "kd_arr_{}_{}",
+                self.structs.type_mangle(base),
+                self.array_size(sz)
+            )
         } else if t.optional {
             // Matches `optional_c_name(id)` (`kd_opt_<type_mangle(inner)>`)
             // without needing the interned id.
@@ -1054,10 +1119,18 @@ impl<'a> Emitter<'a> {
         self.line(&format!("{} {}({}) {{", ret, c_name, params));
         let mut scope = Scope::function();
         for p in &f.params {
-            // `comptime` type parameters are not value bindings; skip them (a
-            // generic instance records only its runtime params, resolved under
-            // the active substitution).
+            // `comptime` parameters are not C value bindings (`format_params`
+            // drops them). A comptime *type* parameter (`comptime T: type`) is
+            // not a value at all and is skipped. A comptime *value* parameter
+            // (`comptime n: usize`, v0.128) IS a compile-time constant of its
+            // declared type: record its (substituted) type so a body reference
+            // coerces correctly, while `emit_expr` substitutes the bound literal
+            // in its place (so it never reads a non-existent C variable).
             if p.is_comptime {
+                if Self::is_value_param(p) {
+                    let pty = self.resolve_ty(&p.ty);
+                    scope.var_types.insert(p.name.clone(), pty);
+                }
                 continue;
             }
             let pty = self.resolve_ty(&p.ty);
@@ -1850,7 +1923,17 @@ impl<'a> Emitter<'a> {
                     value.as_bytes().len()
                 )
             }
-            Expr::Ident { name, .. } => format!("kd_{}", name),
+            Expr::Ident { name, .. } => {
+                // A reference to a comptime value parameter (`comptime n: usize`,
+                // v0.128) emits the bound literal value — the parameter is not a
+                // real C variable (SPEC §24.3). Everything else is the ordinary
+                // `kd_<name>` local/parameter reference.
+                if let Some(v) = self.value_subst.get(name) {
+                    v.to_string()
+                } else {
+                    format!("kd_{}", name)
+                }
+            }
             Expr::Unary { op, expr, .. } => {
                 let inner = self.emit_expr(expr);
                 let opc = match op {
@@ -2246,34 +2329,23 @@ impl<'a> Emitter<'a> {
     /// substituted parameter type so a `T`/`null` value widens correctly.
     fn emit_generic_call(&mut self, callee: &str, gf: &Func, args: &[Expr]) -> String {
         let k = gf.params.iter().filter(|p| p.is_comptime).count();
-        // Type arguments, resolved under the current substitution.
-        let type_args: Vec<Type> = gf
-            .params
-            .iter()
-            .filter(|p| p.is_comptime)
-            .zip(args.iter())
-            .map(|(_, a)| match a {
-                Expr::Ident { name, .. } => self.base_type(name),
-                _ => Type::Void,
-            })
-            .collect();
+        // The comptime arguments (type + value) pick the instantiation; build
+        // the instance key + the inner substitutions the runtime parameter types
+        // resolve under (SPEC §24.3).
+        let (cargs, tinner, vinner) = self.comptime_args_and_subst(gf, args);
         let inst = Instantiation {
             fn_name: callee.to_string(),
-            type_args: type_args.clone(),
+            args: cargs,
         };
         let cname = self.structs.instantiation_c_name(&inst);
         // The instance's runtime parameter types, resolved under the inner
-        // substitution (comptime params → these concrete type args), drive
-        // coercion of the runtime arguments.
-        let mut inner: HashMap<String, Type> = HashMap::new();
-        for (p, t) in gf.params.iter().filter(|p| p.is_comptime).zip(type_args.iter()) {
-            inner.insert(p.name.clone(), *t);
-        }
+        // substitutions (comptime type params → concrete types, comptime value
+        // params → concrete `[n]T` lengths), drive coercion of the runtime args.
         let runtime_param_tys: Vec<Type> = gf
             .params
             .iter()
             .filter(|p| !p.is_comptime)
-            .map(|p| self.resolve_ty_in(&p.ty, &inner))
+            .map(|p| self.resolve_ty_in(&p.ty, &tinner, &vinner))
             .collect();
         let mut arg_strs = Vec::with_capacity(args.len().saturating_sub(k));
         for (i, x) in args.iter().skip(k).enumerate() {
@@ -2286,19 +2358,60 @@ impl<'a> Emitter<'a> {
         format!("{}({})", cname, arg_strs.join(", "))
     }
 
-    /// The substituted return type of a call to generic function `gf` with the
-    /// given call `args` (the leading type-name args pick the substitution),
-    /// resolved under the current substitution (SPEC §17.2). Lets `type_of_expr`
-    /// / `struct_of_expr` infer a generic call's result type (so e.g.
-    /// `var x: i32 = max(i32, a, b);` coerces correctly and `g(T, …).len` works).
-    fn generic_call_ret(&self, gf: &Func, args: &[Expr]) -> Type {
-        let mut inner: HashMap<String, Type> = HashMap::new();
+    /// Compute the comptime arguments of a generic call (SPEC §24.2) plus the
+    /// inner type / value substitution maps that the instance's runtime
+    /// parameter and return types resolve under. For each comptime parameter (in
+    /// order): a `type` parameter takes the corresponding type-name identifier
+    /// argument (resolved under the current substitution, so a transitively
+    /// nested type parameter still resolves), and a value parameter
+    /// const-evaluates its argument to an `i64` (the active value substitution
+    /// participates, so an enclosing instance's value param resolves too). A
+    /// non-constant value argument is impossible for validated input; it folds
+    /// to `0` so emission never panics.
+    fn comptime_args_and_subst(
+        &self,
+        gf: &Func,
+        args: &[Expr],
+    ) -> (Vec<ComptimeArg>, HashMap<String, Type>, HashMap<String, i64>) {
+        // The const-eval environment: the top-level constants plus any active
+        // comptime value parameters (so a value arg may reference an enclosing
+        // instance's value param), mirroring how type args resolve transitively.
+        let mut env = self.consts.clone();
+        for (name, v) in &self.value_subst {
+            env.insert(name.clone(), ConstVal::Int(*v));
+        }
+        let mut cargs = Vec::new();
+        let mut tinner: HashMap<String, Type> = HashMap::new();
+        let mut vinner: HashMap<String, i64> = HashMap::new();
         for (p, a) in gf.params.iter().filter(|p| p.is_comptime).zip(args.iter()) {
-            if let Expr::Ident { name, .. } = a {
-                inner.insert(p.name.clone(), self.base_type(name));
+            if Self::is_value_param(p) {
+                let v = match crate::const_eval::eval(a, &env) {
+                    Ok(ConstVal::Int(n)) => n,
+                    _ => 0,
+                };
+                cargs.push(ComptimeArg::Value(v));
+                vinner.insert(p.name.clone(), v);
+            } else {
+                let t = match a {
+                    Expr::Ident { name, .. } => self.base_type(name),
+                    _ => Type::Void,
+                };
+                cargs.push(ComptimeArg::Type(t));
+                tinner.insert(p.name.clone(), t);
             }
         }
-        self.resolve_ty_in(&gf.ret, &inner)
+        (cargs, tinner, vinner)
+    }
+
+    /// The substituted return type of a call to generic function `gf` with the
+    /// given call `args` (the leading comptime args pick the substitution),
+    /// resolved under the current substitution (SPEC §17.2 / §24.2). Lets
+    /// `type_of_expr` / `struct_of_expr` infer a generic call's result type (so
+    /// e.g. `var x: i32 = max(i32, a, b);` coerces correctly, `g(T, …).len`
+    /// works, and a `[n]T` return resolves to its concrete-length array type).
+    fn generic_call_ret(&self, gf: &Func, args: &[Expr]) -> Type {
+        let (_, tinner, vinner) = self.comptime_args_and_subst(gf, args);
+        self.resolve_ty_in(&gf.ret, &tinner, &vinner)
     }
 
     /// Lower one operand of a binary expression. This is ordinarily just
@@ -2861,11 +2974,11 @@ fn c_string_literal(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::ast::{
-        BinOp, Block, Expr, FieldDecl, FieldInit, Func, Item, Module, Param, Stmt, StructDecl,
-        SwitchArm, TestBlock, TypeExpr,
+        ArraySize, BinOp, Block, Expr, FieldDecl, FieldInit, Func, Item, Module, Param, Stmt,
+        StructDecl, SwitchArm, TestBlock, TypeExpr,
     };
     use crate::span::Span;
-    use crate::types::{StructTable, Type};
+    use crate::types::{ComptimeArg, StructTable, Type};
 
     fn ty(name: &str) -> TypeExpr {
         TypeExpr {
@@ -2903,14 +3016,29 @@ mod tests {
         }
     }
 
-    /// A fixed-size array type `[len]name` (`array_len = Some(len)`, the element
-    /// type name in `name`).
+    /// A fixed-size array type `[len]name` with a literal length
+    /// (`array_len = Some(ArraySize::Lit(len))`, the element type name in
+    /// `name`).
     fn arr_ty(name: &str, len: i64) -> TypeExpr {
         TypeExpr {
             name: name.to_string(),
             optional: false,
             error_union: false,
-            array_len: Some(len),
+            array_len: Some(ArraySize::Lit(len)),
+            pointer: false,
+            slice: false,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A comptime-value-parameter-sized array type `[param]name`
+    /// (`array_len = Some(ArraySize::Param(param))`, v0.128).
+    fn arr_param_ty(name: &str, param: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: false,
+            error_union: false,
+            array_len: Some(ArraySize::Param(param.to_string())),
             pointer: false,
             slice: false,
             span: Span::DUMMY,
@@ -5707,7 +5835,7 @@ mod tests {
         // fn pick(x: i32, y: i32) i32 { return max(i32, x, y); }
         let mut structs = StructTable::new();
         assert!(
-            structs.intern_instantiation("max", vec![Type::I32]),
+            structs.intern_instantiation("max", vec![ComptimeArg::Type(Type::I32)]),
             "first instantiation should be newly recorded"
         );
         let user = func(
@@ -5752,8 +5880,8 @@ mod tests {
     fn generic_fn_two_instantiations_emit_two_functions() {
         // The same generic, recorded at `i32` and `i64`, yields two C functions.
         let mut structs = StructTable::new();
-        structs.intern_instantiation("max", vec![Type::I32]);
-        structs.intern_instantiation("max", vec![Type::I64]);
+        structs.intern_instantiation("max", vec![ComptimeArg::Type(Type::I32)]);
+        structs.intern_instantiation("max", vec![ComptimeArg::Type(Type::I64)]);
         let m = Module {
             items: vec![Item::Func(generic_max())],
         };
@@ -5780,7 +5908,7 @@ mod tests {
         // `?i32` at the return (SPEC §17.2 substituted return type).
         let mut structs = StructTable::new();
         structs.intern_optional(Type::I32);
-        structs.intern_instantiation("max", vec![Type::I32]);
+        structs.intern_instantiation("max", vec![ComptimeArg::Type(Type::I32)]);
         let user = Func {
             is_pub: false,
             name: "pick".to_string(),
@@ -5813,7 +5941,7 @@ mod tests {
         // `i32`) widens to the present optional at the call site.
         let mut structs = StructTable::new();
         structs.intern_optional(Type::I32);
-        structs.intern_instantiation("first", vec![Type::I32]);
+        structs.intern_instantiation("first", vec![ComptimeArg::Type(Type::I32)]);
         let user = func(
             "use",
             vec![param("v", "i32")],
@@ -5841,6 +5969,188 @@ mod tests {
                 "kd_first__int32_t(((kd_opt_int32_t){ .has = true, .val = kd_v }))"
             ),
             "runtime arg should widen to the substituted optional param:\n{out}"
+        );
+    }
+
+    // -- comptime value parameters (v0.128, SPEC §24) ----------------------
+
+    /// A `comptime IDENT: usize` value parameter (`is_comptime = true`, v0.128).
+    fn comptime_value_param(name: &str) -> Param {
+        Param {
+            name: name.to_string(),
+            ty: ty("usize"),
+            is_comptime: true,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `fn make(comptime n: usize, a: [n]i32) [n]i32 { return a; }` — a generic
+    /// function whose runtime parameter and return type are sized by the
+    /// comptime value parameter `n`.
+    fn generic_make() -> Func {
+        Func {
+            is_pub: false,
+            name: "make".to_string(),
+            params: vec![
+                comptime_value_param("n"),
+                Param {
+                    name: "a".to_string(),
+                    ty: arr_param_ty("i32", "n"),
+                    is_comptime: false,
+                    span: Span::DUMMY,
+                },
+            ],
+            ret: arr_param_ty("i32", "n"),
+            body: block(vec![ret(ident("a"))]),
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn comptime_value_param_sizes_array_and_call_drops_value_arg() {
+        // fn make(comptime n: usize, a: [n]i32) [n]i32 { return a; }
+        // fn use2(a: [2]i32) [2]i32 { return make(2, a); }
+        // Instantiated at n = 2: the `[n]i32` param/return resolve to `[2]i32`,
+        // the instance is `kd_make__2`, and the call drops the value arg.
+        let mut structs = StructTable::new();
+        structs.intern_array(Type::I32, 2);
+        structs.intern_instantiation("make", vec![ComptimeArg::Value(2)]);
+        let user = Func {
+            is_pub: false,
+            name: "use2".to_string(),
+            params: vec![Param {
+                name: "a".to_string(),
+                ty: arr_ty("i32", 2),
+                is_comptime: false,
+                span: Span::DUMMY,
+            }],
+            ret: arr_ty("i32", 2),
+            body: block(vec![ret(call("make", vec![int(2), ident("a")]))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(generic_make()), Item::Func(user)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The `[2]i32` array type is emitted (length resolved from n = 2).
+        assert!(
+            out.contains("typedef struct { int32_t data[2]; } kd_arr_int32_t_2;"),
+            "array type of length 2 missing:\n{out}"
+        );
+        // The instance is forward-declared and defined as `kd_make__2`, the
+        // `[n]i32` param/return resolved to the `[2]i32` C type.
+        assert!(
+            out.contains("kd_arr_int32_t_2 kd_make__2(kd_arr_int32_t_2 kd_a);"),
+            "instance forward decl missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains("kd_arr_int32_t_2 kd_make__2(kd_arr_int32_t_2 kd_a) {"),
+            "instance definition missing/wrong:\n{out}"
+        );
+        // The call drops the comptime value arg and targets the mangled instance
+        // with ONLY the runtime arg.
+        assert!(
+            out.contains("kd_make__2(kd_a)"),
+            "generic call should use the mangled instance name with only runtime args:\n{out}"
+        );
+        // Never emitted under the plain generic name.
+        assert!(
+            !out.contains("kd_make("),
+            "a generic function must not be emitted under its plain name:\n{out}"
+        );
+    }
+
+    #[test]
+    fn comptime_value_param_reference_emits_literal() {
+        // fn size(comptime n: usize) usize { return n; }  instantiated at n = 5.
+        // A body reference to `n` emits the bound literal (it is not a C var).
+        let mut structs = StructTable::new();
+        structs.intern_instantiation("size", vec![ComptimeArg::Value(5)]);
+        let f = Func {
+            is_pub: false,
+            name: "size".to_string(),
+            params: vec![comptime_value_param("n")],
+            ret: ty("usize"),
+            body: block(vec![ret(ident("n"))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The value-only param list collapses to `void`; instance is `kd_size__5`.
+        assert!(
+            out.contains("uintptr_t kd_size__5(void) {"),
+            "value-param instance signature wrong:\n{out}"
+        );
+        // The reference to `n` emits the bound literal `5`, not a `kd_n` variable.
+        assert!(
+            out.contains("return (5);"),
+            "value-param reference should emit the bound literal:\n{out}"
+        );
+        assert!(
+            !out.contains("kd_n"),
+            "a comptime value param is not a real C variable:\n{out}"
+        );
+        assert!(
+            !out.contains("kd_size("),
+            "a generic function must not be emitted under its plain name:\n{out}"
+        );
+    }
+
+    #[test]
+    fn comptime_value_two_instantiations_distinct_arrays() {
+        // The same generic `make` recorded at n = 2 and n = 4 yields two
+        // instances over two distinct array types.
+        let mut structs = StructTable::new();
+        structs.intern_array(Type::I32, 2);
+        structs.intern_array(Type::I32, 4);
+        structs.intern_instantiation("make", vec![ComptimeArg::Value(2)]);
+        structs.intern_instantiation("make", vec![ComptimeArg::Value(4)]);
+        let m = Module {
+            items: vec![Item::Func(generic_make())],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_arr_int32_t_2 kd_make__2(kd_arr_int32_t_2 kd_a) {"),
+            "n = 2 instance missing:\n{out}"
+        );
+        assert!(
+            out.contains("kd_arr_int32_t_4 kd_make__4(kd_arr_int32_t_4 kd_a) {"),
+            "n = 4 instance missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn literal_sized_array_unchanged_by_value_params() {
+        // A non-generic `fn id(a: [3]i32) [3]i32 { return a; }` still lowers
+        // exactly as in v0.117 — value params do not perturb literal arrays.
+        let mut structs = StructTable::new();
+        structs.intern_array(Type::I32, 3);
+        let f = Func {
+            is_pub: false,
+            name: "id".to_string(),
+            params: vec![Param {
+                name: "a".to_string(),
+                ty: arr_ty("i32", 3),
+                is_comptime: false,
+                span: Span::DUMMY,
+            }],
+            ret: arr_ty("i32", 3),
+            body: block(vec![ret(ident("a"))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("typedef struct { int32_t data[3]; } kd_arr_int32_t_3;"),
+            "literal array typedef missing/changed:\n{out}"
+        );
+        assert!(
+            out.contains("kd_arr_int32_t_3 kd_id(kd_arr_int32_t_3 kd_a) {"),
+            "literal-array function signature changed:\n{out}"
         );
     }
 

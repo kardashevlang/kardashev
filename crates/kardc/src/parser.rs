@@ -12,8 +12,9 @@
 //! `Err` if any diagnostic was produced.
 
 use crate::ast::{
-    BinOp, Block, ConstDecl, EnumDecl, Expr, FieldDecl, FieldInit, Func, ImportDecl, Item, Module,
-    Param, Stmt, StructDecl, SwitchArm, TestBlock, TypeExpr, UnOp, UnionDecl, UnionVariant,
+    ArraySize, BinOp, Block, ConstDecl, EnumDecl, Expr, FieldDecl, FieldInit, Func, ImportDecl,
+    Item, Module, Param, Stmt, StructDecl, SwitchArm, TestBlock, TypeExpr, UnOp, UnionDecl,
+    UnionVariant,
 };
 use crate::diag::Diagnostic;
 use crate::span::Span;
@@ -150,9 +151,8 @@ impl<'a> Parser<'a> {
         Ok((s, span))
     }
 
-    /// Consume an integer literal, returning its value and span. Used for the
-    /// array length `N` in a `[N]T` type (SPEC §14.1); a negative or absurd `N`
-    /// is a sema concern (`E0224`), not the parser's.
+    /// Consume an integer literal, returning its value and span. A negative or
+    /// absurd literal is a sema concern (`E0224`), not the parser's.
     fn expect_int(&mut self) -> PResult<(i64, Span)> {
         let span = self.peek_span();
         let v = match self.peek_kind() {
@@ -161,6 +161,28 @@ impl<'a> Parser<'a> {
         };
         self.bump();
         Ok((v, span))
+    }
+
+    /// Parse the array size `N` inside a `[N]T` type, with the cursor on the
+    /// token after the `[` (SPEC §14.1, §24.1). An integer literal `[3]T` is a
+    /// literal size (`ArraySize::Lit`); an identifier `[n]T` is a comptime
+    /// value-parameter name (`ArraySize::Param`, v0.128, bound per
+    /// monomorphisation). Whether a literal is non-negative, and whether a named
+    /// size resolves to a bound comptime value, are sema concerns
+    /// (`E0224`/§24.2), not the parser's.
+    fn parse_array_size(&mut self) -> PResult<ArraySize> {
+        match self.peek_kind() {
+            TokenKind::Int(_) => {
+                let (v, _) = self.expect_int()?;
+                Ok(ArraySize::Lit(v))
+            }
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                self.bump();
+                Ok(ArraySize::Param(name))
+            }
+            _ => Err(self.expected("an array size (integer literal or parameter name)")),
+        }
     }
 
     /// Push an `E0200` "expected X, found Y" diagnostic at the current token.
@@ -292,13 +314,16 @@ impl<'a> Parser<'a> {
             return Ok(params);
         }
         loop {
-            // An optional leading `comptime` keyword marks a compile-time type
-            // parameter `comptime IDENT: type` (SPEC §17.1). The rest of the
-            // parameter — `IDENT : type` — is parsed identically; for a comptime
-            // type parameter the type name is the literal `type`, but it is just
-            // an ordinary Ident-named `TypeExpr` here (sema gives `type`, and the
-            // "comptime params precede runtime params" rule, their meaning). A
-            // plain parameter has `is_comptime = false`.
+            // An optional leading `comptime` keyword marks a compile-time
+            // parameter (SPEC §17.1, §24.1). The rest of the parameter —
+            // `IDENT : type` — is parsed identically regardless of what the
+            // annotation is: a `comptime IDENT: type` is a compile-time *type*
+            // parameter (v0.120), while a `comptime IDENT: usize` (or any int
+            // type) is a compile-time *value* parameter (v0.128, array-size
+            // generics). The annotation is always just an ordinary `TypeExpr`
+            // here; sema distinguishes the two by whether it resolves to the
+            // literal `type` or to an integer type. A plain parameter has
+            // `is_comptime = false`.
             let comptime_span = if self.at_kw(Kw::Comptime) {
                 let sp = self.peek_span();
                 self.bump(); // `comptime`
@@ -338,8 +363,11 @@ impl<'a> Parser<'a> {
     /// "expected identifier" diagnostic. A bare type has every flag `false`.
     ///
     /// A leading `[` introduces either a fixed-size array `[N]T` (`array_len =
-    /// Some(N)`, `name = T`) when an integer length follows the `[`, or a slice
-    /// `[]T` (`slice = true`) when the brackets are empty (SPEC §14.1, §15.2). A
+    /// Some(..)`, `name = T`) when an array size follows the `[`, or a slice
+    /// `[]T` (`slice = true`) when the brackets are empty (SPEC §14.1, §15.2,
+    /// §24.1). The array size is either an integer literal `[3]T`
+    /// (`ArraySize::Lit(3)`, v0.117) or an identifier `[n]T`
+    /// (`ArraySize::Param("n")`, a comptime value-parameter name, v0.128). A
     /// leading `*` introduces a single pointer `*T` (`pointer = true`, SPEC
     /// §15.1). In v0.118 the pointer / slice / array forms are **not** combined
     /// with `?`/`!` or with each other, so each is a distinct leading form that
@@ -367,9 +395,9 @@ impl<'a> Parser<'a> {
         if self.at_punct(&TokenKind::LBracket) {
             let start = self.peek_span();
             self.bump(); // `[`
-            // Empty brackets `[]T` are a slice (SPEC §15.2); `[N]T` (an integer
-            // length) is a fixed-size array (SPEC §14.1). Distinguish by
-            // whether a `]` immediately follows the `[`.
+            // Empty brackets `[]T` are a slice (SPEC §15.2); `[N]T` (an array
+            // size inside the brackets) is a fixed-size array (SPEC §14.1,
+            // §24.1). Distinguish by whether a `]` immediately follows the `[`.
             if self.at_punct(&TokenKind::RBracket) {
                 self.bump(); // `]`
                 let (name, name_span) = self.expect_ident()?;
@@ -383,14 +411,14 @@ impl<'a> Parser<'a> {
                     span: start.merge(name_span),
                 });
             }
-            let (len, _) = self.expect_int()?;
+            let size = self.parse_array_size()?;
             self.expect_punct(&TokenKind::RBracket, "`]`")?;
             let (name, name_span) = self.expect_ident()?;
             return Ok(TypeExpr {
                 name,
                 optional: false,
                 error_union: false,
-                array_len: Some(len),
+                array_len: Some(size),
                 pointer: false,
                 slice: false,
                 span: start.merge(name_span),
@@ -3581,7 +3609,11 @@ mod tests {
                 assert_eq!(f.params.len(), 1);
                 let ty = &f.params[0].ty;
                 assert_eq!(ty.name, "i32");
-                assert_eq!(ty.array_len, Some(3), "`[3]i32` must set array_len");
+                assert_eq!(
+                    ty.array_len,
+                    Some(ArraySize::Lit(3)),
+                    "`[3]i32` must set array_len"
+                );
                 assert!(!ty.optional, "an array type is not optional");
                 assert!(!ty.error_union, "an array type is not an error union");
                 assert!(ty.span.start < ty.span.end, "span should cover `[3]i32`");
@@ -3663,11 +3695,11 @@ mod tests {
                 assert_eq!(name, "a");
                 let ty = ty.as_ref().expect("annotated local carries Some(ty)");
                 assert_eq!(ty.name, "i32");
-                assert_eq!(ty.array_len, Some(2));
+                assert_eq!(ty.array_len, Some(ArraySize::Lit(2)));
                 match value {
                     Expr::ArrayLit { elem, elems, .. } => {
                         assert_eq!(elem.name, "i32");
-                        assert_eq!(elem.array_len, Some(2));
+                        assert_eq!(elem.array_len, Some(ArraySize::Lit(2)));
                         assert_eq!(elems.len(), 2);
                         assert!(matches!(elems[0], Expr::Int { value: 1, .. }));
                         assert!(matches!(elems[1], Expr::Int { value: 2, .. }));
@@ -3698,7 +3730,7 @@ mod tests {
         match e {
             Expr::ArrayLit { elem, elems, span } => {
                 assert_eq!(elem.name, "i32");
-                assert_eq!(elem.array_len, Some(3));
+                assert_eq!(elem.array_len, Some(ArraySize::Lit(3)));
                 assert_eq!(elems.len(), 3);
                 assert!(matches!(elems[2], Expr::Int { value: 3, .. }));
                 assert!(span.start < span.end, "span should cover the literal");
@@ -3928,6 +3960,134 @@ mod tests {
         assert!(err.iter().any(|d| d.code == "E0200"));
     }
 
+    // ---- v0.128: comptime value parameters (`[n]T`, `comptime n: usize`) ---
+
+    #[test]
+    fn array_type_named_size_is_param() {
+        // fn f(a: [n]i32) void { }  — `[n]i32` sets array_len=Some(Param("n")),
+        // name=i32 (SPEC §24.1: the size is a comptime value-parameter name).
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            id("a"),
+            TokenKind::Colon,
+            TokenKind::LBracket,
+            id("n"),
+            TokenKind::RBracket,
+            id("i32"),
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                let ty = &f.params[0].ty;
+                assert_eq!(ty.name, "i32");
+                assert_eq!(
+                    ty.array_len,
+                    Some(ArraySize::Param("n".to_string())),
+                    "`[n]i32` must set array_len to a Param size"
+                );
+                assert!(!ty.slice, "`[n]i32` is an array, not a slice");
+                assert!(!ty.pointer);
+                assert!(!ty.optional);
+                assert!(!ty.error_union);
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn comptime_value_param_and_named_return_array() {
+        // fn zeros(comptime n: usize) [n]i32 { return [n]i32{}; }
+        // The parameter is comptime (a value parameter, annotation `usize`), and
+        // the return type is `[n]i32` with a Param array size (SPEC §24.1).
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("zeros"),
+            TokenKind::LParen,
+            TokenKind::Keyword(Kw::Comptime),
+            id("n"),
+            TokenKind::Colon,
+            id("usize"),
+            TokenKind::RParen,
+            // return type `[n]i32`
+            TokenKind::LBracket,
+            id("n"),
+            TokenKind::RBracket,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            // `[n]i32{}` — an array literal whose element type carries the Param
+            // size; the count-vs-N check is a sema concern.
+            TokenKind::LBracket,
+            id("n"),
+            TokenKind::RBracket,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("`fn zeros(comptime n: usize) [n]i32` should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert_eq!(f.name, "zeros");
+                assert_eq!(f.params.len(), 1);
+                let p = &f.params[0];
+                assert_eq!(p.name, "n");
+                assert!(p.is_comptime, "`comptime n: usize` is a comptime param");
+                assert_eq!(p.ty.name, "usize");
+                assert_eq!(p.ty.array_len, None, "the annotation `usize` is scalar");
+                // Return type `[n]i32`.
+                assert_eq!(f.ret.name, "i32");
+                assert_eq!(
+                    f.ret.array_len,
+                    Some(ArraySize::Param("n".to_string())),
+                    "return `[n]i32` must carry a Param size"
+                );
+                // The array-literal initializer's element type also parses `[n]`.
+                match &f.body.stmts[0] {
+                    Stmt::Return {
+                        value: Some(Expr::ArrayLit { elem, .. }),
+                        ..
+                    } => {
+                        assert_eq!(elem.name, "i32");
+                        assert_eq!(elem.array_len, Some(ArraySize::Param("n".to_string())));
+                    }
+                    other => panic!("expected `return [n]i32{{}}`, got {:?}", other),
+                }
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn array_size_must_be_int_or_ident() {
+        // `[+]i32` (a non-int, non-ident array size) is rejected with E0200: the
+        // parser requires either an integer literal or a parameter name there.
+        let err = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            id("a"),
+            TokenKind::Colon,
+            TokenKind::LBracket,
+            TokenKind::Plus,
+            TokenKind::RBracket,
+            id("i32"),
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect_err("`[+]i32` should fail");
+        assert!(err.iter().any(|d| d.code == "E0200"));
+    }
+
     #[test]
     fn empty_brackets_now_parse_as_slice_type() {
         // In v0.117 `[]i32` (empty brackets) was a syntax error; in v0.118 the
@@ -4098,7 +4258,7 @@ mod tests {
         match &m.items[0] {
             Item::Func(f) => {
                 let ty = &f.params[0].ty;
-                assert_eq!(ty.array_len, Some(3));
+                assert_eq!(ty.array_len, Some(ArraySize::Lit(3)));
                 assert!(!ty.slice, "`[3]i32` is an array, not a slice");
                 assert!(!ty.pointer);
             }

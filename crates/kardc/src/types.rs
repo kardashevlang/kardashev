@@ -238,11 +238,19 @@ pub struct StructTable {
     instantiations: Vec<Instantiation>,
 }
 
-/// One monomorphised instantiation of a generic function (v0.120).
+/// One comptime argument to a generic function: a type (`comptime T: type`,
+/// v0.120) or a value (`comptime n: usize`, v0.128).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComptimeArg {
+    Type(Type),
+    Value(i64),
+}
+
+/// One monomorphised instantiation of a generic function (v0.120 / v0.128).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Instantiation {
     pub fn_name: String,
-    pub type_args: Vec<Type>,
+    pub args: Vec<ComptimeArg>,
 }
 
 impl StructTable {
@@ -509,17 +517,17 @@ impl StructTable {
     // --- generic-function instantiations (v0.120) -------------------------
 
     /// Record a monomorphisation instantiation; returns true if newly added.
-    pub fn intern_instantiation(&mut self, fn_name: &str, type_args: Vec<Type>) -> bool {
+    pub fn intern_instantiation(&mut self, fn_name: &str, args: Vec<ComptimeArg>) -> bool {
         if self
             .instantiations
             .iter()
-            .any(|i| i.fn_name == fn_name && i.type_args == type_args)
+            .any(|i| i.fn_name == fn_name && i.args == args)
         {
             return false;
         }
         self.instantiations.push(Instantiation {
             fn_name: fn_name.to_string(),
-            type_args,
+            args,
         });
         true
     }
@@ -529,14 +537,18 @@ impl StructTable {
         &self.instantiations
     }
 
-    /// The C name for an instantiation, e.g. `kd_max__int32_t`.
+    /// The C name for an instantiation, e.g. `kd_max__int32_t` or
+    /// `kd_zeros__5` (a comptime value arg mangles to its decimal digits).
     pub fn instantiation_c_name(&self, inst: &Instantiation) -> String {
         let mut s = format!("kd_{}__", inst.fn_name);
-        for (i, t) in inst.type_args.iter().enumerate() {
+        for (i, a) in inst.args.iter().enumerate() {
             if i > 0 {
                 s.push('_');
             }
-            s.push_str(&self.type_mangle(*t));
+            match a {
+                ComptimeArg::Type(t) => s.push_str(&self.type_mangle(*t)),
+                ComptimeArg::Value(v) => s.push_str(&v.to_string()),
+            }
         }
         s
     }
