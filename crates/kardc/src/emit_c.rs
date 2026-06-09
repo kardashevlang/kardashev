@@ -322,16 +322,20 @@ impl<'a> Emitter<'a> {
     }
 
     /// Set the active substitution for emitting a generic-struct instance's
-    /// methods (v0.130, SPEC §26.3): the constructor's comptime type
-    /// parameter(s) → the concrete argument `arg`, plus the contextual `Self`
-    /// → the instantiated struct `Struct(struct_id)`. Mirrors
-    /// [`Emitter::set_subst_for`] but adds the `Self` binding (a type-constructor
-    /// in v0.130 has a single comptime *type* parameter, never a value one).
-    fn set_instance_subst(&mut self, ctor: &Func, arg: Type, struct_id: u32) {
+    /// methods (v0.130/v0.135, SPEC §26.3/§31.2): each of the constructor's
+    /// comptime type parameters (in declaration order) → the corresponding
+    /// concrete argument from `args`, plus the contextual `Self` → the
+    /// instantiated struct `Struct(struct_id)`. Mirrors
+    /// [`Emitter::set_subst_for`] but adds the `Self` binding. A type-constructor
+    /// has only comptime *type* parameters (never value ones), so each is bound
+    /// into [`Emitter::subst`]; v0.135 allows **more than one** of them, zipped
+    /// positionally with `args` (v0.129/v0.130's single-parameter case is the
+    /// length-1 zip and behaves identically).
+    fn set_instance_subst(&mut self, ctor: &Func, args: &[Type], struct_id: u32) {
         self.subst.clear();
         self.value_subst.clear();
-        for p in ctor.params.iter().filter(|p| p.is_comptime) {
-            self.subst.insert(p.name.clone(), arg);
+        for (p, a) in ctor.params.iter().filter(|p| p.is_comptime).zip(args.iter()) {
+            self.subst.insert(p.name.clone(), *a);
         }
         self.subst.insert("Self".to_string(), Type::Struct(struct_id));
     }
@@ -379,7 +383,7 @@ impl<'a> Emitter<'a> {
         let sinsts = structs.struct_instances().to_vec();
         for inst in &sinsts {
             if let Some(ctor) = Self::instance_ctor(module, inst) {
-                self.set_instance_subst(&ctor, inst.arg, inst.struct_id);
+                self.set_instance_subst(&ctor, &inst.args, inst.struct_id);
                 for m in Self::ctor_methods(&ctor) {
                     self.note_func_ptrs(&m);
                 }
@@ -425,7 +429,7 @@ impl<'a> Emitter<'a> {
                 None => continue,
             };
             let sname = self.structs.get(inst.struct_id).name.clone();
-            self.set_instance_subst(&ctor, inst.arg, inst.struct_id);
+            self.set_instance_subst(&ctor, &inst.args, inst.struct_id);
             for m in Self::ctor_methods(&ctor) {
                 let ret = self.resolve_ty(&m.ret);
                 self.method_ret.insert((sname.clone(), m.name.clone()), ret);
@@ -990,7 +994,7 @@ impl<'a> Emitter<'a> {
                 continue;
             }
             let sname = self.structs.get(inst.struct_id).name.clone();
-            self.set_instance_subst(&ctor, inst.arg, inst.struct_id);
+            self.set_instance_subst(&ctor, &inst.args, inst.struct_id);
             for m in &methods {
                 let ret = self.cty(&m.ret);
                 let params = self.format_params(&m.params);
@@ -1055,7 +1059,7 @@ impl<'a> Emitter<'a> {
             let methods = Self::ctor_methods(&ctor);
             let sname = self.structs.get(inst.struct_id).name.clone();
             for m in &methods {
-                self.set_instance_subst(&ctor, inst.arg, inst.struct_id);
+                self.set_instance_subst(&ctor, &inst.args, inst.struct_id);
                 let cname = format!("kd_{}_{}", sname, m.name);
                 self.emit_func_named(m, &cname);
                 self.clear_subst();
@@ -7670,7 +7674,7 @@ mod tests {
         let mut structs = StructTable::new();
         let sid = structs.intern("Box__int32_t");
         structs.set_fields(sid, vec![("v".to_string(), Type::I32)]);
-        structs.record_struct_instance(sid, "Box", Type::I32);
+        structs.record_struct_instance(sid, "Box", vec![Type::I32]);
         structs.add_alias("IB", Type::Struct(sid));
 
         let get = Func {
@@ -7836,7 +7840,7 @@ mod tests {
         let mut structs = StructTable::new();
         let sid = structs.intern("Box__int32_t");
         structs.set_fields(sid, vec![("v".to_string(), Type::I32)]);
-        structs.record_struct_instance(sid, "Box", Type::I32);
+        structs.record_struct_instance(sid, "Box", vec![Type::I32]);
 
         let box_ctor = Func {
             is_pub: false,
@@ -7883,6 +7887,276 @@ mod tests {
         assert!(
             !out.contains("kd_Box("),
             "type-constructor was emitted:\n{out}"
+        );
+    }
+
+    // -- multiple type parameters (v0.135) -----------------------------------
+
+    /// The post-sema shape of:
+    /// ```text
+    /// fn Pair(comptime A: type, comptime B: type) type {
+    ///     return struct {
+    ///         a: A,
+    ///         b: B,
+    ///         fn first(self: Self) A { return self.a; }
+    ///         fn second(self: Self) B { return self.b; }
+    ///         fn sum_widths(self: Self) i64 { return self.a + self.b; }
+    ///     };
+    /// }
+    /// const IB = Pair(i32, i64);
+    /// fn main() void {
+    ///     var p: IB = IB{ .a = 3, .b = 9 };
+    ///     print(p.first());      // 3   (A → i32)
+    ///     print(p.second());     // 9   (B → i64)
+    ///     print(p.sum_widths()); // 12  (uses both fields)
+    /// }
+    /// ```
+    /// sema interns the monomorphised struct `Pair__int32_t_int64_t` (fields
+    /// `a: i32`, `b: i64`) and records it as an instance of `Pair` with
+    /// `args = [i32, i64]`. The backend must build the method substitution by
+    /// **zipping** the constructor's two comptime type parameters with those two
+    /// args (`A → i32`, `B → i64`, plus `Self → Struct(id)`), so `first` returns
+    /// `int32_t`, `second` returns `int64_t`, and a per-field body resolves both
+    /// fields (SPEC §31.2).
+    fn pair_with_methods_program() -> (Module, StructTable) {
+        let mut structs = StructTable::new();
+        let sid = structs.intern("Pair__int32_t_int64_t");
+        structs.set_fields(
+            sid,
+            vec![("a".to_string(), Type::I32), ("b".to_string(), Type::I64)],
+        );
+        structs.record_struct_instance(sid, "Pair", vec![Type::I32, Type::I64]);
+        structs.add_alias("IB", Type::Struct(sid));
+
+        let first = Func {
+            is_pub: false,
+            name: "first".to_string(),
+            params: vec![param("self", "Self")],
+            ret: ty("A"),
+            body: block(vec![ret(field(ident("self"), "a"))]),
+            span: Span::DUMMY,
+        };
+        let second = Func {
+            is_pub: false,
+            name: "second".to_string(),
+            params: vec![param("self", "Self")],
+            ret: ty("B"),
+            body: block(vec![ret(field(ident("self"), "b"))]),
+            span: Span::DUMMY,
+        };
+        let sum_widths = Func {
+            is_pub: false,
+            name: "sum_widths".to_string(),
+            params: vec![param("self", "Self")],
+            ret: ty("i64"),
+            body: block(vec![ret(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(field(ident("self"), "a")),
+                rhs: Box::new(field(ident("self"), "b")),
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+
+        let pair_ctor = Func {
+            is_pub: false,
+            name: "Pair".to_string(),
+            params: vec![
+                Param {
+                    name: "A".to_string(),
+                    ty: type_kw(),
+                    is_comptime: true,
+                    span: Span::DUMMY,
+                },
+                Param {
+                    name: "B".to_string(),
+                    ty: type_kw(),
+                    is_comptime: true,
+                    span: Span::DUMMY,
+                },
+            ],
+            ret: type_kw(),
+            body: block(vec![ret(Expr::StructType {
+                fields: vec![
+                    FieldDecl {
+                        name: "a".to_string(),
+                        ty: ty("A"),
+                        span: Span::DUMMY,
+                    },
+                    FieldDecl {
+                        name: "b".to_string(),
+                        ty: ty("B"),
+                        span: Span::DUMMY,
+                    },
+                ],
+                methods: vec![first, second, sum_widths],
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+
+        let alias = Item::Const(ConstDecl {
+            is_pub: false,
+            name: "IB".to_string(),
+            ty: None,
+            value: Expr::Call {
+                callee: "Pair".to_string(),
+                args: vec![ident("i32"), ident("i64")],
+                span: Span::DUMMY,
+            },
+            span: Span::DUMMY,
+        });
+
+        let main = Func {
+            is_pub: false,
+            name: "main".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "p".to_string(),
+                    ty: Some(ty("IB")),
+                    value: Expr::StructLit {
+                        name: "IB".to_string(),
+                        fields: vec![finit("a", int(3)), finit("b", int(9))],
+                        span: Span::DUMMY,
+                    },
+                    span: Span::DUMMY,
+                },
+                print(method_call(ident("p"), "first", vec![])),
+                print(method_call(ident("p"), "second", vec![])),
+                print(method_call(ident("p"), "sum_widths", vec![])),
+            ]),
+            span: Span::DUMMY,
+        };
+
+        let m = Module {
+            items: vec![Item::Func(pair_ctor), alias, Item::Func(main)],
+        };
+        (m, structs)
+    }
+
+    #[test]
+    fn two_type_param_constructor_zips_params_with_args() {
+        let (m, structs) = pair_with_methods_program();
+        let out = emit(&m, &structs, EmitMode::Program);
+
+        // The monomorphised struct emits as an ordinary typedef with *both*
+        // fields resolved to their concrete types.
+        assert!(
+            out.contains(
+                "typedef struct { int32_t kd_a; int64_t kd_b; } kd_struct_Pair__int32_t_int64_t;"
+            ),
+            "two-field monomorphised struct typedef missing/wrong:\n{out}"
+        );
+        // `first` returns `A` — the FIRST type parameter — so it must resolve to
+        // int32_t. If the params were not zipped positionally (e.g. all bound to
+        // the last arg, the pre-v0.135 single-arg behaviour) this would be
+        // int64_t and the assertion fails.
+        assert!(
+            out.contains(
+                "int32_t kd_Pair__int32_t_int64_t_first(kd_struct_Pair__int32_t_int64_t kd_self);"
+            ),
+            "`first` did not resolve A → int32_t (param zip wrong):\n{out}"
+        );
+        assert!(
+            out.contains(
+                "int32_t kd_Pair__int32_t_int64_t_first(kd_struct_Pair__int32_t_int64_t kd_self) {"
+            ),
+            "`first` definition missing/wrong:\n{out}"
+        );
+        // `second` returns `B` — the SECOND type parameter — so it must resolve
+        // to int64_t. Together with `first` this proves the positional zip.
+        assert!(
+            out.contains(
+                "int64_t kd_Pair__int32_t_int64_t_second(kd_struct_Pair__int32_t_int64_t kd_self);"
+            ),
+            "`second` did not resolve B → int64_t (param zip wrong):\n{out}"
+        );
+        // A method using *both* fields resolves each through the struct.
+        assert!(
+            out.contains(
+                "int64_t kd_Pair__int32_t_int64_t_sum_widths(kd_struct_Pair__int32_t_int64_t kd_self) {"
+            ),
+            "`sum_widths` definition missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains("(kd_self).kd_a") && out.contains("(kd_self).kd_b"),
+            "`sum_widths` body did not read both fields:\n{out}"
+        );
+        // Method calls lower to the instance C functions.
+        assert!(
+            out.contains("kd_Pair__int32_t_int64_t_first(kd_p)")
+                && out.contains("kd_Pair__int32_t_int64_t_second(kd_p)")
+                && out.contains("kd_Pair__int32_t_int64_t_sum_widths(kd_p)"),
+            "method calls did not lower to the instance functions:\n{out}"
+        );
+        // The type-constructor itself is never emitted (§25.3).
+        assert!(
+            !out.contains("kd_Pair("),
+            "type-constructor was emitted as a C function:\n{out}"
+        );
+        // `Self` must never leak into the C name space.
+        assert!(
+            !out.contains("kd_struct_Self") && !out.contains("kd_Self_"),
+            "the contextual `Self` leaked into the emitted C:\n{out}"
+        );
+    }
+
+    #[test]
+    fn single_type_param_constructor_still_emits_identically() {
+        // Regression: the v0.129/v0.130 single-type-parameter case must be
+        // byte-for-byte unchanged under the new (vector-based) zip — the
+        // length-1 zip binds the single param exactly as before.
+        let (m, structs) = box_with_methods_program();
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("typedef struct { int32_t kd_v; } kd_struct_Box__int32_t;"),
+            "single-param struct typedef regressed:\n{out}"
+        );
+        assert!(
+            out.contains("int32_t kd_Box__int32_t_get(kd_struct_Box__int32_t kd_self) {"),
+            "single-param method emission regressed:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "kd_struct_Box__int32_t kd_Box__int32_t_replaced(kd_struct_Box__int32_t kd_self, int32_t kd_nv) {"
+            ),
+            "single-param `Self` resolution regressed:\n{out}"
+        );
+    }
+
+    #[test]
+    fn two_type_param_program_compiles_and_prints_field_values() {
+        // End-to-end through the backend the emit_c module owns: emit C for a
+        // program that builds `Pair(i32, i64)`, sets both fields, and reads each
+        // back via methods, then compile with `cc` and run it, asserting the
+        // printed values. Driving emit → cc → run from the AST+table exercises
+        // the whole instance-method lowering without depending on sema/parser.
+        let (m, structs) = pair_with_methods_program();
+        let c = emit(&m, &structs, EmitMode::Program);
+
+        let exe = std::env::temp_dir().join(format!(
+            "kardc_emit_v135_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        crate::backend::cc_build(&c, &exe, &crate::backend::BuildOptions::default())
+            .expect("emitted C for a two-type-param generic struct should compile");
+        let output = std::process::Command::new(&exe)
+            .output()
+            .expect("the compiled program should run");
+        let _ = std::fs::remove_file(&exe);
+
+        assert!(output.status.success(), "program exited non-zero:\n{c}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout, "3\n9\n12\n",
+            "field values printed wrong (expected first=3, second=9, sum=12):\nstdout={stdout}\n--- C ---\n{c}"
         );
     }
 

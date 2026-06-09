@@ -260,14 +260,14 @@ pub struct Instantiation {
 }
 
 /// One monomorphised generic-struct instance (v0.130): the interned struct, the
-/// type-constructor it came from, and the concrete type argument. The backend
-/// emits the constructor's methods for each instance (substituting the type
-/// parameter and `Self`).
+/// type-constructor it came from, and its concrete type argument(s) (v0.135
+/// allows more than one). The backend emits the constructor's methods for each
+/// instance (substituting the type parameters and `Self`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructInstance {
     pub struct_id: u32,
     pub ctor: String,
-    pub arg: Type,
+    pub args: Vec<Type>,
 }
 
 impl StructTable {
@@ -564,16 +564,16 @@ impl StructTable {
         self.type_aliases.get(name).copied()
     }
 
-    /// Record a monomorphised generic-struct instance (v0.130); deduped on the
-    /// struct id (each interned instance is emitted once).
-    pub fn record_struct_instance(&mut self, struct_id: u32, ctor: &str, arg: Type) {
+    /// Record a monomorphised generic-struct instance (v0.130 / v0.135); deduped
+    /// on the struct id (each interned instance is emitted once).
+    pub fn record_struct_instance(&mut self, struct_id: u32, ctor: &str, args: Vec<Type>) {
         if self.struct_instances.iter().any(|i| i.struct_id == struct_id) {
             return;
         }
         self.struct_instances.push(StructInstance {
             struct_id,
             ctor: ctor.to_string(),
-            arg,
+            args,
         });
     }
 

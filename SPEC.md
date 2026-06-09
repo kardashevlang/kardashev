@@ -1149,3 +1149,25 @@ A pointer-receiver method is `kd_<Struct>_<m>(<Struct>* self, …)`; inside it
 `self.field` lowers to `(*self).kd_field`. The call lowers to
 `kd_<Struct>_<m>(&(<obj>), …)`. Field read/assign on any `*Struct` lowers through
 `(*p)`. Mutations are real — they update the caller's struct.
+
+## 31. Multiple type parameters (v0.135)
+
+Generic **functions** already accept more than one comptime parameter
+(type/value, §17/§24) — monomorphised on the tuple of arguments. v0.135 extends
+the same to **type-constructors** (§25): `fn Map(comptime K: type, comptime V:
+type) type { return struct { … }; }`.
+
+### 31.1 Semantics (`sema`)
+- A type-constructor may declare **one or more** `comptime _: type` parameters
+  (all must be `type`); the body is still `return struct { … };`.
+- A type alias `const M = Map(K, V);` must pass exactly as many type arguments as
+  the constructor has type parameters (else `E0311`). Each is resolved to a
+  concrete type; the struct is interned as `<Ctor>__<tag1>_<tag2>…` (memoised on
+  the argument tuple) with the substitution `{ K→…, V→…, Self→Struct(id) }`
+  applied to its fields and methods (§26).
+- `StructInstance` records `args: Vec<Type>`.
+
+### 31.2 Backend (`emit_c`)
+For each instance, the emitter builds the substitution by zipping the
+constructor's type parameters with `StructInstance.args` (plus `Self`), then
+emits the methods exactly as in §26.3.

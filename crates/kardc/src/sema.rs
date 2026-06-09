@@ -884,18 +884,20 @@ impl Checker {
 
     // ---- generic structs / type-constructors (v0.129, SPEC §25) -----------
 
-    /// Validate a type-constructor and record it (SPEC §25.2). A valid
-    /// type-constructor takes **exactly one** `comptime` *type* parameter and has
-    /// a body of exactly `return struct { … };` (an [`Expr::StructType`]);
-    /// anything else is `E0310`. It is recorded under its name regardless, so a
-    /// `const Alias = Name(C);` still resolves to *a* struct (avoiding cascading
-    /// `E0100`s) even when the constructor itself is malformed.
+    /// Validate a type-constructor and record it (SPEC §25.2 / §31.1). A valid
+    /// type-constructor takes **one or more** `comptime` *type* parameters (all
+    /// must be `comptime _: type` — a value/non-type comptime parameter, e.g.
+    /// `comptime n: usize`, is `E0310`) and has a body of exactly
+    /// `return struct { … };` (an [`Expr::StructType`]); anything else is
+    /// `E0310`. It is recorded under its name regardless, so a
+    /// `const Alias = Name(C, …);` still resolves to *a* struct (avoiding
+    /// cascading `E0100`s) even when the constructor itself is malformed.
     fn collect_type_ctor(&mut self, f: &Func) {
         let valid_params =
-            f.params.len() == 1 && f.params[0].is_comptime && is_type_kw(&f.params[0].ty);
+            !f.params.is_empty() && f.params.iter().all(|p| p.is_comptime && is_type_kw(&p.ty));
         if !valid_params {
             let msg = format!(
-                "type-returning function `{}` must take exactly one `comptime` type parameter \
+                "type-returning function `{}` must take one or more `comptime` type parameters \
                  (`comptime T: type`)",
                 f.name
             );
@@ -912,36 +914,51 @@ impl Checker {
         self.type_ctors.insert(f.name.clone(), f.clone());
     }
 
-    /// Instantiate a type-constructor for a type alias `const Alias = Name(C);`
-    /// (SPEC §25.2). The single argument must resolve to a concrete type
-    /// (`E0311` otherwise); the constructor is instantiated at that type (a
-    /// monomorphised struct, memoised) and the alias is bound to it.
+    /// Instantiate a type-constructor for a type alias `const Alias = Name(C, …);`
+    /// (SPEC §25.2 / §31.1). The call must pass **exactly as many** type
+    /// arguments as the constructor has type parameters (`E0311` otherwise);
+    /// each must resolve to a concrete type (`E0311` otherwise). The constructor
+    /// is instantiated at those types (a monomorphised struct, memoised on the
+    /// argument tuple) and the alias is bound to it.
     fn instantiate_alias(&mut self, alias_name: &str, ctor_name: &str, args: &[Expr], span: Span) {
         let ctor = match self.type_ctors.get(ctor_name) {
             Some(f) => f.clone(),
             None => return, // unreachable: the caller checked membership
         };
-        if args.len() != 1 {
+        // A valid type-constructor's parameters are all `comptime _: type`, so
+        // the parameter count is the expected type-argument count (a malformed
+        // constructor — already `E0310` — still uses its parameter count, so a
+        // dependent alias degrades gracefully rather than cascading).
+        let nparams = ctor.params.len();
+        if args.len() != nparams {
             let msg = format!(
-                "type-constructor `{}` takes exactly one type argument, found {}",
+                "type-constructor `{}` takes {} type argument{}, found {}",
                 ctor_name,
+                nparams,
+                if nparams == 1 { "" } else { "s" },
                 args.len()
             );
             self.error(span, "E0311", msg);
             return;
         }
-        let concrete = match self.resolve_alias_type_arg(&args[0]) {
-            Some(t) => t,
-            None => return, // `E0311` already emitted
-        };
-        let id = self.instantiate_type_ctor(ctor_name, &ctor, concrete);
+        // Resolve every argument to a concrete type, in parameter order. A
+        // non-type argument is `E0311` (already emitted); bail without binding
+        // the alias (matching the single-argument v0.129 behaviour).
+        let mut concretes: Vec<Type> = Vec::with_capacity(nparams);
+        for arg in args {
+            match self.resolve_alias_type_arg(arg) {
+                Some(t) => concretes.push(t),
+                None => return, // `E0311` already emitted
+            }
+        }
+        let id = self.instantiate_type_ctor(ctor_name, &ctor, &concretes);
         self.type_aliases.insert(alias_name.to_string(), Type::Struct(id));
         // Share the alias with the backend (which only receives the StructTable)
         // so an alias name resolves in emitted types + struct literals (v0.129).
         self.structs.add_alias(alias_name, Type::Struct(id));
     }
 
-    /// Resolve a type-constructor's single argument (SPEC §25.2): it must be an
+    /// Resolve one type-constructor argument (SPEC §25.2 / §31.1): it must be an
     /// identifier naming a concrete type — a builtin, a struct/enum/union, or
     /// another type alias (all via [`resolve_base`]). Anything else is `E0311`.
     fn resolve_alias_type_arg(&mut self, arg: &Expr) -> Option<Type> {
@@ -966,26 +983,38 @@ impl Checker {
         }
     }
 
-    /// Instantiate the type-constructor `ctor` at the concrete type `concrete`,
-    /// returning the id of the monomorphised struct (SPEC §25.2). The struct is
-    /// named `<Ctor>__<typemangle>` and **memoised by that name** (via
+    /// Instantiate the type-constructor `ctor` at the concrete types `concretes`
+    /// (one per type parameter, in parameter order), returning the id of the
+    /// monomorphised struct (SPEC §25.2 / §31.1). The struct is named
+    /// `<Ctor>__<tag1>_<tag2>…` — the [`type_mangle`](StructTable::type_mangle)
+    /// of each argument joined by `_` in parameter order (so a single-parameter
+    /// `Box(i32)` stays `Box__int32_t`, and `Map(i32, i64)` is
+    /// `Map__int32_t_int64_t`) — and **memoised by that name** (via
     /// [`StructTable::intern`]'s de-duplication / an `id_of` guard), so the same
-    /// `(constructor, concrete type)` reuses one struct id while a different
-    /// concrete type yields a distinct struct. Each field type is resolved under
-    /// the substitution `{ param -> concrete }`.
-    fn instantiate_type_ctor(&mut self, ctor_name: &str, ctor: &Func, concrete: Type) -> u32 {
-        let mangled = format!("{}__{}", ctor_name, self.structs.type_mangle(concrete));
-        // Memoised: a repeated `(constructor, concrete)` reuses the existing id.
+    /// `(constructor, argument tuple)` reuses one struct id while a different
+    /// tuple (including a different *order*) yields a distinct struct. Each field
+    /// (and method, §26) type is resolved under the substitution mapping every
+    /// type parameter to its concrete argument.
+    fn instantiate_type_ctor(&mut self, ctor_name: &str, ctor: &Func, concretes: &[Type]) -> u32 {
+        let mut mangled = format!("{}__", ctor_name);
+        for (i, c) in concretes.iter().enumerate() {
+            if i > 0 {
+                mangled.push('_');
+            }
+            mangled.push_str(&self.structs.type_mangle(*c));
+        }
+        // Memoised: a repeated `(constructor, argument tuple)` reuses the id.
         if let Some(id) = self.structs.id_of(&mangled) {
             return id;
         }
         let id = self.structs.intern(&mangled);
-        // The single comptime type parameter binds to `concrete`. A malformed
-        // constructor (no parameter / non-`struct` body) falls back to an empty
-        // substitution and a field-less struct, but is still a usable type.
+        // Each comptime type parameter binds to its concrete argument (parameter
+        // order). A malformed constructor (no parameter / non-`struct` body)
+        // zips to an empty/short substitution and a field-less struct, but is
+        // still a usable type.
         let mut subst: HashMap<String, Type> = HashMap::new();
-        if let Some(p) = ctor.params.first() {
-            subst.insert(p.name.clone(), concrete);
+        for (p, c) in ctor.params.iter().zip(concretes.iter()) {
+            subst.insert(p.name.clone(), *c);
         }
         let mut fields: Vec<(String, Type)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -1019,21 +1048,22 @@ impl Checker {
         self.structs.set_fields(id, fields);
 
         // v0.130 (SPEC §26): a generic struct may also declare **methods**, which
-        // use `Self` (the instantiated struct) and the type parameter `T`. They
-        // are monomorphised once per instance — the memoisation guard at the top
-        // returns early on a repeat `(constructor, concrete)`, so this runs at
-        // most once per struct id (no duplicate registration / re-check / record).
+        // use `Self` (the instantiated struct) and the type parameter(s) (§31).
+        // They are monomorphised once per instance — the memoisation guard at the
+        // top returns early on a repeat `(constructor, argument tuple)`, so this
+        // runs at most once per struct id (no duplicate registration / re-check /
+        // record).
         //
         // For each method we (1) register its signature on the struct-method
         // table (SPEC §10 / Pass-1b shape) so `x.m(args)` resolves, (2) type-check
-        // its body under `{ <type param> -> concrete, Self -> Struct(id) }`, and
+        // its body under `{ <type params> -> concretes, Self -> Struct(id) }`, and
         // (3) record the instance so the backend emits the methods. A *fields-only*
         // generic struct (v0.129) has no methods, so it registers nothing and is
         // **not** recorded — preserving v0.129 behaviour exactly.
         if let Some(methods) = type_ctor_struct_methods(ctor) {
             if !methods.is_empty() {
-                // The method substitution: the type parameter -> concrete, plus
-                // the contextual `Self` -> the instantiated struct.
+                // The method substitution: every type parameter -> its concrete
+                // argument, plus the contextual `Self` -> the instantiated struct.
                 let mut msubst = subst.clone();
                 msubst.insert("Self".to_string(), Type::Struct(id));
 
@@ -1088,8 +1118,11 @@ impl Checker {
                     self.check_type_ctor_method(f, id, &msubst);
                 }
 
-                // (3) Record the instance so the backend emits its methods.
-                self.structs.record_struct_instance(id, ctor_name, concrete);
+                // (3) Record the instance (with every concrete argument, in
+                // parameter order) so the backend rebuilds the substitution and
+                // emits its methods (SPEC §31.2).
+                self.structs
+                    .record_struct_instance(id, ctor_name, concretes.to_vec());
             }
         }
         id
@@ -9244,7 +9277,7 @@ mod tests {
         // backend emits the methods.
         let id = table.id_of("List__int32_t").expect("instance struct interned");
         assert!(table.struct_instances().iter().any(
-            |i| i.struct_id == id && i.ctor == "List" && i.arg == Type::I32
+            |i| i.struct_id == id && i.ctor == "List" && i.args == vec![Type::I32]
         ));
     }
 
@@ -9393,6 +9426,224 @@ mod tests {
         assert!(table.id_of("List__int64_t").is_some());
         // Two distinct instances recorded.
         assert_eq!(table.struct_instances().len(), 2);
+    }
+
+    // ---- multiple type parameters for type-constructors (v0.135, §31) -----
+
+    /// A type-constructor with two `comptime` type parameters
+    /// `fn Name(comptime A: type, comptime B: type) type { return struct { … }; }`
+    /// whose struct fields/methods are given as explicit [`TypeExpr`]s.
+    fn type_ctor2(
+        name: &str,
+        a: &str,
+        b: &str,
+        fields: Vec<(&str, TypeExpr)>,
+        methods: Vec<Func>,
+    ) -> Item {
+        Item::Func(raw_func(
+            name,
+            vec![param_comptime(a), param_comptime(b)],
+            "type",
+            vec![ret(Some(struct_type_expr_m(fields, methods)))],
+        ))
+    }
+
+    #[test]
+    fn type_ctor_two_type_params_fields_and_method_typecheck() {
+        // fn Pair(comptime A: type, comptime B: type) type {
+        //   return struct {
+        //     a: A, b: B,
+        //     fn make(self: Self, a: A, b: B) Self { return Self{ .a=a, .b=b }; }
+        //   };
+        // }
+        // const IB = Pair(i32, i64);
+        // fn use_pair(p: IB) void { var pa: i32 = p.a; var pb: i64 = p.b; }
+        let make = raw_func(
+            "make",
+            vec![param("self", "Self"), param("a", "A"), param("b", "B")],
+            "Self",
+            vec![ret(Some(struct_lit(
+                "Self",
+                vec![("a", ident("a")), ("b", ident("b"))],
+            )))],
+        );
+        let items = vec![
+            type_ctor2(
+                "Pair",
+                "A",
+                "B",
+                vec![("a", te("A")), ("b", te("B"))],
+                vec![make],
+            ),
+            const_item_infer("IB", call("Pair", vec![ident("i32"), ident("i64")])),
+            func(
+                "use_pair",
+                vec![param("p", "IB")],
+                "void",
+                vec![
+                    // p.a is `i32`, p.b is `i64` — the two type parameters resolve
+                    // independently through the substitution.
+                    let_var("pa", "i32", field(ident("p"), "a")),
+                    let_var("pb", "i64", field(ident("p"), "b")),
+                ],
+            ),
+        ];
+        let table = check_ok(items);
+        let id = table
+            .id_of("Pair__int32_t_int64_t")
+            .expect("monomorphised struct interned");
+        assert_eq!(
+            table.get(id).fields,
+            vec![("a".to_string(), Type::I32), ("b".to_string(), Type::I64)]
+        );
+        // The instance is recorded with both concrete args, in parameter order.
+        assert!(table.struct_instances().iter().any(
+            |i| i.struct_id == id && i.ctor == "Pair" && i.args == vec![Type::I32, Type::I64]
+        ));
+    }
+
+    #[test]
+    fn type_ctor_field_type_mismatch_under_two_params_is_e0110() {
+        // const IB = Pair(i32, i64); var p: IB = IB{ .a = true, .b = 9 };
+        //   → field `a` is `i32`, not `bool`.
+        let items = vec![
+            type_ctor2(
+                "Pair",
+                "A",
+                "B",
+                vec![("a", te("A")), ("b", te("B"))],
+                vec![],
+            ),
+            const_item_infer("IB", call("Pair", vec![ident("i32"), ident("i64")])),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var(
+                    "p",
+                    "IB",
+                    struct_lit("IB", vec![("a", boolean(true)), ("b", int(9))]),
+                )],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn type_ctor_wrong_arg_count_is_e0311() {
+        // const Bad = Pair(i32);  → Pair takes two type arguments.
+        let items = vec![
+            type_ctor2(
+                "Pair",
+                "A",
+                "B",
+                vec![("a", te("A")), ("b", te("B"))],
+                vec![],
+            ),
+            const_item_infer("Bad", call("Pair", vec![ident("i32")])),
+        ];
+        assert!(codes(items).contains(&"E0311"));
+    }
+
+    #[test]
+    fn type_ctor_too_many_args_is_e0311() {
+        // const Bad = Pair(i32, i64, bool);  → too many type arguments.
+        let items = vec![
+            type_ctor2(
+                "Pair",
+                "A",
+                "B",
+                vec![("a", te("A")), ("b", te("B"))],
+                vec![],
+            ),
+            const_item_infer(
+                "Bad",
+                call("Pair", vec![ident("i32"), ident("i64"), ident("bool")]),
+            ),
+        ];
+        assert!(codes(items).contains(&"E0311"));
+    }
+
+    #[test]
+    fn type_ctor_arg_order_makes_distinct_structs() {
+        // Pair(i32, i64) and Pair(i64, i32) are distinct structs (order matters in
+        // both the mangled name and the field types).
+        let pair = type_ctor2(
+            "Pair",
+            "A",
+            "B",
+            vec![("a", te("A")), ("b", te("B"))],
+            vec![],
+        );
+        let items = vec![
+            pair,
+            const_item_infer("AB", call("Pair", vec![ident("i32"), ident("i64")])),
+            const_item_infer("BA", call("Pair", vec![ident("i64"), ident("i32")])),
+        ];
+        let table = check_ok(items);
+        let ab = table.id_of("Pair__int32_t_int64_t").unwrap();
+        let ba = table.id_of("Pair__int64_t_int32_t").unwrap();
+        assert_ne!(ab, ba);
+        assert_eq!(
+            table.get(ab).fields,
+            vec![("a".to_string(), Type::I32), ("b".to_string(), Type::I64)]
+        );
+        assert_eq!(
+            table.get(ba).fields,
+            vec![("a".to_string(), Type::I64), ("b".to_string(), Type::I32)]
+        );
+    }
+
+    #[test]
+    fn single_type_param_ctor_name_preserved() {
+        // The multi-param refactor must keep a single-parameter `Box(i32)`
+        // interning *exactly* `Box__int32_t` (the v0.129/§25 name) and recording
+        // a one-element `args` vector.
+        let get = raw_func(
+            "get",
+            vec![param("self", "Self")],
+            "T",
+            vec![ret(Some(field(ident("self"), "v")))],
+        );
+        let items = vec![
+            type_ctor_m("Box", "T", vec![("v", te("T"))], vec![get]),
+            const_item_infer("IB", call("Box", vec![ident("i32")])),
+        ];
+        let table = check_ok(items);
+        let id = table
+            .id_of("Box__int32_t")
+            .expect("single-param name preserved");
+        assert_eq!(table.get(id).fields, vec![("v".to_string(), Type::I32)]);
+        assert!(table
+            .struct_instances()
+            .iter()
+            .any(|i| i.struct_id == id && i.ctor == "Box" && i.args == vec![Type::I32]));
+    }
+
+    #[test]
+    fn type_ctor_with_value_comptime_param_is_e0310() {
+        // fn Bad(comptime n: usize) type { return struct { v: i32 }; }
+        //   → a comptime *value* parameter is not allowed in a type-constructor.
+        let items = vec![Item::Func(raw_func(
+            "Bad",
+            vec![param_comptime_val("n", "usize")],
+            "type",
+            vec![ret(Some(struct_type_expr(vec![("v", "i32")])))],
+        ))];
+        assert!(codes(items).contains(&"E0310"));
+    }
+
+    #[test]
+    fn type_ctor_mixed_type_and_value_params_is_e0310() {
+        // fn Bad(comptime T: type, comptime n: usize) type { return struct { v: T }; }
+        //   → every type-constructor parameter must be `comptime _: type`.
+        let items = vec![Item::Func(raw_func(
+            "Bad",
+            vec![param_comptime("T"), param_comptime_val("n", "usize")],
+            "type",
+            vec![ret(Some(struct_type_expr(vec![("v", "T")])))],
+        ))];
+        assert!(codes(items).contains(&"E0310"));
     }
 
     // ---- pointer-receiver methods (true mutation) (v0.134, SPEC §30) ------
@@ -9734,7 +9985,7 @@ mod tests {
         assert!(table
             .struct_instances()
             .iter()
-            .any(|i| i.struct_id == id && i.ctor == "Counter" && i.arg == Type::I32));
+            .any(|i| i.struct_id == id && i.ctor == "Counter" && i.args == vec![Type::I32]));
     }
 
     #[test]
