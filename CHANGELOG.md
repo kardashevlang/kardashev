@@ -18,6 +18,17 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.142.0] — `catch |e|` capture
+
+### Added
+- **`expr catch |e| default`** — the capturing error handler (deferred from
+  v0.125): if `expr` (an `!T`) is ok it yields the payload, else it binds the
+  error **code** (`i32`) to `e` and evaluates `default` (a `T`) **only on the
+  error path**, so the handler can react to which error occurred.
+- `Expr::Catch.capture`; lowered by hoisting like `try` (a temp + an `if` on
+  `.err`). The non-capturing `expr catch default` (§12) is unchanged.
+- 846 unit + 40 e2e tests; `examples/catch_capture.ks`.
+
 ## [0.141.0] — `@panic` + `unreachable`
 
 First version of **Arc 4** (toward a practical 1.0: safety, floats, std).

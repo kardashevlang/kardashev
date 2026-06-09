@@ -502,9 +502,13 @@ pub enum Expr {
     /// `try expr` — unwrap an error union `!T`, or propagate the error by
     /// returning it from the enclosing `!U` function. v0.115: statement-level.
     Try { expr: Box<Expr>, span: Span },
-    /// `expr catch default` — unwrap `!T`, or evaluate `default` (a `T`) on error.
+    /// `expr catch default` — unwrap `!T`, or evaluate `default` (a `T`) on
+    /// error. `capture` is `Some(name)` for the capturing form `expr catch
+    /// |name| default` (v0.142): `name` binds the error code (`i32`) and
+    /// `default` is evaluated only on the error path with it in scope.
     Catch {
         expr: Box<Expr>,
+        capture: Option<String>,
         default: Box<Expr>,
         span: Span,
     },

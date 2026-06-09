@@ -1067,3 +1067,26 @@ pub fn main() i32 {
     assert_eq!(code, 101); // exit-101 panic convention
     assert_eq!(out, "5\n100\n"); // stdout flushed up to the panic; 999 never printed
 }
+
+// --- v0.142 catch |e| capture ----------------------------------------------
+
+#[test]
+fn catch_capture_binds_the_error_code() {
+    let src = r#"
+fn risky(bad: bool) !i32 {
+    if (bad) { return error.Boom; }
+    return 7;
+}
+pub fn main() i32 {
+    print(risky(false) catch |e| (0 - e));   // 7   (ok: handler skipped)
+    print(risky(true) catch |e| (100 + e));   // 101 (error: e == Boom's code == 1)
+    print(risky(true) catch 99);              // 99  (non-capturing, unchanged)
+    var x: i32 = risky(true) catch |e| e;      // x = the error code
+    print(x);                                  // 1
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "7\n101\n99\n1\n");
+}
