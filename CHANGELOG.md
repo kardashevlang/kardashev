@@ -18,6 +18,15 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.149.0] — String utilities
+
+### Added
+- **`std` string helpers** over `[]u8`: `str_eq`, `str_starts_with`,
+  `str_index_of` (first byte, or `-1`), and `str_concat` (allocating) — added to
+  the embedded `std`, written entirely in the language (no compiler change).
+- CI smoke-tests them; the `@import("std")` flatten test pins their presence.
+  954 unit + 44 e2e tests; `examples/string_utils.ks`.
+
 ## [0.148.0] — stdin / file I/O
 
 ### Added

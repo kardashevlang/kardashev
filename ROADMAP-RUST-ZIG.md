@@ -303,8 +303,10 @@ stdin line — minimal I/O on the `Allocator`, allocating the result. An open/re
 error yields an empty slice (no `![]u8` to express it). `@`-builtins + `kd_read_*`
 C helpers (emitted only when used).
 
-### v0.149.0 — String utilities (`std.str`)
-`eq`, `concat`, `starts_with`, `index_of` over `[]u8`, on the `Allocator`.
+### v0.149.0 — String utilities ✅
+`str_eq`, `str_starts_with`, `str_index_of`, `str_concat` over `[]u8` (on the
+`Allocator`), added to the embedded `std` — pure library, written in the
+language, no compiler change.
 
 ### v0.150.0 — Test filtering + bench polish
 `kard test -filter NAME` to run a subset, and a `kard bench` timing harness — the

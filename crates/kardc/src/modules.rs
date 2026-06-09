@@ -317,6 +317,12 @@ mod tests {
             ns.iter().any(|n| n == "HashMap"),
             "std should provide HashMap"
         );
+        // String utilities (v0.149).
+        assert!(ns.iter().any(|n| n == "str_eq"), "std should provide str_eq");
+        assert!(
+            ns.iter().any(|n| n == "str_concat"),
+            "std should provide str_concat"
+        );
         assert!(ns.iter().any(|n| n == "main"), "the program's own main");
         // Imports are erased.
         assert!(!module.items.iter().any(|it| matches!(it, Item::Import(_))));
