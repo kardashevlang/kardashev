@@ -555,3 +555,26 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "42\n99\n7\n911\n-1\n");
 }
+
+// --- v0.127 strings --------------------------------------------------------
+
+#[test]
+fn strings_as_u8_slices() {
+    let src = r#"
+fn greet(name: []u8) void {
+    print("Hello,");
+    print(name);
+}
+pub fn main() i32 {
+    greet("world");
+    var s: []u8 = "kardashev";   // inferred []u8
+    print(s);
+    print(s.len);                // 9
+    print(s[0]);                 // 107 ('k')
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "Hello,\nworld\nkardashev\n9\n107\n");
+}

@@ -597,6 +597,9 @@ fn expr_prec(e: &Expr) -> u8 {
         // Both bind tightest (SPEC §14.1).
         | Expr::ArrayLit { .. }
         | Expr::Index { .. }
+        // A string literal `"…"` is an atomic primary — a `[]u8` value over
+        // static bytes (SPEC §23). It binds tightest, like an integer literal.
+        | Expr::StrLit { .. }
         // `expr.*` (deref) and `base[lo..hi]` (slice) are postfix forms and bind
         // as primaries, like `.?` and `a[i]` (SPEC §15).
         | Expr::Deref { .. }
@@ -660,6 +663,11 @@ fn fmt_expr(e: &Expr) -> String {
         Expr::Int { value, .. } => value.to_string(),
         Expr::Bool { value, .. } => if *value { "true" } else { "false" }.to_string(),
         Expr::Ident { name, .. } => name.clone(),
+        // A string literal `"…"` — a `[]u8` value over static bytes (SPEC §23).
+        // Re-emit as a double-quoted literal, re-escaping `\n \t \" \\` (and any
+        // other special characters) via the same [`escape_string`] helper used
+        // for `test` names, so the printed form re-lexes to the same bytes.
+        Expr::StrLit { value, .. } => escape_string(value),
         Expr::Unary { op, expr, .. } => {
             let ops = match op {
                 UnOp::Neg => "-",
@@ -3396,6 +3404,95 @@ mod tests {
             "    }\n",
             "}\n",
         );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    // ----- string literals (v0.127) ---------------------------------------
+
+    /// A string literal `"…"` helper (SPEC §23). `value` holds the *decoded*
+    /// bytes — the lexer resolves escapes, so a `\n` in source is a real newline
+    /// here — matching what the parser stores in [`Expr::StrLit`].
+    fn str_lit(value: &str) -> Expr {
+        Expr::StrLit {
+            value: value.to_string(),
+            span: D,
+        }
+    }
+
+    #[test]
+    fn string_literal_prints_escaped() {
+        // The printer re-escapes the decoded bytes into a double-quoted literal,
+        // reusing the `escape_string` helper. A real newline byte prints as the
+        // two-character escape `\n`.
+        assert_eq!(fmt_expr(&str_lit("hi\n")), "\"hi\\n\"");
+
+        // Backslash, quote and tab all re-escape; ordinary bytes pass through.
+        assert_eq!(fmt_expr(&str_lit("a\\b\"c\td")), "\"a\\\\b\\\"c\\td\"");
+
+        // The empty string round-trips to `""`.
+        assert_eq!(fmt_expr(&str_lit("")), "\"\"");
+    }
+
+    #[test]
+    fn string_literal_binds_as_primary() {
+        // A string literal is an atomic primary (SPEC §23), so it never gets
+        // wrapped in parentheses as an operand — `print("hi")` and `s.len`-style
+        // postfix uses print bare. Here a call argument and a `+`-operand both
+        // print the literal with no surrounding parens.
+        let c = call("print", vec![str_lit("hi")]);
+        assert_eq!(fmt_expr(&c), "print(\"hi\")");
+
+        // As a postfix base (indexing `"abc"[0]`) it needs no parentheses.
+        let idx = Expr::Index {
+            base: Box::new(str_lit("abc")),
+            index: Box::new(int(0)),
+            span: D,
+        };
+        assert_eq!(fmt_expr(&idx), "\"abc\"[0]");
+    }
+
+    #[test]
+    fn string_literal_in_let() {
+        // `var s = "hi\n";` (SPEC §23): an inferred binding (SPEC §18, no `: T`)
+        // whose value is a string literal. The StrLit prints as the re-escaped
+        // double-quoted form `"hi\n"`.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::Let {
+                        is_const: false,
+                        name: "s".to_string(),
+                        ty: None,
+                        value: str_lit("hi\n"),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = "fn f() void {\n    var s = \"hi\\n\";\n}\n";
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn string_literal_source_round_trips() {
+        // End-to-end (lex → parse → print), SPEC §23: `var s = "hi\n";` is
+        // already canonical — the lexer decodes `\n` to a newline, the parser
+        // stores it in `Expr::StrLit`, and the printer re-escapes it back to
+        // `\n`. So formatting reproduces the source byte-for-byte and
+        // re-formatting that output is byte-identical (idempotence).
+        let src = "fn f() void {\n    var s = \"hi\\n\";\n}\n";
         let once = format_source(src).expect("source formats");
         assert_eq!(once, src);
         let twice = format_source(&once).expect("canonical source re-formats");

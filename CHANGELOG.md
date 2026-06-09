@@ -18,6 +18,16 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.127.0] — Strings (`[]u8` literals)
+
+### Added
+- **String literals** are now **values** of type `[]u8` (a slice over static
+  bytes) — `Expr::StrLit`. Reuses the slice machinery, so `.len`, indexing
+  `s[i]` (a `u8`) and sub-slicing `s[lo..hi]` all work, no new type.
+- **`print`** now accepts a string (`[]u8`) as well as an integer — it writes
+  the bytes followed by a newline (`fwrite` + `fputc`).
+- 571 unit + 24 e2e tests; `examples/strings.ks`.
+
 ## [0.126.0] — Multi-file modules (`@import`)
 
 ### Added
