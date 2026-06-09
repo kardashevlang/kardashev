@@ -47,6 +47,10 @@ pub fn emit(module: &Module, structs: &crate::types::StructTable, mode: EmitMode
     // when an `@panic(..)` lowering will appear, so a string-using program that
     // never panics is unaffected.
     em.uses_panic = module_uses_panic(module);
+    // Whether the `kd_read_file`/`kd_read_line` runtime helpers are needed
+    // (SPEC §41.2): emitted only when an `@readFile`/`@readLine` lowering will
+    // appear, so a program doing no I/O keeps its smaller output.
+    em.uses_io = module_uses_io(module);
     em.emit_prelude();
     em.emit_type_defs();
     em.emit_consts(module);
@@ -152,6 +156,111 @@ fn expr_uses_panic(e: &Expr) -> bool {
         Expr::Try { expr, .. } => expr_uses_panic(expr),
         Expr::Catch { expr, default, .. } => expr_uses_panic(expr) || expr_uses_panic(default),
         Expr::StructType { methods, .. } => methods.iter().any(|m| block_uses_panic(&m.body)),
+        Expr::Int { .. }
+        | Expr::Float { .. }
+        | Expr::Bool { .. }
+        | Expr::Ident { .. }
+        | Expr::StrLit { .. }
+        | Expr::Null { .. }
+        | Expr::ErrorLit { .. }
+        | Expr::EnumLit { .. }
+        | Expr::Unreachable { .. } => false,
+    }
+}
+
+// -- v0.148 stdin/file-I/O usage scan (SPEC §41.2) -------------------------
+//
+// Whether the module references `@readFile`/`@readLine` anywhere. Drives
+// whether the `kd_read_file`/`kd_read_line` runtime helpers are emitted (at the
+// tail of `emit_type_defs`, since they return the `kd_slice_uint8_t` typedef).
+// Mirrors `module_uses_panic`'s exhaustive walk: over-counting is harmless (an
+// unused `static` helper), but under-counting would leave a `kd_read_*(..)`
+// lowering referencing an undeclared function.
+
+fn module_uses_io(module: &Module) -> bool {
+    module.items.iter().any(item_uses_io)
+}
+
+fn item_uses_io(item: &Item) -> bool {
+    match item {
+        Item::Func(f) => block_uses_io(&f.body),
+        Item::Const(c) => expr_uses_io(&c.value),
+        Item::Test(t) => block_uses_io(&t.body),
+        Item::Struct(s) => s.methods.iter().any(|m| block_uses_io(&m.body)),
+        Item::Enum(_) | Item::Union(_) | Item::Import(_) | Item::ErrorSet(_) => false,
+    }
+}
+
+fn block_uses_io(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_uses_io)
+}
+
+fn stmt_uses_io(s: &Stmt) -> bool {
+    match s {
+        Stmt::Let { value, .. } => expr_uses_io(value),
+        Stmt::Assign { value, .. } => expr_uses_io(value),
+        Stmt::FieldAssign { place, value, .. } => expr_uses_io(place) || expr_uses_io(value),
+        Stmt::Expr(e) => expr_uses_io(e),
+        Stmt::Return { value, .. } => value.as_ref().is_some_and(expr_uses_io),
+        Stmt::If {
+            cond, then, els, ..
+        } => {
+            expr_uses_io(cond)
+                || block_uses_io(then)
+                || els.as_deref().is_some_and(stmt_uses_io)
+        }
+        Stmt::While {
+            cond, cont, body, ..
+        } => {
+            expr_uses_io(cond)
+                || cont.as_deref().is_some_and(stmt_uses_io)
+                || block_uses_io(body)
+        }
+        Stmt::For { iter, body, .. } => expr_uses_io(iter) || block_uses_io(body),
+        Stmt::Break { .. } | Stmt::Continue { .. } => false,
+        Stmt::Defer { stmt, .. } | Stmt::ErrDefer { stmt, .. } => stmt_uses_io(stmt),
+        Stmt::Block(b) => block_uses_io(b),
+        Stmt::Switch {
+            scrutinee,
+            arms,
+            default,
+            ..
+        } => {
+            expr_uses_io(scrutinee)
+                || arms
+                    .iter()
+                    .any(|a| a.labels.iter().any(expr_uses_io) || block_uses_io(&a.body))
+                || default.as_ref().is_some_and(block_uses_io)
+        }
+    }
+}
+
+fn expr_uses_io(e: &Expr) -> bool {
+    match e {
+        Expr::Builtin { name, args, .. } => {
+            name == "readFile" || name == "readLine" || args.iter().any(expr_uses_io)
+        }
+        Expr::Unary { expr, .. } => expr_uses_io(expr),
+        Expr::Binary { lhs, rhs, .. } => expr_uses_io(lhs) || expr_uses_io(rhs),
+        Expr::Call { args, .. } => args.iter().any(expr_uses_io),
+        Expr::Comptime { expr, .. } => expr_uses_io(expr),
+        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_uses_io(&f.value)),
+        Expr::Field { base, .. } => expr_uses_io(base),
+        Expr::MethodCall { receiver, args, .. } => {
+            expr_uses_io(receiver) || args.iter().any(expr_uses_io)
+        }
+        Expr::Orelse { lhs, rhs, .. } => expr_uses_io(lhs) || expr_uses_io(rhs),
+        Expr::Unwrap { expr, .. } => expr_uses_io(expr),
+        Expr::ArrayLit { elems, .. } => elems.iter().any(expr_uses_io),
+        Expr::Index { base, index, .. } => expr_uses_io(base) || expr_uses_io(index),
+        Expr::AddrOf { place, .. } => expr_uses_io(place),
+        Expr::Deref { expr, .. } => expr_uses_io(expr),
+        Expr::SliceExpr { base, lo, hi, .. } => {
+            expr_uses_io(base) || expr_uses_io(lo) || expr_uses_io(hi)
+        }
+        Expr::Try { expr, .. } => expr_uses_io(expr),
+        Expr::Catch { expr, default, .. } => expr_uses_io(expr) || expr_uses_io(default),
+        Expr::StructType { methods, .. } => methods.iter().any(|m| block_uses_io(&m.body)),
         Expr::Int { .. }
         | Expr::Float { .. }
         | Expr::Bool { .. }
@@ -315,6 +424,12 @@ struct Emitter<'a> {
     /// string-using program that never panics keeps its `fwrite`-free output.
     /// Computed once in [`emit`] before any type is emitted.
     uses_panic: bool,
+    /// v0.148: whether the module references `@readFile`/`@readLine` (SPEC §41).
+    /// Drives whether the `kd_read_file`/`kd_read_line` runtime helpers are
+    /// emitted at the tail of `emit_type_defs` (after the `kd_slice_uint8_t`
+    /// typedef they return), so a program with no I/O keeps its smaller output
+    /// and avoids unused-function warnings. Computed once in [`emit`].
+    uses_io: bool,
 }
 
 impl<'a> Emitter<'a> {
@@ -342,6 +457,7 @@ impl<'a> Emitter<'a> {
             value_subst: HashMap::new(),
             generics: HashMap::new(),
             uses_panic: false,
+            uses_io: false,
         }
     }
 
@@ -906,6 +1022,22 @@ impl<'a> Emitter<'a> {
         if self.uses_panic && self.structs.slices().any(|(_, e)| e == Type::U8) {
             self.line(
                 "_Noreturn void kd_panic(kd_slice_uint8_t m) { fwrite(m.ptr, 1, m.len, stderr); fputc(0x0a, stderr); exit(101); }",
+            );
+        }
+        // v0.148 (SPEC §41.2): the minimal stdin/file-I/O helpers. Emitted here —
+        // at the tail of the type-def section — because both return a `[]u8`
+        // (`kd_slice_uint8_t`) and so must follow that typedef. Gated on actual
+        // `@readFile`/`@readLine` use (to avoid bloat + unused-`static` warnings);
+        // the `[]u8` guard is then always satisfied, since both produce a `[]u8`
+        // (sema interns `[]u8` whenever either builtin appears). The allocator is
+        // the malloc/free-backed stub (§16.2), so it is ignored — `malloc` owns
+        // the bytes and the result is freeable via `free(a, slice)` → `free(ptr)`.
+        if self.uses_io && self.structs.slices().any(|(_, e)| e == Type::U8) {
+            self.line(
+                "static kd_slice_uint8_t kd_read_file(kd_allocator a, kd_slice_uint8_t path) { (void)a; kd_slice_uint8_t r; r.ptr = 0; r.len = 0; char* p = (char*)malloc(path.len + 1); if (!p) return r; for (uintptr_t i = 0; i < path.len; i++) p[i] = (char)path.ptr[i]; p[path.len] = 0; FILE* f = fopen(p, \"rb\"); free(p); if (!f) return r; if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return r; } long sz = ftell(f); if (sz < 0) { fclose(f); return r; } fseek(f, 0, SEEK_SET); uint8_t* buf = (uint8_t*)malloc((uintptr_t)sz + 1); if (!buf) { fclose(f); return r; } size_t got = fread(buf, 1, (size_t)sz, f); fclose(f); r.ptr = buf; r.len = (uintptr_t)got; return r; }",
+            );
+            self.line(
+                "static kd_slice_uint8_t kd_read_line(kd_allocator a) { (void)a; uintptr_t cap = 64, len = 0; uint8_t* buf = (uint8_t*)malloc(cap); kd_slice_uint8_t r; r.ptr = buf; r.len = 0; if (!buf) return r; int c; while ((c = getchar()) != EOF && c != 10) { if (len + 1 > cap) { cap *= 2; uint8_t* nb = (uint8_t*)realloc(buf, cap); if (!nb) { r.ptr = buf; r.len = len; return r; } buf = nb; } buf[len++] = (uint8_t)c; } r.ptr = buf; r.len = len; return r; }",
             );
         }
         self.blank();
@@ -2824,6 +2956,29 @@ impl<'a> Emitter<'a> {
                         };
                         format!("(kd_panic({}), 0)", msg)
                     }
+                    // `@readFile(a, path)` → `kd_read_file((a), (path))`; both
+                    // args are values (an `Allocator` and a `[]u8` path) and the
+                    // result is a freshly `malloc`-backed `[]u8` (SPEC §41.2).
+                    "readFile" => {
+                        let a = match args.first() {
+                            Some(e) => self.emit_expr(e),
+                            None => "((kd_allocator){0})".to_string(),
+                        };
+                        let path = match args.get(1) {
+                            Some(e) => self.emit_expr(e),
+                            None => "((kd_slice_uint8_t){0})".to_string(),
+                        };
+                        format!("kd_read_file(({}), ({}))", a, path)
+                    }
+                    // `@readLine(a)` → `kd_read_line((a))` — reads one line from
+                    // stdin (sans newline) into a fresh `[]u8` (SPEC §41.2).
+                    "readLine" => {
+                        let a = match args.first() {
+                            Some(e) => self.emit_expr(e),
+                            None => "((kd_allocator){0})".to_string(),
+                        };
+                        format!("kd_read_line(({}))", a)
+                    }
                     // Unknown builtins are rejected by sema; emit a placeholder.
                     _ => "0".to_string(),
                 }
@@ -3631,6 +3786,14 @@ impl<'a> Emitter<'a> {
             Expr::Builtin { name, args, .. } => match name.as_str() {
                 "sizeOf" => Some(Type::Usize),
                 "typeName" => self
+                    .structs
+                    .slices()
+                    .find(|(_, e)| *e == Type::U8)
+                    .map(|(id, _)| Type::Slice(id)),
+                // `@readFile(a, p)` / `@readLine(a)` → `[]u8` (SPEC §41.1): map
+                // back to the interned `[]u8` slice (it exists whenever either
+                // builtin appears), so `var s = @readLine(a);` infers `[]u8`.
+                "readFile" | "readLine" => self
                     .structs
                     .slices()
                     .find(|(_, e)| *e == Type::U8)
@@ -10694,6 +10857,173 @@ mod tests {
         assert_eq!(
             stdout, "3.5\n3.5\n3\n",
             "f64 program printed wrong values:\nstdout={stdout}\n--- C ---\n{c}"
+        );
+    }
+
+    // -- v0.148 stdin/file I/O (`@readFile`/`@readLine`, SPEC §41) ----------
+
+    /// `@<name>(<args>)` — a generic `@`-builtin expression.
+    fn io_builtin(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::Builtin {
+            name: name.to_string(),
+            args,
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn readfile_lowers_to_helper_call_and_emits_helper() {
+        // fn f() void { var c = @readFile(a, path); }
+        // The builtin lowers to `kd_read_file((a), (path))`, the binding infers
+        // the `[]u8` slice type, and the runtime helper definition is emitted at
+        // the tail of the type-defs (after the `kd_slice_uint8_t` typedef).
+        let f = func(
+            "f",
+            vec![],
+            "void",
+            vec![let_infer(
+                "c",
+                io_builtin("readFile", vec![ident("a"), ident("path")]),
+            )],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(
+            out.contains("kd_slice_uint8_t kd_c = kd_read_file((kd_a), (kd_path));"),
+            "@readFile should lower to kd_read_file((a), (path)) into a []u8 binding:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "static kd_slice_uint8_t kd_read_file(kd_allocator a, kd_slice_uint8_t path)"
+            ),
+            "the kd_read_file runtime helper should be emitted:\n{out}"
+        );
+        // It follows the `[]u8` slice typedef it returns.
+        let typedef_at = out
+            .find("} kd_slice_uint8_t;")
+            .expect("[]u8 slice typedef should be emitted");
+        let helper_at = out
+            .find("static kd_slice_uint8_t kd_read_file(")
+            .expect("kd_read_file helper should be emitted");
+        assert!(
+            typedef_at < helper_at,
+            "kd_read_file must follow the kd_slice_uint8_t typedef:\n{out}"
+        );
+    }
+
+    #[test]
+    fn readline_lowers_to_helper_call_and_emits_helper() {
+        // fn f() void { var c = @readLine(a); }
+        let f = func(
+            "f",
+            vec![],
+            "void",
+            vec![let_infer("c", io_builtin("readLine", vec![ident("a")]))],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(
+            out.contains("kd_slice_uint8_t kd_c = kd_read_line((kd_a));"),
+            "@readLine should lower to kd_read_line((a)) into a []u8 binding:\n{out}"
+        );
+        assert!(
+            out.contains("static kd_slice_uint8_t kd_read_line(kd_allocator a)"),
+            "the kd_read_line runtime helper should be emitted:\n{out}"
+        );
+    }
+
+    #[test]
+    fn no_io_program_omits_helpers() {
+        // A program that uses `[]u8` (a string `print`) but no I/O: the
+        // `kd_slice_uint8_t` typedef is present, yet neither I/O helper is
+        // emitted (the gate is on actual `@readFile`/`@readLine` use, not on the
+        // mere existence of the `[]u8` slice).
+        //   fn main() void { print("hi"); }
+        let f = func("main", vec![], "void", vec![print(str_lit("hi"))]);
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(
+            out.contains("} kd_slice_uint8_t;"),
+            "[]u8 slice typedef should still be emitted:\n{out}"
+        );
+        assert!(
+            !out.contains("kd_read_file"),
+            "kd_read_file must NOT be emitted for an I/O-free program:\n{out}"
+        );
+        assert!(
+            !out.contains("kd_read_line"),
+            "kd_read_line must NOT be emitted for an I/O-free program:\n{out}"
+        );
+    }
+
+    #[test]
+    fn readfile_reads_temp_file_at_runtime() {
+        // End-to-end: write a temp file, then a program that
+        //   var a = c_allocator();
+        //   var data = @readFile(a, "<temp path>");
+        //   print(data.len);   // 5
+        //   print(data);       // hello
+        //   free(a, data);
+        // compiles, runs, and prints the file's length then its contents.
+        let nonce = format!(
+            "{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let data_path = std::env::temp_dir().join(format!("kardc_v148_readfile_{nonce}.txt"));
+        std::fs::write(&data_path, b"hello").expect("should write the temp data file");
+        let path_str = data_path
+            .to_str()
+            .expect("temp path should be valid UTF-8")
+            .to_string();
+
+        let main = func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_infer("a", call("c_allocator", vec![])),
+                let_infer(
+                    "data",
+                    io_builtin("readFile", vec![ident("a"), str_lit(&path_str)]),
+                ),
+                print(field(ident("data"), "len")),
+                print(ident("data")),
+                Stmt::Expr(call("free", vec![ident("a"), ident("data")])),
+            ],
+        );
+        let m = Module {
+            items: vec![Item::Func(main)],
+        };
+        let c = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(
+            c.contains("kd_read_file((kd_a), ("),
+            "@readFile should lower to kd_read_file(..):\n{c}"
+        );
+
+        let exe = std::env::temp_dir().join(format!("kardc_emit_v148_exe_{nonce}"));
+        crate::backend::cc_build(&c, &exe, &crate::backend::BuildOptions::default())
+            .expect("emitted C for a @readFile program should compile");
+        let output = std::process::Command::new(&exe)
+            .output()
+            .expect("the compiled @readFile program should run");
+        let _ = std::fs::remove_file(&exe);
+        let _ = std::fs::remove_file(&data_path);
+
+        assert!(output.status.success(), "program exited non-zero:\n{c}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout, "5\nhello\n",
+            "@readFile program printed wrong output:\nstdout={stdout}\n--- C ---\n{c}"
         );
     }
 }

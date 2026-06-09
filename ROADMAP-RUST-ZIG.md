@@ -297,9 +297,11 @@ Loops may carry a label (`outer: while (…) { … }`) and `break :outer` /
 to the targeted loop). Value-yielding block expressions (`blk: { break :blk v;
 }`) are a larger AST change, deferred.
 
-### v0.148.0 — stdin / file I/O (`std.io`)
-Read a line from stdin and read a whole file into a `[]u8` — minimal I/O on the
-`Allocator`.
+### v0.148.0 — stdin / file I/O ✅
+`@readFile(a, path)` reads a whole file into a `[]u8` and `@readLine(a)` reads one
+stdin line — minimal I/O on the `Allocator`, allocating the result. An open/read
+error yields an empty slice (no `![]u8` to express it). `@`-builtins + `kd_read_*`
+C helpers (emitted only when used).
 
 ### v0.149.0 — String utilities (`std.str`)
 `eq`, `concat`, `starts_with`, `index_of` over `[]u8`, on the `Allocator`.

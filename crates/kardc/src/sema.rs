@@ -3021,9 +3021,102 @@ impl Checker {
                     }
                     result
                 }
+                "readFile" => {
+                    // `@readFile(a, path)` (v0.148, SPEC §41) — read the whole file
+                    // named by `path` (a `[]u8`) into a fresh `[]u8` allocated on the
+                    // `Allocator` `a`. Exactly two arguments: an `Allocator` and a
+                    // `[]u8` path; the result is a `[]u8`. A wrong argument count is
+                    // `E0320`; a non-`Allocator` first argument is `E0321`, a
+                    // non-`[]u8` path is `E0110`. On any open/read error the runtime
+                    // helper yields an empty slice (there is no `![]u8` to express the
+                    // error — the optional/error-union named-type-only limit, §11/§12).
+                    let u8_slice = Type::Slice(self.structs.intern_slice(Type::U8));
+                    if args.len() != 2 {
+                        self.error(
+                            *span,
+                            "E0320",
+                            format!(
+                                "`@readFile` takes exactly 2 arguments (an `Allocator` and a `[]u8` path), found {}",
+                                args.len()
+                            ),
+                        );
+                        // Still validate every argument expression.
+                        for a in args {
+                            self.check_expr(a, None);
+                        }
+                        return None;
+                    }
+                    // arg0 must be an `Allocator`.
+                    if let Some(at) = self.check_expr(&args[0], Some(Type::Allocator)) {
+                        if at != Type::Allocator {
+                            self.error(
+                                args[0].span(),
+                                "E0321",
+                                format!(
+                                    "`@readFile`'s first argument must be an `Allocator`, found `{}`",
+                                    self.type_name(at)
+                                ),
+                            );
+                        }
+                    }
+                    // arg1 must be a `[]u8` path.
+                    if let Some(pt) = self.check_expr(&args[1], Some(u8_slice)) {
+                        let is_u8_slice = matches!(
+                            pt,
+                            Type::Slice(id) if self.structs.slice_elem(id) == Type::U8
+                        );
+                        if !is_u8_slice {
+                            self.error(
+                                args[1].span(),
+                                "E0110",
+                                format!(
+                                    "`@readFile`'s path must be a `[]u8`, found `{}`",
+                                    self.type_name(pt)
+                                ),
+                            );
+                        }
+                    }
+                    Some(u8_slice)
+                }
+                "readLine" => {
+                    // `@readLine(a)` (v0.148, SPEC §41) — read one line from stdin
+                    // (without the trailing newline) into a fresh `[]u8` allocated on
+                    // the `Allocator` `a`. Exactly one argument, an `Allocator`; the
+                    // result is a `[]u8`. A wrong argument count is `E0320`; a
+                    // non-`Allocator` argument is `E0321`. An empty line / EOF yields a
+                    // zero-length slice.
+                    let u8_slice = Type::Slice(self.structs.intern_slice(Type::U8));
+                    if args.len() != 1 {
+                        self.error(
+                            *span,
+                            "E0320",
+                            format!(
+                                "`@readLine` takes exactly 1 argument (an `Allocator`), found {}",
+                                args.len()
+                            ),
+                        );
+                        for a in args {
+                            self.check_expr(a, None);
+                        }
+                        return None;
+                    }
+                    if let Some(at) = self.check_expr(&args[0], Some(Type::Allocator)) {
+                        if at != Type::Allocator {
+                            self.error(
+                                args[0].span(),
+                                "E0321",
+                                format!(
+                                    "`@readLine`'s argument must be an `Allocator`, found `{}`",
+                                    self.type_name(at)
+                                ),
+                            );
+                        }
+                    }
+                    Some(u8_slice)
+                }
                 other => {
                     let msg = format!(
-                        "unknown `@`-builtin `@{}` (expected `@sizeOf`, `@typeName`, `@as`, `@panic`, `@intFromEnum`, or `@enumFromInt`)",
+                        "unknown `@`-builtin `@{}` (expected `@sizeOf`, `@typeName`, `@as`, `@panic`, `@intFromEnum`, `@enumFromInt`, `@readFile`, or `@readLine`)",
                         other
                     );
                     self.error(*span, "E0320", msg);
@@ -11496,6 +11589,97 @@ mod tests {
             vec![],
             "void",
             vec![let_var("x", "i64", builtin("intFromEnum", vec![]))],
+        )];
+        assert!(codes(items).contains(&"E0320"));
+    }
+
+    // ---- stdin / file I/O builtins (v0.148, SPEC §41) ---------------------
+
+    #[test]
+    fn read_file_is_slice_of_u8() {
+        // fn f(a: Allocator) void { var s: []u8 = @readFile(a, "x.txt"); }
+        // The result types as `[]u8`, so the slice binding type-checks cleanly.
+        let items = vec![func(
+            "f",
+            vec![param("a", "Allocator")],
+            "void",
+            vec![let_var_slice(
+                "s",
+                "u8",
+                builtin("readFile", vec![ident("a"), str_lit("x.txt")]),
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn read_line_is_slice_of_u8() {
+        // fn f(a: Allocator) void { var s: []u8 = @readLine(a); }
+        let items = vec![func(
+            "f",
+            vec![param("a", "Allocator")],
+            "void",
+            vec![let_var_slice(
+                "s",
+                "u8",
+                builtin("readLine", vec![ident("a")]),
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn read_file_non_allocator_first_arg_is_error() {
+        // fn main() void { var s: []u8 = @readFile(5, "x.txt"); }  — 5 is no Allocator.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_slice(
+                "s",
+                "u8",
+                builtin("readFile", vec![int(5), str_lit("x.txt")]),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0321"));
+    }
+
+    #[test]
+    fn read_file_non_slice_path_is_error() {
+        // fn f(a: Allocator) void { var s: []u8 = @readFile(a, 5); }  — 5 is no []u8.
+        let items = vec![func(
+            "f",
+            vec![param("a", "Allocator")],
+            "void",
+            vec![let_var_slice(
+                "s",
+                "u8",
+                builtin("readFile", vec![ident("a"), int(5)]),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn read_line_wrong_arity_is_e0320() {
+        // fn main() void { var s = @readLine(); }  — wrong arity.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_infer("s", builtin("readLine", vec![]))],
+        )];
+        assert!(codes(items).contains(&"E0320"));
+    }
+
+    #[test]
+    fn read_file_wrong_arity_is_e0320() {
+        // fn f(a: Allocator) void { var s = @readFile(a); }  — wrong arity.
+        let items = vec![func(
+            "f",
+            vec![param("a", "Allocator")],
+            "void",
+            vec![let_var_infer("s", builtin("readFile", vec![ident("a")]))],
         )];
         assert!(codes(items).contains(&"E0320"));
     }
