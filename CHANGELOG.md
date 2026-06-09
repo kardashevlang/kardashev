@@ -18,6 +18,16 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.148.0] — stdin / file I/O
+
+### Added
+- **`@readFile(a, path)`** reads a whole file into a freshly-allocated `[]u8`
+  and **`@readLine(a)`** reads one stdin line (newline stripped) — minimal I/O
+  on the `Allocator`. An open/read error / EOF yields an empty slice (there is
+  no `![]u8` to express the error).
+- `@`-builtins (sema arms + `kd_read_file`/`kd_read_line` C helpers, emitted only
+  when used). CI smoke-tests both. 954 unit + 44 e2e tests; `examples/io.ks`.
+
 ## [0.147.0] — Labeled `break` / `continue`
 
 ### Added

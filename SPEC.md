@@ -1390,3 +1390,28 @@ continue-label `__kd_cont_<label>:;` at its continue point. `break :L` flushes
 __kd_cont_L;`. Unlabeled `break`/`continue` are unchanged (innermost loop). The
 emitter's loop-body `Scope` records the loop's label so the flush walks to the
 right scope.
+
+## 41. stdin / file I/O (v0.148)
+
+Two `@`-builtins for minimal input, both allocating their result on the passed
+`Allocator` and returning a `[]u8`:
+
+- `@readFile(a, path)` — read the whole file named by `path` (a `[]u8`) into a
+  fresh `[]u8`. On any open/read error it yields an **empty** slice (`len == 0`)
+  — there is no `![]u8` to express the error (the optional/error-union
+  named-type-only limitation, §11/§12).
+- `@readLine(a)` — read one line from stdin (without the trailing newline) into a
+  fresh `[]u8`; an empty line or EOF yields a zero-length slice.
+
+### 41.1 Semantics (`sema`)
+`Expr::Builtin{ name: "readFile"/"readLine" }`. `@readFile`'s first argument is
+an `Allocator` and its second a `[]u8`; `@readLine`'s only argument is an
+`Allocator`. Both have type `[]u8`. (Not constant — `const_eval` rejects.)
+
+### 41.2 Backend (`emit_c`)
+Prelude `_`/runtime helpers `kd_read_file(kd_allocator, kd_slice_uint8_t) ->
+kd_slice_uint8_t` (NUL-copies the path, `fopen`/`fread`s the file, empty slice on
+failure) and `kd_read_line(kd_allocator) -> kd_slice_uint8_t` (`getchar` loop to
+a `\n`/EOF), both `malloc`-backed (the allocator is the malloc-backed stub,
+§16.2; the result is freeable with `free(a, slice)`). Emitted only when used.
+`@readFile(a, p)` → `kd_read_file((a), (p))`; `@readLine(a)` → `kd_read_line((a))`.

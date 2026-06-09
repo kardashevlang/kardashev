@@ -86,6 +86,13 @@ jobs:
           sd="$(mktemp -d)"
           printf '@import("std");\nconst L = ArrayList(i32);\npub fn main() i32 { var a: Allocator = c_allocator(); var l: L = L.init(a); l.push(a, imax(40, 2)); print(l.get(0)); l.deinit(a); return 0; }\n' > "$sd/m.ks"
           ( cd "$sd" && [ "$("$KARD" run m.ks)" = "40" ] )
+          # I/O (v0.148): @readFile reads a file; @readLine reads piped stdin.
+          iod="$(mktemp -d)"
+          printf 'kardashev' > "$iod/data.txt"
+          printf 'pub fn main() i32 { var a: Allocator = c_allocator(); var s: []u8 = @readFile(a, "%s/data.txt"); print(s.len); free(a, s); return 0; }\n' "$iod" > "$iod/rf.ks"
+          ( cd "$iod" && [ "$("$KARD" run rf.ks)" = "9" ] )
+          printf 'pub fn main() i32 { var a: Allocator = c_allocator(); var l: []u8 = @readLine(a); print(l.len); free(a, l); return 0; }\n' > "$iod/rl.ks"
+          ( cd "$iod" && [ "$(printf "hello\nx\n" | "$KARD" run rl.ks)" = "5" ] )
           # Cross-compilation plumbing (v0.123): `targets` lists triples, and
           # `-target <host triple>` exercises clang's --target end to end (the
           # host triple always has its sysroot, so it links + runs).
