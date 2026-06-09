@@ -1175,15 +1175,28 @@ impl Checker {
                 };
                 self.define(name, bind_ty, *is_const);
             }
-            Stmt::Assign { name, value, span } => match self.lookup(name) {
+            Stmt::Assign {
+                name,
+                op,
+                value,
+                span,
+            } => match self.lookup(name) {
                 Some((ty, is_const)) => {
                     if is_const {
+                        // A compound assignment to a `const` is rejected exactly
+                        // as a plain `=` is (SPEC §27.2): the immutability error
+                        // is primary; the rhs is still checked against the place
+                        // type so its own diagnostics still surface.
                         self.error(
                             *span,
                             "E0110",
                             format!("cannot assign to immutable binding `{}`", name),
                         );
                         self.check_expr(value, Some(ty));
+                    } else if op.is_some() {
+                        // Compound assignment `name op= value` (v0.131, §27.2):
+                        // the place and rhs must be the same integer type.
+                        self.check_compound_assign_arith(ty, value, *span);
                     } else {
                         // Optional coercion (§11.2): assigning a `T` value or
                         // `null` to a `?T` place widens implicitly.
@@ -1206,17 +1219,26 @@ impl Checker {
                     self.check_expr(value, None);
                 }
             },
-            Stmt::FieldAssign { place, value, .. } => {
+            Stmt::FieldAssign {
+                place, op, value, ..
+            } => {
                 if let Some(pt) = self.resolve_place(place) {
-                    // Optional coercion (§11.2): a `T`/`null` widens to a `?T` field.
-                    if let Some(vt) = self.check_coerce(value, pt) {
-                        if vt != pt {
-                            let msg = format!(
-                                "cannot assign value of type `{}` to field of type `{}`",
-                                self.type_name(vt),
-                                self.type_name(pt)
-                            );
-                            self.error(value.span(), "E0110", msg);
+                    if op.is_some() {
+                        // Compound assignment `place op= value` (v0.131, §27.2):
+                        // the place is resolved once above; the place and rhs
+                        // must be the same integer type.
+                        self.check_compound_assign_arith(pt, value, place.span());
+                    } else {
+                        // Optional coercion (§11.2): a `T`/`null` widens to a `?T` field.
+                        if let Some(vt) = self.check_coerce(value, pt) {
+                            if vt != pt {
+                                let msg = format!(
+                                    "cannot assign value of type `{}` to field of type `{}`",
+                                    self.type_name(vt),
+                                    self.type_name(pt)
+                                );
+                                self.error(value.span(), "E0110", msg);
+                            }
                         }
                     }
                 } else {
@@ -3019,6 +3041,49 @@ impl Checker {
         }
     }
 
+    /// Type-check the arithmetic of a compound assignment `place op= rhs`
+    /// (v0.131, SPEC §27.2). The place type (`place_ty`) is already resolved by
+    /// the caller; this enforces the **same rule as the binary arithmetic
+    /// operators**: both the place and `rhs` must be the *same integer type*.
+    /// The `rhs` is checked against `place_ty` (when integer) so a flexible
+    /// integer literal adopts it, matching the binary-op integer-literal
+    /// polymorphism. Reports the general type error `E0110` on a non-integer
+    /// place, a non-integer `rhs`, or a mismatch; `span` locates the statement.
+    fn check_compound_assign_arith(&mut self, place_ty: Type, rhs: &Expr, span: Span) {
+        // Evaluate the rhs first (surfacing any of its own diagnostics), with
+        // the place type as the expected type only when it is an integer.
+        let rt = self.check_expr(rhs, Some(place_ty).filter(|t| t.is_int()));
+        // The place must be an integer — arithmetic operands are integers.
+        if !place_ty.is_int() {
+            let msg = format!(
+                "compound assignment requires an integer place, found `{}`",
+                self.type_name(place_ty)
+            );
+            self.error(span, "E0110", msg);
+            return;
+        }
+        let rt = match rt {
+            Some(t) => t,
+            None => return,
+        };
+        if !rt.is_int() {
+            let msg = format!(
+                "compound assignment requires an integer operand, found `{}`",
+                self.type_name(rt)
+            );
+            self.error(rhs.span(), "E0110", msg);
+            return;
+        }
+        if rt != place_ty {
+            let msg = format!(
+                "compound assignment operands must have the same type, found `{}` and `{}`",
+                self.type_name(place_ty),
+                self.type_name(rt)
+            );
+            self.error(span, "E0110", msg);
+        }
+    }
+
     /// Type-check the first argument of `alloc` / `free`, which must be an
     /// `Allocator` (SPEC §16.1). A mismatch is the general type error `E0110`.
     fn check_allocator_arg(&mut self, arg: &Expr, callee: &str) {
@@ -4092,6 +4157,16 @@ mod tests {
     fn field_assign(place: Expr, value: Expr) -> Stmt {
         Stmt::FieldAssign {
             place,
+            op: None,
+            value,
+            span: sp(),
+        }
+    }
+    /// A compound field/index assignment `place op= value;` (v0.131).
+    fn field_assign_op(place: Expr, op: BinOp, value: Expr) -> Stmt {
+        Stmt::FieldAssign {
+            place,
+            op: Some(op),
             value,
             span: sp(),
         }
@@ -4137,6 +4212,16 @@ mod tests {
     fn assign(name: &str, value: Expr) -> Stmt {
         Stmt::Assign {
             name: name.into(),
+            op: None,
+            value,
+            span: sp(),
+        }
+    }
+    /// A compound name assignment `name op= value;` (v0.131).
+    fn assign_op(name: &str, op: BinOp, value: Expr) -> Stmt {
+        Stmt::Assign {
+            name: name.into(),
+            op: Some(op),
             value,
             span: sp(),
         }
@@ -4317,6 +4402,233 @@ mod tests {
             vec![let_const("c", "i32", int(5)), assign("c", int(6))],
         )];
         assert!(codes(items).contains(&"E0110"));
+    }
+
+    // ---- compound assignment (v0.131, SPEC §27) ---------------------------
+
+    #[test]
+    fn compound_assign_var_ok() {
+        // fn main() void { var x: i32 = 0; x += 5; x -= 1; x *= 2; x /= 2; x %= 3; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("x", "i32", int(0)),
+                assign_op("x", BinOp::Add, int(5)),
+                assign_op("x", BinOp::Sub, int(1)),
+                assign_op("x", BinOp::Mul, int(2)),
+                assign_op("x", BinOp::Div, int(2)),
+                assign_op("x", BinOp::Rem, int(3)),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn compound_assign_var_matches_place_int_type() {
+        // fn main() void { var x: u8 = 0; x += 7; }   — literal adopts u8.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var("x", "u8", int(0)), assign_op("x", BinOp::Add, int(7))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn compound_assign_bool_rhs_is_e0110() {
+        // fn main() void { var x: i32 = 0; x += true; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("x", "i32", int(0)),
+                assign_op("x", BinOp::Add, boolean(true)),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn compound_assign_mismatched_int_types_is_e0110() {
+        // fn main() void { var x: i32 = 0; var y: i64 = 0; x += y; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("x", "i32", int(0)),
+                let_var("y", "i64", int(0)),
+                assign_op("x", BinOp::Add, ident("y")),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn compound_assign_to_const_is_e0110() {
+        // fn main() void { const c: i32 = 5; c += 1; }  — like a plain `=` to a const.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_const("c", "i32", int(5)), assign_op("c", BinOp::Add, int(1))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn compound_assign_on_bool_place_is_e0110() {
+        // fn main() void { var b: bool = false; b += 1; }  — non-integer place.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var("b", "bool", boolean(false)),
+                assign_op("b", BinOp::Add, int(1)),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn compound_assign_on_struct_place_is_e0110() {
+        // const Point = struct { x: i32, y: i32 };
+        // fn main() void { var p: Point = Point{ .x = 0, .y = 0 }; p += 1; }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32"), ("y", "i32")]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var(
+                        "p",
+                        "Point",
+                        struct_lit("Point", vec![("x", int(0)), ("y", int(0))]),
+                    ),
+                    assign_op("p", BinOp::Add, int(1)),
+                ],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn compound_assign_struct_field_ok() {
+        // const Point = struct { x: i32, y: i32 };
+        // fn main() void { var p: Point = Point{ .x = 0, .y = 0 }; p.x += 5; }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32"), ("y", "i32")]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var(
+                        "p",
+                        "Point",
+                        struct_lit("Point", vec![("x", int(0)), ("y", int(0))]),
+                    ),
+                    field_assign_op(field(ident("p"), "x"), BinOp::Add, int(5)),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn compound_assign_struct_field_bool_rhs_is_e0110() {
+        // p.x += true;  — rhs is not an integer.
+        let items = vec![
+            struct_item("Point", vec![("x", "i32"), ("y", "i32")]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var(
+                        "p",
+                        "Point",
+                        struct_lit("Point", vec![("x", int(0)), ("y", int(0))]),
+                    ),
+                    field_assign_op(field(ident("p"), "x"), BinOp::Add, boolean(true)),
+                ],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn compound_assign_slice_index_ok() {
+        // fn f(a: []i32, i: usize) void { a[i] += 1; }  — slice elem is assignable,
+        // and the index `i` is read once (a backend concern; sema accepts it).
+        let items = vec![func(
+            "f",
+            vec![param_slice("a", "i32"), param("i", "usize")],
+            "void",
+            vec![field_assign_op(
+                index(ident("a"), ident("i")),
+                BinOp::Add,
+                int(1),
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn compound_assign_array_index_ok() {
+        // fn main() void { var a: [3]i32 = [3]i32{1,2,3}; a[0] += 4; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_arr("a", "i32", 3, array_lit("i32", 3, vec![int(1), int(2), int(3)])),
+                field_assign_op(index(ident("a"), int(0)), BinOp::Add, int(4)),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn compound_assign_index_into_immutable_array_is_e0223() {
+        // fn f(a: [3]i32) void { a[0] += 1; }  — array param is immutable.
+        let items = vec![func(
+            "f",
+            vec![param_arr("a", "i32", 3)],
+            "void",
+            vec![field_assign_op(index(ident("a"), int(0)), BinOp::Add, int(1))],
+        )];
+        assert!(codes(items).contains(&"E0223"));
+    }
+
+    #[test]
+    fn compound_assign_unknown_name_is_e0100() {
+        // fn main() void { z += 1; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![assign_op("z", BinOp::Add, int(1))],
+        )];
+        assert!(codes(items).contains(&"E0100"));
+    }
+
+    #[test]
+    fn plain_assign_still_ok_after_compound_support() {
+        // fn main() void { var x: i32 = 0; x = 5; }  — plain `=` is unchanged.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var("x", "i32", int(0)), assign("x", int(5))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
     }
 
     #[test]

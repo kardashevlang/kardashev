@@ -1042,3 +1042,30 @@ tests.
 ### 26.5 Deferred (honest)
 Still one type parameter and `Self` only (no `@This()`); multiple type
 parameters remain later work.
+
+## 27. Compound assignment (v0.131)
+
+`place op= rhs;` for `op ∈ { +=, -=, *=, /=, %= }` means `place = place op rhs`,
+with **the place evaluated once**. The lexer produces `PlusEq`/`MinusEq`/
+`StarEq`/`SlashEq`/`PercentEq`; the corresponding `BinOp` is
+`Add`/`Sub`/`Mul`/`Div`/`Rem`.
+
+### 27.1 AST & parsing
+`Stmt::Assign{ name, op, value }` and `Stmt::FieldAssign{ place, op, value }`
+carry `op: Option<BinOp>` — `None` for a plain `=`, `Some(binop)` for a compound
+form. The parser, after a place and on seeing a compound-assign token, records
+the op; a simple-name target uses `Assign`, a field/index chain uses
+`FieldAssign` (as for `=`).
+
+### 27.2 Semantics (`sema`)
+A compound assignment requires the place to be assignable (a `var`, as for `=`)
+and both the place and `rhs` to be the **same integer type** (the arithmetic
+operators require integer operands — `E0132`/the usual binop type rule); the
+result type matches the place. A plain `=` is unchanged.
+
+### 27.3 Backend (`emit_c`)
+`op = None` is unchanged. For `op = Some(binop)`: a `Stmt::Assign` lowers to
+`kd_<name> = kd_<name> <c-op> (<rhs>);` (a var read is free). A
+`Stmt::FieldAssign` evaluates the place **once** — reusing the existing index
+hoist for `a[i]` (so `a[i] += e` reads `i` once) — then `<place> = <place>
+<c-op> (<rhs>);`.

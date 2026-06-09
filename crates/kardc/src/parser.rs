@@ -704,7 +704,12 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Kw::Errdefer) => self.parse_errdefer(),
             TokenKind::Keyword(Kw::Switch) => self.parse_switch(),
             TokenKind::LBrace => Ok(Stmt::Block(self.parse_block()?)),
-            TokenKind::Ident(_) if matches!(self.peek2_kind(), TokenKind::Eq) => self.parse_assign(),
+            // A simple-name target followed by an assignment operator (`=` or a
+            // compound `+= -= *= /= %=`, SPEC §27.1) is a `Stmt::Assign`; a
+            // field/index place is handled by `parse_expr_stmt`.
+            TokenKind::Ident(_) if assign_op_kind(self.peek2_kind()).is_some() => {
+                self.parse_assign()
+            }
             _ => self.parse_expr_stmt(),
         }
     }
@@ -737,11 +742,19 @@ impl<'a> Parser<'a> {
 
     fn parse_assign(&mut self) -> PResult<Stmt> {
         let (name, name_span) = self.expect_ident()?;
-        self.expect_punct(&TokenKind::Eq, "`=`")?;
+        // Plain `=` → `op: None`; a compound `+= -= *= /= %=` → the matching
+        // `BinOp` (SPEC §27.1). The `parse_stmt` dispatch only routes here on an
+        // assignment operator, but fall back to a real diagnostic regardless.
+        let op = match assign_op_kind(self.peek_kind()) {
+            Some(op) => op,
+            None => return Err(self.expected("`=`, `+=`, `-=`, `*=`, `/=`, or `%=`")),
+        };
+        self.bump(); // the assignment operator
         let value = self.parse_expr()?;
         let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
         Ok(Stmt::Assign {
             name,
+            op,
             value,
             span: name_span.merge(semi),
         })
@@ -846,13 +859,22 @@ impl<'a> Parser<'a> {
     /// expression, with no trailing `;` (the closing `)` terminates it).
     fn parse_loop_cont(&mut self) -> PResult<Stmt> {
         if matches!(self.peek_kind(), TokenKind::Ident(_))
-            && matches!(self.peek2_kind(), TokenKind::Eq)
+            && assign_op_kind(self.peek2_kind()).is_some()
         {
             let (name, name_span) = self.expect_ident()?;
-            self.expect_punct(&TokenKind::Eq, "`=`")?;
+            // Plain `=` → `op: None`; a compound `+= -= *= /= %=` → its `BinOp`
+            // (SPEC §27.1). The guard above ensures this is an assignment
+            // operator, so `flatten` keeps the (inner) op and never drops one.
+            let op = assign_op_kind(self.peek_kind()).flatten();
+            self.bump(); // the assignment operator
             let value = self.parse_expr()?;
             let span = name_span.merge(value.span());
-            Ok(Stmt::Assign { name, value, span })
+            Ok(Stmt::Assign {
+                name,
+                op,
+                value,
+                span,
+            })
         } else {
             let e = self.parse_expr()?;
             Ok(Stmt::Expr(e))
@@ -985,17 +1007,25 @@ impl<'a> Parser<'a> {
         // earlier in `parse_stmt`. Anything else is an expression statement.
         // Composites like `a[i].x = e;` / `m.data[i] = e;` parse here too, since
         // their place is a `Field`/`Index`/`Deref` chain.
-        if matches!(
+        // A compound assignment (`+= -= *= /= %=`, SPEC §27.1) is accepted on a
+        // place just like a plain `=`; the matched op (`None`/`Some(binop)`) is
+        // threaded into `Stmt::FieldAssign`.
+        let place_op = if matches!(
             expr,
             Expr::Field { .. } | Expr::Index { .. } | Expr::Deref { .. }
-        ) && self.at_punct(&TokenKind::Eq)
-        {
-            self.bump(); // `=`
+        ) {
+            assign_op_kind(self.peek_kind())
+        } else {
+            None
+        };
+        if let Some(op) = place_op {
+            self.bump(); // the assignment operator
             let value = self.parse_expr()?;
             let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
             let span = expr.span().merge(semi);
             return Ok(Stmt::FieldAssign {
                 place: expr,
+                op,
                 value,
                 span,
             });
@@ -1534,6 +1564,25 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Classify an assignment-operator token for the `op` field of a
+/// `Stmt::Assign` / `Stmt::FieldAssign` (SPEC §27.1, v0.131).
+///
+/// Returns `None` if `kind` is not an assignment operator. Otherwise the outer
+/// `Some` marks an assignment, and the inner `Option<BinOp>` is `None` for a
+/// plain `=` or `Some(binop)` for a compound `+= -= *= /= %=` (mapping to
+/// `Add`/`Sub`/`Mul`/`Div`/`Rem`), which means `place = place op rhs`.
+fn assign_op_kind(kind: &TokenKind) -> Option<Option<BinOp>> {
+    match kind {
+        TokenKind::Eq => Some(None),
+        TokenKind::PlusEq => Some(Some(BinOp::Add)),
+        TokenKind::MinusEq => Some(Some(BinOp::Sub)),
+        TokenKind::StarEq => Some(Some(BinOp::Mul)),
+        TokenKind::SlashEq => Some(Some(BinOp::Div)),
+        TokenKind::PercentEq => Some(Some(BinOp::Rem)),
+        _ => None,
+    }
+}
+
 /// Human-readable description of a token kind for diagnostic messages.
 fn describe_kind(kind: &TokenKind) -> String {
     match kind {
@@ -1552,6 +1601,11 @@ fn describe_kind(kind: &TokenKind) -> String {
         TokenKind::Colon => "`:`".to_string(),
         TokenKind::Dot => "`.`".to_string(),
         TokenKind::Eq => "`=`".to_string(),
+        TokenKind::PlusEq => "`+=`".to_string(),
+        TokenKind::MinusEq => "`-=`".to_string(),
+        TokenKind::StarEq => "`*=`".to_string(),
+        TokenKind::SlashEq => "`/=`".to_string(),
+        TokenKind::PercentEq => "`%=`".to_string(),
         TokenKind::EqEq => "`==`".to_string(),
         TokenKind::BangEq => "`!=`".to_string(),
         TokenKind::Lt => "`<`".to_string(),
@@ -2423,6 +2477,213 @@ mod tests {
             other => panic!("expected func, got {:?}", other),
         };
         assert!(matches!(&body.stmts[0], Stmt::Assign { name, .. } if name == "a"));
+    }
+
+    /// Parse `fn f() void { <body> }` and return a clone of its first statement.
+    fn first_stmt(body: Vec<TokenKind>) -> Stmt {
+        let mut kinds = vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+        ];
+        kinds.extend(body);
+        kinds.push(TokenKind::RBrace);
+        let m = parse(&toks(kinds)).expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => f.body.stmts[0].clone(),
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plain_assign_has_no_op() {
+        // `x = 1;` → Stmt::Assign { name: x, op: None } (SPEC §27.1).
+        match first_stmt(vec![
+            id("x"),
+            TokenKind::Eq,
+            TokenKind::Int(1),
+            TokenKind::Semicolon,
+        ]) {
+            Stmt::Assign { name, op, .. } => {
+                assert_eq!(name, "x");
+                assert_eq!(op, None);
+            }
+            other => panic!("expected assign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compound_assign_add_to_name() {
+        // `x += 1;` → Stmt::Assign { name: x, op: Some(Add) } (SPEC §27.1).
+        match first_stmt(vec![
+            id("x"),
+            TokenKind::PlusEq,
+            TokenKind::Int(1),
+            TokenKind::Semicolon,
+        ]) {
+            Stmt::Assign { name, op, .. } => {
+                assert_eq!(name, "x");
+                assert_eq!(op, Some(BinOp::Add));
+            }
+            other => panic!("expected compound assign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compound_assign_all_ops_to_name() {
+        // Each compound token maps to the matching BinOp (SPEC §27).
+        for (tok, want) in [
+            (TokenKind::PlusEq, BinOp::Add),
+            (TokenKind::MinusEq, BinOp::Sub),
+            (TokenKind::StarEq, BinOp::Mul),
+            (TokenKind::SlashEq, BinOp::Div),
+            (TokenKind::PercentEq, BinOp::Rem),
+        ] {
+            match first_stmt(vec![
+                id("x"),
+                tok.clone(),
+                TokenKind::Int(2),
+                TokenKind::Semicolon,
+            ]) {
+                Stmt::Assign { op, .. } => assert_eq!(op, Some(want), "token {:?}", tok),
+                other => panic!("expected assign for {:?}, got {:?}", tok, other),
+            }
+        }
+    }
+
+    #[test]
+    fn compound_index_place_mul() {
+        // `a[i] *= 2;` → Stmt::FieldAssign { place: Index, op: Some(Mul) }.
+        match first_stmt(vec![
+            id("a"),
+            TokenKind::LBracket,
+            id("i"),
+            TokenKind::RBracket,
+            TokenKind::StarEq,
+            TokenKind::Int(2),
+            TokenKind::Semicolon,
+        ]) {
+            Stmt::FieldAssign { place, op, .. } => {
+                assert!(matches!(place, Expr::Index { .. }));
+                assert_eq!(op, Some(BinOp::Mul));
+            }
+            other => panic!("expected field assign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compound_field_place_sub() {
+        // `s.f -= 3;` → Stmt::FieldAssign { place: Field, op: Some(Sub) }.
+        match first_stmt(vec![
+            id("s"),
+            TokenKind::Dot,
+            id("f"),
+            TokenKind::MinusEq,
+            TokenKind::Int(3),
+            TokenKind::Semicolon,
+        ]) {
+            Stmt::FieldAssign { place, op, .. } => {
+                assert!(matches!(place, Expr::Field { .. }));
+                assert_eq!(op, Some(BinOp::Sub));
+            }
+            other => panic!("expected field assign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plain_field_assign_has_no_op() {
+        // `s.f = 3;` keeps op: None (the plain `=` path is unchanged).
+        match first_stmt(vec![
+            id("s"),
+            TokenKind::Dot,
+            id("f"),
+            TokenKind::Eq,
+            TokenKind::Int(3),
+            TokenKind::Semicolon,
+        ]) {
+            Stmt::FieldAssign { op, .. } => assert_eq!(op, None),
+            other => panic!("expected field assign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compound_deref_place_div_rem() {
+        // `p.* /= 4;` and `p.* %= 4;` → FieldAssign over a Deref place.
+        for (tok, want) in [(TokenKind::SlashEq, BinOp::Div), (TokenKind::PercentEq, BinOp::Rem)] {
+            match first_stmt(vec![
+                id("p"),
+                TokenKind::Dot,
+                TokenKind::Star,
+                tok.clone(),
+                TokenKind::Int(4),
+                TokenKind::Semicolon,
+            ]) {
+                Stmt::FieldAssign { place, op, .. } => {
+                    assert!(matches!(place, Expr::Deref { .. }));
+                    assert_eq!(op, Some(want), "token {:?}", tok);
+                }
+                other => panic!("expected field assign for {:?}, got {:?}", tok, other),
+            }
+        }
+    }
+
+    #[test]
+    fn while_continue_clause_compound() {
+        // `while (c) : (i += 1) { }` — the continue-clause threads the op too.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::While),
+            TokenKind::LParen,
+            id("c"),
+            TokenKind::RParen,
+            TokenKind::Colon,
+            TokenKind::LParen,
+            id("i"),
+            TokenKind::PlusEq,
+            TokenKind::Int(1),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        let body = match &m.items[0] {
+            Item::Func(f) => &f.body,
+            other => panic!("expected func, got {:?}", other),
+        };
+        match &body.stmts[0] {
+            Stmt::While { cont: Some(cont), .. } => match cont.as_ref() {
+                Stmt::Assign { name, op, .. } => {
+                    assert_eq!(name, "i");
+                    assert_eq!(*op, Some(BinOp::Add));
+                }
+                other => panic!("expected assign continue-clause, got {:?}", other),
+            },
+            other => panic!("expected while with continue clause, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn index_expr_statement_not_assign() {
+        // `a[i];` is a plain expression statement, not a (compound) assignment.
+        match first_stmt(vec![
+            id("a"),
+            TokenKind::LBracket,
+            id("i"),
+            TokenKind::RBracket,
+            TokenKind::Semicolon,
+        ]) {
+            Stmt::Expr(Expr::Index { .. }) => {}
+            other => panic!("expected index expr stmt, got {:?}", other),
+        }
     }
 
     #[test]

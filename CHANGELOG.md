@@ -18,6 +18,18 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.131.0] — Compound assignment operators
+
+First version of **Arc 3** (toward 1.0: ergonomics, mutation, richer generics).
+
+### Added
+- **`+= -= *= /= %=`** on any assignable place (`x`, `s.f`, `a[i]`): `place =
+  place op rhs`, with the place evaluated **once** (an index compound reads `i`
+  a single time), valid in a `while` continue-clause too.
+- Lexer `+=`/`-=`/`*=`/`/=`/`%=`; `Stmt::Assign`/`Stmt::FieldAssign` carry
+  `op: Option<BinOp>`. Integer operands required (the binop type rule).
+- 667 unit + 29 e2e tests; `examples/compound_assign.ks`.
+
 ## [0.130.0] — Generic-struct methods + `ArrayList(T)`
 
 The final piece of the numbered roadmap (**v0.112–v0.130 complete**).

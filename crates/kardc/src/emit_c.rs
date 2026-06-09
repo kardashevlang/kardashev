@@ -9,7 +9,8 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    ArraySize, Block, Expr, Func, Item, Module, Param, Stmt, SwitchArm, TestBlock, TypeExpr, UnOp,
+    ArraySize, BinOp, Block, Expr, Func, Item, Module, Param, Stmt, SwitchArm, TestBlock, TypeExpr,
+    UnOp,
 };
 use crate::const_eval::ConstVal;
 use crate::types::{ComptimeArg, Instantiation, StructTable, Type};
@@ -1395,6 +1396,20 @@ impl<'a> Emitter<'a> {
 
     // -- statements ---------------------------------------------------------
 
+    /// Build the C store statement for a (possibly compound) assignment to an
+    /// already side-effect-free / hoisted lvalue `target` (SPEC §27.3). A plain
+    /// `=` (`op == None`) is `target = (val);`. A compound `op=` re-spells the
+    /// place on both sides — `target = target <c-op> (val);` — which is correct
+    /// precisely because `target` is side-effect-free (a var/field read, or the
+    /// already-hoisted `__kd_idx` slot), so re-reading it does not re-evaluate
+    /// any sub-expression.
+    fn store_str(target: &str, op: Option<BinOp>, val: &str) -> String {
+        match op {
+            None => format!("{} = ({});", target, val),
+            Some(binop) => format!("{} = {} {} ({});", target, target, binop.c_op(), val),
+        }
+    }
+
     /// Emit one statement. Returns `true` if it unconditionally transfers
     /// control (`return`/`break`/`continue`, or an `if`/block all of whose
     /// paths do).
@@ -1443,17 +1458,34 @@ impl<'a> Emitter<'a> {
                 }
                 false
             }
-            Stmt::Assign { name, value, .. } => {
+            Stmt::Assign {
+                name, op, value, ..
+            } => {
                 // The target is an assignable `var` local; coerce the RHS to its
                 // declared type (so a `T`/`null` RHS widens to a `?T` target).
                 let es = match self.lookup_var_type(name) {
                     Some(t) => self.emit_coerced(value, t),
                     None => self.emit_expr(value),
                 };
-                self.line(&format!("kd_{} = {};", name, es));
+                match op {
+                    // Plain `=` (SPEC §4.3): `kd_<name> = <rhs>;`.
+                    None => self.line(&format!("kd_{} = {};", name, es)),
+                    // Compound `op=` (SPEC §27.3): `name op= rhs` ≡ `name = name op
+                    // rhs`. A var read is free, so the place is just re-spelled on
+                    // the RHS — `kd_<name> = kd_<name> <c-op> (<rhs>);`.
+                    Some(binop) => self.line(&format!(
+                        "kd_{} = kd_{} {} ({});",
+                        name,
+                        name,
+                        binop.c_op(),
+                        es
+                    )),
+                }
                 false
             }
-            Stmt::FieldAssign { place, value, .. } => {
+            Stmt::FieldAssign {
+                place, op, value, ..
+            } => {
                 match place {
                     Expr::Index { base, index, .. } => {
                         // Index-assignment → a bounds-checked block: the index is
@@ -1462,18 +1494,26 @@ impl<'a> Emitter<'a> {
                         // `T`-coercible value widens. An array writes through
                         // `.data` and a fixed length (SPEC §14.3); a slice writes
                         // through `.ptr` and the runtime `.len` (SPEC §15.2).
+                        //
+                        // For a compound `a[i] op= e` (SPEC §27.3) the hoisted
+                        // `__kd_idx{k}` is the *single* evaluation of the index, so
+                        // re-spelling the element access on both sides of the
+                        // store reads and writes the same slot without
+                        // re-evaluating `i` — `target = target <c-op> (val);`.
                         let k = self.idx_counter;
                         self.idx_counter += 1;
                         let idx = self.emit_expr(index);
                         let base_str = self.emit_expr(base);
                         if let Some(Type::Slice(sid)) = self.type_of_expr(base) {
                             let val = self.emit_coerced(value, self.structs.slice_elem(sid));
+                            let target = format!("({base}).ptr[__kd_idx{k}]", base = base_str, k = k);
+                            let store = Self::store_str(&target, *op, &val);
                             self.line(&format!(
-                                "{{ int64_t __kd_idx{k} = ({idx}); if (__kd_idx{k} < 0 || (uint64_t)__kd_idx{k} >= ({base}).len) {{ fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); }} ({base}).ptr[__kd_idx{k}] = ({val}); }}",
+                                "{{ int64_t __kd_idx{k} = ({idx}); if (__kd_idx{k} < 0 || (uint64_t)__kd_idx{k} >= ({base}).len) {{ fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); }} {store} }}",
                                 k = k,
                                 idx = idx,
                                 base = base_str,
-                                val = val
+                                store = store
                             ));
                         } else {
                             let (len, elem_ty) = match self.type_of_expr(base) {
@@ -1487,38 +1527,45 @@ impl<'a> Emitter<'a> {
                                 Some(t) => self.emit_coerced(value, t),
                                 None => self.emit_expr(value),
                             };
+                            let target = format!("({base}).data[__kd_idx{k}]", base = base_str, k = k);
+                            let store = Self::store_str(&target, *op, &val);
                             self.line(&format!(
-                                "{{ int64_t __kd_idx{k} = ({idx}); if (__kd_idx{k} < 0 || (uint64_t)__kd_idx{k} >= {len}) {{ fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); }} ({base}).data[__kd_idx{k}] = ({val}); }}",
+                                "{{ int64_t __kd_idx{k} = ({idx}); if (__kd_idx{k} < 0 || (uint64_t)__kd_idx{k} >= {len}) {{ fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); }} {store} }}",
                                 k = k,
                                 idx = idx,
                                 len = len,
-                                base = base_str,
-                                val = val
+                                store = store
                             ));
                         }
                     }
                     Expr::Deref { expr, .. } => {
                         // Deref-assignment `p.* = e;` → `*(<p>) = (<e>);` (SPEC
                         // §15.1). Coerce the RHS to the pointee type (the type of
-                        // the `Deref` place).
+                        // the `Deref` place). The pointer expression is
+                        // side-effect-free, so a compound `p.* op= e` re-spells the
+                        // dereference on both sides (SPEC §27.3).
                         let inner = self.emit_expr(expr);
                         let es = match self.type_of_expr(place) {
                             Some(t) => self.emit_coerced(value, t),
                             None => self.emit_expr(value),
                         };
-                        self.line(&format!("*({}) = ({});", inner, es));
+                        let target = format!("*({})", inner);
+                        self.line(&Self::store_str(&target, *op, &es));
                     }
                     _ => {
                         // `place` is a field-access chain (`a.b.c`); lowering it
                         // yields a C lvalue, so the assignment is a plain
                         // `(<place>) = (<value>);`. Coerce the RHS to the field's
-                        // type (widening to `?T` if it is an optional field).
+                        // type (widening to `?T` if it is an optional field). A
+                        // field access is side-effect-free, so a compound
+                        // `s.f op= e` re-spells the place on both sides (SPEC §27.3).
                         let ps = self.emit_expr(place);
                         let es = match self.type_of_expr(place) {
                             Some(t) => self.emit_coerced(value, t),
                             None => self.emit_expr(value),
                         };
-                        self.line(&format!("({}) = ({});", ps, es));
+                        let target = format!("({})", ps);
+                        self.line(&Self::store_str(&target, *op, &es));
                     }
                 }
                 false
@@ -1753,12 +1800,25 @@ impl<'a> Emitter<'a> {
     /// machinery `emit_stmt` uses.
     fn emit_cont(&mut self, c: &Stmt) {
         match c {
-            Stmt::Assign { name, value, .. } => {
+            Stmt::Assign {
+                name, op, value, ..
+            } => {
                 let es = match self.lookup_var_type(name) {
                     Some(t) => self.emit_coerced(value, t),
                     None => self.emit_expr(value),
                 };
-                self.line(&format!("kd_{} = {};", name, es));
+                match op {
+                    None => self.line(&format!("kd_{} = {};", name, es)),
+                    // A compound continue-clause (`while (..) : (i += 1)`) lowers
+                    // like any other compound name-assign (SPEC §27.3).
+                    Some(binop) => self.line(&format!(
+                        "kd_{} = kd_{} {} ({});",
+                        name,
+                        name,
+                        binop.c_op(),
+                        es
+                    )),
+                }
             }
             Stmt::Expr(e) => {
                 let es = self.emit_expr(e);
@@ -3733,6 +3793,7 @@ mod tests {
                 },
                 Stmt::FieldAssign {
                     place: field(ident("p"), "x"),
+                    op: None,
                     value: int(5),
                     span: Span::DUMMY,
                 },
@@ -4730,6 +4791,7 @@ mod tests {
     fn assign(name: &str, value: Expr) -> Stmt {
         Stmt::Assign {
             name: name.to_string(),
+            op: None,
             value,
             span: Span::DUMMY,
         }
@@ -5443,6 +5505,7 @@ mod tests {
             ret: ty("void"),
             body: block(vec![Stmt::FieldAssign {
                 place: index(ident("a"), int(0)),
+                op: None,
                 value: int(5),
                 span: Span::DUMMY,
             }]),
@@ -5457,6 +5520,217 @@ mod tests {
                 "{ int64_t __kd_idx0 = (0); if (__kd_idx0 < 0 || (uint64_t)__kd_idx0 >= 3) { fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); } (kd_a).data[__kd_idx0] = (5); }"
             ),
             "index assign lowering wrong:\n{out}"
+        );
+    }
+
+    // -- v0.131 compound assignment (SPEC §27.3) ----------------------------
+
+    fn compound_assign(name: &str, op: BinOp, value: Expr) -> Stmt {
+        Stmt::Assign {
+            name: name.to_string(),
+            op: Some(op),
+            value,
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn compound_name_assign_lowers_to_self_op() {
+        // fn go() void { var x: i32 = 0; x += 2; x -= 1; x *= 4; x /= 3; x %= 5; }
+        // Each compound `x op= e` re-spells the var on the RHS: a var read is
+        // free, so `kd_x = kd_x <c-op> (e);`.
+        let f = Func {
+            is_pub: false,
+            name: "go".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "x".to_string(),
+                    ty: Some(ty("i32")),
+                    value: int(0),
+                    span: Span::DUMMY,
+                },
+                compound_assign("x", BinOp::Add, int(2)),
+                compound_assign("x", BinOp::Sub, int(1)),
+                compound_assign("x", BinOp::Mul, int(4)),
+                compound_assign("x", BinOp::Div, int(3)),
+                compound_assign("x", BinOp::Rem, int(5)),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(out.contains("kd_x = kd_x + (2);"), "+= lowering wrong:\n{out}");
+        assert!(out.contains("kd_x = kd_x - (1);"), "-= lowering wrong:\n{out}");
+        assert!(out.contains("kd_x = kd_x * (4);"), "*= lowering wrong:\n{out}");
+        assert!(out.contains("kd_x = kd_x / (3);"), "/= lowering wrong:\n{out}");
+        assert!(out.contains("kd_x = kd_x % (5);"), "%= lowering wrong:\n{out}");
+    }
+
+    #[test]
+    fn compound_index_assign_hoists_index_once() {
+        // fn go(a: [3]i32) void { a[2] += 5; }
+        // The bounds-checked block hoists the index into a single `__kd_idx0`;
+        // the compound store reads and writes that one slot — `i` is evaluated
+        // exactly once (SPEC §27.3).
+        let structs = arr_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "go".to_string(),
+            params: vec![Param {
+                name: "a".to_string(),
+                ty: arr_ty("i32", 3),
+                is_comptime: false,
+                span: Span::DUMMY,
+            }],
+            ret: ty("void"),
+            body: block(vec![Stmt::FieldAssign {
+                place: index(ident("a"), int(2)),
+                op: Some(BinOp::Add),
+                value: int(5),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // Read and write go through the same hoisted index temp.
+        assert!(
+            out.contains("(kd_a).data[__kd_idx0] = (kd_a).data[__kd_idx0] + (5);"),
+            "compound index store wrong:\n{out}"
+        );
+        // The index expression is hoisted exactly once (single evaluation).
+        assert_eq!(
+            out.matches("int64_t __kd_idx0 =").count(),
+            1,
+            "index must be hoisted exactly once:\n{out}"
+        );
+    }
+
+    #[test]
+    fn compound_slice_index_assign_hoists_index_once() {
+        // fn go(s: []i32) void { s[1] -= 4; }  — slices write through `.ptr`.
+        let structs = slice_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "go".to_string(),
+            params: vec![Param {
+                name: "s".to_string(),
+                ty: slice_ty("i32"),
+                is_comptime: false,
+                span: Span::DUMMY,
+            }],
+            ret: ty("void"),
+            body: block(vec![Stmt::FieldAssign {
+                place: index(ident("s"), int(1)),
+                op: Some(BinOp::Sub),
+                value: int(4),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("(kd_s).ptr[__kd_idx0] = (kd_s).ptr[__kd_idx0] - (4);"),
+            "compound slice store wrong:\n{out}"
+        );
+        assert_eq!(
+            out.matches("int64_t __kd_idx0 =").count(),
+            1,
+            "index must be hoisted exactly once:\n{out}"
+        );
+    }
+
+    #[test]
+    fn compound_field_assign_respells_place() {
+        // fn set() void { var p: Point = Point{.x=0,.y=0}; p.x *= 3; }
+        // A field access is side-effect-free, so the place is re-spelled on both
+        // sides of the store (SPEC §27.3).
+        let structs = point_table();
+        let lit = Expr::StructLit {
+            name: "Point".to_string(),
+            fields: vec![finit("x", int(0)), finit("y", int(0))],
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "set".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "p".to_string(),
+                    ty: Some(ty("Point")),
+                    value: lit,
+                    span: Span::DUMMY,
+                },
+                Stmt::FieldAssign {
+                    place: field(ident("p"), "x"),
+                    op: Some(BinOp::Mul),
+                    value: int(3),
+                    span: Span::DUMMY,
+                },
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("((kd_p).kd_x) = ((kd_p).kd_x) * (3);"),
+            "compound field store wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn compound_continue_clause_lowers_self_op() {
+        // fn go() void { var i: i32 = 0; while (i < 3) : (i += 1) {} }
+        // The continue-clause `i += 1` lowers like any compound name-assign.
+        let f = Func {
+            is_pub: false,
+            name: "go".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "i".to_string(),
+                    ty: Some(ty("i32")),
+                    value: int(0),
+                    span: Span::DUMMY,
+                },
+                Stmt::While {
+                    cond: Expr::Binary {
+                        op: BinOp::Lt,
+                        lhs: Box::new(ident("i")),
+                        rhs: Box::new(int(3)),
+                        span: Span::DUMMY,
+                    },
+                    cont: Some(Box::new(compound_assign("i", BinOp::Add, int(1)))),
+                    body: block(vec![]),
+                    span: Span::DUMMY,
+                },
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            out.contains("kd_i = kd_i + (1);"),
+            "compound continue-clause lowering wrong:\n{out}"
         );
     }
 
@@ -5635,6 +5909,7 @@ mod tests {
             ret: ty("void"),
             body: block(vec![Stmt::FieldAssign {
                 place: deref(ident("p")),
+                op: None,
                 value: int(5),
                 span: Span::DUMMY,
             }]),
@@ -5825,6 +6100,7 @@ mod tests {
             ret: ty("void"),
             body: block(vec![Stmt::FieldAssign {
                 place: index(ident("s"), int(0)),
+                op: None,
                 value: int(9),
                 span: Span::DUMMY,
             }]),
@@ -6537,6 +6813,7 @@ mod tests {
                 },
                 Stmt::Assign {
                     name: "x".to_string(),
+                    op: None,
                     value: Expr::Null { span: Span::DUMMY },
                     span: Span::DUMMY,
                 },

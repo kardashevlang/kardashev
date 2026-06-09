@@ -316,17 +316,31 @@ impl Printer {
                 self.out.push_str(&fmt_expr(value));
                 self.out.push_str(";\n");
             }
-            Stmt::Assign { name, value, .. } => {
+            // `name = expr;`, or a compound `name op= expr;` (SPEC §27): `op`
+            // selects the operator spelling — `=` when `None`, `+= -= *= /= %=`
+            // when `Some` — with a single space on each side either way.
+            Stmt::Assign {
+                name, op, value, ..
+            } => {
                 self.write_indent();
                 self.out.push_str(name);
-                self.out.push_str(" = ");
+                self.out.push(' ');
+                self.out.push_str(&assign_op_src(*op));
+                self.out.push(' ');
                 self.out.push_str(&fmt_expr(value));
                 self.out.push_str(";\n");
             }
-            Stmt::FieldAssign { place, value, .. } => {
+            // `place = expr;`, or a compound `place op= expr;` (SPEC §27), where
+            // `place` is a field-access / index / deref chain. The operator
+            // spelling follows `op`, exactly as for [`Stmt::Assign`].
+            Stmt::FieldAssign {
+                place, op, value, ..
+            } => {
                 self.write_indent();
                 self.out.push_str(&fmt_expr(place));
-                self.out.push_str(" = ");
+                self.out.push(' ');
+                self.out.push_str(&assign_op_src(*op));
+                self.out.push(' ');
                 self.out.push_str(&fmt_expr(value));
                 self.out.push_str(";\n");
             }
@@ -661,11 +675,29 @@ fn binop_src(op: BinOp) -> &'static str {
     }
 }
 
+/// The source spelling of an assignment operator (SPEC §27). A plain `=` for
+/// `None`; a compound `op=` for `Some(binop)` — `+= -= *= /= %=` from the
+/// arithmetic [`BinOp`]s, reusing [`binop_src`] for the operator character. The
+/// returned text is the operator alone (no surrounding spaces); callers add the
+/// single spaces, so a plain assignment stays `<lhs> = <rhs>` and a compound one
+/// is `<lhs> += <rhs>` (SPEC §27.1). Re-lexes to the same token, so re-formatting
+/// is idempotent.
+fn assign_op_src(op: Option<BinOp>) -> String {
+    match op {
+        None => "=".to_string(),
+        Some(b) => format!("{}=", binop_src(b)),
+    }
+}
+
 /// Format a `while` continue-clause statement (an assignment or expression)
 /// inline, with no trailing semicolon — e.g. `i = i + 1`.
 fn fmt_cont(s: &Stmt) -> String {
     match s {
-        Stmt::Assign { name, value, .. } => format!("{} = {}", name, fmt_expr(value)),
+        // The continue-clause may itself be a compound assignment (SPEC §27); the
+        // operator spelling follows `op` (`=` / `+=` / …), with no trailing `;`.
+        Stmt::Assign {
+            name, op, value, ..
+        } => format!("{} {} {}", name, assign_op_src(*op), fmt_expr(value)),
         Stmt::Expr(e) => fmt_expr(e),
         // The parser only produces Assign/Expr in this position.
         _ => String::new(),
@@ -1052,10 +1084,14 @@ fn fmt_stmt_inline(stmt: &Stmt) -> String {
             s.push(';');
             s
         }
-        Stmt::Assign { name, value, .. } => format!("{} = {};", name, fmt_expr(value)),
-        Stmt::FieldAssign { place, value, .. } => {
-            format!("{} = {};", fmt_expr(place), fmt_expr(value))
-        }
+        // `name = expr;` / compound `name op= expr;` (SPEC §27), inline.
+        Stmt::Assign {
+            name, op, value, ..
+        } => format!("{} {} {};", name, assign_op_src(*op), fmt_expr(value)),
+        // `place = expr;` / compound `place op= expr;` (SPEC §27), inline.
+        Stmt::FieldAssign {
+            place, op, value, ..
+        } => format!("{} {} {};", fmt_expr(place), assign_op_src(*op), fmt_expr(value)),
         Stmt::Expr(e) => format!("{};", fmt_expr(e)),
         Stmt::Return { value, .. } => match value {
             Some(e) => format!("return {};", fmt_expr(e)),
@@ -1472,6 +1508,7 @@ mod tests {
                         },
                         Stmt::Assign {
                             name: "x".to_string(),
+                            op: None,
                             value: bin(BinOp::Add, ident("x"), int(2)),
                             span: D,
                         },
@@ -1583,6 +1620,7 @@ mod tests {
                         cond: bin(BinOp::Lt, ident("i"), int(10)),
                         cont: Some(Box::new(Stmt::Assign {
                             name: "i".to_string(),
+                            op: None,
                             value: bin(BinOp::Add, ident("i"), int(1)),
                             span: D,
                         })),
@@ -1810,6 +1848,7 @@ mod tests {
                             },
                             Stmt::FieldAssign {
                                 place: field(ident("p"), "x"),
+                                op: None,
                                 value: field(ident("p"), "y"),
                                 span: D,
                             },
@@ -2954,6 +2993,7 @@ mod tests {
                         },
                         Stmt::FieldAssign {
                             place: index(ident("a"), int(0)),
+                            op: None,
                             value: int(5),
                             span: D,
                         },
@@ -3189,6 +3229,7 @@ mod tests {
                         },
                         Stmt::FieldAssign {
                             place: deref(ident("p")),
+                            op: None,
                             value: int(9),
                             span: D,
                         },
@@ -4220,6 +4261,135 @@ mod tests {
             "while (i < self.n) : (i = i + 1) { ",
             "if (i == 0) { print(i); } else { print(self.n); } } ",
             "return i; } };\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    // ----- compound assignment (v0.131) ------------------------------------
+
+    /// A compound `Stmt::Assign` (`op = Some(..)`) prints `<name> <op>= <rhs>;`
+    /// for each of `+= -= *= /= %=` (SPEC §27.1), with a single space on each
+    /// side of the operator, while a plain assignment (`op = None`) is unchanged
+    /// (`<name> = <rhs>;`). Built from the AST directly so it pins the printer
+    /// independently of the parser; re-printing yields identical bytes
+    /// (idempotence as determinism).
+    fn compound_assign(name: &str, op: Option<BinOp>, value: Expr) -> Stmt {
+        Stmt::Assign {
+            name: name.to_string(),
+            op,
+            value,
+            span: D,
+        }
+    }
+
+    #[test]
+    fn compound_name_assign_print_each_operator() {
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![
+                        compound_assign("x", None, int(1)),
+                        compound_assign("x", Some(BinOp::Add), int(1)),
+                        compound_assign("x", Some(BinOp::Sub), int(2)),
+                        compound_assign("x", Some(BinOp::Mul), int(3)),
+                        compound_assign("x", Some(BinOp::Div), int(4)),
+                        compound_assign("x", Some(BinOp::Rem), int(5)),
+                    ],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f() void {\n",
+            "    x = 1;\n",
+            "    x += 1;\n",
+            "    x -= 2;\n",
+            "    x *= 3;\n",
+            "    x /= 4;\n",
+            "    x %= 5;\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: the pure printer re-prints identically.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn compound_field_and_index_assign_print() {
+        // `a[i] -= 2;` (an `Index` place) and `s.f %= 3;` (a `Field` place) print
+        // with the compound operator spelling (SPEC §27.1); the place is rendered
+        // by the ordinary expression printer, unchanged from a plain `=`.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![
+                        Stmt::FieldAssign {
+                            place: index(ident("a"), ident("i")),
+                            op: Some(BinOp::Sub),
+                            value: int(2),
+                            span: D,
+                        },
+                        Stmt::FieldAssign {
+                            place: field(ident("s"), "f"),
+                            op: Some(BinOp::Rem),
+                            value: int(3),
+                            span: D,
+                        },
+                        // A plain field assignment (`op = None`) is unchanged.
+                        Stmt::FieldAssign {
+                            place: field(ident("s"), "g"),
+                            op: None,
+                            value: int(4),
+                            span: D,
+                        },
+                    ],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f() void {\n",
+            "    a[i] -= 2;\n",
+            "    s.f %= 3;\n",
+            "    s.g = 4;\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn compound_assign_round_trip() {
+        // End-to-end (lex → parse → print), SPEC §27: each compound form and a
+        // plain `=` are already canonical, so formatting reproduces the source
+        // byte-for-byte and re-formatting that output is byte-identical
+        // (idempotence). Exercises a simple-name target (`Assign`) and a
+        // field/index-chain target (`FieldAssign`).
+        let src = concat!(
+            "fn f() void {\n",
+            "    x = 1;\n",
+            "    x += 1;\n",
+            "    a[i] -= 2;\n",
+            "    s.f %= 3;\n",
+            "    y *= 4;\n",
+            "    z /= 5;\n",
             "}\n",
         );
         let once = format_source(src).expect("source formats");

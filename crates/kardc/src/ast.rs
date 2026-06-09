@@ -174,16 +174,22 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
-    /// `name = expr;`
+    /// `name = expr;`, or a compound assignment `name op= expr;` (v0.131) when
+    /// `op` is `Some` (`+= -= *= /= %=` → `Add`/`Sub`/`Mul`/`Div`/`Rem`),
+    /// which means `name = name op expr` (the place is read once).
     Assign {
         name: String,
+        op: Option<BinOp>,
         value: Expr,
         span: Span,
     },
-    /// `place = expr;` where `place` is a field-access chain (`a.b.c`).
-    /// Simple `name = expr;` uses [`Stmt::Assign`] instead.
+    /// `place = expr;` (or a compound `place op= expr;`, v0.131) where `place` is
+    /// a field-access / index chain (`a.b.c`, `a[i]`). Simple `name = expr;`
+    /// uses [`Stmt::Assign`] instead. For a compound assignment the place is
+    /// evaluated once.
     FieldAssign {
         place: Expr,
+        op: Option<BinOp>,
         value: Expr,
         span: Span,
     },
