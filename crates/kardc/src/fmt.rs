@@ -600,7 +600,27 @@ fn fmt_type(ty: &TypeExpr) -> String {
 // ----- expressions ---------------------------------------------------------
 
 /// Binding-power of an expression, used to insert minimal parentheses. Higher
-/// binds tighter. Mirrors the grammar in SPEC §2 / §11.
+/// binds tighter. Mirrors the grammar in SPEC §2 / §11 / §28.1.
+///
+/// The full ladder (loosest → tightest), matching the parser's
+/// precedence-climbing chain:
+///
+/// ```text
+///  0  orelse / catch
+///  1  or
+///  2  and
+///  3  |   (BitOr)
+///  4  ^   (BitXor)
+///  5  &   (BitAnd)
+///  6  == != (equality)
+///  7  < <= > >= (relational)
+///  8  << >> (shift)
+///  9  + -  (additive)
+/// 10  * / % (multiplicative)
+/// 11  - ! ~ / try / &  (unary prefix)
+/// 12  comptime
+/// 13  primaries & postfix
+/// ```
 fn expr_prec(e: &Expr) -> u8 {
     match e {
         // Primaries and postfix forms (calls, struct literals, field access,
@@ -633,17 +653,27 @@ fn expr_prec(e: &Expr) -> u8 {
         // as primaries, like `.?` and `a[i]` (SPEC §15).
         | Expr::Deref { .. }
         | Expr::SliceExpr { .. }
-        | Expr::Unwrap { .. } => 8,
-        Expr::Comptime { .. } => 7,
+        | Expr::Unwrap { .. } => 13,
+        Expr::Comptime { .. } => 12,
         // `try expr` is a prefix form (SPEC §12.1), at the same binding power as
-        // the other prefixes (`-`/`!`); `&place` (address-of) is likewise a
-        // prefix (SPEC §15.1). v0.115 only ever produces `try` at a statement
-        // position, so it is rarely a sub-operand; this keeps the printer total.
-        Expr::Unary { .. } | Expr::Try { .. } | Expr::AddrOf { .. } => 6,
+        // the other prefixes (`-`/`!`/`~`); `&place` (address-of) is likewise a
+        // prefix (SPEC §15.1 / §28). v0.115 only ever produces `try` at a
+        // statement position, so it is rarely a sub-operand; this keeps the
+        // printer total.
+        Expr::Unary { .. } | Expr::Try { .. } | Expr::AddrOf { .. } => 11,
+        // Binary operators (SPEC §28.1). Bitwise `& | ^` and the shifts `<< >>`
+        // slot into the C-like ladder: `|` < `^` < `&` < equality < relational
+        // < shift < additive. Equality and relational are now distinct levels
+        // (shift binds tighter than both).
         Expr::Binary { op, .. } => match op {
-            BinOp::Mul | BinOp::Div | BinOp::Rem => 5,
-            BinOp::Add | BinOp::Sub => 4,
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 3,
+            BinOp::Mul | BinOp::Div | BinOp::Rem => 10,
+            BinOp::Add | BinOp::Sub => 9,
+            BinOp::Shl | BinOp::Shr => 8,
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 7,
+            BinOp::Eq | BinOp::Ne => 6,
+            BinOp::BitAnd => 5,
+            BinOp::BitXor => 4,
+            BinOp::BitOr => 3,
             BinOp::And => 2,
             BinOp::Or => 1,
         },
@@ -672,6 +702,14 @@ fn binop_src(op: BinOp) -> &'static str {
         BinOp::Ge => ">=",
         BinOp::And => "and",
         BinOp::Or => "or",
+        // Bitwise & shift (SPEC §28). The source spelling matches `c_op`'s here,
+        // since C uses the same `& | ^ << >>` characters; only the logical
+        // `and`/`or` differ from C's `&&`/`||`.
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
     }
 }
 
@@ -719,11 +757,13 @@ fn fmt_expr(e: &Expr) -> String {
             let ops = match op {
                 UnOp::Neg => "-",
                 UnOp::Not => "!",
+                // `~x` — bitwise complement (SPEC §28). A prefix like `-`/`!`.
+                UnOp::BitNot => "~",
             };
             // A unary operand may be a unary/comptime/primary but never a bare
-            // binary (grammar: `unary := ("-"|"!") unary | comptime_expr`), so
-            // parenthesise binaries (precedence < unary).
-            if expr_prec(expr) < 6 {
+            // binary (grammar: `unary := ("-"|"!"|"~") unary | comptime_expr`),
+            // so parenthesise binaries (precedence < unary).
+            if expr_prec(expr) < 11 {
                 format!("{}({})", ops, fmt_expr(expr))
             } else {
                 format!("{}{}", ops, fmt_expr(expr))
@@ -751,7 +791,7 @@ fn fmt_expr(e: &Expr) -> String {
         Expr::Comptime { expr, .. } => {
             // `comptime` binds a single primary; wrap anything that is not a
             // primary (Int/Bool/Ident/Call) in parentheses.
-            if expr_prec(expr) >= 8 {
+            if expr_prec(expr) >= 13 {
                 format!("comptime {}", fmt_expr(expr))
             } else {
                 format!("comptime ({})", fmt_expr(expr))
@@ -824,7 +864,7 @@ fn fmt_expr(e: &Expr) -> String {
             // primary), so a base that is not itself primary/postfix is
             // parenthesised. The parser never produces such a base, but this
             // keeps the printer total and idempotent.
-            if expr_prec(base) >= 8 {
+            if expr_prec(base) >= 13 {
                 format!("{}.{}", fmt_expr(base), field)
             } else {
                 format!("({}).{}", fmt_expr(base), field)
@@ -842,7 +882,7 @@ fn fmt_expr(e: &Expr) -> String {
             // receiver to stay total and idempotent; the parser never produces
             // one.
             let mut s = String::new();
-            if expr_prec(receiver) >= 8 {
+            if expr_prec(receiver) >= 13 {
                 s.push_str(&fmt_expr(receiver));
             } else {
                 s.push('(');
@@ -878,7 +918,7 @@ fn fmt_expr(e: &Expr) -> String {
         // binds as a primary, so a non-primary/non-postfix operand (e.g. an
         // `orelse`) is parenthesised to stay total and idempotent.
         Expr::Unwrap { expr, .. } => {
-            if expr_prec(expr) >= 8 {
+            if expr_prec(expr) >= 13 {
                 format!("{}.?", fmt_expr(expr))
             } else {
                 format!("({}).?", fmt_expr(expr))
@@ -918,7 +958,7 @@ fn fmt_expr(e: &Expr) -> String {
         // to stay total and idempotent; the parser never produces such a base.
         // The index is a full expression and prints bare inside the brackets.
         Expr::Index { base, index, .. } => {
-            if expr_prec(base) >= 8 {
+            if expr_prec(base) >= 13 {
                 format!("{}[{}]", fmt_expr(base), fmt_expr(index))
             } else {
                 format!("({})[{}]", fmt_expr(base), fmt_expr(index))
@@ -930,7 +970,7 @@ fn fmt_expr(e: &Expr) -> String {
         // Anything looser is parenthesised to keep the printer total and
         // idempotent; the parser never produces such a place.
         Expr::AddrOf { place, .. } => {
-            if expr_prec(place) >= 8 {
+            if expr_prec(place) >= 13 {
                 format!("&{}", fmt_expr(place))
             } else {
                 format!("&({})", fmt_expr(place))
@@ -940,7 +980,7 @@ fn fmt_expr(e: &Expr) -> String {
         // unwrap it binds as a primary, so a non-primary/non-postfix operand
         // (e.g. an `orelse`) is parenthesised to stay total and idempotent.
         Expr::Deref { expr, .. } => {
-            if expr_prec(expr) >= 8 {
+            if expr_prec(expr) >= 13 {
                 format!("{}.*", fmt_expr(expr))
             } else {
                 format!("({}).*", fmt_expr(expr))
@@ -951,7 +991,7 @@ fn fmt_expr(e: &Expr) -> String {
         // parenthesised; the bounds are full expressions and print bare, joined
         // by `..` inside the brackets.
         Expr::SliceExpr { base, lo, hi, .. } => {
-            let b = if expr_prec(base) >= 8 {
+            let b = if expr_prec(base) >= 13 {
                 fmt_expr(base)
             } else {
                 format!("({})", fmt_expr(base))
@@ -965,7 +1005,7 @@ fn fmt_expr(e: &Expr) -> String {
         // AST whether `try` is read as a prefix (binding tighter than `+`) or as
         // consuming the whole following expression — both accept `try (e)`.
         Expr::Try { expr, .. } => {
-            if expr_prec(expr) >= 8 {
+            if expr_prec(expr) >= 13 {
                 format!("try {}", fmt_expr(expr))
             } else {
                 format!("try ({})", fmt_expr(expr))
@@ -4390,6 +4430,142 @@ mod tests {
             "    s.f %= 3;\n",
             "    y *= 4;\n",
             "    z /= 5;\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    // ----- bitwise & shift operators (v0.132) -----------------------------
+
+    #[test]
+    fn bitwise_and_shift_operator_spellings() {
+        // Each binary bitwise/shift operator prints with a single space on each
+        // side (SPEC §28); the spelling matches the source `&`/`|`/`^`/`<<`/`>>`.
+        assert_eq!(
+            fmt_expr(&bin(BinOp::BitAnd, ident("a"), ident("b"))),
+            "a & b"
+        );
+        assert_eq!(
+            fmt_expr(&bin(BinOp::BitOr, ident("a"), ident("b"))),
+            "a | b"
+        );
+        assert_eq!(
+            fmt_expr(&bin(BinOp::BitXor, ident("a"), ident("b"))),
+            "a ^ b"
+        );
+        assert_eq!(fmt_expr(&bin(BinOp::Shl, ident("a"), int(2))), "a << 2");
+        assert_eq!(fmt_expr(&bin(BinOp::Shr, ident("a"), int(1))), "a >> 1");
+
+        // Unary bitwise complement `~` is a prefix like `-`/`!`: bare over a
+        // primary, parenthesised over a (looser) binary operand.
+        let bitnot = Expr::Unary {
+            op: UnOp::BitNot,
+            expr: Box::new(ident("a")),
+            span: D,
+        };
+        assert_eq!(fmt_expr(&bitnot), "~a");
+        let bitnot_bin = Expr::Unary {
+            op: UnOp::BitNot,
+            expr: Box::new(bin(BinOp::Add, ident("a"), ident("b"))),
+            span: D,
+        };
+        assert_eq!(fmt_expr(&bitnot_bin), "~(a + b)");
+    }
+
+    #[test]
+    fn bitwise_and_shift_precedence() {
+        // SPEC §28.1 ladder: `|` < `^` < `&` < equality < relational < shift <
+        // additive. The formatter inserts the minimal parentheses for each.
+
+        // `&` binds tighter than `|`, so `a | b & c` needs no parentheses.
+        let e1 = bin(
+            BinOp::BitOr,
+            ident("a"),
+            bin(BinOp::BitAnd, ident("b"), ident("c")),
+        );
+        assert_eq!(fmt_expr(&e1), "a | b & c");
+
+        // The reverse grouping is below `&`, so it is parenthesised.
+        let e2 = bin(
+            BinOp::BitAnd,
+            bin(BinOp::BitOr, ident("a"), ident("b")),
+            ident("c"),
+        );
+        assert_eq!(fmt_expr(&e2), "(a | b) & c");
+
+        // `^` sits between `|` and `&`: `a ^ b | c` is `(a ^ b) | c`, no parens.
+        let e3 = bin(
+            BinOp::BitOr,
+            bin(BinOp::BitXor, ident("a"), ident("b")),
+            ident("c"),
+        );
+        assert_eq!(fmt_expr(&e3), "a ^ b | c");
+
+        // Shift binds tighter than equality: `a == b << c` needs no parens.
+        let e4 = bin(
+            BinOp::Eq,
+            ident("a"),
+            bin(BinOp::Shl, ident("b"), ident("c")),
+        );
+        assert_eq!(fmt_expr(&e4), "a == b << c");
+
+        // Additive binds tighter than shift, so neither natural grouping needs
+        // parentheses: `(a + b) << c` and `a << (b + c)` print bare.
+        let e5 = bin(
+            BinOp::Shl,
+            bin(BinOp::Add, ident("a"), ident("b")),
+            ident("c"),
+        );
+        assert_eq!(fmt_expr(&e5), "a + b << c");
+        let e6 = bin(
+            BinOp::Shl,
+            ident("a"),
+            bin(BinOp::Add, ident("b"), ident("c")),
+        );
+        assert_eq!(fmt_expr(&e6), "a << b + c");
+
+        // The SPEC §28.3 const example: shift is looser than subtraction, so the
+        // left shift is parenthesised — `(1 << 8) - 1`.
+        let mask = bin(BinOp::Sub, bin(BinOp::Shl, int(1), int(8)), int(1));
+        assert_eq!(fmt_expr(&mask), "(1 << 8) - 1");
+
+        // Equality is now a distinct, looser level than relational: `a == b < c`
+        // is `a == (b < c)` and prints with no parentheses (relational binds
+        // tighter).
+        let e7 = bin(
+            BinOp::Eq,
+            ident("a"),
+            bin(BinOp::Lt, ident("b"), ident("c")),
+        );
+        assert_eq!(fmt_expr(&e7), "a == b < c");
+    }
+
+    #[test]
+    fn bitwise_and_shift_source_round_trips() {
+        // End-to-end (lex → parse → print), SPEC §28. The canonical spacing for
+        // the bitwise/shift operators and the prefix `~` is already minimal, so
+        // formatting reproduces the source byte-for-byte and re-formatting is
+        // idempotent. This also pins the grammar distinctions that must survive:
+        // the prefix `&a` (address-of, §15.1) and the optional-payload capture
+        // `|v|` (§21) are NOT read as the infix bitand/bitor that appear in the
+        // same parse; `(a | b) & c` and `(1 << 8) - 1` exercise precedence parens.
+        let src = concat!(
+            "const MASK = (1 << 8) - 1;\n",
+            "\n",
+            "fn bits(a: i32, b: i32, opt: ?i32) i32 {\n",
+            "    var addr = &a;\n",
+            "    var c = a & b;\n",
+            "    c = (a | b) & c;\n",
+            "    c = c ^ b;\n",
+            "    c = c << 2;\n",
+            "    c = c >> 1;\n",
+            "    if (opt) |v| {\n",
+            "        c = c | v;\n",
+            "    }\n",
+            "    return ~c;\n",
             "}\n",
         );
         let once = format_source(src).expect("source formats");

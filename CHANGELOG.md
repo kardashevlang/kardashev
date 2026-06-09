@@ -18,6 +18,21 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.132.0] — Bitwise & shift operators
+
+### Added
+- **`& | ^ << >> ~`** on integers, with C-like precedence
+  (`| < ^ < & < == < relational < shift < + < *`). Infix `&`/`|` are bitwise;
+  prefix `&` stays address-of and `|x|` stays a capture (disambiguated by
+  position). All fold in `const` expressions (`const MASK = (1 << 8) - 1;`).
+- Lexer `^`/`~`/`<<`/`>>`; `BinOp::{BitAnd,BitOr,BitXor,Shl,Shr}` +
+  `UnOp::BitNot`. Integer operands required.
+- 696 unit + 30 e2e tests; `examples/bitwise.ks`.
+
+### Deferred (honest)
+Bitwise compound assignments (`|= &= ^= <<= >>=`) and hex/binary integer
+literals are later work.
+
 ## [0.131.0] — Compound assignment operators
 
 First version of **Arc 3** (toward 1.0: ergonomics, mutation, richer generics).

@@ -145,10 +145,14 @@ pub enum TokenKind {
     Bang,     // !
     Question, // ?
     FatArrow, // =>  (switch arms)
-    Amp,      // &   (address-of)
+    Amp,      // &   (address-of / bitwise and)
     DotDot,   // ..  (slice ranges)
-    Pipe,     // |   (switch / capture payload binding)
+    Pipe,     // |   (switch / capture payload binding / bitwise or)
     At,       // @   (builtins: @import)
+    Caret,    // ^   (bitwise xor)
+    Tilde,    // ~   (bitwise not)
+    Shl,      // <<  (left shift)
+    Shr,      // >>  (right shift)
 
     /// End of input. Always the final token.
     Eof,

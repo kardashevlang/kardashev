@@ -1090,10 +1090,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_and(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_cmp()?;
+        let mut lhs = self.parse_bitor()?;
         while self.at_kw(Kw::And) {
             self.bump();
-            let rhs = self.parse_cmp()?;
+            let rhs = self.parse_bitor()?;
             let span = lhs.span().merge(rhs.span());
             lhs = Expr::Binary {
                 op: BinOp::And,
@@ -1105,16 +1105,126 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    fn parse_cmp(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_add()?;
+    /// Bitwise-or level (SPEC §28.1): infix `|` (`BinOp::BitOr`), left-
+    /// associative, binding looser than `^`/`&` but tighter than the `and`
+    /// keyword. The `|` is **infix here only** — it is reached after a left
+    /// operand has already been parsed, so the capture form `| IDENT |`
+    /// (recognised in the `if`/`catch`/`switch` grammar positions, never as an
+    /// expression operand) is unaffected by this level.
+    fn parse_bitor(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_bitxor()?;
+        while self.at_punct(&TokenKind::Pipe) {
+            self.bump();
+            let rhs = self.parse_bitxor()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op: BinOp::BitOr,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// Bitwise-xor level (SPEC §28.1): infix `^` (`BinOp::BitXor`), left-
+    /// associative, sitting between `|` (looser) and `&` (tighter).
+    fn parse_bitxor(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_bitand()?;
+        while self.at_punct(&TokenKind::Caret) {
+            self.bump();
+            let rhs = self.parse_bitand()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op: BinOp::BitXor,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// Bitwise-and level (SPEC §28.1): infix `&` (`BinOp::BitAnd`), left-
+    /// associative, binding tighter than `^`/`|` but looser than equality
+    /// (`==`/`!=`), so `x & y == z` parses as `x & (y == z)`. The `&` is
+    /// **infix here only** — it is reached after a left operand, so the prefix
+    /// address-of `&place` (parsed at the unary level, SPEC §15.1) is
+    /// unaffected.
+    fn parse_bitand(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_eq()?;
+        while self.at_punct(&TokenKind::Amp) {
+            self.bump();
+            let rhs = self.parse_eq()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op: BinOp::BitAnd,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// Equality level (SPEC §28.1): infix `==`/`!=` (`BinOp::Eq`/`Ne`), left-
+    /// associative, binding looser than the relational operators.
+    fn parse_eq(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_rel()?;
         loop {
             let op = match self.peek_kind() {
                 TokenKind::EqEq => BinOp::Eq,
                 TokenKind::BangEq => BinOp::Ne,
+                _ => break,
+            };
+            self.bump();
+            let rhs = self.parse_rel()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// Relational level (SPEC §28.1): infix `< <= > >=` (`BinOp::Lt`/`Le`/
+    /// `Gt`/`Ge`), left-associative, binding tighter than equality but looser
+    /// than the shift operators.
+    fn parse_rel(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_shift()?;
+        loop {
+            let op = match self.peek_kind() {
                 TokenKind::Lt => BinOp::Lt,
                 TokenKind::Le => BinOp::Le,
                 TokenKind::Gt => BinOp::Gt,
                 TokenKind::Ge => BinOp::Ge,
+                _ => break,
+            };
+            self.bump();
+            let rhs = self.parse_shift()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// Shift level (SPEC §28.1): infix `<<`/`>>` (`BinOp::Shl`/`Shr`), left-
+    /// associative, binding tighter than the relational operators but looser
+    /// than additive (`+`/`-`), so `1 << 2 + 3` parses as `1 << (2 + 3)`.
+    fn parse_shift(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_add()?;
+        loop {
+            let op = match self.peek_kind() {
+                TokenKind::Shl => BinOp::Shl,
+                TokenKind::Shr => BinOp::Shr,
                 _ => break,
             };
             self.bump();
@@ -1203,9 +1313,12 @@ impl<'a> Parser<'a> {
                 span,
             });
         }
+        // `~expr` (SPEC §28.1) is the bitwise-complement prefix, sitting at the
+        // unary level alongside `-`/`!`; it yields `Expr::Unary { UnOp::BitNot }`.
         let op = match self.peek_kind() {
             TokenKind::Minus => Some(UnOp::Neg),
             TokenKind::Bang => Some(UnOp::Not),
+            TokenKind::Tilde => Some(UnOp::BitNot),
             _ => None,
         };
         if let Some(op) = op {
@@ -1624,6 +1737,10 @@ fn describe_kind(kind: &TokenKind) -> String {
         TokenKind::DotDot => "`..`".to_string(),
         TokenKind::Pipe => "`|`".to_string(),
         TokenKind::At => "`@`".to_string(),
+        TokenKind::Caret => "`^`".to_string(),
+        TokenKind::Tilde => "`~`".to_string(),
+        TokenKind::Shl => "`<<`".to_string(),
+        TokenKind::Shr => "`>>`".to_string(),
         TokenKind::Eof => "end of input".to_string(),
     }
 }
@@ -2249,6 +2366,334 @@ mod tests {
                 other => panic!("expected `and` on the right, got {:?}", other),
             },
             other => panic!("expected `or` at the root, got {:?}", other),
+        }
+    }
+
+    // ---- v0.132: bitwise & shift operators (SPEC §28) ---------------------
+
+    /// Each infix bitwise/shift operator parses to its `BinOp`.
+    #[test]
+    fn bitwise_infix_ops_parse() {
+        for (tok, want) in [
+            (TokenKind::Amp, BinOp::BitAnd),
+            (TokenKind::Pipe, BinOp::BitOr),
+            (TokenKind::Caret, BinOp::BitXor),
+            (TokenKind::Shl, BinOp::Shl),
+            (TokenKind::Shr, BinOp::Shr),
+        ] {
+            let e = parse_assign_rhs(vec![id("a"), tok.clone(), id("b")]);
+            match e {
+                Expr::Binary { op, .. } => assert_eq!(op, want, "for token {:?}", tok),
+                other => panic!("expected binary for {:?}, got {:?}", tok, other),
+            }
+        }
+    }
+
+    /// `a << 2` / `a >> 1` parse with an integer right operand.
+    #[test]
+    fn shift_with_int_operand() {
+        let e = parse_assign_rhs(vec![id("a"), TokenKind::Shl, TokenKind::Int(2)]);
+        assert!(
+            matches!(e, Expr::Binary { op: BinOp::Shl, .. }),
+            "expected `a << 2` to be Shl, got {:?}",
+            e
+        );
+        let e = parse_assign_rhs(vec![id("a"), TokenKind::Shr, TokenKind::Int(1)]);
+        assert!(
+            matches!(e, Expr::Binary { op: BinOp::Shr, .. }),
+            "expected `a >> 1` to be Shr, got {:?}",
+            e
+        );
+    }
+
+    /// `~a` is the bitwise-complement prefix at the unary level.
+    #[test]
+    fn bitnot_prefix_parses() {
+        let e = parse_assign_rhs(vec![TokenKind::Tilde, id("a")]);
+        match e {
+            Expr::Unary {
+                op: UnOp::BitNot,
+                expr,
+                ..
+            } => assert!(matches!(*expr, Expr::Ident { .. })),
+            other => panic!("expected `~a` to be UnOp::BitNot, got {:?}", other),
+        }
+    }
+
+    /// `~a.b` binds the prefix `~` over the whole postfix chain: `~(a.b)`.
+    #[test]
+    fn bitnot_binds_below_postfix() {
+        let e = parse_assign_rhs(vec![TokenKind::Tilde, id("a"), TokenKind::Dot, id("b")]);
+        match e {
+            Expr::Unary {
+                op: UnOp::BitNot,
+                expr,
+                ..
+            } => assert!(matches!(*expr, Expr::Field { .. }), "got {:?}", expr),
+            other => panic!("expected `~(a.b)`, got {:?}", other),
+        }
+    }
+
+    /// `&` binds tighter than `|`: `a | b & c` ==> `a | (b & c)`.
+    #[test]
+    fn precedence_bitor_bitand() {
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Pipe,
+            id("b"),
+            TokenKind::Amp,
+            id("c"),
+        ]);
+        match e {
+            Expr::Binary {
+                op: BinOp::BitOr,
+                rhs,
+                ..
+            } => assert!(
+                matches!(*rhs, Expr::Binary { op: BinOp::BitAnd, .. }),
+                "expected `&` on the right of `|`, got {:?}",
+                rhs
+            ),
+            other => panic!("expected `|` at the root, got {:?}", other),
+        }
+    }
+
+    /// `^` sits between `|` and `&`: `a | b ^ c` ==> `a | (b ^ c)`.
+    #[test]
+    fn precedence_bitor_bitxor() {
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Pipe,
+            id("b"),
+            TokenKind::Caret,
+            id("c"),
+        ]);
+        match e {
+            Expr::Binary {
+                op: BinOp::BitOr,
+                rhs,
+                ..
+            } => assert!(
+                matches!(*rhs, Expr::Binary { op: BinOp::BitXor, .. }),
+                "expected `^` on the right of `|`, got {:?}",
+                rhs
+            ),
+            other => panic!("expected `|` at the root, got {:?}", other),
+        }
+    }
+
+    /// `&` binds tighter than `^`: `a ^ b & c` ==> `a ^ (b & c)`.
+    #[test]
+    fn precedence_bitxor_bitand() {
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Caret,
+            id("b"),
+            TokenKind::Amp,
+            id("c"),
+        ]);
+        match e {
+            Expr::Binary {
+                op: BinOp::BitXor,
+                rhs,
+                ..
+            } => assert!(
+                matches!(*rhs, Expr::Binary { op: BinOp::BitAnd, .. }),
+                "expected `&` on the right of `^`, got {:?}",
+                rhs
+            ),
+            other => panic!("expected `^` at the root, got {:?}", other),
+        }
+    }
+
+    /// Additive binds tighter than shift: `1 << 2 + 3` ==> `1 << (2 + 3)`.
+    #[test]
+    fn precedence_shift_below_additive() {
+        let e = parse_assign_rhs(vec![
+            TokenKind::Int(1),
+            TokenKind::Shl,
+            TokenKind::Int(2),
+            TokenKind::Plus,
+            TokenKind::Int(3),
+        ]);
+        match e {
+            Expr::Binary {
+                op: BinOp::Shl,
+                rhs,
+                ..
+            } => assert!(
+                matches!(*rhs, Expr::Binary { op: BinOp::Add, .. }),
+                "expected `+` on the right of `<<`, got {:?}",
+                rhs
+            ),
+            other => panic!("expected `<<` at the root, got {:?}", other),
+        }
+    }
+
+    /// Equality binds tighter than `&` (which is below `==`): `x & y == z`
+    /// ==> `x & (y == z)`.
+    #[test]
+    fn precedence_bitand_below_equality() {
+        let e = parse_assign_rhs(vec![
+            id("x"),
+            TokenKind::Amp,
+            id("y"),
+            TokenKind::EqEq,
+            id("z"),
+        ]);
+        match e {
+            Expr::Binary {
+                op: BinOp::BitAnd,
+                rhs,
+                ..
+            } => assert!(
+                matches!(*rhs, Expr::Binary { op: BinOp::Eq, .. }),
+                "expected `==` on the right of `&`, got {:?}",
+                rhs
+            ),
+            other => panic!("expected `&` at the root, got {:?}", other),
+        }
+    }
+
+    /// Relational binds tighter than equality: `a == b < c` ==> `a == (b < c)`.
+    #[test]
+    fn precedence_equality_below_relational() {
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::EqEq,
+            id("b"),
+            TokenKind::Lt,
+            id("c"),
+        ]);
+        match e {
+            Expr::Binary {
+                op: BinOp::Eq,
+                rhs,
+                ..
+            } => assert!(
+                matches!(*rhs, Expr::Binary { op: BinOp::Lt, .. }),
+                "expected `<` on the right of `==`, got {:?}",
+                rhs
+            ),
+            other => panic!("expected `==` at the root, got {:?}", other),
+        }
+    }
+
+    /// Shift binds tighter than relational: `a < b << c` ==> `a < (b << c)`.
+    #[test]
+    fn precedence_relational_below_shift() {
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Lt,
+            id("b"),
+            TokenKind::Shl,
+            id("c"),
+        ]);
+        match e {
+            Expr::Binary {
+                op: BinOp::Lt,
+                rhs,
+                ..
+            } => assert!(
+                matches!(*rhs, Expr::Binary { op: BinOp::Shl, .. }),
+                "expected `<<` on the right of `<`, got {:?}",
+                rhs
+            ),
+            other => panic!("expected `<` at the root, got {:?}", other),
+        }
+    }
+
+    /// `const MASK = (1 << 8) - 1;`-style nesting: parenthesised shift then
+    /// additive. `(1 << 8) - 1` ==> `(1 << 8) - 1`.
+    #[test]
+    fn parenthesised_shift_then_sub() {
+        let e = parse_assign_rhs(vec![
+            TokenKind::LParen,
+            TokenKind::Int(1),
+            TokenKind::Shl,
+            TokenKind::Int(8),
+            TokenKind::RParen,
+            TokenKind::Minus,
+            TokenKind::Int(1),
+        ]);
+        match e {
+            Expr::Binary {
+                op: BinOp::Sub,
+                lhs,
+                ..
+            } => assert!(
+                matches!(*lhs, Expr::Binary { op: BinOp::Shl, .. }),
+                "expected `<<` on the left of `-`, got {:?}",
+                lhs
+            ),
+            other => panic!("expected `-` at the root, got {:?}", other),
+        }
+    }
+
+    /// REGRESSION: prefix `&x` is still address-of, never an infix bitand —
+    /// an infix `&` only applies *between* operands. `a & &b` ==>
+    /// `BitAnd(a, AddrOf(b))`.
+    #[test]
+    fn infix_bitand_vs_prefix_addrof() {
+        let e = parse_assign_rhs(vec![id("a"), TokenKind::Amp, TokenKind::Amp, id("b")]);
+        match e {
+            Expr::Binary {
+                op: BinOp::BitAnd,
+                lhs,
+                rhs,
+                ..
+            } => {
+                assert!(matches!(*lhs, Expr::Ident { .. }), "lhs is `a`");
+                assert!(
+                    matches!(*rhs, Expr::AddrOf { .. }),
+                    "rhs is address-of `&b`, got {:?}",
+                    rhs
+                );
+            }
+            other => panic!("expected `a & (&b)`, got {:?}", other),
+        }
+    }
+
+    /// REGRESSION: a leading prefix `&x` with no following infix `&` is still
+    /// a bare address-of (unchanged from SPEC §15.1).
+    #[test]
+    fn prefix_addrof_still_works() {
+        let e = parse_assign_rhs(vec![TokenKind::Amp, id("y")]);
+        assert!(
+            matches!(e, Expr::AddrOf { .. }),
+            "expected `&y` address-of, got {:?}",
+            e
+        );
+    }
+
+    /// REGRESSION: a capture `if (cond) |v| {}` still binds `v`, and an infix
+    /// `|` *inside* the parenthesised condition is a `BitOr` — the two `|`
+    /// positions never collide. `if (a | b) |v| { }`.
+    #[test]
+    fn if_capture_coexists_with_infix_bitor() {
+        let stmts = body_stmts(vec![
+            TokenKind::Keyword(Kw::If),
+            TokenKind::LParen,
+            id("a"),
+            TokenKind::Pipe,
+            id("b"),
+            TokenKind::RParen,
+            TokenKind::Pipe,
+            id("v"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]);
+        match &stmts[0] {
+            Stmt::If { cond, capture, .. } => {
+                assert_eq!(capture.as_deref(), Some("v"), "capture binds `v`");
+                assert!(
+                    matches!(cond, Expr::Binary { op: BinOp::BitOr, .. }),
+                    "condition `a | b` is BitOr, got {:?}",
+                    cond
+                );
+            }
+            other => panic!("expected if-capture, got {:?}", other),
         }
     }
 

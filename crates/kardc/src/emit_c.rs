@@ -2213,6 +2213,8 @@ impl<'a> Emitter<'a> {
                 let opc = match op {
                     UnOp::Neg => "-",
                     UnOp::Not => "!",
+                    // Bitwise complement (v0.132): `~x`, mirroring `-`/`!`.
+                    UnOp::BitNot => "~",
                 };
                 format!("({}{})", opc, inner)
             }
@@ -2915,7 +2917,9 @@ impl<'a> Emitter<'a> {
             Expr::Ident { name, .. } => self.lookup_var_type(name),
             Expr::Unary { op, expr, .. } => match op {
                 UnOp::Not => Some(Type::Bool),
-                UnOp::Neg => self.type_of_expr(expr),
+                // `-x` and `~x` (bitwise complement, v0.132) keep the operand's
+                // integer type.
+                UnOp::Neg | UnOp::BitNot => self.type_of_expr(expr),
             },
             Expr::Binary { op, lhs, .. } => {
                 if op.is_bool_result() {
@@ -7441,6 +7445,114 @@ mod tests {
         assert!(
             !out.contains("kd_Box("),
             "type-constructor was emitted:\n{out}"
+        );
+    }
+
+    // ---- v0.132: bitwise & shift operators -------------------------------
+
+    #[test]
+    fn bitwise_and_shift_binops_emit_c_operators() {
+        // For each binary bitwise/shift op, `fn go(a:i32,b:i32) i32 { return
+        // a OP b; }` lowers to `(kd_a <c-op> kd_b)` via BinOp::c_op() — the
+        // existing `Expr::Binary` path already routes through `c_op()`, so the
+        // new ops need no special-casing (SPEC §28.3).
+        let cases = [
+            (BinOp::BitAnd, "(kd_a & kd_b)"),
+            (BinOp::BitOr, "(kd_a | kd_b)"),
+            (BinOp::BitXor, "(kd_a ^ kd_b)"),
+            (BinOp::Shl, "(kd_a << kd_b)"),
+            (BinOp::Shr, "(kd_a >> kd_b)"),
+        ];
+        for (op, expected) in cases {
+            let f = func(
+                "go",
+                vec![param("a", "i32"), param("b", "i32")],
+                "i32",
+                vec![ret(Expr::Binary {
+                    op,
+                    lhs: Box::new(ident("a")),
+                    rhs: Box::new(ident("b")),
+                    span: Span::DUMMY,
+                })],
+            );
+            let m = Module {
+                items: vec![Item::Func(f)],
+            };
+            let out = emit(&m, &StructTable::new(), EmitMode::Program);
+            assert!(
+                out.contains(expected),
+                "{op:?} should emit {expected}:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn bitnot_unary_emits_tilde() {
+        // fn go(a: i32) i32 { return ~a; }  →  `(~kd_a)`, mirroring `-`/`!`.
+        let f = func(
+            "go",
+            vec![param("a", "i32")],
+            "i32",
+            vec![ret(Expr::Unary {
+                op: UnOp::BitNot,
+                expr: Box::new(ident("a")),
+                span: Span::DUMMY,
+            })],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(out.contains("(~kd_a)"), "~a should emit (~kd_a):\n{out}");
+    }
+
+    #[test]
+    fn bit_twiddle_expression_lowers_with_precedence_parens() {
+        // fn go(a,b,c: i32) i32 { return ((a << 4) | (b & 7)) ^ ~c; }
+        // Each sub-expression is parenthesised, so the C output preserves the
+        // intended grouping regardless of C's operator precedence.
+        let shifted = Expr::Binary {
+            op: BinOp::Shl,
+            lhs: Box::new(ident("a")),
+            rhs: Box::new(int(4)),
+            span: Span::DUMMY,
+        };
+        let masked = Expr::Binary {
+            op: BinOp::BitAnd,
+            lhs: Box::new(ident("b")),
+            rhs: Box::new(int(7)),
+            span: Span::DUMMY,
+        };
+        let ored = Expr::Binary {
+            op: BinOp::BitOr,
+            lhs: Box::new(shifted),
+            rhs: Box::new(masked),
+            span: Span::DUMMY,
+        };
+        let notc = Expr::Unary {
+            op: UnOp::BitNot,
+            expr: Box::new(ident("c")),
+            span: Span::DUMMY,
+        };
+        let xored = Expr::Binary {
+            op: BinOp::BitXor,
+            lhs: Box::new(ored),
+            rhs: Box::new(notc),
+            span: Span::DUMMY,
+        };
+        let f = func(
+            "go",
+            vec![param("a", "i32"), param("b", "i32"), param("c", "i32")],
+            "i32",
+            vec![ret(xored)],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            out.contains("(((kd_a << 4) | (kd_b & 7)) ^ (~kd_c))"),
+            "bit-twiddle expression lowering wrong:\n{out}"
         );
     }
 }

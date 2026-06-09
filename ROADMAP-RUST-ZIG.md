@@ -191,9 +191,10 @@ cadence (SPEC+contract → workflow → integrate → test → PR → CI both �
 rhs`, evaluating the place once (an index compound reads `i` once). `Stmt::Assign`
 / `Stmt::FieldAssign` carry `op: Option<BinOp>`.
 
-### v0.132.0 — Bitwise & shift operators
-`& | ^ << >> ~` on integers. Binary `&`/`|` disambiguate from address-of /
-capture by position (infix vs prefix / capture context).
+### v0.132.0 — Bitwise & shift operators ✅
+`& | ^ << >> ~` on integers, C-like precedence; const-folded. Binary `&`/`|`
+disambiguate from address-of / capture by position (infix vs prefix / capture
+context). (Bitwise compound assignments `|= &= ^= <<= >>=` are later work.)
 
 ### v0.133.0 — `for` loops over arrays & slices
 `for (xs) |x| { … }` and `for (xs, 0..) |x, i| { … }` — element (and index)

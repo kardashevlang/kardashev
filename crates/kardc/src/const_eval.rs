@@ -133,6 +133,14 @@ fn eval_unary(op: UnOp, v: ConstVal, span: Span) -> Result<ConstVal, Diagnostic>
                 "unary `!` requires a bool operand in a constant expression",
             )),
         },
+        UnOp::BitNot => match v {
+            ConstVal::Int(n) => Ok(ConstVal::Int(!n)),
+            ConstVal::Bool(_) => Err(Diagnostic::error(
+                span,
+                "E0132",
+                "unary `~` requires an integer operand in a constant expression",
+            )),
+        },
     }
 }
 
@@ -224,6 +232,29 @@ fn eval_binary(op: BinOp, l: ConstVal, r: ConstVal, span: Span) -> Result<ConstV
                 }
             };
             Ok(ConstVal::Bool(if op == BinOp::And { a && b } else { a || b }))
+        }
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+            let (a, b) = match (l, r) {
+                (ConstVal::Int(a), ConstVal::Int(b)) => (a, b),
+                _ => {
+                    return Err(Diagnostic::error(
+                        span,
+                        "E0132",
+                        "bitwise/shift operators require integer operands in a constant expression",
+                    ))
+                }
+            };
+            let v = match op {
+                BinOp::BitAnd => a & b,
+                BinOp::BitOr => a | b,
+                BinOp::BitXor => a ^ b,
+                // Shift amount masked to 0..63 (wrapping) — mirrors the backend's
+                // 64-bit shift; a negative or huge amount is UB-free.
+                BinOp::Shl => a.wrapping_shl(b as u32),
+                BinOp::Shr => a.wrapping_shr(b as u32),
+                _ => unreachable!(),
+            };
+            Ok(ConstVal::Int(v))
         }
     }
 }

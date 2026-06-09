@@ -197,19 +197,25 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diagnostic>> {
                 }
             }
             b'<' => {
-                if next == Some(b'=') {
+                if next == Some(b'<') {
+                    (TokenKind::Shl, 2)
+                } else if next == Some(b'=') {
                     (TokenKind::Le, 2)
                 } else {
                     (TokenKind::Lt, 1)
                 }
             }
             b'>' => {
-                if next == Some(b'=') {
+                if next == Some(b'>') {
+                    (TokenKind::Shr, 2)
+                } else if next == Some(b'=') {
                     (TokenKind::Ge, 2)
                 } else {
                     (TokenKind::Gt, 1)
                 }
             }
+            b'^' => (TokenKind::Caret, 1),
+            b'~' => (TokenKind::Tilde, 1),
             _ => {
                 // Unrecognized byte — the span covers the whole UTF-8 char so a
                 // multibyte symbol is caret-underlined correctly. Then recover.
@@ -507,9 +513,9 @@ mod tests {
 
     #[test]
     fn unknown_char_is_e0001_and_collected() {
-        // Both `#` and `^` are unknown; `x` still lexes between them. (`@` is a
-        // valid token since v0.126 — `@import` — so it is not used here.)
-        let err = lex("# x ^").expect_err("two unknown chars");
+        // Both `#` and `$` are unknown; `x` still lexes between them. (`@` is a
+        // token since v0.126 and `^` since v0.132, so neither is used here.)
+        let err = lex("# x $").expect_err("two unknown chars");
         assert_eq!(err.len(), 2);
         assert!(err.iter().all(|d| d.code == "E0001"));
         assert_eq!(err[0].span, Span::new(0, 1));

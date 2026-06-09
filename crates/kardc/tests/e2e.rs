@@ -733,3 +733,31 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "15\n12\n48\n9\n1\n120\n10\n");
 }
+
+// --- v0.132 bitwise & shift operators --------------------------------------
+
+#[test]
+fn bitwise_and_shift_operators() {
+    let src = r#"
+const MASK: i32 = (1 << 8) - 1;   // 255, folded at compile time
+pub fn main() i32 {
+    var a: i32 = 12;
+    var b: i32 = 10;
+    print(a & b);        // 8
+    print(a | b);        // 14
+    print(a ^ b);        // 6
+    print(a << 2);       // 48
+    print(a >> 1);       // 6
+    print(~a);           // -13
+    print(MASK);         // 255
+    print(a | b & 4);    // 12  (& binds tighter than |, and b&4 == 0)
+    var x: i32 = 99;
+    var p: *i32 = &x;    // prefix & (address-of) is unaffected by infix bitand
+    print(p.*);          // 99
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "8\n14\n6\n48\n6\n-13\n255\n12\n99\n");
+}
