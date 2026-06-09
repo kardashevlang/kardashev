@@ -18,6 +18,19 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.139.0] — Named error sets
+
+### Added
+- **Named error sets**: `const FileErr = error{ NotFound, Denied };`
+  (`Item::ErrorSet`) and error unions typed over them — `FileErr!T` — alongside
+  the implicit global `!T`. `TypeExpr.error_set`.
+- **Membership checking**: a `return error.X;` (or `var x: Set!T = error.X;`)
+  must name a member of the set (`E0330`); an undeclared set or a duplicate
+  member is `E0331`. A global `!T` accepts any error name (unchanged).
+- At runtime `Set!T` lowers identically to `!T` (the set is a compile-time
+  constraint), so `try`/`catch` are unchanged. 805 unit + 38 e2e tests;
+  `examples/error_sets.ks`.
+
 ## [0.138.0] — `HashMap(V)` std container
 
 ### Added

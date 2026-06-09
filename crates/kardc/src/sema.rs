@@ -194,6 +194,17 @@ struct Checker {
     /// top-level `const`s and free functions. Each entry is
     /// `(constructor name, instance struct id, substitution)`.
     pending_ctor_methods: Vec<(String, u32, HashMap<String, Type>)>,
+    /// Named error sets (v0.139, SPEC §34.2): each declared `const Name =
+    /// error{ A, B };` maps `Name` → its member names (declaration order,
+    /// duplicates removed). Used to validate `Set!T` set names (E0331) and
+    /// `error.X` membership against a named-set target (E0330). The members are
+    /// *also* interned as global error names so each gets a stable code.
+    error_sets: HashMap<String, Vec<String>>,
+    /// The named error set of the current function/test's return type (v0.139):
+    /// `Some(set)` when the return type was written `Set!T`, else `None` (a
+    /// global `!T` or a non-error return). A `return error.X;` checks `X`'s
+    /// membership against this set.
+    ret_error_set: Option<String>,
 }
 
 impl Checker {
@@ -215,6 +226,8 @@ impl Checker {
             type_ctors: HashMap::new(),
             type_aliases: HashMap::new(),
             pending_ctor_methods: Vec::new(),
+            error_sets: HashMap::new(),
+            ret_error_set: None,
         }
     }
 
@@ -285,6 +298,34 @@ impl Checker {
                     variants.push(v.clone());
                 }
                 self.structs.set_enum_variants(id, variants);
+            }
+        }
+
+        // Pass 0 (error sets, v0.139, SPEC §34.2): register every named error
+        // set `const Name = error{ A, B };`. Each member is *also* interned as a
+        // global error name (so `error.A` keeps a stable code, exactly as a bare
+        // `error.A` literal would, §12) and recorded as belonging to the set, so
+        // a `Set!T` set name (E0331) and an `error.X` membership (E0330) can be
+        // checked later. A member repeated within one set is `E0331`. Error sets
+        // have no dependencies, so source order is irrelevant; doing this before
+        // signatures/bodies lets any later `Set!T` reference resolve.
+        for item in &m.items {
+            if let Item::ErrorSet(es) = item {
+                let mut members: Vec<String> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                for member in &es.members {
+                    if !seen.insert(member.clone()) {
+                        let msg =
+                            format!("duplicate member `{}` in error set `{}`", member, es.name);
+                        self.error(es.span, "E0331", msg);
+                        continue;
+                    }
+                    // Reuse the global error-code registration path so this
+                    // member behaves identically to a bare `error.<member>`.
+                    self.structs.intern_error(member);
+                    members.push(member.clone());
+                }
+                self.error_sets.insert(es.name.clone(), members);
             }
         }
 
@@ -626,6 +667,9 @@ impl Checker {
                 Item::Enum(_) => {}
                 // Unions are fully resolved in Pass 0c; they have no body either.
                 Item::Union(_) => {}
+                // Named error sets (v0.139) are fully registered in the error-set
+                // pre-pass; they are compile-time only and have no body to check.
+                Item::ErrorSet(_) => {}
                 // Imports are resolved + erased by the module flattener before
                 // sema runs; a residual one means a single-file compile saw an
                 // `@import` with no path to resolve.
@@ -640,6 +684,10 @@ impl Checker {
 
     fn check_func(&mut self, f: &Func) {
         self.ret_type = self.resolve_type(&f.ret).unwrap_or(Type::Void);
+        // A `Set!T` return type carries the named error set (v0.139); a global
+        // `!T` (or non-error) return leaves it `None`. Used to check membership
+        // of a `return error.X;`.
+        self.ret_error_set = f.ret.error_set.clone();
         self.in_test = false;
         self.loop_depth = 0;
         self.scopes.push(HashMap::new());
@@ -676,6 +724,7 @@ impl Checker {
         // is still bound explicitly below.)
         let prev_self = self.bind_self(struct_id);
         self.ret_type = self.resolve_type(&f.ret).unwrap_or(Type::Void);
+        self.ret_error_set = f.ret.error_set.clone();
         self.in_test = false;
         self.loop_depth = 0;
         self.scopes.push(HashMap::new());
@@ -709,6 +758,7 @@ impl Checker {
     fn check_test(&mut self, t: &TestBlock) {
         // A test body behaves like a `void` function for return purposes.
         self.ret_type = Type::Void;
+        self.ret_error_set = None;
         self.in_test = true;
         self.loop_depth = 0;
         self.check_block(&t.body);
@@ -896,11 +946,56 @@ impl Checker {
     /// Resolve a type name to a builtin or a registered struct, emitting
     /// `E0100` for an unknown name.
     fn resolve_type(&mut self, te: &TypeExpr) -> Option<Type> {
+        // A `Set!T` whose *set* name is not a declared error set is `E0331`
+        // (v0.139, SPEC §34.2); the set is a compile-time constraint and does
+        // not change the resolved runtime type (it is still `Type::ErrorUnion`
+        // over the payload, identical to the global `!T`). This is the single
+        // diagnostic gateway for type names, so each written `Set!T` reports
+        // once; the global `!T` (`error_set: None`) is unaffected.
+        self.check_error_set_ref(te);
         match self.resolve_type_opt(te) {
             Some(t) => Some(t),
             None => {
                 self.error(te.span, "E0100", format!("unknown type `{}`", te.name));
                 None
+            }
+        }
+    }
+
+    /// Validate the *set* name of a `Set!T` type expression (v0.139, SPEC §34.2):
+    /// a named error union must name a declared error set, else `E0331`. A global
+    /// `!T` (`error_set: None`) and every non-error-union type are accepted
+    /// unchanged. This never alters the resolved type — the set is purely a
+    /// compile-time membership constraint (checked separately at error-literal
+    /// sites).
+    fn check_error_set_ref(&mut self, te: &TypeExpr) {
+        if let (true, Some(set)) = (te.error_union, &te.error_set) {
+            if !self.error_sets.contains_key(set) {
+                let msg = format!("unknown error set `{}`", set);
+                self.error(te.span, "E0331", msg);
+            }
+        }
+    }
+
+    /// Check that a directly-written `error.X` coerced to a *named* error-union
+    /// target is a member of that set (v0.139, SPEC §34.2). `set` is the target
+    /// type's error-set name: `None` for the global `!T` (which accepts any error
+    /// name, backward compatible) means no check. Only a literal `error.X` value
+    /// is checked — exactly the `return error.X;` and `var x: Set!T = error.X;`
+    /// positions the SPEC names. A non-member is `E0330`. An *undeclared* set is
+    /// already reported as `E0331` at the type site and so is skipped here (its
+    /// member list is unknown), avoiding a duplicate diagnostic.
+    fn check_error_set_membership(&mut self, value: &Expr, set: &Option<String>) {
+        let set = match set {
+            Some(s) => s,
+            None => return,
+        };
+        if let Expr::ErrorLit { name, span } = value {
+            if let Some(members) = self.error_sets.get(set) {
+                if !members.iter().any(|m| m == name) {
+                    let msg = format!("error.{} is not a member of set `{}`", name, set);
+                    self.error(*span, "E0330", msg);
+                }
             }
         }
     }
@@ -1205,6 +1300,7 @@ impl Checker {
         let saved_subst = std::mem::replace(&mut self.subst, msubst.clone());
         let saved_value_subst = std::mem::take(&mut self.value_subst);
         let saved_ret = self.ret_type;
+        let saved_ret_error_set = self.ret_error_set.take();
         let saved_in_test = self.in_test;
         let saved_loop = self.loop_depth;
         let saved_scopes = std::mem::take(&mut self.scopes);
@@ -1212,6 +1308,7 @@ impl Checker {
         // With `self.subst` active, the return type resolves `Self` / the type
         // parameter to concrete types.
         self.ret_type = self.resolve_type(&f.ret).unwrap_or(Type::Void);
+        self.ret_error_set = f.ret.error_set.clone();
         self.in_test = false;
         self.loop_depth = 0;
         self.scopes.push(HashMap::new());
@@ -1243,6 +1340,7 @@ impl Checker {
         self.subst = saved_subst;
         self.value_subst = saved_value_subst;
         self.ret_type = saved_ret;
+        self.ret_error_set = saved_ret_error_set;
         self.in_test = saved_in_test;
         self.loop_depth = saved_loop;
         self.scopes = saved_scopes;
@@ -1288,6 +1386,10 @@ impl Checker {
                                 self.error(value.span(), "E0110", msg);
                             }
                         }
+                        // A `var x: Set!T = error.X;` over a *named* set requires
+                        // `X` to belong to `Set` (v0.139, SPEC §34.2); a global
+                        // `!T` annotation (`error_set: None`) accepts any error.
+                        self.check_error_set_membership(value, &te.error_set);
                         declared.unwrap_or(Type::I64)
                     }
                     // Inferred binding (v0.121, SPEC §18.2): the binding's type is
@@ -1419,6 +1521,12 @@ impl Checker {
                                 self.error(e.span(), "E0110", msg);
                             }
                         }
+                        // A `return error.X;` from a `fn … Set!T` over a *named*
+                        // set requires `X` to belong to `Set` (v0.139, SPEC
+                        // §34.2); a global `!T` return (`ret_error_set: None`)
+                        // accepts any error.
+                        let ret_set = self.ret_error_set.clone();
+                        self.check_error_set_membership(e, &ret_set);
                     }
                 }
                 None => {
@@ -3987,6 +4095,7 @@ impl Checker {
         let saved_subst = std::mem::replace(&mut self.subst, subst);
         let saved_value_subst = std::mem::replace(&mut self.value_subst, value_subst);
         let saved_ret = self.ret_type;
+        let saved_ret_error_set = self.ret_error_set.take();
         let saved_in_test = self.in_test;
         let saved_loop = self.loop_depth;
         let saved_scopes = std::mem::take(&mut self.scopes);
@@ -3995,6 +4104,7 @@ impl Checker {
         // runtime-parameter types resolve their type-parameter uses to concrete
         // types and any `[n]T` to its bound length.
         self.ret_type = self.resolve_type(&f.ret).unwrap_or(Type::Void);
+        self.ret_error_set = f.ret.error_set.clone();
         self.in_test = false;
         self.loop_depth = 0;
         self.scopes.push(HashMap::new());
@@ -4019,6 +4129,7 @@ impl Checker {
         self.subst = saved_subst;
         self.value_subst = saved_value_subst;
         self.ret_type = saved_ret;
+        self.ret_error_set = saved_ret_error_set;
         self.in_test = saved_in_test;
         self.loop_depth = saved_loop;
         self.scopes = saved_scopes;
@@ -4148,8 +4259,8 @@ fn needs_inference_context(e: &Expr) -> bool {
 mod tests {
     use super::*;
     use crate::ast::{
-        ConstDecl, EnumDecl, FieldDecl, FieldInit, Func, Param, StructDecl, TestBlock, UnionDecl,
-        UnionVariant,
+        ConstDecl, EnumDecl, ErrorSetDecl, FieldDecl, FieldInit, Func, Param, StructDecl,
+        TestBlock, UnionDecl, UnionVariant,
     };
 
     fn sp() -> Span {
@@ -4160,6 +4271,7 @@ mod tests {
             name: name.into(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: None,
             pointer: false,
             slice: false,
@@ -4172,18 +4284,34 @@ mod tests {
             name: name.into(),
             optional: true,
             error_union: false,
+            error_set: None,
             array_len: None,
             pointer: false,
             slice: false,
             span: sp(),
         }
     }
-    /// An error-union type expression `!name`.
+    /// An error-union type expression `!name` (the global error set, v0.115).
     fn te_err(name: &str) -> TypeExpr {
         TypeExpr {
             name: name.into(),
             optional: false,
             error_union: true,
+            error_set: None,
+            array_len: None,
+            pointer: false,
+            slice: false,
+            span: sp(),
+        }
+    }
+    /// A *named* error-union type expression `set!name` (v0.139): the error union
+    /// over the named error set `set` with payload type `name`.
+    fn te_err_set(set: &str, name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.into(),
+            optional: false,
+            error_union: true,
+            error_set: Some(set.into()),
             array_len: None,
             pointer: false,
             slice: false,
@@ -4197,6 +4325,7 @@ mod tests {
             name: elem.into(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: Some(ArraySize::Lit(len)),
             pointer: false,
             slice: false,
@@ -4210,6 +4339,7 @@ mod tests {
             name: elem.into(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: Some(ArraySize::Param(name.into())),
             pointer: false,
             slice: false,
@@ -4222,6 +4352,7 @@ mod tests {
             name: name.into(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: None,
             pointer: true,
             slice: false,
@@ -4234,6 +4365,7 @@ mod tests {
             name: name.into(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: None,
             pointer: false,
             slice: true,
@@ -6159,6 +6291,158 @@ mod tests {
             func_te("g", vec![], te_err("i32"), vec![ret(Some(error_lit("Oops")))]),
         ];
         assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    // ---- named error sets (v0.139, SPEC §34) ------------------------------
+
+    /// A named error set `const Name = error{ members… };`.
+    fn error_set_item(name: &str, members: Vec<&str>) -> Item {
+        Item::ErrorSet(ErrorSetDecl {
+            is_pub: false,
+            name: name.into(),
+            members: members.into_iter().map(|s| s.to_string()).collect(),
+            span: sp(),
+        })
+    }
+    /// `var name: set!payload = value;` — a local annotated with a *named* error
+    /// union (v0.139).
+    fn let_var_err_set(name: &str, set: &str, payload: &str, value: Expr) -> Stmt {
+        Stmt::Let {
+            is_const: false,
+            name: name.into(),
+            ty: Some(te_err_set(set, payload)),
+            value,
+            span: sp(),
+        }
+    }
+
+    #[test]
+    fn named_error_set_return_member_ok() {
+        // const E = error{ A, B };
+        // fn f() E!i32 { return error.A; }   // A is a member of E
+        let items = vec![
+            error_set_item("E", vec!["A", "B"]),
+            func_te("f", vec![], te_err_set("E", "i32"), vec![ret(Some(error_lit("A")))]),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn named_error_set_return_non_member_is_e0330() {
+        // const E = error{ A, B };
+        // fn g() E!i32 { return error.C; }   // C is NOT a member of E
+        let items = vec![
+            error_set_item("E", vec!["A", "B"]),
+            func_te("g", vec![], te_err_set("E", "i32"), vec![ret(Some(error_lit("C")))]),
+        ];
+        assert!(codes(items).contains(&"E0330"));
+    }
+
+    #[test]
+    fn global_error_union_accepts_any_error_name_ok() {
+        // const E = error{ A, B };   (declared but irrelevant to a global `!T`)
+        // fn h() !i32 { return error.Whatever; }   // global `!T` accepts any
+        let items = vec![
+            error_set_item("E", vec!["A", "B"]),
+            func_te("h", vec![], te_err("i32"), vec![ret(Some(error_lit("Whatever")))]),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn unknown_error_set_name_is_e0331() {
+        // fn k() Unknown!i32 { return 0; }   // `Unknown` is not a declared set
+        let items = vec![func_te(
+            "k",
+            vec![],
+            te_err_set("Unknown", "i32"),
+            vec![ret(Some(int(0)))],
+        )];
+        assert!(codes(items).contains(&"E0331"));
+    }
+
+    #[test]
+    fn duplicate_error_set_member_is_e0331() {
+        // const Dups = error{ A, A };   // duplicate member
+        let items = vec![error_set_item("Dups", vec!["A", "A"])];
+        assert!(codes(items).contains(&"E0331"));
+    }
+
+    #[test]
+    fn named_error_set_let_initializer_member_ok_and_non_member_is_e0330() {
+        // const E = error{ A, B };
+        // fn ok()  void { var x: E!i32 = error.A; }   // member → ok
+        // fn bad() void { var y: E!i32 = error.C; }   // non-member → E0330
+        let ok = func(
+            "ok",
+            vec![],
+            "void",
+            vec![let_var_err_set("x", "E", "i32", error_lit("A"))],
+        );
+        let bad = func(
+            "bad",
+            vec![],
+            "void",
+            vec![let_var_err_set("y", "E", "i32", error_lit("C"))],
+        );
+        // The member case alone passes.
+        assert_eq!(
+            codes(vec![error_set_item("E", vec!["A", "B"]), ok]),
+            Vec::<&str>::new()
+        );
+        // The non-member case reports E0330.
+        assert!(codes(vec![error_set_item("E", vec!["A", "B"]), bad]).contains(&"E0330"));
+    }
+
+    #[test]
+    fn named_error_set_payload_coerces_and_try_catch_unchanged_ok() {
+        // const E = error{ A, B };
+        // fn f() E!i32 { return 3; }                         // payload T → Set!T
+        // fn g() E!i32 { var x: i32 = try f(); return x; }   // try on a named set
+        // fn main() void { var v: i32 = f() catch 0; print(v); }  // catch unchanged
+        let items = vec![
+            error_set_item("E", vec!["A", "B"]),
+            func_te("f", vec![], te_err_set("E", "i32"), vec![ret(Some(int(3)))]),
+            func_te(
+                "g",
+                vec![],
+                te_err_set("E", "i32"),
+                vec![
+                    let_var("x", "i32", try_expr(call("f", vec![]))),
+                    ret(Some(ident("x"))),
+                ],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("v", "i32", catch_expr(call("f", vec![]), int(0))),
+                    Stmt::Expr(call("print", vec![ident("v")])),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn named_set_resolves_to_same_error_union_type_as_global_and_members_registered() {
+        // const E = error{ A, B };
+        // fn f() E!i32 { return error.A; }   // named-set error union over i32
+        // fn h() !i32  { return 0; }          // global error union over i32
+        // The set is purely a sema constraint, so `E!i32` interns the SAME
+        // `Type::ErrorUnion(i32)` as `!i32` — exactly one payload entry. Every
+        // set member (even an unused `B`) is registered as a global error name.
+        let table = check_ok(vec![
+            error_set_item("E", vec!["A", "B"]),
+            func_te("f", vec![], te_err_set("E", "i32"), vec![ret(Some(error_lit("A")))]),
+            func_te("h", vec![], te_err("i32"), vec![ret(Some(int(0)))]),
+        ]);
+        let payloads: Vec<Type> = table.error_unions().map(|(_, t)| t).collect();
+        assert_eq!(payloads, vec![Type::I32], "named + global `!i32` share one error union");
+        // Both members get stable global codes (B is never written as error.B).
+        assert!(table.error_code("A").is_some(), "set member A must be registered");
+        assert!(table.error_code("B").is_some(), "set member B must be registered");
     }
 
     #[test]

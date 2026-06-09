@@ -1209,3 +1209,35 @@ two arguments: a type and a value).
 
 This unblocks mixed-integer code (e.g. an `i32` key hashed into a `usize` index),
 and with it a real `HashMap`.
+
+## 34. Named error sets (v0.139)
+
+A **named error set** groups a fixed list of error names: `pub? const FileErr =
+error{ NotFound, Denied };` (`Item::ErrorSet`). An error union may then be typed
+over a named set — `FileErr!T` — alongside the implicit global `!T` (§12).
+
+### 34.1 Syntax & AST
+- `const Name = error{ A, B, … };` — parsed at const-value position (like `=
+  struct`/`= enum`/`= union`), producing `Item::ErrorSet{ name, members }`.
+- `Set!T` in type position: `TypeExpr{ error_union: true, error_set: Some("Set"),
+  name: <payload> }`. The parser, after a base type name `Set`, treats a
+  following `!` as a named error-union (`Set ! payload`). The prefix `!T`
+  (`error_set: None`) is unchanged.
+
+### 34.2 Semantics (`sema`)
+- An `Item::ErrorSet` registers the set name and its members; each member is an
+  error name in the existing global error-code space (so `error.A` keeps a
+  stable code) and is recorded as belonging to the set.
+- `Set!T` resolves to the SAME `Type::ErrorUnion(payload)` as `!T` (the runtime
+  representation is identical, §34.3); the *set* is a compile-time constraint.
+- **Membership**: when the expected type at an error-literal site is an error
+  union with a **named** set `Set` (e.g. a `return error.A;` in a `fn … Set!T`,
+  or `var x: Set!T = error.A;`), `A` must be a member of `Set` (else an error,
+  `E0330`). A global `!T` target accepts any `error.X` (backward compatible).
+- An unknown set name in `Set!T`, or a `const … = error{…}` member duplication,
+  is reported (`E0331`).
+
+### 34.3 Backend (`emit_c`)
+A named error union `Set!T` lowers **identically** to `!T` (the same `{ int32_t
+err; <T> val; }`, interned by payload) — the set is purely a sema constraint, so
+codegen is unchanged. `Item::ErrorSet` emits nothing (compile-time only).
