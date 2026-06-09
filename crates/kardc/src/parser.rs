@@ -833,14 +833,28 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Kw::Var) | TokenKind::Keyword(Kw::Const) => self.parse_let(),
             TokenKind::Keyword(Kw::Return) => self.parse_return(),
             TokenKind::Keyword(Kw::If) => self.parse_if(),
-            TokenKind::Keyword(Kw::While) => self.parse_while(),
-            TokenKind::Keyword(Kw::For) => self.parse_for(),
+            TokenKind::Keyword(Kw::While) => self.parse_while(None, None),
+            TokenKind::Keyword(Kw::For) => self.parse_for(None, None),
             TokenKind::Keyword(Kw::Break) => self.parse_break(),
             TokenKind::Keyword(Kw::Continue) => self.parse_continue(),
             TokenKind::Keyword(Kw::Defer) => self.parse_defer(),
             TokenKind::Keyword(Kw::Errdefer) => self.parse_errdefer(),
             TokenKind::Keyword(Kw::Switch) => self.parse_switch(),
             TokenKind::LBrace => Ok(Stmt::Block(self.parse_block()?)),
+            // A labeled loop `name: while (…)` / `name: for (…)` (SPEC §40): an
+            // identifier, a `:`, then a `while`/`for` keyword. Detected with
+            // three-token lookahead so an ordinary expression statement (which
+            // never begins `IDENT :`) is undisturbed; a `name:` followed by
+            // anything but a loop keyword falls through to `parse_expr_stmt`.
+            TokenKind::Ident(_)
+                if matches!(self.peek2_kind(), TokenKind::Colon)
+                    && matches!(
+                        self.peek3_kind(),
+                        TokenKind::Keyword(Kw::While) | TokenKind::Keyword(Kw::For)
+                    ) =>
+            {
+                self.parse_labeled_loop()
+            }
             // A simple-name target followed by an assignment operator (`=` or a
             // compound `+= -= *= /= %=`, SPEC §27.1) is a `Stmt::Assign`; a
             // field/index place is handled by `parse_expr_stmt`.
@@ -967,8 +981,17 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_while(&mut self) -> PResult<Stmt> {
-        let start = self.peek_span();
+    /// Parse a `while` loop (SPEC §2, §8). `label` is `Some(name)` when reached
+    /// via [`Parser::parse_labeled_loop`] for a `name: while (…)` form (SPEC §40),
+    /// else `None`. `label_start`, when present, is the span of the leading label
+    /// identifier, so the loop's span begins at the label rather than the `while`
+    /// keyword; an unlabeled loop passes `None` and starts at `while` as before.
+    fn parse_while(
+        &mut self,
+        label: Option<String>,
+        label_start: Option<Span>,
+    ) -> PResult<Stmt> {
+        let start = label_start.unwrap_or_else(|| self.peek_span());
         self.bump(); // `while`
         self.expect_punct(&TokenKind::LParen, "`(`")?;
         let cond = self.parse_expr()?;
@@ -988,8 +1011,23 @@ impl<'a> Parser<'a> {
             cond,
             cont,
             body,
+            label,
             span,
         })
+    }
+
+    /// Parse a labeled loop `name: while (…)` / `name: for (…)` (SPEC §40). The
+    /// cursor is on the label identifier; `parse_stmt` has already confirmed (via
+    /// three-token lookahead) that a `:` and a `while`/`for` keyword follow. The
+    /// label span is threaded into the loop so its overall span covers the label.
+    fn parse_labeled_loop(&mut self) -> PResult<Stmt> {
+        let (name, label_span) = self.expect_ident()?;
+        self.expect_punct(&TokenKind::Colon, "`:`")?;
+        match self.peek_kind() {
+            TokenKind::Keyword(Kw::While) => self.parse_while(Some(name), Some(label_span)),
+            TokenKind::Keyword(Kw::For) => self.parse_for(Some(name), Some(label_span)),
+            _ => Err(self.expected("`while` or `for` after a loop label")),
+        }
     }
 
     /// Parse a `while` continue-clause: an assignment `IDENT = expr` or a bare
@@ -1036,8 +1074,16 @@ impl<'a> Parser<'a> {
     /// parser's. The body is an ordinary braced block (a loop-body scope, so
     /// `break`/`continue`/`defer` behave; the lowering to an indexed `while` is
     /// an emit concern, SPEC §29.2).
-    fn parse_for(&mut self) -> PResult<Stmt> {
-        let start = self.peek_span();
+    ///
+    /// `label`/`label_start` mirror [`Parser::parse_while`]: `Some` when reached
+    /// via [`Parser::parse_labeled_loop`] for a `name: for (…)` form (SPEC §40),
+    /// `None` for a bare `for`.
+    fn parse_for(
+        &mut self,
+        label: Option<String>,
+        label_start: Option<Span>,
+    ) -> PResult<Stmt> {
+        let start = label_start.unwrap_or_else(|| self.peek_span());
         self.bump(); // `for`
         self.expect_punct(&TokenKind::LParen, "`(`")?;
         let iter = self.parse_expr()?;
@@ -1093,6 +1139,7 @@ impl<'a> Parser<'a> {
             elem,
             index,
             body,
+            label,
             span,
         })
     }
@@ -1100,15 +1147,37 @@ impl<'a> Parser<'a> {
     fn parse_break(&mut self) -> PResult<Stmt> {
         let start = self.peek_span();
         self.bump(); // `break`
+        let target = self.parse_loop_target()?;
         let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
-        Ok(Stmt::Break(start.merge(semi)))
+        Ok(Stmt::Break {
+            target,
+            span: start.merge(semi),
+        })
     }
 
     fn parse_continue(&mut self) -> PResult<Stmt> {
         let start = self.peek_span();
         self.bump(); // `continue`
+        let target = self.parse_loop_target()?;
         let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
-        Ok(Stmt::Continue(start.merge(semi)))
+        Ok(Stmt::Continue {
+            target,
+            span: start.merge(semi),
+        })
+    }
+
+    /// Parse the optional target label of a `break`/`continue` (SPEC §40): a
+    /// `: IDENT` after the keyword names an enclosing labeled loop and yields
+    /// `Some(name)`; a bare `break;`/`continue;` (no colon) yields `None` (the
+    /// innermost loop, unchanged). The cursor is just past the keyword. That the
+    /// label actually names an enclosing loop is a sema concern (SPEC §40.1).
+    fn parse_loop_target(&mut self) -> PResult<Option<String>> {
+        if self.eat_punct(&TokenKind::Colon) {
+            let (name, _) = self.expect_ident()?;
+            Ok(Some(name))
+        } else {
+            Ok(None)
+        }
     }
 
     fn parse_defer(&mut self) -> PResult<Stmt> {
@@ -2409,7 +2478,7 @@ mod tests {
                 ..
             } => {
                 assert!(matches!(cont.as_ref(), Stmt::Expr(Expr::Ident { .. })));
-                assert!(matches!(body.stmts[0], Stmt::Break(_)));
+                assert!(matches!(body.stmts[0], Stmt::Break { .. }));
             }
             other => panic!("expected while-with-continue, got {:?}", other),
         }
@@ -7494,6 +7563,140 @@ mod tests {
                 assert_eq!(body.stmts.len(), 1, "the loop body keeps its statement");
             }
             other => panic!("expected for loop, got {:?}", other),
+        }
+    }
+
+    // ---- v0.147: labeled break / continue (SPEC §40) ----------------------
+
+    #[test]
+    fn labeled_while_with_break_to_label() {
+        // outer: while (c) { break :outer; }
+        //   => While.label Some("outer"), inner Break.target Some("outer").
+        match first_stmt(vec![
+            id("outer"),
+            TokenKind::Colon,
+            TokenKind::Keyword(Kw::While),
+            TokenKind::LParen,
+            id("c"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Break),
+            TokenKind::Colon,
+            id("outer"),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]) {
+            Stmt::While { label, body, .. } => {
+                assert_eq!(label.as_deref(), Some("outer"), "loop carries its label");
+                match &body.stmts[0] {
+                    Stmt::Break { target, .. } => {
+                        assert_eq!(target.as_deref(), Some("outer"), "break targets the label");
+                    }
+                    other => panic!("expected break, got {:?}", other),
+                }
+            }
+            other => panic!("expected labeled while, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn labeled_for_with_continue_to_label() {
+        // each: for (xs) |x| { continue :each; }
+        //   => For.label Some("each"), inner Continue.target Some("each").
+        match first_stmt(vec![
+            id("each"),
+            TokenKind::Colon,
+            TokenKind::Keyword(Kw::For),
+            TokenKind::LParen,
+            id("xs"),
+            TokenKind::RParen,
+            TokenKind::Pipe,
+            id("x"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Continue),
+            TokenKind::Colon,
+            id("each"),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]) {
+            Stmt::For { label, body, .. } => {
+                assert_eq!(label.as_deref(), Some("each"), "loop carries its label");
+                match &body.stmts[0] {
+                    Stmt::Continue { target, .. } => {
+                        assert_eq!(target.as_deref(), Some("each"), "continue targets the label");
+                    }
+                    other => panic!("expected continue, got {:?}", other),
+                }
+            }
+            other => panic!("expected labeled for, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unlabeled_break_has_no_target() {
+        // break;  => Break { target: None }.
+        match first_stmt(vec![TokenKind::Keyword(Kw::Break), TokenKind::Semicolon]) {
+            Stmt::Break { target, .. } => assert_eq!(target, None),
+            other => panic!("expected break, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn continue_with_label_target() {
+        // continue :lp;  => Continue { target: Some("lp") }.
+        match first_stmt(vec![
+            TokenKind::Keyword(Kw::Continue),
+            TokenKind::Colon,
+            id("lp"),
+            TokenKind::Semicolon,
+        ]) {
+            Stmt::Continue { target, .. } => assert_eq!(target.as_deref(), Some("lp")),
+            other => panic!("expected continue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unlabeled_while_has_no_label() {
+        // while (c) { break; }  — a bare loop carries no label (label None), and an
+        // unlabeled break still parses (target None): v0.111-v0.146 behaviour.
+        match first_stmt(vec![
+            TokenKind::Keyword(Kw::While),
+            TokenKind::LParen,
+            id("c"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Break),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]) {
+            Stmt::While { label, body, .. } => {
+                assert_eq!(label, None, "a bare while has no label");
+                assert!(matches!(
+                    body.stmts[0],
+                    Stmt::Break { target: None, .. }
+                ));
+            }
+            other => panic!("expected while, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unlabeled_for_has_no_label() {
+        // for (xs) |x| {}  — a bare for carries no label (label None).
+        match first_stmt(vec![
+            TokenKind::Keyword(Kw::For),
+            TokenKind::LParen,
+            id("xs"),
+            TokenKind::RParen,
+            TokenKind::Pipe,
+            id("x"),
+            TokenKind::Pipe,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]) {
+            Stmt::For { label, .. } => assert_eq!(label, None, "a bare for has no label"),
+            other => panic!("expected for, got {:?}", other),
         }
     }
 

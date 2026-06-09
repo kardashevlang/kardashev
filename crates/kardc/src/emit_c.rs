@@ -110,7 +110,7 @@ fn stmt_uses_panic(s: &Stmt) -> bool {
                 || block_uses_panic(body)
         }
         Stmt::For { iter, body, .. } => expr_uses_panic(iter) || block_uses_panic(body),
-        Stmt::Break(_) | Stmt::Continue(_) => false,
+        Stmt::Break { .. } | Stmt::Continue { .. } => false,
         Stmt::Defer { stmt, .. } | Stmt::ErrDefer { stmt, .. } => stmt_uses_panic(stmt),
         Stmt::Block(b) => block_uses_panic(b),
         Stmt::Switch {
@@ -183,6 +183,13 @@ struct Scope {
     /// temp is not a `kd_`-prefixed source binding). `None` for `while`/plain
     /// scopes, so their lowering is unchanged.
     cont_raw: Option<String>,
+    /// The loop's source label, when this is a *labeled* loop-body scope
+    /// (`name: while …` / `name: for …`, v0.147). Drives the C break/continue
+    /// labels `__kd_brk_<label>` / `__kd_cont_<label>` and lets a labeled
+    /// `break :name` / `continue :name` flush `defer`s out to exactly this
+    /// scope. `None` for unlabeled loops and plain scopes, so their lowering is
+    /// byte-identical to pre-v0.147.
+    loop_label: Option<String>,
     /// Types of locals/params introduced in this scope, keyed by source name.
     /// Used both to resolve a method call's receiver to the struct whose
     /// function is invoked (`kd_<Struct>_<method>`) and to decide optional
@@ -198,6 +205,7 @@ impl Scope {
             is_loop_body: false,
             cont: None,
             cont_raw: None,
+            loop_label: None,
             var_types: HashMap::new(),
         }
     }
@@ -214,6 +222,7 @@ impl Scope {
             is_loop_body: true,
             cont,
             cont_raw: None,
+            loop_label: None,
             var_types: HashMap::new(),
         }
     }
@@ -1607,12 +1616,25 @@ impl<'a> Emitter<'a> {
                 break;
             }
         }
+        // On fall-through off the body end, flush this scope's `defer`s.
         if !diverged {
             self.flush_current_reversed(false);
-            // A loop body runs its continue-clause at the end of each iteration
-            // (the fall-through edge), after the body's defers.
-            if self.scopes.last().map(|s| s.is_loop_body).unwrap_or(false) {
-                let idx = self.scopes.len() - 1;
+        }
+        // A loop body runs its continue-clause at the end of each iteration —
+        // after the body's defers, before re-testing. For a *labeled* loop
+        // (v0.147) the continue-clause is preceded by the C continue-label
+        // `__kd_cont_<L>:;`, which a `continue :L` `goto`s to; the label is
+        // emitted *after* the fall-through defer flush, so the `goto` (which
+        // flushed those defers itself) skips re-flushing them. The label — and
+        // hence the continue-clause it guards — must exist even when the body
+        // diverges, since the `goto` from a deeper scope still targets it.
+        if self.scopes.last().map(|s| s.is_loop_body).unwrap_or(false) {
+            let idx = self.scopes.len() - 1;
+            let label = self.scopes[idx].loop_label.clone();
+            if let Some(l) = &label {
+                self.line(&format!("__kd_cont_{}:;", l));
+            }
+            if !diverged || label.is_some() {
                 self.emit_loop_cont(idx);
             }
         }
@@ -1813,13 +1835,25 @@ impl<'a> Emitter<'a> {
                 None => self.emit_if(cond, then, els),
             },
             Stmt::While {
-                cond, cont, body, ..
+                cond,
+                cont,
+                body,
+                label,
+                ..
             } => {
                 let cs = self.emit_expr(cond);
                 self.line(&format!("while ({}) {{", cs));
                 let cont_stmt = cont.as_ref().map(|b| (**b).clone());
-                self.emit_block(body, Scope::loop_body(cont_stmt));
+                let mut scope = Scope::loop_body(cont_stmt);
+                scope.loop_label = label.clone();
+                self.emit_block(body, scope);
                 self.line("}");
+                // A labeled loop (v0.147) places its C break-label after the
+                // closing brace, so a `break :L` `goto __kd_brk_L;` lands past
+                // both this loop and any nested loops it jumped out of.
+                if let Some(l) = label {
+                    self.line(&format!("__kd_brk_{}:;", l));
+                }
                 // A `while` may iterate zero times or `break`, so the loop
                 // statement itself never diverges.
                 false
@@ -1829,18 +1863,47 @@ impl<'a> Emitter<'a> {
                 elem,
                 index,
                 body,
+                label,
                 ..
-            } => self.emit_for(iter, elem, index, body),
-            Stmt::Break(_) => {
-                self.flush_to_loop_reversed();
-                self.line("break;");
+            } => self.emit_for(iter, elem, index, body, label),
+            Stmt::Break { target, .. } => {
+                match target {
+                    // Unlabeled (v0.111): flush to the innermost loop, then a C
+                    // `break;`. Byte-identical to pre-v0.147.
+                    None => {
+                        self.flush_to_loop_reversed();
+                        self.line("break;");
+                    }
+                    // Labeled `break :L` (v0.147): flush `defer`s out to and
+                    // including loop `L`'s scope, then `goto` its break-label
+                    // (which sits just past `L`'s closing brace), exiting every
+                    // loop in between.
+                    Some(l) => {
+                        self.flush_to_labeled_loop(l);
+                        self.line(&format!("goto __kd_brk_{};", l));
+                    }
+                }
                 true
             }
-            Stmt::Continue(_) => {
-                if let Some(i) = self.flush_to_loop_reversed() {
-                    self.emit_loop_cont(i);
+            Stmt::Continue { target, .. } => {
+                match target {
+                    // Unlabeled (v0.111): flush to the innermost loop, run its
+                    // continue-clause, then a C `continue;`. Unchanged.
+                    None => {
+                        if let Some(i) = self.flush_to_loop_reversed() {
+                            self.emit_loop_cont(i);
+                        }
+                        self.line("continue;");
+                    }
+                    // Labeled `continue :L` (v0.147): flush `defer`s out to and
+                    // including loop `L`'s scope, then `goto` its continue-label.
+                    // That label runs `L`'s continue-clause and re-tests, so the
+                    // clause is *not* emitted here (the `goto` target emits it).
+                    Some(l) => {
+                        self.flush_to_labeled_loop(l);
+                        self.line(&format!("goto __kd_cont_{};", l));
+                    }
                 }
-                self.line("continue;");
                 true
             }
             Stmt::Defer { stmt, .. } => {
@@ -2113,6 +2176,7 @@ impl<'a> Emitter<'a> {
         elem: &str,
         index: &Option<String>,
         body: &Block,
+        label: &Option<String>,
     ) -> bool {
         // The iterable's type selects the element access (`.ptr[i]` for a slice,
         // `.data[i]` for an array) and the length form (the runtime `.len` of a
@@ -2160,6 +2224,7 @@ impl<'a> Emitter<'a> {
         // types so body uses (method calls, coercion) resolve correctly.
         let mut scope = Scope::loop_body(None);
         scope.cont_raw = Some(format!("{} += 1;", iv));
+        scope.loop_label = label.clone();
         scope.var_types.insert(elem.to_string(), elem_ty);
         if let Some(ix) = index {
             scope.var_types.insert(ix.clone(), Type::Usize);
@@ -2177,7 +2242,12 @@ impl<'a> Emitter<'a> {
         }
 
         // Emit the body statements; on fall-through flush the body's defers and
-        // run the index increment (mirroring `emit_block`'s loop handling).
+        // run the index increment (mirroring `emit_block`'s loop handling). For
+        // a *labeled* `for` (v0.147) the increment is preceded by the C
+        // continue-label `__kd_cont_<L>:;` (a `continue :L` `goto`s to it),
+        // placed after the fall-through defer flush so the `goto` skips
+        // re-flushing. The label — and so the increment — is emitted even when
+        // the body diverges, since the `goto` still targets it.
         let mut diverged = false;
         for s in &body.stmts {
             diverged = self.emit_stmt(s);
@@ -2187,7 +2257,12 @@ impl<'a> Emitter<'a> {
         }
         if !diverged {
             self.flush_current_reversed(false);
-            let idx = self.scopes.len() - 1;
+        }
+        let idx = self.scopes.len() - 1;
+        if let Some(l) = label {
+            self.line(&format!("__kd_cont_{}:;", l));
+        }
+        if !diverged || label.is_some() {
             self.emit_loop_cont(idx);
         }
         self.scopes.pop();
@@ -2196,6 +2271,11 @@ impl<'a> Emitter<'a> {
         self.line("}"); // close the `while` body
         self.indent -= 1;
         self.line("}"); // close the outer block
+        // A labeled `for` places its break-label past the outer block close, so
+        // a `break :L` `goto __kd_brk_L;` lands beyond the whole loop.
+        if let Some(l) = label {
+            self.line(&format!("__kd_brk_{}:;", l));
+        }
         // A `for` may iterate zero times, so the loop statement never diverges.
         false
     }
@@ -2609,6 +2689,28 @@ impl<'a> Emitter<'a> {
         let mut loop_idx = None;
         for i in (0..n).rev() {
             if self.scopes[i].is_loop_body {
+                loop_idx = Some(i);
+                break;
+            }
+        }
+        let loop_idx = loop_idx?;
+        for i in (loop_idx..n).rev() {
+            self.flush_scope(i, false);
+        }
+        Some(loop_idx)
+    }
+
+    /// Flush scopes innermost-first down to and including the loop-body scope
+    /// whose label is `label` (each reversed), for a labeled `break :L` /
+    /// `continue :L` (v0.147, SPEC §40.2). Returns that scope's index, or `None`
+    /// if no enclosing loop carries the label (which a validated module never
+    /// hits — sema rejects an unknown loop label). Like `break`/`continue`,
+    /// these are normal exits, so `errdefer`s never run here.
+    fn flush_to_labeled_loop(&mut self, label: &str) -> Option<usize> {
+        let n = self.scopes.len();
+        let mut loop_idx = None;
+        for i in (0..n).rev() {
+            if self.scopes[i].is_loop_body && self.scopes[i].loop_label.as_deref() == Some(label) {
                 loop_idx = Some(i);
                 break;
             }
@@ -4311,7 +4413,10 @@ mod tests {
     #[test]
     fn while_continue_runs_cont_then_continues() {
         // fn g() void { while (true) : (print(9)) { continue; } }
-        let body = block(vec![Stmt::Continue(Span::DUMMY)]);
+        let body = block(vec![Stmt::Continue {
+            target: None,
+            span: Span::DUMMY,
+        }]);
         let f = Func {
             is_pub: false,
             name: "g".to_string(),
@@ -4328,6 +4433,7 @@ mod tests {
                     span: Span::DUMMY,
                 }))),
                 body,
+                label: None,
                 span: Span::DUMMY,
             }]),
             span: Span::DUMMY,
@@ -7450,6 +7556,7 @@ mod tests {
                     },
                     cont: Some(Box::new(compound_assign("i", BinOp::Add, int(1)))),
                     body: block(vec![]),
+                    label: None,
                     span: Span::DUMMY,
                 },
             ]),
@@ -9563,6 +9670,7 @@ mod tests {
             elem: elem.to_string(),
             index: index.map(|s| s.to_string()),
             body: block(body),
+            label: None,
             span: Span::DUMMY,
         }
     }
@@ -9708,7 +9816,10 @@ mod tests {
                 ident("a"),
                 "x",
                 None,
-                vec![Stmt::Continue(Span::DUMMY)],
+                vec![Stmt::Continue {
+                    target: None,
+                    span: Span::DUMMY,
+                }],
             )],
         );
         let m = Module {
@@ -9727,6 +9838,449 @@ mod tests {
             out.matches("__kd_fi0 += 1;").count(),
             1,
             "exactly one increment expected (no duplicate on a diverging body):\n{out}"
+        );
+    }
+
+    // ---- v0.147: labeled break / continue (SPEC §40.2) --------------------
+
+    /// A labeled `name: while (cond) [: (cont)] { body }` (v0.147).
+    fn labeled_while(label: &str, cond: Expr, cont: Option<Stmt>, body: Vec<Stmt>) -> Stmt {
+        Stmt::While {
+            cond,
+            cont: cont.map(Box::new),
+            body: block(body),
+            label: Some(label.to_string()),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// An unlabeled `while (cond) { body }`.
+    fn plain_while(cond: Expr, body: Vec<Stmt>) -> Stmt {
+        Stmt::While {
+            cond,
+            cont: None,
+            body: block(body),
+            label: None,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn break_to(label: &str) -> Stmt {
+        Stmt::Break {
+            target: Some(label.to_string()),
+            span: Span::DUMMY,
+        }
+    }
+
+    fn continue_to(label: &str) -> Stmt {
+        Stmt::Continue {
+            target: Some(label.to_string()),
+            span: Span::DUMMY,
+        }
+    }
+
+    fn break_here() -> Stmt {
+        Stmt::Break {
+            target: None,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn continue_here() -> Stmt {
+        Stmt::Continue {
+            target: None,
+            span: Span::DUMMY,
+        }
+    }
+
+    fn if_then(cond: Expr, then: Vec<Stmt>) -> Stmt {
+        Stmt::If {
+            cond,
+            capture: None,
+            then: block(then),
+            els: None,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `var <name>: i32 = <value>;`
+    fn let_i32(name: &str, value: Expr) -> Stmt {
+        Stmt::Let {
+            is_const: false,
+            name: name.to_string(),
+            ty: Some(ty("i32")),
+            value,
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn labeled_break_emits_brk_label_and_goto() {
+        // fn g() void { outer: while (true) { while (true) { break :outer; } } }
+        // The inner `break :outer` becomes `goto __kd_brk_outer;`; the label
+        // itself sits just past the *outer* loop's closing brace.
+        let inner = plain_while(
+            Expr::Bool {
+                value: true,
+                span: Span::DUMMY,
+            },
+            vec![break_to("outer")],
+        );
+        let f = func(
+            "g",
+            vec![],
+            "void",
+            vec![labeled_while(
+                "outer",
+                Expr::Bool {
+                    value: true,
+                    span: Span::DUMMY,
+                },
+                None,
+                vec![inner],
+            )],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            out.contains("goto __kd_brk_outer;"),
+            "labeled break must goto the break-label:\n{out}"
+        );
+        assert!(
+            out.contains("__kd_brk_outer:;"),
+            "break-label must be emitted:\n{out}"
+        );
+        // The break-label sits *after* the outer loop's closing brace, i.e. after
+        // the `goto` that jumps to it.
+        let goto_at = out.find("goto __kd_brk_outer;").unwrap();
+        let label_at = out.find("__kd_brk_outer:;").unwrap();
+        assert!(
+            goto_at < label_at,
+            "the break-label must follow the loop body (and the goto):\n{out}"
+        );
+        // Exactly one break-label / one continue-label per labeled loop.
+        assert_eq!(
+            out.matches("__kd_brk_outer:;").count(),
+            1,
+            "exactly one break-label expected:\n{out}"
+        );
+        assert_eq!(
+            out.matches("__kd_cont_outer:;").count(),
+            1,
+            "exactly one continue-label expected (even with no continue):\n{out}"
+        );
+    }
+
+    #[test]
+    fn labeled_continue_label_precedes_continue_clause() {
+        // fn g() void {
+        //     outer: while (true) : (print(9)) { while (true) { continue :outer; } }
+        // }
+        // `continue :outer` becomes `goto __kd_cont_outer;`; the continue-label
+        // sits *before* the outer loop's continue-clause, so the goto runs that
+        // clause and re-tests.
+        let inner = plain_while(
+            Expr::Bool {
+                value: true,
+                span: Span::DUMMY,
+            },
+            vec![continue_to("outer")],
+        );
+        let f = func(
+            "g",
+            vec![],
+            "void",
+            vec![labeled_while(
+                "outer",
+                Expr::Bool {
+                    value: true,
+                    span: Span::DUMMY,
+                },
+                Some(print(int(9))),
+                vec![inner],
+            )],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            out.contains("goto __kd_cont_outer;"),
+            "labeled continue must goto the continue-label:\n{out}"
+        );
+        let label_at = out
+            .find("__kd_cont_outer:;")
+            .expect("continue-label must be emitted");
+        let clause_at = out
+            .find("kd_print((long long)(9));")
+            .expect("the outer continue-clause must be emitted");
+        assert!(
+            label_at < clause_at,
+            "the continue-label must precede the continue-clause so the goto runs it:\n{out}"
+        );
+        // The labeled `continue` itself does NOT re-emit the clause inline (the
+        // goto target runs it) — the clause appears exactly once.
+        assert_eq!(
+            out.matches("kd_print((long long)(9));").count(),
+            1,
+            "the continue-clause must be emitted exactly once:\n{out}"
+        );
+    }
+
+    #[test]
+    fn unlabeled_break_continue_are_unchanged() {
+        // fn g() void { while (true) : (print(9)) { break; }  while (true) { continue; } }
+        // Regression: an unlabeled loop with unlabeled break/continue lowers to
+        // plain C `break;`/`continue;` and emits NO goto / NO labels.
+        let f = func(
+            "g",
+            vec![],
+            "void",
+            vec![
+                plain_while(
+                    Expr::Bool {
+                        value: true,
+                        span: Span::DUMMY,
+                    },
+                    vec![break_here()],
+                ),
+                Stmt::While {
+                    cond: Expr::Bool {
+                        value: true,
+                        span: Span::DUMMY,
+                    },
+                    cont: Some(Box::new(print(int(9)))),
+                    body: block(vec![continue_here()]),
+                    label: None,
+                    span: Span::DUMMY,
+                },
+            ],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(out.contains("break;"), "unlabeled break must stay `break;`:\n{out}");
+        assert!(
+            out.contains("continue;"),
+            "unlabeled continue must stay `continue;`:\n{out}"
+        );
+        assert!(
+            !out.contains("goto __kd_"),
+            "unlabeled loops must not emit any goto:\n{out}"
+        );
+        assert!(
+            !out.contains("__kd_brk_") && !out.contains("__kd_cont_"),
+            "unlabeled loops must not emit any break/continue label:\n{out}"
+        );
+        // The unlabeled continue still runs its loop's continue-clause first.
+        let clause_at = out.find("kd_print((long long)(9));").expect("cont-clause present");
+        let cont_at = out.find("continue;").expect("continue present");
+        assert!(
+            clause_at < cont_at,
+            "the continue-clause must run before the C continue:\n{out}"
+        );
+    }
+
+    #[test]
+    fn labeled_break_flushes_inner_defer_before_goto() {
+        // fn g() void {
+        //     outer: while (true) { while (true) { defer print(7); break :outer; } }
+        // }
+        // The inner loop's `defer` flushes before the `goto __kd_brk_outer;`.
+        let inner = plain_while(
+            Expr::Bool {
+                value: true,
+                span: Span::DUMMY,
+            },
+            vec![defer(print(int(7))), break_to("outer")],
+        );
+        let f = func(
+            "g",
+            vec![],
+            "void",
+            vec![labeled_while(
+                "outer",
+                Expr::Bool {
+                    value: true,
+                    span: Span::DUMMY,
+                },
+                None,
+                vec![inner],
+            )],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        let defer_at = out
+            .find("kd_print((long long)(7));")
+            .expect("the inner defer must flush");
+        let goto_at = out
+            .find("goto __kd_brk_outer;")
+            .expect("labeled break goto present");
+        assert!(
+            defer_at < goto_at,
+            "the inner loop's defer must flush before the labeled break goto:\n{out}"
+        );
+    }
+
+    #[test]
+    fn labeled_for_emits_brk_and_cont_labels() {
+        // fn go(a: [3]i32) void { outer: for (a) |x| { break :outer; } }
+        let structs = arr_int_table();
+        let f = fn_one_param(
+            "go",
+            "a",
+            arr_ty("i32", 3),
+            vec![Stmt::For {
+                iter: ident("a"),
+                elem: "x".to_string(),
+                index: None,
+                body: block(vec![break_to("outer")]),
+                label: Some("outer".to_string()),
+                span: Span::DUMMY,
+            }],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("goto __kd_brk_outer;"),
+            "labeled for-break must goto:\n{out}"
+        );
+        // The continue-label precedes the index increment (a `continue :outer`
+        // goto runs it), and both exist even though the body diverges.
+        let cont_at = out
+            .find("__kd_cont_outer:;")
+            .expect("for continue-label present");
+        let inc_at = out.find("__kd_fi0 += 1;").expect("index increment present");
+        assert!(
+            cont_at < inc_at,
+            "the continue-label must precede the index increment:\n{out}"
+        );
+        // The break-label sits past the for's outer block close.
+        let brk_at = out
+            .find("__kd_brk_outer:;")
+            .expect("for break-label present");
+        assert!(
+            inc_at < brk_at,
+            "the break-label must follow the loop (and its outer block):\n{out}"
+        );
+    }
+
+    #[test]
+    fn labeled_break_exits_both_loops_end_to_end() {
+        // fn main() i32 {
+        //     var count: i32 = 0; var i: i32 = 0;
+        //     outer: while (i < 3) : (i = i + 1) {
+        //         var j: i32 = 0;
+        //         while (j < 3) : (j = j + 1) {
+        //             count = count + 1;
+        //             if (count == 4) { break :outer; }
+        //         }
+        //     }
+        //     return count;
+        // }
+        // Unlabeled, the inner break would leave 9 iterations to run (count→9);
+        // `break :outer` leaves BOTH loops at count==4, so main returns 4.
+        let inner = Stmt::While {
+            cond: binary(BinOp::Lt, ident("j"), int(3)),
+            cont: Some(Box::new(assign("j", binary(BinOp::Add, ident("j"), int(1))))),
+            body: block(vec![
+                assign("count", binary(BinOp::Add, ident("count"), int(1))),
+                if_then(
+                    binary(BinOp::Eq, ident("count"), int(4)),
+                    vec![break_to("outer")],
+                ),
+            ]),
+            label: None,
+            span: Span::DUMMY,
+        };
+        let outer = labeled_while(
+            "outer",
+            binary(BinOp::Lt, ident("i"), int(3)),
+            Some(assign("i", binary(BinOp::Add, ident("i"), int(1)))),
+            vec![let_i32("j", int(0)), inner],
+        );
+        let f = func(
+            "main",
+            vec![],
+            "i32",
+            vec![
+                let_i32("count", int(0)),
+                let_i32("i", int(0)),
+                outer,
+                ret(ident("count")),
+            ],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let c = emit(&m, &StructTable::new(), EmitMode::Program);
+        let code = crate::backend::cc_build_and_run(&c, &[])
+            .expect("labeled-break program should compile and run");
+        assert_eq!(code, 4, "break :outer must exit both loops at count==4\n{c}");
+    }
+
+    #[test]
+    fn labeled_continue_advances_outer_loop_end_to_end() {
+        // fn main() i32 {
+        //     var count: i32 = 0; var i: i32 = 0;
+        //     outer: while (i < 3) : (i = i + 1) {
+        //         var j: i32 = 0;
+        //         while (j < 3) : (j = j + 1) {
+        //             count = count + 1;
+        //             if (j == 0) { continue :outer; }
+        //         }
+        //     }
+        //     return count;
+        // }
+        // `continue :outer` jumps straight to the OUTER loop's next iteration
+        // (running `i = i + 1`), so the inner loop only ever runs its first
+        // iteration: count increments once per outer pass → main returns 3.
+        let inner = Stmt::While {
+            cond: binary(BinOp::Lt, ident("j"), int(3)),
+            cont: Some(Box::new(assign("j", binary(BinOp::Add, ident("j"), int(1))))),
+            body: block(vec![
+                assign("count", binary(BinOp::Add, ident("count"), int(1))),
+                if_then(
+                    binary(BinOp::Eq, ident("j"), int(0)),
+                    vec![continue_to("outer")],
+                ),
+            ]),
+            label: None,
+            span: Span::DUMMY,
+        };
+        let outer = labeled_while(
+            "outer",
+            binary(BinOp::Lt, ident("i"), int(3)),
+            Some(assign("i", binary(BinOp::Add, ident("i"), int(1)))),
+            vec![let_i32("j", int(0)), inner],
+        );
+        let f = func(
+            "main",
+            vec![],
+            "i32",
+            vec![
+                let_i32("count", int(0)),
+                let_i32("i", int(0)),
+                outer,
+                ret(ident("count")),
+            ],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let c = emit(&m, &StructTable::new(), EmitMode::Program);
+        let code = crate::backend::cc_build_and_run(&c, &[])
+            .expect("labeled-continue program should compile and run");
+        assert_eq!(
+            code, 3,
+            "continue :outer must advance the outer loop (count==3)\n{c}"
         );
     }
 

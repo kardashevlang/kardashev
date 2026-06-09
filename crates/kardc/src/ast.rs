@@ -247,6 +247,9 @@ pub enum Stmt {
         cond: Expr,
         cont: Option<Box<Stmt>>,
         body: Block,
+        /// `Some(name)` for a labeled loop `name: while (…)` (v0.147), targetable
+        /// by `break :name` / `continue :name`.
+        label: Option<String>,
         span: Span,
     },
     /// `for (iter) |elem| { body }` or `for (iter, 0..) |elem, index| { body }`
@@ -257,10 +260,21 @@ pub enum Stmt {
         elem: String,
         index: Option<String>,
         body: Block,
+        /// `Some(name)` for a labeled loop `name: for (…)` (v0.147).
+        label: Option<String>,
         span: Span,
     },
-    Break(Span),
-    Continue(Span),
+    /// `break;` or `break :label;` (v0.147). `target` is `Some(label)` to break
+    /// out of the enclosing loop with that label, else the innermost loop.
+    Break {
+        target: Option<String>,
+        span: Span,
+    },
+    /// `continue;` or `continue :label;` (v0.147).
+    Continue {
+        target: Option<String>,
+        span: Span,
+    },
     /// `defer stmt;` — runs `stmt` at scope exit, in LIFO order.
     Defer {
         stmt: Box<Stmt>,
@@ -312,8 +326,8 @@ impl Stmt {
             Stmt::If { span, .. } => *span,
             Stmt::While { span, .. } => *span,
             Stmt::For { span, .. } => *span,
-            Stmt::Break(s) => *s,
-            Stmt::Continue(s) => *s,
+            Stmt::Break { span, .. } => *span,
+            Stmt::Continue { span, .. } => *span,
             Stmt::Defer { span, .. } => *span,
             Stmt::ErrDefer { span, .. } => *span,
             Stmt::Block(b) => b.span,
