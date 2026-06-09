@@ -4217,141 +4217,16 @@ fn c_double_literal(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::fixtures::{
+        arr_param_ty, arr_ty, bin as binary, block, call, err_ty, error_lit, ident, int, opt_ty,
+        ptr_ty, set_err_ty, slice_ty, try_expr, ty,
+    };
     use crate::ast::{
-        ArraySize, BinOp, Block, ConstDecl, ErrorSetDecl, Expr, FieldDecl, FieldInit, Func, Item,
-        Module, Param, Stmt, StructDecl, SwitchArm, TestBlock, TypeExpr,
+        BinOp, ConstDecl, ErrorSetDecl, Expr, FieldDecl, FieldInit, Func, Item, Module, Param,
+        Stmt, StructDecl, SwitchArm, TestBlock, TypeExpr,
     };
     use crate::span::Span;
     use crate::types::{ComptimeArg, StructTable, Type};
-
-    fn ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    fn opt_ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: true,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    /// An error union over the **implicit global** error set, `!name` (§12).
-    fn err_ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: true,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    /// An error union over a **named** error set, `set!name` (v0.139, §34). The
-    /// runtime representation is identical to [`err_ty`] — the set name is a
-    /// pure sema constraint and the backend must ignore it.
-    fn set_err_ty(set: &str, name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: true,
-            error_set: Some(set.to_string()),
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    /// A fixed-size array type `[len]name` with a literal length
-    /// (`array_len = Some(ArraySize::Lit(len))`, the element type name in
-    /// `name`).
-    fn arr_ty(name: &str, len: i64) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: Some(ArraySize::Lit(len)),
-            pointer: false,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    /// A comptime-value-parameter-sized array type `[param]name`
-    /// (`array_len = Some(ArraySize::Param(param))`, v0.128).
-    fn arr_param_ty(name: &str, param: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: Some(ArraySize::Param(param.to_string())),
-            pointer: false,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    /// A pointer type `*name` (v0.118).
-    fn ptr_ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: true,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    /// A slice type `[]name` (v0.118).
-    fn slice_ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: true,
-            span: Span::DUMMY,
-        }
-    }
-
-    fn ident(name: &str) -> Expr {
-        Expr::Ident {
-            name: name.to_string(),
-            span: Span::DUMMY,
-        }
-    }
-
-    fn int(v: i64) -> Expr {
-        Expr::Int {
-            value: v,
-            span: Span::DUMMY,
-        }
-    }
 
     fn float(v: f64) -> Expr {
         Expr::Float {
@@ -4365,22 +4240,6 @@ mod tests {
         Expr::Builtin {
             name: "as".to_string(),
             args: vec![ident(ty_name), e],
-            span: Span::DUMMY,
-        }
-    }
-
-    fn binary(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
-        Expr::Binary {
-            op,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-            span: Span::DUMMY,
-        }
-    }
-
-    fn block(stmts: Vec<Stmt>) -> Block {
-        Block {
-            stmts,
             span: Span::DUMMY,
         }
     }
@@ -5702,28 +5561,6 @@ mod tests {
         let mut t = StructTable::new();
         t.intern_error_union(Type::I32);
         t
-    }
-
-    fn error_lit(name: &str) -> Expr {
-        Expr::ErrorLit {
-            name: name.to_string(),
-            span: Span::DUMMY,
-        }
-    }
-
-    fn call(callee: &str, args: Vec<Expr>) -> Expr {
-        Expr::Call {
-            callee: callee.to_string(),
-            args,
-            span: Span::DUMMY,
-        }
-    }
-
-    fn try_expr(inner: Expr) -> Expr {
-        Expr::Try {
-            expr: Box::new(inner),
-            span: Span::DUMMY,
-        }
     }
 
     #[test]

@@ -4605,6 +4605,12 @@ fn needs_inference_context(e: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::fixtures::{
+        arr_param_ty as te_arr_param, arr_ty as te_arr, bin, block, call, catch_capture_expr,
+        catch_expr, err_ty as te_err, error_lit, ident, int, null as null_lit, opt_ty as te_opt,
+        orelse, ptr_ty as te_ptr, set_err_ty as te_err_set, slice_ty as te_slice, try_expr,
+        ty as te, unwrap,
+    };
     use crate::ast::{
         ConstDecl, EnumDecl, EnumVariant, ErrorSetDecl, FieldDecl, FieldInit, Func, Param,
         StructDecl, TestBlock, UnionDecl, UnionVariant,
@@ -4612,112 +4618,6 @@ mod tests {
 
     fn sp() -> Span {
         Span::DUMMY
-    }
-    fn te(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.into(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: sp(),
-        }
-    }
-    /// An optional type expression `?name`.
-    fn te_opt(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.into(),
-            optional: true,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: sp(),
-        }
-    }
-    /// An error-union type expression `!name` (the global error set, v0.115).
-    fn te_err(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.into(),
-            optional: false,
-            error_union: true,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: sp(),
-        }
-    }
-    /// A *named* error-union type expression `set!name` (v0.139): the error union
-    /// over the named error set `set` with payload type `name`.
-    fn te_err_set(set: &str, name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.into(),
-            optional: false,
-            error_union: true,
-            error_set: Some(set.into()),
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: sp(),
-        }
-    }
-    /// A fixed-size array type expression `[len]elem` with a literal length
-    /// (v0.117).
-    fn te_arr(elem: &str, len: i64) -> TypeExpr {
-        TypeExpr {
-            name: elem.into(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: Some(ArraySize::Lit(len)),
-            pointer: false,
-            slice: false,
-            span: sp(),
-        }
-    }
-    /// An array type expression `[name]elem` whose length is the comptime
-    /// value-parameter `name` (v0.128).
-    fn te_arr_param(elem: &str, name: &str) -> TypeExpr {
-        TypeExpr {
-            name: elem.into(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: Some(ArraySize::Param(name.into())),
-            pointer: false,
-            slice: false,
-            span: sp(),
-        }
-    }
-    /// A pointer type expression `*name` (v0.118).
-    fn te_ptr(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.into(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: true,
-            slice: false,
-            span: sp(),
-        }
-    }
-    /// A slice type expression `[]name` (v0.118).
-    fn te_slice(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.into(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: true,
-            span: sp(),
-        }
     }
     /// `&place` — address-of (v0.118).
     fn addr_of(place: Expr) -> Expr {
@@ -4816,35 +4716,6 @@ mod tests {
             span: sp(),
         }
     }
-    fn error_lit(name: &str) -> Expr {
-        Expr::ErrorLit {
-            name: name.into(),
-            span: sp(),
-        }
-    }
-    fn try_expr(e: Expr) -> Expr {
-        Expr::Try {
-            expr: Box::new(e),
-            span: sp(),
-        }
-    }
-    fn catch_expr(e: Expr, default: Expr) -> Expr {
-        Expr::Catch {
-            expr: Box::new(e),
-            capture: None,
-            default: Box::new(default),
-            span: sp(),
-        }
-    }
-    /// `expr catch |name| default` — the capturing handler form (v0.142, §36).
-    fn catch_capture_expr(e: Expr, name: &str, default: Expr) -> Expr {
-        Expr::Catch {
-            expr: Box::new(e),
-            capture: Some(name.into()),
-            default: Box::new(default),
-            span: sp(),
-        }
-    }
     /// A function with an arbitrary [`TypeExpr`] return type (e.g. `!i32`).
     fn func_te(name: &str, params: Vec<Param>, ret: TypeExpr, body: Vec<Stmt>) -> Item {
         Item::Func(Func {
@@ -4855,22 +4726,6 @@ mod tests {
             body: block(body),
             span: sp(),
         })
-    }
-    fn null_lit() -> Expr {
-        Expr::Null { span: sp() }
-    }
-    fn orelse(lhs: Expr, rhs: Expr) -> Expr {
-        Expr::Orelse {
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-            span: sp(),
-        }
-    }
-    fn unwrap(e: Expr) -> Expr {
-        Expr::Unwrap {
-            expr: Box::new(e),
-            span: sp(),
-        }
     }
     fn param_opt(name: &str, inner: &str) -> Param {
         Param {
@@ -4922,9 +4777,6 @@ mod tests {
             span: sp(),
         }
     }
-    fn int(v: i64) -> Expr {
-        Expr::Int { value: v, span: sp() }
-    }
     fn boolean(v: bool) -> Expr {
         Expr::Bool { value: v, span: sp() }
     }
@@ -4935,36 +4787,12 @@ mod tests {
             span: sp(),
         }
     }
-    fn ident(n: &str) -> Expr {
-        Expr::Ident {
-            name: n.into(),
-            span: sp(),
-        }
-    }
-    fn call(c: &str, args: Vec<Expr>) -> Expr {
-        Expr::Call {
-            callee: c.into(),
-            args,
-            span: sp(),
-        }
-    }
-    fn bin(op: BinOp, l: Expr, r: Expr) -> Expr {
-        Expr::Binary {
-            op,
-            lhs: Box::new(l),
-            rhs: Box::new(r),
-            span: sp(),
-        }
-    }
     fn unary(op: UnOp, e: Expr) -> Expr {
         Expr::Unary {
             op,
             expr: Box::new(e),
             span: sp(),
         }
-    }
-    fn block(stmts: Vec<Stmt>) -> Block {
-        Block { stmts, span: sp() }
     }
     fn param(name: &str, ty: &str) -> Param {
         Param {
