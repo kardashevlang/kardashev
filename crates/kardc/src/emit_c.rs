@@ -2478,9 +2478,19 @@ impl<'a> Emitter<'a> {
                 }
                 // Field access: `(<base>).kd_<field>`. The base is parenthesized
                 // so a compound base expression (e.g. a literal or another access)
-                // composes correctly: `((p).kd_a).kd_b`.
+                // composes correctly: `((p).kd_a).kd_b`. When the base is a
+                // pointer to a struct (`*Struct` — e.g. a `self: *Counter`
+                // pointer receiver, v0.134), the access auto-derefs through the
+                // pointer: `(*(<base>)).kd_<field>` (SPEC §30.1). General for any
+                // `*Struct`, not just `self`; because the field-assignment place
+                // lowering also reuses this path, `p.field = e` and `p.field op= e`
+                // likewise write *through* the pointer at the same C lvalue.
                 let b = self.emit_expr(base);
-                format!("({}).kd_{}", b, field)
+                if self.is_ptr_to_struct(base) {
+                    format!("(*({})).kd_{}", b, field)
+                } else {
+                    format!("({}).kd_{}", b, field)
+                }
             }
             Expr::StructLit { name, fields, .. } => {
                 // A union construction `Name{ .v = e }` reuses the struct-literal
@@ -2898,12 +2908,31 @@ impl<'a> Emitter<'a> {
             // Method call on a value: the receiver becomes the leading `self`
             // argument, then the remaining args (coerced against params[1..],
             // skipping the `self` parameter).
-            let self_str = self.emit_expr(receiver);
             let struct_name = self.struct_of_expr(receiver).unwrap_or_default();
             let params = self
                 .method_params
                 .get(&(struct_name.clone(), method.to_string()))
                 .cloned();
+            // A pointer-receiver method (v0.134, SPEC §30.2) has a `*Struct`
+            // `self` parameter (param 0). Auto-ref / auto-deref the receiver so
+            // the C `self` argument matches the parameter, whether the receiver
+            // expression is itself a struct value or is already a pointer:
+            //   value receiver + struct value    → pass the value (a copy)
+            //   ptr   receiver + struct value     → pass `&value`  (address-of)
+            //   value receiver + `*Struct` value  → pass `*ptr`    (deref)
+            //   ptr   receiver + `*Struct` value  → pass the pointer unchanged
+            // sema guarantees `&value` targets an addressable lvalue (a `var`,
+            // field or index); the address-of mutation is real and updates the
+            // caller's struct in place.
+            let ptr_receiver =
+                matches!(params.as_deref().and_then(|p| p.first()), Some(Type::Ptr(_)));
+            let recv_is_ptr = self.is_ptr_to_struct(receiver);
+            let recv = self.emit_expr(receiver);
+            let self_str = match (ptr_receiver, recv_is_ptr) {
+                (true, false) => format!("(&({}))", recv),
+                (false, true) => format!("(*({}))", recv),
+                _ => recv,
+            };
             let arg_strs = self.emit_coerced_args(args, params.as_deref(), 1);
             let mut all = Vec::with_capacity(1 + arg_strs.len());
             all.push(self_str);
@@ -3014,8 +3043,27 @@ impl<'a> Emitter<'a> {
     fn lookup_var_struct(&self, name: &str) -> Option<String> {
         match self.lookup_var_type(name)? {
             Type::Struct(id) => Some(self.structs.get(id).name.clone()),
+            // A `*Struct` local/param (e.g. a `self: *Counter` pointer receiver,
+            // v0.134) resolves to its pointee struct, so a method call on it
+            // names the right `kd_<Struct>_<method>` C function and the receiver
+            // auto-derefs/auto-refs (SPEC §30).
+            Type::Ptr(pid) => match self.ptr_pointee_any(pid) {
+                Type::Struct(id) => Some(self.structs.get(id).name.clone()),
+                _ => None,
+            },
             _ => None,
         }
+    }
+
+    /// True if `e` evaluates to a pointer-to-struct value (`*Struct`). Drives the
+    /// v0.134 auto-deref of `p.field` and the auto-ref/auto-deref of a method
+    /// receiver (SPEC §30). A non-pointer, or a pointer to a non-struct, is
+    /// `false` (those keep their pre-v0.134 lowering).
+    fn is_ptr_to_struct(&self, e: &Expr) -> bool {
+        matches!(
+            self.type_of_expr(e),
+            Some(Type::Ptr(pid)) if matches!(self.ptr_pointee_any(pid), Type::Struct(_))
+        )
     }
 
     /// The recorded type of a local/param, searching scopes innermost-first so
@@ -3114,6 +3162,13 @@ impl<'a> Emitter<'a> {
                 }
                 match self.type_of_expr(base)? {
                     Type::Struct(id) => self.structs.get(id).field_type(field),
+                    // `p.field` on a `*Struct` auto-derefs to the pointee's field
+                    // type (v0.134, SPEC §30.1) — so a field read/assign through a
+                    // pointer receiver resolves and coerces like a value access.
+                    Type::Ptr(pid) => match self.ptr_pointee_any(pid) {
+                        Type::Struct(id) => self.structs.get(id).field_type(field),
+                        _ => None,
+                    },
                     // `a.len` on an array is a `usize` constant (SPEC §14.3).
                     Type::Array(_) if field == "len" => Some(Type::Usize),
                     // `s.len` on a slice is a `usize` (SPEC §15.2).
@@ -4263,6 +4318,252 @@ mod tests {
         assert!(
             out.contains("kd_Counter_get(kd_c)"),
             "explicit-self associated call wrong:\n{out}"
+        );
+    }
+
+    // -- v0.134 pointer-receiver methods (true mutation) -------------------
+
+    /// A pointer-typed param `name: *ty_name` (`self: *Counter`).
+    fn ptr_param(name: &str, ty_name: &str) -> Param {
+        Param {
+            name: name.to_string(),
+            ty: ptr_ty(ty_name),
+            is_comptime: false,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `pub fn inc(self: *Counter) void { self.n += 1; }` — a pointer receiver
+    /// that mutates the pointee in place via a compound assignment.
+    fn counter_inc() -> Func {
+        Func {
+            is_pub: true,
+            name: "inc".to_string(),
+            params: vec![ptr_param("self", "Counter")],
+            ret: ty("void"),
+            body: block(vec![Stmt::FieldAssign {
+                place: field(ident("self"), "n"),
+                op: Some(BinOp::Add),
+                value: int(1),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn pointer_receiver_method_self_param_is_pointer() {
+        // The `self: *Counter` parameter spells as a C pointer, and the body's
+        // `self.n += 1` auto-derefs through it (SPEC §30.1, §30.3): the store
+        // re-spells the same dereferenced lvalue on both sides (single eval).
+        let structs = counter_table();
+        let m = Module {
+            items: vec![counter_struct(vec![counter_inc()])],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("void kd_Counter_inc(kd_struct_Counter* kd_self);"),
+            "ptr-receiver forward decl should take a pointer self:\n{out}"
+        );
+        assert!(
+            out.contains("void kd_Counter_inc(kd_struct_Counter* kd_self) {"),
+            "ptr-receiver definition should take a pointer self:\n{out}"
+        );
+        // `self.n += 1` writes *through* the pointer (the place is re-spelled on
+        // both sides; the field-assign wraps the dereferenced place in parens).
+        assert!(
+            out.contains("((*(kd_self)).kd_n) = ((*(kd_self)).kd_n) + (1);"),
+            "compound assign through self must write through the pointer:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pointer_receiver_call_on_value_takes_address() {
+        // fn run() void { var c: Counter = Counter{ .n = 0 }; c.inc(); c.inc(); }
+        // A pointer-receiver method called on a struct *value* auto-refs the
+        // receiver: `kd_Counter_inc((&(kd_c)))` (SPEC §30.2) — the mutation is
+        // real and updates `c` in place.
+        let structs = counter_table();
+        let run = Func {
+            is_pub: false,
+            name: "run".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "c".to_string(),
+                    ty: Some(ty("Counter")),
+                    value: Expr::StructLit {
+                        name: "Counter".to_string(),
+                        fields: vec![finit("n", int(0))],
+                        span: Span::DUMMY,
+                    },
+                    span: Span::DUMMY,
+                },
+                Stmt::Expr(method_call(ident("c"), "inc", vec![])),
+                Stmt::Expr(method_call(ident("c"), "inc", vec![])),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![counter_struct(vec![counter_inc()]), Item::Func(run)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_Counter_inc((&(kd_c)));"),
+            "ptr-receiver call on a value must take its address:\n{out}"
+        );
+    }
+
+    #[test]
+    fn value_receiver_call_on_value_passes_copy_unchanged() {
+        // A *value* receiver call is unchanged by v0.134: `c.get()` still passes
+        // the struct value by copy — no address-of — so the original is never
+        // mutated through it.
+        let structs = counter_table();
+        let user = func(
+            "peek",
+            vec![param("c", "Counter")],
+            "i32",
+            vec![ret(method_call(ident("c"), "get", vec![]))],
+        );
+        let m = Module {
+            items: vec![
+                counter_struct(vec![counter_get(), counter_inc()]),
+                Item::Func(user),
+            ],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_Counter_get(kd_c)"),
+            "value-receiver call must pass the value by copy:\n{out}"
+        );
+        // It must NOT take the address (that is the pointer-receiver lowering).
+        assert!(
+            !out.contains("kd_Counter_get((&("),
+            "value-receiver call must not take an address:\n{out}"
+        );
+    }
+
+    #[test]
+    fn field_assign_and_read_through_pointer_param() {
+        // fn bump(p: *Counter) void { p.n = 5; }   (a general `*Struct` param,
+        // not just `self`) — both the write and a later read auto-deref through
+        // the pointer (SPEC §30.1).
+        let structs = counter_table();
+        let bump = Func {
+            is_pub: false,
+            name: "bump".to_string(),
+            params: vec![ptr_param("p", "Counter")],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::FieldAssign {
+                    place: field(ident("p"), "n"),
+                    op: None,
+                    value: int(5),
+                    span: Span::DUMMY,
+                },
+                print(field(ident("p"), "n")),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![counter_struct(vec![]), Item::Func(bump)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // Write through the pointer.
+        assert!(
+            out.contains("((*(kd_p)).kd_n) = (5);"),
+            "field assign through a *Struct param must deref:\n{out}"
+        );
+        // Read through the pointer (the print arg auto-derefs).
+        assert!(
+            out.contains("(*(kd_p)).kd_n"),
+            "field read through a *Struct param must deref:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pointer_value_receiver_passes_pointer_unchanged() {
+        // fn drive(p: *Counter) void { p.inc(); }
+        // The receiver `p` is *already* a pointer and `inc` is a pointer
+        // receiver, so it is passed straight through — no extra `&` (SPEC §30.2).
+        let structs = counter_table();
+        let drive = Func {
+            is_pub: false,
+            name: "drive".to_string(),
+            params: vec![ptr_param("p", "Counter")],
+            ret: ty("void"),
+            body: block(vec![Stmt::Expr(method_call(ident("p"), "inc", vec![]))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![counter_struct(vec![counter_inc()]), Item::Func(drive)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_Counter_inc(kd_p);"),
+            "ptr receiver + ptr value must pass the pointer unchanged:\n{out}"
+        );
+        assert!(
+            !out.contains("kd_Counter_inc((&("),
+            "must not double-address an already-pointer receiver:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pointer_value_value_receiver_derefs() {
+        // fn peek(p: *Counter) i32 { return p.get(); }
+        // `get` is a *value* receiver but `p` is a pointer, so the receiver is
+        // dereferenced to pass the value by copy: `kd_Counter_get((*(kd_p)))`.
+        let structs = counter_table();
+        let peek = Func {
+            is_pub: false,
+            name: "peek".to_string(),
+            params: vec![ptr_param("p", "Counter")],
+            ret: ty("i32"),
+            body: block(vec![ret(method_call(ident("p"), "get", vec![]))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![counter_struct(vec![counter_get()]), Item::Func(peek)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_Counter_get((*(kd_p)))"),
+            "value receiver + ptr value must deref the receiver:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pointer_receiver_method_call_on_self_passes_self_unchanged() {
+        // Inside a pointer-receiver method, calling another pointer-receiver
+        // method on `self` passes `self` (already a pointer) unchanged:
+        //   fn inc2(self: *Counter) void { self.inc(); self.inc(); }
+        let structs = counter_table();
+        let inc2 = Func {
+            is_pub: true,
+            name: "inc2".to_string(),
+            params: vec![ptr_param("self", "Counter")],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Expr(method_call(ident("self"), "inc", vec![])),
+                Stmt::Expr(method_call(ident("self"), "inc", vec![])),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![counter_struct(vec![counter_inc(), inc2])],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_Counter_inc(kd_self);"),
+            "ptr-receiver call on a ptr `self` must pass it unchanged:\n{out}"
+        );
+        assert!(
+            !out.contains("kd_Counter_inc((&("),
+            "must not address an already-pointer `self`:\n{out}"
         );
     }
 

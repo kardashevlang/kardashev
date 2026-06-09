@@ -799,3 +799,74 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "150\n2\n2\n24\n");
 }
+
+// --- v0.134 pointer-receiver methods (true mutation) -----------------------
+
+#[test]
+fn pointer_receiver_methods_mutate() {
+    let src = r#"
+const Counter = struct {
+    n: i32,
+    fn inc(self: *Counter) void { self.n += 1; }        // pointer receiver mutates
+    fn add(self: *Counter, by: i32) void { self.n += by; }
+    fn get(self: Counter) i32 { return self.n; }         // value receiver unchanged
+};
+fn reset(c: *Counter) void { c.n = 0; }                  // write through a *Struct param
+pub fn main() i32 {
+    var c: Counter = Counter{ .n = 0 };
+    c.inc();
+    c.inc();
+    print(c.get());        // 2 (real mutation, auto-ref &c)
+    c.add(40);
+    print(c.get());        // 42
+    reset(&c);
+    print(c.get());        // 0
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "2\n42\n0\n");
+}
+
+#[test]
+fn pointer_receiver_generic_arraylist_push() {
+    // Pointer receivers on a generic struct: a mutating `push` (no value-return).
+    let src = r#"
+fn ArrayList(comptime T: type) type {
+    return struct {
+        items: []T,
+        count: usize,
+        fn init(a: Allocator) Self { return Self{ .items = alloc(a, T, 4), .count = 0 }; }
+        fn push(self: *Self, a: Allocator, x: T) void {
+            if (self.count == self.items.len) {
+                var nb: []T = alloc(a, T, self.items.len * 2);
+                var i: usize = 0;
+                while (i < self.count) : (i += 1) { nb[i] = self.items[i]; }
+                free(a, self.items);
+                self.items = nb;     // write a slice field through the pointer
+            }
+            self.items[self.count] = x;
+            self.count += 1;          // compound through the pointer
+        }
+        fn get(self: Self, i: usize) T { return self.items[i]; }
+        fn len(self: Self) usize { return self.count; }
+        fn deinit(self: Self, a: Allocator) void { free(a, self.items); }
+    };
+}
+const IntList = ArrayList(i32);
+pub fn main() i32 {
+    var a: Allocator = c_allocator();
+    var list: IntList = IntList.init(a);
+    var i: i32 = 0;
+    while (i < 6) : (i += 1) { list.push(a, i * i); }   // mutates in place, no reassign
+    print(list.len());        // 6
+    print(list.get(5));       // 25
+    list.deinit(a);
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "6\n25\n");
+}

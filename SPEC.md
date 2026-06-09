@@ -1123,3 +1123,29 @@ behave). The iterable is evaluated **once** into a temp:
 where `<len>` is `__kd_forN.len` for a slice / the literal `N` for an array, and
 `<elem-access>` is `__kd_forN.ptr[__kd_fiN]` (slice) / `__kd_forN.data[__kd_fiN]`
 (array).
+
+## 30. Pointer-receiver methods (true mutation) (v0.134)
+
+A method's `self` parameter may be a **pointer**: `fn bump(self: *Point, …)` (a
+named struct) or `fn push(self: *Self, …)` (a generic struct, §26). The method
+then mutates the receiver in place. A value receiver (`self: Point`/`self: Self`)
+is unchanged (a by-value copy). No new tokens/AST — `*Self`/`*Point` already
+parse (§15.1, §26).
+
+### 30.1 Auto-deref field access (`ptr.field`)
+For any `*Struct` value `p`, `p.field` reads `(*p).field` and `p.field = e` (and
+compound `p.field += e`) writes **through** the pointer. (General, not just for
+`self`.) Method calls likewise auto-deref a `*Struct` receiver.
+
+### 30.2 Auto-ref method calls
+A method call `obj.method(args)` whose method has a **pointer receiver** passes
+`&obj` — so `obj` must be an addressable lvalue (a `var`, field, or index; else
+an error, as for `&`). A value-receiver call passes `obj` by value (unchanged).
+An associated call `Type.method(args)` (no receiver value) passes its explicit
+arguments — including an explicit `self: *Self`/`Self` — unchanged.
+
+### 30.3 Backend (`emit_c`)
+A pointer-receiver method is `kd_<Struct>_<m>(<Struct>* self, …)`; inside it
+`self.field` lowers to `(*self).kd_field`. The call lowers to
+`kd_<Struct>_<m>(&(<obj>), …)`. Field read/assign on any `*Struct` lowers through
+`(*p)`. Mutations are real — they update the caller's struct.
