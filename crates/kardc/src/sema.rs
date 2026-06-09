@@ -189,6 +189,11 @@ struct Checker {
     /// `resolve_base`, so an alias is usable in type position (`var x: Alias`),
     /// as a struct-literal name (`Alias{ … }`), and for field access.
     type_aliases: HashMap<String, Type>,
+    /// Generic-struct method bodies awaiting type-checking (v0.138): registered
+    /// in Pass 0d but checked AFTER Pass 2, so a method body may reference
+    /// top-level `const`s and free functions. Each entry is
+    /// `(constructor name, instance struct id, substitution)`.
+    pending_ctor_methods: Vec<(String, u32, HashMap<String, Type>)>,
 }
 
 impl Checker {
@@ -209,6 +214,7 @@ impl Checker {
             generics: HashMap::new(),
             type_ctors: HashMap::new(),
             type_aliases: HashMap::new(),
+            pending_ctor_methods: Vec::new(),
         }
     }
 
@@ -582,6 +588,22 @@ impl Checker {
                         if let Some(dt) = declared {
                             self.const_types.insert(c.name.clone(), dt);
                         }
+                    }
+                }
+            }
+        }
+
+        // Pass 2b (v0.138): now that free-function signatures (Pass 1) and
+        // top-level consts (Pass 2) are registered, type-check the deferred
+        // generic-struct method bodies, so a method may reference both. Look the
+        // constructor up by name to recover its methods (its signatures were
+        // already registered during Pass 0d instantiation).
+        let pending = std::mem::take(&mut self.pending_ctor_methods);
+        for (ctor_name, id, msubst) in &pending {
+            if let Some(ctor) = self.type_ctors.get(ctor_name).cloned() {
+                if let Some(methods) = type_ctor_struct_methods(&ctor) {
+                    for f in methods {
+                        self.check_type_ctor_method(f, *id, msubst);
                     }
                 }
             }
@@ -1149,13 +1171,12 @@ impl Checker {
                 }
                 self.struct_funcs.insert(id, map);
 
-                // (2) Type-check each method body under the substitution. The
-                // receiver `self` is bound to the instantiated struct; field
-                // accesses `self.f`, `Self{ … }` literals and the type parameter
-                // all resolve through the active substitution.
-                for f in methods {
-                    self.check_type_ctor_method(f, id, &msubst);
-                }
+                // (2) Defer the method-body type-checks to AFTER Pass 2 (v0.138):
+                // a body may reference top-level `const`s / free functions, which
+                // are not yet registered during alias instantiation (Pass 0d).
+                // The signatures registered above already let call sites resolve.
+                self.pending_ctor_methods
+                    .push((ctor_name.to_string(), id, msubst.clone()));
 
                 // (3) Record the instance (with every concrete argument, in
                 // parameter order) so the backend rebuilds the substitution and
