@@ -206,6 +206,43 @@ impl<'a> Emitter<'a> {
         f.params.iter().any(|p| p.is_comptime)
     }
 
+    /// True if `f` is a **type-constructor** (v0.129, SPEC §25): a function
+    /// whose return type is the bare `type` keyword
+    /// (`fn Name(comptime T: type) type { return struct {…}; }`). Like a generic
+    /// function it is compile-time only and is **never emitted** to C — sema has
+    /// already turned each `const Alias = Name(C);` instantiation into an
+    /// ordinary monomorphised struct typedef. A conforming type-constructor also
+    /// has a `comptime` parameter (so [`Emitter::is_generic`] already returns
+    /// `true` for it), but checking the return type directly is robust even for a
+    /// parameter-less `fn F() type`, which carries no C return type. The
+    /// `type` spelling is never decorated with `?`/`!`/`[N]`/`*`/`[]`.
+    fn is_type_ctor(f: &Func) -> bool {
+        f.ret.name == "type"
+            && !f.ret.optional
+            && !f.ret.error_union
+            && f.ret.array_len.is_none()
+            && !f.ret.pointer
+            && !f.ret.slice
+    }
+
+    /// True if `c` is a v0.129 **type-alias** const — `const Alias = Name(C);`
+    /// whose initializer calls a type-constructor function (SPEC §25.3). Such a
+    /// const named a monomorphised struct, not a runtime value, so emit must
+    /// **not** emit it as a C `const`. Detected purely from the module's own
+    /// functions by the callee name (a validated `const` with a `Call`
+    /// initializer can only be a type-constructor instantiation — ordinary value
+    /// consts must be compile-time constant, and a `Call` is not, §3).
+    fn is_type_alias_const(module: &Module, c: &crate::ast::ConstDecl) -> bool {
+        if let Expr::Call { callee, .. } = &c.value {
+            module
+                .items
+                .iter()
+                .any(|it| matches!(it, Item::Func(f) if &f.name == callee && Self::is_type_ctor(f)))
+        } else {
+            false
+        }
+    }
+
     /// True if `p` is a comptime **value** parameter (`comptime n: usize`,
     /// v0.128): a comptime parameter whose annotation is not the `type` kind.
     /// (A `comptime T: type` parameter is a type parameter, v0.120.)
@@ -749,6 +786,14 @@ impl<'a> Emitter<'a> {
         let mut any = false;
         for item in &module.items {
             if let Item::Const(c) = item {
+                // A v0.129 type-alias const — `const Alias = Name(C);` calling a
+                // type-constructor (SPEC §25.3) — produced a struct, not a C
+                // value, so it is NOT emitted as a C `const`. (Such a `Call`
+                // initializer also fails `const_eval` below, so this is belt and
+                // braces; the explicit skip keeps the intent clear.)
+                if Self::is_type_alias_const(module, c) {
+                    continue;
+                }
                 // The module is validated, so this evaluation always succeeds;
                 // if it somehow does not we skip the const rather than panic.
                 if let Ok(v) = crate::const_eval::eval(&c.value, &self.consts) {
@@ -779,7 +824,10 @@ impl<'a> Emitter<'a> {
         // instances are (see `emit_instance_forward_decls`).
         for item in &module.items {
             if let Item::Func(f) = item {
-                if Self::is_generic(f) {
+                // A generic function is emitted per instantiation, never under
+                // its plain name (§17.3); a type-constructor is compile-time only
+                // and never emitted at all (§25.3).
+                if Self::is_generic(f) || Self::is_type_ctor(f) {
                     continue;
                 }
                 let ret = self.cty(&f.ret);
@@ -817,7 +865,9 @@ impl<'a> Emitter<'a> {
         // its plain name (SPEC §17.3) — its instances are emitted below.
         for item in &module.items {
             if let Item::Func(f) = item {
-                if Self::is_generic(f) {
+                // Skip generic functions (emitted per instantiation, §17.3) and
+                // type-constructors (compile-time only, never emitted, §25.3).
+                if Self::is_generic(f) || Self::is_type_ctor(f) {
                     continue;
                 }
                 self.emit_func(f);
@@ -1008,6 +1058,9 @@ impl<'a> Emitter<'a> {
             .or_else(|| self.structs.id_of(name).map(Type::Struct))
             .or_else(|| self.structs.enum_id_of(name).map(Type::Enum))
             .or_else(|| self.structs.union_id_of(name).map(Type::Union))
+            // A type-alias name (`const IL = List(i32);`, v0.129) resolves to
+            // the aliased type (a monomorphised struct).
+            .or_else(|| self.structs.alias_of(name))
             .unwrap_or(Type::Void)
     }
 
@@ -1061,6 +1114,9 @@ impl<'a> Emitter<'a> {
             Type::Enum(id)
         } else if let Some(id) = self.structs.union_id_of(&t.name) {
             Type::Union(id)
+        } else if let Some(ty) = self.structs.alias_of(&t.name) {
+            // A type-alias name (`const IL = List(i32);`, v0.129).
+            ty
         } else {
             Type::I64
         };
@@ -2078,7 +2134,13 @@ impl<'a> Emitter<'a> {
                     return self.emit_union_lit(uid, fields);
                 }
                 // C99 compound literal: `((kd_struct_<Name>){ .kd_<f> = <v>, ... })`.
-                let (cname, sid) = match self.structs.id_of(name) {
+                // A type-alias name (`IL{ ... }` where `const IL = List(i32);`,
+                // v0.129) resolves to the aliased monomorphised struct's id.
+                let resolved_id = self.structs.id_of(name).or_else(|| match self.structs.alias_of(name) {
+                    Some(Type::Struct(id)) => Some(id),
+                    _ => None,
+                });
+                let (cname, sid) = match resolved_id {
                     Some(id) => (self.structs.c_name(id), Some(id)),
                     // Validated input always resolves; fall back to the canonical
                     // spelling so emission stays well-formed even if it does not.
@@ -2240,6 +2302,12 @@ impl<'a> Emitter<'a> {
                     _ => format!("({})", l),
                 }
             }
+            // An anonymous `struct {…}` **type value** (v0.129, SPEC §25) only
+            // ever appears as the body of a type-constructor function, which the
+            // orchestrator never emits (it is skipped like a generic, §25.3). So
+            // this arm is unreachable for validated input; emit a harmless `0`
+            // placeholder so the C stays well-formed even if it were reached.
+            Expr::StructType { .. } => "0".to_string(),
         }
     }
 
@@ -2640,7 +2708,9 @@ impl<'a> Emitter<'a> {
                 .structs
                 .union_id_of(name)
                 .map(Type::Union)
-                .or_else(|| self.structs.id_of(name).map(Type::Struct)),
+                .or_else(|| self.structs.id_of(name).map(Type::Struct))
+                // A type-alias name (`IL{ ... }`, v0.129) → the aliased struct.
+                .or_else(|| self.structs.alias_of(name)),
             Expr::Field { base, field, .. } => {
                 // A qualified enum literal `Enum.V` (base names an enum type) has
                 // type `Enum(id)`; otherwise it is an ordinary struct-field access.
@@ -2733,6 +2803,10 @@ impl<'a> Emitter<'a> {
                     .find(|(_, e)| *e == elem)
                     .map(|(id, _)| Type::Slice(id))
             }
+            // A `struct {…}` type value is compile-time only (v0.129); it never
+            // reaches a runtime value position in validated input and so has no
+            // runtime type — report `None` defensively.
+            Expr::StructType { .. } => None,
         }
     }
 
@@ -2974,8 +3048,8 @@ fn c_string_literal(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::ast::{
-        ArraySize, BinOp, Block, Expr, FieldDecl, FieldInit, Func, Item, Module, Param, Stmt,
-        StructDecl, SwitchArm, TestBlock, TypeExpr,
+        ArraySize, BinOp, Block, ConstDecl, Expr, FieldDecl, FieldInit, Func, Item, Module, Param,
+        Stmt, StructDecl, SwitchArm, TestBlock, TypeExpr,
     };
     use crate::span::Span;
     use crate::types::{ComptimeArg, StructTable, Type};
@@ -6495,5 +6569,161 @@ mod tests {
         assert_eq!(c_string_literal("\u{7}g"), "\"\\x07g\"");
         // The empty string is a valid empty C literal.
         assert_eq!(c_string_literal(""), "\"\"");
+    }
+
+    // -- generic structs / type-returning functions (v0.129) ----------------
+
+    /// A bare `type` return type (`fn Name(...) type`), the marker of a
+    /// type-constructor.
+    fn type_kw() -> TypeExpr {
+        ty("type")
+    }
+
+    /// The post-sema shape of:
+    /// ```text
+    /// fn Box(comptime T: type) type { return struct { v: T }; }
+    /// const IB = Box(i32);
+    /// fn main() void { var b: IB = IB{ .v = 5 }; }
+    /// ```
+    /// sema identifies `Box` as a type-constructor (not checked/emitted as an
+    /// ordinary fn), instantiates it at `i32` into a monomorphised struct named
+    /// `Box__int32_t` (field `v: i32`) held in the [`StructTable`], and resolves
+    /// the alias `IB` to that struct — so emit receives the canonical struct
+    /// name in the `var`/struct-literal positions and lowers them as a normal
+    /// struct (SPEC §25.3). The `Box` body keeps the `Expr::StructType` value to
+    /// exercise the type-constructor skip on a realistic module.
+    fn box_program() -> (Module, StructTable) {
+        let mut structs = StructTable::new();
+        let sid = structs.intern("Box__int32_t");
+        structs.set_fields(sid, vec![("v".to_string(), Type::I32)]);
+
+        let box_ctor = Func {
+            is_pub: false,
+            name: "Box".to_string(),
+            params: vec![Param {
+                name: "T".to_string(),
+                ty: type_kw(),
+                is_comptime: true,
+                span: Span::DUMMY,
+            }],
+            ret: type_kw(),
+            body: block(vec![ret(Expr::StructType {
+                fields: vec![FieldDecl {
+                    name: "v".to_string(),
+                    ty: ty("T"),
+                    span: Span::DUMMY,
+                }],
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+
+        let alias = Item::Const(ConstDecl {
+            is_pub: false,
+            name: "IB".to_string(),
+            ty: None,
+            value: Expr::Call {
+                callee: "Box".to_string(),
+                args: vec![ident("i32")],
+                span: Span::DUMMY,
+            },
+            span: Span::DUMMY,
+        });
+
+        let main = Func {
+            is_pub: false,
+            name: "main".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![Stmt::Let {
+                is_const: false,
+                name: "b".to_string(),
+                ty: Some(ty("Box__int32_t")),
+                value: Expr::StructLit {
+                    name: "Box__int32_t".to_string(),
+                    fields: vec![finit("v", int(5))],
+                    span: Span::DUMMY,
+                },
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+
+        let m = Module {
+            items: vec![Item::Func(box_ctor), alias, Item::Func(main)],
+        };
+        (m, structs)
+    }
+
+    #[test]
+    fn type_constructor_and_alias_are_compile_time_only() {
+        let (m, structs) = box_program();
+        let out = emit(&m, &structs, EmitMode::Program);
+
+        // The monomorphised struct emits as an ordinary C typedef.
+        assert!(
+            out.contains("typedef struct { int32_t kd_v; } kd_struct_Box__int32_t;"),
+            "monomorphised struct typedef missing/wrong:\n{out}"
+        );
+        // The type-constructor itself is compile-time only — never a C function
+        // (neither forward-declared nor defined). `kd_struct_Box__int32_t` must
+        // not be mistaken for a `kd_Box(` function decl, so check the call form.
+        assert!(
+            !out.contains("kd_Box("),
+            "type-constructor was emitted as a C function:\n{out}"
+        );
+        assert!(
+            !out.contains(") type") && !out.contains("type kd_"),
+            "a `type` return type leaked into the C output:\n{out}"
+        );
+        // The type-alias const named a struct, not a value — no C `const` for it.
+        assert!(
+            !out.contains("kd_IB"),
+            "type-alias const was emitted as a C value const:\n{out}"
+        );
+        // The alias-typed `var` and struct literal lower as a normal struct.
+        assert!(
+            out.contains("kd_struct_Box__int32_t kd_b = ((kd_struct_Box__int32_t){ .kd_v = 5 });"),
+            "alias-typed var/struct-literal lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn parameterless_type_constructor_is_also_skipped() {
+        // Defensive: a type-constructor is recognised by its `type` return type
+        // alone, so even a (non-generic) `fn F() type { return struct {}; }` —
+        // which `is_generic` would not catch — is never emitted to C. Such a
+        // function carries no valid C return type, so emitting it would be wrong.
+        let f = Func {
+            is_pub: false,
+            name: "F".to_string(),
+            params: vec![],
+            ret: ty("type"),
+            body: block(vec![ret(Expr::StructType {
+                fields: vec![],
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+        let main = Func {
+            is_pub: false,
+            name: "main".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f), Item::Func(main)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            !out.contains("kd_F("),
+            "parameterless type-constructor was emitted:\n{out}"
+        );
+        assert!(
+            !out.contains("type kd_F"),
+            "a `type` return type leaked into the C output:\n{out}"
+        );
     }
 }

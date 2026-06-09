@@ -107,6 +107,11 @@ pub fn eval(expr: &Expr, consts: &HashMap<String, ConstVal>) -> Result<ConstVal,
             "E0130",
             "string literals are not allowed in a constant expression",
         )),
+        Expr::StructType { span, .. } => Err(Diagnostic::error(
+            *span,
+            "E0130",
+            "a struct type is not a constant value",
+        )),
     }
 }
 

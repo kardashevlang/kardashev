@@ -18,6 +18,24 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.129.0] — Generic structs (type-returning functions)
+
+### Added
+- **Type-constructors**: `fn Name(comptime T: type) type { return struct { …
+  }; }` — a function returning a `type`, monomorphised per type argument
+  (`Expr::StructType` is the anonymous struct-type value).
+- **Type aliases**: `const IP = Pair(i32);` instantiates a type-constructor and
+  binds the result (a monomorphised struct, memoised) as a type usable in
+  signatures, struct literals, and field access. Aliases are shared to the
+  backend via the `StructTable`.
+- Diagnostics `E0310`/`E0311`. 617 unit + 26 e2e tests;
+  `examples/generic_structs.ks`.
+
+### Limitations (honest, v0.129)
+One type parameter, fields-only struct (no methods inside a generic struct), and
+no direct `Name(T)` / `Name(T){…}` in type/literal position (use a `const`
+alias) — all later work.
+
 ## [0.128.0] — `comptime` value parameters
 
 ### Added

@@ -77,12 +77,19 @@
 //!   tagged union (an enum / integer / otherwise un-switchable type) (SPEC §20.2).
 //! - `E0280` — an optional `if` capture (`if (cond) |v| { … }`) whose condition
 //!   is not an optional (`?T`) (SPEC §21.1).
+//! - `E0310` — a type-returning function (`fn Name(comptime T: type) type`) that
+//!   is not a valid type-constructor: it lacks exactly one `comptime` type
+//!   parameter, or its body is not a single `return struct { … };`; or a
+//!   `struct { … }` type value used outside such a body (SPEC §25.2).
+//! - `E0311` — instantiating in a type alias (`const Alias = Name(C);`) a callee
+//!   that is not a type-constructor, or a type-constructor argument that does not
+//!   name a concrete type (SPEC §25.2).
 
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    ArraySize, BinOp, Block, Expr, FieldInit, Func, Item, Module, Param, Stmt, StructDecl,
-    SwitchArm, TestBlock, TypeExpr, UnOp,
+    ArraySize, BinOp, Block, Expr, FieldDecl, FieldInit, Func, Item, Module, Param, Stmt,
+    StructDecl, SwitchArm, TestBlock, TypeExpr, UnOp,
 };
 use crate::const_eval::{self, ConstVal};
 use crate::diag::Diagnostic;
@@ -163,6 +170,17 @@ struct Checker {
     /// concrete instantiation at its call sites rather than in the normal body
     /// pass (SPEC §17.2 / §24.2).
     generics: HashMap<String, Func>,
+    /// Type-constructors (v0.129, SPEC §25): a `fn Name(comptime T: type) type`
+    /// whose body returns a `struct { … }` type value, keyed by name. Stored
+    /// whole and instantiated when a `const Alias = Name(C);` mentions it; never
+    /// type-checked or emitted as an ordinary function.
+    type_ctors: HashMap<String, Func>,
+    /// Type aliases (v0.129): a top-level `const Alias = Name(C);` binds `Alias`
+    /// to the monomorphised `Type::Struct(id)` produced by instantiating the
+    /// type-constructor `Name` at the concrete type `C`. Consulted by
+    /// `resolve_base`, so an alias is usable in type position (`var x: Alias`),
+    /// as a struct-literal name (`Alias{ … }`), and for field access.
+    type_aliases: HashMap<String, Type>,
 }
 
 impl Checker {
@@ -181,6 +199,8 @@ impl Checker {
             subst: HashMap::new(),
             value_subst: HashMap::new(),
             generics: HashMap::new(),
+            type_ctors: HashMap::new(),
+            type_aliases: HashMap::new(),
         }
     }
 
@@ -331,6 +351,28 @@ impl Checker {
             }
         }
 
+        // Pass 0d (v0.129, SPEC §25): collect type-constructors and instantiate
+        // type-alias consts (`const Alias = Name(C);`) BEFORE function signatures
+        // (Pass 1), so an alias type used in a signature (`fn f(p: Alias)`)
+        // resolves. (Aliases only depend on type-constructors + already-interned
+        // structs/enums/unions, all available by now.)
+        for item in &m.items {
+            if let Item::Func(f) = item {
+                if is_type_ctor(f) {
+                    self.collect_type_ctor(f);
+                }
+            }
+        }
+        for item in &m.items {
+            if let Item::Const(c) = item {
+                if let Expr::Call { callee, args, span } = &c.value {
+                    if self.type_ctors.contains_key(callee) {
+                        self.instantiate_alias(&c.name, callee, args, *span);
+                    }
+                }
+            }
+        }
+
         // Pass 1: collect function signatures so calls can forward-reference.
         // A function with any `comptime`-typed parameter is *generic* (SPEC
         // §17): its parameter/return/body types may use type-parameter names, so
@@ -348,6 +390,17 @@ impl Checker {
                         "E0101",
                         format!("cannot redefine builtin `{}`", f.name),
                     );
+                }
+                // A type-returning function `fn Name(comptime T: type) type` is a
+                // *type-constructor* (v0.129, SPEC §25). It is not a value
+                // function nor a generic value function: it is validated and
+                // recorded here, instantiated when a `const Alias = Name(C);`
+                // mentions it (Pass 2), and never checked or emitted as an
+                // ordinary function. (It must precede the `is_generic` branch
+                // below, since a type-constructor also has a `comptime` parameter.)
+                if is_type_ctor(f) {
+                    // Already collected in Pass 0d; never a value/generic fn.
+                    continue;
                 }
                 if is_generic(f) {
                     // Each `comptime` parameter must be either a *type* parameter
@@ -425,6 +478,30 @@ impl Checker {
         // Pass 2: fold top-level consts in source order.
         for item in &m.items {
             if let Item::Const(c) = item {
+                // v0.129 (SPEC §25.2): a top-level `const Alias = Name(C);` whose
+                // initializer is a call to a type-constructor is a **type alias**,
+                // not a value const. Instantiate `Name` at `C` and bind the alias;
+                // it carries no `ConstVal`, so it is *not* folded as a value const.
+                // A call to a known callee that is *not* a type-constructor is an
+                // invalid instantiation (`E0311`); a call to an unknown name falls
+                // through to `const_eval`, which reports it as non-constant
+                // (`E0130`) — preserving the pre-v0.129 behaviour.
+                if let Expr::Call { callee, args, span } = &c.value {
+                    if self.type_ctors.contains_key(callee) {
+                        // Already instantiated as a type alias in Pass 0d; it is
+                        // not a value const, so skip folding.
+                        let _ = (args, span);
+                        continue;
+                    }
+                    if self.funcs.contains_key(callee) || self.generics.contains_key(callee) {
+                        let msg = format!(
+                            "`{}` is not a type-constructor; it cannot be instantiated as a type alias",
+                            callee
+                        );
+                        self.error(*span, "E0311", msg);
+                        continue;
+                    }
+                }
                 // The type annotation is optional (v0.121, SPEC §18.2). When
                 // present it is resolved (`E0100` for an unknown type name) and
                 // type-checked against the folded value below. When absent the
@@ -487,9 +564,12 @@ impl Checker {
         // Pass 3: type-check function and test bodies.
         for item in &m.items {
             match item {
-                // A generic function's body is checked per instantiation (those
-                // are discovered through calls during this pass), never directly.
-                Item::Func(f) if is_generic(f) => {}
+                // A type-constructor (v0.129) is compile-time only — validated in
+                // Pass 1 and instantiated in Pass 2 — so it has no ordinary body
+                // to check. A generic function's body is checked per instantiation
+                // (those are discovered through calls during this pass), never
+                // directly.
+                Item::Func(f) if is_type_ctor(f) || is_generic(f) => {}
                 Item::Func(f) => self.check_func(f),
                 Item::Test(t) => self.check_test(t),
                 Item::Const(_) => {}
@@ -637,10 +717,17 @@ impl Checker {
     }
 
     /// Resolve a bare type *name* (no `?`/`!`/`[N]`/`*`/`[]` wrappers) to a
-    /// builtin, a registered struct, an enum, or a tagged union, without
-    /// consulting any substitution. Returns `None` for an unknown name.
+    /// builtin, a type alias, a registered struct, an enum, or a tagged union,
+    /// without consulting any (generic) type-parameter substitution. Returns
+    /// `None` for an unknown name.
+    ///
+    /// A **type alias** (v0.129, `const Alias = Name(C);`) resolves to its
+    /// aliased `Type` (always a monomorphised `Type::Struct`), so an alias is
+    /// usable wherever a type name is — `var x: Alias`, a struct-literal name,
+    /// and field access all flow through here.
     fn resolve_base(&self, name: &str) -> Option<Type> {
         Type::from_name(name)
+            .or_else(|| self.type_aliases.get(name).copied())
             .or_else(|| self.structs.id_of(name).map(Type::Struct))
             .or_else(|| self.structs.enum_id_of(name).map(Type::Enum))
             .or_else(|| self.structs.union_id_of(name).map(Type::Union))
@@ -764,6 +851,144 @@ impl Checker {
         // never in scope here — so the value substitution is empty (a `[n]T`
         // field would be `E0253`).
         Some(self.wrap_type(inner, te, &HashMap::new()))
+    }
+
+    // ---- generic structs / type-constructors (v0.129, SPEC §25) -----------
+
+    /// Validate a type-constructor and record it (SPEC §25.2). A valid
+    /// type-constructor takes **exactly one** `comptime` *type* parameter and has
+    /// a body of exactly `return struct { … };` (an [`Expr::StructType`]);
+    /// anything else is `E0310`. It is recorded under its name regardless, so a
+    /// `const Alias = Name(C);` still resolves to *a* struct (avoiding cascading
+    /// `E0100`s) even when the constructor itself is malformed.
+    fn collect_type_ctor(&mut self, f: &Func) {
+        let valid_params =
+            f.params.len() == 1 && f.params[0].is_comptime && is_type_kw(&f.params[0].ty);
+        if !valid_params {
+            let msg = format!(
+                "type-returning function `{}` must take exactly one `comptime` type parameter \
+                 (`comptime T: type`)",
+                f.name
+            );
+            self.error(f.span, "E0310", msg);
+        }
+        if type_ctor_struct_fields(f).is_none() {
+            let msg = format!(
+                "type-returning function `{}` must have a body of exactly \
+                 `return struct {{ … }};`",
+                f.name
+            );
+            self.error(f.body.span, "E0310", msg);
+        }
+        self.type_ctors.insert(f.name.clone(), f.clone());
+    }
+
+    /// Instantiate a type-constructor for a type alias `const Alias = Name(C);`
+    /// (SPEC §25.2). The single argument must resolve to a concrete type
+    /// (`E0311` otherwise); the constructor is instantiated at that type (a
+    /// monomorphised struct, memoised) and the alias is bound to it.
+    fn instantiate_alias(&mut self, alias_name: &str, ctor_name: &str, args: &[Expr], span: Span) {
+        let ctor = match self.type_ctors.get(ctor_name) {
+            Some(f) => f.clone(),
+            None => return, // unreachable: the caller checked membership
+        };
+        if args.len() != 1 {
+            let msg = format!(
+                "type-constructor `{}` takes exactly one type argument, found {}",
+                ctor_name,
+                args.len()
+            );
+            self.error(span, "E0311", msg);
+            return;
+        }
+        let concrete = match self.resolve_alias_type_arg(&args[0]) {
+            Some(t) => t,
+            None => return, // `E0311` already emitted
+        };
+        let id = self.instantiate_type_ctor(ctor_name, &ctor, concrete);
+        self.type_aliases.insert(alias_name.to_string(), Type::Struct(id));
+        // Share the alias with the backend (which only receives the StructTable)
+        // so an alias name resolves in emitted types + struct literals (v0.129).
+        self.structs.add_alias(alias_name, Type::Struct(id));
+    }
+
+    /// Resolve a type-constructor's single argument (SPEC §25.2): it must be an
+    /// identifier naming a concrete type — a builtin, a struct/enum/union, or
+    /// another type alias (all via [`resolve_base`]). Anything else is `E0311`.
+    fn resolve_alias_type_arg(&mut self, arg: &Expr) -> Option<Type> {
+        match arg {
+            Expr::Ident { name, span } => match self.resolve_base(name) {
+                Some(t) => Some(t),
+                None => {
+                    let msg =
+                        format!("type-constructor argument `{}` does not name a type", name);
+                    self.error(*span, "E0311", msg);
+                    None
+                }
+            },
+            other => {
+                self.error(
+                    other.span(),
+                    "E0311",
+                    "a type-constructor argument must be an identifier naming a type",
+                );
+                None
+            }
+        }
+    }
+
+    /// Instantiate the type-constructor `ctor` at the concrete type `concrete`,
+    /// returning the id of the monomorphised struct (SPEC §25.2). The struct is
+    /// named `<Ctor>__<typemangle>` and **memoised by that name** (via
+    /// [`StructTable::intern`]'s de-duplication / an `id_of` guard), so the same
+    /// `(constructor, concrete type)` reuses one struct id while a different
+    /// concrete type yields a distinct struct. Each field type is resolved under
+    /// the substitution `{ param -> concrete }`.
+    fn instantiate_type_ctor(&mut self, ctor_name: &str, ctor: &Func, concrete: Type) -> u32 {
+        let mangled = format!("{}__{}", ctor_name, self.structs.type_mangle(concrete));
+        // Memoised: a repeated `(constructor, concrete)` reuses the existing id.
+        if let Some(id) = self.structs.id_of(&mangled) {
+            return id;
+        }
+        let id = self.structs.intern(&mangled);
+        // The single comptime type parameter binds to `concrete`. A malformed
+        // constructor (no parameter / non-`struct` body) falls back to an empty
+        // substitution and a field-less struct, but is still a usable type.
+        let mut subst: HashMap<String, Type> = HashMap::new();
+        if let Some(p) = ctor.params.first() {
+            subst.insert(p.name.clone(), concrete);
+        }
+        let mut fields: Vec<(String, Type)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        if let Some(field_decls) = type_ctor_struct_fields(ctor) {
+            for f in field_decls {
+                if !seen.insert(f.name.clone()) {
+                    let msg = format!(
+                        "duplicate field `{}` in generic struct `{}`",
+                        f.name, ctor_name
+                    );
+                    self.error(f.span, "E0162", msg);
+                    continue;
+                }
+                // The field type resolves under `{ param -> concrete }` (and the
+                // empty value substitution — a generic struct has no comptime
+                // value parameters in v0.129). An unknown field type is `E0161`.
+                let fty = match self.resolve_type_opt_with(&f.ty, &subst, &HashMap::new()) {
+                    Some(t) => t,
+                    None => {
+                        let msg = format!(
+                            "unknown type `{}` in generic struct `{}`",
+                            f.ty.name, ctor_name
+                        );
+                        self.error(f.ty.span, "E0161", msg);
+                        Type::I64
+                    }
+                };
+                fields.push((f.name.clone(), fty));
+            }
+        }
+        self.structs.set_fields(id, fields);
+        id
     }
 
     // ---- statements -------------------------------------------------------
@@ -1678,6 +1903,19 @@ impl Checker {
                 }
             }
             Expr::StructLit { name, fields, span } => self.check_struct_lit(name, fields, *span),
+            // An anonymous `struct { … }` type value (v0.129) is *only* valid as
+            // the body of a type-returning function, which is validated in Pass 1
+            // and never body-checked here. Reaching `check_expr` means it appeared
+            // in an ordinary value position — `E0310`.
+            Expr::StructType { span, .. } => {
+                self.error(
+                    *span,
+                    "E0310",
+                    "a `struct { … }` type value may only be the body of a type-returning \
+                     function (`fn Name(comptime T: type) type`)",
+                );
+                None
+            }
             Expr::Field { base, field, span } => {
                 // `Enum.Variant` — a qualified enum literal (SPEC §13.1). It is
                 // recognised when the base is an identifier naming an enum type
@@ -2344,7 +2582,14 @@ impl Checker {
         if let Some(uid) = self.structs.union_id_of(name) {
             return self.check_union_lit(name, inits, span, uid);
         }
-        let id = match self.structs.id_of(name) {
+        // A type alias (v0.129) names a monomorphised struct: a literal
+        // `Alias{ … }` builds that struct. Aliases never name a union, so this
+        // follows the union check and falls back to the ordinary struct lookup.
+        let alias_id = match self.type_aliases.get(name) {
+            Some(Type::Struct(id)) => Some(*id),
+            _ => None,
+        };
+        let id = match alias_id.or_else(|| self.structs.id_of(name)) {
             Some(id) => id,
             None => {
                 self.error(span, "E0163", format!("`{}` is not a struct", name));
@@ -3180,6 +3425,32 @@ fn is_type_kw(te: &TypeExpr) -> bool {
         && !te.slice
 }
 
+/// Whether `f` is a **type-constructor** — a type-returning function
+/// `fn Name(comptime T: type) type` (v0.129, SPEC §25). Recognised solely by its
+/// return type being the bare `type` keyword; its parameter list and body are
+/// validated separately ([`Checker::collect_type_ctor`]). A type-constructor is
+/// compile-time only: neither checked as an ordinary function nor emitted.
+fn is_type_ctor(f: &Func) -> bool {
+    is_type_kw(&f.ret)
+}
+
+/// Extract the field list of a valid type-constructor's body (SPEC §25.2): its
+/// body must be exactly `return struct { … };` — a single [`Stmt::Return`] of an
+/// [`Expr::StructType`]. Returns `None` for any other body shape (reported as
+/// `E0310`).
+fn type_ctor_struct_fields(f: &Func) -> Option<&[FieldDecl]> {
+    if f.body.stmts.len() != 1 {
+        return None;
+    }
+    match &f.body.stmts[0] {
+        Stmt::Return {
+            value: Some(Expr::StructType { fields, .. }),
+            ..
+        } => Some(fields),
+        _ => None,
+    }
+}
+
 /// Whether `e` is a value whose type cannot be inferred without a contextual
 /// expectation (SPEC §18.2), so an *un-annotated* `var`/`const` binding of it is
 /// `E0260` ("cannot infer type; add an annotation"). These are exactly the
@@ -3710,6 +3981,38 @@ mod tests {
     }
     fn ret(value: Option<Expr>) -> Stmt {
         Stmt::Return { value, span: sp() }
+    }
+    /// A `struct { … }` type value (v0.129) whose field types are plain names.
+    fn struct_type_expr(fields: Vec<(&str, &str)>) -> Expr {
+        Expr::StructType {
+            fields: field_decls(fields),
+            span: sp(),
+        }
+    }
+    /// A `struct { … }` type value whose field types are explicit [`TypeExpr`]s
+    /// (so composite forms like `?T` can be exercised).
+    fn struct_type_expr_te(fields: Vec<(&str, TypeExpr)>) -> Expr {
+        Expr::StructType {
+            fields: fields
+                .into_iter()
+                .map(|(n, ty)| FieldDecl {
+                    name: n.into(),
+                    ty,
+                    span: sp(),
+                })
+                .collect(),
+            span: sp(),
+        }
+    }
+    /// A type-constructor `fn Name(comptime P: type) type { return struct { … }; }`
+    /// (v0.129) whose struct fields have plain-name types.
+    fn type_ctor(name: &str, param: &str, fields: Vec<(&str, &str)>) -> Item {
+        Item::Func(raw_func(
+            name,
+            vec![param_comptime(param)],
+            "type",
+            vec![ret(Some(struct_type_expr(fields)))],
+        ))
     }
 
     fn codes(items: Vec<Item>) -> Vec<&'static str> {
@@ -7528,5 +7831,272 @@ mod tests {
             vec![Stmt::Expr(call("print", vec![ident("s")]))],
         )];
         assert!(codes(items).contains(&"E0110"));
+    }
+
+    // ---- generic structs / type-constructors (v0.129, SPEC §25) -----------
+
+    #[test]
+    fn generic_struct_alias_resolves_and_field_typechecks() {
+        // fn Box(comptime T: type) type { return struct { v: T }; }
+        // const IB = Box(i32);
+        // fn main() void { var b: IB = IB{ .v = 5 }; print(b.v); }
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            const_item_infer("IB", call("Box", vec![ident("i32")])),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("b", "IB", struct_lit("IB", vec![("v", int(5))])),
+                    Stmt::Expr(call("print", vec![field(ident("b"), "v")])),
+                ],
+            ),
+        ];
+        let table = check_ok(items);
+        // The alias interned a monomorphised struct `Box__int32_t` with `v: i32`.
+        let id = table
+            .id_of("Box__int32_t")
+            .expect("monomorphised struct interned");
+        assert_eq!(table.get(id).fields, vec![("v".to_string(), Type::I32)]);
+    }
+
+    #[test]
+    fn two_aliases_of_same_instantiation_share_struct_id() {
+        // const A = Box(i32); const B = Box(i32);  → A and B are the *same* struct,
+        // so `var b: B = A{ .v = 1 };` type-checks (struct equality is by id).
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            const_item_infer("A", call("Box", vec![ident("i32")])),
+            const_item_infer("B", call("Box", vec![ident("i32")])),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("b", "B", struct_lit("A", vec![("v", int(1))])),
+                    Stmt::Expr(call("print", vec![field(ident("b"), "v")])),
+                ],
+            ),
+        ];
+        let table = check_ok(items);
+        assert!(table.id_of("Box__int32_t").is_some());
+    }
+
+    #[test]
+    fn distinct_concrete_types_make_distinct_structs() {
+        // const BI32 = Box(i32); const BI64 = Box(i64);  → two different structs.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            const_item_infer("BI32", call("Box", vec![ident("i32")])),
+            const_item_infer("BI64", call("Box", vec![ident("i64")])),
+        ];
+        let table = check_ok(items);
+        let a = table.id_of("Box__int32_t").unwrap();
+        let b = table.id_of("Box__int64_t").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(table.get(a).fields, vec![("v".to_string(), Type::I32)]);
+        assert_eq!(table.get(b).fields, vec![("v".to_string(), Type::I64)]);
+    }
+
+    #[test]
+    fn assigning_across_distinct_instantiations_is_e0110() {
+        // var x: Box(i32) = Box(i64){ .v = 1 };  → a struct-id mismatch.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            const_item_infer("BI32", call("Box", vec![ident("i32")])),
+            const_item_infer("BI64", call("Box", vec![ident("i64")])),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var(
+                    "x",
+                    "BI32",
+                    struct_lit("BI64", vec![("v", int(1))]),
+                )],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn instantiating_non_type_constructor_is_e0311() {
+        // fn id(x: i32) i32 { return x; }   const Bad = id(i32);
+        let items = vec![
+            func(
+                "id",
+                vec![param("x", "i32")],
+                "i32",
+                vec![ret(Some(ident("x")))],
+            ),
+            const_item_infer("Bad", call("id", vec![ident("i32")])),
+        ];
+        assert!(codes(items).contains(&"E0311"));
+    }
+
+    #[test]
+    fn type_constructor_arg_not_a_type_is_e0311() {
+        // const Bad = Box(5);  → the argument is not a type.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            const_item_infer("Bad", call("Box", vec![int(5)])),
+        ];
+        assert!(codes(items).contains(&"E0311"));
+    }
+
+    #[test]
+    fn type_constructor_arg_unknown_name_is_e0311() {
+        // const Bad = Box(Nope);  → `Nope` names no type.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            const_item_infer("Bad", call("Box", vec![ident("Nope")])),
+        ];
+        assert!(codes(items).contains(&"E0311"));
+    }
+
+    #[test]
+    fn type_ctor_body_not_return_struct_is_e0310() {
+        // fn Box(comptime T: type) type { return 5; }  → body is not a struct type.
+        let items = vec![Item::Func(raw_func(
+            "Box",
+            vec![param_comptime("T")],
+            "type",
+            vec![ret(Some(int(5)))],
+        ))];
+        assert!(codes(items).contains(&"E0310"));
+    }
+
+    #[test]
+    fn type_ctor_with_non_comptime_param_is_e0310() {
+        // fn Box(x: i32) type { return struct { v: i32 }; }  → not a type parameter.
+        let items = vec![Item::Func(raw_func(
+            "Box",
+            vec![param("x", "i32")],
+            "type",
+            vec![ret(Some(struct_type_expr(vec![("v", "i32")])))],
+        ))];
+        assert!(codes(items).contains(&"E0310"));
+    }
+
+    #[test]
+    fn struct_type_value_in_ordinary_position_is_e0310() {
+        // fn main() void { var x = struct { a: i32 }; }  → a struct type is not a value.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_infer("x", struct_type_expr(vec![("a", "i32")]))],
+        )];
+        assert!(codes(items).contains(&"E0310"));
+    }
+
+    #[test]
+    fn field_access_through_alias_unknown_field_is_e0166() {
+        // const IB = Box(i32); ... print(b.nope);  → no such field.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            const_item_infer("IB", call("Box", vec![ident("i32")])),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("b", "IB", struct_lit("IB", vec![("v", int(1))])),
+                    Stmt::Expr(call("print", vec![field(ident("b"), "nope")])),
+                ],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0166"));
+    }
+
+    #[test]
+    fn alias_struct_lit_field_type_mismatch_is_e0110() {
+        // var b: IB = IB{ .v = true };  → `v` is `i32`, not `bool`.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            const_item_infer("IB", call("Box", vec![ident("i32")])),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var(
+                    "b",
+                    "IB",
+                    struct_lit("IB", vec![("v", boolean(true))]),
+                )],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn using_type_alias_as_a_value_is_e0100() {
+        // const IB = Box(i32); fn main() void { print(IB); }  → IB is a type, not a value.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            const_item_infer("IB", call("Box", vec![ident("i32")])),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![Stmt::Expr(call("print", vec![ident("IB")]))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0100"));
+    }
+
+    #[test]
+    fn generic_struct_with_optional_field_resolves() {
+        // fn Maybe(comptime T: type) type { return struct { val: ?T, present: bool }; }
+        // const MI = Maybe(i32);
+        let items = vec![
+            Item::Func(raw_func(
+                "Maybe",
+                vec![param_comptime("T")],
+                "type",
+                vec![ret(Some(struct_type_expr_te(vec![
+                    ("val", te_opt("T")),
+                    ("present", te("bool")),
+                ])))],
+            )),
+            const_item_infer("MI", call("Maybe", vec![ident("i32")])),
+        ];
+        let table = check_ok(items);
+        let id = table.id_of("Maybe__int32_t").unwrap();
+        let fields = &table.get(id).fields;
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0, "val");
+        match fields[0].1 {
+            Type::Optional(oid) => assert_eq!(table.optional_inner(oid), Type::I32),
+            other => panic!("expected `?i32`, got {:?}", other),
+        }
+        assert_eq!(fields[1], ("present".to_string(), Type::Bool));
+    }
+
+    #[test]
+    fn alias_of_alias_as_type_argument_resolves() {
+        // const IB = Box(i32);   const BB = Box(IB);  → nests a prior alias.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            const_item_infer("IB", call("Box", vec![ident("i32")])),
+            const_item_infer("BB", call("Box", vec![ident("IB")])),
+        ];
+        let table = check_ok(items);
+        let inner = table.id_of("Box__int32_t").unwrap();
+        let outer = table.id_of("Box__struct_Box__int32_t").unwrap();
+        assert_eq!(
+            table.get(outer).fields,
+            vec![("v".to_string(), Type::Struct(inner))]
+        );
+    }
+
+    #[test]
+    fn non_type_constructor_const_with_unknown_callee_stays_e0130() {
+        // const X: i32 = bar();  (bar undefined)  → still the non-constant path.
+        let items = vec![const_item("X", "i32", call("bar", vec![]))];
+        let cs = codes(items);
+        assert!(cs.contains(&"E0130"));
+        assert!(!cs.contains(&"E0311"));
     }
 }

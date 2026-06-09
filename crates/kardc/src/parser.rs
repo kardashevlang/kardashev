@@ -1341,6 +1341,30 @@ impl<'a> Parser<'a> {
                     span: tok.span.merge(name_span),
                 })
             }
+            TokenKind::Keyword(Kw::Struct) => {
+                // An anonymous `struct { f: T, ... }` **type value** (SPEC
+                // §25.1) — the body of a type-returning function
+                // `fn F(comptime T: type) type { return struct {…}; }`. This
+                // arm is reached only when `struct` appears in *expression*
+                // position (after `return`/`=` inside a function body, etc.).
+                //
+                // A top-level *named* struct declaration `const Name = struct
+                // {…};` (SPEC §9.1) is dispatched earlier, in `parse_const`'s
+                // `= struct` branch (selected by `peek2_kind`), and never
+                // reaches `parse_expr`/`parse_primary`, so the two `struct`
+                // forms do not collide. v0.129 generic structs are fields-only
+                // (no methods inside), so this parses the same `IDENT : type`
+                // field list as a struct declaration, but stops at the closing
+                // `}` with no method tail.
+                self.bump(); // `struct`
+                self.expect_punct(&TokenKind::LBrace, "`{`")?;
+                let fields = self.parse_struct_type_fields()?;
+                let rbrace = self.expect_punct(&TokenKind::RBrace, "`}`")?;
+                Ok(Expr::StructType {
+                    fields,
+                    span: tok.span.merge(rbrace),
+                })
+            }
             TokenKind::Dot => {
                 // A leading `.Variant` in expression-start position is an
                 // unqualified enum literal (SPEC §13.1); its enum type comes
@@ -1436,6 +1460,35 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(elems)
+    }
+
+    /// Parse the field list of an anonymous `struct { … }` **type value**
+    /// (SPEC §25.1), with the opening `{` already consumed and the cursor
+    /// positioned just after it. Stops at (without consuming) the closing `}`.
+    /// Each field is `IDENT : type`, comma-separated with an optional trailing
+    /// comma; field types reuse [`Parser::parse_type`], so they grow new type
+    /// forms (`?T`, `[]T`, `[N]T`, `*T`) for free. Supports an empty
+    /// `struct {}`. This mirrors the *field* portion of [`Parser::parse_struct_decl`]
+    /// but has **no** method/associated-function tail (v0.129 generic structs
+    /// are fields-only); duplicate field names are a sema concern (`E0162`),
+    /// not the parser's.
+    fn parse_struct_type_fields(&mut self) -> PResult<Vec<FieldDecl>> {
+        let mut fields = Vec::new();
+        while !self.at_punct(&TokenKind::RBrace) {
+            let (fname, fname_span) = self.expect_ident()?;
+            self.expect_punct(&TokenKind::Colon, "`:`")?;
+            let ty = self.parse_type()?;
+            let span = fname_span.merge(ty.span);
+            fields.push(FieldDecl {
+                name: fname,
+                ty,
+                span,
+            });
+            if !self.eat_punct(&TokenKind::Comma) {
+                break; // no separator → the field list is done
+            }
+        }
+        Ok(fields)
     }
 
     fn parse_args(&mut self) -> PResult<Vec<Expr>> {
@@ -5195,5 +5248,214 @@ mod tests {
         ]))
         .expect_err("should reject unknown builtin item");
         assert!(err.iter().any(|d| d.code == "E0200"));
+    }
+
+    // ---- v0.129: generic structs / type-returning functions --------------
+
+    /// A type-constructor `fn B(comptime T: type) type { return struct { v: T
+    /// }; }` parses: the return type is the bare ident `type`, the comptime
+    /// type parameter parses as before, and the `return`-expression body is an
+    /// `Expr::StructType` with one field `v: T` (SPEC §25.1).
+    #[test]
+    fn type_constructor_returns_struct_type() {
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("B"),
+            TokenKind::LParen,
+            TokenKind::Keyword(Kw::Comptime),
+            id("T"),
+            TokenKind::Colon,
+            id("type"),
+            TokenKind::RParen,
+            id("type"), // bare `type` return type
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            id("v"),
+            TokenKind::Colon,
+            id("T"),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert_eq!(f.name, "B");
+                assert_eq!(f.ret.name, "type");
+                assert!(!f.ret.optional && !f.ret.error_union);
+                assert_eq!(f.params.len(), 1);
+                assert!(f.params[0].is_comptime);
+                assert_eq!(f.params[0].ty.name, "type");
+                assert_eq!(f.body.stmts.len(), 1);
+                match &f.body.stmts[0] {
+                    Stmt::Return {
+                        value: Some(Expr::StructType { fields, .. }),
+                        ..
+                    } => {
+                        assert_eq!(fields.len(), 1);
+                        assert_eq!(fields[0].name, "v");
+                        assert_eq!(fields[0].ty.name, "T");
+                    }
+                    other => panic!("expected `return struct {{ v: T }};`, got {:?}", other),
+                }
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    /// A `struct { … }` type value with multiple fields (composite field types)
+    /// and a trailing comma parses — field types reuse `parse_type`, so a slice
+    /// field `[]T` works just like in a struct declaration (SPEC §25.1).
+    #[test]
+    fn struct_type_value_multi_field_composite() {
+        // fn L(comptime T: type) type { return struct { items: []T, n: i32, }; }
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("L"),
+            TokenKind::LParen,
+            TokenKind::Keyword(Kw::Comptime),
+            id("T"),
+            TokenKind::Colon,
+            id("type"),
+            TokenKind::RParen,
+            id("type"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            id("items"),
+            TokenKind::Colon,
+            TokenKind::LBracket,
+            TokenKind::RBracket,
+            id("T"),
+            TokenKind::Comma,
+            id("n"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::Comma, // trailing comma
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => match &f.body.stmts[0] {
+                Stmt::Return {
+                    value: Some(Expr::StructType { fields, .. }),
+                    ..
+                } => {
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].name, "items");
+                    assert_eq!(fields[0].ty.name, "T");
+                    assert!(fields[0].ty.slice);
+                    assert_eq!(fields[1].name, "n");
+                    assert_eq!(fields[1].ty.name, "i32");
+                }
+                other => panic!("expected struct-type return, got {:?}", other),
+            },
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    /// An empty `struct {}` type value parses to an `Expr::StructType` with no
+    /// fields (mirrors the empty-struct declaration form, SPEC §25.1).
+    #[test]
+    fn empty_struct_type_value() {
+        // fn U(comptime T: type) type { return struct {}; }
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("U"),
+            TokenKind::LParen,
+            TokenKind::Keyword(Kw::Comptime),
+            id("T"),
+            TokenKind::Colon,
+            id("type"),
+            TokenKind::RParen,
+            id("type"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => match &f.body.stmts[0] {
+                Stmt::Return {
+                    value: Some(Expr::StructType { fields, .. }),
+                    ..
+                } => assert!(fields.is_empty()),
+                other => panic!("expected empty struct-type return, got {:?}", other),
+            },
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    /// A type alias `const IL = B(i32);` parses as an ordinary (inferred) value
+    /// `const` whose initializer is an `Expr::Call` (no new syntax — SPEC
+    /// §25.1). sema later recognises the callee as a type-constructor.
+    #[test]
+    fn type_alias_const_parses_as_call() {
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("IL"),
+            TokenKind::Eq,
+            id("B"),
+            TokenKind::LParen,
+            id("i32"),
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Const(c) => {
+                assert_eq!(c.name, "IL");
+                assert!(c.ty.is_none(), "inferred const carries no annotation");
+                match &c.value {
+                    Expr::Call { callee, args, .. } => {
+                        assert_eq!(callee, "B");
+                        assert_eq!(args.len(), 1);
+                        assert!(matches!(&args[0], Expr::Ident { name, .. } if name == "i32"));
+                    }
+                    other => panic!("expected call `B(i32)`, got {:?}", other),
+                }
+            }
+            other => panic!("expected const, got {:?}", other),
+        }
+    }
+
+    /// A top-level `const P = struct { x: i32 };` must remain a **named struct
+    /// declaration** (`Item::Struct`), not an `Expr::StructType` — the `=
+    /// struct` item-position dispatch in `parse_const` still wins over the new
+    /// expression-position `struct` form (SPEC §25.1 caution; §9.1).
+    #[test]
+    fn top_level_struct_decl_not_misparsed_as_struct_type() {
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("P"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            id("x"),
+            TokenKind::Colon,
+            id("i32"),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Struct(s) => {
+                assert_eq!(s.name, "P");
+                assert_eq!(s.fields.len(), 1);
+                assert_eq!(s.fields[0].name, "x");
+                assert_eq!(s.fields[0].ty.name, "i32");
+                assert!(s.methods.is_empty());
+            }
+            other => panic!("expected named struct decl, got {:?}", other),
+        }
     }
 }

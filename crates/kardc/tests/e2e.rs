@@ -602,3 +602,32 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "32\n110\n");
 }
+
+// --- v0.129 generic structs (type-returning functions) ---------------------
+
+#[test]
+fn generic_structs_via_type_constructor() {
+    let src = r#"
+fn Pair(comptime T: type) type {
+    return struct { first: T, second: T };
+}
+const IntPair = Pair(i32);
+const I64Pair = Pair(i64);
+
+fn sum_pair(p: IntPair) i32 {
+    return p.first + p.second;
+}
+
+pub fn main() i32 {
+    var p: IntPair = IntPair{ .first = 10, .second = 32 };
+    print(sum_pair(p));        // 42
+    print(p.first);            // 10
+    var q: I64Pair = I64Pair{ .first = 100, .second = 200 };  // distinct instantiation
+    print(q.first);            // 100
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "42\n10\n100\n");
+}
