@@ -12,9 +12,9 @@
 //! `Err` if any diagnostic was produced.
 
 use crate::ast::{
-    ArraySize, BinOp, Block, ConstDecl, EnumDecl, Expr, FieldDecl, FieldInit, Func, ImportDecl,
-    Item, Module, Param, Stmt, StructDecl, SwitchArm, TestBlock, TypeExpr, UnOp, UnionDecl,
-    UnionVariant,
+    ArraySize, BinOp, Block, ConstDecl, EnumDecl, ErrorSetDecl, Expr, FieldDecl, FieldInit, Func,
+    ImportDecl, Item, Module, Param, Stmt, StructDecl, SwitchArm, TestBlock, TypeExpr, UnOp,
+    UnionDecl, UnionVariant,
 };
 use crate::diag::Diagnostic;
 use crate::span::Span;
@@ -78,6 +78,14 @@ impl<'a> Parser<'a> {
     /// The kind one token ahead (clamped to the trailing `Eof`).
     fn peek2_kind(&self) -> &TokenKind {
         let i = (self.pos + 1).min(self.tokens.len().saturating_sub(1));
+        &self.tokens[i].kind
+    }
+
+    /// The kind two tokens ahead (clamped to the trailing `Eof`). Used by
+    /// `parse_const` to distinguish `= error {` (a named error-set declaration,
+    /// v0.139) from `= error .` (an error-literal value const).
+    fn peek3_kind(&self) -> &TokenKind {
+        let i = (self.pos + 2).min(self.tokens.len().saturating_sub(1));
         &self.tokens[i].kind
     }
 
@@ -430,6 +438,7 @@ impl<'a> Parser<'a> {
                 name,
                 optional: false,
                 error_union: false,
+                error_set: None,
                 array_len: None,
                 pointer: true,
                 slice: false,
@@ -449,6 +458,7 @@ impl<'a> Parser<'a> {
                     name,
                     optional: false,
                     error_union: false,
+                    error_set: None,
                     array_len: None,
                     pointer: false,
                     slice: true,
@@ -462,6 +472,7 @@ impl<'a> Parser<'a> {
                 name,
                 optional: false,
                 error_union: false,
+                error_set: None,
                 array_len: Some(size),
                 pointer: false,
                 slice: false,
@@ -485,6 +496,27 @@ impl<'a> Parser<'a> {
             None
         };
         let (name, name_span) = self.parse_type_name()?;
+        // `Set!T` — a *named* error union (SPEC §34.1, v0.139): a base type name
+        // `Set` immediately followed by `!` in type position, where `Set` is the
+        // error set and the type after the `!` is the payload. This is only the
+        // named form when neither a `?` (optional) nor a prefix `!` (the global
+        // error union `!T`) was already consumed, keeping those forms unchanged.
+        // The base-name-then-`!` shape only arises in type position, so it never
+        // disturbs expression parsing (where `!` is logical negation / `!=`).
+        if opt_span.is_none() && err_span.is_none() && self.at_punct(&TokenKind::Bang) {
+            self.bump(); // `!`
+            let (payload, payload_span) = self.parse_type_name()?;
+            return Ok(TypeExpr {
+                name: payload,
+                optional: false,
+                error_union: true,
+                error_set: Some(name),
+                array_len: None,
+                pointer: false,
+                slice: false,
+                span: name_span.merge(payload_span),
+            });
+        }
         let span = match opt_span.or(err_span) {
             Some(prefix) => prefix.merge(name_span),
             None => name_span,
@@ -493,6 +525,7 @@ impl<'a> Parser<'a> {
             name,
             optional: opt_span.is_some(),
             error_union: err_span.is_some(),
+            error_set: None,
             array_len: None,
             pointer: false,
             slice: false,
@@ -522,6 +555,17 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::Keyword(Kw::Union) => {
                     return self.parse_union_decl(is_pub, name, start);
+                }
+                // `= error {` is a named error-set declaration (SPEC §34.1,
+                // v0.139): `const Name = error{ A, B };`. The `error` keyword is
+                // overloaded — `= error .Name` is instead an error-literal value
+                // const, so the set form is selected only when `{` (not `.`)
+                // follows `error`; the `error .` case falls through to the value
+                // path below and parses as an `Expr::ErrorLit`.
+                TokenKind::Keyword(Kw::Error)
+                    if matches!(self.peek3_kind(), TokenKind::LBrace) =>
+                {
+                    return self.parse_error_set_decl(is_pub, name, start);
                 }
                 _ => {
                     // Inferred value const `const IDENT = expr ;` (no annotation).
@@ -705,6 +749,39 @@ impl<'a> Parser<'a> {
             is_pub,
             name,
             variants,
+            span: start.merge(semi),
+        }))
+    }
+
+    /// Parse the tail of a named error-set declaration, with `const IDENT`
+    /// already consumed and the cursor on the `=`:
+    /// `= "error" "{" IDENT ("," IDENT)* ","? "}" ";"` (SPEC §34.1, v0.139). A
+    /// comma-separated list of error-member names with an optional trailing
+    /// comma — the same shape as a plain `enum` body. Member-duplication
+    /// detection is a sema concern (`E0331`), not the parser's. This mirrors
+    /// `= struct`/`= enum`/`= union(enum)` and is dispatched from `parse_const`
+    /// only when `{` (not `.`) follows the `error` keyword, so the value form
+    /// `const C = error.Name;` is left to the expression path.
+    fn parse_error_set_decl(&mut self, is_pub: bool, name: String, start: Span) -> PResult<Item> {
+        self.bump(); // `=`
+        if !self.eat_kw(Kw::Error) {
+            return Err(self.expected("`error`"));
+        }
+        self.expect_punct(&TokenKind::LBrace, "`{`")?;
+        let mut members = Vec::new();
+        while !self.at_punct(&TokenKind::RBrace) {
+            let (mname, _) = self.expect_ident()?;
+            members.push(mname);
+            if !self.eat_punct(&TokenKind::Comma) {
+                break; // no separator → the member list is done
+            }
+        }
+        self.expect_punct(&TokenKind::RBrace, "`}`")?;
+        let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
+        Ok(Item::ErrorSet(ErrorSetDecl {
+            is_pub,
+            name,
+            members,
             span: start.merge(semi),
         }))
     }
@@ -4038,6 +4115,224 @@ mod tests {
         let e = parse_assign_rhs_result(vec![TokenKind::Keyword(Kw::Error), TokenKind::Int(0)]);
         let err = e.expect_err("`error 0` should fail");
         assert!(err.iter().any(|d| d.code == "E0200"));
+    }
+
+    // ---- v0.139 named error sets ----------------------------------------
+
+    #[test]
+    fn error_set_decl_basic() {
+        // const E = error{ A, B };  ==>  Item::ErrorSet{ name: "E", members: [A, B] }
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("E"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Error),
+            TokenKind::LBrace,
+            id("A"),
+            TokenKind::Comma,
+            id("B"),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::ErrorSet(es) => {
+                assert!(!es.is_pub, "no `pub` keyword");
+                assert_eq!(es.name, "E");
+                assert_eq!(es.members, vec!["A".to_string(), "B".to_string()]);
+                assert!(es.span.start < es.span.end);
+            }
+            other => panic!("expected error-set decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn error_set_decl_pub_single_trailing_comma() {
+        // pub const F = error{ X, };  — `pub`, one member, trailing comma.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Pub),
+            TokenKind::Keyword(Kw::Const),
+            id("F"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Error),
+            TokenKind::LBrace,
+            id("X"),
+            TokenKind::Comma,
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::ErrorSet(es) => {
+                assert!(es.is_pub, "`pub const F = error{{ X }};` is public");
+                assert_eq!(es.name, "F");
+                assert_eq!(es.members, vec!["X".to_string()]);
+            }
+            other => panic!("expected error-set decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn named_error_union_return_type() {
+        // fn f() E!i32 { return 0; }  — `E!i32` is an error union over the
+        // named set `E`, payload `i32`. `error_set` is Some("E"); the payload
+        // name is "i32".
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("E"),
+            TokenKind::Bang,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Int(0),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert!(f.ret.error_union, "`E!i32` is an error union");
+                assert_eq!(
+                    f.ret.error_set,
+                    Some("E".to_string()),
+                    "`E!i32` carries the named set `E`"
+                );
+                assert_eq!(f.ret.name, "i32", "payload type is `i32`");
+                assert!(!f.ret.optional, "not optional");
+                assert!(f.ret.span.start < f.ret.span.end);
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn global_error_union_has_no_named_set() {
+        // fn f() !i32 { ... }  — the prefix `!` form keeps `error_set: None`
+        // (the implicit global error set), unchanged by v0.139.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::Bang,
+            id("i32"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Int(0),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert!(f.ret.error_union, "`!i32` is an error union");
+                assert_eq!(f.ret.error_set, None, "`!i32` has no named set");
+                assert_eq!(f.ret.name, "i32");
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn named_error_union_local_var() {
+        // var x: E!i32 = ...; inside a fn — the `Set!T` form is recognised in
+        // any type position, not just returns.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Var),
+            id("x"),
+            TokenKind::Colon,
+            id("FileErr"),
+            TokenKind::Bang,
+            id("i32"),
+            TokenKind::Eq,
+            TokenKind::Int(0),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => match &f.body.stmts[0] {
+                Stmt::Let { ty: Some(ty), .. } => {
+                    assert!(ty.error_union, "`FileErr!i32` is an error union");
+                    assert_eq!(ty.error_set, Some("FileErr".to_string()));
+                    assert_eq!(ty.name, "i32");
+                }
+                other => panic!("expected `let`, got {:?}", other),
+            },
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn error_literal_const_is_not_a_set_decl() {
+        // const C = error.A;  — `= error .` (not `error {`) stays an inferred
+        // value const whose initializer is an `Expr::ErrorLit`, NOT a set decl.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("C"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Error),
+            TokenKind::Dot,
+            id("A"),
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Const(c) => {
+                assert_eq!(c.name, "C");
+                assert!(c.ty.is_none(), "inferred const, no annotation");
+                match &c.value {
+                    Expr::ErrorLit { name, .. } => assert_eq!(name, "A"),
+                    other => panic!("expected error literal, got {:?}", other),
+                }
+            }
+            other => panic!("expected value const, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn error_dot_expression_still_parses_after_v0139() {
+        // Regression: `error.A` in expression position is unchanged by v0.139.
+        let e = parse_assign_rhs(vec![
+            TokenKind::Keyword(Kw::Error),
+            TokenKind::Dot,
+            id("A"),
+        ]);
+        match e {
+            Expr::ErrorLit { name, .. } => assert_eq!(name, "A"),
+            other => panic!("expected error literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn empty_error_set_decl() {
+        // const Empty = error{};  — a degenerate but well-formed empty set.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Const),
+            id("Empty"),
+            TokenKind::Eq,
+            TokenKind::Keyword(Kw::Error),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::ErrorSet(es) => {
+                assert_eq!(es.name, "Empty");
+                assert!(es.members.is_empty());
+            }
+            other => panic!("expected error-set decl, got {:?}", other),
+        }
     }
 
     #[test]

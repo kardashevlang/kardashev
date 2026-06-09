@@ -1010,3 +1010,30 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "222\n1\n0\n");
 }
+
+// --- v0.139 named error sets -----------------------------------------------
+
+#[test]
+fn named_error_sets() {
+    let src = r#"
+const FileErr = error{ NotFound, Denied };
+fn open(ok: bool) FileErr!i32 {
+    if (ok) { return 42; }
+    return error.NotFound;
+}
+fn risky(bad: bool) FileErr!i32 {
+    if (bad) { return error.Denied; }
+    return 7;
+}
+pub fn main() i32 {
+    print(open(true) catch 0 - 1);     // 42
+    print(open(false) catch 0 - 1);    // -1 (NotFound)
+    print(risky(false) catch 0 - 1);   // 7
+    print(risky(true) catch 0 - 1);    // -1 (Denied)
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "42\n-1\n7\n-1\n");
+}

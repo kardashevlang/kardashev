@@ -38,6 +38,11 @@
 //!   reuses the struct-literal form (`Name{ .v = e }`). A `switch` arm that
 //!   binds the matched variant's payload prints `labels => |cap| { … }` (SPEC
 //!   §20).
+//! - `const Name = error{ A, B };` — a named error set (SPEC §34), printed on a
+//!   single line with its members joined by `, ` inside `error{ … }` (one space
+//!   just inside each brace, no trailing comma); an empty set prints `const Name
+//!   = error{};`. A named error union over such a set prints the set name before
+//!   the `!` — `E!i32` — while the implicit global `!i32` is unchanged.
 //!
 //! ## Idempotence
 //!
@@ -45,8 +50,8 @@
 //! canonical output produces byte-identical text.
 
 use crate::ast::{
-    ArraySize, BinOp, Block, ConstDecl, EnumDecl, Expr, Func, Item, Module, Stmt, StructDecl,
-    SwitchArm, TestBlock, TypeExpr, UnOp, UnionDecl,
+    ArraySize, BinOp, Block, ConstDecl, EnumDecl, ErrorSetDecl, Expr, Func, Item, Module, Stmt,
+    StructDecl, SwitchArm, TestBlock, TypeExpr, UnOp, UnionDecl,
 };
 use crate::diag::Diagnostic;
 
@@ -79,6 +84,7 @@ pub fn print_module(module: &Module) -> String {
             Item::Struct(s) => p.print_struct(s),
             Item::Enum(e) => p.print_enum(e),
             Item::Union(u) => p.print_union(u),
+            Item::ErrorSet(es) => p.print_error_set(es),
             Item::Import(im) => {
                 p.out
                     .push_str(&format!("@import({});\n", escape_string(&im.path)));
@@ -270,6 +276,37 @@ impl Printer {
         self.indent -= 1;
         self.write_indent();
         self.out.push_str("};\n");
+    }
+
+    /// Print a named error-set declaration (SPEC §34): `pub? const Name = error{
+    /// A, B };`. Unlike the multi-line struct/enum/union forms, an error set
+    /// prints on a **single line** with its members joined by `, ` inside
+    /// `error{ … }` — a brace-delimited list with one space just inside each
+    /// brace, no trailing comma — mirroring the `error.X` literal spelling
+    /// (SPEC §12). An empty set collapses to `const Name = error{};`, matching
+    /// the empty struct/enum/union forms and keeping the printer total. A `pub`
+    /// set keeps its leading `pub`. The printed form re-lexes to the same
+    /// `Item::ErrorSet`, so re-formatting is idempotent.
+    fn print_error_set(&mut self, es: &ErrorSetDecl) {
+        self.write_indent();
+        if es.is_pub {
+            self.out.push_str("pub ");
+        }
+        self.out.push_str("const ");
+        self.out.push_str(&es.name);
+        self.out.push_str(" = error{");
+        if es.members.is_empty() {
+            self.out.push_str("};\n");
+            return;
+        }
+        self.out.push(' ');
+        for (i, member) in es.members.iter().enumerate() {
+            if i > 0 {
+                self.out.push_str(", ");
+            }
+            self.out.push_str(member);
+        }
+        self.out.push_str(" };\n");
     }
 
     fn print_test(&mut self, t: &TestBlock) {
@@ -591,14 +628,16 @@ impl Printer {
 
 // ----- types ----------------------------------------------------------------
 
-/// Format a type reference (SPEC §11.1 / §12.1 / §14.1 / §15 / §24). A pointer
-/// (`TypeExpr.pointer`) prints with a leading `*` — e.g. `*i32` — a slice
+/// Format a type reference (SPEC §11.1 / §12.1 / §14.1 / §15 / §24 / §34). A
+/// pointer (`TypeExpr.pointer`) prints with a leading `*` — e.g. `*i32` — a slice
 /// (`TypeExpr.slice`) with a leading `[]` — e.g. `[]i32` — an array
 /// (`TypeExpr.array_len = Some(..)`) with a leading `[N]` whose `N` is either a
 /// literal size (`ArraySize::Lit`, e.g. `[3]i32`, v0.117) or a comptime
 /// value-parameter name (`ArraySize::Param`, e.g. `[n]i32`, v0.128) — an
 /// optional type (`TypeExpr.optional`) with a leading `?` — e.g. `?i32` — an
-/// error union (`TypeExpr.error_union`) with a leading `!` — e.g. `!i32` — and a
+/// error union (`TypeExpr.error_union`) with a leading `!` — e.g. `!i32` — or, for
+/// a *named* error union over the error set `Set` (`TypeExpr.error_set =
+/// Some("Set")`, v0.139), the set name before the `!` — e.g. `E!i32` — and a
 /// plain type as its bare name. The qualifiers are mutually exclusive (v0.115:
 /// `?` and `!` are never combined; v0.117: `[N]` is not combined with either;
 /// v0.118: `*`/`[]` are not combined with the others), so at most one prefix is
@@ -622,7 +661,17 @@ fn fmt_type(ty: &TypeExpr) -> String {
     } else if ty.optional {
         format!("?{}", ty.name)
     } else if ty.error_union {
-        format!("!{}", ty.name)
+        // An error union (SPEC §12/§34). The global form `!T` (`error_set ==
+        // None`) prints with a bare leading `!` — `!i32` — unchanged from
+        // v0.115. A **named** error union `Set!T` (`error_set == Some("Set")`,
+        // v0.139) prints the set name before the `!` — `Set!i32` — so the set
+        // constraint is visible and the printed form re-lexes to the same
+        // `TypeExpr` (the parser reads a base type name `Set` followed by `!` as
+        // a named error union).
+        match &ty.error_set {
+            Some(set) => format!("{}!{}", set, ty.name),
+            None => format!("!{}", ty.name),
+        }
     } else {
         ty.name.clone()
     }
@@ -1377,6 +1426,7 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: None,
             pointer: false,
             slice: false,
@@ -1390,6 +1440,7 @@ mod tests {
             name: name.to_string(),
             optional: true,
             error_union: false,
+            error_set: None,
             array_len: None,
             pointer: false,
             slice: false,
@@ -1397,12 +1448,29 @@ mod tests {
         }
     }
 
-    /// An error-union type `!name` (`TypeExpr.error_union = true`; v0.115).
+    /// An error-union type `!name` over the implicit global error set
+    /// (`TypeExpr.error_union = true`, `error_set = None`; v0.115).
     fn err_ty(name: &str) -> TypeExpr {
         TypeExpr {
             name: name.to_string(),
             optional: false,
             error_union: true,
+            error_set: None,
+            array_len: None,
+            pointer: false,
+            slice: false,
+            span: D,
+        }
+    }
+
+    /// A named error-union type `set!name` over the error set `set`
+    /// (`TypeExpr.error_union = true`, `error_set = Some(set)`; v0.139).
+    fn set_err_ty(set: &str, name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: false,
+            error_union: true,
+            error_set: Some(set.to_string()),
             array_len: None,
             pointer: false,
             slice: false,
@@ -1417,6 +1485,7 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: Some(ArraySize::Lit(len)),
             pointer: false,
             slice: false,
@@ -1433,6 +1502,7 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: Some(ArraySize::Param(len_param.to_string())),
             pointer: false,
             slice: false,
@@ -1446,6 +1516,7 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: None,
             pointer: true,
             slice: false,
@@ -1459,6 +1530,7 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: None,
             pointer: false,
             slice: true,
@@ -2493,6 +2565,172 @@ mod tests {
             "}\n",
         );
         assert_eq!(print_module(&m), expected);
+    }
+
+    // ----- named error sets (SPEC §34, v0.139) ----------------------------
+
+    #[test]
+    fn named_error_set_decl_prints() {
+        // `const E = error{ A, B };` — a named error set prints on one line with
+        // its members joined by `, ` inside `error{ … }`, one space just inside
+        // each brace, no trailing comma. (Parser-independent: the AST is built
+        // directly so only the printer is exercised.)
+        let m = Module {
+            items: vec![Item::ErrorSet(ErrorSetDecl {
+                is_pub: false,
+                name: "E".to_string(),
+                members: vec!["A".to_string(), "B".to_string()],
+                span: D,
+            })],
+        };
+        assert_eq!(print_module(&m), "const E = error{ A, B };\n");
+    }
+
+    #[test]
+    fn named_error_set_pub_and_empty_and_single() {
+        // A `pub` set keeps its leading `pub`.
+        let pub_set = Module {
+            items: vec![Item::ErrorSet(ErrorSetDecl {
+                is_pub: true,
+                name: "FileErr".to_string(),
+                members: vec!["NotFound".to_string(), "Denied".to_string()],
+                span: D,
+            })],
+        };
+        assert_eq!(
+            print_module(&pub_set),
+            "pub const FileErr = error{ NotFound, Denied };\n"
+        );
+
+        // A single-member set: no trailing comma, spaces inside the braces.
+        let single = Module {
+            items: vec![Item::ErrorSet(ErrorSetDecl {
+                is_pub: false,
+                name: "E".to_string(),
+                members: vec!["Only".to_string()],
+                span: D,
+            })],
+        };
+        assert_eq!(print_module(&single), "const E = error{ Only };\n");
+
+        // An empty set collapses to `const Name = error{};`, mirroring the empty
+        // struct/enum/union forms (keeps the printer total).
+        let empty = Module {
+            items: vec![Item::ErrorSet(ErrorSetDecl {
+                is_pub: false,
+                name: "E".to_string(),
+                members: vec![],
+                span: D,
+            })],
+        };
+        assert_eq!(print_module(&empty), "const E = error{};\n");
+    }
+
+    #[test]
+    fn named_error_union_type_prints_with_set_prefix() {
+        // A named error union `Set!T` (`error_set = Some("Set")`, v0.139) prints
+        // the set name before the `!`.
+        assert_eq!(fmt_type(&set_err_ty("E", "i32")), "E!i32");
+        assert_eq!(fmt_type(&set_err_ty("FileErr", "Point")), "FileErr!Point");
+
+        // The global form `!T` (`error_set = None`, v0.115) is unchanged — a bare
+        // leading `!`, with no set name.
+        assert_eq!(fmt_type(&err_ty("i32")), "!i32");
+        assert_eq!(fmt_type(&err_ty("Point")), "!Point");
+    }
+
+    #[test]
+    fn named_error_union_in_every_type_position() {
+        // `Set!T` must print wherever a type appears: a top-level `const`
+        // annotation, a struct field, a function's params and return, and a local
+        // `var`/`const` annotation — mirroring the global `!T` coverage test.
+        let set = Item::ErrorSet(ErrorSetDecl {
+            is_pub: false,
+            name: "E".to_string(),
+            members: vec!["A".to_string(), "B".to_string()],
+            span: D,
+        });
+        let const_decl = Item::Const(ConstDecl {
+            is_pub: true,
+            name: "NIL".to_string(),
+            ty: Some(set_err_ty("E", "i32")),
+            value: error_lit("A"),
+            span: D,
+        });
+        let strukt = Item::Struct(StructDecl {
+            is_pub: false,
+            name: "Box".to_string(),
+            fields: vec![FieldDecl {
+                name: "payload".to_string(),
+                ty: set_err_ty("E", "i32"),
+                span: D,
+            }],
+            methods: vec![],
+            span: D,
+        });
+        let func = Item::Func(Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![Param {
+                name: "x".to_string(),
+                ty: set_err_ty("E", "i32"),
+                is_comptime: false,
+                span: D,
+            }],
+            ret: set_err_ty("E", "i32"),
+            body: Block {
+                stmts: vec![Stmt::Let {
+                    is_const: false,
+                    name: "y".to_string(),
+                    ty: Some(set_err_ty("E", "i32")),
+                    value: error_lit("B"),
+                    span: D,
+                }],
+                span: D,
+            },
+            span: D,
+        });
+        let m = Module {
+            items: vec![set, const_decl, strukt, func],
+        };
+        let expected = concat!(
+            "const E = error{ A, B };\n",
+            "\n",
+            "pub const NIL: E!i32 = error.A;\n",
+            "\n",
+            "const Box = struct {\n",
+            "    payload: E!i32,\n",
+            "};\n",
+            "\n",
+            "fn f(x: E!i32) E!i32 {\n",
+            "    var y: E!i32 = error.B;\n",
+            "}\n",
+        );
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn named_error_set_roundtrips_via_source() {
+        // Full lex + parse + print round-trip (`format_source` runs the lexer and
+        // parser, not sema): a named error-set declaration and a function whose
+        // return type is the named error union `E!i32` both reach canonical form,
+        // and re-formatting is idempotent.
+        let src = "const E = error{ A, B };\n\nfn f() E!i32 {\n    return error.A;\n}\n";
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src, "named error set + E!i32 reaches canonical form");
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(once, twice, "re-formatting is idempotent");
+    }
+
+    #[test]
+    fn plain_error_union_still_roundtrips_unchanged() {
+        // The global `!T` form is untouched by named sets: a fn returning `!i32`
+        // round-trips to a bare `!i32`, exactly as in v0.115.
+        let src = "fn f() !i32 {\n    return error.Oops;\n}\n";
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src, "plain !i32 reaches canonical form");
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(once, twice, "re-formatting is idempotent");
     }
 
     #[test]

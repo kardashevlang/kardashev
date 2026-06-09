@@ -177,6 +177,7 @@ fn top_level_name(item: &Item) -> Option<(&str, Span)> {
         Item::Struct(s) => Some((&s.name, s.span)),
         Item::Enum(e) => Some((&e.name, e.span)),
         Item::Union(u) => Some((&u.name, u.span)),
+        Item::ErrorSet(e) => Some((&e.name, e.span)),
         Item::Test(_) | Item::Import(_) => None,
     }
 }

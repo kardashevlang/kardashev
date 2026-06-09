@@ -499,6 +499,10 @@ impl<'a> Emitter<'a> {
                 Item::Union(_) => {}
                 // Imports are erased by the module flattener before emit.
                 Item::Import(_) => {}
+                // A named error set (v0.139, §34) is a compile-time-only sema
+                // constraint with no runtime representation — it declares no
+                // types and registers no pointers.
+                Item::ErrorSet(_) => {}
             }
         }
     }
@@ -3608,8 +3612,8 @@ fn c_string_literal(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::ast::{
-        ArraySize, BinOp, Block, ConstDecl, Expr, FieldDecl, FieldInit, Func, Item, Module, Param,
-        Stmt, StructDecl, SwitchArm, TestBlock, TypeExpr,
+        ArraySize, BinOp, Block, ConstDecl, ErrorSetDecl, Expr, FieldDecl, FieldInit, Func, Item,
+        Module, Param, Stmt, StructDecl, SwitchArm, TestBlock, TypeExpr,
     };
     use crate::span::Span;
     use crate::types::{ComptimeArg, StructTable, Type};
@@ -3619,6 +3623,7 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: None,
             pointer: false,
             slice: false,
@@ -3631,6 +3636,7 @@ mod tests {
             name: name.to_string(),
             optional: true,
             error_union: false,
+            error_set: None,
             array_len: None,
             pointer: false,
             slice: false,
@@ -3638,11 +3644,29 @@ mod tests {
         }
     }
 
+    /// An error union over the **implicit global** error set, `!name` (§12).
     fn err_ty(name: &str) -> TypeExpr {
         TypeExpr {
             name: name.to_string(),
             optional: false,
             error_union: true,
+            error_set: None,
+            array_len: None,
+            pointer: false,
+            slice: false,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// An error union over a **named** error set, `set!name` (v0.139, §34). The
+    /// runtime representation is identical to [`err_ty`] — the set name is a
+    /// pure sema constraint and the backend must ignore it.
+    fn set_err_ty(set: &str, name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: false,
+            error_union: true,
+            error_set: Some(set.to_string()),
             array_len: None,
             pointer: false,
             slice: false,
@@ -3658,6 +3682,7 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: Some(ArraySize::Lit(len)),
             pointer: false,
             slice: false,
@@ -3672,6 +3697,7 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: Some(ArraySize::Param(param.to_string())),
             pointer: false,
             slice: false,
@@ -3685,6 +3711,7 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: None,
             pointer: true,
             slice: false,
@@ -3698,6 +3725,7 @@ mod tests {
             name: name.to_string(),
             optional: false,
             error_union: false,
+            error_set: None,
             array_len: None,
             pointer: false,
             slice: true,
@@ -5330,6 +5358,195 @@ mod tests {
             .expect("error propagation missing");
         // Inside the error branch the defer runs before the propagation return.
         assert!(flush < prop, "defer must flush before propagation:\n{out}");
+    }
+
+    // -- named error sets (v0.139, SPEC §34) -------------------------------
+    //
+    // A named set `Set!T` is purely a sema constraint: it lowers to the SAME
+    // `{ int32_t err; <T> val; }` as the implicit global `!T`, interned by
+    // payload (§34.3). The backend must therefore IGNORE `TypeExpr.error_set`,
+    // and an `Item::ErrorSet` must emit nothing (compile-time only).
+
+    #[test]
+    fn named_error_set_return_lowers_identically_to_global() {
+        // fn f() FileErr!i32 { return 9; }  must emit byte-identical C to
+        // fn f() !i32 { return 9; } — `error_set` is invisible to codegen.
+        let structs = err_int_table();
+        let make = |rty: TypeExpr| Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: rty,
+                body: block(vec![ret(int(9))]),
+                span: Span::DUMMY,
+            })],
+        };
+        let global = emit(&make(err_ty("i32")), &structs, EmitMode::Program);
+        let named = emit(&make(set_err_ty("FileErr", "i32")), &structs, EmitMode::Program);
+        assert_eq!(
+            global, named,
+            "a named-set error union must lower identically to the global `!T`"
+        );
+        // Sanity: the shared lowering is the canonical success widening + typedef.
+        assert!(
+            named.contains("kd_err_int32_t kd_f(void)"),
+            "named-set return type must use the payload-keyed typedef:\n{named}"
+        );
+        assert!(
+            named.contains("return (((kd_err_int32_t){ .err = 0, .val = 9 }));"),
+            "named-set success-value coercion wrong:\n{named}"
+        );
+    }
+
+    #[test]
+    fn named_error_set_error_lit_and_catch_lower_correctly() {
+        // const FileErr = error{ NotFound, Denied };
+        // fn f() FileErr!i32 { return error.NotFound; }
+        // fn g(x: FileErr!i32) i32 { return x catch 0; }
+        let mut structs = StructTable::new();
+        structs.intern_error_union(Type::I32);
+        structs.intern_error("NotFound"); // 1-based global code 1
+        structs.intern_error("Denied"); // code 2
+
+        let eset = Item::ErrorSet(ErrorSetDecl {
+            is_pub: false,
+            name: "FileErr".to_string(),
+            members: vec!["NotFound".to_string(), "Denied".to_string()],
+            span: Span::DUMMY,
+        });
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: set_err_ty("FileErr", "i32"),
+            body: block(vec![ret(error_lit("NotFound"))]),
+            span: Span::DUMMY,
+        };
+        let g = Func {
+            is_pub: false,
+            name: "g".to_string(),
+            params: vec![Param {
+                name: "x".to_string(),
+                ty: set_err_ty("FileErr", "i32"),
+                is_comptime: false,
+                span: Span::DUMMY,
+            }],
+            ret: ty("i32"),
+            body: block(vec![ret(Expr::Catch {
+                expr: Box::new(ident("x")),
+                default: Box::new(int(0)),
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![eset, Item::Func(f), Item::Func(g)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // `FileErr!i32` uses the same payload-keyed error-union typedef as `!i32`.
+        assert!(
+            out.contains("kd_err_int32_t kd_f(void)"),
+            "named-set return type wrong:\n{out}"
+        );
+        // `error.NotFound` widens to a failure value carrying its global code.
+        assert!(
+            out.contains("return (((kd_err_int32_t){ .err = 1 }));"),
+            "named-set error-literal coercion wrong:\n{out}"
+        );
+        // The `FileErr!i32` parameter is typed with the error-union typedef.
+        assert!(
+            out.contains("int32_t kd_g(kd_err_int32_t kd_x)"),
+            "named-set param type wrong:\n{out}"
+        );
+        // `x catch 0` lowers to the set-agnostic inline catch helper.
+        assert!(
+            out.contains("kd_err_int32_t_catch(kd_x, 0)"),
+            "named-set catch lowering wrong:\n{out}"
+        );
+        // The set declaration emits nothing — its name never reaches the C.
+        assert!(
+            !out.contains("FileErr"),
+            "Item::ErrorSet must emit nothing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn named_error_set_try_propagation_identical_to_global() {
+        // fn g() <ret> { return 1; }  fn f() <ret> { return try g(); }
+        // with <ret> = `!i32` then `FileErr!i32`: identical propagation lowering.
+        let structs = err_int_table();
+        let make = |rty: TypeExpr| {
+            let g = Func {
+                is_pub: false,
+                name: "g".to_string(),
+                params: vec![],
+                ret: rty.clone(),
+                body: block(vec![ret(int(1))]),
+                span: Span::DUMMY,
+            };
+            let f = Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: rty,
+                body: block(vec![ret(try_expr(call("g", vec![])))]),
+                span: Span::DUMMY,
+            };
+            Module {
+                items: vec![Item::Func(g), Item::Func(f)],
+            }
+        };
+        let global = emit(&make(err_ty("i32")), &structs, EmitMode::Program);
+        let named = emit(&make(set_err_ty("FileErr", "i32")), &structs, EmitMode::Program);
+        assert_eq!(
+            global, named,
+            "named-set `try` propagation must lower identically to the global `!T`"
+        );
+        assert!(
+            named.contains("kd_err_int32_t __kd_try0 = kd_g();"),
+            "named-set try temp hoist wrong:\n{named}"
+        );
+        assert!(
+            named.contains("return (kd_err_int32_t){ .err = __kd_try0.err };"),
+            "named-set try error propagation wrong:\n{named}"
+        );
+    }
+
+    #[test]
+    fn item_error_set_emits_nothing() {
+        // A module that is `const FileErr = error{ A, B };` plus an empty `main`
+        // must emit exactly what the same module WITHOUT the set emits.
+        let structs = StructTable::new();
+        let main = Func {
+            is_pub: false,
+            name: "main".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![]),
+            span: Span::DUMMY,
+        };
+        let with_set = Module {
+            items: vec![
+                Item::ErrorSet(ErrorSetDecl {
+                    is_pub: true,
+                    name: "FileErr".to_string(),
+                    members: vec!["A".to_string(), "B".to_string()],
+                    span: Span::DUMMY,
+                }),
+                Item::Func(main.clone()),
+            ],
+        };
+        let without_set = Module {
+            items: vec![Item::Func(main)],
+        };
+        let a = emit(&with_set, &structs, EmitMode::Program);
+        let b = emit(&without_set, &structs, EmitMode::Program);
+        assert_eq!(a, b, "an Item::ErrorSet must add nothing to the emitted C");
+        assert!(
+            !a.contains("FileErr"),
+            "the set name must not appear in the emitted C:\n{a}"
+        );
     }
 
     // -- enums & switch (v0.116) -------------------------------------------

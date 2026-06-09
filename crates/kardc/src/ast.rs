@@ -24,6 +24,17 @@ pub enum Item {
     /// `@import("path.ks");` — a top-level import (v0.126). Resolved and erased
     /// by the module flattener before sema/emit; a residual one is an error.
     Import(ImportDecl),
+    /// `pub? const Name = error{ A, B, … };` — a named error set (v0.139).
+    ErrorSet(ErrorSetDecl),
+}
+
+/// A named error set `const Name = error{ A, B };` (v0.139).
+#[derive(Clone, Debug)]
+pub struct ErrorSetDecl {
+    pub is_pub: bool,
+    pub name: String,
+    pub members: Vec<String>,
+    pub span: Span,
 }
 
 /// A `@import("path");` declaration (v0.126).
@@ -136,6 +147,10 @@ pub struct TypeExpr {
     /// True if written as `!T` (an error union). v0.115: implicit global error
     /// set; not combined with `optional`.
     pub error_union: bool,
+    /// `Some(name)` if written as `Set!T` (an error union over the *named* error
+    /// set `Set`, v0.139); `None` for the implicit global `!T`. Only meaningful
+    /// when `error_union` is true.
+    pub error_set: Option<String>,
     /// `Some(..)` if written as `[N]T` (a fixed-size array); `name` is then the
     /// element type. The size is a literal (`[3]T`, v0.117) or a comptime
     /// value-parameter name (`[n]T`, v0.128). Not combined with `?`/`!`.

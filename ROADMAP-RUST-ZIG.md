@@ -235,9 +235,12 @@ limitations from v0.130: a method may now **reference top-level `const`s and fre
 functions** (method bodies are checked after Pass 2) and **call `Self.assoc(…)`**
 associated constructors.
 
-### v0.139.0 — Named error sets
-`const FileErr = error{ NotFound, Denied };`, `FileErr!T`, and set membership —
-named error sets alongside the implicit global one.
+### v0.139.0 — Named error sets ✅
+`const FileErr = error{ NotFound, Denied };`, `FileErr!T`, and **membership
+checking** (`return error.X` must be in the set, `E0330`) — named error sets
+alongside the implicit global `!T`. `TypeExpr.error_set`; `Item::ErrorSet`. At
+runtime `Set!T` ≡ `!T` (the set is a compile-time constraint), so `try`/`catch`
+are unchanged.
 
 ### v0.140.0 — Doc comments + `kard doc`
 `/// …` doc comments parsed onto items, and `kard doc` to extract a module's
