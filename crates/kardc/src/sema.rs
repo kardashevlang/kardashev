@@ -452,6 +452,12 @@ impl Checker {
                     Some(id) => id,
                     None => continue, // unreachable: interned in pass 0a
                 };
+                // Bind `Self` -> this struct while resolving the method
+                // signatures (v0.136, SPEC §32.2), so a non-receiver `Self`/`*Self`
+                // parameter or a `Self`/`*Self` return type resolves to the struct
+                // (not the `i64`/`void` fallback). The leading `self` receiver is
+                // still set explicitly below via `self_ty`.
+                let prev_self = self.bind_self(id);
                 let mut map: HashMap<String, StructFn> = HashMap::new();
                 for f in &s.methods {
                     let is_method = f.params.first().map_or(false, |p| p.name == "self");
@@ -491,6 +497,7 @@ impl Checker {
                     );
                 }
                 self.struct_funcs.insert(id, map);
+                self.restore_self(prev_self);
             }
         }
 
@@ -639,6 +646,13 @@ impl Checker {
     /// Type-check one struct function body. `struct_id` is the enclosing struct,
     /// used as the type of a leading `self` parameter.
     fn check_struct_func(&mut self, f: &Func, struct_id: u32) {
+        // Bind `Self` -> the enclosing struct so `Self` / `*Self` / `@This()`
+        // resolve in this plain struct's method signature **and** body (v0.136,
+        // SPEC §32.2): the return type, any non-receiver `Self`/`*Self`
+        // parameter, `var x: Self`, `Self{ … }` literals and `Self.assoc()` calls
+        // all flow through the active substitution. (The leading `self` receiver
+        // is still bound explicitly below.)
+        let prev_self = self.bind_self(struct_id);
         self.ret_type = self.resolve_type(&f.ret).unwrap_or(Type::Void);
         self.in_test = false;
         self.loop_depth = 0;
@@ -667,6 +681,7 @@ impl Checker {
         }
         self.check_block(&f.body);
         self.scopes.pop();
+        self.restore_self(prev_self);
     }
 
     fn check_test(&mut self, t: &TestBlock) {
@@ -830,6 +845,30 @@ impl Checker {
             return self.structs.intern_array(elem, 0);
         }
         self.structs.intern_array(elem, len as usize)
+    }
+
+    /// Bind `Self` to `Struct(struct_id)` in the active type substitution,
+    /// returning the previous binding (if any) so the caller can restore it via
+    /// [`restore_self`]. This lets `Self` / `*Self` / `@This()` (the parser
+    /// desugars `@This()` to the type name `Self`) resolve inside a **plain**
+    /// named-struct method's signature and body (v0.136, SPEC §32.2). Generic-
+    /// struct methods already bind `Self` through their own `msubst`, so this is
+    /// only used on the plain-struct path.
+    fn bind_self(&mut self, struct_id: u32) -> Option<Type> {
+        self.subst.insert("Self".to_string(), Type::Struct(struct_id))
+    }
+
+    /// Undo a [`bind_self`], restoring the previous `Self` binding (or removing
+    /// it when there was none).
+    fn restore_self(&mut self, prev: Option<Type>) {
+        match prev {
+            Some(t) => {
+                self.subst.insert("Self".to_string(), t);
+            }
+            None => {
+                self.subst.remove("Self");
+            }
+        }
     }
 
     /// Resolve a type name to a builtin or a registered struct, emitting
@@ -2559,6 +2598,42 @@ impl Checker {
                     None => None,
                 }
             }
+            // A comptime reflection builtin `@name(T)` in expression position
+            // (v0.136, SPEC §32.1). The single argument names a *type*, resolved
+            // exactly like `alloc`'s type argument (`resolve_type_arg`, which is
+            // substitution-aware so `@sizeOf(T)` / `@typeName(T)` work inside a
+            // generic body). `@sizeOf(T)` yields `usize`; `@typeName(T)` yields a
+            // `[]u8` string (the §23 slice). An unknown `@name`, or a wrong
+            // argument count, is `E0320`.
+            Expr::Builtin { name, args, span } => match name.as_str() {
+                "sizeOf" | "typeName" => {
+                    if args.len() != 1 {
+                        let msg = format!(
+                            "`@{}` takes exactly 1 type argument, found {}",
+                            name,
+                            args.len()
+                        );
+                        self.error(*span, "E0320", msg);
+                        return None;
+                    }
+                    // Validate (and intern) the type argument; the result type of
+                    // each builtin does not otherwise depend on which type it is.
+                    let _ = self.resolve_type_arg(&args[0]);
+                    if name == "sizeOf" {
+                        Some(Type::Usize)
+                    } else {
+                        Some(Type::Slice(self.structs.intern_slice(Type::U8)))
+                    }
+                }
+                other => {
+                    let msg = format!(
+                        "unknown `@`-builtin `@{}` (expected `@sizeOf` or `@typeName`)",
+                        other
+                    );
+                    self.error(*span, "E0320", msg);
+                    None
+                }
+            },
         }
     }
 
@@ -10029,5 +10104,233 @@ mod tests {
             ),
         ];
         assert!(codes(items).contains(&"E0231"));
+    }
+
+    // ---- comptime reflection builtins (v0.136, SPEC §32) ------------------
+
+    /// A `@name(args)` comptime builtin call in expression position (v0.136).
+    fn builtin(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::Builtin {
+            name: name.into(),
+            args,
+            span: sp(),
+        }
+    }
+
+    #[test]
+    fn sizeof_builtin_is_usize() {
+        // `@sizeOf(i32)` type-checks to `usize`.
+        let mut cx = Checker::new();
+        let t = cx.check_expr(&builtin("sizeOf", vec![ident("i32")]), None);
+        assert_eq!(t, Some(Type::Usize));
+    }
+
+    #[test]
+    fn typename_builtin_is_slice_of_u8() {
+        // `@typeName(i32)` type-checks to the interned `[]u8` slice type.
+        let mut cx = Checker::new();
+        let t = cx.check_expr(&builtin("typeName", vec![ident("i32")]), None);
+        let expected = Type::Slice(cx.structs.intern_slice(Type::U8));
+        assert_eq!(t, Some(expected));
+        assert_eq!(cx.type_name(expected), "[]u8");
+    }
+
+    #[test]
+    fn inferred_sizeof_var_is_usize() {
+        // fn main() void { var n = @sizeOf(i32); var m: usize = n; }
+        // The inferred `n` must be `usize`, so assigning it to a `usize` binding
+        // type-checks.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_var_infer("n", builtin("sizeOf", vec![ident("i32")])),
+                let_var("m", "usize", ident("n")),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn typename_assignable_to_slice_of_u8() {
+        // fn main() void { var s: []u8 = @typeName(i32); }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_slice("s", "u8", builtin("typeName", vec![ident("i32")]))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn sizeof_of_struct_type_ok() {
+        // const Point = struct { x: i32, y: i32 };
+        // fn main() void { var n: usize = @sizeOf(Point); }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32"), ("y", "i32")]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("n", "usize", builtin("sizeOf", vec![ident("Point")]))],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn sizeof_of_type_parameter_in_generic_body() {
+        // fn sz(comptime T: type) usize { return @sizeOf(T); }
+        // fn main() void { var n: usize = sz(i32); }
+        // `@sizeOf(T)` resolves `T` through the active type substitution at the
+        // instantiation, so the generic body type-checks.
+        let sz = Item::Func(raw_func(
+            "sz",
+            vec![param_comptime("T")],
+            "usize",
+            vec![ret(Some(builtin("sizeOf", vec![ident("T")])))],
+        ));
+        let items = vec![
+            sz,
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("n", "usize", call("sz", vec![ident("i32")]))],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn unknown_builtin_is_e0320() {
+        // fn main() void { var n = @foo(i32); }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_infer("n", builtin("foo", vec![ident("i32")]))],
+        )];
+        assert!(codes(items).contains(&"E0320"));
+    }
+
+    #[test]
+    fn builtin_too_many_args_is_e0320() {
+        // fn main() void { var n = @sizeOf(i32, i32); }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_infer(
+                "n",
+                builtin("sizeOf", vec![ident("i32"), ident("i32")]),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0320"));
+    }
+
+    #[test]
+    fn builtin_no_args_is_e0320() {
+        // fn main() void { var n = @typeName(); }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_infer("n", builtin("typeName", vec![]))],
+        )];
+        assert!(codes(items).contains(&"E0320"));
+    }
+
+    #[test]
+    fn builtin_in_const_is_e0130() {
+        // const C: usize = @sizeOf(i32);  // not a constant expression
+        let items = vec![const_item("C", "usize", builtin("sizeOf", vec![ident("i32")]))];
+        assert!(codes(items).contains(&"E0130"));
+    }
+
+    // ---- `@This()` / `Self` in plain struct methods (v0.136, SPEC §32.2) ---
+
+    #[test]
+    fn plain_struct_ptr_self_receiver_ok() {
+        // const P = struct { x: i32, fn at(self: *Self) i32 { return self.x; } };
+        // (`@This()` desugars to `Self`.) The `*Self` receiver auto-derefs.
+        let at = raw_func(
+            "at",
+            vec![param_ptr("self", "Self")],
+            "i32",
+            vec![ret(Some(field(ident("self"), "x")))],
+        );
+        let items = vec![struct_item_m("P", vec![("x", "i32")], vec![at])];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn plain_struct_self_return_and_literal_ok() {
+        // const Q = struct { x: i32, fn with(self: Self, v: i32) Self {
+        //   return Self{ .x = v };
+        // } };
+        // A `Self` return type and a `Self{ … }` literal resolve to the struct.
+        let with = raw_func(
+            "with",
+            vec![param("self", "Self"), param("v", "i32")],
+            "Self",
+            vec![ret(Some(struct_lit("Self", vec![("x", ident("v"))])))],
+        );
+        let items = vec![struct_item_m("Q", vec![("x", "i32")], vec![with])];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn plain_struct_self_value_parameter_ok() {
+        // const R = struct { x: i32, fn eq(self: Self, other: Self) bool {
+        //   return self.x == other.x;
+        // } };
+        // A non-receiver `Self` parameter resolves to the struct (Pass-1b binds
+        // `Self`), so the field access on `other` type-checks.
+        let eq = raw_func(
+            "eq",
+            vec![param("self", "Self"), param("other", "Self")],
+            "bool",
+            vec![ret(Some(bin(
+                BinOp::Eq,
+                field(ident("self"), "x"),
+                field(ident("other"), "x"),
+            )))],
+        );
+        let items = vec![struct_item_m("R", vec![("x", "i32")], vec![eq])];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn plain_struct_self_call_resolves_through_other_param() {
+        // Calling `a.eq(b)` where both `self` and `other` are `Self`: the
+        // registered signature's `other` parameter is `Struct(R)`, so passing an
+        // `R` value type-checks. (Guards the Pass-1b `Self` binding.)
+        let eq = raw_func(
+            "eq",
+            vec![param("self", "Self"), param("other", "Self")],
+            "bool",
+            vec![ret(Some(bin(
+                BinOp::Eq,
+                field(ident("self"), "x"),
+                field(ident("other"), "x"),
+            )))],
+        );
+        let items = vec![
+            struct_item_m("R", vec![("x", "i32")], vec![eq]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("a", "R", struct_lit("R", vec![("x", int(1))])),
+                    let_var("b", "R", struct_lit("R", vec![("x", int(2))])),
+                    Stmt::Expr(method_call(ident("a"), "eq", vec![ident("b")])),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
     }
 }

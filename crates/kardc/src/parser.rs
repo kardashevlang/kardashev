@@ -366,6 +366,39 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
+    /// Parse a type *name* — the identifier at the core of a type reference.
+    ///
+    /// This is normally an `IDENT` (e.g. `i32`, `Point`, `Self`), but in type
+    /// position the reflection builtin `@This()` (SPEC §32.2) denotes the
+    /// **enclosing struct type** and **desugars to `Self`** (the v0.130
+    /// self-type, resolved contextually in sema). So an `@This()` here yields
+    /// the name `"Self"` with a span covering the whole `@This()` form, exactly
+    /// as if `Self` had been written. The only `@`-builtin valid in type
+    /// position is `@This()`: an `@` followed by anything other than `This`, or
+    /// `This` not followed by `()`, is `E0200` (`@import` is a top-level item
+    /// and the expression builtins `@sizeOf`/`@typeName` are values, not types).
+    ///
+    /// Used wherever a bare type name is expected — the `*T`, `[]T`, `[N]T`, and
+    /// plain forms — so `@This()` and `*@This()` (a pointer receiver, SPEC §30)
+    /// parse uniformly. For an ordinary identifier this is exactly
+    /// [`Parser::expect_ident`], so existing type parsing is unchanged.
+    fn parse_type_name(&mut self) -> PResult<(String, Span)> {
+        if self.at_punct(&TokenKind::At) {
+            let start = self.peek_span();
+            self.bump(); // `@`
+            let is_this = matches!(self.peek_kind(), TokenKind::Ident(s) if s == "This");
+            if !is_this {
+                return Err(self.expected("`This` (the only `@`-builtin valid in a type)"));
+            }
+            self.bump(); // `This`
+            self.expect_punct(&TokenKind::LParen, "`(`")?;
+            let rparen = self.expect_punct(&TokenKind::RParen, "`)`")?;
+            // `@This()` === `Self` (SPEC §32.2 / §30): the enclosing struct type.
+            return Ok(("Self".to_string(), start.merge(rparen)));
+        }
+        self.expect_ident()
+    }
+
     /// Parse a type reference (SPEC §11.1, §12.1, §14.1, §15). A leading `?`
     /// marks an optional type `?T` (`optional = true`); a leading `!` marks an
     /// error union `!T` (`error_union = true`). The two prefixes are **mutually
@@ -392,7 +425,7 @@ impl<'a> Parser<'a> {
         if self.at_punct(&TokenKind::Star) {
             let start = self.peek_span();
             self.bump(); // `*`
-            let (name, name_span) = self.expect_ident()?;
+            let (name, name_span) = self.parse_type_name()?;
             return Ok(TypeExpr {
                 name,
                 optional: false,
@@ -411,7 +444,7 @@ impl<'a> Parser<'a> {
             // §24.1). Distinguish by whether a `]` immediately follows the `[`.
             if self.at_punct(&TokenKind::RBracket) {
                 self.bump(); // `]`
-                let (name, name_span) = self.expect_ident()?;
+                let (name, name_span) = self.parse_type_name()?;
                 return Ok(TypeExpr {
                     name,
                     optional: false,
@@ -424,7 +457,7 @@ impl<'a> Parser<'a> {
             }
             let size = self.parse_array_size()?;
             self.expect_punct(&TokenKind::RBracket, "`]`")?;
-            let (name, name_span) = self.expect_ident()?;
+            let (name, name_span) = self.parse_type_name()?;
             return Ok(TypeExpr {
                 name,
                 optional: false,
@@ -451,7 +484,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let (name, name_span) = self.expect_ident()?;
+        let (name, name_span) = self.parse_type_name()?;
         let span = match opt_span.or(err_span) {
             Some(prefix) => prefix.merge(name_span),
             None => name_span,
@@ -1691,6 +1724,29 @@ impl<'a> Parser<'a> {
                     elem,
                     elems,
                     span: tok.span.merge(rbrace),
+                })
+            }
+            TokenKind::At => {
+                // A comptime reflection builtin `@name(args)` in expression
+                // position (SPEC §32.1): `@sizeOf(T)` → `usize`, `@typeName(T)`
+                // → `[]u8`. The builtin *name* is an identifier after the `@`;
+                // the parenthesised arguments are ordinary expressions (the type
+                // argument is just an `Ident` naming a type, which sema resolves
+                // — substitution-aware, like `alloc`'s type argument, SPEC §16).
+                // The parser does not special-case the name beyond requiring the
+                // `@ IDENT ( … )` shape; an unknown builtin name is a sema
+                // concern. (`@import` is a top-level item, dispatched in
+                // `parse_item` before any expression is parsed, and `@This()` is
+                // a *type*, parsed in `parse_type` — neither reaches here.)
+                self.bump(); // `@`
+                let (name, _) = self.expect_ident()?;
+                self.expect_punct(&TokenKind::LParen, "`(`")?;
+                let args = self.parse_args()?;
+                let rparen = self.expect_punct(&TokenKind::RParen, "`)`")?;
+                Ok(Expr::Builtin {
+                    name,
+                    args,
+                    span: tok.span.merge(rparen),
                 })
             }
             _ => Err(self.expected("an expression")),
@@ -6679,6 +6735,198 @@ mod tests {
                 assert_eq!(body.stmts.len(), 1, "the loop body keeps its statement");
             }
             other => panic!("expected for loop, got {:?}", other),
+        }
+    }
+
+    // ---- v0.136: comptime reflection builtins (SPEC §32) ------------------
+
+    #[test]
+    fn builtin_size_of_expr() {
+        // fn f() void { var n = @sizeOf(i32); }
+        // => Stmt::Let { value: Expr::Builtin { name: "sizeOf", args: [Ident i32] } }
+        let stmt = parse_one_stmt(vec![
+            TokenKind::Keyword(Kw::Var),
+            id("n"),
+            TokenKind::Eq,
+            TokenKind::At,
+            id("sizeOf"),
+            TokenKind::LParen,
+            id("i32"),
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+        ]);
+        match stmt {
+            Stmt::Let { name, ty, value, .. } => {
+                assert_eq!(name, "n");
+                assert!(ty.is_none(), "inferred binding has no annotation");
+                match value {
+                    Expr::Builtin { name, args, .. } => {
+                        assert_eq!(name, "sizeOf");
+                        assert_eq!(args.len(), 1);
+                        match &args[0] {
+                            Expr::Ident { name, .. } => assert_eq!(name, "i32"),
+                            other => panic!("expected the type arg `i32` as an Ident, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected @sizeOf builtin, got {:?}", other),
+                }
+            }
+            other => panic!("expected a `var` binding, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn builtin_type_name_expr() {
+        // fn f() void { var s = @typeName(Point); }
+        // => Expr::Builtin { name: "typeName", args: [Ident Point] }
+        let stmt = parse_one_stmt(vec![
+            TokenKind::Keyword(Kw::Var),
+            id("s"),
+            TokenKind::Eq,
+            TokenKind::At,
+            id("typeName"),
+            TokenKind::LParen,
+            id("Point"),
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+        ]);
+        match stmt {
+            Stmt::Let { value: Expr::Builtin { name, args, .. }, .. } => {
+                assert_eq!(name, "typeName");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(&args[0], Expr::Ident { name, .. } if name == "Point"));
+            }
+            other => panic!("expected `var s = @typeName(Point);`, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn builtin_unknown_name_parses_as_builtin() {
+        // The parser does not validate the builtin name (sema does): any
+        // `@IDENT( … )` shape parses to `Expr::Builtin`. `@whatever(x)` parses.
+        let stmt = parse_one_stmt(vec![
+            TokenKind::Keyword(Kw::Var),
+            id("z"),
+            TokenKind::Eq,
+            TokenKind::At,
+            id("whatever"),
+            TokenKind::LParen,
+            id("x"),
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+        ]);
+        assert!(matches!(
+            stmt,
+            Stmt::Let { value: Expr::Builtin { .. }, .. }
+        ));
+    }
+
+    #[test]
+    fn this_in_type_desugars_to_self() {
+        // fn m(self: *@This()) void {}
+        // The `self` parameter type is `*Self`: name == "Self", pointer == true.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("m"),
+            TokenKind::LParen,
+            id("self"),
+            TokenKind::Colon,
+            TokenKind::Star,
+            TokenKind::At,
+            id("This"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert_eq!(f.name, "m");
+                assert_eq!(f.params.len(), 1);
+                let p = &f.params[0];
+                assert_eq!(p.name, "self");
+                // `@This()` desugared to the self-type `Self`, behind a pointer.
+                assert_eq!(p.ty.name, "Self");
+                assert!(p.ty.pointer, "`*@This()` is a pointer type");
+                assert!(!p.ty.optional && !p.ty.error_union && !p.ty.slice);
+                assert!(p.ty.array_len.is_none());
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn this_bare_in_type_desugars_to_self() {
+        // fn g(self: @This()) void {} — a bare (non-pointer) `@This()` type
+        // also desugars to `Self`: name == "Self", pointer == false.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("g"),
+            TokenKind::LParen,
+            id("self"),
+            TokenKind::Colon,
+            TokenKind::At,
+            id("This"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                let p = &f.params[0];
+                assert_eq!(p.ty.name, "Self");
+                assert!(!p.ty.pointer, "bare `@This()` is not a pointer");
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn non_this_at_in_type_is_error() {
+        // fn h(self: @Nope()) void {} — `@` in type position must be `@This()`.
+        let res = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("h"),
+            TokenKind::LParen,
+            id("self"),
+            TokenKind::Colon,
+            TokenKind::At,
+            id("Nope"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]));
+        let diags = res.expect_err("a non-`This` `@` in type position is an error");
+        assert!(diags.iter().any(|d| d.code == "E0200"));
+    }
+
+    #[test]
+    fn at_import_is_still_an_item() {
+        // @import("x.ks"); — a top-level import item (SPEC §22), unchanged by the
+        // new expression/type `@` handling.
+        let m = parse(&toks(vec![
+            TokenKind::At,
+            id("import"),
+            TokenKind::LParen,
+            TokenKind::Str("x.ks".to_string()),
+            TokenKind::RParen,
+            TokenKind::Semicolon,
+        ]))
+        .expect("should parse");
+        assert_eq!(m.items.len(), 1);
+        match &m.items[0] {
+            Item::Import(imp) => assert_eq!(imp.path, "x.ks"),
+            other => panic!("expected an @import item, got {:?}", other),
         }
     }
 }

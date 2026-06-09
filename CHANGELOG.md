@@ -18,6 +18,19 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.136.0] — comptime reflection builtins
+
+### Added
+- **`@sizeOf(T)`** → `usize` (lowers to C `sizeof`) and **`@typeName(T)`** →
+  `[]u8` (the type's source name). Both are substitution-aware, so they work on
+  a generic type parameter (`@sizeOf(T)` inside a generic body). `Expr::Builtin`.
+- **`@This()`** — the enclosing struct type, parsed in type position and
+  desugared to `Self`; `Self`/`@This()` are now bound in **plain** struct methods
+  too (not only generic structs), e.g. `fn m(self: *@This())` in a `const Point
+  = struct { … }`.
+- Diagnostics `E0320` (unknown / mis-arity `@`-builtin). 779 unit + 35 e2e tests;
+  `examples/comptime_builtins.ks`.
+
 ## [0.135.0] — Multiple type parameters
 
 ### Added

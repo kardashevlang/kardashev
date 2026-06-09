@@ -213,9 +213,10 @@ type, comptime B: type) type`), monomorphised on the tuple of arguments
 (argument order matters; single-param unchanged). Generic *functions* already
 supported N comptime params (v0.120/v0.128). `StructInstance.args: Vec<Type>`.
 
-### v0.136.0 — comptime reflection builtins
-`@This()` (the enclosing struct type, replacing the `Self` convention),
-`@sizeOf(T)`, and `@typeName(T)`.
+### v0.136.0 — comptime reflection builtins ✅
+`@sizeOf(T)` → `usize` (C `sizeof`), `@typeName(T)` → `[]u8` (subst-aware, so
+both work on a generic type parameter), and `@This()` → the enclosing struct
+type (desugars to `Self`, now bound in plain struct methods too). `Expr::Builtin`.
 
 ### v0.137.0 — Named error sets
 `const FileErr = error{ NotFound, Denied };`, `FileErr!T`, and set membership /

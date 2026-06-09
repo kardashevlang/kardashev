@@ -906,3 +906,38 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "5\n9\n7\n11\n3\n");
 }
+
+// --- v0.136 comptime reflection builtins (@sizeOf/@typeName/@This) ----------
+
+#[test]
+fn comptime_reflection_builtins() {
+    let src = r#"
+const Point = struct {
+    x: i32,
+    y: i32,
+    fn at_origin(self: *@This()) bool {     // @This() in a plain struct
+        return self.x == 0 and self.y == 0;
+    }
+    fn shift(self: *Self, d: i32) void {    // Self also works in a plain struct
+        self.x += d;
+        self.y += d;
+    }
+};
+pub fn main() i32 {
+    print(@sizeOf(i32));        // 4
+    print(@sizeOf(i64));        // 8
+    print(@sizeOf(Point));      // 8
+    var p: Point = Point{ .x = 0, .y = 0 };
+    if (p.at_origin()) { print(1); } else { print(0); }   // 1
+    p.shift(5);
+    print(p.x);                 // 5
+    if (p.at_origin()) { print(1); } else { print(0); }   // 0
+    print(@typeName(i32));      // i32
+    print(@typeName(Point));    // Point
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "4\n8\n8\n1\n5\n0\ni32\nPoint\n");
+}

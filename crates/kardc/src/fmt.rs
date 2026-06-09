@@ -660,6 +660,10 @@ fn expr_prec(e: &Expr) -> u8 {
         | Expr::Bool { .. }
         | Expr::Ident { .. }
         | Expr::Call { .. }
+        // A comptime reflection builtin `@name(args)` (SPEC §32.1) — e.g.
+        // `@sizeOf(T)` / `@typeName(T)`. It is a call-shaped primary, so it
+        // binds tightest like an ordinary `Expr::Call`.
+        | Expr::Builtin { .. }
         | Expr::StructLit { .. }
         // An anonymous `struct { … }` **type value** (SPEC §25). It only ever
         // appears as the whole body of a type-returning function's `return`, so
@@ -809,6 +813,30 @@ fn fmt_expr(e: &Expr) -> String {
         Expr::Call { callee, args, .. } => {
             let mut s = String::new();
             s.push_str(callee);
+            s.push('(');
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&fmt_expr(arg));
+            }
+            s.push(')');
+            s
+        }
+        // A comptime reflection builtin `@name(args)` (SPEC §32.1) — e.g.
+        // `@sizeOf(i32)` / `@typeName(Point)`. Prints `@` then the builtin name,
+        // then the argument list in parentheses (each argument a full
+        // expression, joined with `, `), mirroring an ordinary [`Expr::Call`]
+        // with a leading `@`. The single argument is the type-naming `Ident`,
+        // which prints as its bare name, so `@sizeOf(i32)` round-trips. (Note
+        // `@import` is a top-level item and `@This()` is a *type*, both handled
+        // elsewhere; this arm is only for expression-position builtins.) The
+        // printed form re-lexes to the same `Expr::Builtin`, so re-formatting is
+        // idempotent.
+        Expr::Builtin { name, args, .. } => {
+            let mut s = String::new();
+            s.push('@');
+            s.push_str(name);
             s.push('(');
             for (i, arg) in args.iter().enumerate() {
                 if i > 0 {
@@ -4750,6 +4778,153 @@ mod tests {
             "        print(i);\n",
             "    }\n",
             "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    // ----- comptime reflection builtins (v0.136, SPEC §32) -----------------
+
+    /// A comptime reflection builtin `@name(args)` expression (SPEC §32.1).
+    fn builtin(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::Builtin {
+            name: name.to_string(),
+            args,
+            span: D,
+        }
+    }
+
+    #[test]
+    fn builtin_sizeof_in_let_prints() {
+        // `var n = @sizeOf(i32);` — a comptime reflection builtin (SPEC §32.1)
+        // as an inferred `var` initializer. The builtin prints call-shaped with
+        // a leading `@`: `@<name>(<args>)`; its single type argument is the bare
+        // `i32` ident.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::Let {
+                        is_const: false,
+                        name: "n".to_string(),
+                        ty: None,
+                        value: builtin("sizeOf", vec![ident("i32")]),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = "fn f() void {\n    var n = @sizeOf(i32);\n}\n";
+        assert_eq!(print_module(&m), expected);
+    }
+
+    #[test]
+    fn builtin_typename_prints() {
+        // `@typeName(Point)` prints `@typeName(Point)` (SPEC §32.1): the `@`
+        // prefix, the builtin name, then the type-naming ident bare in parens.
+        assert_eq!(
+            fmt_expr(&builtin("typeName", vec![ident("Point")])),
+            "@typeName(Point)"
+        );
+    }
+
+    #[test]
+    fn builtin_binds_as_primary() {
+        // A builtin is a call-shaped primary (binding power 13), so it never
+        // takes parentheses as a binary operand: `@sizeOf(i32) + 1` reads with
+        // no parens around the builtin (SPEC §32.1).
+        let e = bin(BinOp::Add, builtin("sizeOf", vec![ident("i32")]), int(1));
+        assert_eq!(fmt_expr(&e), "@sizeOf(i32) + 1");
+    }
+
+    #[test]
+    fn builtin_source_round_trips() {
+        // End-to-end (lex → parse → print), SPEC §32.1: `@sizeOf(i32)` and
+        // `@typeName(Point)` in expression position are already canonical, so
+        // formatting reproduces the source byte-for-byte and re-formatting that
+        // output is byte-identical (idempotence).
+        let src = concat!(
+            "fn f() void {\n",
+            "    var n = @sizeOf(i32);\n",
+            "    var s = @typeName(Point);\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn self_pointer_param_prints_as_self() {
+        // A plain struct method whose receiver is `self: *Self` (the desugaring
+        // of `*@This()`, SPEC §32.2) prints the param type as `*Self`: the
+        // TypeExpr printer emits the `*` pointer prefix and the bare `Self` type
+        // name with no special handling (the parser desugars `@This()` to
+        // `Self`, so the formatter never sees `@This()` in type position).
+        let m = Module {
+            items: vec![Item::Struct(StructDecl {
+                is_pub: false,
+                name: "Point".to_string(),
+                fields: vec![FieldDecl {
+                    name: "x".to_string(),
+                    ty: ty("i32"),
+                    span: D,
+                }],
+                methods: vec![Func {
+                    is_pub: false,
+                    name: "translate".to_string(),
+                    params: vec![
+                        Param {
+                            name: "self".to_string(),
+                            ty: ptr_ty("Self"),
+                            is_comptime: false,
+                            span: D,
+                        },
+                        Param {
+                            name: "dx".to_string(),
+                            ty: ty("i32"),
+                            is_comptime: false,
+                            span: D,
+                        },
+                    ],
+                    ret: ty("void"),
+                    body: Block {
+                        stmts: vec![],
+                        span: D,
+                    },
+                    span: D,
+                }],
+                span: D,
+            })],
+        };
+        let out = print_module(&m);
+        assert!(
+            out.contains("fn translate(self: *Self, dx: i32) void {"),
+            "expected a `*Self` self param, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn self_pointer_param_source_round_trips() {
+        // End-to-end (lex → parse → print), SPEC §32.2: a plain struct method
+        // with a `self: *Self` receiver is already canonical, so formatting
+        // reproduces the source byte-for-byte and re-formatting is idempotent.
+        let src = concat!(
+            "const Point = struct {\n",
+            "    x: i32,\n",
+            "\n",
+            "    fn translate(self: *Self, dx: i32) void {\n",
+            "        self.x += dx;\n",
+            "    }\n",
+            "};\n",
         );
         let once = format_source(src).expect("source formats");
         assert_eq!(once, src);

@@ -1171,3 +1171,25 @@ type) type { return struct { … }; }`.
 For each instance, the emitter builds the substitution by zipping the
 constructor's type parameters with `StructInstance.args` (plus `Self`), then
 emits the methods exactly as in §26.3.
+
+## 32. comptime reflection builtins (v0.136)
+
+Three `@`-builtins (the `@` token, §22):
+
+### 32.1 `@sizeOf(T)` and `@typeName(T)` (expressions)
+`Expr::Builtin{ name, args }` in expression position; the single argument names
+a type (an `Ident`, resolved like `alloc`'s type argument §16 — substitution-
+aware, so it works inside a generic body).
+- `@sizeOf(T)` → `usize`, the size in bytes of `T`. Lowers to C `sizeof(<cty
+  T>)`.
+- `@typeName(T)` → `[]u8`, the source name of `T`. Lowers to a `[]u8` slice over
+  a static string of the name (the §23 string lowering).
+An unknown `@name(…)` in expression position is an error. Builtins are not
+constant expressions (`const_eval` → `E0130`).
+
+### 32.2 `@This()` (a type)
+`@This()` denotes the **enclosing struct type**. It is parsed in *type position*
+and desugared to `Self` (the v0.130 self-type). v0.136 also binds `Self` in
+**plain** (non-generic) struct method scopes, so `@This()` / `Self` work in any
+struct method — e.g. `fn translate(self: *@This(), …)` inside a plain `const
+Point = struct { … }`.

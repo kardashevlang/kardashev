@@ -415,6 +415,14 @@ pub enum Expr {
     /// A string literal `"…"` as a value of type `[]u8` (v0.127): a slice over
     /// static bytes. `value` is the decoded (unescaped) contents.
     StrLit { value: String, span: Span },
+    /// A comptime builtin call `@name(args)` in expression position (v0.136):
+    /// `@sizeOf(T)` → `usize`, `@typeName(T)` → `[]u8`. (`@This()` is a *type*,
+    /// handled in `TypeExpr`, and `@import` is a top-level item.)
+    Builtin {
+        name: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
     /// An anonymous `struct { fields [methods] }` **type value** (v0.129) — only
     /// valid as the body of a type-returning function `fn F(comptime T: type)
     /// type`. `methods` (v0.130) are monomorphised per instantiation and use
@@ -515,6 +523,7 @@ impl Expr {
             Expr::ArrayLit { span, .. } => *span,
             Expr::Index { span, .. } => *span,
             Expr::StrLit { span, .. } => *span,
+            Expr::Builtin { span, .. } => *span,
             Expr::StructType { span, .. } => *span,
             Expr::AddrOf { span, .. } => *span,
             Expr::Deref { span, .. } => *span,
