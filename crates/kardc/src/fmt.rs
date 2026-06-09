@@ -1139,12 +1139,23 @@ fn fmt_expr(e: &Expr) -> String {
         // operator, so its left operand never needs parentheses and only an
         // equal-precedence right operand (another `catch`/`orelse`) does. This
         // yields the left-associative `a catch b catch c` and the explicit
-        // `a catch (b catch c)`.
-        Expr::Catch { expr, default, .. } => {
+        // `a catch (b catch c)`. The capturing form (SPEC §36, v0.142) prints
+        // the binding between `catch` and the fallback as `<expr> catch |e|
+        // <default>`; `|e|` is purely a binder, so the operand
+        // parenthesisation is identical to the non-capturing form.
+        Expr::Catch {
+            expr,
+            capture,
+            default,
+            ..
+        } => {
             let p = expr_prec(e);
             let l = fmt_operand(expr, p, false);
             let r = fmt_operand(default, p, true);
-            format!("{} catch {}", l, r)
+            match capture {
+                Some(name) => format!("{} catch |{}| {}", l, name, r),
+                None => format!("{} catch {}", l, r),
+            }
         }
     }
 }
@@ -1571,6 +1582,16 @@ mod tests {
     fn catch_(expr: Expr, default: Expr) -> Expr {
         Expr::Catch {
             expr: Box::new(expr),
+            capture: None,
+            default: Box::new(default),
+            span: D,
+        }
+    }
+
+    fn catch_cap(expr: Expr, name: &str, default: Expr) -> Expr {
+        Expr::Catch {
+            expr: Box::new(expr),
+            capture: Some(name.to_string()),
             default: Box::new(default),
             span: D,
         }
@@ -2519,6 +2540,61 @@ mod tests {
         // `try` over a primary (field access binds as a primary) does not.
         let tf = try_(field(ident("a"), "b"));
         assert_eq!(fmt_expr(&tf), "try a.b");
+    }
+
+    #[test]
+    fn capturing_catch_prints_binder(/* SPEC §36, v0.142 */) {
+        // The capturing form spells the binder between `catch` and the fallback:
+        // `parse(s) catch |e| e`. Both the left operand and the `default` keep the
+        // same parenthesisation as the non-capturing `catch` (the `|e|` binder
+        // does not change precedence).
+        assert_eq!(
+            fmt_expr(&catch_cap(call("parse", vec![ident("s")]), "e", ident("e"))),
+            "parse(s) catch |e| e"
+        );
+
+        // A non-trivial fallback that references the captured error code still
+        // needs no parentheses — `catch` is the loosest operator.
+        assert_eq!(
+            fmt_expr(&catch_cap(
+                ident("head"),
+                "e",
+                bin(BinOp::Add, ident("e"), int(1))
+            )),
+            "head catch |e| e + 1"
+        );
+
+        // A right-nested `catch` fallback is still parenthesised (equal
+        // precedence on the right of the left-associative `catch`), exactly as in
+        // the non-capturing form.
+        assert_eq!(
+            fmt_expr(&catch_cap(ident("a"), "e", catch_(ident("b"), ident("c")))),
+            "a catch |e| (b catch c)"
+        );
+
+        // The non-capturing form is byte-for-byte unchanged.
+        assert_eq!(
+            fmt_expr(&catch_(call("parse", vec![ident("s")]), int(0))),
+            "parse(s) catch 0"
+        );
+    }
+
+    #[test]
+    fn catch_roundtrips_via_source() {
+        // Full lex + parse + print round-trip (`format_source` runs the lexer and
+        // parser): both the non-capturing `f() catch 0` and the capturing
+        // `f() catch |e| e` reach canonical form, and re-formatting is idempotent.
+        let src = concat!(
+            "fn g() i32 {\n",
+            "    const a: i32 = f() catch 0;\n",
+            "    const b: i32 = f() catch |e| e;\n",
+            "    return a + b;\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src, "both catch forms reach canonical form");
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(once, twice, "re-formatting is idempotent");
     }
 
     #[test]

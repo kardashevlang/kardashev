@@ -262,10 +262,11 @@ a path the programmer asserts is impossible) — runtime-safety primitives that
 (e.g. a total `switch`'s `else` arm). `Expr::Unreachable`; `@panic` via
 `Expr::Builtin`; `_Noreturn` C helpers.
 
-### v0.142.0 — `catch |e|` capture
-The capturing error handler `expr catch |e| handler` (deferred from v0.125):
-binds the error to `e` and evaluates `handler` only on the error path, lowered by
-hoisting at statement position (`var x = f() catch |e| …;`).
+### v0.142.0 — `catch |e|` capture ✅
+The capturing error handler `expr catch |e| default` (deferred from v0.125):
+binds the error **code** (`i32`) to `e` and evaluates `default` only on the error
+path, lowered by hoisting like `try`. `Expr::Catch.capture`; the non-capturing
+`expr catch default` is unchanged.
 
 ### v0.143.0 — Enum explicit values + conversions
 `enum { A = 1, B = 4 }`, `@intFromEnum(e)` and `@enumFromInt(E, n)` — give enums

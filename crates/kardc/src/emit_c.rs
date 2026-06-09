@@ -267,6 +267,12 @@ struct Emitter<'a> {
     /// walking index of a `for` loop (SPEC §29.2). Reset per function/test body,
     /// exactly like the other temp counters.
     for_counter: usize,
+    /// Monotonic counter for the `__kd_eu{N}` error-union temporary and
+    /// `__kd_catch{N}` result temporary that lower a **capturing** `catch`
+    /// (`expr catch |e| default`, v0.142, SPEC §36.2). Reset per function/test
+    /// body, exactly like the other temp counters. The non-capturing `catch`
+    /// keeps its eager inline-helper lowering and never touches this counter.
+    catch_counter: usize,
     /// Pointee types of the `*T` pointer types written in this module's
     /// signatures / locals, in first-seen order (SPEC §15.1). Pointers have no
     /// typedef and the table exposes no `pointers()` iterator, so emit keeps
@@ -320,6 +326,7 @@ impl<'a> Emitter<'a> {
             if_counter: 0,
             str_counter: 0,
             for_counter: 0,
+            catch_counter: 0,
             local_ptr_pointees: Vec::new(),
             subst: HashMap::new(),
             value_subst: HashMap::new(),
@@ -1537,6 +1544,7 @@ impl<'a> Emitter<'a> {
         self.if_counter = 0;
         self.str_counter = 0;
         self.for_counter = 0;
+        self.catch_counter = 0;
         self.current_ret = self.resolve_ty(&f.ret);
         let ret = self.cty(&f.ret);
         let params = self.format_params(&f.params);
@@ -2284,6 +2292,70 @@ impl<'a> Emitter<'a> {
         format!("{}.val", temp)
     }
 
+    /// Lower a **capturing** `catch`: `expr catch |name| default` (v0.142, SPEC
+    /// §36.2). Mirrors [`Emitter::emit_try`] — the `!T` operand is hoisted into a
+    /// fresh `__kd_eu{N}` temporary, a result temporary `__kd_catch{N}` of the
+    /// payload type `T` is declared, and an `if/else` selects between them:
+    /// ```c
+    /// kd_err_<tag> __kd_euN = <expr>;
+    /// <T> __kd_catchN;
+    /// if (__kd_euN.err != 0) { int32_t kd_<name> = __kd_euN.err; __kd_catchN = <default>; }
+    /// else { __kd_catchN = __kd_euN.val; }
+    /// ```
+    /// so `default` runs *only* on the error path with the error code bound to
+    /// `name` (an `i32`). Like `emit_try`, the statements are emitted via
+    /// [`Emitter::line`] before this returns the result-temp string, so a
+    /// capturing `catch` works in any value position (let/return/assign).
+    fn emit_catch_capture(&mut self, expr: &Expr, name: &str, default: &Expr) -> String {
+        let n = self.catch_counter;
+        self.catch_counter += 1;
+        let eu = format!("__kd_eu{}", n);
+        let res = format!("__kd_catch{}", n);
+        // The operand's own error-union C type and its payload type `T`.
+        let (err_cty, payload) = match self.type_of_expr(expr) {
+            Some(Type::ErrorUnion(eid)) => (
+                self.structs.error_union_c_name(eid),
+                self.structs.error_union_payload(eid),
+            ),
+            // Unreachable for validated input (`expr` is always `!T`); fall back
+            // to the enclosing function's error-union type (same `{err,val}`
+            // layout) so emission never panics and the output stays well-formed.
+            _ => match self.current_ret {
+                Type::ErrorUnion(eid) => (
+                    self.structs.error_union_c_name(eid),
+                    self.structs.error_union_payload(eid),
+                ),
+                other => (self.cty_of(other), other),
+            },
+        };
+        let payload_cty = self.cty_of(payload);
+        // Hoist the operand once, then declare the (uninitialised) result temp —
+        // both arms below assign it, so it is always set before any read.
+        let es = self.emit_expr(expr);
+        self.line(&format!("{} {} = {};", err_cty, eu, es));
+        self.line(&format!("{} {};", payload_cty, res));
+        self.line(&format!("if ({}.err != 0) {{", eu));
+        self.indent += 1;
+        // Bind the error code to `kd_<name>` (an `i32`) inside the error branch
+        // and record its type so `default` can read it.
+        self.line(&format!("int32_t kd_{} = {}.err;", name, eu));
+        let mut scope = Scope::plain();
+        scope.var_types.insert(name.to_string(), Type::I32);
+        self.scopes.push(scope);
+        // `default` is a `T`, coerced to the payload type exactly like the
+        // non-capturing form. Any nested hoist lands inside this error branch.
+        let d = self.emit_coerced(default, payload);
+        self.line(&format!("{} = {};", res, d));
+        self.scopes.pop();
+        self.indent -= 1;
+        self.line("} else {");
+        self.indent += 1;
+        self.line(&format!("{} = {}.val;", res, eu));
+        self.indent -= 1;
+        self.line("}");
+        res
+    }
+
     /// The payload type `T` of a `try inner` (i.e. the inner `!T`'s payload),
     /// used to coerce the unwrapped value back into a wider position. Falls back
     /// to the enclosing function's payload, which `try` always matches.
@@ -2923,7 +2995,18 @@ impl<'a> Emitter<'a> {
                 // validated input — emit the inner value so output stays valid.
                 format!("({})", self.emit_expr(expr))
             }
-            Expr::Catch { expr, default, .. } => {
+            Expr::Catch {
+                expr,
+                capture,
+                default,
+                ..
+            } => {
+                // The **capturing** form `e catch |name| d` (v0.142, SPEC §36.2)
+                // lowers like `try`: hoist `e`, then run `d` on the error path
+                // only with the error code bound to `name`. See `emit_catch_capture`.
+                if let Some(name) = capture {
+                    return self.emit_catch_capture(expr, name, default);
+                }
                 // `e catch d` → `kd_err_<tag>_catch(<e>, <d>)`; `d` is eager and
                 // coerced to the payload type.
                 let l = self.emit_expr(expr);
@@ -3672,6 +3755,7 @@ impl<'a> Emitter<'a> {
         self.idx_counter = 0;
         self.if_counter = 0;
         self.for_counter = 0;
+        self.catch_counter = 0;
         self.current_ret = Type::I32; // the harness test functions return `int`
         self.line(&format!("static int kd_test_{}(void) {{", idx));
         self.indent += 1;
@@ -5351,6 +5435,7 @@ mod tests {
             ret: ty("i32"),
             body: block(vec![ret(Expr::Catch {
                 expr: Box::new(ident("x")),
+                capture: None,
                 default: Box::new(int(0)),
                 span: Span::DUMMY,
             })]),
@@ -5369,6 +5454,207 @@ mod tests {
         assert!(
             out.contains("kd_err_int32_t_catch(kd_x, 0)"),
             "catch lowering wrong:\n{out}"
+        );
+        // The non-capturing form must NOT take the hoisting (`try`-style) path.
+        assert!(
+            !out.contains("__kd_eu") && !out.contains("__kd_catch"),
+            "non-capturing catch must not hoist:\n{out}"
+        );
+    }
+
+    #[test]
+    fn catch_capture_hoists_temp_and_branches() {
+        // fn f(x: !i32) i32 { return x catch |e| e; }
+        // The capturing form lowers like `try`: hoist the `!T`, declare a result
+        // temp, and select between the payload and the handler in an if/else.
+        let structs = err_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![Param {
+                name: "x".to_string(),
+                ty: err_ty("i32"),
+                is_comptime: false,
+                span: Span::DUMMY,
+            }],
+            ret: ty("i32"),
+            body: block(vec![ret(Expr::Catch {
+                expr: Box::new(ident("x")),
+                capture: Some("e".to_string()),
+                default: Box::new(ident("e")),
+                span: Span::DUMMY,
+            })]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // (1) the operand is hoisted into the error-union temp.
+        assert!(
+            out.contains("kd_err_int32_t __kd_eu0 = kd_x;"),
+            "catch-capture hoist wrong:\n{out}"
+        );
+        // (2) the payload-typed result temp is declared (uninitialised).
+        assert!(
+            out.contains("int32_t __kd_catch0;"),
+            "catch-capture result temp wrong:\n{out}"
+        );
+        // (3) error branch binds the code to `kd_e` and runs the handler.
+        assert!(
+            out.contains("if (__kd_eu0.err != 0) {"),
+            "catch-capture error check missing:\n{out}"
+        );
+        assert!(
+            out.contains("int32_t kd_e = __kd_eu0.err;"),
+            "catch-capture code binding wrong:\n{out}"
+        );
+        assert!(
+            out.contains("__kd_catch0 = kd_e;"),
+            "catch-capture handler assignment wrong:\n{out}"
+        );
+        // (4) success branch yields the payload.
+        assert!(
+            out.contains("} else {") && out.contains("__kd_catch0 = __kd_eu0.val;"),
+            "catch-capture success branch wrong:\n{out}"
+        );
+        // (5) the expression yields the result temp.
+        assert!(
+            out.contains("return (__kd_catch0);"),
+            "catch-capture result yield wrong:\n{out}"
+        );
+        // The capturing form must NOT *call* the eager inline helper. (The
+        // helper *definition* is always emitted for every error union, §12.3,
+        // so we check that it is not applied to the operand.)
+        assert!(
+            !out.contains("_catch(kd_x"),
+            "catch-capture must not call the eager helper:\n{out}"
+        );
+    }
+
+    #[test]
+    fn catch_capture_handler_runs_only_on_error_path() {
+        // fn f(x: !i32) i32 { var y = x catch |e| 0; return y; }
+        // In a `let` value position the hoist + if/else are emitted *before* the
+        // binding line, and the default (`0`, coerced to the i32 payload) lives
+        // only inside the error branch — never on the success path.
+        let structs = err_int_table();
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![Param {
+                name: "x".to_string(),
+                ty: err_ty("i32"),
+                is_comptime: false,
+                span: Span::DUMMY,
+            }],
+            ret: ty("i32"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "y".to_string(),
+                    ty: Some(ty("i32")),
+                    value: Expr::Catch {
+                        expr: Box::new(ident("x")),
+                        capture: Some("e".to_string()),
+                        default: Box::new(int(0)),
+                        span: Span::DUMMY,
+                    },
+                    span: Span::DUMMY,
+                },
+                ret(ident("y")),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // The hoist/if precede the binding, and the binding reads the result temp.
+        let eu = out
+            .find("kd_err_int32_t __kd_eu0 = kd_x;")
+            .expect("hoist missing");
+        let bind = out
+            .find("int32_t kd_y = __kd_catch0;")
+            .expect("binding missing");
+        assert!(eu < bind, "hoist must precede the binding:\n{out}");
+        // The default `0` is assigned to the result temp on the error path only.
+        assert!(
+            out.contains("__kd_catch0 = 0;"),
+            "catch-capture default assignment wrong:\n{out}"
+        );
+        // A single capturing catch numbers from 0.
+        assert!(
+            !out.contains("__kd_eu1") && !out.contains("__kd_catch1"),
+            "catch-capture counter should start at 0:\n{out}"
+        );
+    }
+
+    #[test]
+    fn catch_capture_counter_resets_and_increments_within_a_body() {
+        // Two capturing catches in one body get distinct temps (0 then 1); a
+        // second function restarts the numbering at 0 (counter resets per body).
+        // fn f(a: !i32, b: !i32) i32 { var p = a catch |e| e; var q = b catch |e| e; return p; }
+        // fn g(x: !i32) i32 { return x catch |e| e; }
+        let structs = err_int_table();
+        let cap = |v: &str| Expr::Catch {
+            expr: Box::new(ident(v)),
+            capture: Some("e".to_string()),
+            default: Box::new(ident("e")),
+            span: Span::DUMMY,
+        };
+        let param = |n: &str| Param {
+            name: n.to_string(),
+            ty: err_ty("i32"),
+            is_comptime: false,
+            span: Span::DUMMY,
+        };
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![param("a"), param("b")],
+            ret: ty("i32"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "p".to_string(),
+                    ty: Some(ty("i32")),
+                    value: cap("a"),
+                    span: Span::DUMMY,
+                },
+                Stmt::Let {
+                    is_const: false,
+                    name: "q".to_string(),
+                    ty: Some(ty("i32")),
+                    value: cap("b"),
+                    span: Span::DUMMY,
+                },
+                ret(ident("p")),
+            ]),
+            span: Span::DUMMY,
+        };
+        let g = Func {
+            is_pub: false,
+            name: "g".to_string(),
+            params: vec![param("x")],
+            ret: ty("i32"),
+            body: block(vec![ret(cap("x"))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f), Item::Func(g)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // First body: two catches → __kd_eu0 / __kd_eu1.
+        assert!(
+            out.contains("kd_err_int32_t __kd_eu0 = kd_a;")
+                && out.contains("kd_err_int32_t __kd_eu1 = kd_b;"),
+            "two catches must get distinct temps:\n{out}"
+        );
+        // Second body restarts numbering at 0.
+        assert!(
+            out.contains("kd_err_int32_t __kd_eu0 = kd_x;"),
+            "counter must reset per function body:\n{out}"
         );
     }
 
@@ -5617,6 +5903,7 @@ mod tests {
             ret: ty("i32"),
             body: block(vec![ret(Expr::Catch {
                 expr: Box::new(ident("x")),
+                capture: None,
                 default: Box::new(int(0)),
                 span: Span::DUMMY,
             })]),

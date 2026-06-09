@@ -2570,10 +2570,13 @@ impl Checker {
                     None
                 }
             },
-            // `expr catch default`: `expr` must be `!T` (else `E0192`); `default`
-            // is a `T`; the result is `T` (SPEC §12.1).
+            // `expr catch default` / `expr catch |e| default`: `expr` must be `!T`
+            // (else `E0192`); `default` is a `T`; the result is `T` (SPEC §12.1).
+            // With a capture, `e` binds the error code (an immutable `i32`) only
+            // inside `default` (SPEC §36.1); the non-capturing form is unchanged.
             Expr::Catch {
                 expr: inner,
+                capture,
                 default,
                 span,
             } => {
@@ -2581,7 +2584,7 @@ impl Checker {
                 match self.check_expr(inner, inner_expected) {
                     Some(Type::ErrorUnion(id)) => {
                         let payload = self.structs.error_union_payload(id);
-                        if let Some(dt) = self.check_expr(default, Some(payload)) {
+                        if let Some(dt) = self.check_catch_default(capture, default, Some(payload)) {
                             if dt != payload {
                                 let msg = format!(
                                     "`catch` default type mismatch: expected `{}`, found `{}`",
@@ -2599,12 +2602,14 @@ impl Checker {
                             self.type_name(other)
                         );
                         self.error(*span, "E0192", msg);
-                        // Still check the default to surface its own errors.
-                        self.check_expr(default, None);
+                        // Still check the default to surface its own errors (with
+                        // the capture bound, so a handler that uses `e` does not
+                        // also cascade an unknown-name error).
+                        self.check_catch_default(capture, default, None);
                         None
                     }
                     None => {
-                        self.check_expr(default, None);
+                        self.check_catch_default(capture, default, None);
                         None
                     }
                 }
@@ -2894,6 +2899,31 @@ impl Checker {
             Some(t @ Type::ErrorUnion(_)) => Some(t),
             Some(other) => Some(Type::ErrorUnion(self.structs.intern_error_union(other))),
             None => None,
+        }
+    }
+
+    /// Type-check a `catch` handler `default` expecting type `expected`. For the
+    /// capturing form `expr catch |name| default` (SPEC §36.1) the capture
+    /// `name` is bound as an immutable `i32` (the error code) in a fresh scope
+    /// wrapping `default`, so it is visible only inside the handler — mirroring
+    /// the optional-`if` and union-`switch` payload captures. For the
+    /// non-capturing form (`capture == None`) this is just [`check_expr`], so
+    /// the existing behaviour is unchanged. Returns the handler's type.
+    fn check_catch_default(
+        &mut self,
+        capture: &Option<String>,
+        default: &Expr,
+        expected: Option<Type>,
+    ) -> Option<Type> {
+        match capture {
+            Some(name) => {
+                self.scopes.push(HashMap::new());
+                self.define(name, Type::I32, true);
+                let dt = self.check_expr(default, expected);
+                self.scopes.pop();
+                dt
+            }
+            None => self.check_expr(default, expected),
         }
     }
 
@@ -4534,6 +4564,16 @@ mod tests {
     fn catch_expr(e: Expr, default: Expr) -> Expr {
         Expr::Catch {
             expr: Box::new(e),
+            capture: None,
+            default: Box::new(default),
+            span: sp(),
+        }
+    }
+    /// `expr catch |name| default` — the capturing handler form (v0.142, §36).
+    fn catch_capture_expr(e: Expr, name: &str, default: Expr) -> Expr {
+        Expr::Catch {
+            expr: Box::new(e),
+            capture: Some(name.into()),
             default: Box::new(default),
             span: sp(),
         }
@@ -6654,6 +6694,104 @@ mod tests {
                 vec![],
                 "void",
                 vec![let_var("v", "i32", catch_expr(call("f", vec![]), boolean(true)))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    // ---- capturing `catch |e|` (v0.142, SPEC §36) -------------------------
+
+    #[test]
+    fn catch_capture_yields_payload_and_binds_error_code_as_i32() {
+        // fn f() !i32 { return 1; }
+        // fn main() void { var x: i32 = f() catch |e| e; print(x); }
+        // The result is the payload `i32`; the handler's `e` is the error code
+        // (`i32`), so returning `e` as the default type-checks (else E0110).
+        let items = vec![
+            func_te("f", vec![], te_err("i32"), vec![ret(Some(int(1)))]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("x", "i32", catch_capture_expr(call("f", vec![]), "e", ident("e"))),
+                    Stmt::Expr(call("print", vec![ident("x")])),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn catch_capture_handler_can_use_error_code_in_expression() {
+        // fn f() !i32 { return 1; }
+        // fn main() void { var x: i32 = f() catch |e| (0 - e); }
+        // `e` (an i32) participates in arithmetic; the i32 result matches the
+        // i32 payload.
+        let items = vec![
+            func_te("f", vec![], te_err("i32"), vec![ret(Some(int(1)))]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var(
+                    "x",
+                    "i32",
+                    catch_capture_expr(call("f", vec![]), "e", bin(BinOp::Sub, int(0), ident("e"))),
+                )],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn catch_capture_does_not_leak_after_handler() {
+        // fn f() !i32 { return 1; }
+        // fn main() void { var x: i32 = f() catch |e| e; var y: i32 = e; }
+        // The capture binds only inside the handler; using `e` afterwards is an
+        // unknown name (E0100).
+        let items = vec![
+            func_te("f", vec![], te_err("i32"), vec![ret(Some(int(1)))]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("x", "i32", catch_capture_expr(call("f", vec![]), "e", ident("e"))),
+                    let_var("y", "i32", ident("e")),
+                ],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0100"));
+    }
+
+    #[test]
+    fn catch_capture_on_non_error_union_is_e0192() {
+        // fn f(x: i32) void { var v: i32 = x catch |e| e; }   // x is i32, not !T
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "void",
+            vec![let_var("v", "i32", catch_capture_expr(ident("x"), "e", ident("e")))],
+        )];
+        assert!(codes(items).contains(&"E0192"));
+    }
+
+    #[test]
+    fn catch_capture_default_type_mismatch_is_e0110() {
+        // fn f() !i32 { return 1; }
+        // fn main() void { var v: i32 = f() catch |e| true; }   // default is bool
+        let items = vec![
+            func_te("f", vec![], te_err("i32"), vec![ret(Some(int(1)))]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var(
+                    "v",
+                    "i32",
+                    catch_capture_expr(call("f", vec![]), "e", boolean(true)),
+                )],
             ),
         ];
         assert!(codes(items).contains(&"E0110"));

@@ -1260,10 +1260,23 @@ impl<'a> Parser<'a> {
                 };
             } else if self.at_kw(Kw::Catch) {
                 self.bump();
+                // An optional `| IDENT |` capture (SPEC §36) binds the error
+                // code (`i32`) inside `default`, which is then evaluated only on
+                // the error path. A bare `catch default` (no pipes) leaves
+                // `capture = None` — the non-capturing form (§12, unchanged).
+                let capture = if self.at_punct(&TokenKind::Pipe) {
+                    self.bump(); // `|`
+                    let (cap, _) = self.expect_ident()?;
+                    self.expect_punct(&TokenKind::Pipe, "`|`")?;
+                    Some(cap)
+                } else {
+                    None
+                };
                 let default = self.parse_or()?;
                 let span = lhs.span().merge(default.span());
                 lhs = Expr::Catch {
                     expr: Box::new(lhs),
+                    capture,
                     default: Box::new(default),
                     span,
                 };
@@ -4411,11 +4424,113 @@ mod tests {
             TokenKind::Int(0),
         ]);
         match e {
-            Expr::Catch { expr, default, .. } => {
+            Expr::Catch {
+                expr,
+                capture,
+                default,
+                ..
+            } => {
                 assert!(matches!(*expr, Expr::Call { ref callee, .. } if callee == "g"));
                 assert!(matches!(*default, Expr::Int { value: 0, .. }));
+                assert_eq!(capture, None, "the non-capturing form leaves `capture = None`");
             }
             other => panic!("expected catch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn catch_capture_binds_error() {
+        // x = g() catch |e| 0;  ==>  Catch { capture: Some("e"), default: Int 0 }
+        let e = parse_assign_rhs(vec![
+            id("g"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::Keyword(Kw::Catch),
+            TokenKind::Pipe,
+            id("e"),
+            TokenKind::Pipe,
+            TokenKind::Int(0),
+        ]);
+        match e {
+            Expr::Catch {
+                expr,
+                capture,
+                default,
+                ..
+            } => {
+                assert!(matches!(*expr, Expr::Call { ref callee, .. } if callee == "g"));
+                assert_eq!(capture, Some("e".to_string()));
+                assert!(matches!(*default, Expr::Int { value: 0, .. }));
+            }
+            other => panic!("expected capturing catch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn catch_capture_default_uses_error() {
+        // x = g() catch |e| handle(e);  — the default may reference the binding.
+        let e = parse_assign_rhs(vec![
+            id("g"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::Keyword(Kw::Catch),
+            TokenKind::Pipe,
+            id("e"),
+            TokenKind::Pipe,
+            id("handle"),
+            TokenKind::LParen,
+            id("e"),
+            TokenKind::RParen,
+        ]);
+        match e {
+            Expr::Catch {
+                capture, default, ..
+            } => {
+                assert_eq!(capture, Some("e".to_string()));
+                match *default {
+                    Expr::Call { callee, args, .. } => {
+                        assert_eq!(callee, "handle");
+                        assert_eq!(args.len(), 1);
+                        assert!(matches!(&args[0], Expr::Ident { name, .. } if name == "e"));
+                    }
+                    other => panic!("expected `handle(e)` call default, got {:?}", other),
+                }
+            }
+            other => panic!("expected capturing catch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn catch_capture_is_left_associative() {
+        // a catch |e| b catch |f| c  ==>  ((a catch |e| b) catch |f| c).
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Keyword(Kw::Catch),
+            TokenKind::Pipe,
+            id("e"),
+            TokenKind::Pipe,
+            id("b"),
+            TokenKind::Keyword(Kw::Catch),
+            TokenKind::Pipe,
+            id("f"),
+            TokenKind::Pipe,
+            id("c"),
+        ]);
+        match e {
+            Expr::Catch {
+                expr,
+                capture,
+                default,
+                ..
+            } => {
+                assert_eq!(capture, Some("f".to_string()));
+                assert!(matches!(*default, Expr::Ident { ref name, .. } if name == "c"));
+                match *expr {
+                    Expr::Catch { capture, .. } => assert_eq!(capture, Some("e".to_string())),
+                    other => panic!("left operand should nest a catch, got {:?}", other),
+                }
+            }
+            other => panic!("expected catch at the root, got {:?}", other),
         }
     }
 

@@ -1266,3 +1266,27 @@ fixed message, `exit(101)`). A statement (or arm) lowers to `kd_panic(<msg>);` /
 expression position the lowering is `(kd_panic(<msg>), 0)` / `(kd_unreachable(),
 0)` — the helper exits, so the trailing `0` is dead (works where an integer is
 expected; a non-integer value position is a later refinement).
+
+## 36. `catch |e|` capture (v0.142)
+
+The capturing error handler `expr catch |e| default` (deferred from §21.3): if
+`expr` (an `!T`) is ok it yields the payload, otherwise it binds the **error
+code** to `e` (an `i32`) and evaluates `default` (a `T`) — so the handler can
+react to *which* error occurred. `Expr::Catch` gains `capture: Option<String>`
+(`None` = the non-capturing `expr catch default`, §12, unchanged).
+
+### 36.1 Semantics (`sema`)
+With a capture, `expr` must be `!T`; `e` is bound (immutable, `i32`) only inside
+`default`; `default` must be a `T`; the whole expression has type `T`. Without a
+capture, behaviour is unchanged.
+
+### 36.2 Backend (`emit_c`)
+The capturing form lowers like `try` (§12.3): the `!T` is hoisted into a temp,
+a result temp `<T> __kd_catchN` is declared, then
+```c
+if (__kd_euN.err != 0) { int32_t kd_<e> = __kd_euN.err; __kd_catchN = <default>; }
+else { __kd_catchN = __kd_euN.val; }
+```
+and the expression yields `__kd_catchN` — so `default` runs only on the error
+path, with `e` in scope. The non-capturing form keeps its existing
+(eager-`default`) lowering.
