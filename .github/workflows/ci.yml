@@ -97,6 +97,14 @@ jobs:
           su="$(mktemp -d)"
           printf '@import("std");\npub fn main() i32 { var a: Allocator = c_allocator(); var s: []u8 = str_concat(a, "foo", "bar"); print(s.len); print(str_index_of(s, 98)); free(a, s); return 0; }\n' > "$su/s.ks"
           ( cd "$su" && [ "$("$KARD" run s.ks | tr "\n" " ")" = "6 3 " ] )
+          # Test filtering + bench (v0.150).
+          tb="$(mktemp -d)"
+          printf 'pub fn main() i32 { return 0; }\ntest "alpha" { expect(1 == 1); }\ntest "beta" { expect(2 == 2); }\n' > "$tb/t.ks"
+          # --filter runs a subset; the harness summary says "(filtered)".
+          "$KARD" test "$tb/t.ks" --filter alpha 2>&1 | grep -q '1/1 tests passed (filtered)'
+          # bench prints a per-test timing line and still passes.
+          "$KARD" bench "$tb/t.ks" 2>&1 | grep -q 'alpha: '
+          [ "$("$KARD" bench "$tb/t.ks" >/dev/null 2>&1; echo $?)" = "0" ]
           # Cross-compilation plumbing (v0.123): `targets` lists triples, and
           # `-target <host triple>` exercises clang's --target end to end (the
           # host triple always has its sysroot, so it links + runs).
