@@ -60,7 +60,7 @@ jobs:
       - name: Toolchain smoke test
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           KARD="$(pwd)/target/release/kard"
           "$KARD" version
           tmp="$(mktemp -d)"
