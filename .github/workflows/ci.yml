@@ -93,6 +93,10 @@ jobs:
           ( cd "$iod" && [ "$("$KARD" run rf.ks)" = "9" ] )
           printf 'pub fn main() i32 { var a: Allocator = c_allocator(); var l: []u8 = @readLine(a); print(l.len); free(a, l); return 0; }\n' > "$iod/rl.ks"
           ( cd "$iod" && [ "$(printf "hello\nx\n" | "$KARD" run rl.ks)" = "5" ] )
+          # String utilities (v0.149): std `str_concat` / `str_index_of`.
+          su="$(mktemp -d)"
+          printf '@import("std");\npub fn main() i32 { var a: Allocator = c_allocator(); var s: []u8 = str_concat(a, "foo", "bar"); print(s.len); print(str_index_of(s, 98)); free(a, s); return 0; }\n' > "$su/s.ks"
+          ( cd "$su" && [ "$("$KARD" run s.ks | tr "\n" " ")" = "6 3 " ] )
           # Cross-compilation plumbing (v0.123): `targets` lists triples, and
           # `-target <host triple>` exercises clang's --target end to end (the
           # host triple always has its sysroot, so it links + runs).

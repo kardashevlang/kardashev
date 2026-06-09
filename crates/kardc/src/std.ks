@@ -28,6 +28,62 @@ pub fn iabs(x: i32) i32 {
     return x;
 }
 
+// --- string utilities (over `[]u8`) ----------------------------------------
+
+// Byte-for-byte equality of two strings.
+pub fn str_eq(a: []u8, b: []u8) bool {
+    if (a.len != b.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < a.len) : (i += 1) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Does `s` begin with `prefix`?
+pub fn str_starts_with(s: []u8, prefix: []u8) bool {
+    if (prefix.len > s.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < prefix.len) : (i += 1) {
+        if (s[i] != prefix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Index of the first byte equal to `c`, or -1 if absent.
+pub fn str_index_of(s: []u8, c: u8) i32 {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == c) {
+            return @as(i32, i);
+        }
+    }
+    return 0 - 1;
+}
+
+// Concatenate `x` and `y` into a freshly-allocated `[]u8` (free it with
+// `free(a, result)`).
+pub fn str_concat(a: Allocator, x: []u8, y: []u8) []u8 {
+    var out: []u8 = alloc(a, u8, x.len + y.len);
+    var i: usize = 0;
+    while (i < x.len) : (i += 1) {
+        out[i] = x[i];
+    }
+    var j: usize = 0;
+    while (j < y.len) : (j += 1) {
+        out[x.len + j] = y[j];
+    }
+    return out;
+}
+
 // --- ArrayList(V) — a growable list -----------------------------------------
 
 pub fn ArrayList(comptime V: type) type {
