@@ -97,6 +97,17 @@ jobs:
           su="$(mktemp -d)"
           printf '@import("std");\npub fn main() i32 { var a: Allocator = c_allocator(); var s: []u8 = str_concat(a, "foo", "bar"); print(s.len); print(str_index_of(s, 98)); free(a, s); return 0; }\n' > "$su/s.ks"
           ( cd "$su" && [ "$("$KARD" run s.ks | tr "\n" " ")" = "6 3 " ] )
+          # Test filtering + bench (v0.150).
+          tb="$(mktemp -d)"
+          printf 'pub fn main() i32 { return 0; }\ntest "alpha" { expect(1 == 1); }\ntest "beta" { expect(2 == 2); }\n' > "$tb/t.ks"
+          # --filter runs a subset; `bench` times each test. NB: capture the
+          # output into a var THEN match it — piping `kard test` straight into
+          # `grep -q` lets grep close the pipe on its first match, and the CLI's
+          # later stdout write hits a broken pipe (a Rust panic, exit 101).
+          fout="$("$KARD" test "$tb/t.ks" --filter alpha 2>&1)"
+          case "$fout" in *"1/1 tests passed (filtered)"*) ;; *) echo "filter FAILED: $fout"; exit 1 ;; esac
+          bout="$("$KARD" bench "$tb/t.ks" 2>&1)"
+          case "$bout" in *"alpha: "*) ;; *) echo "bench FAILED: $bout"; exit 1 ;; esac
           # Cross-compilation plumbing (v0.123): `targets` lists triples, and
           # `-target <host triple>` exercises clang's --target end to end (the
           # host triple always has its sysroot, so it links + runs).

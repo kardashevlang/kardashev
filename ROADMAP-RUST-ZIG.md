@@ -308,9 +308,11 @@ C helpers (emitted only when used).
 `Allocator`), added to the embedded `std` — pure library, written in the
 language, no compiler change.
 
-### v0.150.0 — Test filtering + bench polish
-`kard test -filter NAME` to run a subset, and a `kard bench` timing harness — the
-DX capstone of Arc 4.
+### v0.150.0 — Test filtering + `kard bench` ✅
+`kard test [FILE] --filter SUBSTR` runs only tests whose name contains `SUBSTR`,
+and `kard bench [FILE]` runs the harness with **per-test wall-clock timing**
+(`<name>: <ms> ms`). The harness `main` parses argv (`--filter`/`--bench`) via a
+name+fn table. **This completes Arc 4 (v0.141–v0.150).**
 
 ### Beyond (Arc 5+, each multi-session)
 Bundled cross-compilation sysroots; the full imperative `build.ks` graph (a

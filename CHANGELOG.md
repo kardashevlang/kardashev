@@ -18,6 +18,19 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.150.0] — Test filtering + `kard bench`
+
+The capstone of **Arc 4** (v0.141–v0.150 complete).
+
+### Added
+- **`kard test [FILE] --filter SUBSTR`** — run only the tests whose name
+  contains `SUBSTR` (the summary notes `(filtered)`).
+- **`kard bench [FILE]`** — run the test harness with **per-test wall-clock
+  timing** (`<name>: <ms> ms`); a failing test still fails.
+- The emitted test harness `main` now parses argv (`--filter`/`--bench`) over a
+  name + function-pointer table. CI smoke-tests both; `examples/tested.ks`.
+- 955 unit + 44 e2e tests.
+
 ## [0.149.0] — String utilities
 
 ### Added

@@ -838,6 +838,10 @@ impl<'a> Emitter<'a> {
         // `<stdlib.h>` provides `exit` (the `?T` unwrap panic helper) and, since
         // v0.114, `malloc`/`free` (the allocator helpers + `free` builtin).
         self.out.push_str("#include <stdlib.h>\n");
+        // `<string.h>` (`strstr`/`strcmp`) + `<time.h>` (`clock`) back the
+        // v0.150 test harness's `--filter` and `--bench` arg handling.
+        self.out.push_str("#include <string.h>\n");
+        self.out.push_str("#include <time.h>\n");
         // The `Allocator` interface value (SPEC §16). v0.119 ships a single,
         // empty malloc/free-backed allocator (`c_allocator()`); the `int _unused`
         // field exists only so the struct is non-empty and stays valid C.
@@ -4065,27 +4069,58 @@ impl<'a> Emitter<'a> {
         }
 
         let total = names.len();
+        // A name table + a function-pointer table, so the driver can loop and
+        // filter/time by index (v0.150). Both are `static` at file scope inside
+        // `main`'s translation unit — emit them just before `main`.
+        if total > 0 {
+            let name_inits: Vec<String> = names.iter().map(|n| format!("\"{}\"", c_escape(n))).collect();
+            self.line(&format!(
+                "static const char *kd_test_names[] = {{ {} }};",
+                name_inits.join(", ")
+            ));
+            let fn_inits: Vec<String> = (0..total).map(|i| format!("kd_test_{}", i)).collect();
+            self.line(&format!(
+                "static int (*kd_test_fns[])(void) = {{ {} }};",
+                fn_inits.join(", ")
+            ));
+        }
+        self.blank();
         self.line("int main(int argc, char **argv) {");
         self.indent += 1;
-        self.line("(void)argc; (void)argv;");
-        self.line("int failures = 0;");
-        for (i, name) in names.iter().enumerate() {
-            let esc = c_escape(name);
-            self.line(&format!("if (kd_test_{}() == 0) {{", i));
+        // `--filter SUBSTR` / a bare SUBSTR runs only tests whose name contains
+        // it; `--bench` times each test. (v0.150)
+        self.line("const char *filter = 0; int bench = 0;");
+        self.line("for (int ai = 1; ai < argc; ai++) {");
+        self.indent += 1;
+        self.line("if (strcmp(argv[ai], \"--bench\") == 0) { bench = 1; }");
+        self.line("else if (strcmp(argv[ai], \"--filter\") == 0) { if (ai + 1 < argc) { filter = argv[++ai]; } }");
+        self.line("else { filter = argv[ai]; }");
+        self.indent -= 1;
+        self.line("}");
+        self.line(&format!("int total = {};", total));
+        self.line("int failures = 0; int ran = 0;");
+        if total > 0 {
+            self.line("for (int ti = 0; ti < total; ti++) {");
             self.indent += 1;
-            self.line(&format!("fprintf(stderr, \"ok: %s\\n\", \"{}\");", esc));
+            self.line("if (filter && !strstr(kd_test_names[ti], filter)) { continue; }");
+            self.line("ran++;");
+            self.line("int rc; clock_t t0 = clock();");
+            self.line("rc = kd_test_fns[ti]();");
+            self.line("if (bench) {");
+            self.indent += 1;
+            self.line("double ms = (double)(clock() - t0) * 1000.0 / (double)CLOCKS_PER_SEC;");
+            self.line("fprintf(stderr, \"%s: %.3f ms%s\\n\", kd_test_names[ti], ms, rc == 0 ? \"\" : \" (FAIL)\");");
             self.indent -= 1;
             self.line("} else {");
             self.indent += 1;
-            self.line(&format!("fprintf(stderr, \"FAIL: %s\\n\", \"{}\");", esc));
-            self.line("failures++;");
+            self.line("fprintf(stderr, \"%s: %s\\n\", rc == 0 ? \"ok\" : \"FAIL\", kd_test_names[ti]);");
+            self.indent -= 1;
+            self.line("}");
+            self.line("if (rc != 0) { failures++; }");
             self.indent -= 1;
             self.line("}");
         }
-        self.line(&format!(
-            "fprintf(stderr, \"%d/%d tests passed\\n\", {} - failures, {});",
-            total, total
-        ));
+        self.line("fprintf(stderr, \"%d/%d tests passed%s\\n\", ran - failures, ran, filter ? \" (filtered)\" : \"\");");
         self.line("return failures;");
         self.indent -= 1;
         self.line("}");
@@ -4548,21 +4583,30 @@ mod tests {
         assert!(out.contains("if (!(true)) {"), "expect lowering missing:\n{out}");
         assert!(out.contains("return 1;"), "fail return missing:\n{out}");
         assert!(out.contains("return 0;"), "pass return missing:\n{out}");
-        // Harness driver.
+        // Harness driver (v0.150: name/fn tables + an argv-driven loop).
         assert!(
-            out.contains("if (kd_test_0() == 0) {"),
+            out.contains("static const char *kd_test_names[] = { \"ok\" };"),
+            "test name table missing:\n{out}"
+        );
+        assert!(
+            out.contains("static int (*kd_test_fns[])(void) = { kd_test_0 };"),
+            "test fn table missing:\n{out}"
+        );
+        assert!(
+            out.contains("rc = kd_test_fns[ti]();"),
             "harness dispatch missing:\n{out}"
         );
         assert!(
-            out.contains("fprintf(stderr, \"ok: %s\\n\", \"ok\");"),
-            "ok print missing:\n{out}"
+            out.contains("if (filter && !strstr(kd_test_names[ti], filter)) { continue; }"),
+            "filter handling missing:\n{out}"
+        );
+        assert!(out.contains("if (bench) {"), "bench timing branch missing:\n{out}");
+        assert!(
+            out.contains("rc == 0 ? \"ok\" : \"FAIL\""),
+            "ok/FAIL print missing:\n{out}"
         );
         assert!(
-            out.contains("fprintf(stderr, \"FAIL: %s\\n\", \"ok\");"),
-            "fail print missing:\n{out}"
-        );
-        assert!(
-            out.contains("fprintf(stderr, \"%d/%d tests passed\\n\", 1 - failures, 1);"),
+            out.contains("\"%d/%d tests passed%s\\n\""),
             "summary missing:\n{out}"
         );
         assert!(out.contains("return failures;"), "exit code missing:\n{out}");

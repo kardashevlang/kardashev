@@ -42,10 +42,15 @@ Commands:
             no argument and multiple targets in ./build.ks, a TARGET name is
             required.
 
-    test  [FILE|TARGET]
+    test  [FILE|TARGET] [--filter SUBSTR]
             Build and run the test harness; reports pass/fail counts and
-            exits non-zero if any test fails. With no argument and multiple
+            exits non-zero if any test fails. --filter runs only the tests
+            whose name contains SUBSTR. With no argument and multiple
             targets in ./build.ks, a TARGET name is required.
+
+    bench [FILE|TARGET]
+            Build and run the test harness with per-test wall-clock timing
+            (prints `<name>: <ms> ms`). A failing test still fails.
 
     fmt   FILE [--check | -w]
             Format source. With no flag, prints canonical source to stdout.
@@ -88,8 +93,13 @@ enum Command {
         file: Option<String>,
         args: Vec<String>,
     },
-    /// `test [FILE]`
-    Test { file: Option<String> },
+    /// `test [FILE] [--filter SUBSTR]`
+    Test {
+        file: Option<String>,
+        filter: Option<String>,
+    },
+    /// `bench [FILE]` — run the tests with per-test wall-clock timing (v0.150).
+    Bench { file: Option<String> },
     /// `fmt FILE [--check | -w]`
     Fmt { file: String, mode: FmtMode },
     /// `doc FILE` — print Markdown API docs for a file's public items (v0.140).
@@ -144,7 +154,8 @@ pub fn run(args: Vec<String>) -> ExitCode {
             object_only,
         } => cmd_build(file, out, target, object_only),
         Command::Run { file, args } => cmd_run(file, args),
-        Command::Test { file } => cmd_test(file),
+        Command::Test { file, filter } => cmd_test(file, filter),
+        Command::Bench { file } => cmd_bench(file),
         Command::Fmt { file, mode } => cmd_fmt(file, mode),
         Command::Doc { file } => cmd_doc(file),
         Command::Init { name } => cmd_init(name),
@@ -170,6 +181,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "build" => parse_build(&rest),
         "run" => parse_run(&rest),
         "test" => parse_test(&rest),
+        "bench" => parse_bench(&rest),
         "fmt" => parse_fmt(&rest),
         "doc" => parse_doc(&rest),
         "init" => parse_init(&rest),
@@ -274,9 +286,18 @@ fn parse_run(rest: &[&str]) -> Result<Command, String> {
 
 fn parse_test(rest: &[&str]) -> Result<Command, String> {
     let mut file: Option<String> = None;
-    for &a in rest {
+    let mut filter: Option<String> = None;
+    let mut it = rest.iter();
+    while let Some(&a) = it.next() {
         if a == "-h" || a == "--help" {
             return Ok(Command::Help);
+        }
+        if a == "--filter" {
+            match it.next() {
+                Some(&v) => filter = Some(v.to_string()),
+                None => return Err("`--filter` requires a SUBSTRING argument".to_string()),
+            }
+            continue;
         }
         if a.starts_with('-') {
             return Err(format!("unknown flag `{a}` for `test`"));
@@ -286,7 +307,24 @@ fn parse_test(rest: &[&str]) -> Result<Command, String> {
         }
         file = Some(a.to_string());
     }
-    Ok(Command::Test { file })
+    Ok(Command::Test { file, filter })
+}
+
+fn parse_bench(rest: &[&str]) -> Result<Command, String> {
+    let mut file: Option<String> = None;
+    for &a in rest {
+        if a == "-h" || a == "--help" {
+            return Ok(Command::Help);
+        }
+        if a.starts_with('-') {
+            return Err(format!("unknown flag `{a}` for `bench`"));
+        }
+        if file.is_some() {
+            return Err(format!("unexpected extra argument `{a}` for `bench`"));
+        }
+        file = Some(a.to_string());
+    }
+    Ok(Command::Bench { file })
 }
 
 fn parse_fmt(rest: &[&str]) -> Result<Command, String> {
@@ -656,22 +694,52 @@ fn cmd_run(file: Option<String>, prog_args: Vec<String>) -> ExitCode {
     }
 }
 
-fn cmd_test(file: Option<String>) -> ExitCode {
+fn cmd_test(file: Option<String>, filter: Option<String>) -> ExitCode {
     let (_src, c) = match compile_source(file, EmitMode::Test) {
         Ok(v) => v,
         Err(()) => return ExitCode::FAILURE,
     };
 
+    // `--filter SUBSTR` is handed to the harness binary, which runs only the
+    // tests whose name contains it (v0.150).
+    let args: Vec<String> = match &filter {
+        Some(f) => vec!["--filter".to_string(), f.clone()],
+        None => Vec::new(),
+    };
+
     // The harness itself prints per-test `ok:`/`FAIL:` lines and a final
     // `<passed>/<total> tests passed` summary to stderr, and exits with the
     // failure count. We add a one-line outcome summary on stdout.
-    match crate::backend::cc_build_and_run(&c, &[]) {
+    match crate::backend::cc_build_and_run(&c, &args) {
         Ok(0) => {
             println!("all tests passed");
             ExitCode::SUCCESS
         }
         Ok(n) => {
             println!("{n} test(s) failed");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `kard bench [FILE]` — build the test harness and run it with `--bench`, so it
+/// prints a wall-clock time per test (v0.150). A failing test still fails.
+fn cmd_bench(file: Option<String>) -> ExitCode {
+    let (_src, c) = match compile_source(file, EmitMode::Test) {
+        Ok(v) => v,
+        Err(()) => return ExitCode::FAILURE,
+    };
+    match crate::backend::cc_build_and_run(&c, &["--bench".to_string()]) {
+        Ok(0) => {
+            println!("all benchmarks ran");
+            ExitCode::SUCCESS
+        }
+        Ok(n) => {
+            println!("{n} benchmark(s) failed");
             ExitCode::FAILURE
         }
         Err(e) => {
@@ -1110,9 +1178,35 @@ mod tests {
             parse(&["test", "t.ks"]).unwrap(),
             Command::Test {
                 file: Some("t.ks".to_string()),
+                filter: None,
             }
         );
-        assert_eq!(parse(&["test"]).unwrap(), Command::Test { file: None });
+        assert_eq!(
+            parse(&["test"]).unwrap(),
+            Command::Test {
+                file: None,
+                filter: None
+            }
+        );
+    }
+
+    #[test]
+    fn test_filter_and_bench() {
+        assert_eq!(
+            parse(&["test", "t.ks", "--filter", "math"]).unwrap(),
+            Command::Test {
+                file: Some("t.ks".to_string()),
+                filter: Some("math".to_string()),
+            }
+        );
+        assert!(parse(&["test", "--filter"]).is_err()); // needs an argument
+        assert_eq!(
+            parse(&["bench", "t.ks"]).unwrap(),
+            Command::Bench {
+                file: Some("t.ks".to_string())
+            }
+        );
+        assert_eq!(parse(&["bench"]).unwrap(), Command::Bench { file: None });
     }
 
     #[test]
