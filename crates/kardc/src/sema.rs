@@ -44,7 +44,9 @@
 //! - `E0211` — a duplicate enum variant in a declaration, or a duplicate
 //!   `switch` label across arms.
 //! - `E0212` — an enum variant name (`Enum.V` / `.V` / a `switch` label) that
-//!   the enum does not declare.
+//!   the enum does not declare, or a range label `lo..hi` on a `switch` whose
+//!   scrutinee is not an integer type (a range is only a valid label for an
+//!   integer `switch`, SPEC §39.1).
 //! - `E0213` — a `switch` scrutinee whose type is neither an enum nor an
 //!   integer.
 //! - `E0214` — a non-exhaustive `switch` on an integer type (no `else` arm).
@@ -1725,13 +1727,23 @@ impl Checker {
             // A tagged-union scrutinee is the only kind whose arms may bind a
             // payload capture (SPEC §20.2); enum/integer arms with a capture are
             // rejected (`E0272`) below.
-            Some(Type::Union(uid)) => self.check_union_switch(uid, arms, default, span),
+            Some(Type::Union(uid)) => {
+                // A range label `lo..hi` only matches an integer scrutinee; a
+                // range on a tagged-union switch is invalid (SPEC §39.1).
+                self.reject_arm_ranges(arms);
+                self.check_union_switch(uid, arms, default, span)
+            }
             Some(Type::Enum(eid)) => {
                 self.reject_arm_captures(arms);
+                // A range label is only valid for an integer scrutinee, not an
+                // enum (SPEC §39.1).
+                self.reject_arm_ranges(arms);
                 self.check_enum_switch(eid, arms, default, span)
             }
             Some(t) if t.is_int() => {
                 self.reject_arm_captures(arms);
+                // Range labels (`lo..hi`) are valid here — they are checked /
+                // lowered as part of the integer switch.
                 self.check_int_switch(t, arms, default, span)
             }
             Some(t) => {
@@ -1742,7 +1754,9 @@ impl Checker {
                 self.error(scrutinee.span(), "E0213", msg);
                 // The scrutinee is unswitchable, so labels cannot be validated,
                 // but arm bodies and the `else` block are still checked so their
-                // own errors surface.
+                // own errors surface. A range label is likewise invalid on a
+                // non-integer scrutinee (SPEC §39.1).
+                self.reject_arm_ranges(arms);
                 self.check_switch_blocks(arms, default);
             }
             // The scrutinee itself errored; just check the arm bodies + else.
@@ -1761,6 +1775,24 @@ impl Checker {
                     arm.span,
                     "E0272",
                     "a payload capture `|x|` is only valid in a `switch` over a tagged union",
+                );
+            }
+        }
+    }
+
+    /// Emit `E0212` for any arm carrying an inclusive integer-range label
+    /// (`lo..hi`) on a `switch` whose scrutinee is **not** an integer type: a
+    /// range is only a valid label for an integer `switch` (SPEC §39.1). Enum /
+    /// union / otherwise non-integer scrutinees accept only their own (value)
+    /// labels. (Value labels and payload captures on such arms are validated by
+    /// the per-kind checkers as before; rejecting ranges here is independent.)
+    fn reject_arm_ranges(&mut self, arms: &[SwitchArm]) {
+        for arm in arms {
+            if !arm.ranges.is_empty() {
+                self.error(
+                    arm.span,
+                    "E0212",
+                    "a range label `lo..hi` is only valid in a `switch` over an integer type",
                 );
             }
         }
@@ -7029,6 +7061,7 @@ mod tests {
     fn switch_arm(labels: Vec<Expr>, body: Vec<Stmt>) -> SwitchArm {
         SwitchArm {
             labels,
+            ranges: vec![],
             capture: None,
             body: block(body),
             span: sp(),
@@ -7038,7 +7071,23 @@ mod tests {
     fn switch_arm_cap(labels: Vec<Expr>, cap: &str, body: Vec<Stmt>) -> SwitchArm {
         SwitchArm {
             labels,
+            ranges: vec![],
             capture: Some(cap.into()),
+            body: block(body),
+            span: sp(),
+        }
+    }
+    /// A `switch` arm carrying inclusive integer-range labels `lo..hi` (v0.146),
+    /// optionally alongside value `labels` (the arm matches any label OR range).
+    fn switch_arm_ranges(
+        labels: Vec<Expr>,
+        ranges: Vec<(i64, i64)>,
+        body: Vec<Stmt>,
+    ) -> SwitchArm {
+        SwitchArm {
+            labels,
+            ranges,
+            capture: None,
             body: block(body),
             span: sp(),
         }
@@ -7297,6 +7346,99 @@ mod tests {
             )],
         )];
         assert!(codes(items).contains(&"E0211"));
+    }
+
+    // ---- switch range labels (v0.146) ------------------------------------
+
+    #[test]
+    fn int_switch_with_range_label_and_else_ok() {
+        // fn f(x: i32) void { switch (x) { 1..5 => { print(1); }, else => {} } }
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "void",
+            vec![switch_stmt(
+                ident("x"),
+                vec![switch_arm_ranges(
+                    vec![],
+                    vec![(1, 5)],
+                    vec![Stmt::Expr(call("print", vec![int(1)]))],
+                )],
+                Some(vec![]),
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn int_switch_value_plus_range_mixed_arm_ok() {
+        // fn f(x: i32) void { switch (x) { 0, 10..20 => {}, else => {} } }
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "void",
+            vec![switch_stmt(
+                ident("x"),
+                vec![switch_arm_ranges(vec![int(0)], vec![(10, 20)], vec![])],
+                Some(vec![]),
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn int_switch_backwards_range_matches_nothing_ok() {
+        // fn f(x: i32) void { switch (x) { 5..1 => {}, else => {} } }
+        // A backwards range matches nothing (SPEC §39.1) — not an error.
+        let items = vec![func(
+            "f",
+            vec![param("x", "i32")],
+            "void",
+            vec![switch_stmt(
+                ident("x"),
+                vec![switch_arm_ranges(vec![], vec![(5, 1)], vec![])],
+                Some(vec![]),
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn range_label_on_enum_switch_is_e0212() {
+        // switch (c) { 0..2 => {}, else => {} }   // a range on an enum scrutinee
+        let items = vec![
+            color_enum(),
+            func(
+                "classify",
+                vec![param("c", "Color")],
+                "void",
+                vec![switch_stmt(
+                    ident("c"),
+                    vec![switch_arm_ranges(vec![], vec![(0, 2)], vec![])],
+                    Some(vec![]),
+                )],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0212"));
+    }
+
+    #[test]
+    fn range_label_on_union_switch_is_e0212() {
+        // switch (n) { 0..1 => {}, else => {} }   // a range on a union scrutinee
+        let items = vec![
+            num_union(),
+            func(
+                "consume",
+                vec![param("n", "Num")],
+                "void",
+                vec![switch_stmt(
+                    ident("n"),
+                    vec![switch_arm_ranges(vec![], vec![(0, 1)], vec![])],
+                    Some(vec![]),
+                )],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0212"));
     }
 
     #[test]

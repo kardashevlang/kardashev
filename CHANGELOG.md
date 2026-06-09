@@ -18,6 +18,21 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.146.0] — `switch` ranges + multi-label arms
+
+### Added
+- **Inclusive integer-range arms**: `switch (n) { 1..10 => …, else => … }` —
+  matches when the scrutinee is in `[lo, hi]`. `SwitchArm.ranges`; lowered to GNU
+  C case-ranges (`case 1 ... 10:`), combinable with value labels in one arm
+  (`0, 10..20, 99 => …`). A range on an enum/union switch is `E0212`.
+- (Multi-label arms `1, 2, 3 =>` / `.A, .B =>` already worked — `labels` is a
+  `Vec` — so this version added the range form.)
+- 917 unit + 43 e2e tests; `examples/switch_ranges.ks`.
+
+### Fixed
+- The embedded `VERSION` now tracks the release again (v0.145 shipped without
+  bumping it).
+
 ## [0.145.0] — Importable `std` library
 
 ### Added

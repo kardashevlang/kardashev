@@ -1339,3 +1339,22 @@ a decimal point so C reads it as `double`). Arithmetic/comparison reuse the
 existing binary lowering (the operands are `double`). `print(x: f64)` lowers to a
 `double` print helper (`kd_print_f64`, `printf("%g\n", …)`-style). `@as` reuses
 the §33 cast lowering (`((double)(e))` / `((int32_t)(e))`).
+
+## 39. `switch` ranges + multi-label arms (v0.146)
+
+A `switch` arm may already list **several labels** (`1, 2, 3 => …`;
+`.A, .B => …` — `SwitchArm.labels` is a `Vec`, since §13/§20). v0.146 adds
+**inclusive integer-range labels**: `lo..hi => …` matches when the scrutinee is
+in `[lo, hi]`. `SwitchArm.ranges: Vec<(i64, i64)>`; bounds are integer literals;
+ranges and labels combine in one arm (it matches any label OR any range).
+
+### 39.1 Semantics (`sema`)
+A range label is valid only for an **integer** scrutinee (a range on an
+enum/union switch is an error). As for any integer `switch`, an `else` arm is
+required (ranges do not establish exhaustiveness). A backwards range (`hi < lo`)
+matches nothing.
+
+### 39.2 Backend (`emit_c`)
+A range label lowers to a GNU C case-range `case <lo> ... <hi>:` (supported by
+the `cc`/`clang` backend), beside the ordinary `case <label>:` lines for value
+labels. The rest of the `switch` lowering is unchanged.

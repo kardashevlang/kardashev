@@ -290,6 +290,10 @@ pub enum Stmt {
 #[derive(Clone, Debug)]
 pub struct SwitchArm {
     pub labels: Vec<Expr>,
+    /// Inclusive integer-range labels `lo..hi` (v0.146): the arm matches when the
+    /// scrutinee is in `[lo, hi]`. Bounds are integer literals. Combine freely
+    /// with `labels` (an arm matches any label OR any range).
+    pub ranges: Vec<(i64, i64)>,
     /// `|name|` payload capture (v0.124, tagged-union switch): binds the matched
     /// variant's payload in the arm body. `None` for enum/integer switches.
     pub capture: Option<String>,

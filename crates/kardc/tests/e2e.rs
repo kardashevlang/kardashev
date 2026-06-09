@@ -1151,3 +1151,41 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "3.5\n3\n1\n3.5\n3\n10\n");
 }
+
+// --- v0.146 switch range labels --------------------------------------------
+
+#[test]
+fn switch_range_and_multi_labels() {
+    let src = r#"
+fn grade(score: i32) i32 {
+    switch (score) {
+        90..100 => { return 4; },
+        80..89 => { return 3; },
+        70..79 => { return 2; },
+        else => { return 0; },
+    }
+}
+fn classify(n: i32) i32 {
+    switch (n) {
+        0 => { return 100; },                  // single value
+        1, 2, 3 => { return 200; },             // multi-label
+        10..20, 90..99 => { return 300; },      // two ranges in one arm
+        else => { return 0; },
+    }
+}
+pub fn main() i32 {
+    print(grade(95));    // 4
+    print(grade(72));    // 2
+    print(grade(50));    // 0
+    print(classify(0));  // 100
+    print(classify(2));  // 200
+    print(classify(15)); // 300
+    print(classify(95)); // 300
+    print(classify(50)); // 0
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "4\n2\n0\n100\n200\n300\n300\n0\n");
+}
