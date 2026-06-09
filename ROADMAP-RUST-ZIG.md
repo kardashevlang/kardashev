@@ -227,10 +227,13 @@ A comptime builtin (extends §32's `Expr::Builtin`) that casts an integer value
 to another integer type — `@as(usize, key)` — lowering to a C cast `((T)(e))`.
 Unblocks mixed-integer code and `HashMap`.
 
-### v0.138.0 — `HashMap(K, V)` std container
-A real open-addressing hash map on the `Allocator` (`put`/`get`/`has`/`len`),
-built on multi-parameter generics (v0.135) + pointer receivers (v0.134) + casts
-(v0.137) — written in the language itself.
+### v0.138.0 — `HashMap(V)` std container ✅
+A real open-addressing hash map on the `Allocator` (`put`/`get`/`has`/`remove`/
+`len`, grow-and-rehash, tombstones), written in the language itself
+(`examples/hashmap.ks`). Implementing it lifted two generic-struct-method
+limitations from v0.130: a method may now **reference top-level `const`s and free
+functions** (method bodies are checked after Pass 2) and **call `Self.assoc(…)`**
+associated constructors.
 
 ### v0.139.0 — Named error sets
 `const FileErr = error{ NotFound, Denied };`, `FileErr!T`, and set membership —

@@ -2974,12 +2974,20 @@ impl<'a> Emitter<'a> {
             // `const IntList = ArrayList(i32);`, v0.130) → the struct's source
             // name, so the call lowers to `kd_<struct>_<method>` matching the
             // emitted instance method.
-            Expr::Ident { name, .. } => self.structs.id_of(name).map(|_| name.clone()).or_else(
-                || match self.structs.alias_of(name) {
+            Expr::Ident { name, .. } => self
+                .structs
+                .id_of(name)
+                .map(|_| name.clone())
+                .or_else(|| match self.structs.alias_of(name) {
                     Some(Type::Struct(id)) => Some(self.structs.get(id).name.clone()),
                     _ => None,
-                },
-            ),
+                })
+                // `Self.assoc(...)` inside a generic-struct method: `Self` is in
+                // the active substitution → the instantiated struct (v0.138).
+                .or_else(|| match self.subst.get(name) {
+                    Some(Type::Struct(id)) => Some(self.structs.get(*id).name.clone()),
+                    _ => None,
+                }),
             _ => None,
         };
         if let Some(struct_name) = assoc {

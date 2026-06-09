@@ -18,6 +18,23 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.138.0] — `HashMap(V)` std container
+
+### Added
+- **`HashMap(V)`** — a generic open-addressing hash map on the `Allocator`
+  (`put`/`get`/`has`/`remove`/`len`, with grow-and-rehash at 0.75 load and
+  tombstones for `remove`), written entirely in the language —
+  `examples/hashmap.ks`. The second allocator-based std container.
+
+### Fixed (generic-struct methods, lifting two v0.130 limitations)
+- A generic-struct method body may now **reference top-level `const`s and free
+  functions**: method bodies are checked in a new post-Pass-2 phase (their
+  signatures are still registered earlier so call sites resolve).
+- A generic-struct method may **call `Self.assoc(…)`** (an associated
+  constructor like `Self.with_cap`): the backend now resolves a `Self` receiver
+  through the active substitution.
+- 779 unit + 37 e2e tests.
+
 ## [0.137.0] — Integer casts `@as(T, e)`
 
 ### Added

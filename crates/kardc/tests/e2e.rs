@@ -965,3 +965,48 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "7\n1000000\n7\n99\n");
 }
+
+// --- v0.138 generic-struct methods may use top-level consts + Self.assoc ----
+
+#[test]
+fn generic_struct_method_uses_const_and_self_assoc() {
+    let src = r#"
+const EMPTY: i32 = 0;
+const FULL: i32 = 1;
+fn Slots(comptime V: type) type {
+    return struct {
+        state: []i32,
+        vals: []V,
+        cap: usize,
+        fn make(a: Allocator, c: usize) Self {       // associated constructor
+            var s: Self = Self{ .state = alloc(a, i32, c), .vals = alloc(a, V, c), .cap = c };
+            var i: usize = 0;
+            while (i < c) : (i += 1) { s.state[i] = EMPTY; }   // top-level const in a method
+            return s;
+        }
+        fn init(a: Allocator) Self { return Self.make(a, 4); }  // Self.assoc() call
+        fn set(self: *Self, i: usize, v: V) void {
+            self.state[i] = FULL;                               // top-level const
+            self.vals[i] = v;
+        }
+        fn live(self: Self, i: usize) bool { return self.state[i] == FULL; }
+        fn at(self: Self, i: usize) V { return self.vals[i]; }
+        fn deinit(self: Self, a: Allocator) void { free(a, self.state); free(a, self.vals); }
+    };
+}
+const S = Slots(i32);
+pub fn main() i32 {
+    var a: Allocator = c_allocator();
+    var s: S = S.init(a);            // -> Self.make(a, 4)
+    s.set(2, 222);
+    print(s.at(2));                  // 222
+    if (s.live(2)) { print(1); } else { print(0); }   // 1
+    if (s.live(0)) { print(1); } else { print(0); }   // 0
+    s.deinit(a);
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "222\n1\n0\n");
+}
