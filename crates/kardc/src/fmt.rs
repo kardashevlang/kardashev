@@ -596,6 +596,11 @@ fn expr_prec(e: &Expr) -> u8 {
         | Expr::Ident { .. }
         | Expr::Call { .. }
         | Expr::StructLit { .. }
+        // An anonymous `struct { … }` **type value** (SPEC §25). It only ever
+        // appears as the whole body of a type-returning function's `return`, so
+        // it is never actually a sub-operand; treating it as an atomic primary
+        // (like a struct literal) keeps the printer total and idempotent.
+        | Expr::StructType { .. }
         | Expr::Field { .. }
         | Expr::MethodCall { .. }
         | Expr::Null { .. }
@@ -737,6 +742,32 @@ fn fmt_expr(e: &Expr) -> String {
                 s.push_str(&init.name);
                 s.push_str(" = ");
                 s.push_str(&fmt_expr(&init.value));
+            }
+            s.push_str(" }");
+            s
+        }
+        // An anonymous `struct { f: T, … }` **type value** (SPEC §25) — the body
+        // of a type-returning function `fn F(comptime T: type) type`, e.g.
+        // `return struct { v: T };`. Prints inline on a single line, mirroring the
+        // struct-literal spacing: `struct { f1: T1, f2: T2 }` with one space just
+        // inside the braces and `, ` between fields; an empty struct type collapses
+        // to `struct {}`. Each field is `name: Type` (the field-decl spelling),
+        // not the per-line / trailing-comma layout a *top-level* `const Name =
+        // struct {…};` declaration uses, because this is an inline expression in
+        // value/return position. The printed form re-lexes to the same
+        // `Expr::StructType`, so re-formatting is idempotent.
+        Expr::StructType { fields, .. } => {
+            if fields.is_empty() {
+                return "struct {}".to_string();
+            }
+            let mut s = String::from("struct { ");
+            for (i, f) in fields.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&f.name);
+                s.push_str(": ");
+                s.push_str(&fmt_type(&f.ty));
             }
             s.push_str(" }");
             s
@@ -3624,6 +3655,123 @@ mod tests {
         // `\n`. So formatting reproduces the source byte-for-byte and
         // re-formatting that output is byte-identical (idempotence).
         let src = "fn f() void {\n    var s = \"hi\\n\";\n}\n";
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    // ----- generic structs / type-returning functions (v0.129) -------------
+
+    #[test]
+    fn struct_type_expr_inline_forms() {
+        // An anonymous `struct { … }` type value (SPEC §25.1) prints inline as a
+        // single line, mirroring struct-literal spacing.
+
+        // Empty anonymous struct type → `struct {}`.
+        let empty = Expr::StructType {
+            fields: vec![],
+            span: D,
+        };
+        assert_eq!(fmt_expr(&empty), "struct {}");
+
+        // Single field → `struct { v: T }` (the field-decl `name: Type` style).
+        let one = Expr::StructType {
+            fields: vec![field_decl("v", "T")],
+            span: D,
+        };
+        assert_eq!(fmt_expr(&one), "struct { v: T }");
+
+        // Multiple fields join with `, `; a composite (`[]T`) field type prints
+        // through `fmt_type`, so its `[]` prefix is preserved.
+        let many = Expr::StructType {
+            fields: vec![
+                FieldDecl {
+                    name: "items".to_string(),
+                    ty: slice_ty("T"),
+                    span: D,
+                },
+                field_decl("len", "usize"),
+            ],
+            span: D,
+        };
+        assert_eq!(fmt_expr(&many), "struct { items: []T, len: usize }");
+    }
+
+    #[test]
+    fn type_constructor_fn_prints_structtype_in_return() {
+        // `fn Box(comptime T: type) type { return struct { v: T }; }` — a
+        // type-returning function (SPEC §25.1). The `comptime T: type` parameter
+        // prints with the `comptime` keyword (SPEC §17), the return type is the
+        // bare `type`, and the body's `return` carries an `Expr::StructType`
+        // printed inline as `struct { v: T }`. No special-casing of the function
+        // or its return type is needed — the existing printers handle both.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "Box".to_string(),
+                params: vec![Param {
+                    name: "T".to_string(),
+                    ty: ty("type"),
+                    is_comptime: true,
+                    span: D,
+                }],
+                ret: ty("type"),
+                body: Block {
+                    stmts: vec![Stmt::Return {
+                        value: Some(Expr::StructType {
+                            fields: vec![field_decl("v", "T")],
+                            span: D,
+                        }),
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = "fn Box(comptime T: type) type {\n    return struct { v: T };\n}\n";
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: the pure printer re-prints identically.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn type_alias_const_prints_normally() {
+        // `const IL = Box(i32);` — a type alias (SPEC §25.1) is an ordinary
+        // inferred `const` whose initializer is a call to a type-constructor; it
+        // needs no special-casing and prints via the normal const printer with no
+        // `: T` annotation.
+        let m = Module {
+            items: vec![Item::Const(ConstDecl {
+                is_pub: false,
+                name: "IL".to_string(),
+                ty: None,
+                value: call("Box", vec![ident("i32")]),
+                span: D,
+            })],
+        };
+        let expected = "const IL = Box(i32);\n";
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn type_constructor_and_alias_source_round_trip() {
+        // End-to-end (lex → parse → print), SPEC §25: a type-constructor and the
+        // type alias that instantiates it, in canonical form, re-format
+        // byte-for-byte — the `Expr::StructType` prints in the `return` and the
+        // alias `const` prints as an ordinary call. Re-formatting the output is
+        // byte-identical (idempotence).
+        let src = concat!(
+            "fn Box(comptime T: type) type {\n",
+            "    return struct { v: T };\n",
+            "}\n",
+            "\n",
+            "const IL = Box(i32);\n",
+        );
         let once = format_source(src).expect("source formats");
         assert_eq!(once, src);
         let twice = format_source(&once).expect("canonical source re-formats");

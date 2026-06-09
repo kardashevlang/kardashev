@@ -164,9 +164,11 @@ Reuses slices, so no new type.
 monomorphised per concrete value, extending v0.120. Array sizes are now
 `ArraySize::{Lit, Param}`; instantiations key on `ComptimeArg::{Type, Value}`.
 
-### v0.129.0 — Generic structs / type-returning functions
-`fn List(comptime T: type) type { return struct { … }; }` — comptime functions
-that return `struct` types, monomorphised. Unlocks generic containers. (XL.)
+### v0.129.0 — Generic structs / type-returning functions ✅
+`fn Pair(comptime T: type) type { return struct { … }; }` — type-constructors,
+monomorphised; used via a type-alias `const IP = Pair(i32);` (memoised). Unlocks
+generic containers. (Single type param, fields-only struct in v0.129; multiple
+params / methods / direct `Name(T)` in type position are later work.)
 
 ### v0.130.0 — Standard prelude: `ArrayList(T)`
 A growable list built on the `Allocator` + generic structs (`append`, `get`,

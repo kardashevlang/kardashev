@@ -236,6 +236,9 @@ pub struct StructTable {
     /// Monomorphisation instantiations of generic functions (v0.120): each is a
     /// `(generic fn name, concrete type arguments)` pair the backend must emit.
     instantiations: Vec<Instantiation>,
+    /// Type aliases `const Alias = Name(C);` → the aliased type (v0.129). Shared
+    /// from sema to the backend so an alias name resolves in both.
+    type_aliases: HashMap<String, Type>,
 }
 
 /// One comptime argument to a generic function: a type (`comptime T: type`,
@@ -535,6 +538,16 @@ impl StructTable {
     /// All recorded instantiations, in discovery order.
     pub fn instantiations(&self) -> &[Instantiation] {
         &self.instantiations
+    }
+
+    /// Record a type alias `Alias` → `ty` (v0.129).
+    pub fn add_alias(&mut self, name: &str, ty: Type) {
+        self.type_aliases.insert(name.to_string(), ty);
+    }
+
+    /// The type a type-alias name refers to, if any (v0.129).
+    pub fn alias_of(&self, name: &str) -> Option<Type> {
+        self.type_aliases.get(name).copied()
     }
 
     /// The C name for an instantiation, e.g. `kd_max__int32_t` or

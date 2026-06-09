@@ -386,6 +386,12 @@ pub enum Expr {
     /// A string literal `"…"` as a value of type `[]u8` (v0.127): a slice over
     /// static bytes. `value` is the decoded (unescaped) contents.
     StrLit { value: String, span: Span },
+    /// An anonymous `struct { fields }` **type value** (v0.129) — only valid as
+    /// the body of a type-returning function `fn F(comptime T: type) type`.
+    StructType {
+        fields: Vec<FieldDecl>,
+        span: Span,
+    },
     /// A method / associated-function call: `receiver.method(args)`.
     /// `receiver` is either a struct value (method; `self` is prepended) or an
     /// `Ident` naming a struct type (associated call). Resolved in sema.
@@ -477,6 +483,7 @@ impl Expr {
             Expr::ArrayLit { span, .. } => *span,
             Expr::Index { span, .. } => *span,
             Expr::StrLit { span, .. } => *span,
+            Expr::StructType { span, .. } => *span,
             Expr::AddrOf { span, .. } => *span,
             Expr::Deref { span, .. } => *span,
             Expr::SliceExpr { span, .. } => *span,

@@ -959,3 +959,46 @@ the type substitution. `ArraySize::Param(n)` resolves to the bound value when
 forming the array type; a reference to a value param `n` in the body emits the
 literal value; the instance is emitted as `kd_<fn>__<args>` (a value arg mangles
 to its digits). Non-generic literal-sized arrays are unchanged.
+
+## 25. Generic structs / type-returning functions (v0.129)
+
+Zig's metaprogramming for *types*: a function may **return a type**, and that
+type is a `struct` parameterised by the function's comptime type parameter.
+
+### 25.1 Syntax & AST
+- A **type-constructor** is `pub? fn Name(comptime T: type) type { return struct
+  { f1: T, f2: …, … }; }` — its return type is the bare `type`, and its body is
+  exactly `return <struct-type>;`. The struct body is an `Expr::StructType{
+  fields }` (an anonymous struct **type value**, parsed when `struct {` appears
+  in expression/return position). v0.129: one comptime type parameter,
+  fields-only struct (no methods inside the generic struct).
+- **Type aliases**: `const Alias = Name(ConcreteType);` — a top-level `const`
+  whose initializer is a call to a type-constructor. (No new syntax; reuses
+  `Expr::Call`.)
+
+### 25.2 Semantics (`sema`)
+- Identify type-constructors (return type `type`). They are *not* checked as
+  ordinary functions.
+- A `const Alias = Name(C);` instantiates `Name` at `C`: substitute the type
+  parameter throughout the type-constructor's `StructType` fields, **intern a
+  struct** named `Name__<typetag>` (memoised — the same `(Name, C)` yields the
+  same struct id), and bind `Alias` as a **type alias** to that
+  `Type::Struct(id)`.
+- A type alias is usable in type position (`var x: Alias`), as a struct-literal
+  name (`Alias{ .f = v }`), and for field access (`x.f`) — all resolving to the
+  aliased struct via the existing Ident-based machinery.
+- Diagnostics: a type-constructor whose body isn't `return struct {…};` →
+  `E0310`; instantiating a non-type-constructor, or a type-constructor argument
+  that isn't a type → `E0311`; using a type alias as a value → reuse the
+  unknown-name/`E0100` path.
+
+### 25.3 Backend (`emit_c`)
+Type-constructor functions are **not emitted** (compile-time only, like generic
+functions); `Expr::StructType` therefore never reaches the backend. Type-alias
+`const`s emit nothing. The monomorphised structs interned by sema are emitted as
+ordinary C struct typedefs (in dependency order) and used like any struct.
+
+### 25.4 Deferred (honest)
+Multiple type parameters, comptime-value type-constructor params, methods inside
+a generic struct, and direct `Name(T)` / `Name(T){…}` in type / literal position
+(use a `const` type alias) — all later work.
