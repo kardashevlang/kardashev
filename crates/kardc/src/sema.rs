@@ -118,15 +118,23 @@ struct FuncSig {
 /// A resolved signature for a struct's method or associated function (SPEC §10).
 ///
 /// `params` lists every parameter type in declaration order — including the
-/// leading `self` (whose type is the enclosing struct) when `is_method` is true.
-/// `is_method` records whether the first parameter is named `self`, which
-/// decides whether the function may be invoked on a value (`v.m(..)`) or only
-/// statically (`Name.f(..)`).
+/// leading `self` (whose type is the enclosing struct, or a pointer to it for a
+/// pointer receiver) when `is_method` is true. `is_method` records whether the
+/// first parameter is named `self`, which decides whether the function may be
+/// invoked on a value (`v.m(..)`) or only statically (`Name.f(..)`).
+///
+/// `is_ptr_receiver` records whether that `self` is a **pointer receiver**
+/// (`self: *Struct` / `self: *Self`, SPEC §30): such a method mutates the
+/// receiver in place, so `params[0]` is `Ptr(Struct)` and a value-receiver call
+/// `obj.m(..)` auto-refs `&obj` (the receiver must be an addressable lvalue). A
+/// value receiver (`self: Struct` / `self: Self`) keeps `is_ptr_receiver` false
+/// and is unchanged from pre-v0.134.
 #[derive(Clone)]
 struct StructFn {
     params: Vec<Type>,
     ret: Type,
     is_method: bool,
+    is_ptr_receiver: bool,
 }
 
 /// A lexical binding: its type and whether it is immutable (a `const` or a
@@ -447,13 +455,23 @@ impl Checker {
                 let mut map: HashMap<String, StructFn> = HashMap::new();
                 for f in &s.methods {
                     let is_method = f.params.first().map_or(false, |p| p.name == "self");
+                    // A pointer receiver `self: *Point` / `self: *Self` (SPEC
+                    // §30) gives `self` the type `Ptr(Struct)` (true in-place
+                    // mutation); a value receiver is unchanged.
+                    let is_ptr_receiver =
+                        is_method && is_ptr_receiver_param(&f.params[0], &s.name);
+                    let self_ty = if is_ptr_receiver {
+                        Type::Ptr(self.structs.intern_ptr(Type::Struct(id)))
+                    } else {
+                        Type::Struct(id)
+                    };
                     let params = f
                         .params
                         .iter()
                         .enumerate()
                         .map(|(i, p)| {
                             if i == 0 && is_method {
-                                Type::Struct(id)
+                                self_ty
                             } else {
                                 self.resolve_type_opt(&p.ty).unwrap_or(Type::I64)
                             }
@@ -468,6 +486,7 @@ impl Checker {
                             params,
                             ret,
                             is_method,
+                            is_ptr_receiver,
                         },
                     );
                 }
@@ -624,12 +643,22 @@ impl Checker {
         self.in_test = false;
         self.loop_depth = 0;
         self.scopes.push(HashMap::new());
+        let struct_name = self.structs.get(struct_id).name.clone();
         let is_method = f.params.first().map_or(false, |p| p.name == "self");
+        // A pointer receiver `self: *Point` / `self: *Self` (SPEC §30) binds
+        // `self` to `Ptr(Struct)`, so `self.field` auto-derefs and mutations
+        // write through. A value receiver binds the enclosing struct by value.
+        let self_ty = if is_method && is_ptr_receiver_param(&f.params[0], &struct_name) {
+            Type::Ptr(self.structs.intern_ptr(Type::Struct(struct_id)))
+        } else {
+            Type::Struct(struct_id)
+        };
         for (i, p) in f.params.iter().enumerate() {
-            // The receiver `self` always has the enclosing struct type; other
-            // parameters resolve normally (emitting `E0100` for unknown types).
+            // The receiver `self` has the enclosing struct type (or a pointer to
+            // it for a pointer receiver); other parameters resolve normally
+            // (emitting `E0100` for unknown types).
             let pt = if i == 0 && is_method {
-                Type::Struct(struct_id)
+                self_ty
             } else {
                 self.resolve_type(&p.ty).unwrap_or(Type::I64)
             };
@@ -1009,16 +1038,25 @@ impl Checker {
                 msubst.insert("Self".to_string(), Type::Struct(id));
 
                 // (1) Register each method's signature. A `self` receiver is the
-                // instantiated struct *by value* (SPEC §10 / §26); the remaining
-                // parameter and return types resolve under `msubst`, so `Self`,
-                // `*Self`, `[]T`, `?T`, … all resolve as written.
+                // instantiated struct *by value* (SPEC §10 / §26), or a pointer
+                // to it for a pointer receiver `self: *Self` (SPEC §30); the
+                // remaining parameter and return types resolve under `msubst`, so
+                // `Self`, `*Self`, `[]T`, `?T`, … all resolve as written.
+                let struct_name = self.structs.get(id).name.clone();
                 let mut map: HashMap<String, StructFn> = HashMap::new();
                 for f in methods {
                     let is_method = f.params.first().map_or(false, |p| p.name == "self");
+                    let is_ptr_receiver =
+                        is_method && is_ptr_receiver_param(&f.params[0], &struct_name);
+                    let self_ty = if is_ptr_receiver {
+                        Type::Ptr(self.structs.intern_ptr(Type::Struct(id)))
+                    } else {
+                        Type::Struct(id)
+                    };
                     let mut params: Vec<Type> = Vec::with_capacity(f.params.len());
                     for (i, p) in f.params.iter().enumerate() {
                         let pt = if i == 0 && is_method {
-                            Type::Struct(id)
+                            self_ty
                         } else {
                             self.resolve_type_opt_with(&p.ty, &msubst, &HashMap::new())
                                 .unwrap_or(Type::I64)
@@ -1036,6 +1074,7 @@ impl Checker {
                             params,
                             ret,
                             is_method,
+                            is_ptr_receiver,
                         },
                     );
                 }
@@ -1083,12 +1122,22 @@ impl Checker {
         self.in_test = false;
         self.loop_depth = 0;
         self.scopes.push(HashMap::new());
+        let struct_name = self.structs.get(struct_id).name.clone();
         let is_method = f.params.first().map_or(false, |p| p.name == "self");
+        // A pointer receiver `self: *Self` (SPEC §30) binds `self` to
+        // `Ptr(Struct)` so `self.field` auto-derefs and mutations write through;
+        // a value receiver binds the instantiated struct by value (SPEC §10/§26).
+        let self_ty = if is_method && is_ptr_receiver_param(&f.params[0], &struct_name) {
+            Type::Ptr(self.structs.intern_ptr(Type::Struct(struct_id)))
+        } else {
+            Type::Struct(struct_id)
+        };
         for (i, p) in f.params.iter().enumerate() {
-            // The receiver `self` is the instantiated struct by value (SPEC §10 /
-            // §26); other parameters resolve under the active substitution.
+            // The receiver `self` is the instantiated struct by value (or a
+            // pointer to it for a pointer receiver); other parameters resolve
+            // under the active substitution.
             let pt = if i == 0 && is_method {
-                Type::Struct(struct_id)
+                self_ty
             } else {
                 self.resolve_type(&p.ty).unwrap_or(Type::I64)
             };
@@ -1822,6 +1871,58 @@ impl Checker {
         }
     }
 
+    /// Best-effort, side-effect-free type of a *place* expression (a value
+    /// identifier, field-access chain, index, or deref). Used to detect a
+    /// pointer base for an auto-deref write (SPEC §30.1) **without** emitting
+    /// diagnostics; returns `None` for anything it cannot resolve purely (the
+    /// caller then falls back to the normal, diagnostic-emitting place path).
+    /// Auto-derefs a `*Struct` base so `p.f` / `p.f.g` resolve through pointers.
+    fn place_type_query(&self, e: &Expr) -> Option<Type> {
+        match e {
+            Expr::Ident { name, .. } => self.lookup(name).map(|(t, _)| t),
+            Expr::Field { base, field, .. } => {
+                let bt = self.place_type_query(base)?;
+                let st = match bt {
+                    Type::Ptr(pid) => self.structs.ptr_pointee(pid),
+                    other => other,
+                };
+                match st {
+                    Type::Struct(id) => self.structs.get(id).field_type(field),
+                    _ => None,
+                }
+            }
+            Expr::Index { base, .. } => {
+                let bt = self.place_type_query(base)?;
+                let st = match bt {
+                    Type::Ptr(pid) => self.structs.ptr_pointee(pid),
+                    other => other,
+                };
+                match st {
+                    Type::Array(id) => Some(self.structs.array_elem(id)),
+                    Type::Slice(id) => Some(self.structs.slice_elem(id)),
+                    _ => None,
+                }
+            }
+            Expr::Deref { expr, .. } => match self.place_type_query(expr)? {
+                Type::Ptr(pid) => Some(self.structs.ptr_pointee(pid)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// If place expression `base` has a pointer type — so `base.field = e`
+    /// writes THROUGH the pointer (SPEC §30.1), like `(*base).field = e`, and
+    /// the pointer binding itself need not be mutable — return that pointer
+    /// type; else `None` (the caller falls back to the normal place path, which
+    /// enforces mutability for a value-struct chain). Side-effect-free.
+    fn place_base_ptr_type(&self, base: &Expr) -> Option<Type> {
+        match self.place_type_query(base) {
+            Some(t @ Type::Ptr(_)) => Some(t),
+            _ => None,
+        }
+    }
+
     /// Resolve the type of an assignment place (a field-access chain) and
     /// verify that its root is an assignable `var` local. Emits `E0167` if the
     /// root is a `const`/parameter (or the place is not a chain), and
@@ -1845,7 +1946,16 @@ impl Checker {
                 }
             },
             Expr::Field { base, field, span } => {
-                let bt = self.resolve_place(base)?;
+                // SPEC §30.1: if `base` is a pointer (to a struct), `base.field =
+                // e` writes THROUGH the pointer — like `(*base).field = e` — so
+                // the pointer binding itself need not be mutable (mirrors `p.* =
+                // e`). Resolve the field against the pointee and skip the
+                // assignable-`var` requirement. Otherwise `base` must itself be
+                // an assignable place.
+                let bt = match self.place_base_ptr_type(base) {
+                    Some(pt) => pt,
+                    None => self.resolve_place(base)?,
+                };
                 self.field_type_of(bt, field, *span)
             }
             // `a[i] = e`: for an array (SPEC §14.2) the base must be rooted in a
@@ -1924,7 +2034,11 @@ impl Checker {
             Expr::Field { base: inner, field, span } => {
                 let (bt, mutable) = self.resolve_index_base(inner)?;
                 let ft = self.field_type_of(bt, field, *span)?;
-                Some((ft, mutable))
+                // SPEC §30.1: reaching a field THROUGH a `*Struct` base writes
+                // through the pointer, so its storage is mutable regardless of
+                // the pointer binding's own (im)mutability (e.g. `self.arr[i] =
+                // e` in a pointer-receiver method).
+                Some((ft, mutable || matches!(bt, Type::Ptr(_))))
             }
             // A nested index base (`m[i][j] = e`); v0.117 has no array-of-array,
             // so this generally lands on a non-array element (reported here).
@@ -1959,6 +2073,17 @@ impl Checker {
     /// Resolve `<base type>.field`, emitting `E0165` if `base` is not a struct
     /// or `E0166` if it has no such field. Returns the field's type.
     fn field_type_of(&mut self, base: Type, field: &str, span: Span) -> Option<Type> {
+        // SPEC §30.1: a `*Struct` value auto-derefs for field access — `p.field`
+        // resolves against the pointed-to struct (`(*p).field`). This applies to
+        // ANY `*Struct` value, not only a method's `self`. A pointer to a
+        // non-struct is left as-is so its field access still reports `E0165`.
+        let base = match base {
+            Type::Ptr(pid) => match self.structs.ptr_pointee(pid) {
+                s @ Type::Struct(_) => s,
+                _ => base,
+            },
+            _ => base,
+        };
         match base {
             Type::Struct(id) => match self.structs.get(id).field_type(field) {
                 Some(t) => Some(t),
@@ -2603,10 +2728,28 @@ impl Checker {
                 }
             }
         }
-        // Case (a): evaluate the receiver as a value; it must be a struct.
+        // Case (a): evaluate the receiver as a value; it must be a struct or a
+        // pointer-to-struct (SPEC §30.1: a `*Struct` receiver auto-derefs, so a
+        // value-receiver method takes `*obj` by value and a pointer-receiver
+        // method passes the pointer straight through).
         let recv_ty = self.check_expr(receiver, None)?;
-        let id = match recv_ty {
-            Type::Struct(id) => id,
+        let (id, recv_is_ptr) = match recv_ty {
+            Type::Struct(id) => (id, false),
+            Type::Ptr(pid) => match self.structs.ptr_pointee(pid) {
+                Type::Struct(id) => (id, true),
+                _ => {
+                    let msg = format!(
+                        "type `{}` has no method `{}` (method calls require a struct receiver)",
+                        self.type_name(recv_ty),
+                        method
+                    );
+                    self.error(span, "E0170", msg);
+                    for a in args {
+                        self.check_expr(a, None);
+                    }
+                    return None;
+                }
+            },
             other => {
                 let msg = format!(
                     "type `{}` has no method `{}` (method calls require a struct receiver)",
@@ -2620,16 +2763,22 @@ impl Checker {
                 return None;
             }
         };
-        self.check_value_method_call(id, method, args, span)
+        self.check_value_method_call(id, method, args, span, receiver, recv_is_ptr)
     }
 
     /// Resolve `value.method(args)` — a method call on a struct value (case a).
+    /// `receiver` is the receiver expression and `recv_is_ptr` whether it was
+    /// already a `*Struct` (auto-deref'd). For a **pointer-receiver** method
+    /// (SPEC §30.2) a *value* receiver auto-refs `&obj`, so `obj` must be an
+    /// addressable lvalue; a receiver that is already a pointer is passed through.
     fn check_value_method_call(
         &mut self,
         id: u32,
         method: &str,
         args: &[Expr],
         span: Span,
+        receiver: &Expr,
+        recv_is_ptr: bool,
     ) -> Option<Type> {
         let sf = match self.struct_func(id, method) {
             Some(sf) => sf,
@@ -2658,6 +2807,22 @@ impl Checker {
                 self.check_expr(a, None);
             }
             return None;
+        }
+        // SPEC §30.2: a pointer-receiver method passes `&obj`, so a *value*
+        // receiver must be an addressable lvalue (a variable, field, or element
+        // — the same lvalue set as `&`; a temporary is rejected, reusing the
+        // address-of error `E0231`). A receiver that is already a pointer is
+        // passed straight through (no addressability requirement); a
+        // value-receiver method takes the receiver by value, unchanged.
+        if sf.is_ptr_receiver && !recv_is_ptr && !is_addressable_place(receiver) {
+            let sname = self.structs.get(id).name.clone();
+            let msg = format!(
+                "method `{}` of `{}` has a pointer receiver (`self: *{}`); its receiver must be \
+                 an addressable lvalue (a variable, field, or element), not a temporary",
+                method, sname, sname
+            );
+            self.error(receiver.span(), "E0231", msg);
+            // Continue checking the arguments so their own diagnostics surface.
         }
         // The receiver supplies `self`; the remaining parameters bind `args`.
         let expected: Vec<Type> = sf.params[1..].to_vec();
@@ -3730,6 +3895,22 @@ fn is_generic(f: &Func) -> bool {
     f.params.iter().any(|p| p.is_comptime)
 }
 
+/// Whether a method's leading parameter `p` is a **pointer receiver** (SPEC §30)
+/// for the enclosing struct named `struct_name`: a `self` whose annotated type is
+/// a bare pointer (`*T`, no `?`/`!`/`[N]`/`[]` wrapper) to the enclosing struct
+/// (`*Point`) or to `Self` (`*Self`). Such a method takes `self` as `Ptr(Struct)`
+/// and mutates the receiver in place. A value receiver (`self: Point`/`self: Self`,
+/// the pre-v0.134 form) returns false and is unchanged. The caller must already
+/// have established that `p` is the `self` parameter (`p.name == "self"`).
+fn is_ptr_receiver_param(p: &Param, struct_name: &str) -> bool {
+    p.ty.pointer
+        && !p.ty.optional
+        && !p.ty.error_union
+        && p.ty.array_len.is_none()
+        && !p.ty.slice
+        && (p.ty.name == struct_name || p.ty.name == "Self")
+}
+
 /// Whether a [`TypeExpr`] is exactly the bare type keyword `type` — the only
 /// valid annotation for a `comptime` type parameter (SPEC §17.2). Any wrapper
 /// (`?`/`!`/`[N]`/`*`/`[]`) or other name makes it not a plain `type`.
@@ -4139,6 +4320,16 @@ mod tests {
         Param {
             name: name.into(),
             ty: te(ty),
+            is_comptime: false,
+            span: sp(),
+        }
+    }
+    /// A pointer-typed parameter `name: *pointee` — used for pointer receivers
+    /// (`self: *Point` / `self: *Self`) and `*Struct` value parameters (v0.134).
+    fn param_ptr(name: &str, pointee: &str) -> Param {
+        Param {
+            name: name.into(),
+            ty: te_ptr(pointee),
             is_comptime: false,
             span: sp(),
         }
@@ -9202,5 +9393,390 @@ mod tests {
         assert!(table.id_of("List__int64_t").is_some());
         // Two distinct instances recorded.
         assert_eq!(table.struct_instances().len(), 2);
+    }
+
+    // ---- pointer-receiver methods (true mutation) (v0.134, SPEC §30) ------
+
+    /// A `Point` struct mixing pointer-receiver methods, a value-receiver method,
+    /// and an associated function:
+    /// ```text
+    /// const Point = struct {
+    ///     x: i32,
+    ///     fn inc(self: *Point) void { self.x += 1; }              // compound, through *self
+    ///     fn add(self: *Point, by: i32) void { self.x = self.x + by; } // read+write through *self
+    ///     fn get(self: Point) i32 { return self.x; }              // value receiver (unchanged)
+    ///     fn make() Point { return Point{ .x = 0 }; }             // associated (no self)
+    /// };
+    /// ```
+    fn point_ptr_struct() -> Item {
+        let inc = raw_func(
+            "inc",
+            vec![param_ptr("self", "Point")],
+            "void",
+            vec![field_assign_op(field(ident("self"), "x"), BinOp::Add, int(1))],
+        );
+        let add = raw_func(
+            "add",
+            vec![param_ptr("self", "Point"), param("by", "i32")],
+            "void",
+            vec![field_assign(
+                field(ident("self"), "x"),
+                bin(BinOp::Add, field(ident("self"), "x"), ident("by")),
+            )],
+        );
+        let get = raw_func(
+            "get",
+            vec![param("self", "Point")],
+            "i32",
+            vec![ret(Some(field(ident("self"), "x")))],
+        );
+        let make = raw_func(
+            "make",
+            vec![],
+            "Point",
+            vec![ret(Some(struct_lit("Point", vec![("x", int(0))])))],
+        );
+        struct_item_m("Point", vec![("x", "i32")], vec![inc, add, get, make])
+    }
+
+    #[test]
+    fn pointer_receiver_method_bodies_typecheck() {
+        // The pointer-receiver bodies (`self.x += 1`, `self.x = self.x + by`)
+        // read and write the field through `self: *Point` — the struct on its
+        // own must type-check.
+        assert_eq!(codes(vec![point_ptr_struct()]), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn pointer_receiver_call_on_var_and_assoc_call_typecheck() {
+        // fn main() void {
+        //     var p: Point = Point.make();   // associated call — unchanged
+        //     p.inc();                       // pointer-receiver call on a var (auto-ref &p)
+        //     p.add(5);                       // pointer-receiver call with an arg
+        // }
+        let items = vec![
+            point_ptr_struct(),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("p", "Point", method_call(ident("Point"), "make", vec![])),
+                    Stmt::Expr(method_call(ident("p"), "inc", vec![])),
+                    Stmt::Expr(method_call(ident("p"), "add", vec![int(5)])),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn pointer_receiver_call_on_field_lvalue_ok() {
+        // A field is an addressable lvalue, so a pointer-receiver call on it is
+        // allowed (auto-ref `&w.p`).
+        // const Wrap = struct { p: Point };
+        // fn f(w: Wrap) void { w.p.inc(); }
+        let items = vec![
+            point_ptr_struct(),
+            struct_item("Wrap", vec![("p", "Point")]),
+            func(
+                "f",
+                vec![param("w", "Wrap")],
+                "void",
+                vec![Stmt::Expr(method_call(field(ident("w"), "p"), "inc", vec![]))],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn pointer_receiver_call_on_temporary_is_e0231() {
+        // fn main() void { Point.make().inc(); }   — receiver is a temporary, so
+        // the auto-ref `&<temp>` is rejected exactly like `&<temp>` (E0231).
+        let items = vec![
+            point_ptr_struct(),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![Stmt::Expr(method_call(
+                    method_call(ident("Point"), "make", vec![]),
+                    "inc",
+                    vec![],
+                ))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0231"));
+    }
+
+    #[test]
+    fn value_receiver_method_on_temporary_still_ok() {
+        // A value-receiver call on a temporary is unchanged (no auto-ref): it
+        // passes the temporary by value.
+        // fn main() void { var r: i32 = Point.make().get(); print(r); }
+        let items = vec![
+            point_ptr_struct(),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var(
+                        "r",
+                        "i32",
+                        method_call(method_call(ident("Point"), "make", vec![]), "get", vec![]),
+                    ),
+                    Stmt::Expr(call("print", vec![ident("r")])),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn pointer_param_field_read_and_write_typecheck() {
+        // A `*Struct` param (not `self`) auto-derefs for field access too
+        // (general, SPEC §30.1): read + write through the pointer.
+        // const Point = struct { x: i32 };
+        // fn set(q: *Point, v: i32) i32 { q.x = v; return q.x; }
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            Item::Func(raw_func(
+                "set",
+                vec![param_ptr("q", "Point"), param("v", "i32")],
+                "i32",
+                vec![
+                    field_assign(field(ident("q"), "x"), ident("v")),
+                    ret(Some(field(ident("q"), "x"))),
+                ],
+            )),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn pointer_param_compound_field_assign_typechecks() {
+        // `q.x += 1` through a `*Point` parameter (write through the pointer).
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            Item::Func(raw_func(
+                "bump",
+                vec![param_ptr("q", "Point")],
+                "void",
+                vec![field_assign_op(field(ident("q"), "x"), BinOp::Add, int(1))],
+            )),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn pointer_field_assign_does_not_require_mutable_binding() {
+        // Even a `const`/immutable `*Point` binding may write through the pointer:
+        // the *pointer* binding's mutability is irrelevant (mirrors `p.* = e`).
+        // fn f(q: *Point) void { q.x = 9; }  — q is an (immutable) parameter.
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            Item::Func(raw_func(
+                "f",
+                vec![param_ptr("q", "Point")],
+                "void",
+                vec![field_assign(field(ident("q"), "x"), int(9))],
+            )),
+        ];
+        // No E0167 (immutable-binding) — writing THROUGH the pointer is allowed.
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn value_struct_field_assign_still_requires_mutable_var() {
+        // Regression guard: a *value* struct parameter is still immutable, so
+        // `p.x = 5` on a by-value `Point` param stays `E0167` (unchanged).
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            func(
+                "f",
+                vec![param("p", "Point")],
+                "void",
+                vec![field_assign(field(ident("p"), "x"), int(5))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0167"));
+    }
+
+    #[test]
+    fn pointer_param_indexed_field_assign_through_pointer_ok() {
+        // `self.arr[i] = e` through a `*Holder` writes through the pointer, so the
+        // array element is mutable even though the pointer binding is immutable.
+        // const Holder = struct { arr: [3]i32 };
+        // fn put(h: *Holder, i: usize, v: i32) void { h.arr[i] = v; }
+        let items = vec![
+            Item::Struct(StructDecl {
+                is_pub: false,
+                name: "Holder".into(),
+                fields: vec![FieldDecl {
+                    name: "arr".into(),
+                    ty: te_arr("i32", 3),
+                    span: sp(),
+                }],
+                methods: Vec::new(),
+                span: sp(),
+            }),
+            Item::Func(raw_func(
+                "put",
+                vec![param_ptr("h", "Holder"), param("i", "usize"), param("v", "i32")],
+                "void",
+                vec![field_assign(
+                    index(field(ident("h"), "arr"), ident("i")),
+                    ident("v"),
+                )],
+            )),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn pointer_receiver_call_through_pointer_value_ok() {
+        // A receiver that is already a `*Point` is passed straight through (no
+        // addressability requirement); the call still resolves.
+        // fn run(q: *Point) void { q.inc(); }
+        let items = vec![
+            point_ptr_struct(),
+            Item::Func(raw_func(
+                "run",
+                vec![param_ptr("q", "Point")],
+                "void",
+                vec![Stmt::Expr(method_call(ident("q"), "inc", vec![]))],
+            )),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn value_receiver_method_on_pointer_receiver_auto_derefs() {
+        // A `*Point` receiver calling a *value*-receiver method auto-derefs
+        // (passes `*q` by value), SPEC §30.1.
+        // fn val(q: *Point) i32 { return q.get(); }
+        let items = vec![
+            point_ptr_struct(),
+            Item::Func(raw_func(
+                "val",
+                vec![param_ptr("q", "Point")],
+                "i32",
+                vec![ret(Some(method_call(ident("q"), "get", vec![])))],
+            )),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn explicit_pointer_self_static_call_requires_pointer_arg() {
+        // `Point.inc(p)` (static form) binds the explicit `self: *Point`, so the
+        // argument must be a `*Point`; passing a value `Point` is `E0110`,
+        // passing `&p` type-checks.
+        // fn ok(p: *Point) void { Point.inc(p); }
+        // fn bad(p: Point) void { Point.inc(p); }   -> E0110
+        let ok_items = vec![
+            point_ptr_struct(),
+            Item::Func(raw_func(
+                "ok",
+                vec![param_ptr("p", "Point")],
+                "void",
+                vec![Stmt::Expr(method_call(ident("Point"), "inc", vec![ident("p")]))],
+            )),
+        ];
+        assert_eq!(codes(ok_items), Vec::<&str>::new());
+
+        let bad_items = vec![
+            point_ptr_struct(),
+            func(
+                "bad",
+                vec![param("p", "Point")],
+                "void",
+                vec![Stmt::Expr(method_call(ident("Point"), "inc", vec![ident("p")]))],
+            ),
+        ];
+        assert!(codes(bad_items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn generic_struct_pointer_receiver_method_typechecks() {
+        // fn Counter(comptime T: type) type {
+        //   return struct {
+        //     n: T,
+        //     fn set(self: *Self, v: T) void { self.n = v; }   // write through *Self
+        //   };
+        // }
+        // const IC = Counter(i32);
+        // fn run() void { var c: IC = IC{ .n = 0 }; c.set(5); }
+        let set = raw_func(
+            "set",
+            vec![param_ptr("self", "Self"), param("v", "T")],
+            "void",
+            vec![field_assign(field(ident("self"), "n"), ident("v"))],
+        );
+        let items = vec![
+            type_ctor_m("Counter", "T", vec![("n", te("T"))], vec![set]),
+            const_item_infer("IC", call("Counter", vec![ident("i32")])),
+            func(
+                "run",
+                vec![],
+                "void",
+                vec![
+                    let_var("c", "IC", struct_lit("IC", vec![("n", int(0))])),
+                    Stmt::Expr(method_call(ident("c"), "set", vec![int(5)])),
+                ],
+            ),
+        ];
+        let table = check_ok(items);
+        // The instance was recorded so the backend emits the pointer-receiver
+        // method.
+        let id = table.id_of("Counter__int32_t").expect("instance struct interned");
+        assert!(table
+            .struct_instances()
+            .iter()
+            .any(|i| i.struct_id == id && i.ctor == "Counter" && i.arg == Type::I32));
+    }
+
+    #[test]
+    fn generic_struct_pointer_receiver_call_on_temp_is_e0231() {
+        // A pointer-receiver generic-struct method called on a temporary is
+        // E0231 (the auto-ref `&<temp>` is rejected). Here the receiver is an
+        // associated call's result.
+        // fn Counter(comptime T: type) type {
+        //   return struct {
+        //     n: T,
+        //     fn set(self: *Self, v: T) void { self.n = v; }
+        //     fn make() Self { return Self{ .n = 0 }; }
+        //   };
+        // }
+        // const IC = Counter(i32);
+        // fn run() void { IC.make().set(5); }
+        let set = raw_func(
+            "set",
+            vec![param_ptr("self", "Self"), param("v", "T")],
+            "void",
+            vec![field_assign(field(ident("self"), "n"), ident("v"))],
+        );
+        let make = raw_func(
+            "make",
+            vec![],
+            "Self",
+            vec![ret(Some(struct_lit("Self", vec![("n", int(0))])))],
+        );
+        let items = vec![
+            type_ctor_m("Counter", "T", vec![("n", te("T"))], vec![set, make]),
+            const_item_infer("IC", call("Counter", vec![ident("i32")])),
+            func(
+                "run",
+                vec![],
+                "void",
+                vec![Stmt::Expr(method_call(
+                    method_call(ident("IC"), "make", vec![]),
+                    "set",
+                    vec![int(5)],
+                ))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0231"));
     }
 }

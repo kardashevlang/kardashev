@@ -18,6 +18,19 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.134.0] — Pointer-receiver methods (true mutation)
+
+### Added
+- **Pointer-receiver methods**: `fn m(self: *Point, …)` / `fn m(self: *Self, …)`
+  mutate the receiver in place. The call site **auto-refs** (`c.inc()` passes
+  `&c`; the receiver must be an addressable lvalue) and field access
+  **auto-derefs** (`self.field`). A value receiver (`self: Point`) still copies.
+- Field read/assign (and compound assign) on **any** `*Struct` value writes
+  through the pointer (`p.field = e`). Enables a mutating `ArrayList`/`Stack`
+  `push` on a generic struct.
+- No new syntax/contract — `*Self`/`*Point` already parse; pure sema + emit.
+- 741 unit + 33 e2e tests; `examples/pointer_receiver.ks`.
+
 ## [0.133.0] — `for` loops over arrays & slices
 
 ### Added

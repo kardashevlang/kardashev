@@ -201,9 +201,11 @@ context). (Bitwise compound assignments `|= &= ^= <<= >>=` are later work.)
 `usize` index) capture, lowered to an indexed `while` (so `break`/`continue`
 behave, and `continue` still advances the index). Works for `[]T` and `[N]T`.
 
-### v0.134.0 — Pointer-receiver methods (true mutation)
-`fn push(self: *Self, …) …` with auto-ref at the call site (`list.push(x)`
-passes `&list`), so methods mutate the receiver in place — no value-return dance.
+### v0.134.0 — Pointer-receiver methods (true mutation) ✅
+`fn push(self: *Self, …) …` (or `self: *Point`) with auto-ref at the call site
+(`list.push(x)` passes `&list`) and auto-deref field access (`self.field`), so
+methods mutate the receiver in place — no value-return dance. Field read/assign
+on any `*Struct` writes through the pointer. (No contract change — sema + emit.)
 
 ### v0.135.0 — Multiple type parameters
 Generic functions and type-constructors with more than one `comptime T: type`
