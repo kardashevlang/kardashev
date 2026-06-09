@@ -67,7 +67,16 @@ pub struct UnionVariant {
 pub struct EnumDecl {
     pub is_pub: bool,
     pub name: String,
-    pub variants: Vec<String>,
+    pub variants: Vec<EnumVariant>,
+    pub span: Span,
+}
+
+/// One enum variant, optionally with an explicit integer value `A = 1` (v0.143).
+/// A `None` value auto-increments from the previous (C rules: first is 0).
+#[derive(Clone, Debug)]
+pub struct EnumVariant {
+    pub name: String,
+    pub value: Option<i64>,
     pub span: Span,
 }
 

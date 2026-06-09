@@ -18,6 +18,18 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.143.0] — Enum explicit values + conversions
+
+### Added
+- **Explicit enum values**: `const Color = enum { Red = 1, Green, Blue = 10 };`
+  — a variant with `= N` takes value `N`; a value-less variant auto-increments
+  from the previous (first is 0). `EnumVariant{ name, value }`;
+  `EnumInfo.values`; the C `enum` carries the values, so literals / `switch`
+  stay value-based.
+- **`@intFromEnum(e)`** → `i64` (the variant's value) and **`@enumFromInt(E,
+  n)`** → `E` — integer round-trips for stable enum representations.
+- 870 unit + 41 e2e tests; `examples/enum_values.ks`.
+
 ## [0.142.0] — `catch |e|` capture
 
 ### Added

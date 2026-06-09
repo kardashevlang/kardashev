@@ -176,12 +176,21 @@ impl StructInfo {
 pub struct EnumInfo {
     pub name: String,
     pub variants: Vec<String>,
+    /// The integer value of each variant (parallel to `variants`), explicit or
+    /// auto-incremented (v0.143). Empty before `set_enum_variants` is called.
+    pub values: Vec<i64>,
 }
 
 impl EnumInfo {
-    /// The 0-based index (and C value) of `variant`, if present.
+    /// The 0-based index of `variant`, if present.
     pub fn variant_index(&self, variant: &str) -> Option<usize> {
         self.variants.iter().position(|v| v == variant)
+    }
+
+    /// The integer value of `variant` (explicit `= N` or auto-incremented), if
+    /// present (v0.143).
+    pub fn variant_value(&self, variant: &str) -> Option<i64> {
+        self.variant_index(variant).and_then(|i| self.values.get(i).copied())
     }
 }
 
@@ -379,6 +388,7 @@ impl StructTable {
         self.enum_defs.push(EnumInfo {
             name: name.to_string(),
             variants: Vec::new(),
+            values: Vec::new(),
         });
         self.enum_by_name.insert(name.to_string(), id);
         id
@@ -392,8 +402,12 @@ impl StructTable {
         &self.enum_defs[id as usize]
     }
 
-    pub fn set_enum_variants(&mut self, id: u32, variants: Vec<String>) {
+    /// Set an enum's variant names and their integer values (parallel vectors,
+    /// v0.143). `values[i]` is the explicit-or-auto-incremented value of
+    /// `variants[i]`.
+    pub fn set_enum_variants(&mut self, id: u32, variants: Vec<String>, values: Vec<i64>) {
         self.enum_defs[id as usize].variants = variants;
+        self.enum_defs[id as usize].values = values;
     }
 
     /// The C typedef name for an enum, e.g. `kd_enum_Color`.

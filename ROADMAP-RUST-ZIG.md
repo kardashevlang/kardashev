@@ -268,9 +268,10 @@ binds the error **code** (`i32`) to `e` and evaluates `default` only on the erro
 path, lowered by hoisting like `try`. `Expr::Catch.capture`; the non-capturing
 `expr catch default` is unchanged.
 
-### v0.143.0 — Enum explicit values + conversions
-`enum { A = 1, B = 4 }`, `@intFromEnum(e)` and `@enumFromInt(E, n)` — give enums
-stable integer representations and round-trips.
+### v0.143.0 — Enum explicit values + conversions ✅
+`enum { A = 1, B, C = 10 }` (a value-less variant auto-increments), `@intFromEnum(e)`
+→ `i64` and `@enumFromInt(E, n)` → `E` — stable integer representations and
+round-trips. The C enum carries the values, so literals/switch stay value-based.
 
 ### v0.144.0 — Floating point `f64`
 A 64-bit float type: literals (`3.14`), arithmetic / comparison, `@as` to and
