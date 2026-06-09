@@ -7,6 +7,7 @@
 //! produces byte-identical output.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::ast::{
     ArraySize, BinOp, Block, Expr, Func, Item, Module, Param, Stmt, SwitchArm, TestBlock, TypeExpr,
@@ -63,204 +64,134 @@ pub fn emit(module: &Module, structs: &crate::types::StructTable, mode: EmitMode
     em.out
 }
 
-// -- v0.141 `@panic` usage scan (SPEC §35.2) -------------------------------
+// -- builtin usage scans (v0.141 `@panic`, v0.148 I/O) ----------------------
 //
-// Whether the module contains any `@panic(..)` builtin — in a function body, a
-// struct method, a test block, a `const` initializer, or a (monomorphised)
-// generic-struct method. Drives whether the `kd_panic` runtime helper is
-// emitted. Over-counting is harmless (an unused `_Noreturn` helper), but
-// under-counting would leave a `kd_panic(..)` call referencing an undeclared
-// function, so the walk is exhaustive over the current AST.
+// Whether the module contains any `@builtin(..)` whose name satisfies `pred` —
+// in a function body, a struct method, a test block, a `const` initializer, or
+// a (monomorphised) generic-struct method. Drives whether the matching runtime
+// helper(s) are emitted. Over-counting is harmless (an unused helper), but
+// under-counting would leave a lowering referencing an undeclared function, so
+// the walk is exhaustive over the current AST. `pred` is a plain fn pointer so
+// the recursive walkers stay non-generic.
 
-fn module_uses_panic(module: &Module) -> bool {
-    module.items.iter().any(item_uses_panic)
+/// Whether the module contains any `@panic(..)` builtin (SPEC §35.2). Drives
+/// whether the `kd_panic` `_Noreturn` runtime helper is emitted, so a
+/// string-using program that never panics is unaffected.
+fn module_uses_panic(m: &Module) -> bool {
+    module_uses_builtin(m, |n| n == "panic")
 }
 
-fn item_uses_panic(item: &Item) -> bool {
+/// Whether the module references `@readFile`/`@readLine` anywhere (SPEC
+/// §41.2). Drives whether the `kd_read_file`/`kd_read_line` runtime helpers
+/// are emitted (at the tail of `emit_type_defs`, since they return the
+/// `kd_slice_uint8_t` typedef).
+fn module_uses_io(m: &Module) -> bool {
+    module_uses_builtin(m, |n| n == "readFile" || n == "readLine")
+}
+
+fn module_uses_builtin(m: &Module, pred: fn(&str) -> bool) -> bool {
+    m.items.iter().any(|it| item_uses_builtin(it, pred))
+}
+
+fn item_uses_builtin(item: &Item, pred: fn(&str) -> bool) -> bool {
     match item {
-        Item::Func(f) => block_uses_panic(&f.body),
-        Item::Const(c) => expr_uses_panic(&c.value),
-        Item::Test(t) => block_uses_panic(&t.body),
-        Item::Struct(s) => s.methods.iter().any(|m| block_uses_panic(&m.body)),
+        Item::Func(f) => block_uses_builtin(&f.body, pred),
+        Item::Const(c) => expr_uses_builtin(&c.value, pred),
+        Item::Test(t) => block_uses_builtin(&t.body, pred),
+        Item::Struct(s) => s.methods.iter().any(|m| block_uses_builtin(&m.body, pred)),
         Item::Enum(_) | Item::Union(_) | Item::Import(_) | Item::ErrorSet(_) => false,
     }
 }
 
-fn block_uses_panic(b: &Block) -> bool {
-    b.stmts.iter().any(stmt_uses_panic)
+fn block_uses_builtin(b: &Block, pred: fn(&str) -> bool) -> bool {
+    b.stmts.iter().any(|s| stmt_uses_builtin(s, pred))
 }
 
-fn stmt_uses_panic(s: &Stmt) -> bool {
+fn stmt_uses_builtin(s: &Stmt, pred: fn(&str) -> bool) -> bool {
     match s {
-        Stmt::Let { value, .. } => expr_uses_panic(value),
-        Stmt::Assign { value, .. } => expr_uses_panic(value),
+        Stmt::Let { value, .. } => expr_uses_builtin(value, pred),
+        Stmt::Assign { value, .. } => expr_uses_builtin(value, pred),
         Stmt::FieldAssign { place, value, .. } => {
-            expr_uses_panic(place) || expr_uses_panic(value)
+            expr_uses_builtin(place, pred) || expr_uses_builtin(value, pred)
         }
-        Stmt::Expr(e) => expr_uses_panic(e),
-        Stmt::Return { value, .. } => value.as_ref().is_some_and(expr_uses_panic),
+        Stmt::Expr(e) => expr_uses_builtin(e, pred),
+        Stmt::Return { value, .. } => value.as_ref().is_some_and(|v| expr_uses_builtin(v, pred)),
         Stmt::If {
             cond, then, els, ..
         } => {
-            expr_uses_panic(cond)
-                || block_uses_panic(then)
-                || els.as_deref().is_some_and(stmt_uses_panic)
+            expr_uses_builtin(cond, pred)
+                || block_uses_builtin(then, pred)
+                || els.as_deref().is_some_and(|e| stmt_uses_builtin(e, pred))
         }
         Stmt::While {
             cond, cont, body, ..
         } => {
-            expr_uses_panic(cond)
-                || cont.as_deref().is_some_and(stmt_uses_panic)
-                || block_uses_panic(body)
+            expr_uses_builtin(cond, pred)
+                || cont.as_deref().is_some_and(|c| stmt_uses_builtin(c, pred))
+                || block_uses_builtin(body, pred)
         }
-        Stmt::For { iter, body, .. } => expr_uses_panic(iter) || block_uses_panic(body),
+        Stmt::For { iter, body, .. } => {
+            expr_uses_builtin(iter, pred) || block_uses_builtin(body, pred)
+        }
         Stmt::Break { .. } | Stmt::Continue { .. } => false,
-        Stmt::Defer { stmt, .. } | Stmt::ErrDefer { stmt, .. } => stmt_uses_panic(stmt),
-        Stmt::Block(b) => block_uses_panic(b),
+        Stmt::Defer { stmt, .. } | Stmt::ErrDefer { stmt, .. } => stmt_uses_builtin(stmt, pred),
+        Stmt::Block(b) => block_uses_builtin(b, pred),
         Stmt::Switch {
             scrutinee,
             arms,
             default,
             ..
         } => {
-            expr_uses_panic(scrutinee)
+            expr_uses_builtin(scrutinee, pred)
                 || arms.iter().any(|a| {
-                    a.labels.iter().any(expr_uses_panic) || block_uses_panic(&a.body)
+                    a.labels.iter().any(|l| expr_uses_builtin(l, pred))
+                        || block_uses_builtin(&a.body, pred)
                 })
-                || default.as_ref().is_some_and(block_uses_panic)
+                || default
+                    .as_ref()
+                    .is_some_and(|d| block_uses_builtin(d, pred))
         }
     }
 }
 
-fn expr_uses_panic(e: &Expr) -> bool {
-    match e {
-        Expr::Builtin { name, args, .. } => name == "panic" || args.iter().any(expr_uses_panic),
-        Expr::Unary { expr, .. } => expr_uses_panic(expr),
-        Expr::Binary { lhs, rhs, .. } => expr_uses_panic(lhs) || expr_uses_panic(rhs),
-        Expr::Call { args, .. } => args.iter().any(expr_uses_panic),
-        Expr::Comptime { expr, .. } => expr_uses_panic(expr),
-        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_uses_panic(&f.value)),
-        Expr::Field { base, .. } => expr_uses_panic(base),
-        Expr::MethodCall { receiver, args, .. } => {
-            expr_uses_panic(receiver) || args.iter().any(expr_uses_panic)
-        }
-        Expr::Orelse { lhs, rhs, .. } => expr_uses_panic(lhs) || expr_uses_panic(rhs),
-        Expr::Unwrap { expr, .. } => expr_uses_panic(expr),
-        Expr::ArrayLit { elems, .. } => elems.iter().any(expr_uses_panic),
-        Expr::Index { base, index, .. } => expr_uses_panic(base) || expr_uses_panic(index),
-        Expr::AddrOf { place, .. } => expr_uses_panic(place),
-        Expr::Deref { expr, .. } => expr_uses_panic(expr),
-        Expr::SliceExpr { base, lo, hi, .. } => {
-            expr_uses_panic(base) || expr_uses_panic(lo) || expr_uses_panic(hi)
-        }
-        Expr::Try { expr, .. } => expr_uses_panic(expr),
-        Expr::Catch { expr, default, .. } => expr_uses_panic(expr) || expr_uses_panic(default),
-        Expr::StructType { methods, .. } => methods.iter().any(|m| block_uses_panic(&m.body)),
-        Expr::Int { .. }
-        | Expr::Float { .. }
-        | Expr::Bool { .. }
-        | Expr::Ident { .. }
-        | Expr::StrLit { .. }
-        | Expr::Null { .. }
-        | Expr::ErrorLit { .. }
-        | Expr::EnumLit { .. }
-        | Expr::Unreachable { .. } => false,
-    }
-}
-
-// -- v0.148 stdin/file-I/O usage scan (SPEC §41.2) -------------------------
-//
-// Whether the module references `@readFile`/`@readLine` anywhere. Drives
-// whether the `kd_read_file`/`kd_read_line` runtime helpers are emitted (at the
-// tail of `emit_type_defs`, since they return the `kd_slice_uint8_t` typedef).
-// Mirrors `module_uses_panic`'s exhaustive walk: over-counting is harmless (an
-// unused `static` helper), but under-counting would leave a `kd_read_*(..)`
-// lowering referencing an undeclared function.
-
-fn module_uses_io(module: &Module) -> bool {
-    module.items.iter().any(item_uses_io)
-}
-
-fn item_uses_io(item: &Item) -> bool {
-    match item {
-        Item::Func(f) => block_uses_io(&f.body),
-        Item::Const(c) => expr_uses_io(&c.value),
-        Item::Test(t) => block_uses_io(&t.body),
-        Item::Struct(s) => s.methods.iter().any(|m| block_uses_io(&m.body)),
-        Item::Enum(_) | Item::Union(_) | Item::Import(_) | Item::ErrorSet(_) => false,
-    }
-}
-
-fn block_uses_io(b: &Block) -> bool {
-    b.stmts.iter().any(stmt_uses_io)
-}
-
-fn stmt_uses_io(s: &Stmt) -> bool {
-    match s {
-        Stmt::Let { value, .. } => expr_uses_io(value),
-        Stmt::Assign { value, .. } => expr_uses_io(value),
-        Stmt::FieldAssign { place, value, .. } => expr_uses_io(place) || expr_uses_io(value),
-        Stmt::Expr(e) => expr_uses_io(e),
-        Stmt::Return { value, .. } => value.as_ref().is_some_and(expr_uses_io),
-        Stmt::If {
-            cond, then, els, ..
-        } => {
-            expr_uses_io(cond)
-                || block_uses_io(then)
-                || els.as_deref().is_some_and(stmt_uses_io)
-        }
-        Stmt::While {
-            cond, cont, body, ..
-        } => {
-            expr_uses_io(cond)
-                || cont.as_deref().is_some_and(stmt_uses_io)
-                || block_uses_io(body)
-        }
-        Stmt::For { iter, body, .. } => expr_uses_io(iter) || block_uses_io(body),
-        Stmt::Break { .. } | Stmt::Continue { .. } => false,
-        Stmt::Defer { stmt, .. } | Stmt::ErrDefer { stmt, .. } => stmt_uses_io(stmt),
-        Stmt::Block(b) => block_uses_io(b),
-        Stmt::Switch {
-            scrutinee,
-            arms,
-            default,
-            ..
-        } => {
-            expr_uses_io(scrutinee)
-                || arms
-                    .iter()
-                    .any(|a| a.labels.iter().any(expr_uses_io) || block_uses_io(&a.body))
-                || default.as_ref().is_some_and(block_uses_io)
-        }
-    }
-}
-
-fn expr_uses_io(e: &Expr) -> bool {
+fn expr_uses_builtin(e: &Expr, pred: fn(&str) -> bool) -> bool {
     match e {
         Expr::Builtin { name, args, .. } => {
-            name == "readFile" || name == "readLine" || args.iter().any(expr_uses_io)
+            pred(name) || args.iter().any(|a| expr_uses_builtin(a, pred))
         }
-        Expr::Unary { expr, .. } => expr_uses_io(expr),
-        Expr::Binary { lhs, rhs, .. } => expr_uses_io(lhs) || expr_uses_io(rhs),
-        Expr::Call { args, .. } => args.iter().any(expr_uses_io),
-        Expr::Comptime { expr, .. } => expr_uses_io(expr),
-        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_uses_io(&f.value)),
-        Expr::Field { base, .. } => expr_uses_io(base),
+        Expr::Unary { expr, .. } => expr_uses_builtin(expr, pred),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_uses_builtin(lhs, pred) || expr_uses_builtin(rhs, pred)
+        }
+        Expr::Call { args, .. } => args.iter().any(|a| expr_uses_builtin(a, pred)),
+        Expr::Comptime { expr, .. } => expr_uses_builtin(expr, pred),
+        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_uses_builtin(&f.value, pred)),
+        Expr::Field { base, .. } => expr_uses_builtin(base, pred),
         Expr::MethodCall { receiver, args, .. } => {
-            expr_uses_io(receiver) || args.iter().any(expr_uses_io)
+            expr_uses_builtin(receiver, pred) || args.iter().any(|a| expr_uses_builtin(a, pred))
         }
-        Expr::Orelse { lhs, rhs, .. } => expr_uses_io(lhs) || expr_uses_io(rhs),
-        Expr::Unwrap { expr, .. } => expr_uses_io(expr),
-        Expr::ArrayLit { elems, .. } => elems.iter().any(expr_uses_io),
-        Expr::Index { base, index, .. } => expr_uses_io(base) || expr_uses_io(index),
-        Expr::AddrOf { place, .. } => expr_uses_io(place),
-        Expr::Deref { expr, .. } => expr_uses_io(expr),
+        Expr::Orelse { lhs, rhs, .. } => {
+            expr_uses_builtin(lhs, pred) || expr_uses_builtin(rhs, pred)
+        }
+        Expr::Unwrap { expr, .. } => expr_uses_builtin(expr, pred),
+        Expr::ArrayLit { elems, .. } => elems.iter().any(|el| expr_uses_builtin(el, pred)),
+        Expr::Index { base, index, .. } => {
+            expr_uses_builtin(base, pred) || expr_uses_builtin(index, pred)
+        }
+        Expr::AddrOf { place, .. } => expr_uses_builtin(place, pred),
+        Expr::Deref { expr, .. } => expr_uses_builtin(expr, pred),
         Expr::SliceExpr { base, lo, hi, .. } => {
-            expr_uses_io(base) || expr_uses_io(lo) || expr_uses_io(hi)
+            expr_uses_builtin(base, pred)
+                || expr_uses_builtin(lo, pred)
+                || expr_uses_builtin(hi, pred)
         }
-        Expr::Try { expr, .. } => expr_uses_io(expr),
-        Expr::Catch { expr, default, .. } => expr_uses_io(expr) || expr_uses_io(default),
-        Expr::StructType { methods, .. } => methods.iter().any(|m| block_uses_io(&m.body)),
+        Expr::Try { expr, .. } => expr_uses_builtin(expr, pred),
+        Expr::Catch { expr, default, .. } => {
+            expr_uses_builtin(expr, pred) || expr_uses_builtin(default, pred)
+        }
+        Expr::StructType { methods, .. } => {
+            methods.iter().any(|m| block_uses_builtin(&m.body, pred))
+        }
         Expr::Int { .. }
         | Expr::Float { .. }
         | Expr::Bool { .. }
@@ -352,10 +283,10 @@ struct Emitter<'a> {
     consts: HashMap<String, ConstVal>,
     /// The struct table from sema: resolves struct C names and field types.
     structs: &'a StructTable,
-    /// Resolved return type of every struct function, keyed by
-    /// `(struct_name, method_name)`. Lets a chained method call resolve the
-    /// struct of its receiver when that receiver is itself a method call.
-    method_ret: HashMap<(String, String), Type>,
+    /// Resolved return type of every struct function, keyed by struct id, then
+    /// method name. Lets a chained method call resolve the struct of its
+    /// receiver when that receiver is itself a method call.
+    method_ret: HashMap<u32, HashMap<String, Type>>,
     /// Resolved return type of every top-level `fn`, keyed by name. Lets a
     /// method call whose receiver is a free-function call resolve the struct.
     fn_ret: HashMap<String, Type>,
@@ -363,9 +294,9 @@ struct Emitter<'a> {
     /// optional coercion of call arguments.
     fn_params: HashMap<String, Vec<Type>>,
     /// Resolved parameter types of every struct function (including any leading
-    /// `self`), keyed by `(struct_name, method_name)`. Drives optional coercion
+    /// `self`), keyed by struct id, then method name. Drives optional coercion
     /// of method/associated-call arguments.
-    method_params: HashMap<(String, String), Vec<Type>>,
+    method_params: HashMap<u32, HashMap<String, Vec<Type>>>,
     /// Monotonic counter for the `__kd_tryN` temporaries that lower `try`
     /// expressions. Reset at the start of every function/test body so the
     /// numbering stays small and deterministic; names never collide because
@@ -415,9 +346,10 @@ struct Emitter<'a> {
     /// Every generic top-level function (one with ≥1 `comptime` type
     /// parameter), keyed by name. A generic function is never emitted under its
     /// plain name — only one specialised C function per recorded instantiation
-    /// is emitted (see [`Emitter::emit_instance_defs`]). Stored as clones so a
-    /// `Call` to a generic can be lowered to its instance's C name anywhere.
-    generics: HashMap<String, Func>,
+    /// is emitted (see [`Emitter::emit_instance_defs`]). Stored as Rc-shared
+    /// clones of the parsed Func so a `Call` to a generic can be lowered to its
+    /// instance's C name anywhere without re-cloning the body.
+    generics: HashMap<String, Rc<Func>>,
     /// v0.141: whether the module contains any `@panic(..)` (SPEC §35). Drives
     /// whether the `kd_panic` runtime helper is emitted in `emit_type_defs` — it
     /// must accompany every `kd_panic(..)` lowering and be absent otherwise, so a
@@ -539,34 +471,37 @@ impl<'a> Emitter<'a> {
         self.value_subst.clear();
     }
 
-    /// The type-constructor `Func` (cloned) that produced generic-struct
-    /// instance `inst`, if present in this module (v0.130, SPEC §26.3). It is
-    /// the `fn Name(comptime T: type) type` whose `return struct {…};` body
+    /// The type-constructor `Func` that produced generic-struct instance
+    /// `inst`, if present in this module (v0.130, SPEC §26.3). It is the
+    /// `fn Name(comptime T: type) type` whose `return struct {…};` body
     /// carries the methods to monomorphise for this instance.
-    fn instance_ctor(module: &Module, inst: &crate::types::StructInstance) -> Option<Func> {
+    fn instance_ctor<'m>(
+        module: &'m Module,
+        inst: &crate::types::StructInstance,
+    ) -> Option<&'m Func> {
         module.items.iter().find_map(|it| match it {
-            Item::Func(f) if f.name == inst.ctor && Self::is_type_ctor(f) => Some(f.clone()),
+            Item::Func(f) if f.name == inst.ctor && Self::is_type_ctor(f) => Some(f),
             _ => None,
         })
     }
 
-    /// The methods (cloned) declared inside a type-constructor's `struct {…}`
-    /// body (v0.130, SPEC §26.1). A conforming constructor body is `return
+    /// The methods declared inside a type-constructor's `struct {…}` body
+    /// (v0.130, SPEC §26.1). A conforming constructor body is `return
     /// struct {…};`; the `Expr::StructType`'s `methods` are returned. An empty
-    /// vector for the v0.129 fields-only shape (or any non-canonical body —
+    /// slice for the v0.129 fields-only shape (or any non-canonical body —
     /// impossible for validated input), so a fields-only generic struct keeps
     /// behaving exactly as v0.129.
-    fn ctor_methods(ctor: &Func) -> Vec<Func> {
+    fn ctor_methods(ctor: &Func) -> &[Func] {
         for s in &ctor.body.stmts {
             if let Stmt::Return {
                 value: Some(Expr::StructType { methods, .. }),
                 ..
             } = s
             {
-                return methods.clone();
+                return methods;
             }
         }
-        Vec::new()
+        &[]
     }
 
     /// Set the active substitution for emitting a generic-struct instance's
@@ -588,6 +523,73 @@ impl<'a> Emitter<'a> {
         self.subst.insert("Self".to_string(), Type::Struct(struct_id));
     }
 
+    /// Run `f` with the contextual `Self` bound to the plain struct named
+    /// `struct_name` in the active substitution (v0.136, §32.2), so a
+    /// `self: *Self` / `@This()` written in the struct's methods resolves to
+    /// this struct. The binding is removed afterwards only if this call
+    /// inserted it (an unknown name — impossible for validated input — binds
+    /// nothing and removes nothing).
+    fn with_self_bound<R>(&mut self, struct_name: &str, f: impl FnOnce(&mut Self) -> R) -> R {
+        let sid = self.structs.id_of(struct_name);
+        if let Some(id) = sid {
+            self.subst.insert("Self".to_string(), Type::Struct(id));
+        }
+        let r = f(self);
+        if sid.is_some() {
+            self.subst.remove("Self");
+        }
+        r
+    }
+
+    /// Run `f` once per monomorphised generic-struct instance **method**
+    /// (v0.130, SPEC §26.3), under that instance's substitution
+    /// `{ type-param → arg, Self → Struct(id) }`. For each recorded
+    /// [`crate::types::StructInstance`]: its type-constructor is looked up (an
+    /// instance whose constructor is absent cannot occur for validated input
+    /// and is skipped), the instantiated struct's id + source name are passed
+    /// through to `f` alongside each constructor method, and the substitution
+    /// is cleared after the instance. A fields-only instance (v0.129) declares
+    /// no methods, so `f` never runs for it.
+    fn each_instance_method(
+        &mut self,
+        module: &Module,
+        mut f: impl FnMut(&mut Self, u32, &str, &Func),
+    ) {
+        for inst in self.structs.struct_instances() {
+            let ctor = match Self::instance_ctor(module, inst) {
+                Some(c) => c,
+                None => continue,
+            };
+            // The instance's source name, resolved before the substitution is
+            // set (the lookup ignores `subst`).
+            let sname = self.structs.get(inst.struct_id).name.as_str();
+            self.set_instance_subst(ctor, &inst.args, inst.struct_id);
+            for m in Self::ctor_methods(ctor) {
+                f(self, inst.struct_id, sname, m);
+            }
+            self.clear_subst();
+        }
+    }
+
+    /// Run `f` once per recorded generic-function **instantiation** (SPEC
+    /// §17.3), under that instance's comptime substitution. For each recorded
+    /// [`Instantiation`]: the generic `Func` is looked up (an instantiation of
+    /// a function not present as a generic in this module cannot occur for
+    /// validated input and is skipped — the `Rc` clone is a cheap refcount
+    /// bump), `set_subst_for` binds its comptime parameters to the instance's
+    /// args, and the substitution is cleared after `f`.
+    fn each_instantiation(&mut self, mut f: impl FnMut(&mut Self, &Func, &Instantiation)) {
+        for inst in self.structs.instantiations() {
+            let func = match self.generics.get(&inst.fn_name).cloned() {
+                Some(g) => g,
+                None => continue,
+            };
+            self.set_subst_for(&func, &inst.args);
+            f(self, &func, inst);
+            self.clear_subst();
+        }
+    }
+
     /// Pre-pass: record the resolved return type of every top-level function and
     /// every struct function. These let [`Emitter::struct_of_expr`] follow a
     /// receiver chain that passes through a call to find the struct whose
@@ -600,7 +602,7 @@ impl<'a> Emitter<'a> {
         for item in &module.items {
             if let Item::Func(f) = item {
                 if Self::is_generic(f) {
-                    self.generics.insert(f.name.clone(), f.clone());
+                    self.generics.insert(f.name.clone(), Rc::new(f.clone()));
                 }
             }
         }
@@ -613,31 +615,14 @@ impl<'a> Emitter<'a> {
         // instantiation, resolved under that instance's substitution — so a
         // `*T` used in a generic body (e.g. `*i32` for the `i32` instance) maps
         // to a real pointee in [`Emitter::local_ptr_pointees`] (SPEC §17.3).
-        let structs = self.structs;
-        let insts = structs.instantiations().to_vec();
-        for inst in &insts {
-            if let Some(f) = self.generics.get(&inst.fn_name).cloned() {
-                self.set_subst_for(&f, &inst.args);
-                self.note_func_ptrs(&f);
-                self.clear_subst();
-            }
-        }
+        self.each_instantiation(|em, f, _inst| em.note_func_ptrs(f));
         // Register the `*T` / `*Self` pointee types used inside each
         // generic-struct instance's methods, under that instance's substitution
         // (v0.130, SPEC §26.3) — so a pointer receiver (`self: *Self`) or local
         // resolves to a real pointee, mirroring the generic-function pre-pass
         // above. By-value methods register no pointers, so this is a no-op for
         // the common case.
-        let sinsts = structs.struct_instances().to_vec();
-        for inst in &sinsts {
-            if let Some(ctor) = Self::instance_ctor(module, inst) {
-                self.set_instance_subst(&ctor, &inst.args, inst.struct_id);
-                for m in Self::ctor_methods(&ctor) {
-                    self.note_func_ptrs(&m);
-                }
-                self.clear_subst();
-            }
-        }
+        self.each_instance_method(module, |em, _sid, _sname, m| em.note_func_ptrs(m));
         for item in &module.items {
             match item {
                 Item::Func(f) => {
@@ -652,23 +637,28 @@ impl<'a> Emitter<'a> {
                     self.fn_params.insert(f.name.clone(), ptys);
                 }
                 Item::Struct(s) => {
+                    let sid = match self.structs.id_of(&s.name) {
+                        Some(id) => id,
+                        // unreachable: sema pass-0a interns every struct.
+                        None => continue,
+                    };
                     // Bind `Self` so a `*Self` / `@This()` receiver resolves to a
                     // pointer to this struct (v0.136, §32.2).
-                    let sid = self.structs.id_of(&s.name);
-                    if let Some(id) = sid {
-                        self.subst.insert("Self".to_string(), Type::Struct(id));
-                    }
-                    for m in &s.methods {
-                        let ret = self.resolve_ty(&m.ret);
-                        self.method_ret.insert((s.name.clone(), m.name.clone()), ret);
-                        let ptys: Vec<Type> =
-                            m.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
-                        self.method_params
-                            .insert((s.name.clone(), m.name.clone()), ptys);
-                    }
-                    if sid.is_some() {
-                        self.subst.remove("Self");
-                    }
+                    self.with_self_bound(&s.name, |em| {
+                        for m in &s.methods {
+                            let ret = em.resolve_ty(&m.ret);
+                            em.method_ret
+                                .entry(sid)
+                                .or_default()
+                                .insert(m.name.clone(), ret);
+                            let ptys: Vec<Type> =
+                                m.params.iter().map(|p| em.resolve_ty(&p.ty)).collect();
+                            em.method_params
+                                .entry(sid)
+                                .or_default()
+                                .insert(m.name.clone(), ptys);
+                        }
+                    });
                 }
                 _ => {}
             }
@@ -676,27 +666,22 @@ impl<'a> Emitter<'a> {
         // Register the return + parameter types of every monomorphised
         // generic-struct instance method (v0.130, SPEC §26.3), resolved under
         // the instance substitution `{ type-param → arg, Self → Struct(id) }`,
-        // keyed by the instantiated struct's source name. These let a method
-        // call on an instance value resolve its return type (`type_of_expr` /
+        // keyed by the instantiated struct's id. These let a method call on an
+        // instance value resolve its return type (`type_of_expr` /
         // `struct_of_expr`) and coerce its arguments, exactly as for an
         // ordinary struct method (SPEC §10).
-        for inst in &sinsts {
-            let ctor = match Self::instance_ctor(module, inst) {
-                Some(c) => c,
-                None => continue,
-            };
-            let sname = self.structs.get(inst.struct_id).name.clone();
-            self.set_instance_subst(&ctor, &inst.args, inst.struct_id);
-            for m in Self::ctor_methods(&ctor) {
-                let ret = self.resolve_ty(&m.ret);
-                self.method_ret.insert((sname.clone(), m.name.clone()), ret);
-                let ptys: Vec<Type> =
-                    m.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
-                self.method_params
-                    .insert((sname.clone(), m.name.clone()), ptys);
-            }
-            self.clear_subst();
-        }
+        self.each_instance_method(module, |em, sid, _sname, m| {
+            let ret = em.resolve_ty(&m.ret);
+            em.method_ret
+                .entry(sid)
+                .or_default()
+                .insert(m.name.clone(), ret);
+            let ptys: Vec<Type> = m.params.iter().map(|p| em.resolve_ty(&p.ty)).collect();
+            em.method_params
+                .entry(sid)
+                .or_default()
+                .insert(m.name.clone(), ptys);
+        });
     }
 
     /// Walk every `TypeExpr` written in a signature or local declaration and
@@ -720,16 +705,11 @@ impl<'a> Emitter<'a> {
                     // Bind `Self` so a `*Self` / `@This()` receiver registers a
                     // pointer to THIS struct as a pointee (v0.136, §32.2), so
                     // `self.field` auto-derefs in the lowering.
-                    let sid = self.structs.id_of(&s.name);
-                    if let Some(id) = sid {
-                        self.subst.insert("Self".to_string(), Type::Struct(id));
-                    }
-                    for m in &s.methods {
-                        self.note_func_ptrs(m);
-                    }
-                    if sid.is_some() {
-                        self.subst.remove("Self");
-                    }
+                    self.with_self_bound(&s.name, |em| {
+                        for m in &s.methods {
+                            em.note_func_ptrs(m);
+                        }
+                    });
                 }
                 Item::Const(c) => {
                     // A const's type annotation is optional (v0.121); an inferred
@@ -1253,6 +1233,14 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Emit one forward-declaration line `<ret> <cname>(<params>);`, with the
+    /// return / parameter types resolved under the active substitution.
+    fn decl_line(&mut self, ret: &TypeExpr, cname: &str, params: &[Param]) {
+        let rty = self.cty(ret);
+        let ps = self.format_params(params);
+        self.line(&format!("{} {}({});", rty, cname, ps));
+    }
+
     fn emit_forward_decls(&mut self, module: &Module) {
         let mut any = false;
         // Ordinary top-level functions first. A generic function is never
@@ -1266,9 +1254,7 @@ impl<'a> Emitter<'a> {
                 if Self::is_generic(f) || Self::is_type_ctor(f) {
                     continue;
                 }
-                let ret = self.cty(&f.ret);
-                let params = self.format_params(&f.params);
-                self.line(&format!("{} kd_{}({});", ret, f.name, params));
+                self.decl_line(&f.ret, &format!("kd_{}", f.name), &f.params);
                 any = true;
             }
         }
@@ -1284,19 +1270,12 @@ impl<'a> Emitter<'a> {
             if let Item::Struct(s) = item {
                 // Bind `Self` so a `self: *Self` / `@This()` method signature
                 // resolves in the forward declaration too (v0.136, §32.2).
-                let self_id = self.structs.id_of(&s.name);
-                if let Some(id) = self_id {
-                    self.subst.insert("Self".to_string(), Type::Struct(id));
-                }
-                for m in &s.methods {
-                    let ret = self.cty(&m.ret);
-                    let params = self.format_params(&m.params);
-                    self.line(&format!("{} kd_{}_{}({});", ret, s.name, m.name, params));
-                    any = true;
-                }
-                if self_id.is_some() {
-                    self.subst.remove("Self");
-                }
+                self.with_self_bound(&s.name, |em| {
+                    for m in &s.methods {
+                        em.decl_line(&m.ret, &format!("kd_{}_{}", s.name, m.name), &m.params);
+                        any = true;
+                    }
+                });
             }
         }
         // Finally every generic-struct instance's methods (v0.130, SPEC §26.3),
@@ -1320,27 +1299,11 @@ impl<'a> Emitter<'a> {
     /// Returns `true` if any were emitted. A fields-only instance (v0.129)
     /// declares no methods, so nothing is emitted for it.
     fn emit_struct_instance_forward_decls(&mut self, module: &Module) -> bool {
-        let insts = self.structs.struct_instances().to_vec();
         let mut any = false;
-        for inst in &insts {
-            let ctor = match Self::instance_ctor(module, inst) {
-                Some(c) => c,
-                None => continue,
-            };
-            let methods = Self::ctor_methods(&ctor);
-            if methods.is_empty() {
-                continue;
-            }
-            let sname = self.structs.get(inst.struct_id).name.clone();
-            self.set_instance_subst(&ctor, &inst.args, inst.struct_id);
-            for m in &methods {
-                let ret = self.cty(&m.ret);
-                let params = self.format_params(&m.params);
-                self.line(&format!("{} kd_{}_{}({});", ret, sname, m.name, params));
-                any = true;
-            }
-            self.clear_subst();
-        }
+        self.each_instance_method(module, |em, _sid, sname, m| {
+            em.decl_line(&m.ret, &format!("kd_{}_{}", sname, m.name), &m.params);
+            any = true;
+        });
         any
     }
 
@@ -1363,18 +1326,13 @@ impl<'a> Emitter<'a> {
             if let Item::Struct(s) = item {
                 // Bind `Self` to this struct so a plain-struct method written
                 // with `self: *Self` / `@This()` (v0.136, §32.2) resolves.
-                let self_id = self.structs.id_of(&s.name);
-                if let Some(id) = self_id {
-                    self.subst.insert("Self".to_string(), Type::Struct(id));
-                }
-                for m in &s.methods {
-                    let cname = format!("kd_{}_{}", s.name, m.name);
-                    self.emit_func_named(m, &cname);
-                    self.blank();
-                }
-                if self_id.is_some() {
-                    self.subst.remove("Self");
-                }
+                self.with_self_bound(&s.name, |em| {
+                    for m in &s.methods {
+                        let cname = format!("kd_{}_{}", s.name, m.name);
+                        em.emit_func_named(m, &cname);
+                        em.blank();
+                    }
+                });
             }
         }
         // Emit one specialised C function per recorded instantiation (SPEC
@@ -1397,22 +1355,11 @@ impl<'a> Emitter<'a> {
     /// call lowering. Mirrors [`Emitter::emit_instance_defs`] for generic
     /// functions; the type-constructor itself is never emitted (SPEC §25.3).
     fn emit_struct_instance_defs(&mut self, module: &Module) {
-        let insts = self.structs.struct_instances().to_vec();
-        for inst in &insts {
-            let ctor = match Self::instance_ctor(module, inst) {
-                Some(c) => c,
-                None => continue,
-            };
-            let methods = Self::ctor_methods(&ctor);
-            let sname = self.structs.get(inst.struct_id).name.clone();
-            for m in &methods {
-                self.set_instance_subst(&ctor, &inst.args, inst.struct_id);
-                let cname = format!("kd_{}_{}", sname, m.name);
-                self.emit_func_named(m, &cname);
-                self.clear_subst();
-                self.blank();
-            }
-        }
+        self.each_instance_method(module, |em, _sid, sname, m| {
+            let cname = format!("kd_{}_{}", sname, m.name);
+            em.emit_func_named(m, &cname);
+            em.blank();
+        });
     }
 
     /// Forward-declare every recorded generic instantiation (SPEC §17.3), each
@@ -1420,24 +1367,12 @@ impl<'a> Emitter<'a> {
     /// return type resolve to concrete types. Returns `true` if any were
     /// emitted (so the caller can add the trailing blank line).
     fn emit_instance_forward_decls(&mut self) -> bool {
-        let structs = self.structs;
-        let insts = structs.instantiations().to_vec();
         let mut any = false;
-        for inst in &insts {
-            let f = match self.generics.get(&inst.fn_name).cloned() {
-                Some(f) => f,
-                // An instantiation of a function not present as a generic in
-                // this module cannot occur for validated input; skip it.
-                None => continue,
-            };
-            self.set_subst_for(&f, &inst.args);
-            let ret = self.cty(&f.ret);
-            let params = self.format_params(&f.params);
-            let cname = self.structs.instantiation_c_name(inst);
-            self.line(&format!("{} {}({});", ret, cname, params));
-            self.clear_subst();
+        self.each_instantiation(|em, f, inst| {
+            let cname = em.structs.instantiation_c_name(inst);
+            em.decl_line(&f.ret, &cname, &f.params);
             any = true;
-        }
+        });
         any
     }
 
@@ -1446,19 +1381,11 @@ impl<'a> Emitter<'a> {
     /// every type-parameter use in the runtime params, return type and body
     /// resolves to the concrete type; the body reuses all existing lowering.
     fn emit_instance_defs(&mut self) {
-        let structs = self.structs;
-        let insts = structs.instantiations().to_vec();
-        for inst in &insts {
-            let f = match self.generics.get(&inst.fn_name).cloned() {
-                Some(f) => f,
-                None => continue,
-            };
-            self.set_subst_for(&f, &inst.args);
-            let cname = self.structs.instantiation_c_name(inst);
-            self.emit_func_named(&f, &cname);
-            self.clear_subst();
-            self.blank();
-        }
+        self.each_instantiation(|em, f, inst| {
+            let cname = em.structs.instantiation_c_name(inst);
+            em.emit_func_named(f, &cname);
+            em.blank();
+        });
     }
 
     fn format_params(&self, params: &[Param]) -> String {
@@ -2886,7 +2813,7 @@ impl<'a> Emitter<'a> {
                 format!(
                     "((kd_slice_uint8_t){{ .ptr = (uint8_t *){}, .len = {} }})",
                     c_string_literal(value),
-                    value.as_bytes().len()
+                    value.len()
                 )
             }
             Expr::Builtin { name, args, .. } => {
@@ -2939,12 +2866,12 @@ impl<'a> Emitter<'a> {
                         let display = if self.subst.contains_key(&arg_name) {
                             self.type_display_name(ty)
                         } else {
-                            arg_name.clone()
+                            arg_name
                         };
                         format!(
                             "((kd_slice_uint8_t){{ .ptr = (uint8_t *){}, .len = {} }})",
                             c_string_literal(&display),
-                            display.as_bytes().len()
+                            display.len()
                         )
                     }
                     // `@panic(msg)` in expression position (SPEC §35.2): the
@@ -3561,43 +3488,44 @@ impl<'a> Emitter<'a> {
     fn emit_method_call(&mut self, receiver: &Expr, method: &str, args: &[Expr]) -> String {
         let assoc = match receiver {
             // A direct struct name, or a type-alias name (`IntList.init(a)` where
-            // `const IntList = ArrayList(i32);`, v0.130) → the struct's source
-            // name, so the call lowers to `kd_<struct>_<method>` matching the
-            // emitted instance method.
+            // `const IntList = ArrayList(i32);`, v0.130) → the struct's id, so
+            // the call lowers to `kd_<struct>_<method>` matching the emitted
+            // instance method.
             Expr::Ident { name, .. } => self
                 .structs
                 .id_of(name)
-                .map(|_| name.clone())
                 .or_else(|| match self.structs.alias_of(name) {
-                    Some(Type::Struct(id)) => Some(self.structs.get(id).name.clone()),
+                    Some(Type::Struct(id)) => Some(id),
                     _ => None,
                 })
                 // `Self.assoc(...)` inside a generic-struct method: `Self` is in
                 // the active substitution → the instantiated struct (v0.138).
                 .or_else(|| match self.subst.get(name) {
-                    Some(Type::Struct(id)) => Some(self.structs.get(*id).name.clone()),
+                    Some(Type::Struct(id)) => Some(*id),
                     _ => None,
                 }),
             _ => None,
         };
-        if let Some(struct_name) = assoc {
+        if let Some(sid) = assoc {
             // Associated call: args bind to *all* params (including an explicit
             // `self` in the `Counter.get(c)` form), so the receiver itself is
             // not passed. Coerce each arg against its parameter type.
             let params = self
                 .method_params
-                .get(&(struct_name.clone(), method.to_string()))
+                .get(&sid)
+                .and_then(|m| m.get(method))
                 .cloned();
             let arg_strs = self.emit_coerced_args(args, params.as_deref(), 0);
+            let struct_name = &self.structs.get(sid).name;
             format!("kd_{}_{}({})", struct_name, method, arg_strs.join(", "))
         } else {
             // Method call on a value: the receiver becomes the leading `self`
             // argument, then the remaining args (coerced against params[1..],
             // skipping the `self` parameter).
-            let struct_name = self.struct_of_expr(receiver).unwrap_or_default();
-            let params = self
-                .method_params
-                .get(&(struct_name.clone(), method.to_string()))
+            let sid = self.struct_of_expr(receiver);
+            let params = sid
+                .and_then(|id| self.method_params.get(&id))
+                .and_then(|m| m.get(method))
                 .cloned();
             // A pointer-receiver method (v0.134, SPEC §30.2) has a `*Struct`
             // `self` parameter (param 0). Auto-ref / auto-deref the receiver so
@@ -3623,6 +3551,11 @@ impl<'a> Emitter<'a> {
             let mut all = Vec::with_capacity(1 + arg_strs.len());
             all.push(self_str);
             all.extend(arg_strs);
+            // An unresolvable receiver cannot occur for validated input; emit an
+            // empty struct name so the output stays well-formed.
+            let struct_name = sid
+                .map(|id| self.structs.get(id).name.as_str())
+                .unwrap_or_default();
             format!("kd_{}_{}({})", struct_name, method, all.join(", "))
         }
     }
@@ -3649,22 +3582,21 @@ impl<'a> Emitter<'a> {
         out
     }
 
-    /// The source name of the struct an expression evaluates to, or `None` if it
-    /// is not a struct (or cannot be determined). Used only to name the C
-    /// function for a method call on a value. Resolves:
+    /// The id of the struct an expression evaluates to, or `None` if it is not
+    /// a struct (or cannot be determined). Used only to name the C function for
+    /// a method call on a value. Resolves:
     /// - `Ident` — a struct-typed local/param recorded in the scope stack;
     /// - `Field` — the field's type within its base struct;
-    /// - `StructLit` — the literal's own struct name;
+    /// - `StructLit` — the literal's own struct;
     /// - `Call` — the called top-level function's return type;
     /// - `MethodCall` — the invoked struct function's return type.
-    fn struct_of_expr(&self, e: &Expr) -> Option<String> {
+    fn struct_of_expr(&self, e: &Expr) -> Option<u32> {
         match e {
             Expr::Ident { name, .. } => self.lookup_var_struct(name),
             Expr::Field { base, field, .. } => {
-                let base_struct = self.struct_of_expr(base)?;
-                let id = self.structs.id_of(&base_struct)?;
+                let id = self.struct_of_expr(base)?;
                 match self.structs.get(id).field_type(field)? {
-                    Type::Struct(fid) => Some(self.structs.get(fid).name.clone()),
+                    Type::Struct(fid) => Some(fid),
                     _ => None,
                 }
             }
@@ -3673,20 +3605,20 @@ impl<'a> Emitter<'a> {
                 // method (v0.130), or a type-alias name (v0.129), names the
                 // monomorphised struct — resolve it so a method call on the
                 // literal uses the real `kd_<struct>_<method>` name. An ordinary
-                // struct literal already carries its own struct name.
+                // struct literal resolves through its own struct name.
                 if let Some(Type::Struct(id)) = self.subst.get(name) {
-                    return Some(self.structs.get(*id).name.clone());
+                    return Some(*id);
                 }
                 if let Some(Type::Struct(id)) = self.structs.alias_of(name) {
-                    return Some(self.structs.get(id).name.clone());
+                    return Some(id);
                 }
-                Some(name.clone())
+                self.structs.id_of(name)
             }
             // A struct-typed array element: `a[i]` where the array's element is
             // a struct, so `a[i].method()` resolves to the element's struct.
             Expr::Index { base, .. } => match self.type_of_expr(base)? {
                 Type::Array(aid) => match self.structs.array_elem(aid) {
-                    Type::Struct(sid) => Some(self.structs.get(sid).name.clone()),
+                    Type::Struct(sid) => Some(sid),
                     _ => None,
                 },
                 _ => None,
@@ -3696,12 +3628,12 @@ impl<'a> Emitter<'a> {
                 // type (SPEC §17.2); an ordinary call's from its recorded ret.
                 if let Some(gf) = self.generics.get(callee) {
                     return match self.generic_call_ret(gf, args) {
-                        Type::Struct(id) => Some(self.structs.get(id).name.clone()),
+                        Type::Struct(id) => Some(id),
                         _ => None,
                     };
                 }
                 match self.fn_ret.get(callee)? {
-                    Type::Struct(id) => Some(self.structs.get(*id).name.clone()),
+                    Type::Struct(id) => Some(*id),
                     _ => None,
                 }
             }
@@ -3710,12 +3642,15 @@ impl<'a> Emitter<'a> {
             } => {
                 // The struct on which `method` is invoked: an associated call's
                 // type-name receiver, else the receiver expression's struct.
-                let recv_struct = match receiver.as_ref() {
-                    Expr::Ident { name, .. } if self.structs.id_of(name).is_some() => name.clone(),
+                let recv_sid = match receiver.as_ref() {
+                    Expr::Ident { name, .. } => self
+                        .structs
+                        .id_of(name)
+                        .or_else(|| self.struct_of_expr(receiver))?,
                     _ => self.struct_of_expr(receiver)?,
                 };
-                match self.method_ret.get(&(recv_struct, method.clone()))? {
-                    Type::Struct(id) => Some(self.structs.get(*id).name.clone()),
+                match self.method_ret.get(&recv_sid).and_then(|m| m.get(method))? {
+                    Type::Struct(id) => Some(*id),
                     _ => None,
                 }
             }
@@ -3723,18 +3658,18 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Find the struct name a (struct-typed) variable was recorded with,
+    /// Find the struct id a (struct-typed) variable was recorded with,
     /// searching scopes innermost-first so a shadowing binding wins. A variable
     /// whose type is not a struct (a primitive or an optional) yields `None`.
-    fn lookup_var_struct(&self, name: &str) -> Option<String> {
+    fn lookup_var_struct(&self, name: &str) -> Option<u32> {
         match self.lookup_var_type(name)? {
-            Type::Struct(id) => Some(self.structs.get(id).name.clone()),
+            Type::Struct(id) => Some(id),
             // A `*Struct` local/param (e.g. a `self: *Counter` pointer receiver,
             // v0.134) resolves to its pointee struct, so a method call on it
             // names the right `kd_<Struct>_<method>` C function and the receiver
             // auto-derefs/auto-refs (SPEC §30).
             Type::Ptr(pid) => match self.ptr_pointee_any(pid) {
-                Type::Struct(id) => Some(self.structs.get(id).name.clone()),
+                Type::Struct(id) => Some(id),
                 _ => None,
             },
             _ => None,
@@ -3901,11 +3836,17 @@ impl<'a> Emitter<'a> {
             Expr::MethodCall {
                 receiver, method, ..
             } => {
-                let recv_struct = match receiver.as_ref() {
-                    Expr::Ident { name, .. } if self.structs.id_of(name).is_some() => name.clone(),
+                let recv_sid = match receiver.as_ref() {
+                    Expr::Ident { name, .. } => self
+                        .structs
+                        .id_of(name)
+                        .or_else(|| self.struct_of_expr(receiver))?,
                     _ => self.struct_of_expr(receiver)?,
                 };
-                self.method_ret.get(&(recv_struct, method.clone())).copied()
+                self.method_ret
+                    .get(&recv_sid)
+                    .and_then(|m| m.get(method))
+                    .copied()
             }
             // A bare `null` has no intrinsic type — its `?T` comes from context.
             Expr::Null { .. } => None,
@@ -4276,141 +4217,16 @@ fn c_double_literal(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::fixtures::{
+        arr_param_ty, arr_ty, bin as binary, block, call, err_ty, error_lit, ident, int, opt_ty,
+        ptr_ty, set_err_ty, slice_ty, try_expr, ty,
+    };
     use crate::ast::{
-        ArraySize, BinOp, Block, ConstDecl, ErrorSetDecl, Expr, FieldDecl, FieldInit, Func, Item,
-        Module, Param, Stmt, StructDecl, SwitchArm, TestBlock, TypeExpr,
+        BinOp, ConstDecl, ErrorSetDecl, Expr, FieldDecl, FieldInit, Func, Item, Module, Param,
+        Stmt, StructDecl, SwitchArm, TestBlock, TypeExpr,
     };
     use crate::span::Span;
     use crate::types::{ComptimeArg, StructTable, Type};
-
-    fn ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    fn opt_ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: true,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    /// An error union over the **implicit global** error set, `!name` (§12).
-    fn err_ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: true,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    /// An error union over a **named** error set, `set!name` (v0.139, §34). The
-    /// runtime representation is identical to [`err_ty`] — the set name is a
-    /// pure sema constraint and the backend must ignore it.
-    fn set_err_ty(set: &str, name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: true,
-            error_set: Some(set.to_string()),
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    /// A fixed-size array type `[len]name` with a literal length
-    /// (`array_len = Some(ArraySize::Lit(len))`, the element type name in
-    /// `name`).
-    fn arr_ty(name: &str, len: i64) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: Some(ArraySize::Lit(len)),
-            pointer: false,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    /// A comptime-value-parameter-sized array type `[param]name`
-    /// (`array_len = Some(ArraySize::Param(param))`, v0.128).
-    fn arr_param_ty(name: &str, param: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: Some(ArraySize::Param(param.to_string())),
-            pointer: false,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    /// A pointer type `*name` (v0.118).
-    fn ptr_ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: true,
-            slice: false,
-            span: Span::DUMMY,
-        }
-    }
-
-    /// A slice type `[]name` (v0.118).
-    fn slice_ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: true,
-            span: Span::DUMMY,
-        }
-    }
-
-    fn ident(name: &str) -> Expr {
-        Expr::Ident {
-            name: name.to_string(),
-            span: Span::DUMMY,
-        }
-    }
-
-    fn int(v: i64) -> Expr {
-        Expr::Int {
-            value: v,
-            span: Span::DUMMY,
-        }
-    }
 
     fn float(v: f64) -> Expr {
         Expr::Float {
@@ -4424,22 +4240,6 @@ mod tests {
         Expr::Builtin {
             name: "as".to_string(),
             args: vec![ident(ty_name), e],
-            span: Span::DUMMY,
-        }
-    }
-
-    fn binary(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
-        Expr::Binary {
-            op,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-            span: Span::DUMMY,
-        }
-    }
-
-    fn block(stmts: Vec<Stmt>) -> Block {
-        Block {
-            stmts,
             span: Span::DUMMY,
         }
     }
@@ -5763,28 +5563,6 @@ mod tests {
         t
     }
 
-    fn error_lit(name: &str) -> Expr {
-        Expr::ErrorLit {
-            name: name.to_string(),
-            span: Span::DUMMY,
-        }
-    }
-
-    fn call(callee: &str, args: Vec<Expr>) -> Expr {
-        Expr::Call {
-            callee: callee.to_string(),
-            args,
-            span: Span::DUMMY,
-        }
-    }
-
-    fn try_expr(inner: Expr) -> Expr {
-        Expr::Try {
-            expr: Box::new(inner),
-            span: Span::DUMMY,
-        }
-    }
-
     #[test]
     fn error_union_typedef_and_catch_emitted() {
         // The typedef + inline `_catch` come straight off `error_unions`.
@@ -7094,7 +6872,7 @@ mod tests {
                 items: vec![Item::Func(func("main", vec![], "i32", vec![sw]))],
             };
             let c = emit(&m, &StructTable::new(), EmitMode::Program);
-            let code = crate::backend::cc_build_and_run(&c, &[])
+            let code = crate::backend::cc_build_and_run(&c, &[], crate::backend::OptLevel::O2)
                 .expect("a switch-range program should compile and run");
             assert_eq!(
                 code, expected,
@@ -10428,7 +10206,7 @@ mod tests {
             items: vec![Item::Func(f)],
         };
         let c = emit(&m, &StructTable::new(), EmitMode::Program);
-        let code = crate::backend::cc_build_and_run(&c, &[])
+        let code = crate::backend::cc_build_and_run(&c, &[], crate::backend::OptLevel::O2)
             .expect("labeled-break program should compile and run");
         assert_eq!(code, 4, "break :outer must exit both loops at count==4\n{c}");
     }
@@ -10483,7 +10261,7 @@ mod tests {
             items: vec![Item::Func(f)],
         };
         let c = emit(&m, &StructTable::new(), EmitMode::Program);
-        let code = crate::backend::cc_build_and_run(&c, &[])
+        let code = crate::backend::cc_build_and_run(&c, &[], crate::backend::OptLevel::O2)
             .expect("labeled-continue program should compile and run");
         assert_eq!(
             code, 3,

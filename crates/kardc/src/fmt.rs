@@ -140,28 +140,9 @@ impl Printer {
 
     fn print_func(&mut self, f: &Func) {
         self.write_indent();
-        if f.is_pub {
-            self.out.push_str("pub ");
-        }
-        self.out.push_str("fn ");
-        self.out.push_str(&f.name);
-        self.out.push('(');
-        for (i, param) in f.params.iter().enumerate() {
-            if i > 0 {
-                self.out.push_str(", ");
-            }
-            // A compile-time type parameter (`comptime T: type`, SPEC §17.1)
-            // prints with a leading `comptime ` keyword; everything else about
-            // the parameter list is unchanged.
-            if param.is_comptime {
-                self.out.push_str("comptime ");
-            }
-            self.out.push_str(&param.name);
-            self.out.push_str(": ");
-            self.out.push_str(&fmt_type(&param.ty));
-        }
-        self.out.push_str(") ");
-        self.out.push_str(&fmt_type(&f.ret));
+        // The `pub? fn name(params) ret` signature spelling is shared with the
+        // inline printer via [`fmt_func_sig`]; only the layout differs.
+        self.out.push_str(&fmt_func_sig(f));
         self.out.push_str(" {\n");
         self.print_block_body(&f.body);
         self.write_indent();
@@ -366,17 +347,8 @@ impl Printer {
                 ..
             } => {
                 self.write_indent();
-                self.out.push_str(if *is_const { "const " } else { "var " });
-                self.out.push_str(name);
-                // The type annotation is optional (SPEC §18): `var name: T = …;`
-                // when present, `var name = …;` when inferred from the value.
-                if let Some(ty) = ty {
-                    self.out.push_str(": ");
-                    self.out.push_str(&fmt_type(ty));
-                }
-                self.out.push_str(" = ");
-                self.out.push_str(&fmt_expr(value));
-                self.out.push_str(";\n");
+                self.out.push_str(&fmt_let_core(*is_const, name, ty, value));
+                self.out.push('\n');
             }
             // `name = expr;`, or a compound `name op= expr;` (SPEC §27): `op`
             // selects the operator spelling — `=` when `None`, `+= -= *= /= %=`
@@ -385,12 +357,8 @@ impl Printer {
                 name, op, value, ..
             } => {
                 self.write_indent();
-                self.out.push_str(name);
-                self.out.push(' ');
-                self.out.push_str(&assign_op_src(*op));
-                self.out.push(' ');
-                self.out.push_str(&fmt_expr(value));
-                self.out.push_str(";\n");
+                self.out.push_str(&fmt_assign_core(name, *op, value));
+                self.out.push('\n');
             }
             // `place = expr;`, or a compound `place op= expr;` (SPEC §27), where
             // `place` is a field-access / index / deref chain. The operator
@@ -399,12 +367,9 @@ impl Printer {
                 place, op, value, ..
             } => {
                 self.write_indent();
-                self.out.push_str(&fmt_expr(place));
-                self.out.push(' ');
-                self.out.push_str(&assign_op_src(*op));
-                self.out.push(' ');
-                self.out.push_str(&fmt_expr(value));
-                self.out.push_str(";\n");
+                self.out
+                    .push_str(&fmt_assign_core(&fmt_expr(place), *op, value));
+                self.out.push('\n');
             }
             Stmt::Expr(e) => {
                 self.write_indent();
@@ -442,15 +407,7 @@ impl Printer {
                 ..
             } => {
                 self.write_indent();
-                self.out.push_str(&fmt_loop_label(label));
-                self.out.push_str("while (");
-                self.out.push_str(&fmt_expr(cond));
-                self.out.push(')');
-                if let Some(c) = cont {
-                    self.out.push_str(" : (");
-                    self.out.push_str(&fmt_cont(c));
-                    self.out.push(')');
-                }
+                self.out.push_str(&fmt_while_header(cond, cont, label));
                 self.out.push_str(" {\n");
                 self.print_block_body(body);
                 self.write_indent();
@@ -475,19 +432,8 @@ impl Printer {
                 ..
             } => {
                 self.write_indent();
-                self.out.push_str(&fmt_loop_label(label));
-                self.out.push_str("for (");
-                self.out.push_str(&fmt_expr(iter));
-                if index.is_some() {
-                    self.out.push_str(", 0..");
-                }
-                self.out.push_str(") |");
-                self.out.push_str(elem);
-                if let Some(idx) = index {
-                    self.out.push_str(", ");
-                    self.out.push_str(idx);
-                }
-                self.out.push_str("| {\n");
+                self.out.push_str(&fmt_for_header(iter, elem, index, label));
+                self.out.push_str(" {\n");
                 self.print_block_body(body);
                 self.write_indent();
                 self.out.push_str("}\n");
@@ -558,15 +504,10 @@ impl Printer {
         self.indent += 1;
         for arm in arms {
             self.write_indent();
-            self.out.push_str(&fmt_arm_labels(arm));
-            match &arm.capture {
-                Some(cap) => {
-                    self.out.push_str(" => |");
-                    self.out.push_str(cap);
-                    self.out.push_str("| {\n");
-                }
-                None => self.out.push_str(" => {\n"),
-            }
+            // The `<labels> => |cap|?` arm opening is shared with the inline
+            // printer via [`fmt_switch_arm_open`]; only the layout differs.
+            self.out.push_str(&fmt_switch_arm_open(arm));
+            self.out.push_str(" {\n");
             self.print_block_body(&arm.body);
             self.write_indent();
             self.out.push_str("},\n");
@@ -588,7 +529,9 @@ impl Printer {
     /// trailing branch. With a capture (SPEC §21.1) the header prints
     /// `if (<cond>) |<name>| {`; without one it is the unchanged `if (<cond>) {`.
     /// An `else if` whose own `if` carries a capture chains the same way
-    /// (`} else if (<cond>) |<name>| {`).
+    /// (`} else if (<cond>) |<name>| {`). The `if (<cond>) |<name>|?` header
+    /// spelling is shared with the inline printer via [`fmt_if_header`]; only
+    /// the brace/indent layout differs.
     fn print_if(
         &mut self,
         cond: &Expr,
@@ -597,10 +540,8 @@ impl Printer {
         els: &Option<Box<Stmt>>,
     ) {
         self.write_indent();
-        self.out.push_str("if (");
-        self.out.push_str(&fmt_expr(cond));
-        self.out.push(')');
-        self.print_if_open(capture);
+        self.out.push_str(&fmt_if_header(cond, capture));
+        self.out.push_str(" {\n");
         self.print_block_body(then);
 
         let mut els = els;
@@ -620,10 +561,9 @@ impl Printer {
                         ..
                     } => {
                         self.write_indent();
-                        self.out.push_str("} else if (");
-                        self.out.push_str(&fmt_expr(c2));
-                        self.out.push(')');
-                        self.print_if_open(cap2);
+                        self.out.push_str("} else ");
+                        self.out.push_str(&fmt_if_header(c2, cap2));
+                        self.out.push_str(" {\n");
                         self.print_block_body(t2);
                         els = e2;
                     }
@@ -649,21 +589,6 @@ impl Printer {
                     }
                 },
             }
-        }
-    }
-
-    /// Print the opening of an `if` header after its `)`: an optional-payload
-    /// capture (`|<name>|`, SPEC §21.1) when present, then ` {` and a newline.
-    /// With no capture this is the unchanged ` {`, so a plain `if` prints exactly
-    /// as before.
-    fn print_if_open(&mut self, capture: &Option<String>) {
-        match capture {
-            Some(name) => {
-                self.out.push_str(" |");
-                self.out.push_str(name);
-                self.out.push_str("| {\n");
-            }
-            None => self.out.push_str(" {\n"),
         }
     }
 }
@@ -909,6 +834,157 @@ fn fmt_continue(target: &Option<String>) -> String {
         Some(label) => format!("continue :{};", label),
         None => "continue;".to_string(),
     }
+}
+
+/// The source spelling of a function signature (SPEC §3/§17): `pub? fn
+/// name(comptime? p: T, …) ret` — an optional `pub `, the parameter list with a
+/// `comptime ` prefix on compile-time type parameters and `name: Type` entries
+/// joined with `, `, then the Zig-style return type after the parens. Stops
+/// before the body's opening brace, so the multi-line and inline printers share
+/// one spelling and differ only in the brace/indent layout that follows. Shared
+/// by [`Printer::print_func`] and [`fmt_func_inline`].
+fn fmt_func_sig(f: &Func) -> String {
+    let mut s = String::new();
+    if f.is_pub {
+        s.push_str("pub ");
+    }
+    s.push_str("fn ");
+    s.push_str(&f.name);
+    s.push('(');
+    for (i, param) in f.params.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        // A compile-time type parameter (`comptime T: type`, SPEC §17.1)
+        // prints with a leading `comptime ` keyword; everything else about
+        // the parameter list is unchanged.
+        if param.is_comptime {
+            s.push_str("comptime ");
+        }
+        s.push_str(&param.name);
+        s.push_str(": ");
+        s.push_str(&fmt_type(&param.ty));
+    }
+    s.push_str(") ");
+    s.push_str(&fmt_type(&f.ret));
+    s
+}
+
+/// The source spelling of a `const`/`var` binding (SPEC §18), trailing `;`
+/// included: `const NAME: T = expr;` / `var name = expr;` — `const` vs `var`
+/// per `is_const`, with the `: T` annotation only when present (an inferred
+/// binding prints none). Shared by [`Printer::print_stmt`] and
+/// [`fmt_stmt_inline`]; the callers add only the indent / newline layout.
+fn fmt_let_core(is_const: bool, name: &str, ty: &Option<TypeExpr>, value: &Expr) -> String {
+    let mut s = String::new();
+    s.push_str(if is_const { "const " } else { "var " });
+    s.push_str(name);
+    // The type annotation is optional (SPEC §18): `var name: T = …;` when
+    // present, `var name = …;` when inferred from the value.
+    if let Some(ty) = ty {
+        s.push_str(": ");
+        s.push_str(&fmt_type(ty));
+    }
+    s.push_str(" = ");
+    s.push_str(&fmt_expr(value));
+    s.push(';');
+    s
+}
+
+/// The source spelling of an assignment statement (SPEC §27), trailing `;`
+/// included: `<lhs> = <rhs>;`, or compound `<lhs> += <rhs>;` per `op` (see
+/// [`assign_op_src`]), with a single space on each side of the operator. The
+/// left-hand side arrives pre-rendered so one helper serves both
+/// [`Stmt::Assign`] (a bare name) and [`Stmt::FieldAssign`] (a field-access /
+/// index / deref chain rendered by [`fmt_expr`]). Shared by
+/// [`Printer::print_stmt`] and [`fmt_stmt_inline`].
+fn fmt_assign_core(lhs: &str, op: Option<BinOp>, value: &Expr) -> String {
+    format!("{} {} {};", lhs, assign_op_src(op), fmt_expr(value))
+}
+
+/// The source spelling of a `while` header (SPEC §5/§40): the optional
+/// `label: ` prefix (see [`fmt_loop_label`]), `while (<cond>)`, then the
+/// optional ` : (<cont>)` continue clause (see [`fmt_cont`]). Stops before the
+/// body's opening brace, so the multi-line and inline printers share one
+/// spelling and differ only in the layout that follows. Shared by
+/// [`Printer::print_stmt`] and [`fmt_stmt_inline`].
+fn fmt_while_header(cond: &Expr, cont: &Option<Box<Stmt>>, label: &Option<String>) -> String {
+    let mut s = fmt_loop_label(label);
+    s.push_str("while (");
+    s.push_str(&fmt_expr(cond));
+    s.push(')');
+    if let Some(c) = cont {
+        s.push_str(" : (");
+        s.push_str(&fmt_cont(c));
+        s.push(')');
+    }
+    s
+}
+
+/// The source spelling of a `for` header (SPEC §29/§40): the optional `label: `
+/// prefix, `for (<iter>)` with `, 0..` appended inside the parens when an index
+/// is captured, then the `|elem|` / `|elem, index|` capture list up to and
+/// including the closing `|`. Stops before the body's opening brace, so the
+/// multi-line and inline printers share one spelling and differ only in the
+/// layout that follows. Shared by [`Printer::print_stmt`] and
+/// [`fmt_stmt_inline`].
+fn fmt_for_header(
+    iter: &Expr,
+    elem: &str,
+    index: &Option<String>,
+    label: &Option<String>,
+) -> String {
+    let mut s = fmt_loop_label(label);
+    s.push_str("for (");
+    s.push_str(&fmt_expr(iter));
+    if index.is_some() {
+        s.push_str(", 0..");
+    }
+    s.push_str(") |");
+    s.push_str(elem);
+    if let Some(idx) = index {
+        s.push_str(", ");
+        s.push_str(idx);
+    }
+    s.push('|');
+    s
+}
+
+/// The source spelling of a `switch` arm's opening (SPEC §13/§20/§39):
+/// `<labels> =>` — the label list rendered by [`fmt_arm_labels`] (value labels
+/// first, then ranges) and the arrow — with an optional ` |<cap>|` payload
+/// capture appended (SPEC §20). Stops before the arm body's opening brace, so
+/// the multi-line and inline printers share one spelling and differ only in the
+/// layout that follows. Shared by [`Printer::print_switch`] and
+/// [`fmt_stmt_inline`].
+fn fmt_switch_arm_open(arm: &SwitchArm) -> String {
+    let mut s = fmt_arm_labels(arm);
+    s.push_str(" =>");
+    if let Some(cap) = &arm.capture {
+        s.push_str(" |");
+        s.push_str(cap);
+        s.push('|');
+    }
+    s
+}
+
+/// The source spelling of an `if` / `else if` header (SPEC §5/§21.1):
+/// `if (<cond>)` with an optional ` |<name>|` payload capture appended. The
+/// same text serves the chain's initial `if` and — after a `} else ` / ` else `
+/// prefix from the caller — every `else if`, stopping before the branch body's
+/// opening brace so the multi-line and inline printers share one spelling and
+/// differ only in the layout that follows. Shared by [`Printer::print_if`] and
+/// [`fmt_if_inline`].
+fn fmt_if_header(cond: &Expr, capture: &Option<String>) -> String {
+    let mut s = String::from("if (");
+    s.push_str(&fmt_expr(cond));
+    s.push(')');
+    if let Some(name) = capture {
+        s.push_str(" |");
+        s.push_str(name);
+        s.push('|');
+    }
+    s
 }
 
 /// Format an expression with no surrounding parentheses.
@@ -1274,36 +1350,19 @@ fn fmt_operand(e: &Expr, parent_prec: u8, is_right: bool) -> String {
 // expression, including a nested `StructType` — free of any indent context. The
 // spelling of every construct (the `pub? fn name(params) ret` signature with a
 // `comptime ` prefix, `name: Type` fields, `if`/`while`/`switch`/`defer`/…
-// statements) matches the multi-line printers exactly; only the whitespace
-// differs, so the inline form re-lexes to the same AST and re-formatting is
-// idempotent.
+// statements) is shared with the multi-line printers **by construction**: both
+// call the same pure spelling helpers ([`fmt_func_sig`], [`fmt_let_core`],
+// [`fmt_assign_core`], [`fmt_while_header`], [`fmt_for_header`],
+// [`fmt_switch_arm_open`], [`fmt_if_header`], [`fmt_break`], …) and differ only
+// in the brace/indent/newline layout they wrap around them, so the inline form
+// re-lexes to the same AST and re-formatting is idempotent.
 
 /// Format a function on a single line (SPEC §26): `pub? fn name(params) ret {
-/// body }`, mirroring [`Printer::print_func`]'s spelling — a `comptime ` prefix
-/// on compile-time parameters, `name: Type` parameters joined with `, `, the
-/// Zig-style return type after the parens — but laid out inline. Used for the
+/// body }` — the `pub? fn name(params) ret` signature spelling shared with
+/// [`Printer::print_func`] via [`fmt_func_sig`], laid out inline. Used for the
 /// methods of an [`Expr::StructType`] type value.
 fn fmt_func_inline(f: &Func) -> String {
-    let mut s = String::new();
-    if f.is_pub {
-        s.push_str("pub ");
-    }
-    s.push_str("fn ");
-    s.push_str(&f.name);
-    s.push('(');
-    for (i, param) in f.params.iter().enumerate() {
-        if i > 0 {
-            s.push_str(", ");
-        }
-        if param.is_comptime {
-            s.push_str("comptime ");
-        }
-        s.push_str(&param.name);
-        s.push_str(": ");
-        s.push_str(&fmt_type(&param.ty));
-    }
-    s.push_str(") ");
-    s.push_str(&fmt_type(&f.ret));
+    let mut s = fmt_func_sig(f);
     s.push(' ');
     s.push_str(&fmt_block_inline(&f.body));
     s
@@ -1331,27 +1390,15 @@ fn fmt_stmt_inline(stmt: &Stmt) -> String {
             ty,
             value,
             ..
-        } => {
-            let mut s = String::new();
-            s.push_str(if *is_const { "const " } else { "var " });
-            s.push_str(name);
-            if let Some(ty) = ty {
-                s.push_str(": ");
-                s.push_str(&fmt_type(ty));
-            }
-            s.push_str(" = ");
-            s.push_str(&fmt_expr(value));
-            s.push(';');
-            s
-        }
+        } => fmt_let_core(*is_const, name, ty, value),
         // `name = expr;` / compound `name op= expr;` (SPEC §27), inline.
         Stmt::Assign {
             name, op, value, ..
-        } => format!("{} {} {};", name, assign_op_src(*op), fmt_expr(value)),
+        } => fmt_assign_core(name, *op, value),
         // `place = expr;` / compound `place op= expr;` (SPEC §27), inline.
         Stmt::FieldAssign {
             place, op, value, ..
-        } => format!("{} {} {};", fmt_expr(place), assign_op_src(*op), fmt_expr(value)),
+        } => fmt_assign_core(&fmt_expr(place), *op, value),
         Stmt::Expr(e) => format!("{};", fmt_expr(e)),
         Stmt::Return { value, .. } => match value {
             Some(e) => format!("return {};", fmt_expr(e)),
@@ -1371,25 +1418,17 @@ fn fmt_stmt_inline(stmt: &Stmt) -> String {
             label,
             ..
         } => {
-            // A `Some(name)` label (SPEC §40) prints `name: ` before `while`,
-            // exactly as in the multi-line printer; unlabeled is unchanged.
-            let mut s = fmt_loop_label(label);
-            s.push_str("while (");
-            s.push_str(&fmt_expr(cond));
-            s.push(')');
-            if let Some(c) = cont {
-                s.push_str(" : (");
-                s.push_str(&fmt_cont(c));
-                s.push(')');
-            }
+            // The `label: while (cond) : (cont)?` header spelling is shared
+            // with the multi-line printer via [`fmt_while_header`].
+            let mut s = fmt_while_header(cond, cont, label);
             s.push(' ');
             s.push_str(&fmt_block_inline(body));
             s
         }
         // `for (<iter>) |elem| { … }` / `for (<iter>, 0..) |elem, index| { … }`
-        // (SPEC §29), inline. Mirrors the multi-line printer construct-for-
-        // construct, differing only in whitespace, so the result re-lexes to the
-        // same `Stmt::For`.
+        // (SPEC §29), inline. The header spelling — label, `, 0..` and captures
+        // — is shared with the multi-line printer via [`fmt_for_header`], so
+        // the result re-lexes to the same `Stmt::For`.
         Stmt::For {
             iter,
             elem,
@@ -1398,21 +1437,8 @@ fn fmt_stmt_inline(stmt: &Stmt) -> String {
             label,
             ..
         } => {
-            // A `Some(name)` label (SPEC §40) prints `name: ` before `for`,
-            // exactly as in the multi-line printer; unlabeled is unchanged.
-            let mut s = fmt_loop_label(label);
-            s.push_str("for (");
-            s.push_str(&fmt_expr(iter));
-            if index.is_some() {
-                s.push_str(", 0..");
-            }
-            s.push_str(") |");
-            s.push_str(elem);
-            if let Some(idx) = index {
-                s.push_str(", ");
-                s.push_str(idx);
-            }
-            s.push_str("| ");
+            let mut s = fmt_for_header(iter, elem, index, label);
+            s.push(' ');
             s.push_str(&fmt_block_inline(body));
             s
         }
@@ -1434,15 +1460,10 @@ fn fmt_stmt_inline(stmt: &Stmt) -> String {
             s.push_str(") {");
             for arm in arms {
                 s.push(' ');
-                s.push_str(&fmt_arm_labels(arm));
-                match &arm.capture {
-                    Some(cap) => {
-                        s.push_str(" => |");
-                        s.push_str(cap);
-                        s.push_str("| ");
-                    }
-                    None => s.push_str(" => "),
-                }
+                // The `<labels> => |cap|?` arm opening is shared with the
+                // multi-line printer via [`fmt_switch_arm_open`].
+                s.push_str(&fmt_switch_arm_open(arm));
+                s.push(' ');
                 s.push_str(&fmt_block_inline(&arm.body));
                 s.push(',');
             }
@@ -1474,22 +1495,16 @@ fn fmt_arm_labels(arm: &SwitchArm) -> String {
 
 /// Format an `if`/`else if`/`else` chain inline (SPEC §26). With a capture the
 /// header is `if (<cond>) |<name>| { … }`; without one it is `if (<cond>) { …
-/// }`. Mirrors [`Printer::print_if`]'s chaining (`} else if …` / `} else …`),
-/// inline.
+/// }`. The `if (<cond>) |<name>|?` header spelling is shared with
+/// [`Printer::print_if`] via [`fmt_if_header`]; the chaining (`} else if …` /
+/// `} else …`) mirrors it, inline.
 fn fmt_if_inline(
     cond: &Expr,
     capture: &Option<String>,
     then: &Block,
     els: &Option<Box<Stmt>>,
 ) -> String {
-    let mut s = String::from("if (");
-    s.push_str(&fmt_expr(cond));
-    s.push(')');
-    if let Some(name) = capture {
-        s.push_str(" |");
-        s.push_str(name);
-        s.push('|');
-    }
+    let mut s = fmt_if_header(cond, capture);
     s.push(' ');
     s.push_str(&fmt_block_inline(then));
 
@@ -1505,14 +1520,8 @@ fn fmt_if_inline(
                     els: e2,
                     ..
                 } => {
-                    s.push_str(" else if (");
-                    s.push_str(&fmt_expr(c2));
-                    s.push(')');
-                    if let Some(name) = cap2 {
-                        s.push_str(" |");
-                        s.push_str(name);
-                        s.push('|');
-                    }
+                    s.push_str(" else ");
+                    s.push_str(&fmt_if_header(c2, cap2));
                     s.push(' ');
                     s.push_str(&fmt_block_inline(t2));
                     els = e2;
@@ -1555,206 +1564,15 @@ fn escape_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::fixtures::{
+        arr_param_ty as arr_ty_param, arr_ty, bin, call, catch_capture_expr as catch_cap,
+        catch_expr as catch_, err_ty, error_lit, ident, int, null, opt_ty, orelse, ptr_ty,
+        set_err_ty, slice_ty, try_expr as try_, ty, unwrap,
+    };
     use crate::ast::{EnumVariant, FieldDecl, FieldInit, Param, TypeExpr, UnionVariant};
     use crate::span::Span;
 
     const D: Span = Span::DUMMY;
-
-    fn ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: D,
-        }
-    }
-
-    /// An optional type `?name` (`TypeExpr.optional = true`).
-    fn opt_ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: true,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: D,
-        }
-    }
-
-    /// An error-union type `!name` over the implicit global error set
-    /// (`TypeExpr.error_union = true`, `error_set = None`; v0.115).
-    fn err_ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: true,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: D,
-        }
-    }
-
-    /// A named error-union type `set!name` over the error set `set`
-    /// (`TypeExpr.error_union = true`, `error_set = Some(set)`; v0.139).
-    fn set_err_ty(set: &str, name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: true,
-            error_set: Some(set.to_string()),
-            array_len: None,
-            pointer: false,
-            slice: false,
-            span: D,
-        }
-    }
-
-    /// A fixed-size array type `[len]name`
-    /// (`TypeExpr.array_len = Some(ArraySize::Lit(len))`; v0.117).
-    fn arr_ty(name: &str, len: i64) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: Some(ArraySize::Lit(len)),
-            pointer: false,
-            slice: false,
-            span: D,
-        }
-    }
-
-    /// A comptime value-parameter-sized array type `[len_param]name`
-    /// (`TypeExpr.array_len = Some(ArraySize::Param(len_param))`; v0.128). The
-    /// size is the name of a `comptime n: usize` parameter, resolved per
-    /// monomorphisation in sema/emit but printed verbatim by the formatter.
-    fn arr_ty_param(name: &str, len_param: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: Some(ArraySize::Param(len_param.to_string())),
-            pointer: false,
-            slice: false,
-            span: D,
-        }
-    }
-
-    /// A pointer type `*name` (`TypeExpr.pointer = true`; v0.118).
-    fn ptr_ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: true,
-            slice: false,
-            span: D,
-        }
-    }
-
-    /// A slice type `[]name` (`TypeExpr.slice = true`; v0.118).
-    fn slice_ty(name: &str) -> TypeExpr {
-        TypeExpr {
-            name: name.to_string(),
-            optional: false,
-            error_union: false,
-            error_set: None,
-            array_len: None,
-            pointer: false,
-            slice: true,
-            span: D,
-        }
-    }
-
-    fn error_lit(name: &str) -> Expr {
-        Expr::ErrorLit {
-            name: name.to_string(),
-            span: D,
-        }
-    }
-
-    fn try_(expr: Expr) -> Expr {
-        Expr::Try {
-            expr: Box::new(expr),
-            span: D,
-        }
-    }
-
-    fn catch_(expr: Expr, default: Expr) -> Expr {
-        Expr::Catch {
-            expr: Box::new(expr),
-            capture: None,
-            default: Box::new(default),
-            span: D,
-        }
-    }
-
-    fn catch_cap(expr: Expr, name: &str, default: Expr) -> Expr {
-        Expr::Catch {
-            expr: Box::new(expr),
-            capture: Some(name.to_string()),
-            default: Box::new(default),
-            span: D,
-        }
-    }
-
-    fn call(callee: &str, args: Vec<Expr>) -> Expr {
-        Expr::Call {
-            callee: callee.to_string(),
-            args,
-            span: D,
-        }
-    }
-
-    fn null() -> Expr {
-        Expr::Null { span: D }
-    }
-
-    fn orelse(lhs: Expr, rhs: Expr) -> Expr {
-        Expr::Orelse {
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-            span: D,
-        }
-    }
-
-    fn unwrap(expr: Expr) -> Expr {
-        Expr::Unwrap {
-            expr: Box::new(expr),
-            span: D,
-        }
-    }
-
-    fn ident(name: &str) -> Expr {
-        Expr::Ident {
-            name: name.to_string(),
-            span: D,
-        }
-    }
-
-    fn int(value: i64) -> Expr {
-        Expr::Int { value, span: D }
-    }
-
-    fn bin(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
-        Expr::Binary {
-            op,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-            span: D,
-        }
-    }
 
     #[test]
     fn function_with_params_and_return() {
@@ -5068,6 +4886,72 @@ mod tests {
             "while (i < self.n) : (i = i + 1) { ",
             "if (i == 0) { print(i); } else { print(self.n); } } ",
             "return i; } };\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn struct_type_method_switch_capture_and_ranges_round_trip() {
+        // A `switch` inside a generic-struct method prints inline (SPEC §26)
+        // and round-trips byte-for-byte: a payload-capturing arm (`=> |x|`,
+        // SPEC §20), a multi-label arm mixing value labels with an inclusive
+        // range (`1, 2, 5..9` — values print before ranges, SPEC §39) and a
+        // trailing `else` arm, every arm comma-terminated. Pins the inline
+        // switch-arm spelling to the multi-line printer's.
+        let src = concat!(
+            "fn Box(comptime T: type) type {\n",
+            "    return struct { v: T, ",
+            "fn pick(self: Self, u: Shape) T { ",
+            "switch (u) { ",
+            ".val => |x| { print(x); }, ",
+            "1, 2, 5..9 => { print(self.v); }, ",
+            "else => { print(0); }, } ",
+            "return self.v; } };\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn struct_type_method_for_with_index_round_trip() {
+        // A labeled, index-capturing `for` (SPEC §29/§40) inside a
+        // generic-struct method prints inline and round-trips byte-for-byte:
+        // the `name: ` label prefix, the `, 0..` after the iterable and the
+        // `|elem, index|` capture pair all keep the multi-line spelling.
+        let src = concat!(
+            "fn List(comptime T: type) type {\n",
+            "    return struct { len: usize, ",
+            "fn each(self: Self, xs: []T) void { ",
+            "outer: for (xs, 0..) |x, i| { print(i); print(x); } } };\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn struct_type_method_defer_and_field_assign_round_trip() {
+        // `defer` / `errdefer` (SPEC §21) and field assignments (SPEC §27)
+        // inside a generic-struct method print inline and round-trip
+        // byte-for-byte: the deferred statement shares the keyword's line, a
+        // compound `self.n += 1;` keeps the `op=` spelling and a plain
+        // `self.v = x;` is unchanged.
+        let src = concat!(
+            "fn Box(comptime T: type) type {\n",
+            "    return struct { v: T, n: i32, ",
+            "fn set(self: *Self, x: T) void { ",
+            "defer self.n += 1; ",
+            "errdefer print(0); ",
+            "self.v = x; } };\n",
             "}\n",
         );
         let once = format_source(src).expect("source formats");

@@ -258,8 +258,7 @@ impl<'a> Parser<'a> {
             return self.parse_import(start);
         }
         let is_pub = self.eat_kw(Kw::Pub);
-        let k = self.peek_kind().clone();
-        match k {
+        match self.peek_kind() {
             TokenKind::Keyword(Kw::Fn) => self.parse_func(is_pub, start),
             TokenKind::Keyword(Kw::Const) => self.parse_const(is_pub, start),
             TokenKind::Keyword(Kw::Test) => {
@@ -429,7 +428,7 @@ impl<'a> Parser<'a> {
     fn parse_type(&mut self) -> PResult<TypeExpr> {
         // `*T` — a single pointer (SPEC §15.1). `parse_type` is only ever
         // called in type position, so a leading `*` here never collides with
-        // the `*` multiplication operator (which lives in `parse_mul`).
+        // the `*` multiplication operator (the tightest `parse_binary` level).
         if self.at_punct(&TokenKind::Star) {
             let start = self.peek_span();
             self.bump(); // `*`
@@ -828,8 +827,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
-        let k = self.peek_kind().clone();
-        match k {
+        match self.peek_kind() {
             TokenKind::Keyword(Kw::Var) | TokenKind::Keyword(Kw::Const) => self.parse_let(),
             TokenKind::Keyword(Kw::Return) => self.parse_return(),
             TokenKind::Keyword(Kw::If) => self.parse_if(),
@@ -1364,11 +1362,11 @@ impl<'a> Parser<'a> {
     /// `((a orelse b) catch c)`. Each operand is a full `or`-expression.
     /// `a orelse b` unwraps an optional; `a catch b` unwraps an error union.
     fn parse_orelse(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_or()?;
+        let mut lhs = self.parse_binary(0)?;
         loop {
             if self.at_kw(Kw::Orelse) {
                 self.bump();
-                let rhs = self.parse_or()?;
+                let rhs = self.parse_binary(0)?;
                 let span = lhs.span().merge(rhs.span());
                 lhs = Expr::Orelse {
                     lhs: Box::new(lhs),
@@ -1389,7 +1387,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                let default = self.parse_or()?;
+                let default = self.parse_binary(0)?;
                 let span = lhs.span().merge(default.span());
                 lhs = Expr::Catch {
                     expr: Box::new(lhs),
@@ -1404,112 +1402,28 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    fn parse_or(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_and()?;
-        while self.at_kw(Kw::Or) {
-            self.bump();
-            let rhs = self.parse_and()?;
-            let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
-                op: BinOp::Or,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
-        }
-        Ok(lhs)
-    }
+    /// The number of binary-operator precedence levels in `binop_at`'s table:
+    /// level 0 is the loosest (`or`), level `BIN_LEVELS - 1` the tightest
+    /// (`* / %`), whose operands are unary expressions.
+    const BIN_LEVELS: usize = 10;
 
-    fn parse_and(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_bitor()?;
-        while self.at_kw(Kw::And) {
+    /// One left-associative infix level of the precedence ladder (SPEC §28.1).
+    /// `level` indexes the rows of `binop_at`; each operand is the next-tighter
+    /// level, and the tightest level's operands are unary expressions. All ten
+    /// binary levels share this loop — only the operator table differs.
+    fn parse_binary(&mut self, level: usize) -> PResult<Expr> {
+        let mut lhs = if level + 1 == Self::BIN_LEVELS {
+            self.parse_unary()?
+        } else {
+            self.parse_binary(level + 1)?
+        };
+        while let Some(op) = self.binop_at(level) {
             self.bump();
-            let rhs = self.parse_bitor()?;
-            let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
-                op: BinOp::And,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
+            let rhs = if level + 1 == Self::BIN_LEVELS {
+                self.parse_unary()?
+            } else {
+                self.parse_binary(level + 1)?
             };
-        }
-        Ok(lhs)
-    }
-
-    /// Bitwise-or level (SPEC §28.1): infix `|` (`BinOp::BitOr`), left-
-    /// associative, binding looser than `^`/`&` but tighter than the `and`
-    /// keyword. The `|` is **infix here only** — it is reached after a left
-    /// operand has already been parsed, so the capture form `| IDENT |`
-    /// (recognised in the `if`/`catch`/`switch` grammar positions, never as an
-    /// expression operand) is unaffected by this level.
-    fn parse_bitor(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_bitxor()?;
-        while self.at_punct(&TokenKind::Pipe) {
-            self.bump();
-            let rhs = self.parse_bitxor()?;
-            let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
-                op: BinOp::BitOr,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
-        }
-        Ok(lhs)
-    }
-
-    /// Bitwise-xor level (SPEC §28.1): infix `^` (`BinOp::BitXor`), left-
-    /// associative, sitting between `|` (looser) and `&` (tighter).
-    fn parse_bitxor(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_bitand()?;
-        while self.at_punct(&TokenKind::Caret) {
-            self.bump();
-            let rhs = self.parse_bitand()?;
-            let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
-                op: BinOp::BitXor,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
-        }
-        Ok(lhs)
-    }
-
-    /// Bitwise-and level (SPEC §28.1): infix `&` (`BinOp::BitAnd`), left-
-    /// associative, binding tighter than `^`/`|` but looser than equality
-    /// (`==`/`!=`), so `x & y == z` parses as `x & (y == z)`. The `&` is
-    /// **infix here only** — it is reached after a left operand, so the prefix
-    /// address-of `&place` (parsed at the unary level, SPEC §15.1) is
-    /// unaffected.
-    fn parse_bitand(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_eq()?;
-        while self.at_punct(&TokenKind::Amp) {
-            self.bump();
-            let rhs = self.parse_eq()?;
-            let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
-                op: BinOp::BitAnd,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
-        }
-        Ok(lhs)
-    }
-
-    /// Equality level (SPEC §28.1): infix `==`/`!=` (`BinOp::Eq`/`Ne`), left-
-    /// associative, binding looser than the relational operators.
-    fn parse_eq(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_rel()?;
-        loop {
-            let op = match self.peek_kind() {
-                TokenKind::EqEq => BinOp::Eq,
-                TokenKind::BangEq => BinOp::Ne,
-                _ => break,
-            };
-            self.bump();
-            let rhs = self.parse_rel()?;
             let span = lhs.span().merge(rhs.span());
             lhs = Expr::Binary {
                 op,
@@ -1521,97 +1435,55 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    /// Relational level (SPEC §28.1): infix `< <= > >=` (`BinOp::Lt`/`Le`/
-    /// `Gt`/`Ge`), left-associative, binding tighter than equality but looser
-    /// than the shift operators.
-    fn parse_rel(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_shift()?;
-        loop {
-            let op = match self.peek_kind() {
-                TokenKind::Lt => BinOp::Lt,
-                TokenKind::Le => BinOp::Le,
-                TokenKind::Gt => BinOp::Gt,
-                TokenKind::Ge => BinOp::Ge,
-                _ => break,
-            };
-            self.bump();
-            let rhs = self.parse_shift()?;
-            let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
+    /// The infix operator at the current token for one precedence `level`, or
+    /// `None` if the current token is not an operator of that level. Rows run
+    /// loosest (0) to tightest (9), pinning the precedence order of SPEC §28.1:
+    /// `or` < `and` < `|` < `^` < `&` < `==`/`!=` < `< <= > >=` < `<<`/`>>`
+    /// < `+`/`-` < `*`/`/`/`%`. Every operator that also has a prefix or
+    /// non-expression reading is only consulted here *after* a left operand
+    /// has been parsed, so those readings are unaffected (see the `|`/`&`
+    /// rows below).
+    fn binop_at(&self, level: usize) -> Option<BinOp> {
+        match (level, self.peek_kind()) {
+            // Logical keywords: `or` binds loosest, then `and`.
+            (0, TokenKind::Keyword(Kw::Or)) => Some(BinOp::Or),
+            (1, TokenKind::Keyword(Kw::And)) => Some(BinOp::And),
+            // Bitwise-or (SPEC §28.1): binding looser than `^`/`&` but tighter
+            // than the `and` keyword. The `|` is **infix here only** — it is
+            // reached after a left operand has already been parsed, so the
+            // capture form `| IDENT |` (recognised in the `if`/`catch`/`switch`
+            // grammar positions, never as an expression operand) is unaffected
+            // by this row.
+            (2, TokenKind::Pipe) => Some(BinOp::BitOr),
+            // Bitwise-xor (SPEC §28.1): between `|` (looser) and `&` (tighter).
+            (3, TokenKind::Caret) => Some(BinOp::BitXor),
+            // Bitwise-and (SPEC §28.1): binding tighter than `^`/`|` but looser
+            // than equality (`==`/`!=`), so `x & y == z` parses as
+            // `x & (y == z)`. The `&` is **infix here only** — it is reached
+            // after a left operand, so the prefix address-of `&place` (parsed
+            // at the unary level, SPEC §15.1) is unaffected.
+            (4, TokenKind::Amp) => Some(BinOp::BitAnd),
+            // Equality (SPEC §28.1): looser than the relational operators.
+            (5, TokenKind::EqEq) => Some(BinOp::Eq),
+            (5, TokenKind::BangEq) => Some(BinOp::Ne),
+            // Relational (SPEC §28.1): tighter than equality but looser than
+            // the shift operators.
+            (6, TokenKind::Lt) => Some(BinOp::Lt),
+            (6, TokenKind::Le) => Some(BinOp::Le),
+            (6, TokenKind::Gt) => Some(BinOp::Gt),
+            (6, TokenKind::Ge) => Some(BinOp::Ge),
+            // Shift (SPEC §28.1): tighter than relational but looser than
+            // additive (`+`/`-`), so `1 << 2 + 3` parses as `1 << (2 + 3)`.
+            (7, TokenKind::Shl) => Some(BinOp::Shl),
+            (7, TokenKind::Shr) => Some(BinOp::Shr),
+            // Additive, then multiplicative — the two tightest binary levels.
+            (8, TokenKind::Plus) => Some(BinOp::Add),
+            (8, TokenKind::Minus) => Some(BinOp::Sub),
+            (9, TokenKind::Star) => Some(BinOp::Mul),
+            (9, TokenKind::Slash) => Some(BinOp::Div),
+            (9, TokenKind::Percent) => Some(BinOp::Rem),
+            _ => None,
         }
-        Ok(lhs)
-    }
-
-    /// Shift level (SPEC §28.1): infix `<<`/`>>` (`BinOp::Shl`/`Shr`), left-
-    /// associative, binding tighter than the relational operators but looser
-    /// than additive (`+`/`-`), so `1 << 2 + 3` parses as `1 << (2 + 3)`.
-    fn parse_shift(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_add()?;
-        loop {
-            let op = match self.peek_kind() {
-                TokenKind::Shl => BinOp::Shl,
-                TokenKind::Shr => BinOp::Shr,
-                _ => break,
-            };
-            self.bump();
-            let rhs = self.parse_add()?;
-            let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_add(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_mul()?;
-        loop {
-            let op = match self.peek_kind() {
-                TokenKind::Plus => BinOp::Add,
-                TokenKind::Minus => BinOp::Sub,
-                _ => break,
-            };
-            self.bump();
-            let rhs = self.parse_mul()?;
-            let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_mul(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_unary()?;
-        loop {
-            let op = match self.peek_kind() {
-                TokenKind::Star => BinOp::Mul,
-                TokenKind::Slash => BinOp::Div,
-                TokenKind::Percent => BinOp::Rem,
-                _ => break,
-            };
-            self.bump();
-            let rhs = self.parse_unary()?;
-            let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
-        }
-        Ok(lhs)
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
@@ -2751,6 +2623,38 @@ mod tests {
         }
     }
 
+    /// `-` is left-associative: `a - b - c` ==> `((a - b) - c)`.
+    #[test]
+    fn sub_is_left_associative() {
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Minus,
+            id("b"),
+            TokenKind::Minus,
+            id("c"),
+        ]);
+        match e {
+            Expr::Binary {
+                op: BinOp::Sub,
+                lhs,
+                rhs,
+                ..
+            } => {
+                assert!(
+                    matches!(*lhs, Expr::Binary { op: BinOp::Sub, .. }),
+                    "expected `a - b` on the left, got {:?}",
+                    lhs
+                );
+                assert!(
+                    matches!(*rhs, Expr::Ident { .. }),
+                    "expected `c` on the right, got {:?}",
+                    rhs
+                );
+            }
+            other => panic!("expected `-` at the root, got {:?}", other),
+        }
+    }
+
     // ---- v0.132: bitwise & shift operators (SPEC §28) ---------------------
 
     /// Each infix bitwise/shift operator parses to its `BinOp`.
@@ -2813,6 +2717,31 @@ mod tests {
                 ..
             } => assert!(matches!(*expr, Expr::Field { .. }), "got {:?}", expr),
             other => panic!("expected `~(a.b)`, got {:?}", other),
+        }
+    }
+
+    /// `|` binds tighter than the `and` keyword: `a and b | c` ==>
+    /// `a and (b | c)`.
+    #[test]
+    fn precedence_and_bitor() {
+        let e = parse_assign_rhs(vec![
+            id("a"),
+            TokenKind::Keyword(Kw::And),
+            id("b"),
+            TokenKind::Pipe,
+            id("c"),
+        ]);
+        match e {
+            Expr::Binary {
+                op: BinOp::And,
+                rhs,
+                ..
+            } => assert!(
+                matches!(*rhs, Expr::Binary { op: BinOp::BitOr, .. }),
+                "expected `|` on the right of `and`, got {:?}",
+                rhs
+            ),
+            other => panic!("expected `and` at the root, got {:?}", other),
         }
     }
 

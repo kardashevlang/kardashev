@@ -29,7 +29,7 @@ use emit_c::EmitMode;
 
 /// The toolchain version. Single source of truth; keep in sync with
 /// `Cargo.toml` and `CHANGELOG.md`.
-pub const VERSION: &str = "0.150.0";
+pub const VERSION: &str = "0.151.0";
 
 /// Front-to-middle pipeline: lex, parse and type-check `src`, then lower the
 /// validated module to C source text for `mode`.
@@ -73,9 +73,4 @@ fn has_main(module: &ast::Module) -> bool {
         .items
         .iter()
         .any(|it| matches!(it, ast::Item::Func(f) if f.name == "main"))
-}
-
-/// Parse and re-emit `src` in canonical form (used by `kard fmt`).
-pub fn format(src: &str) -> Result<String, Vec<Diagnostic>> {
-    fmt::format_source(src)
 }

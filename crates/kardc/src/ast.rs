@@ -587,3 +587,196 @@ impl Expr {
         }
     }
 }
+
+/// Shared test-fixture constructors for the sema / fmt / emit_c test modules.
+///
+/// These build the AST shapes the unit tests exercise, with every flag
+/// defaulted and [`Span::DUMMY`] spans. The full set of [`TypeExpr`] fields is
+/// spelled exactly once, in [`fixtures::ty`]; every variant constructor is a
+/// functional-record-update over it, so adding a field to [`TypeExpr`] only
+/// touches `ty`. The parser's exhaustive `TypeExpr` literals (with real merged
+/// spans) are intentionally *not* routed through here.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::{ArraySize, BinOp, Block, Expr, Stmt, TypeExpr};
+    use crate::span::Span;
+
+    /// A bare named type expression `name` — the ONLY place that spells all
+    /// `TypeExpr` fields and their defaults.
+    pub fn ty(name: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: false,
+            error_union: false,
+            error_set: None,
+            array_len: None,
+            pointer: false,
+            slice: false,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// An optional type expression `?name` (v0.114).
+    pub fn opt_ty(name: &str) -> TypeExpr {
+        TypeExpr {
+            optional: true,
+            ..ty(name)
+        }
+    }
+
+    /// An error-union type expression `!name` over the implicit global error
+    /// set (v0.115).
+    pub fn err_ty(name: &str) -> TypeExpr {
+        TypeExpr {
+            error_union: true,
+            ..ty(name)
+        }
+    }
+
+    /// A *named* error-union type expression `set!name` — the error union over
+    /// the named error set `set` with payload type `name` (v0.139). Its runtime
+    /// representation is identical to [`err_ty`]; the set name is a pure sema
+    /// constraint.
+    pub fn set_err_ty(set: &str, name: &str) -> TypeExpr {
+        TypeExpr {
+            error_union: true,
+            error_set: Some(set.to_string()),
+            ..ty(name)
+        }
+    }
+
+    /// A fixed-size array type expression `[len]name` with a literal length
+    /// (v0.117).
+    pub fn arr_ty(name: &str, len: i64) -> TypeExpr {
+        TypeExpr {
+            array_len: Some(ArraySize::Lit(len)),
+            ..ty(name)
+        }
+    }
+
+    /// An array type expression `[param]name` whose length is the comptime
+    /// value-parameter `param` (v0.128).
+    pub fn arr_param_ty(name: &str, param: &str) -> TypeExpr {
+        TypeExpr {
+            array_len: Some(ArraySize::Param(param.to_string())),
+            ..ty(name)
+        }
+    }
+
+    /// A pointer type expression `*name` (v0.118).
+    pub fn ptr_ty(name: &str) -> TypeExpr {
+        TypeExpr {
+            pointer: true,
+            ..ty(name)
+        }
+    }
+
+    /// A slice type expression `[]name` (v0.118).
+    pub fn slice_ty(name: &str) -> TypeExpr {
+        TypeExpr {
+            slice: true,
+            ..ty(name)
+        }
+    }
+
+    /// An identifier expression `name`.
+    pub fn ident(name: &str) -> Expr {
+        Expr::Ident {
+            name: name.to_string(),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// An integer literal expression.
+    pub fn int(value: i64) -> Expr {
+        Expr::Int {
+            value,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A binary expression `lhs op rhs`.
+    pub fn bin(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
+        Expr::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A call expression `callee(args…)`.
+    pub fn call(callee: &str, args: Vec<Expr>) -> Expr {
+        Expr::Call {
+            callee: callee.to_string(),
+            args,
+            span: Span::DUMMY,
+        }
+    }
+
+    /// The `null` literal (v0.114).
+    pub fn null() -> Expr {
+        Expr::Null { span: Span::DUMMY }
+    }
+
+    /// `lhs orelse rhs` — optional defaulting (v0.114).
+    pub fn orelse(lhs: Expr, rhs: Expr) -> Expr {
+        Expr::Orelse {
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `expr.?` — optional unwrap (v0.114).
+    pub fn unwrap(expr: Expr) -> Expr {
+        Expr::Unwrap {
+            expr: Box::new(expr),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// An error literal `error.name` (v0.115).
+    pub fn error_lit(name: &str) -> Expr {
+        Expr::ErrorLit {
+            name: name.to_string(),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `try expr` — error propagation (v0.115).
+    pub fn try_expr(expr: Expr) -> Expr {
+        Expr::Try {
+            expr: Box::new(expr),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `expr catch default` — the non-capturing handler form (v0.115).
+    pub fn catch_expr(expr: Expr, default: Expr) -> Expr {
+        Expr::Catch {
+            expr: Box::new(expr),
+            capture: None,
+            default: Box::new(default),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// `expr catch |name| default` — the capturing handler form (v0.142, §36).
+    pub fn catch_capture_expr(expr: Expr, name: &str, default: Expr) -> Expr {
+        Expr::Catch {
+            expr: Box::new(expr),
+            capture: Some(name.to_string()),
+            default: Box::new(default),
+            span: Span::DUMMY,
+        }
+    }
+
+    /// A block `{ stmts… }`.
+    pub fn block(stmts: Vec<Stmt>) -> Block {
+        Block {
+            stmts,
+            span: Span::DUMMY,
+        }
+    }
+}

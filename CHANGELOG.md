@@ -18,6 +18,50 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.151.0] — Optimization sweep: fast dev loop + internal dedup
+
+A codebase-optimization release. Every change was adversarially verified to be
+behavior-preserving: the generated C is **byte-identical** for all 39 examples
+(plus two 3,200-line stress inputs) before and after.
+
+### Changed
+- **`kard run` and `kard test` build dev binaries at `-O0`** (previously
+  `-O2`). The C compile is ~97% of edit-run latency and `-O2` specifically was
+  the bulk of it, so the dev loop gets several times faster on non-trivial
+  programs. `kard build`, `kard bench` (which reports per-test wall-clock
+  timing) and cross-compiles stay `-O2`.
+- **New `--release` flag on `run`/`test`** restores `-O2` for compute-heavy
+  programs. SPEC §5 documents the split.
+
+### Internal
+- `emit_c`: generic-struct instance lowering no longer deep-clones the
+  constructor AST (8 full-AST clones per instance across the 4 emit passes →
+  borrowed `&Func`/`&[Func]`); the `generics` map shares `Rc<Func>` instead of
+  re-cloning whole function bodies per generic call; six defensive `.to_vec()`
+  list copies dropped; the two ~95-line panic/io AST walkers unified into one
+  predicate-parameterized walker; per-pass boilerplate factored into
+  `with_self_bound`/`each_instance_method`/`each_instantiation`; method
+  resolution rekeyed by struct id (no `(String, String)` key allocation per
+  method-call lowering).
+- `sema`: the duplicate `Checker.type_aliases` map is gone —
+  `StructTable::type_aliases` is the single source of truth; per-call signature
+  `Vec` clones became slice borrows; 14 identical error-recovery loops and the
+  triplicated operand-validation block collapsed into helpers (diagnostics
+  byte-identical); four dead accessors deleted.
+- `parser`: the ten copy-pasted left-associative precedence functions collapsed
+  into one table-driven `parse_binary(level)`/`binop_at` pair (net −71 lines),
+  with the SPEC precedence notes moved onto the table rows and two new
+  precedence pin tests; statement/item dispatch no longer clones the lookahead
+  token.
+- `fmt`: the statement *spelling* shared by the multi-line and inline printers
+  is single-sourced in 7 pure helpers (layout intentionally stays per-printer);
+  3 new byte-exact round-trip pin tests for previously-unpinned inline forms.
+- Test fixtures: the TypeExpr/Expr constructor helpers triplicated across the
+  sema/fmt/emit_c test modules now live once in `ast::fixtures` (net −333
+  lines).
+- Dead `kardc::format` wrapper and `Span::slice` deleted.
+- 963 unit + 44 e2e tests (8 new pin tests).
+
 ## [0.150.0] — Test filtering + `kard bench`
 
 The capstone of **Arc 4** (v0.141–v0.150 complete).

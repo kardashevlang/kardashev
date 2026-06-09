@@ -12,6 +12,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use crate::backend::OptLevel;
 use crate::build_system::{BuildSpec, Target};
 use crate::emit_c::EmitMode;
 
@@ -36,17 +37,19 @@ Commands:
             which cross-compiles without a target sysroot; its default OUT is
             the source/target name with a `.o` extension. See `targets`.
 
-    run   [FILE|TARGET] [-- ARGS...]
+    run   [FILE|TARGET] [--release] [-- ARGS...]
             Build to a temporary executable, run it, and propagate its exit
             code. Arguments after `--` are passed through to the program. With
             no argument and multiple targets in ./build.ks, a TARGET name is
-            required.
+            required. Builds an unoptimized dev binary (-O0) by default;
+            --release restores -O2.
 
-    test  [FILE|TARGET] [--filter SUBSTR]
+    test  [FILE|TARGET] [--filter SUBSTR] [--release]
             Build and run the test harness; reports pass/fail counts and
             exits non-zero if any test fails. --filter runs only the tests
             whose name contains SUBSTR. With no argument and multiple
-            targets in ./build.ks, a TARGET name is required.
+            targets in ./build.ks, a TARGET name is required. Builds an
+            unoptimized dev binary (-O0) by default; --release restores -O2.
 
     bench [FILE|TARGET]
             Build and run the test harness with per-test wall-clock timing
@@ -88,15 +91,19 @@ enum Command {
         /// `-c` / `--emit obj`: compile to an object file only (no link).
         object_only: bool,
     },
-    /// `run [FILE] [-- ARGS...]`
+    /// `run [FILE] [--release] [-- ARGS...]`
     Run {
         file: Option<String>,
         args: Vec<String>,
+        /// `--release`: build at `-O2` instead of the `-O0` dev default.
+        release: bool,
     },
-    /// `test [FILE] [--filter SUBSTR]`
+    /// `test [FILE] [--filter SUBSTR] [--release]`
     Test {
         file: Option<String>,
         filter: Option<String>,
+        /// `--release`: build at `-O2` instead of the `-O0` dev default.
+        release: bool,
     },
     /// `bench [FILE]` — run the tests with per-test wall-clock timing (v0.150).
     Bench { file: Option<String> },
@@ -153,8 +160,16 @@ pub fn run(args: Vec<String>) -> ExitCode {
             target,
             object_only,
         } => cmd_build(file, out, target, object_only),
-        Command::Run { file, args } => cmd_run(file, args),
-        Command::Test { file, filter } => cmd_test(file, filter),
+        Command::Run {
+            file,
+            args,
+            release,
+        } => cmd_run(file, args, release),
+        Command::Test {
+            file,
+            filter,
+            release,
+        } => cmd_test(file, filter, release),
         Command::Bench { file } => cmd_bench(file),
         Command::Fmt { file, mode } => cmd_fmt(file, mode),
         Command::Doc { file } => cmd_doc(file),
@@ -259,6 +274,7 @@ fn parse_run(rest: &[&str]) -> Result<Command, String> {
     let mut file: Option<String> = None;
     let mut prog_args: Vec<String> = Vec::new();
     let mut after_dd = false;
+    let mut release = false;
 
     for &a in rest {
         if after_dd {
@@ -267,6 +283,8 @@ fn parse_run(rest: &[&str]) -> Result<Command, String> {
             after_dd = true;
         } else if a == "-h" || a == "--help" {
             return Ok(Command::Help);
+        } else if a == "--release" {
+            release = true;
         } else if a.starts_with('-') {
             return Err(format!("unknown flag `{a}` for `run`"));
         } else if file.is_some() {
@@ -281,12 +299,14 @@ fn parse_run(rest: &[&str]) -> Result<Command, String> {
     Ok(Command::Run {
         file,
         args: prog_args,
+        release,
     })
 }
 
 fn parse_test(rest: &[&str]) -> Result<Command, String> {
     let mut file: Option<String> = None;
     let mut filter: Option<String> = None;
+    let mut release = false;
     let mut it = rest.iter();
     while let Some(&a) = it.next() {
         if a == "-h" || a == "--help" {
@@ -299,6 +319,10 @@ fn parse_test(rest: &[&str]) -> Result<Command, String> {
             }
             continue;
         }
+        if a == "--release" {
+            release = true;
+            continue;
+        }
         if a.starts_with('-') {
             return Err(format!("unknown flag `{a}` for `test`"));
         }
@@ -307,7 +331,11 @@ fn parse_test(rest: &[&str]) -> Result<Command, String> {
         }
         file = Some(a.to_string());
     }
-    Ok(Command::Test { file, filter })
+    Ok(Command::Test {
+        file,
+        filter,
+        release,
+    })
 }
 
 fn parse_bench(rest: &[&str]) -> Result<Command, String> {
@@ -637,10 +665,12 @@ fn cmd_build(
     }
 
     // Cross-compilation / object-emit options are uniform across every target
-    // in the build, so the backend options are built once.
+    // in the build, so the backend options are built once. `kard build`
+    // produces real artifacts, so it always compiles optimized (`-O2`).
     let opts = crate::backend::BuildOptions {
         target,
         object_only,
+        opt: OptLevel::O2,
     };
 
     for src in &sources {
@@ -679,13 +709,16 @@ fn cmd_targets() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_run(file: Option<String>, prog_args: Vec<String>) -> ExitCode {
+fn cmd_run(file: Option<String>, prog_args: Vec<String>, release: bool) -> ExitCode {
     let (_src, c) = match compile_source(file, EmitMode::Program) {
         Ok(v) => v,
         Err(()) => return ExitCode::FAILURE,
     };
 
-    match crate::backend::cc_build_and_run(&c, &prog_args) {
+    // `run` builds a throwaway dev binary, so it defaults to a fast `-O0`
+    // compile; `--release` restores `-O2`.
+    let opt = if release { OptLevel::O2 } else { OptLevel::O0 };
+    match crate::backend::cc_build_and_run(&c, &prog_args, opt) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("error: {e}");
@@ -694,7 +727,7 @@ fn cmd_run(file: Option<String>, prog_args: Vec<String>) -> ExitCode {
     }
 }
 
-fn cmd_test(file: Option<String>, filter: Option<String>) -> ExitCode {
+fn cmd_test(file: Option<String>, filter: Option<String>, release: bool) -> ExitCode {
     let (_src, c) = match compile_source(file, EmitMode::Test) {
         Ok(v) => v,
         Err(()) => return ExitCode::FAILURE,
@@ -707,10 +740,14 @@ fn cmd_test(file: Option<String>, filter: Option<String>) -> ExitCode {
         None => Vec::new(),
     };
 
+    // `test` builds a throwaway dev harness, so it defaults to a fast `-O0`
+    // compile; `--release` restores `-O2`.
+    let opt = if release { OptLevel::O2 } else { OptLevel::O0 };
+
     // The harness itself prints per-test `ok:`/`FAIL:` lines and a final
     // `<passed>/<total> tests passed` summary to stderr, and exits with the
     // failure count. We add a one-line outcome summary on stdout.
-    match crate::backend::cc_build_and_run(&c, &args) {
+    match crate::backend::cc_build_and_run(&c, &args, opt) {
         Ok(0) => {
             println!("all tests passed");
             ExitCode::SUCCESS
@@ -733,7 +770,9 @@ fn cmd_bench(file: Option<String>) -> ExitCode {
         Ok(v) => v,
         Err(()) => return ExitCode::FAILURE,
     };
-    match crate::backend::cc_build_and_run(&c, &["--bench".to_string()]) {
+    // Benchmarks report per-test wall-clock times, so the harness must stay
+    // optimized: always `-O2`.
+    match crate::backend::cc_build_and_run(&c, &["--bench".to_string()], OptLevel::O2) {
         Ok(0) => {
             println!("all benchmarks ran");
             ExitCode::SUCCESS
@@ -1146,6 +1185,7 @@ mod tests {
             Command::Run {
                 file: Some("main.ks".to_string()),
                 args: vec!["alpha".to_string(), "-V".to_string(), "beta".to_string()],
+                release: false,
             }
         );
     }
@@ -1157,6 +1197,7 @@ mod tests {
             Command::Run {
                 file: None,
                 args: vec![],
+                release: false,
             }
         );
     }
@@ -1168,6 +1209,28 @@ mod tests {
             Command::Run {
                 file: None,
                 args: vec!["x".to_string()],
+                release: false,
+            }
+        );
+    }
+
+    #[test]
+    fn run_release_flag() {
+        assert_eq!(
+            parse(&["run", "--release", "f.ks"]).unwrap(),
+            Command::Run {
+                file: Some("f.ks".to_string()),
+                args: vec![],
+                release: true,
+            }
+        );
+        // After `--`, `--release` is a program argument, not our flag.
+        assert_eq!(
+            parse(&["run", "f.ks", "--", "--release"]).unwrap(),
+            Command::Run {
+                file: Some("f.ks".to_string()),
+                args: vec!["--release".to_string()],
+                release: false,
             }
         );
     }
@@ -1179,13 +1242,15 @@ mod tests {
             Command::Test {
                 file: Some("t.ks".to_string()),
                 filter: None,
+                release: false,
             }
         );
         assert_eq!(
             parse(&["test"]).unwrap(),
             Command::Test {
                 file: None,
-                filter: None
+                filter: None,
+                release: false,
             }
         );
     }
@@ -1197,6 +1262,7 @@ mod tests {
             Command::Test {
                 file: Some("t.ks".to_string()),
                 filter: Some("math".to_string()),
+                release: false,
             }
         );
         assert!(parse(&["test", "--filter"]).is_err()); // needs an argument
@@ -1207,6 +1273,28 @@ mod tests {
             }
         );
         assert_eq!(parse(&["bench"]).unwrap(), Command::Bench { file: None });
+    }
+
+    #[test]
+    fn test_release_flag_combines_with_filter() {
+        assert_eq!(
+            parse(&["test", "t.ks", "--release"]).unwrap(),
+            Command::Test {
+                file: Some("t.ks".to_string()),
+                filter: None,
+                release: true,
+            }
+        );
+        assert_eq!(
+            parse(&["test", "t.ks", "--release", "--filter", "math"]).unwrap(),
+            Command::Test {
+                file: Some("t.ks".to_string()),
+                filter: Some("math".to_string()),
+                release: true,
+            }
+        );
+        // `bench` is always optimized; it takes no `--release` flag.
+        assert!(parse(&["bench", "--release"]).is_err());
     }
 
     #[test]
