@@ -77,6 +77,11 @@ jobs:
           printf 'pub fn triple(n: i32) i32 { return n * 3; }\n' > "$md/util.ks"
           printf '@import("util.ks");\npub fn main() i32 { print(triple(7)); return 0; }\n' > "$md/main.ks"
           ( cd "$md" && [ "$("$KARD" run main.ks)" = "21" ] )
+          # Doc generation (v0.140): `kard doc` renders a public item + its `///`.
+          dd="$(mktemp -d)"
+          printf '/// Add two integers.\npub fn add(a: i32, b: i32) i32 { return a + b; }\npub fn main() i32 { return 0; }\n' > "$dd/lib.ks"
+          "$KARD" doc "$dd/lib.ks" | grep -q 'fn add(a: i32, b: i32) i32'
+          "$KARD" doc "$dd/lib.ks" | grep -q 'Add two integers.'
           # Cross-compilation plumbing (v0.123): `targets` lists triples, and
           # `-target <host triple>` exercises clang's --target end to end (the
           # host triple always has its sysroot, so it links + runs).
