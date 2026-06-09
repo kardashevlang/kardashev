@@ -136,14 +136,23 @@ pub struct TypeExpr {
     /// True if written as `!T` (an error union). v0.115: implicit global error
     /// set; not combined with `optional`.
     pub error_union: bool,
-    /// `Some(N)` if written as `[N]T` (a fixed-size array of `N` elements);
-    /// `name` is then the element type. v0.117: not combined with `?`/`!`.
-    pub array_len: Option<i64>,
+    /// `Some(..)` if written as `[N]T` (a fixed-size array); `name` is then the
+    /// element type. The size is a literal (`[3]T`, v0.117) or a comptime
+    /// value-parameter name (`[n]T`, v0.128). Not combined with `?`/`!`.
+    pub array_len: Option<ArraySize>,
     /// True if written as `*T` (a single pointer to `T`). v0.118.
     pub pointer: bool,
     /// True if written as `[]T` (a slice of `T`). v0.118.
     pub slice: bool,
     pub span: Span,
+}
+
+/// The size of an array type `[N]T`: a literal (`[3]T`) or a comptime
+/// value-parameter name (`[n]T`, resolved per monomorphisation, v0.128).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArraySize {
+    Lit(i64),
+    Param(String),
 }
 
 /// A brace-delimited sequence of statements that introduces a new scope.

@@ -81,13 +81,13 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    BinOp, Block, Expr, FieldInit, Func, Item, Module, Param, Stmt, StructDecl, SwitchArm,
-    TestBlock, TypeExpr, UnOp,
+    ArraySize, BinOp, Block, Expr, FieldInit, Func, Item, Module, Param, Stmt, StructDecl,
+    SwitchArm, TestBlock, TypeExpr, UnOp,
 };
 use crate::const_eval::{self, ConstVal};
 use crate::diag::Diagnostic;
 use crate::span::Span;
-use crate::types::{StructTable, Type};
+use crate::types::{ComptimeArg, StructTable, Type};
 
 /// One-pass semantic check of a whole module. On success, returns the resolved
 /// [`StructTable`] (consumed by the backend); on failure, every diagnostic.
@@ -152,10 +152,16 @@ struct Checker {
     /// normal pass; when non-empty, `resolve_type` / `resolve_type_opt` map a
     /// bound type-parameter name to its concrete [`Type`].
     subst: HashMap<String, Type>,
+    /// The active comptime **value**-parameter substitution while checking a
+    /// generic function's instantiated body (v0.128, SPEC §24.2). Empty during
+    /// the normal pass; when non-empty, an `ArraySize::Param(n)` resolves to the
+    /// bound `i64` length and a reference to `n` folds to that value in a
+    /// constant context.
+    value_subst: HashMap<String, i64>,
     /// Generic function definitions (any `comptime`-typed parameter), keyed by
     /// name. Stored as full ASTs because a generic function is type-checked per
     /// concrete instantiation at its call sites rather than in the normal body
-    /// pass (SPEC §17.2).
+    /// pass (SPEC §17.2 / §24.2).
     generics: HashMap<String, Func>,
 }
 
@@ -173,8 +179,25 @@ impl Checker {
             loop_depth: 0,
             ret_type: Type::Void,
             subst: HashMap::new(),
+            value_subst: HashMap::new(),
             generics: HashMap::new(),
         }
+    }
+
+    /// The constant environment for compile-time evaluation: the top-level
+    /// consts plus any comptime **value** parameters bound in the active
+    /// instantiation (each folded to an `i64`), so that a value-parameter
+    /// reference evaluates to its bound value (SPEC §24.2). During the normal
+    /// pass `value_subst` is empty, so this is exactly the top-level consts.
+    fn const_env(&self) -> HashMap<String, ConstVal> {
+        if self.value_subst.is_empty() {
+            return self.consts.clone();
+        }
+        let mut env = self.consts.clone();
+        for (name, &v) in &self.value_subst {
+            env.insert(name.clone(), ConstVal::Int(v));
+        }
+        env
     }
 
     fn error(&mut self, span: Span, code: &'static str, message: impl Into<String>) {
@@ -327,12 +350,18 @@ impl Checker {
                     );
                 }
                 if is_generic(f) {
-                    // Each `comptime` parameter must be annotated `type` (E0250).
+                    // Each `comptime` parameter must be either a *type* parameter
+                    // (annotated `type`, v0.120) or a *value* parameter of an
+                    // integer type (`comptime n: usize`, v0.128). Anything else
+                    // (a non-integer value annotation, or a composite wrapper) is
+                    // `E0250`.
                     for p in &f.params {
-                        if p.is_comptime && !is_type_kw(&p.ty) {
+                        if p.is_comptime && !is_type_kw(&p.ty) && !self.is_value_param_annotation(&p.ty)
+                        {
                             let msg = format!(
                                 "`comptime` parameter `{}` must be a type parameter \
-                                 (annotated `type`), found `{}`",
+                                 (annotated `type`) or a value parameter of an integer \
+                                 type, found `{}`",
                                 p.name, p.ty.name
                             );
                             self.error(p.span, "E0250", msg);
@@ -582,24 +611,29 @@ impl Checker {
             Some(t) => t,
             None => self.resolve_base(&te.name)?,
         };
-        Some(self.wrap_type(inner, te))
+        // The (small) value substitution is cloned so `wrap_type` can borrow it
+        // while still taking `&mut self` for array interning. It is empty during
+        // the normal pass, so this is a no-cost clone there.
+        let value_subst = self.value_subst.clone();
+        Some(self.wrap_type(inner, te, &value_subst))
     }
 
-    /// Like [`resolve_type_opt`], but consults an explicit substitution `subst`
-    /// instead of the (caller-context) `self.subst`. Used at a generic call site
-    /// to resolve the callee's runtime-parameter and return types under the
-    /// callee's freshly-built substitution while `self.subst` still holds the
-    /// caller's (SPEC §17.2).
+    /// Like [`resolve_type_opt`], but consults explicit type and comptime-value
+    /// substitutions instead of the (caller-context) `self.subst` /
+    /// `self.value_subst`. Used at a generic call site to resolve the callee's
+    /// runtime-parameter and return types under the callee's freshly-built
+    /// substitutions while `self`'s still hold the caller's (SPEC §17.2 / §24.2).
     fn resolve_type_opt_with(
         &mut self,
         te: &TypeExpr,
         subst: &HashMap<String, Type>,
+        value_subst: &HashMap<String, i64>,
     ) -> Option<Type> {
         let inner = match subst.get(&te.name).copied() {
             Some(t) => t,
             None => self.resolve_base(&te.name)?,
         };
-        Some(self.wrap_type(inner, te))
+        Some(self.wrap_type(inner, te, value_subst))
     }
 
     /// Resolve a bare type *name* (no `?`/`!`/`[N]`/`*`/`[]` wrappers) to a
@@ -617,15 +651,21 @@ impl Checker {
     /// (v0.118) take precedence and return directly (they are not combined with
     /// `?`/`!`/`[N]` in v1); then `[N]T` (v0.117), then `?T` (v0.114) / `!T`
     /// (v0.115); a bare name returns `inner` unchanged.
-    fn wrap_type(&mut self, inner: Type, te: &TypeExpr) -> Type {
+    fn wrap_type(
+        &mut self,
+        inner: Type,
+        te: &TypeExpr,
+        value_subst: &HashMap<String, i64>,
+    ) -> Type {
         if te.pointer {
             return Type::Ptr(self.structs.intern_ptr(inner));
         }
         if te.slice {
             return Type::Slice(self.structs.intern_slice(inner));
         }
-        if let Some(n) = te.array_len {
-            return Type::Array(self.intern_array_len(inner, n, te.span));
+        if let Some(size) = &te.array_len {
+            let len = self.resolve_array_size(size, te.span, value_subst);
+            return Type::Array(self.intern_array_len(inner, len, te.span));
         }
         if te.optional {
             Type::Optional(self.structs.intern_optional(inner))
@@ -633,6 +673,34 @@ impl Checker {
             Type::ErrorUnion(self.structs.intern_error_union(inner))
         } else {
             inner
+        }
+    }
+
+    /// Resolve an array size `[N]T` (SPEC §14.1 / §24.2) to its concrete length:
+    /// a literal `[3]T` is its value; a comptime value-parameter form `[n]T`
+    /// resolves `n` through the active value substitution (the bound `i64`). A
+    /// `[n]T` whose `n` is *not* a comptime value parameter in scope (e.g. used
+    /// outside any generic, or a stray name) is `E0253`; the array is then
+    /// interned with length 0 so resolution still yields a usable type.
+    fn resolve_array_size(
+        &mut self,
+        size: &ArraySize,
+        span: Span,
+        value_subst: &HashMap<String, i64>,
+    ) -> i64 {
+        match size {
+            ArraySize::Lit(n) => *n,
+            ArraySize::Param(name) => match value_subst.get(name) {
+                Some(&v) => v,
+                None => {
+                    let msg = format!(
+                        "array size `{}` is not a comptime value parameter in scope",
+                        name
+                    );
+                    self.error(span, "E0253", msg);
+                    0
+                }
+            },
         }
     }
 
@@ -691,8 +759,11 @@ impl Checker {
         };
         // Apply any `*T` / `[]T` / `[N]T` / `?T` / `!T` wrappers around the
         // resolved base type (the base having passed the forward/cyclic-reference
-        // rules above). Identical to the wrapping in `resolve_type_opt`.
-        Some(self.wrap_type(inner, te))
+        // rules above). Identical to the wrapping in `resolve_type_opt`. A struct
+        // field's array size is always a literal — comptime value parameters are
+        // never in scope here — so the value substitution is empty (a `[n]T`
+        // field would be `E0253`).
+        Some(self.wrap_type(inner, te, &HashMap::new()))
     }
 
     // ---- statements -------------------------------------------------------
@@ -1589,9 +1660,12 @@ impl Checker {
             Expr::Call { callee, args, span } => self.check_call(callee, args, *span),
             Expr::Comptime { expr: inner, .. } => {
                 // A `comptime` expression must be const-evaluable over the
-                // top-level consts. Its type follows the folded value (with
-                // integer-literal polymorphism applied to int results).
-                match const_eval::eval(inner, &self.consts) {
+                // top-level consts (plus any comptime value parameters bound in
+                // the active instantiation, SPEC §24.2). Its type follows the
+                // folded value (with integer-literal polymorphism applied to int
+                // results).
+                let env = self.const_env();
+                match const_eval::eval(inner, &env) {
                     Ok(ConstVal::Int(_)) => Some(match expected {
                         Some(t) if t.is_int() => t,
                         _ => Type::I64,
@@ -2816,15 +2890,19 @@ impl Checker {
         }
     }
 
-    // ---- comptime generics (v0.120) ---------------------------------------
+    // ---- comptime generics (v0.120) + value parameters (v0.128) ------------
 
-    /// Type-check a call `g(T1, …, Tk, a1, …)` to the generic function `gen`
-    /// (SPEC §17.2). The leading arguments — one per `comptime` type parameter —
-    /// must be identifiers naming concrete types; they build a substitution
-    /// under which the remaining (runtime) arguments are checked against the
-    /// substituted parameter types and which yields the substituted return type.
-    /// A newly-seen instantiation is recorded and its body type-checked under the
-    /// substitution, which may transitively discover further instantiations.
+    /// Type-check a call `g(C1, …, Ck, a1, …)` to the generic function `gen`
+    /// (SPEC §17.2 / §24.2). The leading arguments — one per `comptime`
+    /// parameter — bind it: a *type* parameter to a `Type` (the argument names a
+    /// concrete type), a *value* parameter to an `i64` (the argument
+    /// const-evaluates to an integer). They build a type substitution and a value
+    /// substitution under which the remaining (runtime) arguments are checked
+    /// against the substituted parameter types (so `[n]T` becomes `[<value>]T`)
+    /// and which yield the substituted return type. A newly-seen instantiation is
+    /// recorded (keyed on the ordered comptime arguments) and its body
+    /// type-checked under the substitutions, which may transitively discover
+    /// further instantiations.
     fn check_generic_call(&mut self, gen: &Func, args: &[Expr], span: Span) -> Option<Type> {
         let comptime_params: Vec<&Param> = gen.params.iter().filter(|p| p.is_comptime).collect();
         let runtime_params: Vec<&Param> = gen.params.iter().filter(|p| !p.is_comptime).collect();
@@ -2843,23 +2921,37 @@ impl Checker {
             return None;
         }
 
-        // Resolve the leading type arguments and build the substitution. A type
-        // argument must be an identifier naming a concrete type (E0251).
-        let mut type_args: Vec<Type> = Vec::with_capacity(k);
+        // Resolve the leading comptime arguments and build the substitutions. A
+        // *type* parameter binds to a `Type` from an identifier naming a concrete
+        // type (E0251); a *value* parameter binds to an `i64` obtained by
+        // const-evaluating the argument (a non-constant value argument is E0253).
+        // The ordered `comptime_args` form the instantiation key.
+        let mut comptime_args: Vec<ComptimeArg> = Vec::with_capacity(k);
         let mut subst: HashMap<String, Type> = HashMap::new();
+        let mut value_subst: HashMap<String, i64> = HashMap::new();
         let mut subst_ok = true;
         for (i, cp) in comptime_params.iter().enumerate() {
-            match self.resolve_type_arg_generic(&args[i]) {
-                Some(t) => {
-                    type_args.push(t);
-                    subst.insert(cp.name.clone(), t);
+            if is_type_kw(&cp.ty) {
+                match self.resolve_type_arg_generic(&args[i]) {
+                    Some(t) => {
+                        comptime_args.push(ComptimeArg::Type(t));
+                        subst.insert(cp.name.clone(), t);
+                    }
+                    None => subst_ok = false,
                 }
-                None => subst_ok = false,
+            } else {
+                match self.eval_comptime_value_arg(&args[i]) {
+                    Some(v) => {
+                        comptime_args.push(ComptimeArg::Value(v));
+                        value_subst.insert(cp.name.clone(), v);
+                    }
+                    None => subst_ok = false,
+                }
             }
         }
         let runtime_args = &args[k..];
         if !subst_ok {
-            // A type argument failed to resolve (E0251 already emitted); still
+            // A comptime argument failed (E0251/E0253 already emitted); still
             // surface any errors in the runtime arguments, then bail to avoid
             // cascading mismatches against an incomplete substitution.
             for a in runtime_args {
@@ -2868,12 +2960,18 @@ impl Checker {
             return None;
         }
 
-        // The runtime-parameter types and return type, resolved under `subst`.
+        // The runtime-parameter types and return type, resolved under both the
+        // type and value substitutions (so `[n]T` becomes the bound length).
         let mut param_tys: Vec<Type> = Vec::with_capacity(runtime_params.len());
         for p in &runtime_params {
-            param_tys.push(self.resolve_type_opt_with(&p.ty, &subst).unwrap_or(Type::I64));
+            param_tys.push(
+                self.resolve_type_opt_with(&p.ty, &subst, &value_subst)
+                    .unwrap_or(Type::I64),
+            );
         }
-        let ret_ty = self.resolve_type_opt_with(&gen.ret, &subst).unwrap_or(Type::Void);
+        let ret_ty = self
+            .resolve_type_opt_with(&gen.ret, &subst, &value_subst)
+            .unwrap_or(Type::Void);
 
         if runtime_args.len() != param_tys.len() {
             let msg = format!(
@@ -2909,10 +3007,41 @@ impl Checker {
         // substitution (which may discover further instantiations through nested
         // generic calls). The dedup in `intern_instantiation` bounds recursion
         // for (mutually) recursive generics with identical type arguments.
-        if self.structs.intern_instantiation(&gen.name, type_args) {
-            self.check_instance_body(gen, subst);
+        if self
+            .structs
+            .intern_instantiation(&gen.name, comptime_args)
+        {
+            self.check_instance_body(gen, subst, value_subst);
         }
         Some(ret_ty)
+    }
+
+    /// Resolve a generic call's comptime **value** argument (SPEC §24.2): it must
+    /// const-evaluate to an integer over the in-scope constants (the top-level
+    /// consts plus any comptime value parameters already bound, via
+    /// [`const_env`]). A non-constant argument, or one that folds to a bool, is
+    /// `E0253`.
+    fn eval_comptime_value_arg(&mut self, arg: &Expr) -> Option<i64> {
+        let env = self.const_env();
+        match const_eval::eval(arg, &env) {
+            Ok(ConstVal::Int(n)) => Some(n),
+            Ok(ConstVal::Bool(_)) => {
+                self.error(
+                    arg.span(),
+                    "E0253",
+                    "comptime value argument must be an integer, found a `bool`",
+                );
+                None
+            }
+            Err(d) => {
+                let msg = format!(
+                    "comptime value argument is not a compile-time constant: {}",
+                    d.message
+                );
+                self.error(arg.span(), "E0253", msg);
+                None
+            }
+        }
     }
 
     /// Resolve a generic call's type argument (SPEC §17.2): it must be an
@@ -2943,28 +3072,54 @@ impl Checker {
         }
     }
 
+    /// Whether `te` is a valid annotation for a comptime **value** parameter
+    /// (SPEC §24.1): a bare integer type name (`usize`, `i32`, …) with no
+    /// composite wrapper (`?`/`!`/`[N]`/`*`/`[]`). A bound type-parameter name is
+    /// never an integer, so this consults only the base resolution.
+    fn is_value_param_annotation(&self, te: &TypeExpr) -> bool {
+        !te.optional
+            && !te.error_union
+            && te.array_len.is_none()
+            && !te.pointer
+            && !te.slice
+            && self.resolve_base(&te.name).map_or(false, |t| t.is_int())
+    }
+
     /// Type-check one monomorphised instantiation of a generic function: its
     /// body, under the substitution `subst` (SPEC §17.2). Saves and restores the
     /// whole per-function checking context (substitution, return type, test /
     /// loop state, scope stack) so this may be called re-entrantly from the
     /// middle of checking another body (a generic call nested inside a body).
-    fn check_instance_body(&mut self, f: &Func, subst: HashMap<String, Type>) {
+    fn check_instance_body(
+        &mut self,
+        f: &Func,
+        subst: HashMap<String, Type>,
+        value_subst: HashMap<String, i64>,
+    ) {
         let saved_subst = std::mem::replace(&mut self.subst, subst);
+        let saved_value_subst = std::mem::replace(&mut self.value_subst, value_subst);
         let saved_ret = self.ret_type;
         let saved_in_test = self.in_test;
         let saved_loop = self.loop_depth;
         let saved_scopes = std::mem::take(&mut self.scopes);
 
-        // With `self.subst` active, the return type and runtime-parameter types
-        // resolve their type-parameter uses to concrete types.
+        // With `self.subst` / `self.value_subst` active, the return type and
+        // runtime-parameter types resolve their type-parameter uses to concrete
+        // types and any `[n]T` to its bound length.
         self.ret_type = self.resolve_type(&f.ret).unwrap_or(Type::Void);
         self.in_test = false;
         self.loop_depth = 0;
         self.scopes.push(HashMap::new());
         for p in &f.params {
-            // Comptime type parameters are not runtime values; only the runtime
-            // parameters become (immutable) locals.
             if p.is_comptime {
+                // A comptime *type* parameter is not a runtime value. A comptime
+                // *value* parameter is an immutable constant of its declared
+                // integer type, usable in the body (SPEC §24.2).
+                if is_type_kw(&p.ty) {
+                    continue;
+                }
+                let pt = self.resolve_type(&p.ty).unwrap_or(Type::I64);
+                self.define(&p.name, pt, true);
                 continue;
             }
             let pt = self.resolve_type(&p.ty).unwrap_or(Type::I64);
@@ -2974,6 +3129,7 @@ impl Checker {
         self.scopes.pop();
 
         self.subst = saved_subst;
+        self.value_subst = saved_value_subst;
         self.ret_type = saved_ret;
         self.in_test = saved_in_test;
         self.loop_depth = saved_loop;
@@ -3086,13 +3242,27 @@ mod tests {
             span: sp(),
         }
     }
-    /// A fixed-size array type expression `[len]elem` (v0.117).
+    /// A fixed-size array type expression `[len]elem` with a literal length
+    /// (v0.117).
     fn te_arr(elem: &str, len: i64) -> TypeExpr {
         TypeExpr {
             name: elem.into(),
             optional: false,
             error_union: false,
-            array_len: Some(len),
+            array_len: Some(ArraySize::Lit(len)),
+            pointer: false,
+            slice: false,
+            span: sp(),
+        }
+    }
+    /// An array type expression `[name]elem` whose length is the comptime
+    /// value-parameter `name` (v0.128).
+    fn te_arr_param(elem: &str, name: &str) -> TypeExpr {
+        TypeExpr {
+            name: elem.into(),
+            optional: false,
+            error_union: false,
+            array_len: Some(ArraySize::Param(name.into())),
             pointer: false,
             slice: false,
             span: sp(),
@@ -3186,6 +3356,16 @@ mod tests {
         Param {
             name: name.into(),
             ty: te_arr(elem, len),
+            is_comptime: false,
+            span: sp(),
+        }
+    }
+    /// A parameter of array type whose length is a comptime value parameter:
+    /// `name: [size]elem` (v0.128).
+    fn param_arr_param(name: &str, elem: &str, size: &str) -> Param {
+        Param {
+            name: name.into(),
+            ty: te_arr_param(elem, size),
             is_comptime: false,
             span: sp(),
         }
@@ -3359,8 +3539,17 @@ mod tests {
             span: sp(),
         }
     }
-    /// A `comptime IDENT: ty` parameter with a *non*-`type` annotation — only
-    /// used to exercise the `E0250` diagnostic.
+    /// A `comptime IDENT: <int type>` comptime **value** parameter (v0.128).
+    fn param_comptime_val(name: &str, ty: &str) -> Param {
+        Param {
+            name: name.into(),
+            ty: te(ty),
+            is_comptime: true,
+            span: sp(),
+        }
+    }
+    /// A `comptime IDENT: ty` parameter with an annotation that is neither
+    /// `type` nor an integer type — used to exercise the `E0250` diagnostic.
     fn param_comptime_bad(name: &str, ty: &str) -> Param {
         Param {
             name: name.into(),
@@ -5890,10 +6079,10 @@ mod tests {
         assert_eq!(insts.len(), 2, "expected two instantiations: {:?}", insts);
         assert!(insts
             .iter()
-            .any(|i| i.fn_name == "max" && i.type_args == vec![Type::I32]));
+            .any(|i| i.fn_name == "max" && i.args == vec![ComptimeArg::Type(Type::I32)]));
         assert!(insts
             .iter()
-            .any(|i| i.fn_name == "max" && i.type_args == vec![Type::I64]));
+            .any(|i| i.fn_name == "max" && i.args == vec![ComptimeArg::Type(Type::I64)]));
     }
 
     #[test]
@@ -5922,7 +6111,7 @@ mod tests {
         assert!(table
             .instantiations()
             .iter()
-            .any(|i| i.fn_name == "id" && i.type_args == vec![Type::I32]));
+            .any(|i| i.fn_name == "id" && i.args == vec![ComptimeArg::Type(Type::I32)]));
     }
 
     #[test]
@@ -6020,10 +6209,10 @@ mod tests {
         assert_eq!(insts.len(), 2, "expected outer + inner: {:?}", insts);
         assert!(insts
             .iter()
-            .any(|i| i.fn_name == "outer" && i.type_args == vec![Type::I32]));
+            .any(|i| i.fn_name == "outer" && i.args == vec![ComptimeArg::Type(Type::I32)]));
         assert!(insts
             .iter()
-            .any(|i| i.fn_name == "inner" && i.type_args == vec![Type::I32]));
+            .any(|i| i.fn_name == "inner" && i.args == vec![ComptimeArg::Type(Type::I32)]));
     }
 
     #[test]
@@ -6092,11 +6281,12 @@ mod tests {
     }
 
     #[test]
-    fn comptime_non_type_annotation_is_e0250() {
-        // fn f(comptime x: i32) void { }  — a comptime param must be `type`.
+    fn comptime_non_type_non_int_annotation_is_e0250() {
+        // fn f(comptime x: bool) void { }  — a comptime param must be `type` or
+        // an integer-typed value parameter; `bool` is neither (v0.128).
         let items = vec![func(
             "f",
-            vec![param_comptime_bad("x", "i32")],
+            vec![param_comptime_bad("x", "bool")],
             "void",
             vec![],
         )];
@@ -6135,7 +6325,7 @@ mod tests {
         assert!(table
             .instantiations()
             .iter()
-            .any(|i| i.fn_name == "id" && i.type_args == vec![Type::Struct(pid)]));
+            .any(|i| i.fn_name == "id" && i.args == vec![ComptimeArg::Type(Type::Struct(pid))]));
     }
 
     #[test]
@@ -6157,6 +6347,238 @@ mod tests {
             ),
         ];
         assert!(codes(items).contains(&"E0110"));
+    }
+
+    // ---- comptime value parameters (v0.128, SPEC §24) ---------------------
+
+    #[test]
+    fn comptime_value_param_array_size_instantiates_at_n() {
+        // fn zeros(comptime n: usize) [n]i32 { var a: [n]i32 = [n]i32{0,0,0}; return a; }
+        // fn main() void { var a: [3]i32 = zeros(3); print(a.len); }
+        // Instantiated at n=3, the return type resolves to `[3]i32` — verified by
+        // looking up the interned array length for the instantiated size.
+        let mut zeros = raw_func(
+            "zeros",
+            vec![param_comptime_val("n", "usize")],
+            "i32",
+            vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "a".into(),
+                    ty: Some(te_arr_param("i32", "n")),
+                    value: Expr::ArrayLit {
+                        elem: te_arr_param("i32", "n"),
+                        elems: vec![int(0), int(0), int(0)],
+                        span: sp(),
+                    },
+                    span: sp(),
+                },
+                ret(Some(ident("a"))),
+            ],
+        );
+        zeros.ret = te_arr_param("i32", "n");
+        let items = vec![
+            Item::Func(zeros),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    Stmt::Let {
+                        is_const: false,
+                        name: "a".into(),
+                        ty: Some(te_arr("i32", 3)),
+                        value: call("zeros", vec![int(3)]),
+                        span: sp(),
+                    },
+                    Stmt::Expr(call("print", vec![field(ident("a"), "len")])),
+                ],
+            ),
+        ];
+        let table = check_ok(items);
+        // The instantiation records the value argument 3.
+        let insts = table.instantiations();
+        assert_eq!(insts.len(), 1, "expected one instantiation: {:?}", insts);
+        assert!(insts
+            .iter()
+            .any(|i| i.fn_name == "zeros" && i.args == vec![ComptimeArg::Value(3)]));
+        // A `[3]i32` array type is interned with length 3.
+        let aid = table
+            .arrays()
+            .find(|&(_, elem, len)| elem == Type::I32 && len == 3)
+            .map(|(id, _, _)| id)
+            .expect("a [3]i32 array should be interned");
+        assert_eq!(table.array_len(aid), 3);
+        assert_eq!(table.array_elem(aid), Type::I32);
+    }
+
+    #[test]
+    fn comptime_value_param_used_as_constant_in_body() {
+        // fn f(comptime n: usize) usize { return n; }
+        // fn main() void { var x: usize = f(7); print(x); }
+        // The value parameter `n` is an immutable constant of its declared type
+        // (usize) inside the body.
+        let mut zeros = raw_func(
+            "f",
+            vec![param_comptime_val("n", "usize")],
+            "usize",
+            vec![ret(Some(ident("n")))],
+        );
+        zeros.ret = te("usize");
+        let items = vec![
+            Item::Func(zeros),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("x", "usize", call("f", vec![int(7)])),
+                    Stmt::Expr(call("print", vec![ident("x")])),
+                ],
+            ),
+        ];
+        let table = check_ok(items);
+        assert!(table
+            .instantiations()
+            .iter()
+            .any(|i| i.fn_name == "f" && i.args == vec![ComptimeArg::Value(7)]));
+    }
+
+    #[test]
+    fn comptime_value_two_distinct_values_record_two_instantiations() {
+        // fn f(comptime n: usize) usize { return n; }
+        // fn main() void { var a = f(2); var b = f(5); }  — two instantiations.
+        let mut f = raw_func(
+            "f",
+            vec![param_comptime_val("n", "usize")],
+            "usize",
+            vec![ret(Some(ident("n")))],
+        );
+        f.ret = te("usize");
+        let items = vec![
+            Item::Func(f),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("a", "usize", call("f", vec![int(2)])),
+                    let_var("b", "usize", call("f", vec![int(5)])),
+                ],
+            ),
+        ];
+        let table = check_ok(items);
+        let insts = table.instantiations();
+        assert_eq!(insts.len(), 2, "expected two instantiations: {:?}", insts);
+        assert!(insts
+            .iter()
+            .any(|i| i.fn_name == "f" && i.args == vec![ComptimeArg::Value(2)]));
+        assert!(insts
+            .iter()
+            .any(|i| i.fn_name == "f" && i.args == vec![ComptimeArg::Value(5)]));
+    }
+
+    #[test]
+    fn comptime_value_const_arg_folds() {
+        // const N: usize = 4;
+        // fn f(comptime n: usize) usize { return n; }
+        // fn main() void { var x: usize = f(N); }  — N folds to 4.
+        let mut f = raw_func(
+            "f",
+            vec![param_comptime_val("n", "usize")],
+            "usize",
+            vec![ret(Some(ident("n")))],
+        );
+        f.ret = te("usize");
+        let items = vec![
+            const_item("N", "usize", int(4)),
+            Item::Func(f),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("x", "usize", call("f", vec![ident("N")]))],
+            ),
+        ];
+        let table = check_ok(items);
+        assert!(table
+            .instantiations()
+            .iter()
+            .any(|i| i.fn_name == "f" && i.args == vec![ComptimeArg::Value(4)]));
+    }
+
+    #[test]
+    fn comptime_value_non_constant_argument_is_e0253() {
+        // fn f(comptime n: usize) usize { return n; }
+        // fn g() usize { return 1; }
+        // fn main() void { var x: usize = f(g()); }  — `g()` is not constant.
+        let mut f = raw_func(
+            "f",
+            vec![param_comptime_val("n", "usize")],
+            "usize",
+            vec![ret(Some(ident("n")))],
+        );
+        f.ret = te("usize");
+        let items = vec![
+            Item::Func(f),
+            func("g", vec![], "usize", vec![ret(Some(int(1)))]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("x", "usize", call("f", vec![call("g", vec![])]))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0253"));
+    }
+
+    #[test]
+    fn array_size_param_outside_generic_is_e0253() {
+        // fn f(a: [n]i32) i32 { return a[0]; }  — `n` is not a comptime value
+        // parameter in scope, so the `[n]i32` array size is unbound.
+        let items = vec![func(
+            "f",
+            vec![param_arr_param("a", "i32", "n")],
+            "i32",
+            vec![ret(Some(index(ident("a"), int(0))))],
+        )];
+        assert!(codes(items).contains(&"E0253"));
+    }
+
+    #[test]
+    fn literal_array_size_still_works() {
+        // fn f(a: [3]i32) i32 { return a[0]; }  — the v0.117 literal form is
+        // unchanged by the v0.128 generalisation.
+        let items = vec![func(
+            "f",
+            vec![param_arr("a", "i32", 3)],
+            "i32",
+            vec![ret(Some(index(ident("a"), int(0))))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn comptime_value_int_param_is_valid_not_e0250() {
+        // fn f(comptime n: usize) usize { return n; }  — a value parameter of an
+        // integer type is valid (it must NOT be flagged E0250).
+        let mut f = raw_func(
+            "f",
+            vec![param_comptime_val("n", "usize")],
+            "usize",
+            vec![ret(Some(ident("n")))],
+        );
+        f.ret = te("usize");
+        let items = vec![
+            Item::Func(f),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("x", "usize", call("f", vec![int(1)]))],
+            ),
+        ];
+        assert!(!codes(items).contains(&"E0250"));
     }
 
     // ---- v0.121: type inference for `var`/`const` (SPEC §18) ---------------

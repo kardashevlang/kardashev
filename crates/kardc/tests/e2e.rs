@@ -578,3 +578,27 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "Hello,\nworld\nkardashev\n9\n107\n");
 }
+
+// --- v0.128 comptime value parameters --------------------------------------
+
+#[test]
+fn comptime_value_params_array_size_generics() {
+    let src = r#"
+fn dot(comptime n: usize, a: [n]i32, b: [n]i32) i32 {
+    var total: i32 = 0;
+    var i: usize = 0;
+    while (i < n) : (i = i + 1) {     // n used as a comptime value
+        total = total + a[i] * b[i];
+    }
+    return total;
+}
+pub fn main() i32 {
+    print(dot(3, [3]i32{ 1, 2, 3 }, [3]i32{ 4, 5, 6 }));   // 32
+    print(dot(2, [2]i32{ 10, 20 }, [2]i32{ 3, 4 }));        // 110 (distinct instantiation)
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "32\n110\n");
+}

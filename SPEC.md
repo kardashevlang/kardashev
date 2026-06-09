@@ -923,3 +923,39 @@ slice over static bytes. (Reuses the slice machinery, so no new type.)
 `print(s)` where `s: []u8` → `{ fwrite((s).ptr, 1, (s).len, stdout); fputc('\n',
 stdout); }` (the integer `print` path is unchanged). `cty`/`type_of_expr` treat
 a `StrLit` as `Type::Slice(u8)`.
+
+## 24. `comptime` value parameters (v0.128)
+
+Extends v0.120 generics: a parameter may be a compile-time **value** —
+`comptime n: usize` — and the function is monomorphised per distinct value
+(array-size generics).
+
+### 24.1 Syntax & AST
+- A `comptime IDENT: <int type>` parameter (`Param.is_comptime` with a non-
+  `type` annotation) is a comptime value parameter. A function with any
+  comptime parameter (type or value) is generic.
+- Array sizes generalise: `TypeExpr.array_len: Option<ArraySize>` where
+  `ArraySize::Lit(n)` is the literal form `[3]T` (v0.117) and
+  `ArraySize::Param(name)` is `[n]T` (the size is a comptime value parameter).
+- Calls pass comptime value arguments positionally (like type args), each a
+  comptime-constant integer.
+
+### 24.2 Semantics (`sema`)
+- At a generic call, each comptime parameter is bound: a `type` param to a
+  `Type` (`ComptimeArg::Type`), a value param to an `i64` obtained by
+  const-evaluating the argument (`ComptimeArg::Value`; a non-constant value arg
+  is `E0251`/`E0253`). The instantiation key is `Vec<ComptimeArg>`.
+- The instance body is checked under both a **type** substitution and a
+  **value** substitution: a reference to a value param `n` is a constant of its
+  declared type; an `ArraySize::Param(n)` resolves to the bound value (so
+  `[n]i32` becomes `[5]i32`). A `[n]T` outside its generic (n unbound) is an
+  error.
+- `StructTable::intern_array` keys arrays on the resolved `(elem, len)`, so each
+  instantiated size makes a distinct array type.
+
+### 24.3 Backend (`emit_c`)
+Per instantiation the emitter holds a value substitution (`name → i64`) beside
+the type substitution. `ArraySize::Param(n)` resolves to the bound value when
+forming the array type; a reference to a value param `n` in the body emits the
+literal value; the instance is emitted as `kd_<fn>__<args>` (a value arg mangles
+to its digits). Non-generic literal-sized arrays are unchanged.

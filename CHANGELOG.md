@@ -18,6 +18,17 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.128.0] — `comptime` value parameters
+
+### Added
+- **`comptime n: usize`** value parameters — a function is monomorphised per
+  distinct value, extending the v0.120 generics machinery. `n` may appear as an
+  **array-size** (`[n]T`) and as a value in the body.
+- Array sizes are now `ArraySize::{Lit(n), Param(name)}`; generic instantiations
+  key on `ComptimeArg::{Type, Value}` (a value arg mangles to its digits, e.g.
+  `kd_dot__3`). A non-constant value argument is `E0251`/`E0253`.
+- 590 unit + 25 e2e tests; `examples/comptime_vals.ks`.
+
 ## [0.127.0] — Strings (`[]u8` literals)
 
 ### Added

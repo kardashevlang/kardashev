@@ -45,8 +45,8 @@
 //! canonical output produces byte-identical text.
 
 use crate::ast::{
-    BinOp, Block, ConstDecl, EnumDecl, Expr, Func, Item, Module, Stmt, StructDecl, SwitchArm,
-    TestBlock, TypeExpr, UnOp, UnionDecl,
+    ArraySize, BinOp, Block, ConstDecl, EnumDecl, Expr, Func, Item, Module, Stmt, StructDecl,
+    SwitchArm, TestBlock, TypeExpr, UnOp, UnionDecl,
 };
 use crate::diag::Diagnostic;
 
@@ -546,10 +546,12 @@ impl Printer {
 
 // ----- types ----------------------------------------------------------------
 
-/// Format a type reference (SPEC §11.1 / §12.1 / §14.1 / §15). A pointer
+/// Format a type reference (SPEC §11.1 / §12.1 / §14.1 / §15 / §24). A pointer
 /// (`TypeExpr.pointer`) prints with a leading `*` — e.g. `*i32` — a slice
-/// (`TypeExpr.slice`) with a leading `[]` — e.g. `[]i32` — a fixed-size array
-/// (`TypeExpr.array_len = Some(N)`) with a leading `[N]` — e.g. `[3]i32` — an
+/// (`TypeExpr.slice`) with a leading `[]` — e.g. `[]i32` — an array
+/// (`TypeExpr.array_len = Some(..)`) with a leading `[N]` whose `N` is either a
+/// literal size (`ArraySize::Lit`, e.g. `[3]i32`, v0.117) or a comptime
+/// value-parameter name (`ArraySize::Param`, e.g. `[n]i32`, v0.128) — an
 /// optional type (`TypeExpr.optional`) with a leading `?` — e.g. `?i32` — an
 /// error union (`TypeExpr.error_union`) with a leading `!` — e.g. `!i32` — and a
 /// plain type as its bare name. The qualifiers are mutually exclusive (v0.115:
@@ -562,8 +564,16 @@ fn fmt_type(ty: &TypeExpr) -> String {
         format!("*{}", ty.name)
     } else if ty.slice {
         format!("[]{}", ty.name)
-    } else if let Some(n) = ty.array_len {
-        format!("[{}]{}", n, ty.name)
+    } else if let Some(size) = &ty.array_len {
+        // A fixed-size array `[N]T`: the size prints inside the `[…]` prefix
+        // before the element type. `ArraySize::Lit(n)` prints the literal
+        // (`[3]i32`, v0.117); `ArraySize::Param(name)` prints the comptime
+        // value-parameter name (`[n]i32`, v0.128). Both forms re-lex to the
+        // same `TypeExpr`, so re-formatting is idempotent.
+        match size {
+            ArraySize::Lit(n) => format!("[{}]{}", n, ty.name),
+            ArraySize::Param(name) => format!("[{}]{}", name, ty.name),
+        }
     } else if ty.optional {
         format!("?{}", ty.name)
     } else if ty.error_union {
@@ -978,14 +988,30 @@ mod tests {
         }
     }
 
-    /// A fixed-size array type `[len]name` (`TypeExpr.array_len = Some(len)`;
-    /// v0.117).
+    /// A fixed-size array type `[len]name`
+    /// (`TypeExpr.array_len = Some(ArraySize::Lit(len))`; v0.117).
     fn arr_ty(name: &str, len: i64) -> TypeExpr {
         TypeExpr {
             name: name.to_string(),
             optional: false,
             error_union: false,
-            array_len: Some(len),
+            array_len: Some(ArraySize::Lit(len)),
+            pointer: false,
+            slice: false,
+            span: D,
+        }
+    }
+
+    /// A comptime value-parameter-sized array type `[len_param]name`
+    /// (`TypeExpr.array_len = Some(ArraySize::Param(len_param))`; v0.128). The
+    /// size is the name of a `comptime n: usize` parameter, resolved per
+    /// monomorphisation in sema/emit but printed verbatim by the formatter.
+    fn arr_ty_param(name: &str, len_param: &str) -> TypeExpr {
+        TypeExpr {
+            name: name.to_string(),
+            optional: false,
+            error_union: false,
+            array_len: Some(ArraySize::Param(len_param.to_string())),
             pointer: false,
             slice: false,
             span: D,
@@ -3089,6 +3115,111 @@ mod tests {
             })],
         };
         assert_eq!(print_module(&m), "fn id(x: i32) i32 {\n    return x;\n}\n");
+    }
+
+    // ----- comptime value parameters (v0.128) ------------------------------
+
+    #[test]
+    fn array_size_literal_and_param_prints() {
+        // SPEC §24: an array type prints its size inside the `[…]` prefix. A
+        // literal size (`ArraySize::Lit`, v0.117) prints the integer; a comptime
+        // value-parameter size (`ArraySize::Param`, v0.128) prints the parameter
+        // name. Both forms compose with any element type.
+        assert_eq!(fmt_type(&arr_ty("i32", 3)), "[3]i32");
+        assert_eq!(fmt_type(&arr_ty_param("i32", "n")), "[n]i32");
+        // A multi-letter parameter name and a struct element both print verbatim
+        // after the prefix.
+        assert_eq!(fmt_type(&arr_ty_param("Point", "len")), "[len]Point");
+        // The other (non-array) type forms are unaffected.
+        assert_eq!(fmt_type(&ty("usize")), "usize");
+        assert_eq!(fmt_type(&slice_ty("i32")), "[]i32");
+    }
+
+    #[test]
+    fn comptime_value_param_fn_prints_comptime_prefix_and_param_array() {
+        // SPEC §24: `fn zeros(comptime n: usize) [n]i32 { … }`. A comptime value
+        // parameter (`is_comptime = true` with a non-`type` annotation, here
+        // `usize`) prints with the same leading `comptime ` keyword as a comptime
+        // *type* parameter — confirming the existing `is_comptime` printing works
+        // for non-type annotations — and the `[n]i32` return type prints the
+        // parameter name inside the array prefix.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "zeros".to_string(),
+                params: vec![Param {
+                    name: "n".to_string(),
+                    ty: ty("usize"),
+                    is_comptime: true,
+                    span: D,
+                }],
+                ret: arr_ty_param("i32", "n"),
+                body: Block {
+                    stmts: vec![],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = "fn zeros(comptime n: usize) [n]i32 {\n}\n";
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: re-printing yields identical bytes.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn comptime_value_param_mixed_with_runtime_and_type_params() {
+        // A generic mixing a comptime *type* parameter, a comptime *value*
+        // parameter and a runtime parameter: each comptime param keeps its
+        // `comptime ` prefix, the value param's `usize` annotation prints plainly,
+        // and a `[n]T` parameter type uses the bound value-parameter name.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: true,
+                name: "fill".to_string(),
+                params: vec![
+                    comptime_param("T"),
+                    Param {
+                        name: "n".to_string(),
+                        ty: ty("usize"),
+                        is_comptime: true,
+                        span: D,
+                    },
+                    param("buf", arr_ty_param("T", "n")),
+                ],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        assert_eq!(
+            print_module(&m),
+            "pub fn fill(comptime T: type, comptime n: usize, buf: [n]T) void {\n}\n"
+        );
+    }
+
+    #[test]
+    fn array_size_forms_round_trip() {
+        // End-to-end (lex → parse → print), SPEC §24: a comptime value parameter
+        // (`comptime n: usize`) with a `[n]i32` return type, and an ordinary
+        // literal-sized `[3]i32` return type, are both already canonical, so
+        // formatting reproduces the source byte-for-byte and re-formatting that
+        // output is byte-identical (idempotence).
+        let src = concat!(
+            "fn zeros(comptime n: usize) [n]i32 {\n",
+            "}\n",
+            "\n",
+            "fn three() [3]i32 {\n",
+            "}\n",
+        );
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once);
     }
 
     // ----- type inference for var/const (v0.121) ---------------------------
