@@ -404,6 +404,12 @@ impl<'a> Emitter<'a> {
                     self.fn_params.insert(f.name.clone(), ptys);
                 }
                 Item::Struct(s) => {
+                    // Bind `Self` so a `*Self` / `@This()` receiver resolves to a
+                    // pointer to this struct (v0.136, §32.2).
+                    let sid = self.structs.id_of(&s.name);
+                    if let Some(id) = sid {
+                        self.subst.insert("Self".to_string(), Type::Struct(id));
+                    }
                     for m in &s.methods {
                         let ret = self.resolve_ty(&m.ret);
                         self.method_ret.insert((s.name.clone(), m.name.clone()), ret);
@@ -411,6 +417,9 @@ impl<'a> Emitter<'a> {
                             m.params.iter().map(|p| self.resolve_ty(&p.ty)).collect();
                         self.method_params
                             .insert((s.name.clone(), m.name.clone()), ptys);
+                    }
+                    if sid.is_some() {
+                        self.subst.remove("Self");
                     }
                 }
                 _ => {}
@@ -460,8 +469,18 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 Item::Struct(s) => {
+                    // Bind `Self` so a `*Self` / `@This()` receiver registers a
+                    // pointer to THIS struct as a pointee (v0.136, §32.2), so
+                    // `self.field` auto-derefs in the lowering.
+                    let sid = self.structs.id_of(&s.name);
+                    if let Some(id) = sid {
+                        self.subst.insert("Self".to_string(), Type::Struct(id));
+                    }
                     for m in &s.methods {
                         self.note_func_ptrs(m);
+                    }
+                    if sid.is_some() {
+                        self.subst.remove("Self");
                     }
                 }
                 Item::Const(c) => {
@@ -953,11 +972,20 @@ impl<'a> Emitter<'a> {
         // parameter (if any) is an ordinary by-value struct parameter.
         for item in &module.items {
             if let Item::Struct(s) = item {
+                // Bind `Self` so a `self: *Self` / `@This()` method signature
+                // resolves in the forward declaration too (v0.136, §32.2).
+                let self_id = self.structs.id_of(&s.name);
+                if let Some(id) = self_id {
+                    self.subst.insert("Self".to_string(), Type::Struct(id));
+                }
                 for m in &s.methods {
                     let ret = self.cty(&m.ret);
                     let params = self.format_params(&m.params);
                     self.line(&format!("{} kd_{}_{}({});", ret, s.name, m.name, params));
                     any = true;
+                }
+                if self_id.is_some() {
+                    self.subst.remove("Self");
                 }
             }
         }
@@ -1023,10 +1051,19 @@ impl<'a> Emitter<'a> {
         }
         for item in &module.items {
             if let Item::Struct(s) = item {
+                // Bind `Self` to this struct so a plain-struct method written
+                // with `self: *Self` / `@This()` (v0.136, §32.2) resolves.
+                let self_id = self.structs.id_of(&s.name);
+                if let Some(id) = self_id {
+                    self.subst.insert("Self".to_string(), Type::Struct(id));
+                }
                 for m in &s.methods {
                     let cname = format!("kd_{}_{}", s.name, m.name);
                     self.emit_func_named(m, &cname);
                     self.blank();
+                }
+                if self_id.is_some() {
+                    self.subst.remove("Self");
                 }
             }
         }
@@ -1261,6 +1298,15 @@ impl<'a> Emitter<'a> {
     /// The C type spelling for a resolved [`Type`]: a struct resolves through
     /// the table (`Type::c_name` would panic on it), an optional through
     /// `optional_c_name`; primitives use their builtin C name.
+    /// A human-readable source name for a type, for `@typeName` (v0.136): a
+    /// struct's interned name, else the primitive spelling.
+    fn type_display_name(&self, t: Type) -> String {
+        match t {
+            Type::Struct(id) => self.structs.get(id).name.clone(),
+            _ => t.name().to_string(),
+        }
+    }
+
     fn cty_of(&self, t: Type) -> String {
         match t {
             Type::Struct(id) => self.structs.c_name(id),
@@ -2337,6 +2383,34 @@ impl<'a> Emitter<'a> {
                     value.as_bytes().len()
                 )
             }
+            Expr::Builtin { name, args, .. } => {
+                // The single argument names a type (an `Ident`); resolve it
+                // (substitution-aware) to its C type / display name (SPEC §32.1).
+                let arg_name = match args.first() {
+                    Some(Expr::Ident { name, .. }) => name.clone(),
+                    _ => String::new(),
+                };
+                let ty = self.base_type(&arg_name);
+                match name.as_str() {
+                    "sizeOf" => format!("sizeof({})", self.cty_of(ty)),
+                    "typeName" => {
+                        // Print the bound type's name for a type parameter, else
+                        // the name as written (a builtin, struct, or alias).
+                        let display = if self.subst.contains_key(&arg_name) {
+                            self.type_display_name(ty)
+                        } else {
+                            arg_name.clone()
+                        };
+                        format!(
+                            "((kd_slice_uint8_t){{ .ptr = (uint8_t *){}, .len = {} }})",
+                            c_string_literal(&display),
+                            display.as_bytes().len()
+                        )
+                    }
+                    // Unknown builtins are rejected by sema; emit a placeholder.
+                    _ => "0".to_string(),
+                }
+            }
             Expr::Ident { name, .. } => {
                 // A reference to a comptime value parameter (`comptime n: usize`,
                 // v0.128) emits the bound literal value — the parameter is not a
@@ -3102,6 +3176,16 @@ impl<'a> Emitter<'a> {
                 .slices()
                 .find(|(_, e)| *e == Type::U8)
                 .map(|(id, _)| Type::Slice(id)),
+            // `@sizeOf(T)` → `usize`; `@typeName(T)` → `[]u8` (SPEC §32.1).
+            Expr::Builtin { name, .. } => match name.as_str() {
+                "sizeOf" => Some(Type::Usize),
+                "typeName" => self
+                    .structs
+                    .slices()
+                    .find(|(_, e)| *e == Type::U8)
+                    .map(|(id, _)| Type::Slice(id)),
+                _ => None,
+            },
             Expr::Ident { name, .. } => self.lookup_var_type(name),
             Expr::Unary { op, expr, .. } => match op {
                 UnOp::Not => Some(Type::Bool),

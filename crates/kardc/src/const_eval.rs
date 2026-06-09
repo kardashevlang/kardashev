@@ -112,6 +112,11 @@ pub fn eval(expr: &Expr, consts: &HashMap<String, ConstVal>) -> Result<ConstVal,
             "E0130",
             "a struct type is not a constant value",
         )),
+        Expr::Builtin { span, .. } => Err(Diagnostic::error(
+            *span,
+            "E0130",
+            "a `@`-builtin is not allowed in a constant expression",
+        )),
     }
 }
 
