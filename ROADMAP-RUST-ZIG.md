@@ -279,10 +279,11 @@ to and from integers, `print`, and `[]f64`/`[N]f64` arrays & slices. The first
 non-integer scalar. `Type::F64`, `Expr::Float`, `TokenKind::Float`. (No implicit
 int↔float mixing; float `const`s are deferred — floats are runtime-only.)
 
-### v0.145.0 — Importable `std` library
-Bundle `ArrayList`/`HashMap` (+ helpers) as an importable `std` module
-(`@import("std")` resolving to a bundled source), so programs reuse the
-containers instead of copying them.
+### v0.145.0 — Importable `std` library ✅
+`@import("std");` resolves to the standard library **embedded in the compiler**
+(`include_str!("std.ks")`) — `ArrayList(T)`, `HashMap(V)`, and `imin`/`imax`/
+`iabs` — flattened into the program by bare name. Programs reuse the containers
+instead of copying them.
 
 ### v0.146.0 — `switch` ranges + multi-label arms
 `switch` arms matching a range (`1..10 =>`) or several labels (`.A, .B =>`),

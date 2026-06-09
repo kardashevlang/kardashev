@@ -82,6 +82,10 @@ jobs:
           printf '/// Add two integers.\npub fn add(a: i32, b: i32) i32 { return a + b; }\npub fn main() i32 { return 0; }\n' > "$dd/lib.ks"
           "$KARD" doc "$dd/lib.ks" | grep -q 'fn add(a: i32, b: i32) i32'
           "$KARD" doc "$dd/lib.ks" | grep -q 'Add two integers.'
+          # Standard library (v0.145): `@import("std")` resolves to the bundled lib.
+          sd="$(mktemp -d)"
+          printf '@import("std");\nconst L = ArrayList(i32);\npub fn main() i32 { var a: Allocator = c_allocator(); var l: L = L.init(a); l.push(a, imax(40, 2)); print(l.get(0)); l.deinit(a); return 0; }\n' > "$sd/m.ks"
+          ( cd "$sd" && [ "$("$KARD" run m.ks)" = "40" ] )
           # Cross-compilation plumbing (v0.123): `targets` lists triples, and
           # `-target <host triple>` exercises clang's --target end to end (the
           # host triple always has its sysroot, so it links + runs).

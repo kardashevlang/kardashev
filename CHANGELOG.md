@@ -18,6 +18,19 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.145.0] — Importable `std` library
+
+### Added
+- **`@import("std");`** resolves to the standard library **bundled into the
+  compiler** (`include_str!("std.ks")`), not a file on disk — flattened into the
+  program like any module. It provides **`ArrayList(T)`**, **`HashMap(V)`** and
+  the helpers **`imin`/`imax`/`iabs`**, so programs reuse the containers instead
+  of copying them.
+- The module flattener special-cases the bare name `std` (a real `std`/`std.ks`
+  file next to the importer still wins); the file/embedded paths share one
+  `process_source`. CI smoke-tests `@import("std")`.
+- 901 unit + 42 e2e tests; `crates/kardc/src/std.ks`; `examples/use_std.ks`.
+
 ## [0.144.0] — Floating point `f64`
 
 ### Added
