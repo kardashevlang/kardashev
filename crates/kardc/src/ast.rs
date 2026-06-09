@@ -395,6 +395,11 @@ pub enum Expr {
         value: i64,
         span: Span,
     },
+    /// A floating-point literal `3.14` of type `f64` (v0.144).
+    Float {
+        value: f64,
+        span: Span,
+    },
     Bool {
         value: bool,
         span: Span,
@@ -535,6 +540,7 @@ impl Expr {
     pub fn span(&self) -> Span {
         match self {
             Expr::Int { span, .. } => *span,
+            Expr::Float { span, .. } => *span,
             Expr::Bool { span, .. } => *span,
             Expr::Ident { span, .. } => *span,
             Expr::Unary { span, .. } => *span,

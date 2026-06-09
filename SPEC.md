@@ -1315,3 +1315,27 @@ The C `enum` carries the values — `enum kd_enum_Color { kd_enum_Color_Red = 1,
 kd_enum_Color_Green = 2, kd_enum_Color_Blue = 10 }` — so enum literals, `switch`
 labels and comparisons are value-based automatically. `@intFromEnum(e)` →
 `((int64_t)(e))`; `@enumFromInt(E, n)` → `((<enum cty>)(n))`.
+
+## 38. Floating point — `f64` (v0.144)
+
+The first non-integer scalar: `f64` (`Type::F64`, C `double`).
+
+- **Literals**: `3.14` → `Expr::Float` of type `f64` (the lexer makes a `Float`
+  token from `digits . digits`; a `.` not followed by a digit stays `..`/field
+  access).
+- **Arithmetic** `+ - * /` on two `f64` → `f64`; **comparison** `== != < <= > >=`
+  on two `f64` → `bool`. There is **no implicit int↔float mixing** — both
+  operands must be `f64` (use `@as`). (No `%` on `f64` in v0.144.)
+- **`@as`** extends to numeric casts: `@as(f64, n)` (int→float) and `@as(i32, x)`
+  (float→int) — `@as`'s target/value may now be any numeric type (int or `f64`),
+  lowering to a C cast.
+- **`print`** accepts an `f64` (in addition to integers and `[]u8`).
+- Floats are **runtime-only** in v0.144: a `const` cannot fold a float
+  (`var x: f64 = 3.14;` is fine; `const P = 3.14;` is `E0130`).
+
+### 38.1 Backend (`emit_c`)
+`Type::F64` → C `double`. A `Float` literal emits a C double literal (always with
+a decimal point so C reads it as `double`). Arithmetic/comparison reuse the
+existing binary lowering (the operands are `double`). `print(x: f64)` lowers to a
+`double` print helper (`kd_print_f64`, `printf("%g\n", …)`-style). `@as` reuses
+the §33 cast lowering (`((double)(e))` / `((int32_t)(e))`).

@@ -117,6 +117,7 @@ pub enum TokenKind {
     // Literals / names.
     Ident(String),
     Int(i64),
+    Float(f64),
     Str(String),
     Keyword(Kw),
 

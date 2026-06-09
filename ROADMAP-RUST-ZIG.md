@@ -273,9 +273,11 @@ path, lowered by hoisting like `try`. `Expr::Catch.capture`; the non-capturing
 → `i64` and `@enumFromInt(E, n)` → `E` — stable integer representations and
 round-trips. The C enum carries the values, so literals/switch stay value-based.
 
-### v0.144.0 — Floating point `f64`
-A 64-bit float type: literals (`3.14`), arithmetic / comparison, `@as` to and
-from integers, and `print`. The first non-integer scalar.
+### v0.144.0 — Floating point `f64` ✅
+A 64-bit float type: literals (`3.14`), arithmetic `+ - * /` / comparison, `@as`
+to and from integers, `print`, and `[]f64`/`[N]f64` arrays & slices. The first
+non-integer scalar. `Type::F64`, `Expr::Float`, `TokenKind::Float`. (No implicit
+int↔float mixing; float `const`s are deferred — floats are runtime-only.)
 
 ### v0.145.0 — Importable `std` library
 Bundle `ArrayList`/`HashMap` (+ helpers) as an importable `std` module

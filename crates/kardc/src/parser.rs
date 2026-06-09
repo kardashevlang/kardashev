@@ -1689,6 +1689,20 @@ impl<'a> Parser<'a> {
                     span: tok.span,
                 })
             }
+            TokenKind::Float(value) => {
+                // A floating-point literal `3.14` in expression position is an
+                // `Expr::Float` of type `f64` (SPEC §38). The lexer has already
+                // assembled `digits . digits` into a single `Float` token (a `.`
+                // not followed by a digit stays `..`/field access), so we simply
+                // move the decoded value into the node. Floats are runtime-only
+                // in v0.144 — `const_eval` rejects this node (E0130) — but the
+                // syntax is unconditionally accepted here.
+                self.bump();
+                Ok(Expr::Float {
+                    value,
+                    span: tok.span,
+                })
+            }
             TokenKind::Str(value) => {
                 // A string literal `"…"` in expression position is an
                 // `Expr::StrLit` of type `[]u8` (SPEC §23.1). The `Str` token
@@ -1966,6 +1980,7 @@ fn describe_kind(kind: &TokenKind) -> String {
     match kind {
         TokenKind::Ident(s) => format!("identifier `{}`", s),
         TokenKind::Int(v) => format!("integer `{}`", v),
+        TokenKind::Float(v) => format!("float `{}`", v),
         TokenKind::Str(s) => format!("string `\"{}\"`", s),
         TokenKind::Keyword(kw) => format!("keyword `{}`", kw.spelling()),
         TokenKind::LParen => "`(`".to_string(),
@@ -7605,5 +7620,116 @@ mod tests {
             }
             other => panic!("expected switch, got {:?}", other),
         }
+    }
+
+    // --- v0.144 floating point `f64` (SPEC §38) ---------------------------
+
+    /// `var x = 3.14;` — a `Float` token in init position parses to a
+    /// `Stmt::Let` whose value is `Expr::Float` carrying the literal `3.14`.
+    #[test]
+    fn float_literal_in_let_init() {
+        let s = parse_one_stmt(vec![
+            TokenKind::Keyword(Kw::Var),
+            id("x"),
+            TokenKind::Eq,
+            TokenKind::Float(3.14),
+            TokenKind::Semicolon,
+        ]);
+        match s {
+            Stmt::Let { name, ty, value, .. } => {
+                assert_eq!(name, "x");
+                assert!(ty.is_none(), "un-annotated `var` infers its type (ty == None)");
+                match value {
+                    Expr::Float { value, .. } => assert_eq!(value, 3.14),
+                    other => panic!("expected Expr::Float, got {:?}", other),
+                }
+            }
+            other => panic!("expected let, got {:?}", other),
+        }
+    }
+
+    /// A bare `3.0` in expression position parses to `Expr::Float` 3.0.
+    #[test]
+    fn float_literal_expr_3_0() {
+        let e = parse_assign_rhs(vec![TokenKind::Float(3.0)]);
+        match e {
+            Expr::Float { value, .. } => assert_eq!(value, 3.0),
+            other => panic!("expected Expr::Float, got {:?}", other),
+        }
+    }
+
+    /// An integer literal `3` still parses to `Expr::Int` (the new Float arm
+    /// must not steal plain integers).
+    #[test]
+    fn integer_literal_still_int() {
+        let e = parse_assign_rhs(vec![TokenKind::Int(3)]);
+        match e {
+            Expr::Int { value: 3, .. } => {}
+            other => panic!("expected Expr::Int 3, got {:?}", other),
+        }
+    }
+
+    /// `a[0..5]` lexes the `..` as a `DotDot` range token (the `0` and `5` are
+    /// separate `Int`s — no float is created) and the parser still produces a
+    /// slice expression. This guards that the f64 work did not perturb the
+    /// `digits . digits` vs `..` boundary. The source is lexed by the real
+    /// lexer here so the token boundary itself is exercised end to end.
+    #[test]
+    fn slice_range_lexes_dotdot_not_float() {
+        let lexed = crate::lexer::lex("a[0..5]").expect("`a[0..5]` should lex");
+        // The token stream must contain a `DotDot` and must NOT contain any
+        // `Float` (the `..` is not swallowed into `0.` / `.5`).
+        assert!(
+            lexed.iter().any(|t| t.kind == TokenKind::DotDot),
+            "expected a DotDot token, got {:?}",
+            lexed.iter().map(|t| &t.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !lexed.iter().any(|t| matches!(t.kind, TokenKind::Float(_))),
+            "no Float token should appear in `a[0..5]`, got {:?}",
+            lexed.iter().map(|t| &t.kind).collect::<Vec<_>>()
+        );
+
+        // And it still parses to a slice expression when used as an init.
+        let mut kinds = vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            id("y"),
+            TokenKind::Eq,
+        ];
+        kinds.extend(vec![
+            id("a"),
+            TokenKind::LBracket,
+            TokenKind::Int(0),
+            TokenKind::DotDot,
+            TokenKind::Int(5),
+            TokenKind::RBracket,
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]);
+        let m = parse(&toks(kinds)).expect("slice expr should parse");
+        match &m.items[0] {
+            Item::Func(f) => match &f.body.stmts[0] {
+                Stmt::Assign { value, .. } => {
+                    assert!(
+                        matches!(value, Expr::SliceExpr { .. }),
+                        "expected a slice expr, got {:?}",
+                        value
+                    );
+                }
+                other => panic!("expected assign, got {:?}", other),
+            },
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    /// `describe_kind` names a `Float` token (used in parser error messages).
+    #[test]
+    fn describe_kind_names_float() {
+        assert_eq!(describe_kind(&TokenKind::Float(2.5)), "float `2.5`");
     }
 }

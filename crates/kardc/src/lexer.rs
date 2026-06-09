@@ -69,6 +69,31 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Vec<Diagnostic>> {
             while pos < len && bytes[pos].is_ascii_digit() {
                 pos += 1;
             }
+            // A `.` immediately followed by a digit makes a float literal
+            // `3.14` (v0.144). A `.` followed by `.` is the slice-range `..`
+            // (`0..5`), and a `.` followed by a non-digit is field access on the
+            // (rare) integer — both leave the integer literal intact.
+            let is_float = pos + 1 < len && bytes[pos] == b'.' && bytes[pos + 1].is_ascii_digit();
+            if is_float {
+                pos += 1; // consume `.`
+                while pos < len && bytes[pos].is_ascii_digit() {
+                    pos += 1;
+                }
+                let span = Span::new(start, pos);
+                let text = &src[start..pos];
+                match text.parse::<f64>() {
+                    Ok(v) => tokens.push(Token::new(TokenKind::Float(v), span)),
+                    Err(_) => {
+                        diags.push(Diagnostic::error(
+                            span,
+                            "E0002",
+                            format!("float literal `{}` is malformed", text),
+                        ));
+                        tokens.push(Token::new(TokenKind::Float(0.0), span));
+                    }
+                }
+                continue;
+            }
             let span = Span::new(start, pos);
             let text = &src[start..pos];
             match text.parse::<i64>() {

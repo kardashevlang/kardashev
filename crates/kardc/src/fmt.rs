@@ -727,6 +727,9 @@ fn expr_prec(e: &Expr) -> u8 {
         // Primaries and postfix forms (calls, struct literals, field access,
         // `null`, and the `.?` unwrap) bind tightest.
         Expr::Int { .. }
+        // A floating-point literal `3.14` is a `f64` value (SPEC §38). Like an
+        // integer literal it is an atomic primary, so it binds tightest.
+        | Expr::Float { .. }
         | Expr::Bool { .. }
         | Expr::Ident { .. }
         | Expr::Call { .. }
@@ -855,6 +858,14 @@ fn fmt_cont(s: &Stmt) -> String {
 fn fmt_expr(e: &Expr) -> String {
     match e {
         Expr::Int { value, .. } => value.to_string(),
+        // A floating-point literal `3.14` of type `f64` (SPEC §38). Print with
+        // Rust's `{:?}` (Debug) formatting, which emits the shortest decimal that
+        // round-trips and always keeps a decimal point on a finite value — `3.0`
+        // stays `3.0` (not `3`), `3.14` stays `3.14`. That keeps it lexable as a
+        // float (the lexer requires a digit on both sides of the `.`, SPEC §1)
+        // and distinct from an integer literal, so the printed form re-lexes to
+        // the same `Expr::Float` and re-formatting is idempotent.
+        Expr::Float { value, .. } => format!("{:?}", value),
         Expr::Bool { value, .. } => if *value { "true" } else { "false" }.to_string(),
         Expr::Ident { name, .. } => name.clone(),
         // A string literal `"…"` — a `[]u8` value over static bytes (SPEC §23).
@@ -5542,6 +5553,76 @@ mod tests {
         );
         let once = format_source(src).expect("source formats");
         assert_eq!(once, src, "unreachable in an arm reaches canonical form");
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once, "re-formatting is idempotent");
+    }
+
+    // ----- floating point `f64` (v0.144) -----------------------------------
+
+    /// A floating-point literal `Expr::Float` of type `f64` (SPEC §38).
+    fn float(value: f64) -> Expr {
+        Expr::Float { value, span: D }
+    }
+
+    #[test]
+    fn float_literal_prints_with_decimal_point() {
+        // A `f64` literal prints via Rust's `{:?}`, which always keeps a decimal
+        // point on a finite value (SPEC §38): `3.14` stays `3.14`, and a whole
+        // value `3.0` keeps its `.0` (it must not collapse to `3`, or it would
+        // re-lex as an integer). The pure printer is deterministic, so printing
+        // twice is byte-identical (idempotence as determinism).
+        assert_eq!(fmt_expr(&float(3.14)), "3.14");
+        assert_eq!(fmt_expr(&float(3.0)), "3.0");
+        assert_eq!(fmt_expr(&float(3.14)), fmt_expr(&float(3.14)));
+        // A float literal binds as a primary, like an integer literal, so it
+        // never needs surrounding parentheses as a binary operand.
+        assert_eq!(
+            fmt_expr(&bin(BinOp::Add, float(1.5), float(2.5))),
+            "1.5 + 2.5"
+        );
+    }
+
+    #[test]
+    fn integer_literal_still_prints_without_decimal_point() {
+        // Integer literals are unchanged (SPEC §3): `3` prints `3`, never `3.0`.
+        assert_eq!(fmt_expr(&int(3)), "3");
+        assert_eq!(fmt_expr(&int(0)), "0");
+    }
+
+    #[test]
+    fn float_let_source_round_trips() {
+        // End-to-end (lex → parse → print), SPEC §38: `var x = 3.14;` is already
+        // canonical — the lexer decodes the `digits.digits` literal into a
+        // `Float` token, the parser stores it in `Expr::Float`, and the printer
+        // re-emits `3.14`. So formatting reproduces the source byte-for-byte and
+        // re-formatting that output is byte-identical (idempotence).
+        let src = "fn f() void {\n    var x = 3.14;\n}\n";
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once, "re-formatting is idempotent");
+    }
+
+    #[test]
+    fn whole_float_keeps_decimal_point_round_trip() {
+        // A whole-valued `f64` literal `3.0` must keep its `.0` through a full
+        // source round-trip — collapsing to `3` would silently retype it as an
+        // integer. The lexer requires a digit on both sides of the `.`, so `3.0`
+        // is the canonical lexable form.
+        let src = "fn f() void {\n    var x = 3.0;\n}\n";
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src, "the .0 is preserved");
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once, "re-formatting is idempotent");
+    }
+
+    #[test]
+    fn integer_let_source_unchanged() {
+        // The integer path is untouched by f64 support: `var x = 3;` still
+        // formats to `3` (no spurious `.0`) and round-trips unchanged (SPEC §3).
+        let src = "fn f() void {\n    var x = 3;\n}\n";
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src, "integer literal stays an integer");
         let twice = format_source(&once).expect("canonical source re-formats");
         assert_eq!(twice, once, "re-formatting is idempotent");
     }

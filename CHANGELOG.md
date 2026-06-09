@@ -18,6 +18,22 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.144.0] — Floating point `f64`
+
+### Added
+- **`f64`** — the first non-integer scalar (C `double`): literals (`3.14`),
+  arithmetic `+ - * /` and comparison, `print`, and `[]f64`/`[N]f64` arrays &
+  slices. `Type::F64`, `Expr::Float`, `TokenKind::Float`; the lexer reads
+  `digits.digits` (a `.` not before a digit stays `..`/field access).
+- **`@as`** extends to numeric casts — `@as(f64, n)` (int→float) and `@as(i32,
+  x)` (float→int, truncating).
+- 900 unit + 42 e2e tests; `examples/floats.ks`.
+
+### Limitations (honest, v0.144)
+No implicit int↔float mixing (cast with `@as`); no `%` on `f64`; float `const`s
+are deferred (floats are runtime-only — `var x: f64 = 3.14;` works, `const`
+doesn't).
+
 ## [0.143.0] — Enum explicit values + conversions
 
 ### Added

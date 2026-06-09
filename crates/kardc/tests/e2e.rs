@@ -1121,3 +1121,33 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "1\n2\n10\n11\n300\n2\n");
 }
+
+// --- v0.144 f64 floating point ---------------------------------------------
+
+#[test]
+fn floating_point_f64() {
+    let src = r#"
+fn average(a: f64, b: f64, c: f64) f64 {
+    return (a + b + c) / @as(f64, 3);
+}
+pub fn main() i32 {
+    var x: f64 = 1.5;
+    var y: f64 = 2.0;
+    print(x + y);                       // 3.5
+    print(average(1.0, 2.0, 6.0));      // 3   (%g drops the trailing .0)
+    if (x < y) { print(1); } else { print(0); }   // 1
+    print(@as(f64, 7) / @as(f64, 2));   // 3.5
+    print(@as(i32, 3.9));               // 3   (float -> int truncation)
+    var sum: f64 = 0.0;
+    var i: i32 = 1;
+    while (i <= 4) : (i += 1) {
+        sum = sum + @as(f64, i);        // 1+2+3+4
+    }
+    print(sum);                         // 10
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "3.5\n3\n1\n3.5\n3\n10\n");
+}

@@ -31,6 +31,13 @@ pub enum ConstVal {
 pub fn eval(expr: &Expr, consts: &HashMap<String, ConstVal>) -> Result<ConstVal, Diagnostic> {
     match expr {
         Expr::Int { value, .. } => Ok(ConstVal::Int(*value)),
+        // Floats are runtime-only in v0.144: a `const` cannot fold a float yet
+        // (a `var f64 = 3.14;` is fine, it is not const-evaluated).
+        Expr::Float { span, .. } => Err(Diagnostic::error(
+            *span,
+            "E0130",
+            "a float is not allowed in a constant expression (v0.144)",
+        )),
         Expr::Bool { value, .. } => Ok(ConstVal::Bool(*value)),
         Expr::Ident { name, span } => match consts.get(name) {
             Some(v) => Ok(*v),
