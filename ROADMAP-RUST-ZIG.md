@@ -248,11 +248,61 @@ FILE`**, which renders a file's `pub` items + their preceding `///` lines as
 Markdown (signatures from the AST, doc text associated by source position) — the
 DX capstone of Arc 3. **This completes Arc 3 (v0.131–v0.140).**
 
-### Beyond (Arc 4+, each multi-session)
+## Arc 4 (v0.141–v0.150) — toward a practical 1.0: safety, floats, std
+
+With the language surface and two containers in place (Arcs 1–3), Arc 4 adds the
+runtime-safety builtins, floating point, richer error/enum ergonomics, and a
+real importable standard library — the pieces a 1.0 needs to write everyday
+programs. Ordered by tractability; each ships via the standard cadence.
+
+### v0.141.0 — `@panic` + `unreachable` ✅
+`@panic(msg: []u8)` (write `msg` to stderr, exit 101) and `unreachable` (trap on
+a path the programmer asserts is impossible) — runtime-safety primitives that
+**diverge** and adopt the expected type, so they stand in any value position
+(e.g. a total `switch`'s `else` arm). `Expr::Unreachable`; `@panic` via
+`Expr::Builtin`; `_Noreturn` C helpers.
+
+### v0.142.0 — `catch |e|` capture
+The capturing error handler `expr catch |e| handler` (deferred from v0.125):
+binds the error to `e` and evaluates `handler` only on the error path, lowered by
+hoisting at statement position (`var x = f() catch |e| …;`).
+
+### v0.143.0 — Enum explicit values + conversions
+`enum { A = 1, B = 4 }`, `@intFromEnum(e)` and `@enumFromInt(E, n)` — give enums
+stable integer representations and round-trips.
+
+### v0.144.0 — Floating point `f64`
+A 64-bit float type: literals (`3.14`), arithmetic / comparison, `@as` to and
+from integers, and `print`. The first non-integer scalar.
+
+### v0.145.0 — Importable `std` library
+Bundle `ArrayList`/`HashMap` (+ helpers) as an importable `std` module
+(`@import("std")` resolving to a bundled source), so programs reuse the
+containers instead of copying them.
+
+### v0.146.0 — `switch` ranges + multi-label arms
+`switch` arms matching a range (`1..10 =>`) or several labels (`.A, .B =>`),
+rounding out pattern matching.
+
+### v0.147.0 — Block expressions + labeled `break`
+`blk: { … break :blk v; }` value blocks and labeled `break`/`continue`, so a
+computation can yield a value.
+
+### v0.148.0 — stdin / file I/O (`std.io`)
+Read a line from stdin and read a whole file into a `[]u8` — minimal I/O on the
+`Allocator`.
+
+### v0.149.0 — String utilities (`std.str`)
+`eq`, `concat`, `starts_with`, `index_of` over `[]u8`, on the `Allocator`.
+
+### v0.150.0 — Test filtering + bench polish
+`kard test -filter NAME` to run a subset, and a `kard bench` timing harness — the
+DX capstone of Arc 4.
+
+### Beyond (Arc 5+, each multi-session)
 Bundled cross-compilation sysroots; the full imperative `build.ks` graph (a
-`build(*Builder)` entry point); richer std (I/O, formatting); re-self-hosting
-(the compiler in kardashev); a package registry; an LSP; and a mechanized spec →
-1.0 stability commitment.
+`build(*Builder)` entry point); re-self-hosting (the compiler in kardashev); a
+package registry; an LSP; and a mechanized spec → 1.0 stability commitment.
 
 ---
 

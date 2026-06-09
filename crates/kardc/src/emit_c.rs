@@ -43,6 +43,10 @@ pub enum EmitMode {
 pub fn emit(module: &Module, structs: &crate::types::StructTable, mode: EmitMode) -> String {
     let mut em = Emitter::new(mode, structs);
     em.collect_signatures(module);
+    // Whether the `kd_panic` runtime helper is needed (SPEC §35.2): emitted only
+    // when an `@panic(..)` lowering will appear, so a string-using program that
+    // never panics is unaffected.
+    em.uses_panic = module_uses_panic(module);
     em.emit_prelude();
     em.emit_type_defs();
     em.emit_consts(module);
@@ -53,6 +57,110 @@ pub fn emit(module: &Module, structs: &crate::types::StructTable, mode: EmitMode
         EmitMode::Test => em.emit_test_harness(module),
     }
     em.out
+}
+
+// -- v0.141 `@panic` usage scan (SPEC §35.2) -------------------------------
+//
+// Whether the module contains any `@panic(..)` builtin — in a function body, a
+// struct method, a test block, a `const` initializer, or a (monomorphised)
+// generic-struct method. Drives whether the `kd_panic` runtime helper is
+// emitted. Over-counting is harmless (an unused `_Noreturn` helper), but
+// under-counting would leave a `kd_panic(..)` call referencing an undeclared
+// function, so the walk is exhaustive over the current AST.
+
+fn module_uses_panic(module: &Module) -> bool {
+    module.items.iter().any(item_uses_panic)
+}
+
+fn item_uses_panic(item: &Item) -> bool {
+    match item {
+        Item::Func(f) => block_uses_panic(&f.body),
+        Item::Const(c) => expr_uses_panic(&c.value),
+        Item::Test(t) => block_uses_panic(&t.body),
+        Item::Struct(s) => s.methods.iter().any(|m| block_uses_panic(&m.body)),
+        Item::Enum(_) | Item::Union(_) | Item::Import(_) | Item::ErrorSet(_) => false,
+    }
+}
+
+fn block_uses_panic(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_uses_panic)
+}
+
+fn stmt_uses_panic(s: &Stmt) -> bool {
+    match s {
+        Stmt::Let { value, .. } => expr_uses_panic(value),
+        Stmt::Assign { value, .. } => expr_uses_panic(value),
+        Stmt::FieldAssign { place, value, .. } => {
+            expr_uses_panic(place) || expr_uses_panic(value)
+        }
+        Stmt::Expr(e) => expr_uses_panic(e),
+        Stmt::Return { value, .. } => value.as_ref().is_some_and(expr_uses_panic),
+        Stmt::If {
+            cond, then, els, ..
+        } => {
+            expr_uses_panic(cond)
+                || block_uses_panic(then)
+                || els.as_deref().is_some_and(stmt_uses_panic)
+        }
+        Stmt::While {
+            cond, cont, body, ..
+        } => {
+            expr_uses_panic(cond)
+                || cont.as_deref().is_some_and(stmt_uses_panic)
+                || block_uses_panic(body)
+        }
+        Stmt::For { iter, body, .. } => expr_uses_panic(iter) || block_uses_panic(body),
+        Stmt::Break(_) | Stmt::Continue(_) => false,
+        Stmt::Defer { stmt, .. } | Stmt::ErrDefer { stmt, .. } => stmt_uses_panic(stmt),
+        Stmt::Block(b) => block_uses_panic(b),
+        Stmt::Switch {
+            scrutinee,
+            arms,
+            default,
+            ..
+        } => {
+            expr_uses_panic(scrutinee)
+                || arms.iter().any(|a| {
+                    a.labels.iter().any(expr_uses_panic) || block_uses_panic(&a.body)
+                })
+                || default.as_ref().is_some_and(block_uses_panic)
+        }
+    }
+}
+
+fn expr_uses_panic(e: &Expr) -> bool {
+    match e {
+        Expr::Builtin { name, args, .. } => name == "panic" || args.iter().any(expr_uses_panic),
+        Expr::Unary { expr, .. } => expr_uses_panic(expr),
+        Expr::Binary { lhs, rhs, .. } => expr_uses_panic(lhs) || expr_uses_panic(rhs),
+        Expr::Call { args, .. } => args.iter().any(expr_uses_panic),
+        Expr::Comptime { expr, .. } => expr_uses_panic(expr),
+        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_uses_panic(&f.value)),
+        Expr::Field { base, .. } => expr_uses_panic(base),
+        Expr::MethodCall { receiver, args, .. } => {
+            expr_uses_panic(receiver) || args.iter().any(expr_uses_panic)
+        }
+        Expr::Orelse { lhs, rhs, .. } => expr_uses_panic(lhs) || expr_uses_panic(rhs),
+        Expr::Unwrap { expr, .. } => expr_uses_panic(expr),
+        Expr::ArrayLit { elems, .. } => elems.iter().any(expr_uses_panic),
+        Expr::Index { base, index, .. } => expr_uses_panic(base) || expr_uses_panic(index),
+        Expr::AddrOf { place, .. } => expr_uses_panic(place),
+        Expr::Deref { expr, .. } => expr_uses_panic(expr),
+        Expr::SliceExpr { base, lo, hi, .. } => {
+            expr_uses_panic(base) || expr_uses_panic(lo) || expr_uses_panic(hi)
+        }
+        Expr::Try { expr, .. } => expr_uses_panic(expr),
+        Expr::Catch { expr, default, .. } => expr_uses_panic(expr) || expr_uses_panic(default),
+        Expr::StructType { methods, .. } => methods.iter().any(|m| block_uses_panic(&m.body)),
+        Expr::Int { .. }
+        | Expr::Bool { .. }
+        | Expr::Ident { .. }
+        | Expr::StrLit { .. }
+        | Expr::Null { .. }
+        | Expr::ErrorLit { .. }
+        | Expr::EnumLit { .. }
+        | Expr::Unreachable { .. } => false,
+    }
 }
 
 /// A lexical scope active during emission. Each one accumulates the `defer`
@@ -185,6 +293,12 @@ struct Emitter<'a> {
     /// is emitted (see [`Emitter::emit_instance_defs`]). Stored as clones so a
     /// `Call` to a generic can be lowered to its instance's C name anywhere.
     generics: HashMap<String, Func>,
+    /// v0.141: whether the module contains any `@panic(..)` (SPEC §35). Drives
+    /// whether the `kd_panic` runtime helper is emitted in `emit_type_defs` — it
+    /// must accompany every `kd_panic(..)` lowering and be absent otherwise, so a
+    /// string-using program that never panics keeps its `fwrite`-free output.
+    /// Computed once in [`emit`] before any type is emitted.
+    uses_panic: bool,
 }
 
 impl<'a> Emitter<'a> {
@@ -210,6 +324,7 @@ impl<'a> Emitter<'a> {
             subst: HashMap::new(),
             value_subst: HashMap::new(),
             generics: HashMap::new(),
+            uses_panic: false,
         }
     }
 
@@ -597,6 +712,15 @@ impl<'a> Emitter<'a> {
             .push_str("typedef struct { int _unused; } kd_allocator;\n");
         self.out
             .push_str("static void kd_print(long long v) { printf(\"%lld\\n\", v); }\n");
+        // v0.141 runtime-safety traps (SPEC §35.2). `kd_unreachable` has no type
+        // dependency, so it lives here in the prelude and is emitted
+        // unconditionally — a never-called `_Noreturn` function is harmless (no
+        // diagnostic for an unused non-`static` definition). Its sibling
+        // `kd_panic` takes the message as a `[]u8` (`kd_slice_uint8_t`) and so is
+        // emitted *after* that slice typedef, at the tail of `emit_type_defs`.
+        self.out.push_str(
+            "_Noreturn void kd_unreachable(void) { fputs(\"reached unreachable code\\n\", stderr); exit(101); }\n",
+        );
         self.blank();
     }
 
@@ -747,6 +871,19 @@ impl<'a> Emitter<'a> {
                 Node::Array(id) => self.emit_one_array(id),
                 Node::Slice(id) => self.emit_one_slice(id),
             }
+        }
+        // v0.141 (SPEC §35.2): the `@panic` runtime trap, emitted here — at the
+        // tail of the type-def section — because it takes the panic message as a
+        // `[]u8` slice (`kd_slice_uint8_t`) and so must follow that typedef. It is
+        // emitted only when the module actually uses `@panic` (a `[]u8` slice may
+        // exist for plain strings without any panic, and its `fwrite` must not
+        // leak into such programs); the `[]u8` guard is then always satisfied,
+        // since `@panic`'s message argument is a `[]u8`. (`kd_unreachable`, which
+        // needs no typedef, lives in the prelude.)
+        if self.uses_panic && self.structs.slices().any(|(_, e)| e == Type::U8) {
+            self.line(
+                "_Noreturn void kd_panic(kd_slice_uint8_t m) { fwrite(m.ptr, 1, m.len, stderr); fputc(0x0a, stderr); exit(101); }",
+            );
         }
         self.blank();
     }
@@ -2042,6 +2179,24 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+        // v0.141 runtime-safety traps as statements / switch arms (SPEC §35.2):
+        // lower to the bare `_Noreturn` call (no `, 0` comma form) and report
+        // divergence so the enclosing block stops — no fall-through flush.
+        match e {
+            Expr::Unreachable { .. } => {
+                self.line("kd_unreachable();");
+                return true;
+            }
+            Expr::Builtin { name, args, .. } if name == "panic" => {
+                let msg = match args.first() {
+                    Some(a) => self.emit_expr(a),
+                    None => "((kd_slice_uint8_t){0})".to_string(),
+                };
+                self.line(&format!("kd_panic({});", msg));
+                return true;
+            }
+            _ => {}
+        }
         // `try e;` as a bare statement: hoist the propagation, discard the
         // unwrapped payload.
         if let Expr::Try { expr, .. } = e {
@@ -2421,6 +2576,19 @@ impl<'a> Emitter<'a> {
                             display.as_bytes().len()
                         )
                     }
+                    // `@panic(msg)` in expression position (SPEC §35.2): the
+                    // comma-expression `(kd_panic(<msg>), 0)`. `kd_panic` is
+                    // `_Noreturn` (it `exit(101)`s), so the trailing `0` is dead;
+                    // it satisfies the type only of an integer value position (a
+                    // non-integer position is a later refinement). A statement
+                    // position lowers without the `, 0` via `emit_expr_stmt`.
+                    "panic" => {
+                        let msg = match args.first() {
+                            Some(e) => self.emit_expr(e),
+                            None => "((kd_slice_uint8_t){0})".to_string(),
+                        };
+                        format!("(kd_panic({}), 0)", msg)
+                    }
                     // Unknown builtins are rejected by sema; emit a placeholder.
                     _ => "0".to_string(),
                 }
@@ -2776,6 +2944,12 @@ impl<'a> Emitter<'a> {
             // this arm is unreachable for validated input; emit a harmless `0`
             // placeholder so the C stays well-formed even if it were reached.
             Expr::StructType { .. } => "0".to_string(),
+            // `unreachable` in expression position (SPEC §35.2): the
+            // comma-expression `(kd_unreachable(), 0)`. `kd_unreachable` is
+            // `_Noreturn`, so the trailing `0` is dead — it only satisfies an
+            // integer value position. A statement position lowers without the
+            // `, 0` via `emit_expr_stmt`.
+            Expr::Unreachable { .. } => "(kd_unreachable(), 0)".to_string(),
         }
     }
 
@@ -3211,6 +3385,10 @@ impl<'a> Emitter<'a> {
                     Some(Expr::Ident { name, .. }) => Some(self.base_type(name)),
                     _ => None,
                 },
+                // `@panic(msg)` diverges (SPEC §35.1): no inherent type — it
+                // adopts the expected type, and emission coerces via the
+                // surrounding let/return annotation.
+                "panic" => None,
                 _ => None,
             },
             Expr::Ident { name, .. } => self.lookup_var_type(name),
@@ -3370,6 +3548,10 @@ impl<'a> Emitter<'a> {
             // reaches a runtime value position in validated input and so has no
             // runtime type — report `None` defensively.
             Expr::StructType { .. } => None,
+            // `unreachable` diverges (SPEC §35.1): no inherent type — it adopts
+            // the expected type, with emission coercing through the surrounding
+            // context (let/return), exactly like `@panic`.
+            Expr::Unreachable { .. } => None,
         }
     }
 
@@ -8767,5 +8949,190 @@ mod tests {
             1,
             "exactly one increment expected (no duplicate on a diverging body):\n{out}"
         );
+    }
+
+    // ---- v0.141: @panic / unreachable runtime-safety traps ----------------
+    // (Reuses the existing `str_lit` / `u8_slice_table` test helpers above.)
+
+    /// `@panic(msg)` — an `Expr::Builtin { name: "panic" }` (SPEC §35).
+    fn panic_call(msg: Expr) -> Expr {
+        Expr::Builtin {
+            name: "panic".to_string(),
+            args: vec![msg],
+            span: Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn panic_statement_emits_kd_panic_over_string_slice_and_diverges() {
+        // fn main() void { @panic("boom"); }
+        let m = Module {
+            items: vec![Item::Func(func(
+                "main",
+                vec![],
+                "void",
+                vec![Stmt::Expr(panic_call(str_lit("boom")))],
+            ))],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        // The `_Noreturn` helper is declared once a `[]u8` slice exists.
+        assert!(
+            out.contains(
+                "_Noreturn void kd_panic(kd_slice_uint8_t m) { fwrite(m.ptr, 1, m.len, stderr); fputc(0x0a, stderr); exit(101); }"
+            ),
+            "kd_panic helper missing:\n{out}"
+        );
+        // Ordering: the helper names `kd_slice_uint8_t`, so the typedef must
+        // precede it (why `kd_panic` lives at the tail of the type-def section,
+        // not in the prelude).
+        let typedef_at = out
+            .find("} kd_slice_uint8_t;")
+            .expect("the []u8 slice typedef must be emitted");
+        let helper_at = out
+            .find("_Noreturn void kd_panic(")
+            .expect("the kd_panic helper must be emitted");
+        assert!(
+            typedef_at < helper_at,
+            "kd_panic must follow the kd_slice_uint8_t typedef:\n{out}"
+        );
+        // The statement lowers to the bare call over the string slice — NOT the
+        // `(.., 0)` comma form — and so diverges.
+        assert!(
+            out.contains(
+                "kd_panic(((kd_slice_uint8_t){ .ptr = (uint8_t *)\"boom\", .len = 4 }));"
+            ),
+            "panic statement lowering wrong:\n{out}"
+        );
+        assert!(
+            !out.contains("(kd_panic(((kd_slice_uint8_t){ .ptr = (uint8_t *)\"boom\", .len = 4 })), 0)"),
+            "a statement-position @panic must not use the comma-expression form:\n{out}"
+        );
+    }
+
+    #[test]
+    fn panic_expression_uses_comma_form() {
+        // `@panic` directly through emit_expr (a value position) keeps the
+        // `(kd_panic(<msg>), 0)` comma form, whose dead `0` satisfies an integer
+        // value position.
+        let t = StructTable::new();
+        let mut em = Emitter::new(EmitMode::Program, &t);
+        let s = em.emit_expr(&panic_call(str_lit("x")));
+        assert_eq!(
+            s,
+            "(kd_panic(((kd_slice_uint8_t){ .ptr = (uint8_t *)\"x\", .len = 1 })), 0)"
+        );
+        // `unreachable` likewise.
+        let u = em.emit_expr(&Expr::Unreachable { span: Span::DUMMY });
+        assert_eq!(u, "(kd_unreachable(), 0)");
+    }
+
+    #[test]
+    fn unreachable_statement_emits_kd_unreachable_and_diverges() {
+        // fn main() void { unreachable; }
+        let m = Module {
+            items: vec![Item::Func(func(
+                "main",
+                vec![],
+                "void",
+                vec![Stmt::Expr(Expr::Unreachable { span: Span::DUMMY })],
+            ))],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Program);
+        // The prelude helper is always present (no type dependency).
+        assert!(
+            out.contains(
+                "_Noreturn void kd_unreachable(void) { fputs(\"reached unreachable code\\n\", stderr); exit(101); }"
+            ),
+            "kd_unreachable prelude helper missing:\n{out}"
+        );
+        // The statement lowers to the bare call.
+        assert!(
+            out.contains("kd_unreachable();"),
+            "unreachable statement lowering wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn panic_program_exits_101_and_prints_message_to_stderr() {
+        // End-to-end: emit → cc → run a program that hits `@panic("boom")`,
+        // asserting exit code 101 and the message (plus newline) on stderr.
+        let m = Module {
+            items: vec![Item::Func(func(
+                "main",
+                vec![],
+                "void",
+                vec![Stmt::Expr(panic_call(str_lit("boom")))],
+            ))],
+        };
+        let c = emit(&m, &u8_slice_table(), EmitMode::Program);
+        let exe = std::env::temp_dir().join(format!(
+            "kardc_emit_v141_panic_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        crate::backend::cc_build(&c, &exe, &crate::backend::BuildOptions::default())
+            .expect("emitted C for an @panic program should compile");
+        let output = std::process::Command::new(&exe)
+            .output()
+            .expect("the compiled program should run");
+        let _ = std::fs::remove_file(&exe);
+        assert_eq!(
+            output.status.code(),
+            Some(101),
+            "an @panic must exit 101:\n--- C ---\n{c}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr, "boom\n",
+            "panic message wrong on stderr:\nstderr={stderr}\n--- C ---\n{c}"
+        );
+    }
+
+    #[test]
+    fn unreachable_in_else_arm_compiles() {
+        // fn main() void { switch (0) { 0 => return; else => unreachable; } }
+        let m = Module {
+            items: vec![Item::Func(func(
+                "main",
+                vec![],
+                "void",
+                vec![Stmt::Switch {
+                    scrutinee: int(0),
+                    arms: vec![SwitchArm {
+                        labels: vec![int(0)],
+                        capture: None,
+                        body: block(vec![Stmt::Return {
+                            value: None,
+                            span: Span::DUMMY,
+                        }]),
+                        span: Span::DUMMY,
+                    }],
+                    default: Some(block(vec![Stmt::Expr(Expr::Unreachable {
+                        span: Span::DUMMY,
+                    })])),
+                    span: Span::DUMMY,
+                }],
+            ))],
+        };
+        let c = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            c.contains("kd_unreachable();"),
+            "else-arm unreachable lowering missing:\n{c}"
+        );
+        // The emitted switch is valid C.
+        let exe = std::env::temp_dir().join(format!(
+            "kardc_emit_v141_switch_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        crate::backend::cc_build(&c, &exe, &crate::backend::BuildOptions::default())
+            .expect("a switch with an `else => unreachable` arm should compile");
+        let _ = std::fs::remove_file(&exe);
     }
 }

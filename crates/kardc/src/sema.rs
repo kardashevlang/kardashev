@@ -2727,13 +2727,21 @@ impl Checker {
                     None => None,
                 }
             }
+            // `unreachable` (v0.141, SPEC §35.1) — a diverging expression: it
+            // never returns, so in a value position it adopts the *expected*
+            // type (e.g. `else => unreachable`, `var x: i32 = unreachable`, the
+            // `x orelse unreachable` form). With no expectation (a bare
+            // statement) it is `void`. It is never a type error; the trap (exit
+            // 101) is emitted by the backend.
+            Expr::Unreachable { .. } => Some(expected.unwrap_or(Type::Void)),
             // A comptime reflection builtin `@name(T)` in expression position
             // (v0.136, SPEC §32.1). The single argument names a *type*, resolved
             // exactly like `alloc`'s type argument (`resolve_type_arg`, which is
             // substitution-aware so `@sizeOf(T)` / `@typeName(T)` work inside a
             // generic body). `@sizeOf(T)` yields `usize`; `@typeName(T)` yields a
-            // `[]u8` string (the §23 slice). An unknown `@name`, or a wrong
-            // argument count, is `E0320`.
+            // `[]u8` string (the §23 slice). `@panic(msg)` (v0.141) is a diverging
+            // runtime-safety builtin (handled below). An unknown `@name`, or a
+            // wrong argument count, is `E0320`.
             Expr::Builtin { name, args, span } => match name.as_str() {
                 "sizeOf" | "typeName" => {
                     if args.len() != 1 {
@@ -2786,9 +2794,51 @@ impl Checker {
                     }
                     target
                 }
+                "panic" => {
+                    // `@panic(msg)` (v0.141, SPEC §35) — a diverging runtime-safety
+                    // builtin: write `msg` (a `[]u8`, the §23 string) to stderr and
+                    // `exit(101)` (the panic convention). Exactly one argument, a
+                    // `[]u8`; a wrong argument count is `E0320` (the `@`-builtin
+                    // arity code). Because it diverges (never returns), the result
+                    // type ADOPTS the *expected* type — so `@panic(…)` type-checks
+                    // anywhere a value is expected (`x orelse @panic(…)`,
+                    // `else => @panic(…)`, `var x: i32 = @panic(…)`); with no
+                    // expectation (a bare statement) it is `void`.
+                    if args.len() != 1 {
+                        self.error(
+                            *span,
+                            "E0320",
+                            format!(
+                                "`@panic` takes exactly 1 argument (a `[]u8` message), found {}",
+                                args.len()
+                            ),
+                        );
+                        return None;
+                    }
+                    // Check the message against the expected `[]u8` (so e.g. a
+                    // string literal types as `[]u8`); any non-`[]u8` argument is a
+                    // type error (`E0110`). The result still adopts the expected
+                    // type — the divergence is independent of the argument.
+                    let u8_slice = Type::Slice(self.structs.intern_slice(Type::U8));
+                    if let Some(at) = self.check_expr(&args[0], Some(u8_slice)) {
+                        let is_u8_slice =
+                            matches!(at, Type::Slice(id) if self.structs.slice_elem(id) == Type::U8);
+                        if !is_u8_slice {
+                            self.error(
+                                args[0].span(),
+                                "E0110",
+                                format!(
+                                    "`@panic` message must be a `[]u8`, found `{}`",
+                                    self.type_name(at)
+                                ),
+                            );
+                        }
+                    }
+                    Some(expected.unwrap_or(Type::Void))
+                }
                 other => {
                     let msg = format!(
-                        "unknown `@`-builtin `@{}` (expected `@sizeOf`, `@typeName`, or `@as`)",
+                        "unknown `@`-builtin `@{}` (expected `@sizeOf`, `@typeName`, `@as`, or `@panic`)",
                         other
                     );
                     self.error(*span, "E0320", msg);
@@ -10585,6 +10635,165 @@ mod tests {
         // const C: usize = @sizeOf(i32);  // not a constant expression
         let items = vec![const_item("C", "usize", builtin("sizeOf", vec![ident("i32")]))];
         assert!(codes(items).contains(&"E0130"));
+    }
+
+    // ---- `@panic` and `unreachable` (v0.141, SPEC §35.1) -------------------
+
+    /// `unreachable` (v0.141).
+    fn unreachable_expr() -> Expr {
+        Expr::Unreachable { span: sp() }
+    }
+
+    #[test]
+    fn unreachable_adopts_expected_type() {
+        // In a value position `unreachable` adopts the expected type; as a bare
+        // statement (no expectation) it is `void`. It is never a type error.
+        let mut cx = Checker::new();
+        assert_eq!(
+            cx.check_expr(&unreachable_expr(), Some(Type::I32)),
+            Some(Type::I32)
+        );
+        assert_eq!(cx.check_expr(&unreachable_expr(), None), Some(Type::Void));
+    }
+
+    #[test]
+    fn unreachable_annotated_var_ok() {
+        // fn main() void { var x: i32 = unreachable; }
+        // The diverging `unreachable` adopts the `i32` annotation, so the
+        // initializer type-checks.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var("x", "i32", unreachable_expr())],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn unreachable_statement_ok() {
+        // fn main() void { unreachable; }   // a bare statement is `void`
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![Stmt::Expr(unreachable_expr())],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn panic_adopts_expected_type() {
+        // fn main() void { var s: i32 = @panic("x"); }
+        // `@panic` diverges, so it adopts the `i32` annotation (works in any
+        // value position).
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var("s", "i32", builtin("panic", vec![str_lit("x")]))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn panic_statement_ok() {
+        // fn main() void { @panic("x"); }   // a bare statement is `void`
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![Stmt::Expr(builtin("panic", vec![str_lit("x")]))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn panic_non_slice_arg_is_error() {
+        // fn main() void { @panic(5); }   // the message must be a `[]u8`
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![Stmt::Expr(builtin("panic", vec![int(5)]))],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn panic_no_args_is_e0320() {
+        // fn main() void { @panic(); }   // wrong arity (the `@`-builtin code)
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![Stmt::Expr(builtin("panic", vec![]))],
+        )];
+        assert!(codes(items).contains(&"E0320"));
+    }
+
+    #[test]
+    fn panic_too_many_args_is_e0320() {
+        // fn main() void { @panic("a", "b"); }   // wrong arity
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![Stmt::Expr(builtin("panic", vec![str_lit("a"), str_lit("b")]))],
+        )];
+        assert!(codes(items).contains(&"E0320"));
+    }
+
+    #[test]
+    fn unreachable_in_switch_else_arm_ok() {
+        // const Color = enum { Red, Green, Blue };
+        // fn classify(c: Color) void {
+        //     switch (c) { .Red => { print(1); } else => { unreachable; } }
+        // }
+        // The `else` arm (a void block) accepts the diverging `unreachable`, and
+        // its presence makes the switch exhaustive.
+        let items = vec![
+            color_enum(),
+            func(
+                "classify",
+                vec![param("c", "Color")],
+                "void",
+                vec![switch_stmt(
+                    ident("c"),
+                    vec![switch_arm(
+                        vec![enum_lit("Red")],
+                        vec![Stmt::Expr(call("print", vec![int(1)]))],
+                    )],
+                    Some(vec![Stmt::Expr(unreachable_expr())]),
+                )],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn panic_in_switch_else_arm_ok() {
+        // const Color = enum { Red, Green, Blue };
+        // fn classify(c: Color) void {
+        //     switch (c) { .Red => { print(1); } else => { @panic("bad color"); } }
+        // }
+        let items = vec![
+            color_enum(),
+            func(
+                "classify",
+                vec![param("c", "Color")],
+                "void",
+                vec![switch_stmt(
+                    ident("c"),
+                    vec![switch_arm(
+                        vec![enum_lit("Red")],
+                        vec![Stmt::Expr(call("print", vec![int(1)]))],
+                    )],
+                    Some(vec![Stmt::Expr(builtin("panic", vec![str_lit("bad color")]))]),
+                )],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
     }
 
     // ---- `@This()` / `Self` in plain struct methods (v0.136, SPEC §32.2) ---

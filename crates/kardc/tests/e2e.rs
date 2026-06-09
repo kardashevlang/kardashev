@@ -1037,3 +1037,33 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "42\n-1\n7\n-1\n");
 }
+
+// --- v0.141 @panic + unreachable -------------------------------------------
+
+#[test]
+fn panic_exits_101_after_prior_output() {
+    let src = r#"
+fn classify(n: i32) i32 {
+    switch (n) {
+        0 => { return 100; },
+        else => { unreachable; },   // a path the caller never takes
+    }
+}
+fn checked_div(a: i32, b: i32) i32 {
+    if (b == 0) {
+        @panic("division by zero");
+    }
+    return a / b;
+}
+pub fn main() i32 {
+    print(checked_div(20, 4));   // 5
+    print(classify(0));          // 100
+    print(checked_div(1, 0));    // @panic -> exit 101
+    print(999);                  // unreachable in practice
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 101); // exit-101 panic convention
+    assert_eq!(out, "5\n100\n"); // stdout flushed up to the panic; 999 never printed
+}

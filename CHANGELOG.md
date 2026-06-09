@@ -18,6 +18,19 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.141.0] — `@panic` + `unreachable`
+
+First version of **Arc 4** (toward a practical 1.0: safety, floats, std).
+
+### Added
+- **`@panic(msg)`** — write the `[]u8` `msg` to stderr and `exit(101)`.
+  **`unreachable`** — trap (exit 101) if reached. Both **diverge** and adopt the
+  expected type, so they stand in any value position (e.g. a total `switch`'s
+  `else => { unreachable; }`).
+- `Expr::Unreachable` + the `unreachable` keyword; `@panic` via `Expr::Builtin`.
+  `_Noreturn` C helpers `kd_panic`/`kd_unreachable`. 833 unit + 39 e2e tests;
+  `examples/panic.ks`.
+
 ## [0.140.0] — Doc comments + `kard doc`
 
 The capstone of **Arc 3** (v0.131–v0.140 complete).
