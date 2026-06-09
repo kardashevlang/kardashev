@@ -242,9 +242,11 @@ alongside the implicit global `!T`. `TypeExpr.error_set`; `Item::ErrorSet`. At
 runtime `Set!T` ≡ `!T` (the set is a compile-time constraint), so `try`/`catch`
 are unchanged.
 
-### v0.140.0 — Doc comments + `kard doc`
-`/// …` doc comments parsed onto items, and `kard doc` to extract a module's
-public API into Markdown — the DX capstone of Arc 3.
+### v0.140.0 — Doc comments + `kard doc` ✅
+`/// …` doc comments (an ignored `//` comment to the compiler) and **`kard doc
+FILE`**, which renders a file's `pub` items + their preceding `///` lines as
+Markdown (signatures from the AST, doc text associated by source position) — the
+DX capstone of Arc 3. **This completes Arc 3 (v0.131–v0.140).**
 
 ### Beyond (Arc 4+, each multi-session)
 Bundled cross-compilation sysroots; the full imperative `build.ks` graph (a

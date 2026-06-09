@@ -18,6 +18,20 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.140.0] — Doc comments + `kard doc`
+
+The capstone of **Arc 3** (v0.131–v0.140 complete).
+
+### Added
+- **`kard doc FILE`** — renders a file's `pub` items and their `///` doc
+  comments as Markdown: signatures (`fn add(a: i32, b: i32) i32`, `struct Vec2`,
+  `error set LookupErr`, `const X: T`) are reconstructed from the AST, and the
+  contiguous `///` lines directly above each item are associated by source
+  position. Non-`pub` items are omitted. CI smoke-tests it.
+- `///` is a doc-comment convention (an ordinary ignored comment to the
+  compiler); no AST/parser change. 807 unit + 38 e2e tests;
+  `examples/documented.ks`.
+
 ## [0.139.0] — Named error sets
 
 ### Added

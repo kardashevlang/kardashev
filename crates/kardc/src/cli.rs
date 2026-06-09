@@ -52,6 +52,10 @@ Commands:
             --check exits non-zero if FILE is not already canonical; -w
             rewrites FILE in place.
 
+    doc   FILE
+            Print Markdown API documentation for FILE's public items, using the
+            `///` doc comments written above each one.
+
     init  [NAME]
             Scaffold a new project. With NAME, creates ./NAME; otherwise
             scaffolds into the current directory.
@@ -88,6 +92,8 @@ enum Command {
     Test { file: Option<String> },
     /// `fmt FILE [--check | -w]`
     Fmt { file: String, mode: FmtMode },
+    /// `doc FILE` — print Markdown API docs for a file's public items (v0.140).
+    Doc { file: String },
     /// `init [NAME]`
     Init { name: Option<String> },
     /// `targets` — list known cross-compilation target triples.
@@ -140,6 +146,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
         Command::Run { file, args } => cmd_run(file, args),
         Command::Test { file } => cmd_test(file),
         Command::Fmt { file, mode } => cmd_fmt(file, mode),
+        Command::Doc { file } => cmd_doc(file),
         Command::Init { name } => cmd_init(name),
         Command::Targets => cmd_targets(),
     }
@@ -164,6 +171,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "run" => parse_run(&rest),
         "test" => parse_test(&rest),
         "fmt" => parse_fmt(&rest),
+        "doc" => parse_doc(&rest),
         "init" => parse_init(&rest),
         "targets" => parse_targets(&rest),
         "version" | "--version" | "-V" => Ok(Command::Version),
@@ -315,6 +323,26 @@ fn parse_fmt(rest: &[&str]) -> Result<Command, String> {
     match file {
         Some(f) => Ok(Command::Fmt { file: f, mode }),
         None => Err("`fmt` requires a FILE argument".to_string()),
+    }
+}
+
+fn parse_doc(rest: &[&str]) -> Result<Command, String> {
+    let mut file: Option<String> = None;
+    for &a in rest {
+        match a {
+            "-h" | "--help" => return Ok(Command::Help),
+            _ if a.starts_with('-') => return Err(format!("unknown flag `{a}` for `doc`")),
+            _ => {
+                if file.is_some() {
+                    return Err(format!("unexpected extra argument `{a}` for `doc`"));
+                }
+                file = Some(a.to_string());
+            }
+        }
+    }
+    match file {
+        Some(f) => Ok(Command::Doc { file: f }),
+        None => Err("`doc` requires a FILE argument".to_string()),
     }
 }
 
@@ -700,6 +728,154 @@ fn cmd_fmt(file: String, mode: FmtMode) -> ExitCode {
     }
 }
 
+/// `kard doc FILE` — render Markdown API documentation for a file's public
+/// items and their `///` doc comments (v0.140). Doc comments are ordinary
+/// (ignored) `//` comments to the compiler; this command associates the
+/// contiguous `///` lines directly above each `pub` item by source position.
+fn cmd_doc(file: String) -> ExitCode {
+    let src = match read_file(&file) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprint!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tokens = match crate::lexer::lex(&src) {
+        Ok(t) => t,
+        Err(diags) => {
+            eprint!("{}", crate::diag::render_all(&diags, &file, &src));
+            return ExitCode::FAILURE;
+        }
+    };
+    let module = match crate::parser::parse(&tokens) {
+        Ok(m) => m,
+        Err(diags) => {
+            eprint!("{}", crate::diag::render_all(&diags, &file, &src));
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{}", render_docs(&file, &src, &module));
+    ExitCode::SUCCESS
+}
+
+/// Byte offset of the start of each line in `src`.
+fn line_starts(src: &str) -> Vec<usize> {
+    let mut v = vec![0usize];
+    for (i, b) in src.bytes().enumerate() {
+        if b == b'\n' {
+            v.push(i + 1);
+        }
+    }
+    v
+}
+
+/// The contiguous `///` doc-comment lines immediately above byte offset `at`,
+/// in source order, with the `///` (and one optional space) stripped.
+fn doc_above(src: &str, starts: &[usize], at: usize) -> Vec<String> {
+    let line = match starts.binary_search(&at) {
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
+    };
+    let mut docs: Vec<String> = Vec::new();
+    let mut i = line;
+    while i > 0 {
+        i -= 1;
+        let s = starts[i];
+        let e = if i + 1 < starts.len() { starts[i + 1] } else { src.len() };
+        let text = src[s..e].trim_end_matches('\n').trim_end_matches('\r');
+        let trimmed = text.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("///") {
+            docs.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+        } else {
+            break;
+        }
+    }
+    docs.reverse();
+    docs
+}
+
+/// A compact source-like spelling of a type for a doc signature.
+fn doc_type_str(te: &crate::ast::TypeExpr) -> String {
+    use crate::ast::ArraySize;
+    if let Some(sz) = &te.array_len {
+        let n = match sz {
+            ArraySize::Lit(n) => n.to_string(),
+            ArraySize::Param(s) => s.clone(),
+        };
+        return format!("[{}]{}", n, te.name);
+    }
+    if te.optional {
+        return format!("?{}", te.name);
+    }
+    if te.error_union {
+        return match &te.error_set {
+            Some(s) => format!("{}!{}", s, te.name),
+            None => format!("!{}", te.name),
+        };
+    }
+    if te.pointer {
+        return format!("*{}", te.name);
+    }
+    if te.slice {
+        return format!("[]{}", te.name);
+    }
+    te.name.clone()
+}
+
+/// A one-line signature for a function, e.g. `fn add(a: i32, b: i32) i32`.
+fn doc_func_sig(f: &crate::ast::Func) -> String {
+    let params: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| {
+            let pre = if p.is_comptime { "comptime " } else { "" };
+            format!("{}{}: {}", pre, p.name, doc_type_str(&p.ty))
+        })
+        .collect();
+    format!("fn {}({}) {}", f.name, params.join(", "), doc_type_str(&f.ret))
+}
+
+/// Render a module's public API as Markdown.
+fn render_docs(file: &str, src: &str, module: &crate::ast::Module) -> String {
+    use crate::ast::Item;
+    let starts = line_starts(src);
+    let mut out = format!("# `{}`\n\n", file);
+    let mut any = false;
+    for item in &module.items {
+        let (sig, span) = match item {
+            Item::Func(f) if f.is_pub => (doc_func_sig(f), f.span),
+            Item::Const(c) if c.is_pub => {
+                let ty = match &c.ty {
+                    Some(t) => format!(": {}", doc_type_str(t)),
+                    None => String::new(),
+                };
+                (format!("const {}{}", c.name, ty), c.span)
+            }
+            Item::Struct(s) if s.is_pub => (format!("struct {}", s.name), s.span),
+            Item::Enum(e) if e.is_pub => (format!("enum {}", e.name), e.span),
+            Item::Union(u) if u.is_pub => (format!("union {}", u.name), u.span),
+            Item::ErrorSet(e) if e.is_pub => (format!("error set {}", e.name), e.span),
+            _ => continue,
+        };
+        any = true;
+        out.push_str(&format!("## `{}`\n\n", sig));
+        let doc = doc_above(src, &starts, span.start);
+        if doc.is_empty() {
+            out.push_str("_No documentation._\n\n");
+        } else {
+            for line in &doc {
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+    }
+    if !any {
+        out.push_str("_No public items._\n");
+    }
+    out
+}
+
 fn cmd_init(name: Option<String>) -> ExitCode {
     // `init NAME` scaffolds ./NAME named NAME; `init` (no NAME) scaffolds the
     // current directory, named after its basename (SPEC §6).
@@ -974,6 +1150,41 @@ mod tests {
     fn fmt_conflicting_modes_error() {
         assert!(parse(&["fmt", "f.ks", "--check", "-w"]).is_err());
         assert!(parse(&["fmt", "f.ks", "-w", "--check"]).is_err());
+    }
+
+    #[test]
+    fn doc_takes_one_file() {
+        assert_eq!(
+            parse(&["doc", "lib.ks"]).unwrap(),
+            Command::Doc {
+                file: "lib.ks".to_string()
+            }
+        );
+        assert!(parse(&["doc"]).is_err()); // FILE required
+        assert!(parse(&["doc", "a.ks", "b.ks"]).is_err()); // one file only
+        assert!(parse(&["doc", "--zonk"]).is_err()); // unknown flag
+    }
+
+    #[test]
+    fn doc_renders_pub_items_with_their_doc_comments() {
+        let src = "\
+/// The answer.
+pub const ANSWER: i32 = 42;
+
+fn hidden() i32 { return 0; }
+
+/// Doubles its input.
+pub fn twice(n: i32) i32 { return n + n; }
+";
+        let module = crate::parser::parse(&crate::lexer::lex(src).unwrap()).unwrap();
+        let md = render_docs("lib.ks", src, &module);
+        assert!(md.contains("# `lib.ks`"));
+        assert!(md.contains("## `const ANSWER: i32`"));
+        assert!(md.contains("The answer."));
+        assert!(md.contains("## `fn twice(n: i32) i32`"));
+        assert!(md.contains("Doubles its input."));
+        // A non-`pub` item is omitted from the public API docs.
+        assert!(!md.contains("hidden"));
     }
 
     #[test]
