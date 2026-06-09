@@ -523,10 +523,41 @@ impl<'a> Parser<'a> {
             return Err(self.expected("`struct`"));
         }
         self.expect_punct(&TokenKind::LBrace, "`{`")?;
-        // Fields come first: `IDENT : type`, comma-separated with an optional
-        // trailing comma. A `pub`/`fn` keyword (the start of a method) or the
-        // closing `}` ends the field list. Field names are identifiers, so they
-        // never collide with the `pub`/`fn` keywords that introduce methods.
+        let (fields, methods) = self.parse_struct_body()?;
+        self.expect_punct(&TokenKind::RBrace, "`}`")?;
+        let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
+        Ok(Item::Struct(StructDecl {
+            is_pub,
+            name,
+            fields,
+            methods,
+            span: start.merge(semi),
+        }))
+    }
+
+    /// Parse the body of a `struct { … }` — the fields, then the methods /
+    /// associated functions — with the opening `{` already consumed and the
+    /// cursor positioned just after it. Stops at (without consuming) the
+    /// closing `}`, returning `(fields, methods)`.
+    ///
+    /// This is shared by a **named** struct declaration `const Name = struct {
+    /// … };` (SPEC §9.1, §10) and an **anonymous** `struct { … }` *type value*
+    /// (SPEC §25.1, §26.1) — both use identical field+method syntax, so a
+    /// type-constructor's struct becomes a real container (the foundation of
+    /// `ArrayList(T)`) for free.
+    ///
+    /// Fields come first: `IDENT : type`, comma-separated with an optional
+    /// trailing comma. A `pub`/`fn` keyword (the start of a method) or the
+    /// closing `}` ends the field list — field names are identifiers, so they
+    /// never collide with the `pub`/`fn` keywords that introduce methods. Then
+    /// zero or more methods / associated functions, each a `pub? fn ...` parsed
+    /// with the shared [`Parser::parse_func_decl`] logic (so both struct forms
+    /// grow new function-syntax features for free), until the closing `}` (SPEC
+    /// §10). A method's `self: Self` / `*Self` receiver — where `Self` denotes
+    /// the enclosing (instantiated) struct, SPEC §26.1 — is just an ordinary
+    /// parameter to the parser; resolving `Self` is a sema concern. Duplicate
+    /// field names are likewise a sema concern (`E0162`), not the parser's.
+    fn parse_struct_body(&mut self) -> PResult<(Vec<FieldDecl>, Vec<Func>)> {
         let mut fields = Vec::new();
         while !self.at_punct(&TokenKind::RBrace)
             && !self.at_kw(Kw::Fn)
@@ -545,8 +576,6 @@ impl<'a> Parser<'a> {
                 break; // no separator → the field list is done
             }
         }
-        // Then methods / associated functions: each is `pub? fn ...`, parsed
-        // with the shared function logic, until the closing `}` (SPEC §10).
         let mut methods = Vec::new();
         while !self.at_punct(&TokenKind::RBrace) {
             let m_start = self.peek_span();
@@ -556,15 +585,7 @@ impl<'a> Parser<'a> {
             }
             methods.push(self.parse_func_decl(m_pub, m_start)?);
         }
-        self.expect_punct(&TokenKind::RBrace, "`}`")?;
-        let semi = self.expect_punct(&TokenKind::Semicolon, "`;`")?;
-        Ok(Item::Struct(StructDecl {
-            is_pub,
-            name,
-            fields,
-            methods,
-            span: start.merge(semi),
-        }))
+        Ok((fields, methods))
     }
 
     /// Parse the tail of an enum declaration, with `const IDENT` already
@@ -1352,16 +1373,20 @@ impl<'a> Parser<'a> {
                 // {…};` (SPEC §9.1) is dispatched earlier, in `parse_const`'s
                 // `= struct` branch (selected by `peek2_kind`), and never
                 // reaches `parse_expr`/`parse_primary`, so the two `struct`
-                // forms do not collide. v0.129 generic structs are fields-only
-                // (no methods inside), so this parses the same `IDENT : type`
-                // field list as a struct declaration, but stops at the closing
-                // `}` with no method tail.
+                // forms do not collide. The body — fields then methods — is
+                // parsed by the shared [`Parser::parse_struct_body`], so an
+                // anonymous struct-type value accepts the **same** field+method
+                // syntax as a named struct declaration (SPEC §26.1): the
+                // fields-only v0.129 case yields `methods: vec![]`, while a
+                // method-carrying generic struct (whose methods may use `Self`
+                // and the type parameter) parses its `pub? fn …` tail here too.
                 self.bump(); // `struct`
                 self.expect_punct(&TokenKind::LBrace, "`{`")?;
-                let fields = self.parse_struct_type_fields()?;
+                let (fields, methods) = self.parse_struct_body()?;
                 let rbrace = self.expect_punct(&TokenKind::RBrace, "`}`")?;
                 Ok(Expr::StructType {
                     fields,
+                    methods,
                     span: tok.span.merge(rbrace),
                 })
             }
@@ -1460,35 +1485,6 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(elems)
-    }
-
-    /// Parse the field list of an anonymous `struct { … }` **type value**
-    /// (SPEC §25.1), with the opening `{` already consumed and the cursor
-    /// positioned just after it. Stops at (without consuming) the closing `}`.
-    /// Each field is `IDENT : type`, comma-separated with an optional trailing
-    /// comma; field types reuse [`Parser::parse_type`], so they grow new type
-    /// forms (`?T`, `[]T`, `[N]T`, `*T`) for free. Supports an empty
-    /// `struct {}`. This mirrors the *field* portion of [`Parser::parse_struct_decl`]
-    /// but has **no** method/associated-function tail (v0.129 generic structs
-    /// are fields-only); duplicate field names are a sema concern (`E0162`),
-    /// not the parser's.
-    fn parse_struct_type_fields(&mut self) -> PResult<Vec<FieldDecl>> {
-        let mut fields = Vec::new();
-        while !self.at_punct(&TokenKind::RBrace) {
-            let (fname, fname_span) = self.expect_ident()?;
-            self.expect_punct(&TokenKind::Colon, "`:`")?;
-            let ty = self.parse_type()?;
-            let span = fname_span.merge(ty.span);
-            fields.push(FieldDecl {
-                name: fname,
-                ty,
-                span,
-            });
-            if !self.eat_punct(&TokenKind::Comma) {
-                break; // no separator → the field list is done
-            }
-        }
-        Ok(fields)
     }
 
     fn parse_args(&mut self) -> PResult<Vec<Expr>> {
@@ -5456,6 +5452,222 @@ mod tests {
                 assert!(s.methods.is_empty());
             }
             other => panic!("expected named struct decl, got {:?}", other),
+        }
+    }
+
+    // ---- v0.130: generic-struct methods ----------------------------------
+
+    /// A type-constructor whose `struct { … }` declares **methods** after its
+    /// fields parses to an `Expr::StructType` carrying both (SPEC §26.1):
+    /// `fn L(comptime T: type) type { return struct { items: []T, n: usize, fn
+    /// len(self: Self) usize { return self.n; } }; }`. The struct-type value
+    /// has 2 fields and 1 method `len` whose first parameter is `self: Self`
+    /// (the contextual self-type name, resolved in sema). The method tail
+    /// reuses the same parsing as a named struct declaration's methods.
+    #[test]
+    fn generic_struct_with_methods() {
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("L"),
+            TokenKind::LParen,
+            TokenKind::Keyword(Kw::Comptime),
+            id("T"),
+            TokenKind::Colon,
+            id("type"),
+            TokenKind::RParen,
+            id("type"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            // fields: items: []T, n: usize,
+            id("items"),
+            TokenKind::Colon,
+            TokenKind::LBracket,
+            TokenKind::RBracket,
+            id("T"),
+            TokenKind::Comma,
+            id("n"),
+            TokenKind::Colon,
+            id("usize"),
+            TokenKind::Comma,
+            // method: fn len(self: Self) usize { return self.n; }
+            TokenKind::Keyword(Kw::Fn),
+            id("len"),
+            TokenKind::LParen,
+            id("self"),
+            TokenKind::Colon,
+            id("Self"),
+            TokenKind::RParen,
+            id("usize"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            id("self"),
+            TokenKind::Dot,
+            id("n"),
+            TokenKind::Semicolon,
+            TokenKind::RBrace, // method body
+            TokenKind::RBrace, // struct body
+            TokenKind::Semicolon,
+            TokenKind::RBrace, // fn body
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => match &f.body.stmts[0] {
+                Stmt::Return {
+                    value: Some(Expr::StructType { fields, methods, .. }),
+                    ..
+                } => {
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].name, "items");
+                    assert!(fields[0].ty.slice);
+                    assert_eq!(fields[0].ty.name, "T");
+                    assert_eq!(fields[1].name, "n");
+                    assert_eq!(fields[1].ty.name, "usize");
+                    assert_eq!(methods.len(), 1);
+                    let len = &methods[0];
+                    assert_eq!(len.name, "len");
+                    assert!(!len.is_pub);
+                    assert_eq!(len.ret.name, "usize");
+                    assert_eq!(len.params.len(), 1);
+                    assert_eq!(len.params[0].name, "self");
+                    assert_eq!(len.params[0].ty.name, "Self");
+                    assert!(!len.params[0].ty.pointer);
+                    assert_eq!(len.body.stmts.len(), 1);
+                }
+                other => panic!("expected struct-type return, got {:?}", other),
+            },
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    /// A v0.129 fields-only `struct { v: T }` type value still parses with an
+    /// **empty** method list — adding the method tail must not change the
+    /// fields-only behaviour (SPEC §26.1: a `StructType` with empty methods
+    /// behaves exactly as v0.129).
+    #[test]
+    fn fields_only_struct_type_has_empty_methods() {
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("B"),
+            TokenKind::LParen,
+            TokenKind::Keyword(Kw::Comptime),
+            id("T"),
+            TokenKind::Colon,
+            id("type"),
+            TokenKind::RParen,
+            id("type"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            id("v"),
+            TokenKind::Colon,
+            id("T"),
+            TokenKind::RBrace,
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => match &f.body.stmts[0] {
+                Stmt::Return {
+                    value: Some(Expr::StructType { fields, methods, .. }),
+                    ..
+                } => {
+                    assert_eq!(fields.len(), 1);
+                    assert!(methods.is_empty());
+                }
+                other => panic!("expected struct-type return, got {:?}", other),
+            },
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    /// A generic struct may declare a `pub` method with a `*Self` pointer
+    /// receiver and an associated function (no `self`), interleaved fields and
+    /// methods just like a named struct declaration (SPEC §26.1). The parser
+    /// treats `*Self` as an ordinary pointer type and a no-`self` `fn` as an
+    /// ordinary function; method/associated-function distinction is sema's job.
+    #[test]
+    fn generic_struct_pub_and_pointer_self_and_assoc() {
+        // return struct {
+        //     n: usize,
+        //     pub fn inc(self: *Self) void { return; }
+        //     fn empty() usize { return 0; }
+        // };
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("L"),
+            TokenKind::LParen,
+            TokenKind::Keyword(Kw::Comptime),
+            id("T"),
+            TokenKind::Colon,
+            id("type"),
+            TokenKind::RParen,
+            id("type"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::LBrace,
+            id("n"),
+            TokenKind::Colon,
+            id("usize"),
+            TokenKind::Comma,
+            // pub fn inc(self: *Self) void { return; }
+            TokenKind::Keyword(Kw::Pub),
+            TokenKind::Keyword(Kw::Fn),
+            id("inc"),
+            TokenKind::LParen,
+            id("self"),
+            TokenKind::Colon,
+            TokenKind::Star,
+            id("Self"),
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+            // fn empty() usize { return 0; }
+            TokenKind::Keyword(Kw::Fn),
+            id("empty"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("usize"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            TokenKind::Int(0),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+            TokenKind::RBrace, // struct body
+            TokenKind::Semicolon,
+            TokenKind::RBrace, // fn body
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => match &f.body.stmts[0] {
+                Stmt::Return {
+                    value: Some(Expr::StructType { fields, methods, .. }),
+                    ..
+                } => {
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(methods.len(), 2);
+                    let inc = &methods[0];
+                    assert_eq!(inc.name, "inc");
+                    assert!(inc.is_pub);
+                    assert_eq!(inc.params.len(), 1);
+                    assert_eq!(inc.params[0].name, "self");
+                    assert_eq!(inc.params[0].ty.name, "Self");
+                    assert!(inc.params[0].ty.pointer, "`*Self` is a pointer receiver");
+                    let empty = &methods[1];
+                    assert_eq!(empty.name, "empty");
+                    assert!(!empty.is_pub);
+                    assert!(empty.params.is_empty(), "associated fn has no self");
+                }
+                other => panic!("expected struct-type return, got {:?}", other),
+            },
+            other => panic!("expected func, got {:?}", other),
         }
     }
 }

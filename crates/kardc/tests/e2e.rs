@@ -631,3 +631,77 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "42\n10\n100\n");
 }
+
+// --- v0.130 generic-struct methods + ArrayList(T) --------------------------
+
+#[test]
+fn generic_struct_methods() {
+    let src = r#"
+fn Box(comptime T: type) type {
+    return struct {
+        v: T,
+        fn get(self: Self) T { return self.v; }
+        fn doubled(self: Self) T { return self.v + self.v; }
+    };
+}
+const IB = Box(i32);
+pub fn main() i32 {
+    var b: IB = IB{ .v = 21 };
+    print(b.get());        // 21
+    print(b.doubled());    // 42
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "21\n42\n");
+}
+
+#[test]
+fn generic_arraylist_grows_on_the_allocator() {
+    let src = r#"
+fn ArrayList(comptime T: type) type {
+    return struct {
+        items: []T,
+        count: usize,
+        fn init(a: Allocator) Self {
+            return Self{ .items = alloc(a, T, 4), .count = 0 };
+        }
+        fn append(self: Self, a: Allocator, x: T) Self {
+            if (self.count < self.items.len) {
+                var here: []T = self.items;
+                here[self.count] = x;
+                return Self{ .items = here, .count = self.count + 1 };
+            }
+            var nb: []T = alloc(a, T, self.items.len * 2);
+            var i: usize = 0;
+            while (i < self.count) : (i = i + 1) { nb[i] = self.items[i]; }
+            free(a, self.items);
+            nb[self.count] = x;
+            return Self{ .items = nb, .count = self.count + 1 };
+        }
+        fn get(self: Self, i: usize) T { return self.items[i]; }
+        fn len(self: Self) usize { return self.count; }
+        fn deinit(self: Self, a: Allocator) void { free(a, self.items); }
+    };
+}
+const IntList = ArrayList(i32);
+pub fn main() i32 {
+    var a: Allocator = c_allocator();
+    var list: IntList = IntList.init(a);     // grows past the initial cap of 4
+    var i: i32 = 0;
+    while (i < 10) : (i = i + 1) { list = list.append(a, i * i); }
+    print(list.len());        // 10
+    print(list.get(9));       // 81
+    var total: i32 = 0;
+    var j: usize = 0;
+    while (j < list.len()) : (j = j + 1) { total = total + list.get(j); }
+    print(total);             // 285
+    list.deinit(a);
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "10\n81\n285\n");
+}

@@ -239,6 +239,9 @@ pub struct StructTable {
     /// Type aliases `const Alias = Name(C);` → the aliased type (v0.129). Shared
     /// from sema to the backend so an alias name resolves in both.
     type_aliases: HashMap<String, Type>,
+    /// Monomorphised generic-struct instances (v0.130) whose constructor has
+    /// methods; the backend emits those methods per instance.
+    struct_instances: Vec<StructInstance>,
 }
 
 /// One comptime argument to a generic function: a type (`comptime T: type`,
@@ -254,6 +257,17 @@ pub enum ComptimeArg {
 pub struct Instantiation {
     pub fn_name: String,
     pub args: Vec<ComptimeArg>,
+}
+
+/// One monomorphised generic-struct instance (v0.130): the interned struct, the
+/// type-constructor it came from, and the concrete type argument. The backend
+/// emits the constructor's methods for each instance (substituting the type
+/// parameter and `Self`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructInstance {
+    pub struct_id: u32,
+    pub ctor: String,
+    pub arg: Type,
 }
 
 impl StructTable {
@@ -548,6 +562,24 @@ impl StructTable {
     /// The type a type-alias name refers to, if any (v0.129).
     pub fn alias_of(&self, name: &str) -> Option<Type> {
         self.type_aliases.get(name).copied()
+    }
+
+    /// Record a monomorphised generic-struct instance (v0.130); deduped on the
+    /// struct id (each interned instance is emitted once).
+    pub fn record_struct_instance(&mut self, struct_id: u32, ctor: &str, arg: Type) {
+        if self.struct_instances.iter().any(|i| i.struct_id == struct_id) {
+            return;
+        }
+        self.struct_instances.push(StructInstance {
+            struct_id,
+            ctor: ctor.to_string(),
+            arg,
+        });
+    }
+
+    /// All monomorphised generic-struct instances, in discovery order (v0.130).
+    pub fn struct_instances(&self) -> &[StructInstance] {
+        &self.struct_instances
     }
 
     /// The C name for an instantiation, e.g. `kd_max__int32_t` or

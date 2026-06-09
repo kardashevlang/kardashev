@@ -988,7 +988,122 @@ impl Checker {
             }
         }
         self.structs.set_fields(id, fields);
+
+        // v0.130 (SPEC §26): a generic struct may also declare **methods**, which
+        // use `Self` (the instantiated struct) and the type parameter `T`. They
+        // are monomorphised once per instance — the memoisation guard at the top
+        // returns early on a repeat `(constructor, concrete)`, so this runs at
+        // most once per struct id (no duplicate registration / re-check / record).
+        //
+        // For each method we (1) register its signature on the struct-method
+        // table (SPEC §10 / Pass-1b shape) so `x.m(args)` resolves, (2) type-check
+        // its body under `{ <type param> -> concrete, Self -> Struct(id) }`, and
+        // (3) record the instance so the backend emits the methods. A *fields-only*
+        // generic struct (v0.129) has no methods, so it registers nothing and is
+        // **not** recorded — preserving v0.129 behaviour exactly.
+        if let Some(methods) = type_ctor_struct_methods(ctor) {
+            if !methods.is_empty() {
+                // The method substitution: the type parameter -> concrete, plus
+                // the contextual `Self` -> the instantiated struct.
+                let mut msubst = subst.clone();
+                msubst.insert("Self".to_string(), Type::Struct(id));
+
+                // (1) Register each method's signature. A `self` receiver is the
+                // instantiated struct *by value* (SPEC §10 / §26); the remaining
+                // parameter and return types resolve under `msubst`, so `Self`,
+                // `*Self`, `[]T`, `?T`, … all resolve as written.
+                let mut map: HashMap<String, StructFn> = HashMap::new();
+                for f in methods {
+                    let is_method = f.params.first().map_or(false, |p| p.name == "self");
+                    let mut params: Vec<Type> = Vec::with_capacity(f.params.len());
+                    for (i, p) in f.params.iter().enumerate() {
+                        let pt = if i == 0 && is_method {
+                            Type::Struct(id)
+                        } else {
+                            self.resolve_type_opt_with(&p.ty, &msubst, &HashMap::new())
+                                .unwrap_or(Type::I64)
+                        };
+                        params.push(pt);
+                    }
+                    let ret = self
+                        .resolve_type_opt_with(&f.ret, &msubst, &HashMap::new())
+                        .unwrap_or(Type::Void);
+                    // A duplicate method name keeps the last declaration (matching
+                    // the named-struct Pass-1b policy).
+                    map.insert(
+                        f.name.clone(),
+                        StructFn {
+                            params,
+                            ret,
+                            is_method,
+                        },
+                    );
+                }
+                self.struct_funcs.insert(id, map);
+
+                // (2) Type-check each method body under the substitution. The
+                // receiver `self` is bound to the instantiated struct; field
+                // accesses `self.f`, `Self{ … }` literals and the type parameter
+                // all resolve through the active substitution.
+                for f in methods {
+                    self.check_type_ctor_method(f, id, &msubst);
+                }
+
+                // (3) Record the instance so the backend emits its methods.
+                self.structs.record_struct_instance(id, ctor_name, concrete);
+            }
+        }
         id
+    }
+
+    /// Type-check one generic-struct method body (v0.130, SPEC §26.2) under the
+    /// substitution `msubst` = `{ <type param> -> concrete, Self -> Struct(id) }`.
+    /// Mirrors [`Checker::check_struct_func`] (the `self` receiver is the
+    /// instantiated struct *by value*) but with the type substitution active, so
+    /// `Self`, the type parameter and composites like `[]T` resolve in both the
+    /// signature and the body. The full per-function checking context
+    /// (substitution, return type, test/loop state, scope stack) is saved and
+    /// restored, so this is safe to call while interning aliases.
+    fn check_type_ctor_method(
+        &mut self,
+        f: &Func,
+        struct_id: u32,
+        msubst: &HashMap<String, Type>,
+    ) {
+        let saved_subst = std::mem::replace(&mut self.subst, msubst.clone());
+        let saved_value_subst = std::mem::take(&mut self.value_subst);
+        let saved_ret = self.ret_type;
+        let saved_in_test = self.in_test;
+        let saved_loop = self.loop_depth;
+        let saved_scopes = std::mem::take(&mut self.scopes);
+
+        // With `self.subst` active, the return type resolves `Self` / the type
+        // parameter to concrete types.
+        self.ret_type = self.resolve_type(&f.ret).unwrap_or(Type::Void);
+        self.in_test = false;
+        self.loop_depth = 0;
+        self.scopes.push(HashMap::new());
+        let is_method = f.params.first().map_or(false, |p| p.name == "self");
+        for (i, p) in f.params.iter().enumerate() {
+            // The receiver `self` is the instantiated struct by value (SPEC §10 /
+            // §26); other parameters resolve under the active substitution.
+            let pt = if i == 0 && is_method {
+                Type::Struct(struct_id)
+            } else {
+                self.resolve_type(&p.ty).unwrap_or(Type::I64)
+            };
+            // Parameters (including `self`) are immutable bindings.
+            self.define(&p.name, pt, true);
+        }
+        self.check_block(&f.body);
+        self.scopes.pop();
+
+        self.subst = saved_subst;
+        self.value_subst = saved_value_subst;
+        self.ret_type = saved_ret;
+        self.in_test = saved_in_test;
+        self.loop_depth = saved_loop;
+        self.scopes = saved_scopes;
     }
 
     // ---- statements -------------------------------------------------------
@@ -2395,10 +2510,24 @@ impl Checker {
         span: Span,
     ) -> Option<Type> {
         // Case (b): an identifier that names a struct type and is not shadowed
-        // by a value in scope → associated / static call.
+        // by a value in scope → associated / static call. A struct name, a type
+        // alias (v0.129, `const Alias = List(C);`), or `Self` / a struct-bound
+        // type parameter (v0.130, the active generic-struct instantiation) may all
+        // front such a call.
         if let Expr::Ident { name, .. } = receiver {
             if self.lookup(name).is_none() {
-                if let Some(id) = self.structs.id_of(name) {
+                let static_id = self
+                    .structs
+                    .id_of(name)
+                    .or_else(|| match self.type_aliases.get(name) {
+                        Some(Type::Struct(id)) => Some(*id),
+                        _ => None,
+                    })
+                    .or_else(|| match self.subst.get(name) {
+                        Some(Type::Struct(id)) => Some(*id),
+                        _ => None,
+                    });
+                if let Some(id) = static_id {
                     return self.check_static_call(id, name, method, args, span);
                 }
             }
@@ -2583,12 +2712,19 @@ impl Checker {
             return self.check_union_lit(name, inits, span, uid);
         }
         // A type alias (v0.129) names a monomorphised struct: a literal
-        // `Alias{ … }` builds that struct. Aliases never name a union, so this
-        // follows the union check and falls back to the ordinary struct lookup.
+        // `Alias{ … }` builds that struct. v0.130: while checking a generic-struct
+        // method, `Self` (and a type parameter bound to a struct) resolve through
+        // the active type substitution, so `Self{ … }` builds the instantiated
+        // struct. Aliases never name a union, so this follows the union check and
+        // falls back to the ordinary struct lookup.
         let alias_id = match self.type_aliases.get(name) {
             Some(Type::Struct(id)) => Some(*id),
             _ => None,
-        };
+        }
+        .or_else(|| match self.subst.get(name) {
+            Some(Type::Struct(id)) => Some(*id),
+            _ => None,
+        });
         let id = match alias_id.or_else(|| self.structs.id_of(name)) {
             Some(id) => id,
             None => {
@@ -2905,7 +3041,15 @@ impl Checker {
     fn resolve_type_arg(&mut self, arg: &Expr) -> Option<Type> {
         match arg {
             Expr::Ident { name, span } => {
-                let resolved = Type::from_name(name)
+                // A type-parameter name bound by the active substitution (a
+                // generic function v0.120, or a generic-struct method v0.130)
+                // resolves to its concrete type — so `alloc(a, T, n)` works
+                // inside a generic body.
+                let resolved = self
+                    .subst
+                    .get(name)
+                    .copied()
+                    .or_else(|| Type::from_name(name))
                     .or_else(|| self.structs.id_of(name).map(Type::Struct))
                     .or_else(|| self.structs.enum_id_of(name).map(Type::Enum));
                 match resolved {
@@ -3451,6 +3595,24 @@ fn type_ctor_struct_fields(f: &Func) -> Option<&[FieldDecl]> {
     }
 }
 
+/// Extract the method list of a valid type-constructor's body (v0.130, SPEC
+/// §26.2): like [`type_ctor_struct_fields`], but yields the
+/// [`Expr::StructType`]'s `methods`. Returns `None` for any other body shape and
+/// an empty slice for a fields-only generic struct (v0.129) — which therefore
+/// registers no methods and is not recorded as an instance.
+fn type_ctor_struct_methods(f: &Func) -> Option<&[Func]> {
+    if f.body.stmts.len() != 1 {
+        return None;
+    }
+    match &f.body.stmts[0] {
+        Stmt::Return {
+            value: Some(Expr::StructType { methods, .. }),
+            ..
+        } => Some(methods),
+        _ => None,
+    }
+}
+
 /// Whether `e` is a value whose type cannot be inferred without a contextual
 /// expectation (SPEC §18.2), so an *un-annotated* `var`/`const` binding of it is
 /// `E0260` ("cannot infer type; add an annotation"). These are exactly the
@@ -3985,6 +4147,7 @@ mod tests {
     /// A `struct { … }` type value (v0.129) whose field types are plain names.
     fn struct_type_expr(fields: Vec<(&str, &str)>) -> Expr {
         Expr::StructType {
+            methods: vec![],
             fields: field_decls(fields),
             span: sp(),
         }
@@ -3993,6 +4156,7 @@ mod tests {
     /// (so composite forms like `?T` can be exercised).
     fn struct_type_expr_te(fields: Vec<(&str, TypeExpr)>) -> Expr {
         Expr::StructType {
+            methods: vec![],
             fields: fields
                 .into_iter()
                 .map(|(n, ty)| FieldDecl {
@@ -4012,6 +4176,37 @@ mod tests {
             vec![param_comptime(param)],
             "type",
             vec![ret(Some(struct_type_expr(fields)))],
+        ))
+    }
+    /// A `struct { … }` type value with explicit field [`TypeExpr`]s **and**
+    /// methods (v0.130).
+    fn struct_type_expr_m(fields: Vec<(&str, TypeExpr)>, methods: Vec<Func>) -> Expr {
+        Expr::StructType {
+            methods,
+            fields: fields
+                .into_iter()
+                .map(|(n, ty)| FieldDecl {
+                    name: n.into(),
+                    ty,
+                    span: sp(),
+                })
+                .collect(),
+            span: sp(),
+        }
+    }
+    /// A type-constructor whose generic struct has methods (v0.130):
+    /// `fn Name(comptime P: type) type { return struct { fields…; methods… }; }`.
+    fn type_ctor_m(
+        name: &str,
+        param: &str,
+        fields: Vec<(&str, TypeExpr)>,
+        methods: Vec<Func>,
+    ) -> Item {
+        Item::Func(raw_func(
+            name,
+            vec![param_comptime(param)],
+            "type",
+            vec![ret(Some(struct_type_expr_m(fields, methods)))],
         ))
     }
 
@@ -8098,5 +8293,189 @@ mod tests {
         let cs = codes(items);
         assert!(cs.contains(&"E0130"));
         assert!(!cs.contains(&"E0311"));
+    }
+
+    // ---- generic-struct methods + `ArrayList(T)` (v0.130, SPEC §26) -------
+
+    #[test]
+    fn generic_struct_method_call_typechecks_and_records_instance() {
+        // fn List(comptime T: type) type {
+        //   return struct {
+        //     items: []T,
+        //     fn get(self: Self, i: usize) T { return self.items[i]; }
+        //   };
+        // }
+        // const IL = List(i32);
+        // fn first(l: IL) i32 { return l.get(0); }
+        let get = raw_func(
+            "get",
+            vec![param("self", "Self"), param("i", "usize")],
+            "T",
+            vec![ret(Some(index(field(ident("self"), "items"), ident("i"))))],
+        );
+        let items = vec![
+            type_ctor_m("List", "T", vec![("items", te_slice("T"))], vec![get]),
+            const_item_infer("IL", call("List", vec![ident("i32")])),
+            func(
+                "first",
+                vec![param("l", "IL")],
+                "i32",
+                vec![ret(Some(method_call(ident("l"), "get", vec![int(0)])))],
+            ),
+        ];
+        let table = check_ok(items);
+        // The monomorphised struct exists and its instance was recorded so the
+        // backend emits the methods.
+        let id = table.id_of("List__int32_t").expect("instance struct interned");
+        assert!(table.struct_instances().iter().any(
+            |i| i.struct_id == id && i.ctor == "List" && i.arg == Type::I32
+        ));
+    }
+
+    #[test]
+    fn generic_struct_method_returning_self_typechecks() {
+        // fn List(comptime T: type) type {
+        //   return struct {
+        //     items: []T, len: usize,
+        //     fn with(self: Self, x: T) Self {
+        //       return Self{ .items = self.items, .len = self.len };
+        //     }
+        //   };
+        // }
+        // const IL = List(i32);
+        let with = raw_func(
+            "with",
+            vec![param("self", "Self"), param("x", "T")],
+            "Self",
+            vec![ret(Some(struct_lit(
+                "Self",
+                vec![
+                    ("items", field(ident("self"), "items")),
+                    ("len", field(ident("self"), "len")),
+                ],
+            )))],
+        );
+        let items = vec![
+            type_ctor_m(
+                "List",
+                "T",
+                vec![("items", te_slice("T")), ("len", te("usize"))],
+                vec![with],
+            ),
+            const_item_infer("IL", call("List", vec![ident("i32")])),
+        ];
+        let table = check_ok(items);
+        let id = table.id_of("List__int32_t").expect("instance struct interned");
+        assert!(table.struct_instances().iter().any(|i| i.struct_id == id));
+    }
+
+    #[test]
+    fn fields_only_generic_struct_records_no_instance() {
+        // v0.129 preserved: a generic struct with NO methods records no instance.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            const_item_infer("IB", call("Box", vec![ident("i32")])),
+        ];
+        let table = check_ok(items);
+        let id = table.id_of("Box__int32_t").unwrap();
+        assert!(table.struct_instances().iter().all(|i| i.struct_id != id));
+        assert!(table.struct_instances().is_empty());
+    }
+
+    #[test]
+    fn generic_struct_method_body_type_error_is_caught() {
+        // fn get(self: Self) T returns a bool from a `T`(==i32) body → E0110.
+        let get = raw_func(
+            "get",
+            vec![param("self", "Self")],
+            "T",
+            vec![ret(Some(boolean(true)))],
+        );
+        let items = vec![
+            type_ctor_m("List", "T", vec![("items", te_slice("T"))], vec![get]),
+            const_item_infer("IL", call("List", vec![ident("i32")])),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn generic_struct_method_arity_mismatch_is_e0171() {
+        // `get` takes one extra arg; calling `l.get()` with none → E0171.
+        let get = raw_func(
+            "get",
+            vec![param("self", "Self"), param("i", "usize")],
+            "T",
+            vec![ret(Some(index(field(ident("self"), "items"), ident("i"))))],
+        );
+        let items = vec![
+            type_ctor_m("List", "T", vec![("items", te_slice("T"))], vec![get]),
+            const_item_infer("IL", call("List", vec![ident("i32")])),
+            func(
+                "first",
+                vec![param("l", "IL")],
+                "i32",
+                vec![ret(Some(method_call(ident("l"), "get", vec![])))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0171"));
+    }
+
+    #[test]
+    fn generic_struct_associated_fn_via_alias_typechecks() {
+        // fn List(comptime T: type) type {
+        //   return struct { len: usize, fn empty() usize { return 0; } };
+        // }
+        // const IL = List(i32);
+        // fn n() usize { return IL.empty(); }   ← static call through the alias.
+        let empty = raw_func("empty", vec![], "usize", vec![ret(Some(int(0)))]);
+        let items = vec![
+            type_ctor_m("List", "T", vec![("len", te("usize"))], vec![empty]),
+            const_item_infer("IL", call("List", vec![ident("i32")])),
+            func(
+                "n",
+                vec![],
+                "usize",
+                vec![ret(Some(method_call(ident("IL"), "empty", vec![])))],
+            ),
+        ];
+        assert!(codes(items).is_empty());
+    }
+
+    #[test]
+    fn generic_struct_method_at_two_types_distinct_returns() {
+        // The same constructor instantiated at i32 and i64 yields two structs,
+        // each with its own `get` returning the respective concrete type.
+        let mk_get = || {
+            raw_func(
+                "get",
+                vec![param("self", "Self"), param("i", "usize")],
+                "T",
+                vec![ret(Some(index(field(ident("self"), "items"), ident("i"))))],
+            )
+        };
+        let items = vec![
+            type_ctor_m("List", "T", vec![("items", te_slice("T"))], vec![mk_get()]),
+            const_item_infer("LI", call("List", vec![ident("i32")])),
+            const_item_infer("LL", call("List", vec![ident("i64")])),
+            // `l.get(0)` must be `i32` here (assigning to an `i32`).
+            func(
+                "fi",
+                vec![param("l", "LI")],
+                "void",
+                vec![let_var("x", "i32", method_call(ident("l"), "get", vec![int(0)]))],
+            ),
+            // `l.get(0)` must be `i64` here.
+            func(
+                "fl",
+                vec![param("l", "LL")],
+                "void",
+                vec![let_var("x", "i64", method_call(ident("l"), "get", vec![int(0)]))],
+            ),
+        ];
+        let table = check_ok(items);
+        assert!(table.id_of("List__int32_t").is_some());
+        assert!(table.id_of("List__int64_t").is_some());
+        // Two distinct instances recorded.
+        assert_eq!(table.struct_instances().len(), 2);
     }
 }
