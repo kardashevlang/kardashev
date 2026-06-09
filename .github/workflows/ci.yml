@@ -60,7 +60,7 @@ jobs:
       - name: Toolchain smoke test
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           KARD="$(pwd)/target/release/kard"
           "$KARD" version
           tmp="$(mktemp -d)"
@@ -100,13 +100,14 @@ jobs:
           # Test filtering + bench (v0.150).
           tb="$(mktemp -d)"
           printf 'pub fn main() i32 { return 0; }\ntest "alpha" { expect(1 == 1); }\ntest "beta" { expect(2 == 2); }\n' > "$tb/t.ks"
-          # DIAGNOSTIC: capture filter/bench output + exit codes verbatim.
-          set +e
-          fout="$("$KARD" test "$tb/t.ks" --filter alpha 2>&1)"; fcode=$?
-          echo "FILTER_CODE=$fcode FILTER_OUT<<<$fout>>>"
-          bout="$("$KARD" bench "$tb/t.ks" 2>&1)"; bcode=$?
-          echo "BENCH_CODE=$bcode BENCH_OUT<<<$bout>>>"
-          set -e
+          # --filter runs a subset; `bench` times each test. NB: capture the
+          # output into a var THEN match it — piping `kard test` straight into
+          # `grep -q` lets grep close the pipe on its first match, and the CLI's
+          # later stdout write hits a broken pipe (a Rust panic, exit 101).
+          fout="$("$KARD" test "$tb/t.ks" --filter alpha 2>&1)"
+          case "$fout" in *"1/1 tests passed (filtered)"*) ;; *) echo "filter FAILED: $fout"; exit 1 ;; esac
+          bout="$("$KARD" bench "$tb/t.ks" 2>&1)"
+          case "$bout" in *"alpha: "*) ;; *) echo "bench FAILED: $bout"; exit 1 ;; esac
           # Cross-compilation plumbing (v0.123): `targets` lists triples, and
           # `-target <host triple>` exercises clang's --target end to end (the
           # host triple always has its sysroot, so it links + runs).
