@@ -72,6 +72,26 @@ fn resolve_file(
     visited: &mut HashSet<PathBuf>,
     stack: &mut Vec<PathBuf>,
 ) -> Result<(), Vec<Diagnostic>> {
+    // `@import("std")` (and `@import("std.ks")`) resolves to the bundled standard
+    // library embedded in the compiler, not a file on disk (v0.145). It is
+    // recognised by the bare name `std`, unless a real `std`/`std.ks` file sits
+    // next to the importer (then that file wins).
+    let is_std = matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("std") | Some("std.ks")
+    ) && !path.exists();
+    if is_std {
+        let canon = PathBuf::from("<std>");
+        if stack.iter().any(|p| p == &canon) {
+            return Ok(()); // a std that imports std — just stop (no cycle error)
+        }
+        if visited.contains(&canon) {
+            return Ok(());
+        }
+        visited.insert(canon.clone());
+        return process_source(&canon, STD_SOURCE, items, files, visited, stack);
+    }
+
     // Canonicalise for dedup + cycle detection. A path that cannot be
     // canonicalised does not name a readable file → E0291.
     let canon = match path.canonicalize() {
@@ -117,20 +137,34 @@ fn resolve_file(
         }
     };
 
-    // Lex + parse against this file's own source. Sub-file diagnostics are
+    process_source(&canon, &src, items, files, visited, stack)
+}
+
+/// Lex/parse `src` (the contents of the already-deduped, in-`visited` module
+/// `canon`), recurse into its `@import`s, then append its own items. Shared by
+/// the on-disk-file path and the embedded `std` path (v0.145).
+fn process_source(
+    canon: &Path,
+    src: &str,
+    items: &mut Vec<Item>,
+    files: &mut Vec<PathBuf>,
+    visited: &mut HashSet<PathBuf>,
+    stack: &mut Vec<PathBuf>,
+) -> Result<(), Vec<Diagnostic>> {
+    // Lex + parse against this module's own source. Sub-file diagnostics are
     // rendered here (the flattener owns the text) and bundled into one E0294.
-    let tokens = match crate::lexer::lex(&src) {
+    let tokens = match crate::lexer::lex(src) {
         Ok(t) => t,
-        Err(diags) => return Err(vec![sub_file_error(&diags, &canon, &src)]),
+        Err(diags) => return Err(vec![sub_file_error(&diags, canon, src)]),
     };
     let module = match crate::parser::parse(&tokens) {
         Ok(m) => m,
-        Err(diags) => return Err(vec![sub_file_error(&diags, &canon, &src)]),
+        Err(diags) => return Err(vec![sub_file_error(&diags, canon, src)]),
     };
 
     // Mark in-progress and resolve children, then append our own items. The
     // importing file's directory anchors relative import paths.
-    stack.push(canon.clone());
+    stack.push(canon.to_path_buf());
     let parent = canon
         .parent()
         .map(Path::to_path_buf)
@@ -147,7 +181,7 @@ fn resolve_file(
     // Pass 2 — append this file's own (non-import) items, erasing the imports.
     for item in module.items {
         if !matches!(item, Item::Import(_)) {
-            files.push(canon.clone());
+            files.push(canon.to_path_buf());
             items.push(item);
         }
     }
@@ -155,6 +189,9 @@ fn resolve_file(
     stack.pop();
     Ok(())
 }
+
+/// The bundled standard library source (`@import("std")`, v0.145).
+const STD_SOURCE: &str = include_str!("std.ks");
 
 /// Build the single `E0294` diagnostic that carries a sub-file's pre-rendered
 /// lex/parse errors, prefixed with the file path.
@@ -253,6 +290,36 @@ mod tests {
 
     fn has_code(diags: &[Diagnostic], code: &str) -> bool {
         diags.iter().any(|d| d.code == code)
+    }
+
+    #[test]
+    fn import_std_brings_in_the_bundled_library() {
+        let dir = fresh_dir("std");
+        // `@import("std")` resolves to the embedded standard library, not a file.
+        let main = write(
+            &dir,
+            "main.ks",
+            "@import(\"std\");\npub fn main() i32 { return imax(1, 2); }\n",
+        );
+        let result = resolve(&main);
+        std::fs::remove_dir_all(&dir).ok();
+
+        let module = result.expect("resolve std should succeed");
+        let ns = names(&module);
+        // The std's public helpers + container constructors are flattened in.
+        assert!(ns.iter().any(|n| n == "imax"), "std should provide imax");
+        assert!(ns.iter().any(|n| n == "iabs"), "std should provide iabs");
+        assert!(
+            ns.iter().any(|n| n == "ArrayList"),
+            "std should provide ArrayList"
+        );
+        assert!(
+            ns.iter().any(|n| n == "HashMap"),
+            "std should provide HashMap"
+        );
+        assert!(ns.iter().any(|n| n == "main"), "the program's own main");
+        // Imports are erased.
+        assert!(!module.items.iter().any(|it| matches!(it, Item::Import(_))));
     }
 
     #[test]
