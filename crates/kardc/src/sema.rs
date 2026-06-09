@@ -192,12 +192,6 @@ struct Checker {
     /// whole and instantiated when a `const Alias = Name(C);` mentions it; never
     /// type-checked or emitted as an ordinary function.
     type_ctors: HashMap<String, Func>,
-    /// Type aliases (v0.129): a top-level `const Alias = Name(C);` binds `Alias`
-    /// to the monomorphised `Type::Struct(id)` produced by instantiating the
-    /// type-constructor `Name` at the concrete type `C`. Consulted by
-    /// `resolve_base`, so an alias is usable in type position (`var x: Alias`),
-    /// as a struct-literal name (`Alias{ … }`), and for field access.
-    type_aliases: HashMap<String, Type>,
     /// Generic-struct method bodies awaiting type-checking (v0.138): registered
     /// in Pass 0d but checked AFTER Pass 2, so a method body may reference
     /// top-level `const`s and free functions. Each entry is
@@ -234,7 +228,6 @@ impl Checker {
             value_subst: HashMap::new(),
             generics: HashMap::new(),
             type_ctors: HashMap::new(),
-            type_aliases: HashMap::new(),
             pending_ctor_methods: Vec::new(),
             error_sets: HashMap::new(),
             ret_error_set: None,
@@ -868,7 +861,7 @@ impl Checker {
     /// and field access all flow through here.
     fn resolve_base(&self, name: &str) -> Option<Type> {
         Type::from_name(name)
-            .or_else(|| self.type_aliases.get(name).copied())
+            .or_else(|| self.structs.alias_of(name))
             .or_else(|| self.structs.id_of(name).map(Type::Struct))
             .or_else(|| self.structs.enum_id_of(name).map(Type::Enum))
             .or_else(|| self.structs.union_id_of(name).map(Type::Union))
@@ -1133,9 +1126,9 @@ impl Checker {
             }
         }
         let id = self.instantiate_type_ctor(ctor_name, &ctor, &concretes);
-        self.type_aliases.insert(alias_name.to_string(), Type::Struct(id));
-        // Share the alias with the backend (which only receives the StructTable)
-        // so an alias name resolves in emitted types + struct literals (v0.129).
+        // Record the alias in the StructTable (the single source of truth shared
+        // with the backend) so an alias name resolves in emitted types + struct
+        // literals (v0.129).
         self.structs.add_alias(alias_name, Type::Struct(id));
     }
 
@@ -3041,9 +3034,7 @@ impl Checker {
                             ),
                         );
                         // Still validate every argument expression.
-                        for a in args {
-                            self.check_expr(a, None);
-                        }
+                        self.check_args_for_recovery(args);
                         return None;
                     }
                     // arg0 must be an `Allocator`.
@@ -3095,9 +3086,7 @@ impl Checker {
                                 args.len()
                             ),
                         );
-                        for a in args {
-                            self.check_expr(a, None);
-                        }
+                        self.check_args_for_recovery(args);
                         return None;
                     }
                     if let Some(at) = self.check_expr(&args[0], Some(Type::Allocator)) {
@@ -3337,8 +3326,8 @@ impl Checker {
                 let static_id = self
                     .structs
                     .id_of(name)
-                    .or_else(|| match self.type_aliases.get(name) {
-                        Some(Type::Struct(id)) => Some(*id),
+                    .or_else(|| match self.structs.alias_of(name) {
+                        Some(Type::Struct(id)) => Some(id),
                         _ => None,
                     })
                     .or_else(|| match self.subst.get(name) {
@@ -3366,9 +3355,7 @@ impl Checker {
                         method
                     );
                     self.error(span, "E0170", msg);
-                    for a in args {
-                        self.check_expr(a, None);
-                    }
+                    self.check_args_for_recovery(args);
                     return None;
                 }
             },
@@ -3379,9 +3366,7 @@ impl Checker {
                     method
                 );
                 self.error(span, "E0170", msg);
-                for a in args {
-                    self.check_expr(a, None);
-                }
+                self.check_args_for_recovery(args);
                 return None;
             }
         };
@@ -3411,9 +3396,7 @@ impl Checker {
                     "E0170",
                     format!("struct `{}` has no method `{}`", sname, method),
                 );
-                for a in args {
-                    self.check_expr(a, None);
-                }
+                self.check_args_for_recovery(args);
                 return None;
             }
         };
@@ -3425,9 +3408,7 @@ impl Checker {
                 method, sname, sname, method
             );
             self.error(span, "E0172", msg);
-            for a in args {
-                self.check_expr(a, None);
-            }
+            self.check_args_for_recovery(args);
             return None;
         }
         // SPEC §30.2: a pointer-receiver method passes `&obj`, so a *value*
@@ -3447,7 +3428,7 @@ impl Checker {
             // Continue checking the arguments so their own diagnostics surface.
         }
         // The receiver supplies `self`; the remaining parameters bind `args`.
-        let expected: Vec<Type> = sf.params[1..].to_vec();
+        let expected = &sf.params[1..];
         if args.len() != expected.len() {
             let sname = self.structs.get(id).name.clone();
             self.error(
@@ -3461,12 +3442,10 @@ impl Checker {
                     args.len()
                 ),
             );
-            for a in args {
-                self.check_expr(a, None);
-            }
+            self.check_args_for_recovery(args);
             return Some(sf.ret);
         }
-        self.check_arg_types(args, &expected);
+        self.check_arg_types(args, expected);
         Some(sf.ret)
     }
 
@@ -3490,15 +3469,13 @@ impl Checker {
                         sname, method
                     ),
                 );
-                for a in args {
-                    self.check_expr(a, None);
-                }
+                self.check_args_for_recovery(args);
                 return None;
             }
         };
         // The static form binds `args` to *all* parameters (including an
         // explicit `self` for methods).
-        let params: Vec<Type> = sf.params.clone();
+        let params = &sf.params;
         if args.len() != params.len() {
             // A method invoked statically with all of its post-`self` arguments
             // but no explicit `self` receiver is the dedicated `E0172`; any other
@@ -3526,12 +3503,10 @@ impl Checker {
                     ),
                 );
             }
-            for a in args {
-                self.check_expr(a, None);
-            }
+            self.check_args_for_recovery(args);
             return Some(sf.ret);
         }
-        self.check_arg_types(args, &params);
+        self.check_arg_types(args, params);
         Some(sf.ret)
     }
 
@@ -3550,6 +3525,15 @@ impl Checker {
                     self.error(a.span(), "E0110", msg);
                 }
             }
+        }
+    }
+
+    /// Error recovery for a call that cannot be checked against parameter types
+    /// (unknown callee, arity mismatch, …): still type-check every argument
+    /// subexpression so its own errors surface.
+    fn check_args_for_recovery(&mut self, args: &[Expr]) {
+        for a in args {
+            self.check_expr(a, None);
         }
     }
 
@@ -3575,8 +3559,8 @@ impl Checker {
         // the active type substitution, so `Self{ … }` builds the instantiated
         // struct. Aliases never name a union, so this follows the union check and
         // falls back to the ordinary struct lookup.
-        let alias_id = match self.type_aliases.get(name) {
-            Some(Type::Struct(id)) => Some(*id),
+        let alias_id = match self.structs.alias_of(name) {
+            Some(Type::Struct(id)) => Some(id),
             _ => None,
         }
         .or_else(|| match self.subst.get(name) {
@@ -3769,34 +3753,20 @@ impl Checker {
                 // `%` is integer-only.
                 let float_ok = !matches!(op, BinOp::Rem);
                 let operand_ok = |t: Type| t.is_int() || (float_ok && t.is_float());
-                if !operand_ok(lt) {
-                    let msg = if float_ok {
+                let msg = |found: &str| {
+                    if float_ok {
                         format!(
                             "arithmetic operand must be a number (an integer or `f64`), found `{}`",
-                            self.type_name(lt)
+                            found
                         )
                     } else {
-                        format!(
-                            "arithmetic operand must be an integer, found `{}`",
-                            self.type_name(lt)
-                        )
-                    };
-                    self.error(lhs.span(), "E0110", msg);
+                        format!("arithmetic operand must be an integer, found `{}`", found)
+                    }
+                };
+                if !self.require_operand(operand_ok(lt), lt, lhs.span(), msg) {
                     return None;
                 }
-                if !operand_ok(rt) {
-                    let msg = if float_ok {
-                        format!(
-                            "arithmetic operand must be a number (an integer or `f64`), found `{}`",
-                            self.type_name(rt)
-                        )
-                    } else {
-                        format!(
-                            "arithmetic operand must be an integer, found `{}`",
-                            self.type_name(rt)
-                        )
-                    };
-                    self.error(rhs.span(), "E0110", msg);
+                if !self.require_operand(operand_ok(rt), rt, rhs.span(), msg) {
                     return None;
                 }
                 if lt != rt {
@@ -3869,26 +3839,14 @@ impl Checker {
                 let rt = self.check_expr(rhs, Some(Type::Bool));
                 let lt = lt?;
                 let rt = rt?;
-                let mut ok = true;
-                if lt != Type::Bool {
-                    let msg = format!(
-                        "`{}` requires `bool` operands, found `{}`",
-                        op.c_op(),
-                        self.type_name(lt)
-                    );
-                    self.error(lhs.span(), "E0110", msg);
-                    ok = false;
-                }
-                if rt != Type::Bool {
-                    let msg = format!(
-                        "`{}` requires `bool` operands, found `{}`",
-                        op.c_op(),
-                        self.type_name(rt)
-                    );
-                    self.error(rhs.span(), "E0110", msg);
-                    ok = false;
-                }
-                if ok {
+                let msg = |found: &str| {
+                    format!("`{}` requires `bool` operands, found `{}`", op.c_op(), found)
+                };
+                // Flag-accumulate (no early return): a non-`bool` on *both* sides
+                // reports both operands before the arm fails.
+                let lt_ok = self.require_operand(lt == Type::Bool, lt, lhs.span(), msg);
+                let rt_ok = self.require_operand(rt == Type::Bool, rt, rhs.span(), msg);
+                if lt_ok && rt_ok {
                     Some(Type::Bool)
                 } else {
                     None
@@ -3906,22 +3864,13 @@ impl Checker {
                 let (lt, rt) = self.check_int_operands(lhs, rhs, expected.filter(|t| t.is_int()));
                 let lt = lt?;
                 let rt = rt?;
-                if !lt.is_int() {
-                    let msg = format!(
-                        "`{}` requires integer operands, found `{}`",
-                        op.c_op(),
-                        self.type_name(lt)
-                    );
-                    self.error(lhs.span(), "E0110", msg);
+                let msg = |found: &str| {
+                    format!("`{}` requires integer operands, found `{}`", op.c_op(), found)
+                };
+                if !self.require_operand(lt.is_int(), lt, lhs.span(), msg) {
                     return None;
                 }
-                if !rt.is_int() {
-                    let msg = format!(
-                        "`{}` requires integer operands, found `{}`",
-                        op.c_op(),
-                        self.type_name(rt)
-                    );
-                    self.error(rhs.span(), "E0110", msg);
+                if !self.require_operand(rt.is_int(), rt, rhs.span(), msg) {
                     return None;
                 }
                 if lt != rt {
@@ -3937,6 +3886,24 @@ impl Checker {
                 Some(lt)
             }
         }
+    }
+
+    /// Validate one binary operand against its arm's (precomputed) operand rule:
+    /// when `ok` is false, report `E0110` at `span` with `msg` applied to `t`'s
+    /// display name. Returns `ok` so the caller keeps its own control flow
+    /// (early return in arith/bitwise, flag accumulation in `and`/`or`).
+    fn require_operand(
+        &mut self,
+        ok: bool,
+        t: Type,
+        span: Span,
+        msg: impl FnOnce(&str) -> String,
+    ) -> bool {
+        if !ok {
+            let msg = msg(&self.type_name(t));
+            self.error(span, "E0110", msg);
+        }
+        ok
     }
 
     /// Check two operands that should share a type, applying integer-literal
@@ -4078,9 +4045,7 @@ impl Checker {
                         "E0110",
                         format!("`print` takes exactly 1 argument, found {}", args.len()),
                     );
-                    for a in args {
-                        self.check_expr(a, None);
-                    }
+                    self.check_args_for_recovery(args);
                     return Some(Type::Void);
                 }
                 if let Some(t) = self.check_expr(&args[0], None) {
@@ -4143,9 +4108,7 @@ impl Checker {
                             args.len()
                         ),
                     );
-                    for a in args {
-                        self.check_expr(a, None);
-                    }
+                    self.check_args_for_recovery(args);
                 }
                 Some(Type::Allocator)
             }
@@ -4205,9 +4168,7 @@ impl Checker {
                             args.len()
                         ),
                     );
-                    for a in args {
-                        self.check_expr(a, None);
-                    }
+                    self.check_args_for_recovery(args);
                     return Some(Type::Void);
                 }
                 self.check_allocator_arg(&args[0], "free");
@@ -4243,9 +4204,7 @@ impl Checker {
                                 args.len()
                             ),
                         );
-                        for a in args {
-                            self.check_expr(a, None);
-                        }
+                        self.check_args_for_recovery(args);
                         return Some(sig.ret);
                     }
                     for (a, &pt) in args.iter().zip(sig.params.iter()) {
@@ -4265,9 +4224,7 @@ impl Checker {
                     Some(sig.ret)
                 } else {
                     self.error(span, "E0100", format!("unknown function `{}`", callee));
-                    for a in args {
-                        self.check_expr(a, None);
-                    }
+                    self.check_args_for_recovery(args);
                     None
                 }
             }
@@ -11491,8 +11448,6 @@ mod tests {
         )]);
         let id = table.enum_id_of("E").expect("E should be registered");
         assert_eq!(table.enum_get(id).values, vec![1, 2, 10]);
-        // The convenience accessor agrees.
-        assert_eq!(table.enum_get(id).variant_value("C"), Some(10));
     }
 
     #[test]

@@ -25,11 +25,4 @@ impl Span {
             end: self.end.max(other.end),
         }
     }
-
-    /// The source slice this span refers to within `src`.
-    pub fn slice<'a>(&self, src: &'a str) -> &'a str {
-        let end = self.end.min(src.len());
-        let start = self.start.min(end);
-        &src[start..end]
-    }
 }

@@ -74,8 +74,3 @@ fn has_main(module: &ast::Module) -> bool {
         .iter()
         .any(|it| matches!(it, ast::Item::Func(f) if f.name == "main"))
 }
-
-/// Parse and re-emit `src` in canonical form (used by `kard fmt`).
-pub fn format(src: &str) -> Result<String, Vec<Diagnostic>> {
-    fmt::format_source(src)
-}

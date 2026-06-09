@@ -13,6 +13,21 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// C-compiler optimization level for a build.
+///
+/// The default is [`OptLevel::O2`], so `BuildOptions::default()` keeps the
+/// historical optimized behavior for `kard build`, `kard bench` and
+/// cross-compiles. `kard run`/`kard test` build unoptimized dev binaries at
+/// [`OptLevel::O0`] for fast iteration (`--release` restores `-O2`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum OptLevel {
+    /// `-O0`: a fast, unoptimized dev build (`kard run`/`test` default).
+    O0,
+    /// `-O2`: an optimized build (`kard build`/`bench`/`--release`).
+    #[default]
+    O2,
+}
+
 /// Options for a C-backend build (v0.123 cross-compilation).
 #[derive(Clone, Debug, Default)]
 pub struct BuildOptions {
@@ -22,6 +37,8 @@ pub struct BuildOptions {
     /// Compile to an object file only (`-c`), skipping the link step — which
     /// lets cross-compilation succeed without a target sysroot/libc.
     pub object_only: bool,
+    /// Optimization level handed to the C compiler. Defaults to `-O2`.
+    pub opt: OptLevel,
 }
 
 /// Monotonic counter giving each temp path a process-unique suffix even when
@@ -117,11 +134,17 @@ fn unique_temp(suffix: &str) -> PathBuf {
 }
 
 /// Invoke the C compiler as
-/// `<cc> -O2 -std=c11 [--target=<triple>] [-c] -o <out> <tmp_c>`, returning the
-/// compiler's stderr on a non-zero exit.
+/// `<cc> <-O0|-O2> -std=c11 [--target=<triple>] [-c] -o <out> <tmp_c>`,
+/// returning the compiler's stderr on a non-zero exit. The optimization level
+/// comes from `opts.opt`: `-O2` by default (`build`/`bench`/cross-compiles),
+/// `-O0` for the `run`/`test` dev builds (unless `--release`).
 fn invoke_cc(cc: &str, tmp_c: &Path, out: &Path, opts: &BuildOptions) -> Result<(), String> {
     let mut cmd = Command::new(cc);
-    cmd.arg("-O2").arg("-std=c11");
+    cmd.arg(match opts.opt {
+        OptLevel::O0 => "-O0",
+        OptLevel::O2 => "-O2",
+    })
+    .arg("-std=c11");
     if let Some(triple) = &opts.target {
         cmd.arg(format!("--target={triple}"));
     }
@@ -181,13 +204,22 @@ fn run_exe(exe: &Path, args: &[String]) -> Result<i32, String> {
     }
 }
 
-/// Compile C source text to a temporary **host executable**, run it, and return
-/// the child process exit code. Returns an error string on a compile failure.
-pub fn cc_build_and_run(c_src: &str, args: &[String]) -> Result<i32, String> {
+/// Compile C source text to a temporary **host executable** at `opt`, run it,
+/// and return the child process exit code. Returns an error string on a
+/// compile failure. `run`/`test` pass [`OptLevel::O0`] (a fast dev build);
+/// `bench` and `--release` pass [`OptLevel::O2`].
+pub fn cc_build_and_run(c_src: &str, args: &[String], opt: OptLevel) -> Result<i32, String> {
     let exe = unique_temp("");
     // Always build for the host as a linked executable: `run`/`test` never
     // cross-compile.
-    cc_build(c_src, &exe, &BuildOptions::default())?;
+    cc_build(
+        c_src,
+        &exe,
+        &BuildOptions {
+            opt,
+            ..BuildOptions::default()
+        },
+    )?;
     let result = run_exe(&exe, args);
     // Best-effort cleanup of the temporary executable.
     let _ = std::fs::remove_file(&exe);
@@ -200,21 +232,32 @@ mod tests {
 
     #[test]
     fn run_returns_exit_code() {
-        let code = cc_build_and_run("int main(){return 7;}", &[]).expect("should compile and run");
+        // `-O0` is the `kard run`/`test` dev default.
+        let code = cc_build_and_run("int main(){return 7;}", &[], OptLevel::O0)
+            .expect("should compile and run");
         assert_eq!(code, 7);
     }
 
     #[test]
     fn run_program_that_prints() {
+        // `-O2` covers the `bench`/`--release` path.
         let src = "#include <stdio.h>\nint main(void){ printf(\"hello from kardc\\n\"); return 0; }";
-        let code = cc_build_and_run(src, &[]).expect("should compile and run");
+        let code = cc_build_and_run(src, &[], OptLevel::O2).expect("should compile and run");
         assert_eq!(code, 0);
     }
 
     #[test]
     fn broken_program_errs() {
-        let result = cc_build_and_run("int main(){ this is not valid C @@@ }", &[]);
+        let result = cc_build_and_run("int main(){ this is not valid C @@@ }", &[], OptLevel::O0);
         assert!(result.is_err(), "broken C should yield Err, got {result:?}");
+    }
+
+    #[test]
+    fn build_options_default_opt_is_o2() {
+        // `kard build`, cross-compiles and the e2e suite all rely on
+        // `BuildOptions::default()` meaning an optimized `-O2` build.
+        assert_eq!(BuildOptions::default().opt, OptLevel::O2);
+        assert_eq!(OptLevel::default(), OptLevel::O2);
     }
 
     #[test]
@@ -267,6 +310,7 @@ mod tests {
         let opts = BuildOptions {
             target: None,
             object_only: true,
+            opt: OptLevel::O2,
         };
         cc_build("int kard_add(int a, int b){ return a + b; }", &out, &opts)
             .expect("object-only compile should succeed");
@@ -288,6 +332,7 @@ mod tests {
         let opts = BuildOptions {
             target: Some("aarch64-linux-gnu".to_string()),
             object_only: true,
+            opt: OptLevel::O2,
         };
         match cc_build("int kard_cross(int a, int b){ return a + b; }", &out, &opts) {
             Ok(()) => {
@@ -322,6 +367,7 @@ mod tests {
         let opts = BuildOptions {
             target: Some("aarch64-linux-gnu".to_string()),
             object_only: true,
+            opt: OptLevel::O2,
         };
         let err = cc_build("int x(void){ return 0; }", &out, &opts)
             .expect_err("targeted build without clang must error");

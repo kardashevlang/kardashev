@@ -132,7 +132,9 @@ impl Type {
             Type::Array(_) => {
                 unreachable!("c_name on an array type; use StructTable::array_c_name")
             }
-            Type::Ptr(_) => unreachable!("c_name on a pointer type; use StructTable::ptr_c_name"),
+            Type::Ptr(_) => {
+                unreachable!("c_name on a pointer type; the emitter formats \"{{base}}*\" inline")
+            }
             Type::Slice(_) => {
                 unreachable!("c_name on a slice type; use StructTable::slice_c_name")
             }
@@ -201,12 +203,6 @@ impl EnumInfo {
     pub fn variant_index(&self, variant: &str) -> Option<usize> {
         self.variants.iter().position(|v| v == variant)
     }
-
-    /// The integer value of `variant` (explicit `= N` or auto-incremented), if
-    /// present (v0.143).
-    pub fn variant_value(&self, variant: &str) -> Option<i64> {
-        self.variant_index(variant).and_then(|i| self.values.get(i).copied())
-    }
 }
 
 /// A resolved tagged-union definition: name + ordered `(variant, payload type)`.
@@ -230,8 +226,8 @@ impl UnionInfo {
 
 /// The table of all struct types in a program, built by semantic analysis and
 /// consumed by the backend. Ids are dense indices assigned in declaration
-/// order, so iterating `0..len()` yields structs in source order — exactly the
-/// order the backend must emit their C typedefs.
+/// order, so [`iter`](StructTable::iter) yields structs in source order —
+/// exactly the order the backend must emit their C typedefs.
 #[derive(Clone, Debug, Default)]
 pub struct StructTable {
     defs: Vec<StructInfo>,
@@ -260,8 +256,12 @@ pub struct StructTable {
     /// Monomorphisation instantiations of generic functions (v0.120): each is a
     /// `(generic fn name, concrete type arguments)` pair the backend must emit.
     instantiations: Vec<Instantiation>,
-    /// Type aliases `const Alias = Name(C);` → the aliased type (v0.129). Shared
-    /// from sema to the backend so an alias name resolves in both.
+    /// Type aliases `const Alias = Name(C);` → the aliased type (always a
+    /// monomorphised `Type::Struct`, v0.129). The single source of truth for
+    /// aliases, shared from sema to the backend so an alias name resolves in
+    /// both: sema's `resolve_base` consults it, so an alias is usable in type
+    /// position (`var x: Alias`), as a struct-literal name (`Alias{ … }`), and
+    /// for field access.
     type_aliases: HashMap<String, Type>,
     /// Monomorphised generic-struct instances (v0.130) whose constructor has
     /// methods; the backend emits those methods per instance.
@@ -331,10 +331,6 @@ impl StructTable {
     /// The C typedef name for a struct, e.g. `kd_struct_Point`.
     pub fn c_name(&self, id: u32) -> String {
         format!("kd_struct_{}", self.defs[id as usize].name)
-    }
-
-    pub fn len(&self) -> usize {
-        self.defs.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -528,12 +524,6 @@ impl StructTable {
         self.ptr_pointees[id as usize]
     }
 
-    /// The C name for `*T`, e.g. `int32_t*`. (Pointers need no typedef.)
-    pub fn ptr_c_name(&self, id: u32, base_cty: &str) -> String {
-        let _ = id;
-        format!("{}*", base_cty)
-    }
-
     pub fn intern_slice(&mut self, elem: Type) -> u32 {
         if let Some(i) = self.slice_elems.iter().position(|t| *t == elem) {
             return i as u32;
@@ -641,14 +631,6 @@ impl StructTable {
     /// The 1-based code of error `name`, if declared.
     pub fn error_code(&self, name: &str) -> Option<u32> {
         self.error_names.iter().position(|n| n == name).map(|i| i as u32 + 1)
-    }
-
-    /// All declared error names paired with their 1-based code.
-    pub fn errors(&self) -> impl Iterator<Item = (u32, &str)> + '_ {
-        self.error_names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (i as u32 + 1, n.as_str()))
     }
 
     /// Intern an `!T` error union with payload `payload`, returning its id.

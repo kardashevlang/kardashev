@@ -207,11 +207,15 @@ The same return-flush path lowers `expect(c)` failures in test mode (see 4.5).
 
 ## 5. Native driver (`backend`)
 
-- `cc_build(c_src, out)` — write `c_src` to a temp `.c`, invoke the system C
-  compiler (`$CC`, else `cc`, `clang`, `gcc` — first found) as
-  `<cc> -O2 -std=c11 -o <out> <tmp.c>`; return its stderr on non-zero exit.
-- `cc_build_and_run(c_src, args)` — build to a temp executable, exec it with
-  `args`, return the child exit code.
+- `cc_build(c_src, out, opts)` — write `c_src` to a temp `.c`, invoke the
+  system C compiler (`$CC`, else `cc`, `clang`, `gcc` — first found) as
+  `<cc> <-O0|-O2> -std=c11 -o <out> <tmp.c>`; return its stderr on non-zero
+  exit. The optimization level comes from `BuildOptions::opt` and defaults to
+  `-O2` (`kard build`, `bench` and cross-compiles); `kard run`/`test` build
+  unoptimized dev binaries at `-O0` for fast iteration, and their `--release`
+  flag restores `-O2`.
+- `cc_build_and_run(c_src, args, opt)` — build to a temp executable at `opt`,
+  exec it with `args`, return the child exit code.
 
 The lex→parse→sema→emit pipeline is `kardc::compile_to_c`; `backend` only does
 cc + process execution.
