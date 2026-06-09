@@ -2625,9 +2625,41 @@ impl Checker {
                         Some(Type::Slice(self.structs.intern_slice(Type::U8)))
                     }
                 }
+                "as" => {
+                    // `@as(T, e)` casts an integer value `e` to integer type `T`
+                    // (v0.137, SPEC §33). Both must be integers in v0.137.
+                    if args.len() != 2 {
+                        self.error(
+                            *span,
+                            "E0320",
+                            format!("`@as` takes a type and a value, found {} arguments", args.len()),
+                        );
+                        return None;
+                    }
+                    let target = self.resolve_type_arg(&args[0]);
+                    if let Some(t) = target {
+                        if !t.is_int() {
+                            self.error(
+                                args[0].span(),
+                                "E0321",
+                                format!("`@as` target must be an integer type, found `{}`", self.type_name(t)),
+                            );
+                        }
+                    }
+                    if let Some(et) = self.check_expr(&args[1], None) {
+                        if !et.is_int() {
+                            self.error(
+                                args[1].span(),
+                                "E0321",
+                                format!("`@as` value must be an integer, found `{}`", self.type_name(et)),
+                            );
+                        }
+                    }
+                    target
+                }
                 other => {
                     let msg = format!(
-                        "unknown `@`-builtin `@{}` (expected `@sizeOf` or `@typeName`)",
+                        "unknown `@`-builtin `@{}` (expected `@sizeOf`, `@typeName`, or `@as`)",
                         other
                     );
                     self.error(*span, "E0320", msg);

@@ -941,3 +941,27 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "4\n8\n8\n1\n5\n0\ni32\nPoint\n");
 }
+
+// --- v0.137 integer casts @as(T, e) ----------------------------------------
+
+#[test]
+fn integer_casts_as_builtin() {
+    let src = r#"
+pub fn main() i32 {
+    var key: i32 = 0 - 7;
+    var h: usize = @as(usize, 0 - key);   // i32 -> usize
+    print(h);                              // 7
+    var big: i64 = @as(i64, 1000000);      // widening
+    print(big);                            // 1000000
+    var back: i32 = @as(i32, h);           // usize -> i32
+    print(back);                           // 7
+    var arr: [8]i32 = [8]i32{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    arr[@as(usize, key + 12)] = 99;        // cast inside an index: arr[5]
+    print(arr[5]);                         // 99
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "7\n1000000\n7\n99\n");
+}
