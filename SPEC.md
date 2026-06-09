@@ -1193,3 +1193,19 @@ and desugared to `Self` (the v0.130 self-type). v0.136 also binds `Self` in
 **plain** (non-generic) struct method scopes, so `@This()` / `Self` work in any
 struct method — e.g. `fn translate(self: *@This(), …)` inside a plain `const
 Point = struct { … }`.
+
+## 33. Integer casts — `@as(T, e)` (v0.137)
+
+`@as(T, e)` casts the integer value `e` to integer type `T` — `var i: usize =
+@as(usize, key);`. It extends the §32 `Expr::Builtin` machinery (`name == "as"`,
+two arguments: a type and a value).
+
+- **sema**: exactly two arguments; the first names an integer type `T` (else
+  `E0321`), the second is an integer value `e` (else `E0321`); the result type is
+  `T`. (v0.137 is integer↔integer only.)
+- **emit**: lowers to a C cast `((<cty T>)(<e>))`.
+- Not a constant expression (`const_eval` → `E0130`); it is a runtime cast (of a
+  value that is itself constant in C).
+
+This unblocks mixed-integer code (e.g. an `i32` key hashed into a `usize` index),
+and with it a real `HashMap`.

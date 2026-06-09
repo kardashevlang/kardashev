@@ -18,6 +18,16 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.137.0] — Integer casts `@as(T, e)`
+
+### Added
+- **`@as(T, e)`** — casts an integer value `e` to integer type `T` (extends the
+  §32 `@`-builtin machinery), lowering to a C cast `((T)(e))`. Bridges the strict
+  integer types (e.g. an `i32` key → a `usize` index), used inline anywhere
+  (`arr[@as(usize, k)]`). Diagnostics `E0321` (non-integer target/value).
+- This unblocks mixed-integer code and a real `HashMap` (verified end-to-end).
+- 779 unit + 36 e2e tests; `examples/casts.ks`.
+
 ## [0.136.0] — comptime reflection builtins
 
 ### Added

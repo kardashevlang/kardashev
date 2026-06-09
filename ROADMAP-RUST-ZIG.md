@@ -218,17 +218,23 @@ supported N comptime params (v0.120/v0.128). `StructInstance.args: Vec<Type>`.
 both work on a generic type parameter), and `@This()` → the enclosing struct
 type (desugars to `Self`, now bound in plain struct methods too). `Expr::Builtin`.
 
-### v0.137.0 — Named error sets
-`const FileErr = error{ NotFound, Denied };`, `FileErr!T`, and set membership /
-merging — replacing the single implicit global error set with named ones.
+(Tail reordered: implementing `HashMap` revealed there are no integer casts —
+`h = key` mixing `i32`/`usize` fails — which blocks real mixed-integer code, so
+casts come first and unblock the map.)
 
-### v0.138.0 — `inline for` + `comptime { }` blocks
-Compile-time-unrolled `inline for` over a comptime range/tuple, and `comptime {
-… }` blocks that force compile-time evaluation — rounding out comptime.
+### v0.137.0 — Integer casts `@as(T, e)` ✅
+A comptime builtin (extends §32's `Expr::Builtin`) that casts an integer value
+to another integer type — `@as(usize, key)` — lowering to a C cast `((T)(e))`.
+Unblocks mixed-integer code and `HashMap`.
 
-### v0.139.0 — `HashMap(K, V)` std container
-A real open-addressing hash map on the `Allocator` (`put`/`get`/`remove`/`len`),
-built on multi-parameter generics (v0.135) + pointer receivers (v0.134).
+### v0.138.0 — `HashMap(K, V)` std container
+A real open-addressing hash map on the `Allocator` (`put`/`get`/`has`/`len`),
+built on multi-parameter generics (v0.135) + pointer receivers (v0.134) + casts
+(v0.137) — written in the language itself.
+
+### v0.139.0 — Named error sets
+`const FileErr = error{ NotFound, Denied };`, `FileErr!T`, and set membership —
+named error sets alongside the implicit global one.
 
 ### v0.140.0 — Doc comments + `kard doc`
 `/// …` doc comments parsed onto items, and `kard doc` to extract a module's

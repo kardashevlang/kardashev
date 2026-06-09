@@ -2392,6 +2392,16 @@ impl<'a> Emitter<'a> {
                 };
                 let ty = self.base_type(&arg_name);
                 match name.as_str() {
+                    "as" => {
+                        // `@as(T, e)` → a C cast `((T)(e))` (v0.137, §33). `ty`
+                        // (resolved from the first arg above) is the target type;
+                        // the second arg is the value.
+                        let val = match args.get(1) {
+                            Some(e) => self.emit_expr(e),
+                            None => "0".to_string(),
+                        };
+                        format!("(({})({}))", self.cty_of(ty), val)
+                    }
                     "sizeOf" => format!("sizeof({})", self.cty_of(ty)),
                     "typeName" => {
                         // Print the bound type's name for a type parameter, else
@@ -3177,13 +3187,18 @@ impl<'a> Emitter<'a> {
                 .find(|(_, e)| *e == Type::U8)
                 .map(|(id, _)| Type::Slice(id)),
             // `@sizeOf(T)` → `usize`; `@typeName(T)` → `[]u8` (SPEC §32.1).
-            Expr::Builtin { name, .. } => match name.as_str() {
+            Expr::Builtin { name, args, .. } => match name.as_str() {
                 "sizeOf" => Some(Type::Usize),
                 "typeName" => self
                     .structs
                     .slices()
                     .find(|(_, e)| *e == Type::U8)
                     .map(|(id, _)| Type::Slice(id)),
+                // `@as(T, e)` has type `T` (the cast target).
+                "as" => match args.first() {
+                    Some(Expr::Ident { name, .. }) => Some(self.base_type(name)),
+                    _ => None,
+                },
                 _ => None,
             },
             Expr::Ident { name, .. } => self.lookup_var_type(name),
