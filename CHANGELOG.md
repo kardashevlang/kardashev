@@ -18,6 +18,33 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.160.0] — Self-hosting stage 2: the parser, in kardashev
+
+`selfhost/parser.ks` (1,729 lines) is a **full kardashev parser written in
+kardashev** — recursive descent mirroring the Rust parser decision-for-
+decision (the clamped 3-token lookahead, the 10-level `parse_binary` ladder +
+orelse/catch layer, the exact span-merge rules, the same `E0200`/`E0201`
+shape-constraint positions) — over `selfhost/ast.ks` (376 lines), an arena
+AST: one generic node table (57 `ND_*` kinds, child/sibling index links,
+span-only names, TypeExpr as flag bits) since the language has no recursive
+types.
+
+### Added
+- `selfhost/ast.ks`, `selfhost/parser.ks`, `selfhost/astdump.ks` (the dump
+  driver) + `tests/selfhost/parser_suite.ks` (29 in-language test blocks:
+  precedence/associativity, exact spans, all type forms, switch
+  arms/ranges/captures, error positions).
+- **Differential testing with zero skips**: a Rust-side AST dumper defines a
+  canonical line format; `astdump` is built once and byte-compared over
+  **701 repo sources — 67,808 dump lines identical** — plus 28 targeted
+  error/edge inputs with exact `ERROR <code> <pos>` agreement. The
+  `DECLARED_UNIMPLEMENTED` skip list is empty and asserted to stay ≤ 0.
+- **Milestone: the self-hosted parser parses itself** — `astdump` over
+  `selfhost/parser.ks` produces 5,965 lines, byte-identical to the Rust
+  parser's view of the same file.
+- 1,107 Rust-side tests green; error model is first-error-wins (provably
+  coincides with the Rust parser's first diagnostic; pinned both ways).
+
 ## [0.159.0] — Self-hosting stage 1: the lexer, in kardashev
 
 The self-host arc begins. `selfhost/lexer.ks` is a **rule-for-rule kardashev
