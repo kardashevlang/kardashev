@@ -1508,3 +1508,51 @@ applications as `comptime` type arguments to **generic functions**
 (`alloc(a, ArrayList(i32), n)` — generic-fn type args stay bare names, §17);
 and application-typed fields in *plain* (non-generic) structs (Pass-0b
 ordering, §42.2 — generic-struct fields support them).
+
+## 43. Dead-function elimination (v0.153)
+
+The emitter only emits functions that are **reachable** from the build mode's
+roots. Before v0.153, `@import("std")` put every std function into every
+program's C (`kd_str_concat` in hello-world); as std grows, that taxes the C
+compile of all programs. Functions are now emitted *pay-as-you-go*, like
+generic instantiations always were.
+
+### 43.1 Semantics (`emit_c`)
+- **Roots**: `EmitMode::Program` → the user's `main`; `EmitMode::Test` → every
+  `test` block. (`pub` does not make a function a root: a kardashev build
+  produces an executable, not a linkable library — `pub` remains a visibility
+  marker for imports, §22.)
+- **Liveness**: a worklist walk over the *flattened* module's AST collects,
+  from each live body, every `Call{callee}` (marking the free function of that
+  name live) and every `MethodCall{method}` (marking methods/associated
+  functions **of that name on every struct** live — name-level, deliberately
+  receiver-agnostic and over-approximate; precision is a §43.3 deferral).
+  Newly-live function bodies join the worklist (transitive closure).
+  `@`-builtins are runtime helpers, not module functions (§35/§41), and keep
+  their existing usage-driven emission.
+- **Always-walked name sources**: bodies that emit regardless of the
+  reachability walk contribute their called names regardless too. The body of
+  every *generic* function is walked unconditionally (even uninstantiated — a
+  deliberate over-approximation needing no instantiation bookkeeping), and a
+  type-constructor's methods are walked for every constructor with **at least
+  one recorded instance** — exactly the methods the backend emits. A
+  never-instantiated constructor emits nothing, so its methods are *not* name
+  sources: this is what keeps an `@import`ed-but-unused std container
+  pay-as-you-go (`HashMap`'s internal `iabs` use must not keep `kd_iabs` in a
+  program that never builds a `HashMap`).
+- **What is skipped**: a dead free function and a dead struct method /
+  associated function are omitted from BOTH the forward-declaration pass and
+  the definition pass (the two passes must agree). Everything else —
+  typedefs, enums/unions, generic instantiations, runtime helpers — is
+  unchanged by this version.
+
+### 43.2 Observable effect
+Generated C for a program that uses no std function contains none; behaviour
+(exit code, stdout) is byte-identical for every program. A program whose every
+function is used emits byte-identical C to v0.152.
+
+### 43.3 Deferred (honest)
+Receiver-precise method liveness (per-struct rather than per-name);
+instantiation-level liveness for generics whose only call sites are dead;
+struct/enum/union typedef pruning (cheap text, kept for simplicity); and
+`const` pruning.

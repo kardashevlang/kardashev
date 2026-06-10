@@ -18,6 +18,32 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.153.0] — Dead-function elimination
+
+Opens **Arc 5** (scale: conformance, std breadth, self-hosting). Functions are
+now emitted **pay-as-you-go** (SPEC §43): the C for a program contains only
+functions reachable from the build mode's roots (`main` for programs, the
+`test` blocks for the harness — a test calling `main()` keeps it via the
+ordinary walk).
+
+### Changed
+- A worklist reachability pass over the flattened module collects `Call`
+  callees (free functions) and `MethodCall` names (name-level method liveness
+  across all structs); dead functions are skipped in both the forward-decl
+  and definition passes. Generic-function bodies are always name sources;
+  a type-constructor's methods are name sources only once instantiated —
+  an `@import`ed-but-unused std container costs nothing (`hello world` with
+  `@import("std")`: generated C 108 → 34 lines).
+- The v0.151 predicate walker family was unified into one visitor
+  (`visit_expr` & co.); the liveness collector and `module_uses_panic/io`
+  share it.
+- Behaviour is unchanged for every program (all 40 examples byte-identical
+  output + exit codes); typedefs/instantiations/consts keep their existing
+  emission (§43.3 deferrals: receiver-precise method liveness,
+  instantiation-level liveness, typedef pruning).
+- 1009 unit + 48 e2e tests (8 new DCE pins). Adversarially reviewed
+  (approve; Test-mode root refinement applied from the review).
+
 ## [0.152.0] — Direct generic-type application `Name(T)`
 
 The v0.129 alias requirement falls (SPEC §42): generic type-constructors are
