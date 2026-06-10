@@ -18,6 +18,38 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.157.0] — std wave 2: formats & text
+
+The embedded `std` grows 1,136 → 3,092 in-language lines. Six new modules
+(every public item `///`-documented, all pay-as-you-go under DCE — a
+hello-world's C stays at 141 lines, the growth being the §43.3-deferred
+plain-struct typedefs):
+
+### Added
+- **json** — a full arena-style JSON parser + serializer (no recursive
+  types: nodes in one `[]JsonNode` linked by indices; zero-copy string/key/
+  number spans into the source). Strict grammar (escape validation, no
+  leading zeros / trailing commas / trailing garbage), exact short-decimal
+  f64 accumulation with saturation at extremes, depth cap 64, `ok`/`err_pos`
+  error contract, lossless minified `json_emit`, `str_decode` for unescaped
+  content. 766 lines, 12 suite blocks / ~200 expects incl. 19 malformed
+  inputs with exact error positions.
+- **baseenc** — RFC 4648 base64 (strict decode) + lowercase hex codecs,
+  empty-slice-on-error convention (documented; `![]u8` stays inexpressible).
+- **hashes** — crc32 (one-shot + streaming `Crc32`, cross-checked
+  implementations), fnv1a32/64, adler32, djb2 — all wrap-safe u32/u64.
+- **strops** — byte- and string-separator splitters (`next`/`current`
+  two-call protocol), `split_collect` into `ArrayList(SpanPair)`, zero-copy
+  `trim`/`trim_start`/`trim_end`, span `join`, non-overlapping `replace`.
+- **glob** — iterative star-backtrack `glob_match` (`*`, `?`, `[a-z]`/`[!…]`
+  classes, escapes; dialect precisely documented), `glob_is_literal`;
+  pathological-backtracking case verified fast.
+- **numtext** — `parse_f64` (`?f64`), fixed-point `fmt_f64` with rounding,
+  overflow-safe `parse_u64`, `fmt_u64`, `fmt_i64_pad`, ASCII case utils.
+- 6 new `tests/std` suites (12 total, all green via real `kard test`;
+  ~700 new hand-computed expects). 1026 unit + 48 e2e + 606-file corpus +
+  std suites green.
+
 ## [0.156.0] — Conformance suite B (§22–§42 + interactions) + 5 more bugs + `!void`
 
 Wave B completes the corpus: **606 conformance programs** (was 311) across 25
