@@ -18,9 +18,3 @@ pub fn main() void {
     }
     print(sum);
 }
-
-// QUARANTINED (compiler bug, not a bad test): SPEC §15.1 lists an index as a
-// valid `&place` lvalue and sema accepts it, but emit_c lowers the place via
-// the bounds-checked rvalue getter — `(&(kd_arr_int64_t_5_get(kd_a, kd_i)))`
-// — which is not a C lvalue, so cc fails ("lvalue required as unary '&'
-// operand"). `&s[1]` on a slice fails identically via kd_slice_<tag>_get.

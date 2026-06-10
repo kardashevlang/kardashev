@@ -1,9 +1,5 @@
 //SPEC: §9.4+§15.2 a field assignment through a slice index (`s[i].f = e`) writes the underlying element's field
 //OUT: 30
-// QUARANTINED (v0.155 corpus, wave A): same hole as the array variant —
-// sema accepts `s[1].x = 30` but emit_c lowers it through the by-value
-// `kd_slice_<tag>_get(...)` accessor, so cc fails with "lvalue required as
-// left operand of assignment".
 const P = struct {
     x: i32,
     y: i32,

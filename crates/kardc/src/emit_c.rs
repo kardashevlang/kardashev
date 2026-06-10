@@ -1425,11 +1425,24 @@ impl<'a> Emitter<'a> {
     }
 
     /// Emit one `kd_arr_<tag>_<N>` fixed-size-array typedef plus its inline
-    /// bounds-checked `_get` helper, per SPEC §14.3. The array is a value type:
-    /// wrapping the C array in a `struct { T data[N]; }` gives it C struct
-    /// copy/pass/return semantics (so assignment, parameters and returns copy
-    /// the whole array). `_get` panics (stderr + `exit(101)`) on an
-    /// out-of-bounds index.
+    /// bounds-checked `_get` and `_at` helpers, per SPEC §14.3. The array is a
+    /// value type: wrapping the C array in a `struct { T data[N]; }` gives it C
+    /// struct copy/pass/return semantics (so assignment, parameters and returns
+    /// copy the whole array). Both helpers panic (stderr + `exit(101)`) on an
+    /// out-of-bounds index — identical check, identical message, identical exit.
+    ///
+    /// `_get` reads an element from an array passed **by value** (rvalue index
+    /// reads). `_at` returns a **pointer to the element in place** — the array
+    /// is passed by pointer, NOT by value, so a write through the result mutates
+    /// the caller's array rather than a copy. It backs the lvalue lowerings of
+    /// SPEC §15.1/§9.4: `&a[i]`, `a[i].f = e` (and chains/compounds through an
+    /// index). The parameter is `const`-qualified (with the const cast away on
+    /// the way out) so a read-only `&a[i]` on a `const` array compiles without a
+    /// qualifier warning; sema forbids *writes* into `const`-rooted arrays
+    /// (E0167/E0223), so the cast never launders an actual const write. Helpers
+    /// are `static inline`, so unused ones cost nothing and warn nowhere —
+    /// emitting them unconditionally alongside the typedef matches `_get` /
+    /// `_alloc` (unlike the usage-gated plain-`static` `kd_read_*` of §41.2).
     fn emit_one_array(&mut self, id: u32) {
         let structs = self.structs;
         let elem_cty = self.cty_of(structs.array_elem(id));
@@ -1445,13 +1458,27 @@ impl<'a> Emitter<'a> {
             cn = cname,
             n = len
         ));
+        self.line(&format!(
+            "static inline {ec} *{cn}_at(const {cn} *a, int64_t i) {{ if (i < 0 || (uint64_t)i >= {n}) {{ fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); }} return ({ec} *)a->data + i; }}",
+            ec = elem_cty,
+            cn = cname,
+            n = len
+        ));
     }
 
     /// Emit one `kd_slice_<tag>` slice typedef plus its inline bounds-checked
-    /// `_get` helper, per SPEC §15.2. A slice is a non-owning `{ptr, len}` view
-    /// over a backing array (or another slice); the backing storage's lifetime
-    /// is the programmer's responsibility (raw, no borrow check). `_get` panics
-    /// (stderr + `exit(101)`) on an out-of-bounds index.
+    /// `_get` and `_at` helpers, per SPEC §15.2. A slice is a non-owning
+    /// `{ptr, len}` view over a backing array (or another slice); the backing
+    /// storage's lifetime is the programmer's responsibility (raw, no borrow
+    /// check). Both helpers panic (stderr + `exit(101)`) on an out-of-bounds
+    /// index — identical check, message and exit code.
+    ///
+    /// `_get` reads an element (rvalue index reads). `_at` returns a pointer to
+    /// the element **in the backing storage** for the lvalue lowerings of SPEC
+    /// §15.1/§9.4 (`&s[i]`, `s[i].f = e`, chains/compounds through an index).
+    /// Unlike the array `_at`, the slice itself is passed by value — copying
+    /// the `{ptr, len}` view loses nothing, because `.ptr` already aims at the
+    /// backing storage the write must land in.
     fn emit_one_slice(&mut self, id: u32) {
         let structs = self.structs;
         let elem_cty = self.cty_of(structs.slice_elem(id));
@@ -1462,6 +1489,11 @@ impl<'a> Emitter<'a> {
         ));
         self.line(&format!(
             "static inline {ec} {sn}_get({sn} s, int64_t i) {{ if (i < 0 || (uint64_t)i >= s.len) {{ fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); }} return s.ptr[i]; }}",
+            ec = elem_cty,
+            sn = sname
+        ));
+        self.line(&format!(
+            "static inline {ec} *{sn}_at({sn} s, int64_t i) {{ if (i < 0 || (uint64_t)i >= s.len) {{ fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); }} return s.ptr + i; }}",
             ec = elem_cty,
             sn = sname
         ));
@@ -2104,6 +2136,120 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    // -- index places (lvalues through `a[i]` / `s[i]`) ----------------------
+    //
+    // Sema accepts an index as a *place* (SPEC §15.1: a valid `&place` lvalue;
+    // §9.4/§14.1: a field-assign chain may pass through an element), but the
+    // rvalue read lowering goes through the by-value getter helpers
+    // (`kd_arr_<tag>_<N>_get` / `kd_slice_<tag>_get`), whose results are not C
+    // lvalues — `(get(a, i)).kd_x = e;` and `&(get(a, i))` do not compile. The
+    // helpers below lower such places through the element-POINTER helpers
+    // (`_at`, emitted next to each `_get`), which perform the *same* bounds
+    // check (same message, same `exit(101)`) and then return `&elem` instead of
+    // a copy. Portable C11 throughout — a GNU statement-expression
+    // (`({ check; &buf[i]; })`) would inline the check but is not C11; a real
+    // helper function is the portable route and matches the `_get` style.
+
+    /// Whether this place expression reaches its target **through an
+    /// array/slice index** via value links (`Field` of / `Index` of), so that
+    /// lowering it with the rvalue getters could not produce a C lvalue. A
+    /// `Deref` (or any non-place leaf) resets the requirement: writing through
+    /// `p.*` needs only the pointer *value*, which a getter read supplies
+    /// correctly (the copied pointer aims at the same storage).
+    fn place_chain_has_index(e: &Expr) -> bool {
+        match e {
+            Expr::Index { .. } => true,
+            Expr::Field { base, .. } => Self::place_chain_has_index(base),
+            _ => false,
+        }
+    }
+
+    /// Whether a `FieldAssign` place needs the `_at`-based lvalue lowering: its
+    /// *base* passes through an index. (A plain outermost `a[i] = e` keeps the
+    /// long-standing hoisted-`__kd_idx` bounds-checked block — see the legacy
+    /// `Index` arm in [`Emitter::emit_stmt`].)
+    fn place_needs_at_lowering(place: &Expr) -> bool {
+        match place {
+            Expr::Index { base, .. } | Expr::Field { base, .. } => {
+                Self::place_chain_has_index(base)
+            }
+            _ => false,
+        }
+    }
+
+    /// Lower `base[index]` to an **element pointer** (`T*`) expression via the
+    /// bounds-checked `_at` helper: `kd_arr_<tag>_<N>_at(&(<base>), <i>)` for an
+    /// array — the array passes by pointer so the element is the caller's, not
+    /// a copy — or `kd_slice_<tag>_at(<base>, <i>)` for a slice (by value; its
+    /// `.ptr` already aims at the backing storage). The array base is itself
+    /// spelled as an lvalue (recursively, via [`Emitter::emit_place`]) so a
+    /// chain like `xs[i].buf[j]` addresses the real nested storage.
+    fn emit_index_addr(&mut self, base: &Expr, index: &Expr) -> String {
+        let i = self.emit_expr(index);
+        match self.type_of_expr(base) {
+            Some(Type::Array(aid)) => {
+                let cname = self.structs.array_c_name(aid);
+                let b = self.emit_place(base);
+                format!("{}_at(&({}), {})", cname, b, i)
+            }
+            Some(Type::Slice(sid)) => {
+                let cname = self.structs.slice_c_name(sid);
+                let b = self.emit_expr(base);
+                format!("{}_at({}, {})", cname, b, i)
+            }
+            // Unreachable for validated input (`base` is an array/slice).
+            _ => {
+                let b = self.emit_expr(base);
+                format!("(&(({})[{}]))", b, i)
+            }
+        }
+    }
+
+    /// Lower a place expression to a C **lvalue** string. Equivalent to
+    /// `emit_expr` for places that already lower to lvalues (a var, a field
+    /// chain, a deref); an `Index` step lowers through the element-pointer
+    /// `_at` helper instead of the by-value `_get`, so writes and `&` work on
+    /// elements: `a[i]` → `(*kd_arr_<tag>_<N>_at(&(a), i))`, `a[i].f` →
+    /// `kd_arr_<tag>_<N>_at(&(a), i)->kd_f`. Bounds checks are preserved (the
+    /// `_at` helpers panic exactly like `_get`) and each index is evaluated
+    /// once per spelling — a compound assignment hoists the place's address so
+    /// the whole place is evaluated once (SPEC §27.3).
+    fn emit_place(&mut self, place: &Expr) -> String {
+        if !Self::place_chain_has_index(place) {
+            // No index in the chain: the ordinary lowering is already a C
+            // lvalue (and keeps the established spellings, e.g. the
+            // `(*(<p>)).kd_f` pointer auto-deref).
+            return self.emit_expr(place);
+        }
+        match place {
+            Expr::Index { base, index, .. } => {
+                format!("(*{})", self.emit_index_addr(base, index))
+            }
+            Expr::Field { base, field, .. } => {
+                // A field directly on an element reads through the element
+                // pointer (`at(...)->kd_f`); deeper chains recurse. A `*Struct`
+                // field in the chain auto-derefs as in the rvalue lowering
+                // (SPEC §30.1).
+                if let Expr::Index {
+                    base: ibase, index, ..
+                } = base.as_ref()
+                {
+                    let at = self.emit_index_addr(ibase, index);
+                    return format!("{}->kd_{}", at, field);
+                }
+                let b = self.emit_place(base);
+                if self.is_ptr_to_struct(base) {
+                    format!("(*({})).kd_{}", b, field)
+                } else {
+                    format!("({}).kd_{}", b, field)
+                }
+            }
+            // Unreachable: `place_chain_has_index` is only true for the two
+            // arms above. Fall back to the ordinary lowering.
+            _ => self.emit_expr(place),
+        }
+    }
+
     /// Emit one statement. Returns `true` if it unconditionally transfers
     /// control (`return`/`break`/`continue`, or an `if`/block all of whose
     /// paths do).
@@ -2181,6 +2327,45 @@ impl<'a> Emitter<'a> {
                 place, op, value, ..
             } => {
                 match place {
+                    // A place whose chain passes THROUGH an array/slice index —
+                    // `a[i].f = e`, `s[i].f.g = e`, `xs[i].buf[j] = e` — cannot
+                    // use the rvalue getters (their results are not C lvalues).
+                    // Lower it through the bounds-checked element-pointer `_at`
+                    // helpers (same out-of-bounds panic/exit as `_get`):
+                    // `(kd_arr_<tag>_<N>_at(&(a), i)->kd_f) = (e);`. A compound
+                    // `op=` evaluates the place ONCE (SPEC §27.3) by hoisting
+                    // its address into a fresh `__kd_pl{k}` pointer, then
+                    // reading and writing through it — one index evaluation,
+                    // one bounds check.
+                    p if Self::place_needs_at_lowering(p) => {
+                        let lv = self.emit_place(p);
+                        let pt = self.type_of_expr(p);
+                        let es = match pt {
+                            Some(t) => self.emit_coerced(value, t),
+                            None => self.emit_expr(value),
+                        };
+                        match op {
+                            None => self.line(&format!("({}) = ({});", lv, es)),
+                            Some(binop) => {
+                                let k = self.idx_counter;
+                                self.idx_counter += 1;
+                                // Unreachable fallback: a validated compound
+                                // place is always typed (integers, §27.2).
+                                let cty = match pt {
+                                    Some(t) => self.cty_of(t),
+                                    None => "int64_t".to_string(),
+                                };
+                                self.line(&format!(
+                                    "{{ {cty} *__kd_pl{k} = (&({lv})); *__kd_pl{k} = *__kd_pl{k} {op} ({es}); }}",
+                                    cty = cty,
+                                    k = k,
+                                    lv = lv,
+                                    op = binop.c_op(),
+                                    es = es
+                                ));
+                            }
+                        }
+                    }
                     Expr::Index { base, index, .. } => {
                         // Index-assignment → a bounds-checked block: the index is
                         // hoisted into a fresh temporary, checked, then stored.
@@ -3625,8 +3810,20 @@ impl<'a> Emitter<'a> {
                 }
             }
             Expr::AddrOf { place, .. } => {
-                // `&place` → `(&(<place>))` (SPEC §15.1). The place is an lvalue
-                // (a `var`, field chain, index or deref); sema guarantees it.
+                // `&place` (SPEC §15.1). An index place — `&a[i]` / `&s[i]` —
+                // IS the bounds-checked element pointer, so it lowers directly
+                // to the `_at` helper call (the rvalue `_get` result is not a C
+                // lvalue and cannot take `&`). A chain through an index
+                // (`&a[i].f`) takes `&` of its `_at`-based lvalue spelling. Any
+                // other place (a `var`, field chain or deref) already lowers to
+                // a C lvalue: `(&(<place>))`.
+                if let Expr::Index { base, index, .. } = place.as_ref() {
+                    return format!("({})", self.emit_index_addr(base, index));
+                }
+                if Self::place_chain_has_index(place) {
+                    let lv = self.emit_place(place);
+                    return format!("(&({}))", lv);
+                }
                 let p = self.emit_expr(place);
                 format!("(&({}))", p)
             }
@@ -3726,7 +3923,18 @@ impl<'a> Emitter<'a> {
     /// context to host an `if`), the check is folded into a portable conditional
     /// whose failing branch never returns (`exit` is `_Noreturn`).
     fn emit_slice_expr(&mut self, base: &Expr, lo: &Expr, hi: &Expr) -> String {
-        let base_str = self.emit_expr(base);
+        // An ARRAY base reached through an index (`xs[i].buf[lo..hi]`) must be
+        // spelled as an lvalue via the `_at` element pointers — the by-value
+        // `_get` would return a temporary copy and the view would dangle. A
+        // slice base copies fine by value (its `.ptr` aims at the real
+        // storage), as does any index-free base (already an lvalue).
+        let base_str = if matches!(self.type_of_expr(base), Some(Type::Array(_)))
+            && Self::place_chain_has_index(base)
+        {
+            self.emit_place(base)
+        } else {
+            self.emit_expr(base)
+        };
         let lo_str = self.emit_expr(lo);
         let hi_str = self.emit_expr(hi);
         // `(data_expr, cap_expr, elem)`: how to reach the backing storage and
@@ -3978,11 +4186,23 @@ impl<'a> Emitter<'a> {
             let ptr_receiver =
                 matches!(params.as_deref().and_then(|p| p.first()), Some(Type::Ptr(_)));
             let recv_is_ptr = self.is_ptr_to_struct(receiver);
-            let recv = self.emit_expr(receiver);
             let self_str = match (ptr_receiver, recv_is_ptr) {
-                (true, false) => format!("(&({}))", recv),
-                (false, true) => format!("(*({}))", recv),
-                _ => recv,
+                (true, false) => {
+                    // Auto-ref of an element receiver — `a[i].inc()` — takes
+                    // the bounds-checked `_at` element pointer (the rvalue
+                    // `_get` result cannot take `&`); a chain through an index
+                    // (`a[i].inner.inc()`) refs its `_at`-based lvalue. The
+                    // mutation lands in the real element, per SPEC §30.2.
+                    if let Expr::Index { base, index, .. } = receiver {
+                        format!("({})", self.emit_index_addr(base, index))
+                    } else if Self::place_chain_has_index(receiver) {
+                        format!("(&({}))", self.emit_place(receiver))
+                    } else {
+                        format!("(&({}))", self.emit_expr(receiver))
+                    }
+                }
+                (false, true) => format!("(*({}))", self.emit_expr(receiver)),
+                _ => self.emit_expr(receiver),
             };
             let arg_strs = self.emit_coerced_args(args, params.as_deref(), 1);
             let mut all = Vec::with_capacity(1 + arg_strs.len());
@@ -7919,6 +8139,213 @@ mod tests {
             out.matches("int64_t __kd_idx0 =").count(),
             1,
             "index must be hoisted exactly once:\n{out}"
+        );
+    }
+
+    // -- v0.155 index places: lvalues through `a[i]` / `s[i]` (`_at`) --------
+
+    /// A `StructTable` with `Point { x, y: i32 }`, `[2]Point` and `[]Point`.
+    fn point_elem_table() -> StructTable {
+        let mut t = point_table();
+        let pid = t.id_of("Point").unwrap();
+        t.intern_array(Type::Struct(pid), 2);
+        t.intern_slice(Type::Struct(pid));
+        t
+    }
+
+    #[test]
+    fn array_and_slice_at_helpers_emitted() {
+        // Each interned array/slice emits an `_at` element-pointer helper next
+        // to its `_get`: the SAME bounds check (message + exit 101), but it
+        // returns `&elem` instead of a copy — the array passes by pointer (a
+        // write through the result mutates the caller's array, not a copy),
+        // the slice by value (its `.ptr` aims at the backing storage).
+        let mut structs = arr_int_table();
+        structs.intern_slice(Type::I32);
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains(
+                "static inline int32_t *kd_arr_int32_t_3_at(const kd_arr_int32_t_3 *a, int64_t i) { if (i < 0 || (uint64_t)i >= 3) { fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); } return (int32_t *)a->data + i; }"
+            ),
+            "array _at helper missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "static inline int32_t *kd_slice_int32_t_at(kd_slice_int32_t s, int64_t i) { if (i < 0 || (uint64_t)i >= s.len) { fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); } return s.ptr + i; }"
+            ),
+            "slice _at helper missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn index_then_field_assign_lowers_through_at() {
+        // fn sa(a: [2]Point) void { a[1].x = 30; }
+        // fn ss(s: []Point) void { s[1].x = 30; }
+        // A field-assign place THROUGH an index writes via the element-pointer
+        // helper — `at(...)->kd_x = ...` — not the by-value `_get` (whose
+        // result is not a C lvalue). The array passes `&(a)` so the write
+        // mutates the caller's element in place (SPEC §9.4 + §14.1/§15.2).
+        let structs = point_elem_table();
+        let sa = Func {
+            is_pub: false,
+            name: "sa".to_string(),
+            params: vec![Param {
+                name: "a".to_string(),
+                ty: arr_ty("Point", 2),
+                is_comptime: false,
+                span: Span::DUMMY,
+            }],
+            ret: ty("void"),
+            body: block(vec![Stmt::FieldAssign {
+                place: field(index(ident("a"), int(1)), "x"),
+                op: None,
+                value: int(30),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let ss = Func {
+            is_pub: false,
+            name: "ss".to_string(),
+            params: vec![Param {
+                name: "s".to_string(),
+                ty: slice_ty("Point"),
+                is_comptime: false,
+                span: Span::DUMMY,
+            }],
+            ret: ty("void"),
+            body: block(vec![Stmt::FieldAssign {
+                place: field(index(ident("s"), int(1)), "x"),
+                op: None,
+                value: int(30),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(sa), Item::Func(ss)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("(kd_arr_struct_Point_2_at(&(kd_a), 1)->kd_x) = (30);"),
+            "array index-then-field assign lowering wrong:\n{out}"
+        );
+        assert!(
+            out.contains("(kd_slice_struct_Point_at(kd_s, 1)->kd_x) = (30);"),
+            "slice index-then-field assign lowering wrong:\n{out}"
+        );
+        assert!(
+            !out.contains("_get(kd_a, ") && !out.contains("_get(kd_s, "),
+            "place base must not lower through the by-value getter:\n{out}"
+        );
+    }
+
+    #[test]
+    fn compound_through_index_hoists_place_pointer_once() {
+        // fn go(a: [2]Point) void { a[1].x += 5; }
+        // A compound `op=` through an index evaluates the place ONCE (SPEC
+        // §27.3): the element-field address is hoisted into `__kd_pl0`, then
+        // read and written through it — one index evaluation, one bounds check.
+        let structs = point_elem_table();
+        let f = Func {
+            is_pub: false,
+            name: "go".to_string(),
+            params: vec![Param {
+                name: "a".to_string(),
+                ty: arr_ty("Point", 2),
+                is_comptime: false,
+                span: Span::DUMMY,
+            }],
+            ret: ty("void"),
+            body: block(vec![Stmt::FieldAssign {
+                place: field(index(ident("a"), int(1)), "x"),
+                op: Some(BinOp::Add),
+                value: int(5),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains(
+                "{ int32_t *__kd_pl0 = (&(kd_arr_struct_Point_2_at(&(kd_a), 1)->kd_x)); *__kd_pl0 = *__kd_pl0 + (5); }"
+            ),
+            "compound through-index store wrong:\n{out}"
+        );
+        // The `_at` call (bounds check + index evaluation) appears exactly once
+        // in the function body (`_at(&(kd_a)` cannot match the helper's own
+        // definition line, whose parameter is spelled `const ... *a`).
+        assert_eq!(
+            out.matches("_at(&(kd_a)").count(),
+            1,
+            "place must be evaluated exactly once:\n{out}"
+        );
+    }
+
+    #[test]
+    fn addr_of_index_lowers_to_at_call() {
+        // fn g(a: [3]i32, i: i64) void { var p: *i32 = &a[i]; }
+        // fn h(s: []i32) void { var q: *i32 = &s[0]; }
+        // `&a[i]` IS the bounds-checked element pointer: it lowers directly to
+        // the `_at` helper call (SPEC §15.1), array by `&(...)`, slice by value.
+        let mut structs = arr_int_table();
+        structs.intern_slice(Type::I32);
+        let g = Func {
+            is_pub: false,
+            name: "g".to_string(),
+            params: vec![
+                Param {
+                    name: "a".to_string(),
+                    ty: arr_ty("i32", 3),
+                    is_comptime: false,
+                    span: Span::DUMMY,
+                },
+                param("i", "i64"),
+            ],
+            ret: ty("void"),
+            body: block(vec![Stmt::Let {
+                is_const: false,
+                name: "p".to_string(),
+                ty: Some(ptr_ty("i32")),
+                value: addr_of(index(ident("a"), ident("i"))),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let h = Func {
+            is_pub: false,
+            name: "h".to_string(),
+            params: vec![Param {
+                name: "s".to_string(),
+                ty: slice_ty("i32"),
+                is_comptime: false,
+                span: Span::DUMMY,
+            }],
+            ret: ty("void"),
+            body: block(vec![Stmt::Let {
+                is_const: false,
+                name: "q".to_string(),
+                ty: Some(ptr_ty("i32")),
+                value: addr_of(index(ident("s"), int(0))),
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(g), Item::Func(h)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("int32_t* kd_p = (kd_arr_int32_t_3_at(&(kd_a), kd_i));"),
+            "&a[i] lowering wrong:\n{out}"
+        );
+        assert!(
+            out.contains("int32_t* kd_q = (kd_slice_int32_t_at(kd_s, 0));"),
+            "&s[i] lowering wrong:\n{out}"
         );
     }
 
