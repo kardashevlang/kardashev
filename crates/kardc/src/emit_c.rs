@@ -6,7 +6,7 @@
 //! `continue` (and, in test mode, a failed `expect`). Identical input always
 //! produces byte-identical output.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ast::{
@@ -43,6 +43,10 @@ pub enum EmitMode {
 /// `typedef` emission and resolves every `Type::Struct(id)` to its C name.
 pub fn emit(module: &Module, structs: &crate::types::StructTable, mode: EmitMode) -> String {
     let mut em = Emitter::new(mode, structs);
+    // Dead-function elimination (v0.153, SPEC §43): compute the reachable
+    // function sets once, before any pass, so the forward-declaration and
+    // definition passes consult the very same liveness and always agree.
+    em.live = live_functions(module, structs, mode);
     em.collect_signatures(module);
     // Whether the `kd_panic` runtime helper is needed (SPEC §35.2): emitted only
     // when an `@panic(..)` lowering will appear, so a string-using program that
@@ -64,15 +68,18 @@ pub fn emit(module: &Module, structs: &crate::types::StructTable, mode: EmitMode
     em.out
 }
 
-// -- builtin usage scans (v0.141 `@panic`, v0.148 I/O) ----------------------
+// -- unified AST expression walker (v0.151 builtin scans, v0.153 liveness) --
 //
-// Whether the module contains any `@builtin(..)` whose name satisfies `pred` —
-// in a function body, a struct method, a test block, a `const` initializer, or
-// a (monomorphised) generic-struct method. Drives whether the matching runtime
-// helper(s) are emitted. Over-counting is harmless (an unused helper), but
-// under-counting would leave a lowering referencing an undeclared function, so
-// the walk is exhaustive over the current AST. `pred` is a plain fn pointer so
-// the recursive walkers stay non-generic.
+// One visitor family shared by every whole-module scan: the `@builtin` usage
+// scans (v0.141 `@panic`, v0.148 I/O) and the dead-function-elimination
+// liveness collection (v0.153, SPEC §43.1). `visit_expr` calls `f` on every
+// `Expr` node (parents before children), recursing through every statement,
+// block, and nested `struct { … }` method body, so each scan only
+// pattern-matches the nodes it cares about. The walk is exhaustive over the
+// current AST: under-visiting would let a scan miss a use (an undeclared C
+// reference for the builtin scans, a wrongly-dropped function for §43), so a
+// new `Expr`/`Stmt` variant must be wired here. The callback is
+// `&mut dyn FnMut` so the mutually-recursive walkers stay non-generic.
 
 /// Whether the module contains any `@panic(..)` builtin (SPEC §35.2). Drives
 /// whether the `kd_panic` `_Noreturn` runtime helper is emitted, so a
@@ -89,108 +96,167 @@ fn module_uses_io(m: &Module) -> bool {
     module_uses_builtin(m, |n| n == "readFile" || n == "readLine")
 }
 
+/// Whether the module contains any `@builtin(..)` whose name satisfies `pred`
+/// — in a function body, a struct method, a test block, a `const`
+/// initializer, or a (monomorphised) generic-struct method. Over-counting is
+/// harmless (an unused helper); a builtin inside a §43-dead function still
+/// counts, which can only keep a helper that ends up unused.
 fn module_uses_builtin(m: &Module, pred: fn(&str) -> bool) -> bool {
-    m.items.iter().any(|it| item_uses_builtin(it, pred))
+    let mut found = false;
+    for item in &m.items {
+        visit_item_exprs(item, &mut |e| {
+            if let Expr::Builtin { name, .. } = e {
+                if pred(name) {
+                    found = true;
+                }
+            }
+        });
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
-fn item_uses_builtin(item: &Item, pred: fn(&str) -> bool) -> bool {
+/// Visit every expression in an item: a function body, a `const` initializer,
+/// a test-block body, or each method body of a struct. Type-only items
+/// (enums, unions, imports — erased before emit — and named error sets)
+/// contain no expressions.
+fn visit_item_exprs(item: &Item, f: &mut dyn FnMut(&Expr)) {
     match item {
-        Item::Func(f) => block_uses_builtin(&f.body, pred),
-        Item::Const(c) => expr_uses_builtin(&c.value, pred),
-        Item::Test(t) => block_uses_builtin(&t.body, pred),
-        Item::Struct(s) => s.methods.iter().any(|m| block_uses_builtin(&m.body, pred)),
-        Item::Enum(_) | Item::Union(_) | Item::Import(_) | Item::ErrorSet(_) => false,
+        Item::Func(func) => visit_block_exprs(&func.body, f),
+        Item::Const(c) => visit_expr(&c.value, f),
+        Item::Test(t) => visit_block_exprs(&t.body, f),
+        Item::Struct(s) => {
+            for m in &s.methods {
+                visit_block_exprs(&m.body, f);
+            }
+        }
+        Item::Enum(_) | Item::Union(_) | Item::Import(_) | Item::ErrorSet(_) => {}
     }
 }
 
-fn block_uses_builtin(b: &Block, pred: fn(&str) -> bool) -> bool {
-    b.stmts.iter().any(|s| stmt_uses_builtin(s, pred))
+fn visit_block_exprs(b: &Block, f: &mut dyn FnMut(&Expr)) {
+    for s in &b.stmts {
+        visit_stmt_exprs(s, f);
+    }
 }
 
-fn stmt_uses_builtin(s: &Stmt, pred: fn(&str) -> bool) -> bool {
+fn visit_stmt_exprs(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
     match s {
-        Stmt::Let { value, .. } => expr_uses_builtin(value, pred),
-        Stmt::Assign { value, .. } => expr_uses_builtin(value, pred),
+        Stmt::Let { value, .. } | Stmt::Assign { value, .. } => visit_expr(value, f),
         Stmt::FieldAssign { place, value, .. } => {
-            expr_uses_builtin(place, pred) || expr_uses_builtin(value, pred)
+            visit_expr(place, f);
+            visit_expr(value, f);
         }
-        Stmt::Expr(e) => expr_uses_builtin(e, pred),
-        Stmt::Return { value, .. } => value.as_ref().is_some_and(|v| expr_uses_builtin(v, pred)),
+        Stmt::Expr(e) => visit_expr(e, f),
+        Stmt::Return { value, .. } => {
+            if let Some(v) = value {
+                visit_expr(v, f);
+            }
+        }
         Stmt::If {
             cond, then, els, ..
         } => {
-            expr_uses_builtin(cond, pred)
-                || block_uses_builtin(then, pred)
-                || els.as_deref().is_some_and(|e| stmt_uses_builtin(e, pred))
+            visit_expr(cond, f);
+            visit_block_exprs(then, f);
+            if let Some(e) = els.as_deref() {
+                visit_stmt_exprs(e, f);
+            }
         }
         Stmt::While {
             cond, cont, body, ..
         } => {
-            expr_uses_builtin(cond, pred)
-                || cont.as_deref().is_some_and(|c| stmt_uses_builtin(c, pred))
-                || block_uses_builtin(body, pred)
+            visit_expr(cond, f);
+            if let Some(c) = cont.as_deref() {
+                visit_stmt_exprs(c, f);
+            }
+            visit_block_exprs(body, f);
         }
         Stmt::For { iter, body, .. } => {
-            expr_uses_builtin(iter, pred) || block_uses_builtin(body, pred)
+            visit_expr(iter, f);
+            visit_block_exprs(body, f);
         }
-        Stmt::Break { .. } | Stmt::Continue { .. } => false,
-        Stmt::Defer { stmt, .. } | Stmt::ErrDefer { stmt, .. } => stmt_uses_builtin(stmt, pred),
-        Stmt::Block(b) => block_uses_builtin(b, pred),
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::Defer { stmt, .. } | Stmt::ErrDefer { stmt, .. } => visit_stmt_exprs(stmt, f),
+        Stmt::Block(b) => visit_block_exprs(b, f),
         Stmt::Switch {
             scrutinee,
             arms,
             default,
             ..
         } => {
-            expr_uses_builtin(scrutinee, pred)
-                || arms.iter().any(|a| {
-                    a.labels.iter().any(|l| expr_uses_builtin(l, pred))
-                        || block_uses_builtin(&a.body, pred)
-                })
-                || default
-                    .as_ref()
-                    .is_some_and(|d| block_uses_builtin(d, pred))
+            visit_expr(scrutinee, f);
+            for a in arms {
+                for l in &a.labels {
+                    visit_expr(l, f);
+                }
+                visit_block_exprs(&a.body, f);
+            }
+            if let Some(d) = default {
+                visit_block_exprs(d, f);
+            }
         }
     }
 }
 
-fn expr_uses_builtin(e: &Expr, pred: fn(&str) -> bool) -> bool {
+fn visit_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    f(e);
     match e {
-        Expr::Builtin { name, args, .. } => {
-            pred(name) || args.iter().any(|a| expr_uses_builtin(a, pred))
+        Expr::Unary { expr, .. }
+        | Expr::Comptime { expr, .. }
+        | Expr::Unwrap { expr, .. }
+        | Expr::Deref { expr, .. }
+        | Expr::Try { expr, .. } => visit_expr(expr, f),
+        Expr::Binary { lhs, rhs, .. } | Expr::Orelse { lhs, rhs, .. } => {
+            visit_expr(lhs, f);
+            visit_expr(rhs, f);
         }
-        Expr::Unary { expr, .. } => expr_uses_builtin(expr, pred),
-        Expr::Binary { lhs, rhs, .. } => {
-            expr_uses_builtin(lhs, pred) || expr_uses_builtin(rhs, pred)
+        Expr::Call { args, .. } | Expr::Builtin { args, .. } => {
+            for a in args {
+                visit_expr(a, f);
+            }
         }
-        Expr::Call { args, .. } => args.iter().any(|a| expr_uses_builtin(a, pred)),
-        Expr::Comptime { expr, .. } => expr_uses_builtin(expr, pred),
-        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_uses_builtin(&f.value, pred)),
-        Expr::Field { base, .. } => expr_uses_builtin(base, pred),
+        Expr::StructLit { fields, .. } => {
+            for fi in fields {
+                visit_expr(&fi.value, f);
+            }
+        }
+        Expr::Field { base, .. } => visit_expr(base, f),
         Expr::MethodCall { receiver, args, .. } => {
-            expr_uses_builtin(receiver, pred) || args.iter().any(|a| expr_uses_builtin(a, pred))
+            visit_expr(receiver, f);
+            for a in args {
+                visit_expr(a, f);
+            }
         }
-        Expr::Orelse { lhs, rhs, .. } => {
-            expr_uses_builtin(lhs, pred) || expr_uses_builtin(rhs, pred)
+        Expr::ArrayLit { elems, .. } => {
+            for el in elems {
+                visit_expr(el, f);
+            }
         }
-        Expr::Unwrap { expr, .. } => expr_uses_builtin(expr, pred),
-        Expr::ArrayLit { elems, .. } => elems.iter().any(|el| expr_uses_builtin(el, pred)),
         Expr::Index { base, index, .. } => {
-            expr_uses_builtin(base, pred) || expr_uses_builtin(index, pred)
+            visit_expr(base, f);
+            visit_expr(index, f);
         }
-        Expr::AddrOf { place, .. } => expr_uses_builtin(place, pred),
-        Expr::Deref { expr, .. } => expr_uses_builtin(expr, pred),
+        Expr::AddrOf { place, .. } => visit_expr(place, f),
         Expr::SliceExpr { base, lo, hi, .. } => {
-            expr_uses_builtin(base, pred)
-                || expr_uses_builtin(lo, pred)
-                || expr_uses_builtin(hi, pred)
+            visit_expr(base, f);
+            visit_expr(lo, f);
+            visit_expr(hi, f);
         }
-        Expr::Try { expr, .. } => expr_uses_builtin(expr, pred),
         Expr::Catch { expr, default, .. } => {
-            expr_uses_builtin(expr, pred) || expr_uses_builtin(default, pred)
+            visit_expr(expr, f);
+            visit_expr(default, f);
         }
+        // The methods of an anonymous `struct { … }` type value (the body of a
+        // type-constructor, SPEC §25/§26) are part of the tree: the builtin
+        // scans must see the builtins inside them, and the §43 liveness walk
+        // must see their calls (every recorded instantiation of those methods
+        // emits, §43.1).
         Expr::StructType { methods, .. } => {
-            methods.iter().any(|m| block_uses_builtin(&m.body, pred))
+            for m in methods {
+                visit_block_exprs(&m.body, f);
+            }
         }
         Expr::Int { .. }
         | Expr::Float { .. }
@@ -200,8 +266,200 @@ fn expr_uses_builtin(e: &Expr, pred: fn(&str) -> bool) -> bool {
         | Expr::Null { .. }
         | Expr::ErrorLit { .. }
         | Expr::EnumLit { .. }
-        | Expr::Unreachable { .. } => false,
+        | Expr::Unreachable { .. } => {}
     }
+}
+
+// -- dead-function elimination (v0.153, SPEC §43) ----------------------------
+
+/// The liveness sets of SPEC §43.1, computed once by [`live_functions`] before
+/// any emission pass. One struct holding both sets, so the two skip sites (the
+/// forward-declaration pass and the definition pass) always consult the same
+/// liveness.
+struct LiveFns {
+    /// Reachable top-level **free-function** names. A plain `fn` whose name is
+    /// not in this set is omitted from both function passes.
+    free: HashSet<String>,
+    /// Reachable **method / associated-function** names — name-level across
+    /// all structs (receiver-agnostic, deliberately over-approximate; per-
+    /// struct precision is a §43.3 deferral). A struct method whose name is
+    /// not in this set is omitted from both function passes.
+    methods: HashSet<String>,
+}
+
+impl LiveFns {
+    fn empty() -> LiveFns {
+        LiveFns {
+            free: HashSet::new(),
+            methods: HashSet::new(),
+        }
+    }
+
+    /// Every function in the module marked live — the no-root fallback of
+    /// [`live_functions`].
+    fn all_of(module: &Module) -> LiveFns {
+        let mut live = LiveFns::empty();
+        for item in &module.items {
+            match item {
+                Item::Func(f) => {
+                    live.free.insert(f.name.clone());
+                }
+                Item::Struct(s) => {
+                    for m in &s.methods {
+                        live.methods.insert(m.name.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        live
+    }
+}
+
+/// The §43.1 reachability pre-pass: which functions `mode`'s roots can reach.
+///
+/// **Roots** (§43.1): in `EmitMode::Program` the user's `main`; in
+/// `EmitMode::Test` every `test` block body (the harness runs each one — its
+/// C `main` calls only the `kd_test_fns[]` table and never `kd_main`, so
+/// `main` is *not* a Test-mode root; a test that calls `main()` marks it live
+/// through the ordinary walk like any other function).
+///
+/// **Liveness**: a worklist transitive closure. Each live body contributes
+/// every `Call{callee}` as a live free-function name and every
+/// `MethodCall{method}` as a live method name — name-level across all structs
+/// (§43.1; receiver-precise liveness is a §43.3 deferral). Names that resolve
+/// to no module function (builtin-backed calls like `print`/`alloc`, or a
+/// generic's instance — emitted per recorded instantiation regardless) mark
+/// nothing further and are harmless.
+///
+/// **Always-walked name sources** (§43.1): bodies that emit regardless of the
+/// reachability walk must contribute their called names regardless too —
+/// every *recorded instantiation* is emitted whether or not its call sites
+/// are live (instantiation-level liveness is a §43.3 deferral), so whatever
+/// those bodies call must stay. Concretely:
+/// - the body of every *generic* function is walked, even one with zero
+///   recorded instantiations (a deliberate over-approximation: with no
+///   instance the kept callees are merely unused, and the walk needs no
+///   instantiation bookkeeping);
+/// - the `struct { … }` methods of a type-constructor are walked for every
+///   constructor with **at least one recorded [`crate::types::StructInstance`]**
+///   — exactly the methods `each_instance_method` emits. A constructor never
+///   instantiated emits nothing, so its methods are *not* name sources: this
+///   is what makes an `@import`ed std container pay-as-you-go (§43 intro —
+///   `HashMap`'s `iabs` use must not keep `kd_iabs` in a program that never
+///   builds a `HashMap`).
+///
+/// **No-root fallback**: a module with no `main` (in Program mode) and no
+/// `test` block (in Test mode) has no root, so strict reachability would drop
+/// *every* function. Such a module is not a runnable artifact of that mode —
+/// `compile_to_c` rejects a mainless program (E0150) before emission — but
+/// direct `emit()` callers (the unit-test fixtures) construct exactly these
+/// shapes to pin individual lowerings. With no root everything is kept: DCE is
+/// an optimization and is vacuous without an entry point.
+fn live_functions(module: &Module, structs: &StructTable, mode: EmitMode) -> LiveFns {
+    let has_main = module
+        .items
+        .iter()
+        .any(|it| matches!(it, Item::Func(f) if f.name == "main"));
+    let has_root = match mode {
+        EmitMode::Program => has_main,
+        EmitMode::Test => module.items.iter().any(|it| matches!(it, Item::Test(_))),
+    };
+    if !has_root {
+        return LiveFns::all_of(module);
+    }
+
+    let mut live = LiveFns::empty();
+    // Pending names discovered but not yet closed over. A name may be pushed
+    // more than once; the `insert` check below processes each exactly once.
+    let mut pending_free: Vec<String> = Vec::new();
+    let mut pending_methods: Vec<String> = Vec::new();
+
+    // Always-walked name sources (§43.1, see the doc comment): every generic
+    // function's body, plus the body of every type-constructor that has at
+    // least one recorded instance (its `struct { … }` methods — the parts
+    // `each_instance_method` emits — are reached by the expression walker).
+    let instantiated_ctors: HashSet<&str> = structs
+        .struct_instances()
+        .iter()
+        .map(|inst| inst.ctor.as_str())
+        .collect();
+    for item in &module.items {
+        if let Item::Func(f) = item {
+            if Emitter::is_type_ctor(f) {
+                if instantiated_ctors.contains(f.name.as_str()) {
+                    collect_called_names(&f.body, &mut pending_free, &mut pending_methods);
+                }
+            } else if Emitter::is_generic(f) {
+                collect_called_names(&f.body, &mut pending_free, &mut pending_methods);
+            }
+        }
+    }
+
+    // Roots (§43.1): `main` in Program mode; every test block body in Test
+    // mode (the harness never calls `kd_main`, see the doc comment).
+    match mode {
+        EmitMode::Program => pending_free.push("main".to_string()),
+        EmitMode::Test => {
+            for item in &module.items {
+                if let Item::Test(t) = item {
+                    collect_called_names(&t.body, &mut pending_free, &mut pending_methods);
+                }
+            }
+        }
+    }
+
+    // Worklist transitive closure: each newly-live function contributes the
+    // names its body calls until both queues drain.
+    loop {
+        if let Some(name) = pending_free.pop() {
+            if !live.free.insert(name.clone()) {
+                continue;
+            }
+            // Walk the body of the plain function of that name. A generic /
+            // type-constructor body was already walked unconditionally above.
+            for item in &module.items {
+                if let Item::Func(f) = item {
+                    if f.name == name && !Emitter::is_generic(f) && !Emitter::is_type_ctor(f) {
+                        collect_called_names(&f.body, &mut pending_free, &mut pending_methods);
+                    }
+                }
+            }
+        } else if let Some(name) = pending_methods.pop() {
+            if !live.methods.insert(name.clone()) {
+                continue;
+            }
+            // Name-level method liveness (§43.1): the method of this name on
+            // EVERY plain struct goes live, so each of their bodies is walked.
+            // Type-constructor (generic-struct) methods were already walked
+            // unconditionally above.
+            for item in &module.items {
+                if let Item::Struct(s) = item {
+                    for m in &s.methods {
+                        if m.name == name {
+                            collect_called_names(&m.body, &mut pending_free, &mut pending_methods);
+                        }
+                    }
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    live
+}
+
+/// Collect the function names a body uses (§43.1) into the pending worklists:
+/// every `Call{callee}` (a free-function name) and every `MethodCall{method}`
+/// (a method name, receiver-agnostic). Driven by the unified expression
+/// walker, so nested closures of the AST — defers, switch arms, struct-type
+/// method bodies — are all covered.
+fn collect_called_names(b: &Block, free: &mut Vec<String>, methods: &mut Vec<String>) {
+    visit_block_exprs(b, &mut |e| match e {
+        Expr::Call { callee, .. } => free.push(callee.clone()),
+        Expr::MethodCall { method, .. } => methods.push(method.clone()),
+        _ => {}
+    });
 }
 
 /// A lexical scope active during emission. Each one accumulates the `defer`
@@ -362,6 +620,12 @@ struct Emitter<'a> {
     /// typedef they return), so a program with no I/O keeps its smaller output
     /// and avoids unused-function warnings. Computed once in [`emit`].
     uses_io: bool,
+    /// v0.153: the reachable function sets (SPEC §43.1), computed once in
+    /// [`emit`] by [`live_functions`] before any pass. The forward-declaration
+    /// pass and the definition pass both skip any function not in here, so the
+    /// two always agree; every other pass ignores it (§43.1: typedefs, enums,
+    /// consts, generic instantiations and runtime helpers are unchanged).
+    live: LiveFns,
 }
 
 impl<'a> Emitter<'a> {
@@ -390,6 +654,7 @@ impl<'a> Emitter<'a> {
             generics: HashMap::new(),
             uses_panic: false,
             uses_io: false,
+            live: LiveFns::empty(),
         }
     }
 
@@ -594,6 +859,15 @@ impl<'a> Emitter<'a> {
     /// every struct function. These let [`Emitter::struct_of_expr`] follow a
     /// receiver chain that passes through a call to find the struct whose
     /// function a method call invokes. Pure bookkeeping — emits nothing.
+    ///
+    /// v0.153 note: this pass deliberately does **not** consult the §43
+    /// liveness sets. It registers signature types and `*T` pointees for dead
+    /// functions too — inert bookkeeping (no call site of a dead function is
+    /// ever emitted, so the extra entries are never consulted) — because
+    /// skipping here would perturb the emit-local pointer registry shared with
+    /// live code while SPEC §43.1 keeps everything except the two function
+    /// passes unchanged. (Typedef emission is driven by sema's `StructTable`,
+    /// not by this pass, so typedef sets are unchanged either way.)
     fn collect_signatures(&mut self, module: &Module) {
         // Register every generic top-level function first (SPEC §17). The
         // pointer pre-pass and the signature pass below both recognise and skip
@@ -1247,6 +1521,11 @@ impl<'a> Emitter<'a> {
         self.line(&format!("{} {}({});", rty, cname, ps));
     }
 
+    /// Forward-declare every **live** function (SPEC §43.1): plain top-level
+    /// functions, generic instantiations, struct methods, and generic-struct
+    /// instance methods. Dead free functions and dead struct methods are
+    /// skipped here exactly as in [`Emitter::emit_func_defs`] — the two passes
+    /// consult the same [`LiveFns`], so they always agree.
     fn emit_forward_decls(&mut self, module: &Module) {
         let mut any = false;
         // Ordinary top-level functions first. A generic function is never
@@ -1258,6 +1537,11 @@ impl<'a> Emitter<'a> {
                 // its plain name (§17.3); a type-constructor is compile-time only
                 // and never emitted at all (§25.3).
                 if Self::is_generic(f) || Self::is_type_ctor(f) {
+                    continue;
+                }
+                // Dead-function elimination (v0.153, SPEC §43.1): a free
+                // function unreachable from this mode's roots is omitted.
+                if !self.live.free.contains(&f.name) {
                     continue;
                 }
                 self.decl_line(&f.ret, &format!("kd_{}", f.name), &f.params);
@@ -1278,6 +1562,11 @@ impl<'a> Emitter<'a> {
                 // resolves in the forward declaration too (v0.136, §32.2).
                 self.with_self_bound(&s.name, |em| {
                     for m in &s.methods {
+                        // §43.1: method liveness is name-level — a method name
+                        // never called on ANY receiver is omitted.
+                        if !em.live.methods.contains(&m.name) {
+                            continue;
+                        }
                         em.decl_line(&m.ret, &format!("kd_{}_{}", s.name, m.name), &m.params);
                         any = true;
                     }
@@ -1313,6 +1602,9 @@ impl<'a> Emitter<'a> {
         any
     }
 
+    /// Define every **live** function (SPEC §43.1), in the same order — and
+    /// with the same §43 skips — as [`Emitter::emit_forward_decls`], so a
+    /// declared function is always defined and vice versa.
     fn emit_func_defs(&mut self, module: &Module) {
         // Ordinary top-level functions first, then struct functions, matching
         // the forward-declaration order. A generic function is not emitted under
@@ -1322,6 +1614,11 @@ impl<'a> Emitter<'a> {
                 // Skip generic functions (emitted per instantiation, §17.3) and
                 // type-constructors (compile-time only, never emitted, §25.3).
                 if Self::is_generic(f) || Self::is_type_ctor(f) {
+                    continue;
+                }
+                // Dead-function elimination (v0.153, SPEC §43.1): a free
+                // function unreachable from this mode's roots is omitted.
+                if !self.live.free.contains(&f.name) {
                     continue;
                 }
                 self.emit_func(f);
@@ -1334,6 +1631,11 @@ impl<'a> Emitter<'a> {
                 // with `self: *Self` / `@This()` (v0.136, §32.2) resolves.
                 self.with_self_bound(&s.name, |em| {
                     for m in &s.methods {
+                        // §43.1: method liveness is name-level — a method name
+                        // never called on ANY receiver is omitted.
+                        if !em.live.methods.contains(&m.name) {
+                            continue;
+                        }
                         let cname = format!("kd_{}_{}", s.name, m.name);
                         em.emit_func_named(m, &cname);
                         em.blank();
@@ -11302,5 +11604,240 @@ mod tests {
             stdout, "5\nhello\n",
             "@readFile program printed wrong output:\nstdout={stdout}\n--- C ---\n{c}"
         );
+    }
+
+    // -- dead-function elimination (v0.153, SPEC §43) -------------------------
+
+    /// Lower real source through the full front-end (lex → parse → sema →
+    /// emit) and return the generated C. The §43 tests use source strings
+    /// rather than the AST fixtures above because liveness interacts with
+    /// sema's struct table and instantiation recording, which only the real
+    /// pipeline populates.
+    fn c_of(src: &str, mode: EmitMode) -> String {
+        crate::compile_to_c(src, mode).expect("§43 test source should compile")
+    }
+
+    /// §43.1(a): an uncalled free function is omitted entirely — no forward
+    /// declaration and no definition — while the called one stays.
+    #[test]
+    fn dce_drops_uncalled_free_fn() {
+        let src = r#"
+fn used() i32 { return 1; }
+fn unused() i32 { return 2; }
+pub fn main() void { print(used()); }
+"#;
+        let out = c_of(src, EmitMode::Program);
+        assert!(out.contains("kd_used"), "live fn missing:\n{out}");
+        assert!(
+            !out.contains("kd_unused"),
+            "dead fn must be fully omitted (decl + def):\n{out}"
+        );
+    }
+
+    /// §43.1(b): liveness is transitive — `main → f → g` all kept, an
+    /// unrelated `h` dropped.
+    #[test]
+    fn dce_transitive_keeps_chain_drops_unrelated() {
+        let src = r#"
+fn g() i32 { return 7; }
+fn f() i32 { return g(); }
+fn h() i32 { return 9; }
+pub fn main() void { print(f()); }
+"#;
+        let out = c_of(src, EmitMode::Program);
+        assert!(out.contains("kd_f("), "f (called by main) missing:\n{out}");
+        assert!(out.contains("kd_g("), "g (called by f) missing:\n{out}");
+        assert!(!out.contains("kd_h"), "unrelated h must be dropped:\n{out}");
+    }
+
+    /// §43.1(c): roots are per-mode — a function called only from a `test`
+    /// block is live in Test mode (test bodies are roots) and dead in Program
+    /// mode (only `main`'s call graph is).
+    #[test]
+    fn dce_test_mode_keeps_test_only_fn_program_mode_drops_it() {
+        let src = r#"
+fn helper() i32 { return 3; }
+pub fn main() void { print(0); }
+test "uses helper" { expect(helper() == 3); }
+"#;
+        let test_c = c_of(src, EmitMode::Test);
+        assert!(
+            test_c.contains("kd_helper"),
+            "test-only fn must be kept in Test mode:\n{test_c}"
+        );
+        let prog_c = c_of(src, EmitMode::Program);
+        assert!(
+            !prog_c.contains("kd_helper"),
+            "test-only fn must be dropped in Program mode:\n{prog_c}"
+        );
+        assert!(
+            prog_c.contains("kd_main"),
+            "main (the root) must always emit:\n{prog_c}"
+        );
+    }
+
+    /// §43.1(d): a struct method nobody calls is omitted (no decl, no def);
+    /// the called method and the struct's typedef are untouched.
+    #[test]
+    fn dce_drops_uncalled_struct_method_keeps_typedef() {
+        let src = r#"
+const Point = struct {
+    x: i32,
+
+    pub fn get(self: Point) i32 { return self.x; }
+
+    pub fn dead(self: Point) i32 { return self.x * 2; }
+};
+pub fn main() void {
+    var p: Point = Point{ .x = 4 };
+    print(p.get());
+}
+"#;
+        let out = c_of(src, EmitMode::Program);
+        assert!(out.contains("kd_Point_get"), "live method missing:\n{out}");
+        assert!(
+            !out.contains("kd_Point_dead"),
+            "dead method must be fully omitted:\n{out}"
+        );
+        // §43.1: typedefs are unchanged by this version.
+        assert!(
+            out.contains("kd_struct_Point"),
+            "struct typedef must survive method DCE:\n{out}"
+        );
+    }
+
+    /// §43.1(e): method liveness is name-level and receiver-agnostic — when
+    /// two structs both declare `m` and only one receiver is used, BOTH
+    /// `kd_*_m` emit. Pins the deliberate over-approximation (per-struct
+    /// precision is a §43.3 deferral).
+    #[test]
+    fn dce_method_liveness_is_name_level_across_structs() {
+        let src = r#"
+const A = struct {
+    x: i32,
+
+    pub fn m(self: A) i32 { return self.x; }
+};
+const B = struct {
+    y: i32,
+
+    pub fn m(self: B) i32 { return self.y + 1; }
+};
+pub fn main() void {
+    var a: A = A{ .x = 1 };
+    print(a.m());
+}
+"#;
+        let out = c_of(src, EmitMode::Program);
+        assert!(out.contains("kd_A_m"), "used receiver's m missing:\n{out}");
+        assert!(
+            out.contains("kd_B_m"),
+            "name-level liveness must keep the other struct's m too (§43.1):\n{out}"
+        );
+    }
+
+    /// §43.1(f): a generic function's body is an always-walked name source —
+    /// a free function called ONLY from it stays live even when the generic is
+    /// never instantiated (every instantiation emits, so its callees must
+    /// exist; with zero instantiations the kept callee is merely unused).
+    #[test]
+    fn dce_keeps_fn_called_only_from_uninstantiated_generic() {
+        let src = r#"
+fn helper() i32 { return 7; }
+fn gen(comptime T: type, x: T) T {
+    print(helper());
+    return x;
+}
+pub fn main() void { print(1); }
+"#;
+        let out = c_of(src, EmitMode::Program);
+        assert!(
+            out.contains("kd_helper"),
+            "callee of an (uninstantiated) generic must stay (§43.1 always-walked):\n{out}"
+        );
+        assert!(
+            !out.contains("kd_gen"),
+            "an uninstantiated generic still emits no instance:\n{out}"
+        );
+    }
+
+    /// §43.1/§43 intro: a type-constructor's methods are name sources only
+    /// when the constructor has a recorded instance — exactly the methods that
+    /// emit. Uninstantiated (the std `HashMap`-keeps-`iabs` headline shape):
+    /// the method's callee is dropped. Instantiated: every method emits, so
+    /// the callee is kept.
+    #[test]
+    fn dce_type_ctor_methods_are_name_sources_only_when_instantiated() {
+        let dead = r#"
+fn helper(x: i32) i32 { return x + 1; }
+fn Box(comptime T: type) type {
+    return struct {
+        v: T,
+
+        fn bumped(self: Self) i32 { return helper(1); }
+    };
+}
+pub fn main() void { print(2); }
+"#;
+        let out = c_of(dead, EmitMode::Program);
+        assert!(
+            !out.contains("kd_helper"),
+            "callee of an UNinstantiated ctor's method must be dropped:\n{out}"
+        );
+
+        let live = r#"
+fn helper(x: i32) i32 { return x + 1; }
+fn Box(comptime T: type) type {
+    return struct {
+        v: T,
+
+        fn bumped(self: Self) i32 { return helper(1); }
+    };
+}
+const BI = Box(i32);
+pub fn main() void {
+    var b: BI = BI{ .v = 5 };
+    print(b.v);
+}
+"#;
+        let out = c_of(live, EmitMode::Program);
+        assert!(
+            out.contains("kd_helper"),
+            "an instantiated ctor's methods all emit, so their callees must stay:\n{out}"
+        );
+        assert!(
+            out.contains("_bumped"),
+            "the instance method itself should emit:\n{out}"
+        );
+    }
+
+    /// §43.2(g): a main-only program — where everything is live — emits
+    /// byte-identical C to the hand-checked pre-v0.153 output: no regression
+    /// in the prelude, helpers, declaration order, or `main` wiring.
+    #[test]
+    fn dce_main_only_program_is_byte_identical() {
+        let src = "pub fn main() void {\n    print(42);\n}\n";
+        let out = c_of(src, EmitMode::Program);
+        let expected = "\
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+typedef struct { int _unused; } kd_allocator;
+static void kd_print(long long v) { printf(\"%lld\\n\", v); }
+static void kd_print_f64(double x) { printf(\"%g\\n\", x); }
+_Noreturn void kd_unreachable(void) { fputs(\"reached unreachable code\\n\", stderr); exit(101); }
+
+void kd_main(void);
+
+void kd_main(void) {
+    kd_print((long long)(42));
+}
+
+int main(int argc, char **argv){ (void)argc;(void)argv; kd_main(); return 0; }
+";
+        assert_eq!(out, expected, "main-only C must be byte-identical");
     }
 }

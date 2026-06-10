@@ -1530,10 +1530,16 @@ generic instantiations always were.
   Newly-live function bodies join the worklist (transitive closure).
   `@`-builtins are runtime helpers, not module functions (§35/§41), and keep
   their existing usage-driven emission.
-- **Always-walked name sources**: the bodies of *generic* functions and of
-  type-constructor methods are walked unconditionally — every recorded
-  instantiation is emitted (instantiation liveness is deferred, §43.3), so
-  anything those bodies call must stay.
+- **Always-walked name sources**: bodies that emit regardless of the
+  reachability walk contribute their called names regardless too. The body of
+  every *generic* function is walked unconditionally (even uninstantiated — a
+  deliberate over-approximation needing no instantiation bookkeeping), and a
+  type-constructor's methods are walked for every constructor with **at least
+  one recorded instance** — exactly the methods the backend emits. A
+  never-instantiated constructor emits nothing, so its methods are *not* name
+  sources: this is what keeps an `@import`ed-but-unused std container
+  pay-as-you-go (`HashMap`'s internal `iabs` use must not keep `kd_iabs` in a
+  program that never builds a `HashMap`).
 - **What is skipped**: a dead free function and a dead struct method /
   associated function are omitted from BOTH the forward-declaration pass and
   the definition pass (the two passes must agree). Everything else —
