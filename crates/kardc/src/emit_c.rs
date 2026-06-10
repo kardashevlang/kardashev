@@ -1410,9 +1410,18 @@ impl<'a> Emitter<'a> {
     /// helper, per SPEC §12.3. The struct carries an `int32_t err` (0 = success,
     /// otherwise the failing error's 1-based code) and the payload `val`;
     /// `_catch` yields the payload on success or the eager default on error.
+    ///
+    /// A **`!void`** union has no payload to carry (SPEC §12.3): its struct
+    /// holds only the `err` field (`void val` would be invalid C) and the
+    /// `_catch` helper is skipped — a `catch` over `!void` lowers lazily as
+    /// hoisted statements instead (see [`Emitter::emit_catch_void`]).
     fn emit_one_error_union(&mut self, id: u32) {
         let structs = self.structs;
         let ename = structs.error_union_c_name(id);
+        if structs.error_union_payload(id) == Type::Void {
+            self.line(&format!("typedef struct {{ int32_t err; }} {};", ename));
+            return;
+        }
         let payload_cty = self.cty_of(structs.error_union_payload(id));
         self.line(&format!(
             "typedef struct {{ int32_t err; {} val; }} {};",
@@ -2087,7 +2096,20 @@ impl<'a> Emitter<'a> {
             let pty = self.resolve_ty(&p.ty);
             scope.var_types.insert(p.name.clone(), pty);
         }
-        self.emit_block(&f.body, scope);
+        let diverged = self.emit_block(&f.body, scope);
+        // A `fn … !void` body that falls off its end returns success (SPEC
+        // §12.3) — like a `void` body, it needs no explicit `return`, so the
+        // implicit exit constructs the payload-less `{ .err = 0 }` value.
+        if !diverged {
+            if let Type::ErrorUnion(eid) = self.current_ret {
+                if self.structs.error_union_payload(eid) == Type::Void {
+                    self.line(&format!(
+                        "return (({}){{ .err = 0 }});",
+                        self.structs.error_union_c_name(eid)
+                    ));
+                }
+            }
+        }
         self.line("}");
     }
 
@@ -2993,7 +3015,19 @@ impl<'a> Emitter<'a> {
         // early-returns on error — then returns the unwrapped payload coerced
         // back to the (error-union) return type.
         let val_str: Option<String> = match value {
-            None => None,
+            // `return;` in a `fn … !void` is the success return (SPEC §12.3):
+            // construct the payload-less success value.
+            None => match ret_ty {
+                Type::ErrorUnion(eid)
+                    if self.structs.error_union_payload(eid) == Type::Void =>
+                {
+                    Some(format!(
+                        "(({}){{ .err = 0 }})",
+                        self.structs.error_union_c_name(eid)
+                    ))
+                }
+                _ => None,
+            },
             Some(Expr::Try { expr, .. }) => {
                 let payload = self.emit_try(expr);
                 Some(self.coerce_str(&payload, self.try_payload_type(expr), ret_ty))
@@ -3058,6 +3092,15 @@ impl<'a> Emitter<'a> {
         self.line(&format!("return ({}){{ .err = {}.err }};", ret_cty, temp));
         self.indent -= 1;
         self.line("}");
+        // A `!void` operand unwraps to no value (SPEC §12.3): there is no
+        // `.val` field to read, so the success "payload" is `((void)0)` —
+        // discarded at the statement position sema requires for `try`.
+        if matches!(
+            self.type_of_expr(inner),
+            Some(Type::ErrorUnion(id)) if self.structs.error_union_payload(id) == Type::Void
+        ) {
+            return "((void)0)".to_string();
+        }
         format!("{}.val", temp)
     }
 
@@ -3125,6 +3168,51 @@ impl<'a> Emitter<'a> {
         res
     }
 
+    /// Lower a `catch` over a **`!void`** operand (SPEC §12.3) — capturing or
+    /// not. There is no payload value to select (the union carries only
+    /// `err`), so both forms hoist the operand and run the (void) handler as a
+    /// statement on the error path only:
+    /// ```c
+    /// kd_err_void __kd_euN = <expr>;
+    /// if (__kd_euN.err != 0) { [int32_t kd_<name> = __kd_euN.err;] <default>; }
+    /// ```
+    /// Note the non-capturing form's handler is therefore **lazy** here (it
+    /// cannot be eager: a `void` value cannot be passed to a `_catch` helper).
+    /// Returns `((void)0)`: the result type is `void`, so a validated program
+    /// only ever discards it at a statement position.
+    fn emit_catch_void(&mut self, expr: &Expr, capture: Option<&str>, default: &Expr) -> String {
+        let n = self.catch_counter;
+        self.catch_counter += 1;
+        let eu = format!("__kd_eu{}", n);
+        // The operand's own error-union C type (fall back to the enclosing
+        // function's, as in `emit_catch_capture` — same `{err}` layout).
+        let err_cty = match self.type_of_expr(expr) {
+            Some(t @ Type::ErrorUnion(_)) => self.cty_of(t),
+            _ => self.cty_of(self.current_ret),
+        };
+        let es = self.emit_expr(expr);
+        self.line(&format!("{} {} = {};", err_cty, eu, es));
+        self.line(&format!("if ({}.err != 0) {{", eu));
+        self.indent += 1;
+        if let Some(name) = capture {
+            // Bind the error code to `kd_<name>` (an `i32`, SPEC §36.1) for the
+            // handler statement.
+            self.line(&format!("int32_t kd_{} = {}.err;", name, eu));
+            let mut scope = Scope::plain();
+            scope.var_types.insert(name.to_string(), Type::I32);
+            self.scopes.push(scope);
+            let d = self.emit_expr(default);
+            self.line(&format!("{};", d));
+            self.scopes.pop();
+        } else {
+            let d = self.emit_expr(default);
+            self.line(&format!("{};", d));
+        }
+        self.indent -= 1;
+        self.line("}");
+        "((void)0)".to_string()
+    }
+
     /// The payload type `T` of a `try inner` (i.e. the inner `!T`'s payload),
     /// used to coerce the unwrapped value back into a wider position. Falls back
     /// to the enclosing function's payload, which `try` always matches.
@@ -3157,7 +3245,14 @@ impl<'a> Emitter<'a> {
                     raw.to_string()
                 } else {
                     let ename = self.structs.error_union_c_name(eid);
-                    format!("(({}){{ .err = 0, .val = {} }})", ename, raw)
+                    // A `!void` target has no payload field (SPEC §12.3):
+                    // evaluate the (void) source for effect, then construct
+                    // the payload-less success value via a comma expression.
+                    if self.structs.error_union_payload(eid) == Type::Void {
+                        format!("(({}), (({}){{ .err = 0 }}))", raw, ename)
+                    } else {
+                        format!("(({}){{ .err = 0, .val = {} }})", ename, raw)
+                    }
                 }
             }
             _ => raw.to_string(),
@@ -3890,6 +3985,16 @@ impl<'a> Emitter<'a> {
                 default,
                 ..
             } => {
+                // A `!void` operand has no payload value (SPEC §12.3): both
+                // forms lower as hoisted statements running the (void) handler
+                // on the error path only. See `emit_catch_void`.
+                if matches!(
+                    self.type_of_expr(expr),
+                    Some(Type::ErrorUnion(id))
+                        if self.structs.error_union_payload(id) == Type::Void
+                ) {
+                    return self.emit_catch_void(expr, capture.as_deref(), default);
+                }
                 // The **capturing** form `e catch |name| d` (v0.142, SPEC §36.2)
                 // lowers like `try`: hoist `e`, then run `d` on the error path
                 // only with the error code bound to `name`. See `emit_catch_capture`.
@@ -4283,14 +4388,35 @@ impl<'a> Emitter<'a> {
         out
     }
 
+    /// The struct id a value of type `t` exposes methods on: a `Struct`
+    /// directly, or a `*Struct` through its pointee — a pointer receiver
+    /// auto-derefs (SPEC §30.1), so e.g. a call returning `*Acc` (or a method
+    /// returning `*Self`) is a valid receiver and resolves to the pointee's
+    /// methods. Anything else has no methods.
+    fn struct_of_type(&self, t: Type) -> Option<u32> {
+        match t {
+            Type::Struct(id) => Some(id),
+            Type::Ptr(pid) => match self.ptr_pointee_any(pid) {
+                Type::Struct(id) => Some(id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The id of the struct an expression evaluates to, or `None` if it is not
     /// a struct (or cannot be determined). Used only to name the C function for
     /// a method call on a value. Resolves:
     /// - `Ident` — a struct-typed local/param recorded in the scope stack;
     /// - `Field` — the field's type within its base struct;
     /// - `StructLit` — the literal's own struct;
+    /// - `Index` — the element type of the indexed array / slice;
     /// - `Call` — the called top-level function's return type;
     /// - `MethodCall` — the invoked struct function's return type.
+    ///
+    /// A `Call` / `MethodCall` whose return type is `*Struct` (e.g. a chain
+    /// through a method returning `*Self`, SPEC §30) resolves to the pointee
+    /// struct via [`Emitter::struct_of_type`].
     fn struct_of_expr(&self, e: &Expr) -> Option<u32> {
         match e {
             Expr::Ident { name, .. } => self.lookup_var_struct(name),
@@ -4315,28 +4441,25 @@ impl<'a> Emitter<'a> {
                 }
                 self.structs.id_of(name)
             }
-            // A struct-typed array element: `a[i]` where the array's element is
-            // a struct, so `a[i].method()` resolves to the element's struct.
+            // A struct-typed element: `a[i]` / `s[i]` where the array's or
+            // slice's element is a struct, so `a[i].method()` / `s[i].method()`
+            // resolves to the element's struct. Slices interned from an alias /
+            // application element spelling already carry the resolved struct
+            // element, so all three spellings resolve here alike.
             Expr::Index { base, .. } => match self.type_of_expr(base)? {
-                Type::Array(aid) => match self.structs.array_elem(aid) {
-                    Type::Struct(sid) => Some(sid),
-                    _ => None,
-                },
+                Type::Array(aid) => self.struct_of_type(self.structs.array_elem(aid)),
+                Type::Slice(sid) => self.struct_of_type(self.structs.slice_elem(sid)),
                 _ => None,
             },
             Expr::Call { callee, args, .. } => {
                 // A generic call's struct is taken from its substituted return
                 // type (SPEC §17.2); an ordinary call's from its recorded ret.
+                // Either way a `*Struct` return resolves to its pointee (SPEC
+                // §30.1), so `pick(&a).add(9)` names the right method.
                 if let Some(gf) = self.generics.get(callee) {
-                    return match self.generic_call_ret(gf, args) {
-                        Type::Struct(id) => Some(id),
-                        _ => None,
-                    };
+                    return self.struct_of_type(self.generic_call_ret(gf, args));
                 }
-                match self.fn_ret.get(callee)? {
-                    Type::Struct(id) => Some(*id),
-                    _ => None,
-                }
+                self.struct_of_type(*self.fn_ret.get(callee)?)
             }
             Expr::MethodCall {
                 receiver, method, ..
@@ -4356,10 +4479,9 @@ impl<'a> Emitter<'a> {
                         .or_else(|| self.struct_of_expr(receiver))?,
                     _ => self.struct_of_expr(receiver)?,
                 };
-                match self.method_ret.get(&recv_sid).and_then(|m| m.get(method))? {
-                    Type::Struct(id) => Some(*id),
-                    _ => None,
-                }
+                // A method returning `*Self` / `*Struct` (SPEC §30) chains:
+                // the next call's receiver struct is the pointee.
+                self.struct_of_type(*self.method_ret.get(&recv_sid).and_then(|m| m.get(method))?)
             }
             _ => None,
         }
@@ -4679,6 +4801,13 @@ impl<'a> Emitter<'a> {
             // structurally-equal but differently-interned `!T` cannot occur.)
             if matches!(self.type_of_expr(e), Some(Type::ErrorUnion(_))) {
                 return self.emit_expr(e);
+            }
+            // A `!void` target has no payload field (SPEC §12.3): evaluate the
+            // (void) source for effect, then construct the payload-less
+            // success value via a comma expression.
+            if self.structs.error_union_payload(eid) == Type::Void {
+                let inner = self.emit_expr(e);
+                return format!("(({}), (({}){{ .err = 0 }}))", inner, ename);
             }
             // Otherwise it is a `T` value being widened to a success `!T`.
             let inner = self.emit_expr(e);
@@ -5803,6 +5932,191 @@ mod tests {
     }
 
     #[test]
+    fn pointer_receiver_call_on_call_result_passes_pointer_through() {
+        // fn pick(p: *Counter) *Counter { return p; }
+        // fn run() void { var c: Counter = Counter{.n=0}; pick(&c).inc(); }
+        // (v0.156, SPEC §30.2) A CALL-RESULT receiver of type `*Counter`
+        // resolves to the pointee struct (`kd_Counter_inc`, not the broken
+        // `kd__inc`) and the pointer passes through unchanged — no deref, no
+        // re-ref — so the mutation is real.
+        let structs = counter_table();
+        let pick = Func {
+            is_pub: false,
+            name: "pick".to_string(),
+            params: vec![ptr_param("p", "Counter")],
+            ret: ptr_ty("Counter"),
+            body: block(vec![ret(ident("p"))]),
+            span: Span::DUMMY,
+        };
+        let run = Func {
+            is_pub: false,
+            name: "run".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "c".to_string(),
+                    ty: Some(ty("Counter")),
+                    value: Expr::StructLit {
+                        name: "Counter".to_string(),
+                        fields: vec![finit("n", int(0))],
+                        span: Span::DUMMY,
+                    },
+                    span: Span::DUMMY,
+                },
+                Stmt::Expr(method_call(
+                    call("pick", vec![Expr::AddrOf {
+                        place: Box::new(ident("c")),
+                        span: Span::DUMMY,
+                    }]),
+                    "inc",
+                    vec![],
+                )),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![
+                counter_struct(vec![counter_inc()]),
+                Item::Func(pick),
+                Item::Func(run),
+            ],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_Counter_inc(kd_pick((&(kd_c))));"),
+            "call-result `*Counter` receiver must pass through:\n{out}"
+        );
+        assert!(
+            !out.contains("kd__inc"),
+            "receiver struct resolution lost on a call result:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pointer_receiver_chain_through_ptr_self_return() {
+        // fn bump(self: *Counter) *Counter { self.n += 1; return self; }
+        // fn run() void { var c: Counter = …; c.bump().bump(); }
+        // (v0.156, SPEC §30.2) The inner call auto-refs `&c`; the outer call's
+        // receiver is the inner call's `*Counter` result, passed through.
+        let structs = counter_table();
+        let bump = Func {
+            is_pub: true,
+            name: "bump".to_string(),
+            params: vec![ptr_param("self", "Counter")],
+            ret: ptr_ty("Counter"),
+            body: block(vec![
+                Stmt::FieldAssign {
+                    place: field(ident("self"), "n"),
+                    op: Some(BinOp::Add),
+                    value: int(1),
+                    span: Span::DUMMY,
+                },
+                ret(ident("self")),
+            ]),
+            span: Span::DUMMY,
+        };
+        let run = Func {
+            is_pub: false,
+            name: "run".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "c".to_string(),
+                    ty: Some(ty("Counter")),
+                    value: Expr::StructLit {
+                        name: "Counter".to_string(),
+                        fields: vec![finit("n", int(0))],
+                        span: Span::DUMMY,
+                    },
+                    span: Span::DUMMY,
+                },
+                Stmt::Expr(method_call(
+                    method_call(ident("c"), "bump", vec![]),
+                    "bump",
+                    vec![],
+                )),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![counter_struct(vec![bump]), Item::Func(run)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_Counter_bump(kd_Counter_bump((&(kd_c))));"),
+            "`*Self`-returning chain must auto-ref once then pass through:\n{out}"
+        );
+        assert!(!out.contains("kd__bump"), "chain receiver lost:\n{out}");
+    }
+
+    #[test]
+    fn slice_element_receiver_resolves_value_and_pointer_methods() {
+        // fn peek(s: []Counter) i32 { return s[0].get(); }   — value receiver
+        // fn poke(s: []Counter) void { s[0].inc(); }          — pointer receiver
+        // (v0.156, SPEC §10/§30.2) A SLICE-indexed receiver resolves the
+        // element struct like an array element: the value receiver reads via
+        // `_get` (a copy), the pointer receiver auto-refs the `_at` element
+        // pointer so the mutation lands in the backing storage.
+        let mut structs = counter_table();
+        let sid = structs.id_of("Counter").unwrap();
+        structs.intern_slice(Type::Struct(sid));
+        let slice_param = |name: &str| Param {
+            name: name.to_string(),
+            ty: slice_ty("Counter"),
+            is_comptime: false,
+            span: Span::DUMMY,
+        };
+        let peek = Func {
+            is_pub: false,
+            name: "peek".to_string(),
+            params: vec![slice_param("s")],
+            ret: ty("i32"),
+            body: block(vec![ret(method_call(
+                index(ident("s"), int(0)),
+                "get",
+                vec![],
+            ))]),
+            span: Span::DUMMY,
+        };
+        let poke = Func {
+            is_pub: false,
+            name: "poke".to_string(),
+            params: vec![slice_param("s")],
+            ret: ty("void"),
+            body: block(vec![Stmt::Expr(method_call(
+                index(ident("s"), int(0)),
+                "inc",
+                vec![],
+            ))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![
+                counter_struct(vec![counter_get(), counter_inc()]),
+                Item::Func(peek),
+                Item::Func(poke),
+            ],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("kd_Counter_get(kd_slice_struct_Counter_get(kd_s, 0))"),
+            "value receiver on a slice element must read via `_get`:\n{out}"
+        );
+        assert!(
+            out.contains("kd_Counter_inc((kd_slice_struct_Counter_at(kd_s, 0)));"),
+            "pointer receiver on a slice element must auto-ref via `_at`:\n{out}"
+        );
+        assert!(
+            !out.contains("kd__get") && !out.contains("kd__inc"),
+            "slice-element receiver struct resolution lost:\n{out}"
+        );
+    }
+
+    #[test]
     fn field_assign_and_read_through_pointer_param() {
         // fn bump(p: *Counter) void { p.n = 5; }   (a general `*Struct` param,
         // not just `self`) — both the write and a later read auto-deref through
@@ -6292,6 +6606,145 @@ mod tests {
                 "static inline int32_t kd_err_int32_t_catch(kd_err_int32_t e, int32_t d) { return e.err == 0 ? e.val : d; }"
             ),
             "catch helper missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn void_payload_error_union_typedef_is_payloadless() {
+        // (v0.156, SPEC §12.3) A `!void` union has no payload: the typedef
+        // carries only `err` (`void val` would be invalid C) and the `_catch`
+        // helper is skipped (a `void` cannot be a helper parameter/result).
+        let mut structs = StructTable::new();
+        structs.intern_error_union(Type::Void);
+        let m = Module { items: vec![] };
+        let out = emit(&m, &structs, EmitMode::Program);
+        assert!(
+            out.contains("typedef struct { int32_t err; } kd_err_void;"),
+            "`!void` typedef missing/wrong:\n{out}"
+        );
+        assert!(!out.contains("void val"), "invalid `void val` field:\n{out}");
+        assert!(
+            !out.contains("kd_err_void_catch"),
+            "`!void` must not emit a `_catch` helper:\n{out}"
+        );
+    }
+
+    #[test]
+    fn void_payload_fn_forms_lower_payloadless() {
+        // fn f() !void { return; }                       — bare success return
+        // fn h() !void { return error.Big; }             — failure return
+        // fn g() !void { try f(); try h(); print(1); }   — try stmts + fall-off-end
+        // fn main() void { g() catch print(7); g() catch |e| print(e); }
+        // (`h` must be CALLED — the §43 liveness pass drops dead functions.)
+        // (v0.156, SPEC §12.1/§12.3) Every lowering constructs / reads only the
+        // `err` field; the `catch` forms hoist and run their handler lazily.
+        let mut structs = StructTable::new();
+        structs.intern_error_union(Type::Void);
+        structs.intern_error("Big"); // 1-based code 1
+        let f = Func {
+            is_pub: false,
+            name: "f".to_string(),
+            params: vec![],
+            ret: err_ty("void"),
+            body: block(vec![Stmt::Return {
+                value: None,
+                span: Span::DUMMY,
+            }]),
+            span: Span::DUMMY,
+        };
+        let h = Func {
+            is_pub: false,
+            name: "h".to_string(),
+            params: vec![],
+            ret: err_ty("void"),
+            body: block(vec![ret(error_lit("Big"))]),
+            span: Span::DUMMY,
+        };
+        let g = Func {
+            is_pub: false,
+            name: "g".to_string(),
+            params: vec![],
+            ret: err_ty("void"),
+            body: block(vec![
+                Stmt::Expr(try_expr(call("f", vec![]))),
+                Stmt::Expr(try_expr(call("h", vec![]))),
+                print(int(1)),
+            ]),
+            span: Span::DUMMY,
+        };
+        let mn = Func {
+            is_pub: true,
+            name: "main".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Expr(Expr::Catch {
+                    expr: Box::new(call("g", vec![])),
+                    capture: None,
+                    default: Box::new(call("print", vec![int(7)])),
+                    span: Span::DUMMY,
+                }),
+                Stmt::Expr(Expr::Catch {
+                    expr: Box::new(call("g", vec![])),
+                    capture: Some("e".to_string()),
+                    default: Box::new(call("print", vec![ident("e")])),
+                    span: Span::DUMMY,
+                }),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(f), Item::Func(h), Item::Func(g), Item::Func(mn)],
+        };
+        let out = emit(&m, &structs, EmitMode::Program);
+        // `return;` constructs the payload-less success value.
+        assert!(
+            out.contains("kd_err_void kd_f(void)"),
+            "`!void` return type wrong:\n{out}"
+        );
+        assert!(
+            out.contains("return (((kd_err_void){ .err = 0 }));"),
+            "bare `return;` must construct `{{ .err = 0 }}`:\n{out}"
+        );
+        // `return error.Big;` carries the code, no `.val`.
+        assert!(
+            out.contains("return (((kd_err_void){ .err = 1 }));"),
+            "error return must carry only the code:\n{out}"
+        );
+        // `try f();` hoists, propagates on error, and unwraps to no value.
+        assert!(
+            out.contains("kd_err_void __kd_try0 = kd_f();"),
+            "try hoist missing:\n{out}"
+        );
+        assert!(
+            out.contains("(void)(((void)0));"),
+            "void try payload must be discarded:\n{out}"
+        );
+        // Fall-off-end of `g` is the implicit success return.
+        assert!(
+            out.contains("return ((kd_err_void){ .err = 0 });"),
+            "fall-off-end of a `!void` fn must return success:\n{out}"
+        );
+        // Both catch forms hoist and run the handler on the error path only.
+        assert!(
+            out.contains("kd_err_void __kd_eu0 = kd_g();"),
+            "catch hoist missing:\n{out}"
+        );
+        assert!(
+            out.contains("if (__kd_eu0.err != 0) {"),
+            "catch error test missing:\n{out}"
+        );
+        assert!(
+            out.contains("kd_print((long long)(7));"),
+            "lazy handler missing:\n{out}"
+        );
+        assert!(
+            out.contains("int32_t kd_e = __kd_eu1.err;"),
+            "capture binding missing:\n{out}"
+        );
+        assert!(
+            !out.contains(".val"),
+            "a `!void` program must never touch a `.val` field:\n{out}"
         );
     }
 
