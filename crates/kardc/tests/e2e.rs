@@ -1367,3 +1367,143 @@ pub fn main() i32 {
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "60\n42\n");
 }
+
+// -- v0.158 file output + program arguments (SPEC §44) -----------------------
+
+/// Like [`build_and_capture`], but runs the executable with `args` — for the
+/// `@argc`/`@arg` builtins (SPEC §44), whose behaviour depends on the command
+/// line.
+fn build_and_capture_with_args(src: &str, args: &[&str]) -> (i32, String) {
+    let c = kardc::compile_to_c(src, EmitMode::Program).unwrap_or_else(|d| {
+        panic!(
+            "compile failed:\n{}",
+            kardc::diag::render_all(&d, "test.ks", src)
+        )
+    });
+    let exe = temp_path("exe");
+    kardc::backend::cc_build(&c, &exe, &kardc::backend::BuildOptions::default())
+        .expect("cc should build the emitted program");
+    let output = Command::new(&exe)
+        .args(args)
+        .output()
+        .expect("should run the program");
+    let _ = std::fs::remove_file(&exe);
+    let code = output.status.code().unwrap_or(-1);
+    (code, String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[test]
+fn write_file_then_read_file_round_trips() {
+    // `@writeFile` (create/truncate) then `@readFile` of the same path gets
+    // the exact bytes back. The temp path is unique per run and embedded into
+    // the program source; the Rust side cleans the file up afterwards (there
+    // is no `@deleteFile` — SPEC §44.3).
+    let path = temp_path("v158_rt").with_extension("tmp");
+    let path_str = path.to_str().expect("temp path should be UTF-8");
+    // Pre-existing content must be truncated away — seed some.
+    std::fs::write(&path, b"stale leftover bytes").expect("should seed the temp file");
+    let src = format!(
+        r#"
+pub fn main() i32 {{
+    var a: Allocator = c_allocator();
+    if (@writeFile("{p}", "hello v158")) {{ print(1); }} else {{ print(0); }}
+    var back: []u8 = @readFile(a, "{p}");
+    print(back.len);
+    print(back);
+    free(a, back);
+    return 0;
+}}
+"#,
+        p = path_str
+    );
+    let (code, out) = build_and_capture(&src, EmitMode::Program);
+    let on_disk = std::fs::read(&path);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0);
+    assert_eq!(out, "1\n10\nhello v158\n");
+    // And the bytes really are on disk (truncated, not appended).
+    assert_eq!(on_disk.expect("the written file should exist"), b"hello v158");
+}
+
+#[test]
+fn append_file_concatenates_and_creates() {
+    // write "ab" + append "cd" → "abcd"; appending to a MISSING path creates
+    // the file (SPEC §44).
+    let path = temp_path("v158_app").with_extension("tmp");
+    let fresh = temp_path("v158_fresh").with_extension("tmp");
+    let (p, f) = (
+        path.to_str().expect("UTF-8").to_string(),
+        fresh.to_str().expect("UTF-8").to_string(),
+    );
+    let src = format!(
+        r#"
+pub fn main() i32 {{
+    var a: Allocator = c_allocator();
+    if (@writeFile("{p}", "ab")) {{ print(1); }} else {{ print(0); }}
+    if (@appendFile("{p}", "cd")) {{ print(1); }} else {{ print(0); }}
+    var back: []u8 = @readFile(a, "{p}");
+    print(back);                       // abcd
+    free(a, back);
+    if (@appendFile("{f}", "made")) {{ print(1); }} else {{ print(0); }}
+    var made: []u8 = @readFile(a, "{f}");
+    print(made);                       // made — append created the file
+    free(a, made);
+    return 0;
+}}
+"#,
+        p = p,
+        f = f
+    );
+    let (code, out) = build_and_capture(&src, EmitMode::Program);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&fresh);
+    assert_eq!(code, 0);
+    assert_eq!(out, "1\n1\nabcd\n1\nmade\n");
+}
+
+#[test]
+fn write_file_failure_yields_false() {
+    // An unopenable path — a directory that does not exist, or an empty path
+    // — makes `@writeFile`/`@appendFile` yield `false` (no error channel,
+    // SPEC §44): the program carries on.
+    let src = r#"
+pub fn main() i32 {
+    if (@writeFile("/nonexistent_kardc_e2e_dir_v158/x.txt", "d")) { print(1); } else { print(0); }
+    if (@appendFile("/nonexistent_kardc_e2e_dir_v158/x.txt", "d")) { print(1); } else { print(0); }
+    if (@writeFile("", "d")) { print(1); } else { print(0); }
+    print(7);
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "0\n0\n0\n7\n");
+}
+
+#[test]
+fn argc_and_arg_echo_the_command_line() {
+    // Run the compiled program with two fixed arguments: `@argc()` counts
+    // argv[0] too, `@arg(a, i)` copies each argument, and an out-of-range
+    // index (too large or negative) yields an empty slice (SPEC §44).
+    let src = r#"
+pub fn main() i32 {
+    var a: Allocator = c_allocator();
+    print(@argc());                       // 3
+    var zero: []u8 = @arg(a, 0);
+    if (zero.len > 0) { print(1); } else { print(0); }   // argv[0] always exists
+    free(a, zero);
+    var i: i64 = 1;
+    while (i < @argc()) : (i = i + 1) {
+        var s: []u8 = @arg(a, i);
+        print(s);
+        free(a, s);
+    }
+    print(@arg(a, 99).len);               // 0 — out of range
+    print(@arg(a, 0 - 1).len);            // 0 — negative
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture_with_args(src, &["hello", "world"]);
+    assert_eq!(code, 0);
+    assert_eq!(out, "3\n1\nhello\nworld\n0\n0\n");
+}
