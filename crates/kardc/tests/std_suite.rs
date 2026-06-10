@@ -56,11 +56,14 @@ fn std_suites_all_pass() {
         kardc::backend::cc_build(&c, &exe, &opts).expect("cc should build the test harness");
         let output = Command::new(&exe).output().expect("should run the harness");
         let _ = std::fs::remove_file(&exe);
+        // The harness prints its ok/FAIL lines to STDERR (per-test status) and
+        // any test-body `print` output to STDOUT — show both on failure.
         assert_eq!(
             output.status.code(),
             Some(0),
-            "std suite {} had failing tests:\n{}",
+            "std suite {} had failing tests:\n--- stderr ---\n{}\n--- stdout ---\n{}",
             f.display(),
+            String::from_utf8_lossy(&output.stderr),
             String::from_utf8_lossy(&output.stdout)
         );
     }

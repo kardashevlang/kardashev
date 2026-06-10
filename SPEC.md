@@ -1391,6 +1391,12 @@ existing binary lowering (the operands are `double`). `print(x: f64)` lowers to 
 `double` print helper (`kd_print_f64`, `printf("%g\n", …)`-style). `@as` reuses
 the §33 cast lowering (`((double)(e))` / `((int32_t)(e))`).
 
+### 38.x Cross-platform determinism (v0.157)
+The driver passes `-ffp-contract=off` to the C compiler (§5): `a * b + c` is
+never fused into a single-rounding FMA, so every `f64` computation rounds
+identically on every platform (Apple clang contracts by default — the same
+program printed a different 17th digit on macOS before this rule).
+
 ## 39. `switch` ranges + multi-label arms (v0.146)
 
 A `switch` arm may already list **several labels** (`1, 2, 3 => …`;
