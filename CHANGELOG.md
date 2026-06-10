@@ -29,7 +29,7 @@ compiler. A parallel Rust runner (`spec_suite.rs`, directive format
 `//SPEC://EXIT://OUT://STDIN://ERR`) runs the whole corpus in ~1.4s
 (thread pool × `-O0` dev builds).
 
-The corpus immediately earned its keep — **3 real bugs found, all fixed**:
+The corpus immediately earned its keep — **4 real bugs found, all fixed** (the fourth by macOS CI running it under clang):
 
 ### Fixed
 - **`Stmt::Block` emitted no C braces**: sibling bare blocks redeclaring a
@@ -46,9 +46,15 @@ The corpus immediately earned its keep — **3 real bugs found, all fixed**:
   behaviour as `_get`) carry every index-place shape: nested chains,
   compound `arr[i].f += e` (place read once, §27.3), write-through-`&`.
 
+- **Zero-length arrays lowered non-portably**: `[0]T` emitted `T data[0]`
+  (a GNU extension) with a `{0}` initializer (invalid C11 for an empty
+  aggregate) — gcc accepted, clang rejected. The typedef now reserves one
+  unreachable storage element; `.len` stays 0, bounds checks still panic.
+
 ### Added
 - 311-file corpus + runner; 4 new emit_c unit pins (1013 unit + 48 e2e +
-  std suite all green). LOC 58,043 → ~64,500.
+  std suite all green, corpus verified under both gcc and clang).
+  LOC 58,043 → ~64,500.
 
 ## [0.154.0] — std wave 1: algorithms & data structures
 
