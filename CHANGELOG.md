@@ -18,6 +18,28 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.159.0] — Self-hosting stage 1: the lexer, in kardashev
+
+The self-host arc begins. `selfhost/lexer.ks` is a **rule-for-rule kardashev
+replica of the Rust lexer** — 73 token kinds (29 keywords, 38 operators with
+maximal munch), span-only `Token{kind, off, len}`, sticky first-error
+`TK_ERROR` carrying E0001/E0002, the exact i64 overflow bound via negative
+accumulation, UTF-8 stepping — written entirely in the language it lexes.
+
+### Added
+- `selfhost/lexer.ks` (importable module, every pub item documented) +
+  `selfhost/lexdump.ks` (token-dump driver: `<KINDNAME> <off> <len>` lines,
+  `ERROR <code> <pos>` for bad input — built on v0.158's `@arg`/`@readFile`).
+- **Differential testing**: a Rust integration test builds `lexdump` once and
+  compares its output **byte-for-byte against the Rust lexer's dump over all
+  697 repo sources** (the whole spec corpus incl. fixtures, std suites,
+  examples, std.ks, selfhost itself) — **120,010 token lines**, plus 17
+  targeted error/edge inputs, plus a 14-block in-language suite
+  (`tests/selfhost/lexer_suite.ks`). A deliberate mutation (disabling `<=`
+  maximal munch) was caught by all three layers before being reverted.
+- 1104 Rust-side tests green; the uncapped differential corpus runs in ~1s
+  release / ~20s debug.
+
 ## [0.158.0] — File output + argv (`@writeFile` / `@appendFile` / `@argc` / `@arg`)
 
 The self-hosting prerequisites (SPEC §44): programs can now write files and
