@@ -18,7 +18,45 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
-## [0.155.0] — Conformance suite A (SPEC §1–§21) + 3 bugs it found
+## [0.156.0] — Conformance suite B (§22–§42 + interactions) + 5 more bugs + `!void`
+
+Wave B completes the corpus: **606 conformance programs** (was 311) across 25
+section directories plus two feature-interaction matrices and `_`-prefixed
+multi-file import fixtures. The whole corpus runs in ~2.9s and is verified
+under gcc **and** clang. Five more real bugs found and fixed (9 total across
+the two waves):
+
+### Fixed
+- **Narrow `~`/`<<` leaked C integer promotion** when consumed directly
+  (`~(u8 170)` printed −171, not 85). Results now truncate back to the
+  operand's type (SPEC §28.4, two's-complement like `@as`).
+- **Slice/array/optional/error-union/union comparison operands** slipped
+  sema and died in cc; now `E0110`.
+- **Overlapping integer `switch` ranges/labels** lowered to overlapping GNU
+  case ranges (raw cc error); `check_int_switch` now detects interval
+  overlap → `E0211`.
+- **Call-result method receivers** (`pick(&a).add(9)`, chains off `*Self`
+  returns) resolved to an empty struct name (`kd__add`) and mis-passed the
+  receiver by value; `struct_of_type` routes Call/MethodCall receivers
+  through return types.
+- **Slice-element method receivers** (`s[i].get()`) had the same empty-name
+  failure; the Index arm now handles slices (value receivers via `_get`,
+  pointer receivers via the v0.155 `_at` element pointers).
+
+### Added
+- **`!void` error unions** (real support, not a rejection): payload-less
+  `{ int32_t err; }` lowering, `try f();` statements, bare `return;` as the
+  success return, lazy `catch` over `!void` (documented §12.1 exception —
+  eager is unimplementable for void), named-set `E!void`. SPEC §12 updated.
+- **`E0233`**: taking `&` of (or calling a pointer-receiver method on) a
+  place rooted in a `const` binding is now rejected, mirroring the
+  assignment rules; immutable params stay addressable. SPEC §15.1/§30.2.
+- 295 wave-B corpus files (§22 modules with import fixtures, §23 strings,
+  §24–§26 comptime values + generic structs, §27–§29, §30–§33, §34–§37,
+  §38–§41, §42 + interactions). 1026 unit + 48 e2e + 606-file corpus +
+  std suite green.
+
+## [0.155.0] — Conformance suite A (SPEC §1–§21) + 4 bugs it found
 
 `tests/spec/` is born: **311 directive-driven conformance programs** across 15
 section directories pin the observable rules of SPEC §1–§21 — the full
