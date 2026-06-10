@@ -18,6 +18,41 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.154.0] — std wave 1: algorithms & data structures
+
+The embedded `std` grows 246 → 1,136 lines of in-language code (all
+pay-as-you-go under v0.153 DCE — an unused module costs a program nothing but
+typedef text). Six new modules, every public item `///`-documented
+(`kard doc` renders 42 sections):
+
+### Added
+- **math64**: `imin64`/`imax64`/`iabs64`/`sign`/`clamp64`, `gcd`/`lcm`,
+  `ipow` (squaring), `isqrt` (Newton, exact at i64 extremes),
+  `div_floor`/`mod_floor` (floor semantics vs C truncation) — all
+  overflow-safe by construction, documented preconditions.
+- **slices**: generic `sort` (quicksort + insertion below 17, median-of-3),
+  `reverse`, `binary_search`, `index_of_elem`, `contains`, `fill`,
+  `copy_into`, `is_sorted`, plus i64 `sum64`/`min_in`/`max_in`.
+- **Deque(T)**: growable ring buffer — `push_front`/`push_back`/
+  `pop_front`/`pop_back`/`front`/`back`/`len`/`is_empty`, doubling growth
+  with ring re-linearisation.
+- **BitSet**: heap-backed dynamic bit set over `[]u64` — `set`/`clear`/
+  `toggle`/`has` (range-guarded), Kernighan `count`, `union_with`/
+  `intersect_with`/`difference_with`, `clear_all`/`is_empty`/`capacity`.
+- **text**: `StrBuilder` (doubling buffer, `append`/`append_byte`/
+  `append_i64`/`build`), `parse_i64` (`?i64`, overflow-safe, exact i64
+  min/max), `fmt_i64` (i64-min-safe), `fmt_u64_hex`, `str_ends_with`/
+  `str_last_index_of`/`str_count`.
+- **rng**: deterministic xorshift64* `Rng` (`init`/`next_u64`/`next_below`/
+  `next_i64_in`, pinned output vectors) + generic Fisher–Yates `shuffle`.
+- **In-language test corpus**: `tests/std/*.ks` — 6 suites, 73 test blocks
+  of hand-pinned expects (boundaries, i64 extremes, wraparound/growth
+  scripts, property-style sweeps), driven by a new Rust integration test
+  (`std_suite.rs`) through the file-based pipeline in Test mode at `-O0`.
+- 1009 unit + 48 e2e + 1 suite-driver test, all green; each module was
+  developed and verified independently (6 parallel agents, fragment files,
+  zero name collisions by construction).
+
 ## [0.153.0] — Dead-function elimination
 
 Opens **Arc 5** (scale: conformance, std breadth, self-hosting). Functions are
