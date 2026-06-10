@@ -478,6 +478,11 @@ Errors are values. v0.115 uses a single **implicit global error set** (an
 - Type `!T`: `TypeExpr.error_union = true` (e.g. `fn f() !i32`). Resolves to
   `Type::ErrorUnion(StructTable::intern_error_union(payload))`. (Not combined
   with `?` in v0.115.)
+- **`!void`** (a `void` payload) is allowed (v0.156): success carries no
+  value. A `!void` function returns success via a bare `return;` or by falling
+  off the end of its body (like a `void` function); `return error.X;` is the
+  failure form and `return g();` (for `g() !void`) passes the union through.
+  A bare `return;` stays an error (`E0110`) for any payload-carrying `!T`.
 - `error.Name` — `Expr::ErrorLit{name}`; registers `Name` via
   `StructTable::intern_error` (1-based code; 0 = "no error"). Coerces to any
   `!T`.
@@ -488,7 +493,10 @@ Errors are values. v0.115 uses a single **implicit global error set** (an
   otherwise it yields the payload.
 - `expr catch default` — `Expr::Catch{expr,default}` (parses at the lowest
   precedence, beside `orelse`). `expr` must be `!T` (`E0192`); `default` is a
-  `T`; result `T`; `default` is evaluated eagerly in v0.115.
+  `T`; result `T`; `default` is evaluated eagerly in v0.115. **Exception
+  (v0.156):** over a `!void` operand the handler is necessarily **lazy** — it
+  runs as a statement on the error path only (there is no payload value to
+  select eagerly, and a `void` handler exists for its effect).
 
 ### 12.2 Coercion
 `T → !T` (success) and `error.X → !T` (failure) at typed positions (initializer
@@ -513,6 +521,17 @@ if (__kd_tryN.err != 0) { <flush active defers>; return (<RET>){ .err = __kd_try
 /* then: bind/return/use __kd_tryN.val */
 ```
 `cty(Type::ErrorUnion(id))` → `StructTable::error_union_c_name(id)`.
+
+A **`!void`** union lowers **payload-less** (v0.156): `typedef struct {
+int32_t err; } kd_err_void;` — no `val` field (`void val` is invalid C) and no
+`_catch` helper. Its lowerings special-case the missing payload: `try f();`
+hoists and propagates as above but unwraps to no value (`((void)0)`,
+discarded); `e catch handler` / `e catch |err| handler` hoist `e` once and run
+the (void) handler as a statement inside `if (eu.err != 0) { … }` — the
+capture binds `int32_t kd_<err>` exactly as in §36; success construction
+writes only `{ .err = 0 }` (a bare `return;`, fall-through off the body end,
+and a `void` expression coerced to `!void` — the latter via a comma
+expression evaluating the source for effect).
 
 ### 12.4 Deferred (honest)
 `errdefer`, `catch |e|` capture, explicit named error sets `error{ … }`, and
@@ -602,6 +621,13 @@ programmer's responsibility (no borrow checking), as for Zig's raw pointers.
 - Type `*T`: `TypeExpr.pointer = true` → `Type::Ptr(intern_ptr(T))`.
 - `&place` → `Expr::AddrOf{place}`: `place` must be an lvalue (a `var`, a field
   chain, an index, or a deref) (`E0231`); result `*T`.
+- The place must **not** be rooted in a `const` binding's own storage
+  (`E0233`, v0.156): there are no const pointers, so the `*T` would let the
+  `const` be mutated. The rule mirrors assignment (§9.4/§14.2): a hop through
+  a pointer (a deref, a `*Struct` field base) or through a **slice** index
+  reaches storage the binding does not own, so such places stay addressable
+  even under a `const` root; immutable **parameters** also remain addressable
+  (the pointer aliases the parameter's local copy).
 - `p.*` → `Expr::Deref{expr}`: `expr` must be `*T` (`E0230`); result `T`.
 - `p.* = e` reuses `Stmt::FieldAssign` with a `Deref` place; `e` coerces to `T`.
 - C: `cty(Ptr) = "<T cty>*"`; `&place` → `(&(<place>))`; `p.*` → `(*(<p>))`;
@@ -1101,6 +1127,15 @@ Direct C lowering: `a & b`, `a | b`, `a ^ b`, `a << b`, `a >> b`, `~a` (the
 operands keep their C integer types). `const_eval` folds all of them (and `~`)
 on integer constants, so `const MASK = (1 << 8) - 1;` works.
 
+### 28.4 Width fidelity on narrow operands (v0.156)
+`~x` and `x << n` yield the **operand's** type (§28.2) even where C's integer
+promotion would widen the intermediate: for 8/16-bit operands the backend
+truncates the result back to the operand's C type (two's-complement, exactly
+the `@as` narrowing of §33), so `~(u8 170)` is `85` and `(u8 200) << 1` is
+`144` whether stored or consumed directly. 32/64-bit operands never promote.
+`>>` and the masking operators cannot exceed the operand width and keep the
+bare lowering. (Found by the v0.156 conformance corpus.)
+
 ## 29. `for` loops over arrays & slices (v0.133)
 
 `for (iter) |elem| { … }` iterates the elements of an array (`[N]T`) or slice
@@ -1146,15 +1181,25 @@ compound `p.field += e`) writes **through** the pointer. (General, not just for
 ### 30.2 Auto-ref method calls
 A method call `obj.method(args)` whose method has a **pointer receiver** passes
 `&obj` — so `obj` must be an addressable lvalue (a `var`, field, or index; else
-an error, as for `&`). A value-receiver call passes `obj` by value (unchanged).
-An associated call `Type.method(args)` (no receiver value) passes its explicit
-arguments — including an explicit `self: *Self`/`Self` — unchanged.
+an error, as for `&`), and — exactly as for `&` (§15.1, v0.156) — must not be
+rooted in a **`const` binding's** own storage (`E0233`: the call would mutate a
+`const`; declare it `var`). A receiver that is **already a pointer** is passed
+through with no addressability requirement — whether a `*Struct` local,
+parameter, or **call result** (`pick(&a).add(9)`, and chains through a method
+returning `*Self`: `a.add(5).add(7)`). A value-receiver call passes `obj` by
+value (unchanged). An associated call `Type.method(args)` (no receiver value)
+passes its explicit arguments — including an explicit `self: *Self`/`Self` —
+unchanged.
 
 ### 30.3 Backend (`emit_c`)
 A pointer-receiver method is `kd_<Struct>_<m>(<Struct>* self, …)`; inside it
 `self.field` lowers to `(*self).kd_field`. The call lowers to
 `kd_<Struct>_<m>(&(<obj>), …)`. Field read/assign on any `*Struct` lowers through
-`(*p)`. Mutations are real — they update the caller's struct.
+`(*p)`. Mutations are real — they update the caller's struct. An **indexed
+receiver** — `a[i].m()` / `s[i].m()`, array and slice alike — auto-refs the
+bounds-checked `_at` element pointer (§14.3/§15.2), so the mutation lands in
+the real element / the slice's backing storage; a value-receiver call on an
+element reads a copy via `_get` (unchanged).
 
 ## 31. Multiple type parameters (v0.135)
 

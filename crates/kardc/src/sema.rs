@@ -64,6 +64,9 @@
 //! - `E0231` — `&` (address-of) applied to a non-lvalue expression.
 //! - `E0232` — slicing (`a[lo..hi]`) a value that is neither a (addressable)
 //!   array nor a slice.
+//! - `E0233` — `&` of (or a pointer-receiver method call on) a place rooted in
+//!   a `const` binding — the resulting `*T` would mutate a `const` (SPEC
+//!   §15.1 / §30.2).
 //! - `E0241` — `alloc`'s second argument is not an identifier naming a type
 //!   (a builtin, struct or enum) (SPEC §16.1).
 //! - `E0242` — `free`'s second argument is not a slice (`[]T`) (SPEC §16.1).
@@ -145,9 +148,25 @@ struct StructFn {
     is_ptr_receiver: bool,
 }
 
-/// A lexical binding: its type and whether it is immutable (a `const` or a
-/// parameter — only `var` locals may be assigned to).
-type Binding = (Type, bool);
+/// How a lexical binding may be used (SPEC §4, §15.1, §30.2):
+/// - `Var` — assignable and addressable.
+/// - `Param` — immutable (not assignable) but addressable: function
+///   parameters and the payload / capture bindings (`if |v|`, `for` elements
+///   and indexes, `switch` and `catch` captures).
+/// - `Const` — immutable **and non-addressable**: a `const` declaration
+///   (local or top-level). `&c` — and the auto-ref of a pointer-receiver
+///   method call on `c` — is rejected (`E0233`): a `*T` into it would let the
+///   `const` be mutated.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mut {
+    Var,
+    Param,
+    Const,
+}
+
+/// A lexical binding: its type and its mutability class (only `Mut::Var`
+/// bindings may be assigned to).
+type Binding = (Type, Mut);
 
 struct Checker {
     diags: Vec<Diagnostic>,
@@ -723,7 +742,7 @@ impl Checker {
         for p in &f.params {
             let pt = self.resolve_type(&p.ty).unwrap_or(Type::I64);
             // Parameters are immutable bindings.
-            self.define(&p.name, pt, true);
+            self.define(&p.name, pt, Mut::Param);
         }
         self.check_block(&f.body);
         self.scopes.pop();
@@ -778,7 +797,7 @@ impl Checker {
                 self.resolve_type(&p.ty).unwrap_or(Type::I64)
             };
             // Parameters (including `self`) are immutable bindings.
-            self.define(&p.name, pt, true);
+            self.define(&p.name, pt, Mut::Param);
         }
         self.check_block(&f.body);
         self.scopes.pop();
@@ -798,13 +817,13 @@ impl Checker {
 
     // ---- scope helpers ----------------------------------------------------
 
-    fn define(&mut self, name: &str, ty: Type, is_const: bool) {
+    fn define(&mut self, name: &str, ty: Type, m: Mut) {
         if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string(), (ty, is_const));
+            scope.insert(name.to_string(), (ty, m));
         }
     }
 
-    /// Resolve a value name to its `(type, is_const)`, searching inner scopes
+    /// Resolve a value name to its `(type, mutability)`, searching inner scopes
     /// first, then falling back to top-level consts.
     fn lookup(&self, name: &str) -> Option<Binding> {
         for scope in self.scopes.iter().rev() {
@@ -812,7 +831,7 @@ impl Checker {
                 return Some(b);
             }
         }
-        self.const_types.get(name).map(|&t| (t, true))
+        self.const_types.get(name).map(|&t| (t, Mut::Const))
     }
 
     /// Resolve a type name to a builtin or a registered struct, without
@@ -1527,7 +1546,7 @@ impl Checker {
                 self.resolve_type(&p.ty).unwrap_or(Type::I64)
             };
             // Parameters (including `self`) are immutable bindings.
-            self.define(&p.name, pt, true);
+            self.define(&p.name, pt, Mut::Param);
         }
         self.check_block(&f.body);
         self.scopes.pop();
@@ -1639,7 +1658,11 @@ impl Checker {
                         }
                     }
                 };
-                self.define(name, bind_ty, *is_const);
+                self.define(
+                    name,
+                    bind_ty,
+                    if *is_const { Mut::Const } else { Mut::Var },
+                );
             }
             Stmt::Assign {
                 name,
@@ -1647,8 +1670,8 @@ impl Checker {
                 value,
                 span,
             } => match self.lookup(name) {
-                Some((ty, is_const)) => {
-                    if is_const {
+                Some((ty, m)) => {
+                    if m != Mut::Var {
                         // A compound assignment to a `const` is rejected exactly
                         // as a plain `=` is (SPEC §27.2): the immutability error
                         // is primary; the rhs is still checked against the place
@@ -1752,9 +1775,18 @@ impl Checker {
                     }
                 }
                 None => {
-                    if self.ret_type != Type::Void {
+                    // `return;` is the success return of a `!void` function too
+                    // (SPEC §12.1): there is no payload value to supply.
+                    let void_enough = self.ret_type == Type::Void
+                        || matches!(
+                            self.ret_type,
+                            Type::ErrorUnion(id)
+                                if self.structs.error_union_payload(id) == Type::Void
+                        );
+                    if !void_enough {
                         let msg = format!(
-                            "`return;` is only valid in a `void` function, found return type `{}`",
+                            "`return;` is only valid in a `void` (or `!void`) function, \
+                             found return type `{}`",
                             self.type_name(self.ret_type)
                         );
                         self.error(*span, "E0110", msg);
@@ -1795,7 +1827,7 @@ impl Checker {
                     // nests its own scope inside, so the binding is visible
                     // throughout the then-block — and only there.
                     self.scopes.push(HashMap::new());
-                    self.define(name, inner, true);
+                    self.define(name, inner, Mut::Param);
                     self.check_block(then);
                     self.scopes.pop();
                     // `els` is checked outside that scope: it never sees `name`.
@@ -1874,9 +1906,9 @@ impl Checker {
                 // only there. `elem` (and `index`) are immutable (`is_const`),
                 // matching other capture bindings: `elem` is a by-value copy.
                 self.scopes.push(HashMap::new());
-                self.define(elem, elem_ty, true);
+                self.define(elem, elem_ty, Mut::Param);
                 if let Some(index_name) = index {
-                    self.define(index_name, Type::Usize, true);
+                    self.define(index_name, Type::Usize, Mut::Param);
                 }
                 self.loop_depth += 1;
                 self.loop_labels.push(label.clone());
@@ -2111,6 +2143,19 @@ impl Checker {
         span: Span,
     ) {
         let mut covered: HashSet<i64> = HashSet::new();
+        // Every value already claimed by a label or range, as inclusive
+        // intervals (a value label is the interval `[v, v]`). Two arms (or two
+        // labels of one arm) claiming an overlapping value would lower to
+        // overlapping GNU `case` ranges — cc rejects that with its own raw
+        // error, so before v0.156 an overlap was a C-compile failure instead
+        // of a diagnostic (found by the conformance corpus, s39). Arm counts
+        // are small; the pairwise scan is fine.
+        let mut intervals: Vec<(i64, i64)> = Vec::new();
+        let overlaps = |lo: i64, hi: i64, ivs: &mut Vec<(i64, i64)>| -> bool {
+            let hit = ivs.iter().any(|&(a, b)| lo <= b && a <= hi);
+            ivs.push((lo, hi));
+            hit
+        };
         for arm in arms {
             for label in &arm.labels {
                 if let Some(v) = self.switch_int_label_value(scrut_ty, label) {
@@ -2120,7 +2165,27 @@ impl Checker {
                             "E0211",
                             format!("duplicate `switch` label `{}`", v),
                         );
+                    } else if overlaps(v, v, &mut intervals) {
+                        self.error(
+                            label.span(),
+                            "E0211",
+                            format!("`switch` label `{}` is already covered by a range", v),
+                        );
                     }
+                } else {
+                    // Unevaluable label: already diagnosed; keep scanning.
+                }
+            }
+            for &(lo, hi) in &arm.ranges {
+                if overlaps(lo, hi, &mut intervals) {
+                    self.error(
+                        arm.span,
+                        "E0211",
+                        format!(
+                            "`switch` range `{}..{}` overlaps an earlier label or range",
+                            lo, hi
+                        ),
+                    );
                 }
             }
             self.check_block(&arm.body);
@@ -2175,7 +2240,7 @@ impl Checker {
             self.scopes.push(HashMap::new());
             if let Some(cap) = &arm.capture {
                 let pty = payload.unwrap_or(Type::I64);
-                self.define(cap, pty, true);
+                self.define(cap, pty, Mut::Param);
             }
             self.check_block(&arm.body);
             self.scopes.pop();
@@ -2420,8 +2485,8 @@ impl Checker {
     fn resolve_place(&mut self, place: &Expr) -> Option<Type> {
         match place {
             Expr::Ident { name, span } => match self.lookup(name) {
-                Some((ty, is_const)) => {
-                    if is_const {
+                Some((ty, m)) => {
+                    if m != Mut::Var {
                         let msg = format!(
                             "cannot assign through immutable binding `{}` (only `var` locals are assignable)",
                             name
@@ -2515,7 +2580,7 @@ impl Checker {
     fn resolve_index_base(&mut self, base: &Expr) -> Option<(Type, bool)> {
         match base {
             Expr::Ident { name, span } => match self.lookup(name) {
-                Some((ty, is_const)) => Some((ty, !is_const)),
+                Some((ty, m)) => Some((ty, m == Mut::Var)),
                 None => {
                     self.error(*span, "E0100", format!("unknown name `{}`", name));
                     None
@@ -2599,8 +2664,10 @@ impl Checker {
     /// Resolve the type of an lvalue place for `&place` (SPEC §15.1). A place is
     /// a value identifier, a field chain, an index (into an array or slice), or
     /// a deref. Unlike [`resolve_place`], address-of does **not** require
-    /// mutability — a pointer to an immutable binding is allowed — so a `const`
-    /// / parameter root is accepted. Anything that is not a place is `E0231`.
+    /// assignability — a pointer to an immutable *parameter* is allowed — but a
+    /// place rooted in a **`const` binding** is rejected (`E0233`, see
+    /// [`Checker::addr_const_root`]): there are no const pointers, so the `*T`
+    /// would let the `const` be mutated. Anything that is not a place is `E0231`.
     fn resolve_lvalue_type(&mut self, place: &Expr) -> Option<Type> {
         match place {
             Expr::Ident { name, span } => match self.lookup(name) {
@@ -2652,6 +2719,43 @@ impl Checker {
                 self.check_expr(place, None);
                 None
             }
+        }
+    }
+
+    /// If taking the address of `place` would hand out a pointer **into a
+    /// `const` binding's own storage**, return that binding's name (for the
+    /// `E0233` diagnostic); else `None`. Mirrors the assignment rules of
+    /// [`Checker::resolve_place`] / [`Checker::resolve_index_base`] (SPEC
+    /// §15.1 / §30.2): the chain walks `Field` / `Index` bases toward the root
+    /// identifier, but storage reached *through* a pointer (an auto-deref'd
+    /// `*Struct` field base, a deref) or through a **slice** element (a slice
+    /// is a mutable view; the binding only holds `{ptr, len}`) is not the
+    /// binding's own, so those hops clear the verdict. Parameters are immutable
+    /// but remain addressable (aliasing the local copy), matching what
+    /// `resolve_lvalue_type` has always accepted. Side-effect-free.
+    fn addr_const_root(&self, place: &Expr) -> Option<String> {
+        match place {
+            Expr::Ident { name, .. } => match self.lookup(name) {
+                Some((_, Mut::Const)) => Some(name.clone()),
+                _ => None,
+            },
+            Expr::Field { base, .. } => {
+                // A pointer base writes through the pointer (SPEC §30.1): the
+                // root binding's constness is irrelevant.
+                if self.place_base_ptr_type(base).is_some() {
+                    None
+                } else {
+                    self.addr_const_root(base)
+                }
+            }
+            Expr::Index { base, .. } => match self.place_type_query(base) {
+                // A slice element lives in the backing storage, not in the
+                // binding (SPEC §15.2) — `&s[i]` on a `const` slice is fine.
+                Some(Type::Slice(_)) => None,
+                _ => self.addr_const_root(base),
+            },
+            // A deref reaches the pointee's storage, never the binding's.
+            _ => None,
         }
     }
 
@@ -2970,9 +3074,18 @@ impl Checker {
                     None => None,
                 }
             }
-            // `&place` (SPEC §15.1): `place` must be an lvalue (`E0231`); the
-            // result is a pointer to its type.
+            // `&place` (SPEC §15.1): `place` must be an lvalue (`E0231`) not
+            // rooted in a `const` binding's own storage (`E0233` — a `*T` into
+            // it would mutate the `const`); the result is a pointer to its type.
             Expr::AddrOf { place, .. } => {
+                if let Some(root) = self.addr_const_root(place) {
+                    let msg = format!(
+                        "cannot take the address of `const` binding `{}`: a `*T` into it \
+                         would allow mutating a `const`; declare `{}` as `var` instead",
+                        root, root
+                    );
+                    self.error(place.span(), "E0233", msg);
+                }
                 let pt = self.resolve_lvalue_type(place)?;
                 Some(Type::Ptr(self.structs.intern_ptr(pt)))
             }
@@ -3382,7 +3495,7 @@ impl Checker {
         match capture {
             Some(name) => {
                 self.scopes.push(HashMap::new());
-                self.define(name, Type::I32, true);
+                self.define(name, Type::I32, Mut::Param);
                 let dt = self.check_expr(default, expected);
                 self.scopes.pop();
                 dt
@@ -3652,15 +3765,28 @@ impl Checker {
         // address-of error `E0231`). A receiver that is already a pointer is
         // passed straight through (no addressability requirement); a
         // value-receiver method takes the receiver by value, unchanged.
-        if sf.is_ptr_receiver && !recv_is_ptr && !is_addressable_place(receiver) {
-            let sname = self.structs.get(id).name.clone();
-            let msg = format!(
-                "method `{}` of `{}` has a pointer receiver (`self: *{}`); its receiver must be \
-                 an addressable lvalue (a variable, field, or element), not a temporary",
-                method, sname, sname
-            );
-            self.error(receiver.span(), "E0231", msg);
-            // Continue checking the arguments so their own diagnostics surface.
+        if sf.is_ptr_receiver && !recv_is_ptr {
+            if !is_addressable_place(receiver) {
+                let sname = self.structs.get(id).name.clone();
+                let msg = format!(
+                    "method `{}` of `{}` has a pointer receiver (`self: *{}`); its receiver must \
+                     be an addressable lvalue (a variable, field, or element), not a temporary",
+                    method, sname, sname
+                );
+                self.error(receiver.span(), "E0231", msg);
+                // Continue checking the arguments so their own diagnostics surface.
+            } else if let Some(root) = self.addr_const_root(receiver) {
+                // The auto-ref `&obj` must not alias a `const` binding's own
+                // storage (SPEC §30.2 / §15.1): the method would mutate a
+                // `const`. Same rule as `&place` (`E0233`).
+                let sname = self.structs.get(id).name.clone();
+                let msg = format!(
+                    "method `{}` of `{}` has a pointer receiver (`self: *{}`) and mutates its \
+                     receiver, but `{}` is a `const` binding; declare `{}` as `var` instead",
+                    method, sname, sname, root, root
+                );
+                self.error(receiver.span(), "E0233", msg);
+            }
         }
         // The receiver supplies `self`; the remaining parameters bind `args`.
         let expected = &sf.params[1..];
@@ -4056,6 +4182,31 @@ impl Checker {
                         "E0110",
                         "`Allocator` values do not support comparison",
                     );
+                    return None;
+                }
+                // The remaining aggregates (slices, arrays, optionals, error
+                // unions, tagged unions) are not comparable either (§3:
+                // operands must be int/bool — §38 adds f64; enums compare by
+                // value §13; pointers compare by address §15). Before v0.156
+                // a slice operand slipped through to emit and died in cc with
+                // "invalid operands to binary ==" (found by the conformance
+                // corpus, s23) — diagnose it here like the other aggregates.
+                let aggregate = |t: Type| {
+                    matches!(
+                        t,
+                        Type::Slice(_)
+                            | Type::Array(_)
+                            | Type::Optional(_)
+                            | Type::ErrorUnion(_)
+                            | Type::Union(_)
+                    )
+                };
+                if aggregate(lt) || aggregate(rt) {
+                    let msg = format!(
+                        "`{}` values do not support comparison",
+                        self.type_name(if aggregate(lt) { lt } else { rt })
+                    );
+                    self.error(span, "E0110", msg);
                     return None;
                 }
                 if lt != rt {
@@ -4715,11 +4866,11 @@ impl Checker {
                     continue;
                 }
                 let pt = self.resolve_type(&p.ty).unwrap_or(Type::I64);
-                self.define(&p.name, pt, true);
+                self.define(&p.name, pt, Mut::Param);
                 continue;
             }
             let pt = self.resolve_type(&p.ty).unwrap_or(Type::I64);
-            self.define(&p.name, pt, true);
+            self.define(&p.name, pt, Mut::Param);
         }
         self.check_block(&f.body);
         self.scopes.pop();
@@ -6876,6 +7027,54 @@ mod tests {
         assert_eq!(codes(items), Vec::<&str>::new());
     }
 
+    #[test]
+    fn bare_return_in_error_union_void_fn_ok() {
+        // `return;` is the success return of a `!void` function (SPEC §12.1,
+        // v0.156): there is no payload value to supply.
+        // fn f() !void { return; }
+        // fn g() !void { return error.Oops; }
+        let items = vec![
+            func_te("f", vec![], te_err("void"), vec![ret(None)]),
+            func_te("g", vec![], te_err("void"), vec![ret(Some(error_lit("Oops")))]),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn bare_return_in_error_union_i32_fn_is_e0110() {
+        // `return;` stays an error for a payload-carrying `!T` — only `void`
+        // (and `!void`) functions may return without a value.
+        // fn f() !i32 { return; }
+        let items = vec![func_te("f", vec![], te_err("i32"), vec![ret(None)])];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn try_and_catch_over_error_union_void_typecheck() {
+        // fn f() !void { return error.Oops; }
+        // fn g() !void { try f(); }
+        // fn main() void { g() catch print(0); }
+        let items = vec![
+            func_te("f", vec![], te_err("void"), vec![ret(Some(error_lit("Oops")))]),
+            func_te(
+                "g",
+                vec![],
+                te_err("void"),
+                vec![Stmt::Expr(try_expr(call("f", vec![])))],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![Stmt::Expr(catch_expr(
+                    call("g", vec![]),
+                    call("print", vec![int(0)]),
+                ))],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
     // ---- named error sets (v0.139, SPEC §34) ------------------------------
 
     /// A named error set `const Name = error{ members… };`.
@@ -8078,6 +8277,75 @@ mod tests {
             vec![
                 let_var_ptr("p", "i32", addr_of(ident("x"))),
                 ret(Some(deref(ident("p")))),
+            ],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn addr_of_const_binding_is_e0233() {
+        // `&` of a `const` binding is rejected: there are no const pointers,
+        // so the `*T` would let the `const` be mutated (SPEC §15.1, v0.156).
+        // fn main() void { const x: i32 = 5; var p: *i32 = &x; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_const("x", "i32", int(5)),
+                let_var_ptr("p", "i32", addr_of(ident("x"))),
+            ],
+        )];
+        assert!(codes(items).contains(&"E0233"));
+    }
+
+    #[test]
+    fn addr_of_const_struct_field_is_e0233() {
+        // A field chain rooted in a `const` binding is the binding's own
+        // storage, so `&pt.x` is rejected like `&pt` (mirrors the E0167
+        // assignment rule).
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    Stmt::Let {
+                        is_const: true,
+                        name: "pt".into(),
+                        ty: Some(te("Point")),
+                        value: struct_lit("Point", vec![("x", int(1))]),
+                        span: sp(),
+                    },
+                    let_var_ptr("p", "i32", addr_of(field(ident("pt"), "x"))),
+                ],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0233"));
+    }
+
+    #[test]
+    fn addr_of_const_slice_elem_is_ok() {
+        // A slice is a mutable VIEW (SPEC §15.2): the binding holds only
+        // `{ptr, len}`, so `&s[0]` on a `const` slice aims at the backing
+        // array — allowed, exactly as `s[i] = e` on a `const` slice is.
+        // fn main() void { var a: [3]i32 = …; const s: []i32 = a[0..2];
+        //                  var p: *i32 = &s[0]; }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                arr3_decl("a"),
+                Stmt::Let {
+                    is_const: true,
+                    name: "s".into(),
+                    ty: Some(te_slice("i32")),
+                    value: slice_expr(ident("a"), int(0), int(2)),
+                    span: sp(),
+                },
+                let_var_ptr("p", "i32", addr_of(index(ident("s"), int(0)))),
             ],
         )];
         assert_eq!(codes(items), Vec::<&str>::new());
@@ -11401,6 +11669,59 @@ mod tests {
             ),
         ];
         assert!(codes(items).contains(&"E0231"));
+    }
+
+    #[test]
+    fn pointer_receiver_call_on_const_binding_is_e0233() {
+        // fn main() void { const p = Point{...}; p.inc(); }   — the auto-ref
+        // `&p` would mutate a `const` binding (SPEC §30.2 / §15.1, v0.156).
+        let items = vec![
+            point_ptr_struct(),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    Stmt::Let {
+                        is_const: true,
+                        name: "p".into(),
+                        ty: Some(te("Point")),
+                        value: struct_lit("Point", vec![("x", int(5))]),
+                        span: sp(),
+                    },
+                    Stmt::Expr(method_call(ident("p"), "inc", vec![])),
+                ],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0233"));
+    }
+
+    #[test]
+    fn pointer_receiver_call_through_const_pointer_binding_is_ok() {
+        // A receiver that is already a `*Point` passes through with no
+        // auto-ref (SPEC §30.2) — the WRITE goes to the pointee, not the
+        // binding, so a `const` pointer binding is fine.
+        // fn main() void { var pt: Point = …; const q: *Point = &pt; q.inc(); }
+        let items = vec![
+            point_ptr_struct(),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![
+                    let_var("pt", "Point", struct_lit("Point", vec![("x", int(0))])),
+                    Stmt::Let {
+                        is_const: true,
+                        name: "q".into(),
+                        ty: Some(te_ptr("Point")),
+                        value: addr_of(ident("pt")),
+                        span: sp(),
+                    },
+                    Stmt::Expr(method_call(ident("q"), "inc", vec![])),
+                ],
+            ),
+        ];
+        assert_eq!(codes(items), Vec::<&str>::new());
     }
 
     #[test]
