@@ -151,14 +151,22 @@ fn process_source(
     visited: &mut HashSet<PathBuf>,
     stack: &mut Vec<PathBuf>,
 ) -> Result<(), Vec<Diagnostic>> {
-    // Lex + parse against this module's own source. Sub-file diagnostics are
-    // rendered here (the flattener owns the text) and bundled into one E0294.
+    // Lex + parse against this module's own source. ROOT-file diagnostics
+    // pass through untouched — the caller holds the root source and renders
+    // them against it, and their structural codes (`E0001`/`E0200`/…, the ones
+    // SPEC §1/§2 document) stay observable. Diagnostics from an *imported*
+    // file are rendered here (only the flattener owns that file's text) and
+    // bundled into one E0294. The root is the file being processed with an
+    // empty resolution stack: `stack.push` happens only after this parse.
+    let is_root = stack.is_empty();
     let tokens = match crate::lexer::lex(src) {
         Ok(t) => t,
+        Err(diags) if is_root => return Err(diags),
         Err(diags) => return Err(vec![sub_file_error(&diags, canon, src)]),
     };
     let module = match crate::parser::parse(&tokens) {
         Ok(m) => m,
+        Err(diags) if is_root => return Err(diags),
         Err(diags) => return Err(vec![sub_file_error(&diags, canon, src)]),
     };
 

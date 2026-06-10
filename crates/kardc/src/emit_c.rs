@@ -2365,7 +2365,17 @@ impl<'a> Emitter<'a> {
                 }
                 false
             }
-            Stmt::Block(b) => self.emit_block(b, Scope::plain()),
+            Stmt::Block(b) => {
+                // A bare block statement is its own scope (§3), so it must be
+                // its own C scope too: without the braces, sibling blocks each
+                // declaring the same local name produce two definitions in one
+                // C scope and cc rejects a sema-valid program (found by the
+                // v0.155 conformance corpus).
+                self.line("{");
+                let diverged = self.emit_block(b, Scope::plain());
+                self.line("}");
+                diverged
+            }
             Stmt::Switch {
                 scrutinee,
                 arms,
