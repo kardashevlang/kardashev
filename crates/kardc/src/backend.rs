@@ -134,16 +134,25 @@ fn unique_temp(suffix: &str) -> PathBuf {
 }
 
 /// Invoke the C compiler as
-/// `<cc> <-O0|-O2> -std=c11 [--target=<triple>] [-c] -o <out> <tmp_c>`,
-/// returning the compiler's stderr on a non-zero exit. The optimization level
-/// comes from `opts.opt`: `-O2` by default (`build`/`bench`/cross-compiles),
-/// `-O0` for the `run`/`test` dev builds (unless `--release`).
+/// `<cc> <-O0|-O2> -ffp-contract=off -std=c11 [--target=<triple>] [-c] -o
+/// <out> <tmp_c>`, returning the compiler's stderr on a non-zero exit. The
+/// optimization level comes from `opts.opt`: `-O2` by default
+/// (`build`/`bench`/cross-compiles), `-O0` for the `run`/`test` dev builds
+/// (unless `--release`).
+///
+/// `-ffp-contract=off` pins **deterministic IEEE-754 float semantics** across
+/// platforms (SPEC §38): Apple clang defaults to contracting `a * b + c` into
+/// a fused multiply-add (one rounding instead of two), which made the same
+/// kardashev program print different `f64` digits on macOS than on Linux
+/// (found by the v0.157 std suite — `fmt_f64(0.1, 17)` differed in its last
+/// digit). Both gcc and clang accept the flag.
 fn invoke_cc(cc: &str, tmp_c: &Path, out: &Path, opts: &BuildOptions) -> Result<(), String> {
     let mut cmd = Command::new(cc);
     cmd.arg(match opts.opt {
         OptLevel::O0 => "-O0",
         OptLevel::O2 => "-O2",
     })
+    .arg("-ffp-contract=off")
     .arg("-std=c11");
     if let Some(triple) = &opts.target {
         cmd.arg(format!("--target={triple}"));

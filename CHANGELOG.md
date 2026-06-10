@@ -46,6 +46,10 @@ plain-struct typedefs):
   pathological-backtracking case verified fast.
 - **numtext** — `parse_f64` (`?f64`), fixed-point `fmt_f64` with rounding,
   overflow-safe `parse_u64`, `fmt_u64`, `fmt_i64_pad`, ASCII case utils.
+- **Deterministic floats**: the driver now passes `-ffp-contract=off` to
+  the C compiler — Apple clang fuses `a*b+c` into single-rounding FMA by
+  default, which made `fmt_f64(0.1, 17)` print a different last digit on
+  macOS (caught by this wave's suite on CI). SPEC §38.x; corpus-pinned.
 - 6 new `tests/std` suites (12 total, all green via real `kard test`;
   ~700 new hand-computed expects). 1026 unit + 48 e2e + 606-file corpus +
   std suites green.
