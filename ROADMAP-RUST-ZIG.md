@@ -331,6 +331,50 @@ deferred: the literal form `Name(T){…}`, composite arguments
 (`ArrayList([]u8)`), applications as generic-fn type arguments, and
 application-typed fields in plain structs (Pass-0b ordering).
 
+## Arc 5 — scale: conformance, std breadth, self-hosting (v0.153–…)
+
+The 12th-goal arc: grow the project to **300k meaningful LOC** — never filler;
+every line pins behaviour, implements a real library, or moves self-hosting —
+while keeping the toolchain fast (optimize/efficiency first where growth would
+otherwise tax every user).
+
+### v0.153.0 — Dead-function elimination (reachability-based emit)
+`@import("std")` currently emits *every* std function into *every* program's C
+(`str_concat` in hello-world). Before std grows, the emitter computes the set
+of functions reachable from the mode's roots (`main` for programs, the `test`
+blocks for the harness) over the call graph — free fns, struct methods,
+associated fns; generic instantiations are already demand-driven — and emits
+only those. Unused-library programs get byte-leaner C and faster cc.
+
+### v0.154.0 — std wave 1: algorithms & data structures
+In-language, each with `test` blocks: `sort`/`sorted` (insertion+quick),
+`binary_search`, `Deque(T)`, `BitSet`, `StrBuilder`, integer parse/format
+(`parse_i64`, `fmt_i64`), `min`/`max`/`clamp`/`abs` over i64, `gcd`/`lcm`/
+`ipow`/`isqrt`, `PRNG` (xorshift). Pure library: no compiler change.
+
+### v0.155.0 — Conformance suite A (runner + SPEC §1–§21)
+`tests/spec/` corpus: directive-driven `.ks` programs (`// RUN-EXIT:`,
+`// RUN-OUT:` …) pinning exact behaviour per SPEC section, with a parallel
+Rust runner (std threads, `-O0` dev builds from v0.151) and `--filter`
+sharding for CI.
+
+### v0.156.0 — Conformance suite B (SPEC §22–§42 + interaction matrix)
+The second half, plus pairwise feature-interaction tests (optionals×generics,
+defer×error-unions, switch×enums×ranges, …) — where compilers actually break.
+
+### v0.157.0 — std wave 2: formats & text
+JSON (parse+emit), base64, hex, crc32/fnv1a, `split`/`trim`/`join`/`replace`,
+glob matching. In-language with tests.
+
+### v0.158.0 — `@writeFile` / `@appendFile` / `@args` (self-host prerequisites)
+Output and argv access — the minimal OS surface a self-hosted compiler needs.
+
+### v0.159.0+ — Self-hosting stages
+`selfhost/lexer.ks` (differential-tested against the Rust lexer), then
+`parser.ks` + AST as tagged unions (differential vs `kard fmt`), then
+`emit.ks` for a growing subset — the compiler compiling itself, version by
+version. LSP and the package registry follow.
+
 ### Beyond (Arc 5+, each multi-session)
 Bundled cross-compilation sysroots; the full imperative `build.ks` graph (a
 `build(*Builder)` entry point); re-self-hosting (the compiler in kardashev); a
