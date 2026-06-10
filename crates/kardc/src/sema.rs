@@ -3418,9 +3418,118 @@ impl Checker {
                     }
                     Some(u8_slice)
                 }
+                "writeFile" | "appendFile" => {
+                    // `@writeFile(path, data)` / `@appendFile(path, data)`
+                    // (v0.158, SPEC §44) — write (create/truncate) or append
+                    // (create if missing) `data` to the file named by `path`.
+                    // Exactly two `[]u8` arguments; the result is a `bool`
+                    // (`true` on success — the §41 no-error-channel convention:
+                    // there is no error payload to distinguish, so `!void`
+                    // would carry the same single bit). A wrong argument count
+                    // is `E0320`; a non-`[]u8` path or data is `E0110`.
+                    let u8_slice = Type::Slice(self.structs.intern_slice(Type::U8));
+                    if args.len() != 2 {
+                        self.error(
+                            *span,
+                            "E0320",
+                            format!(
+                                "`@{}` takes exactly 2 arguments (a `[]u8` path and a `[]u8` data), found {}",
+                                name,
+                                args.len()
+                            ),
+                        );
+                        self.check_args_for_recovery(args);
+                        return None;
+                    }
+                    for (arg, what) in [(&args[0], "path"), (&args[1], "data")] {
+                        if let Some(t) = self.check_expr(arg, Some(u8_slice)) {
+                            let is_u8_slice = matches!(
+                                t,
+                                Type::Slice(id) if self.structs.slice_elem(id) == Type::U8
+                            );
+                            if !is_u8_slice {
+                                self.error(
+                                    arg.span(),
+                                    "E0110",
+                                    format!(
+                                        "`@{}`'s {} must be a `[]u8`, found `{}`",
+                                        name,
+                                        what,
+                                        self.type_name(t)
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    Some(Type::Bool)
+                }
+                "argc" => {
+                    // `@argc()` (v0.158, SPEC §44) — the number of program
+                    // arguments as an `i64`, INCLUDING `argv[0]` (the executable
+                    // name), so it is always ≥ 1. No arguments (`E0320`
+                    // otherwise).
+                    if !args.is_empty() {
+                        self.error(
+                            *span,
+                            "E0320",
+                            format!("`@argc` takes no arguments, found {}", args.len()),
+                        );
+                        self.check_args_for_recovery(args);
+                        return None;
+                    }
+                    Some(Type::I64)
+                }
+                "arg" => {
+                    // `@arg(a, i)` (v0.158, SPEC §44) — the `i`-th program
+                    // argument copied into a fresh `[]u8` allocated on the
+                    // `Allocator` `a` (the `@readLine` allocator convention,
+                    // §41). Out-of-range `i` (negative or ≥ `@argc()`) yields an
+                    // empty slice. A wrong argument count is `E0320`; a
+                    // non-`Allocator` first argument is `E0321`; a non-integer
+                    // index is `E0110` (a flexible literal defaults to `i64`,
+                    // which is accepted — the array-index rule).
+                    let u8_slice = Type::Slice(self.structs.intern_slice(Type::U8));
+                    if args.len() != 2 {
+                        self.error(
+                            *span,
+                            "E0320",
+                            format!(
+                                "`@arg` takes exactly 2 arguments (an `Allocator` and an `i64` index), found {}",
+                                args.len()
+                            ),
+                        );
+                        self.check_args_for_recovery(args);
+                        return None;
+                    }
+                    if let Some(at) = self.check_expr(&args[0], Some(Type::Allocator)) {
+                        if at != Type::Allocator {
+                            self.error(
+                                args[0].span(),
+                                "E0321",
+                                format!(
+                                    "`@arg`'s first argument must be an `Allocator`, found `{}`",
+                                    self.type_name(at)
+                                ),
+                            );
+                        }
+                    }
+                    if let Some(it) = self.check_expr(&args[1], None) {
+                        if !it.is_int() {
+                            self.error(
+                                args[1].span(),
+                                "E0110",
+                                format!(
+                                    "`@arg`'s index must be an integer, found `{}`",
+                                    self.type_name(it)
+                                ),
+                            );
+                        }
+                    }
+                    Some(u8_slice)
+                }
                 other => {
                     let msg = format!(
-                        "unknown `@`-builtin `@{}` (expected `@sizeOf`, `@typeName`, `@as`, `@panic`, `@intFromEnum`, `@enumFromInt`, `@readFile`, or `@readLine`)",
+                        "unknown `@`-builtin `@{}` (expected `@sizeOf`, `@typeName`, `@as`, `@panic`, `@intFromEnum`, `@enumFromInt`, `@readFile`, `@readLine`, `@writeFile`, `@appendFile`, `@argc`, or `@arg`)",
                         other
                     );
                     self.error(*span, "E0320", msg);
@@ -12447,6 +12556,208 @@ mod tests {
             vec![let_var_infer("s", builtin("readFile", vec![ident("a")]))],
         )];
         assert!(codes(items).contains(&"E0320"));
+    }
+
+    // ---- file output + program arguments (v0.158, SPEC §44) ---------------
+
+    #[test]
+    fn write_file_is_bool() {
+        // fn main() void { var ok: bool = @writeFile("p.txt", "data"); }
+        // The result types as `bool`, so the binding type-checks cleanly.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var(
+                "ok",
+                "bool",
+                builtin("writeFile", vec![str_lit("p.txt"), str_lit("data")]),
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn append_file_is_bool() {
+        // fn main() void { var ok: bool = @appendFile("p.txt", "data"); }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var(
+                "ok",
+                "bool",
+                builtin("appendFile", vec![str_lit("p.txt"), str_lit("data")]),
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn write_file_wrong_arity_is_e0320() {
+        // fn main() void { var ok = @writeFile("p.txt"); }  — wrong arity.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_infer(
+                "ok",
+                builtin("writeFile", vec![str_lit("p.txt")]),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0320"));
+    }
+
+    #[test]
+    fn append_file_wrong_arity_is_e0320() {
+        // fn main() void { var ok = @appendFile("p", "d", "x"); }  — wrong arity.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_infer(
+                "ok",
+                builtin(
+                    "appendFile",
+                    vec![str_lit("p"), str_lit("d"), str_lit("x")],
+                ),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0320"));
+    }
+
+    #[test]
+    fn write_file_non_slice_path_is_e0110() {
+        // fn main() void { var ok: bool = @writeFile(5, "d"); }  — 5 is no []u8.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var(
+                "ok",
+                "bool",
+                builtin("writeFile", vec![int(5), str_lit("d")]),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn write_file_non_slice_data_is_e0110() {
+        // fn main() void { var ok: bool = @writeFile("p", 5); }  — 5 is no []u8.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var(
+                "ok",
+                "bool",
+                builtin("writeFile", vec![str_lit("p"), int(5)]),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn argc_is_i64() {
+        // fn main() void { var n: i64 = @argc(); }
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var("n", "i64", builtin("argc", vec![]))],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn argc_with_args_is_e0320() {
+        // fn main() void { var n = @argc(1); }  — takes no arguments.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_infer("n", builtin("argc", vec![int(1)]))],
+        )];
+        assert!(codes(items).contains(&"E0320"));
+    }
+
+    #[test]
+    fn arg_is_slice_of_u8() {
+        // fn f(a: Allocator) void { var s: []u8 = @arg(a, 0); }
+        let items = vec![func(
+            "f",
+            vec![param("a", "Allocator")],
+            "void",
+            vec![let_var_slice(
+                "s",
+                "u8",
+                builtin("arg", vec![ident("a"), int(0)]),
+            )],
+        )];
+        assert_eq!(codes(items), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn arg_wrong_arity_is_e0320() {
+        // fn f(a: Allocator) void { var s = @arg(a); }  — wrong arity.
+        let items = vec![func(
+            "f",
+            vec![param("a", "Allocator")],
+            "void",
+            vec![let_var_infer("s", builtin("arg", vec![ident("a")]))],
+        )];
+        assert!(codes(items).contains(&"E0320"));
+    }
+
+    #[test]
+    fn arg_non_allocator_first_arg_is_e0321() {
+        // fn main() void { var s: []u8 = @arg(5, 0); }  — 5 is no Allocator.
+        let items = vec![func(
+            "main",
+            vec![],
+            "void",
+            vec![let_var_slice(
+                "s",
+                "u8",
+                builtin("arg", vec![int(5), int(0)]),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0321"));
+    }
+
+    #[test]
+    fn arg_non_int_index_is_e0110() {
+        // fn f(a: Allocator) void { var s: []u8 = @arg(a, "x"); }  — no integer.
+        let items = vec![func(
+            "f",
+            vec![param("a", "Allocator")],
+            "void",
+            vec![let_var_slice(
+                "s",
+                "u8",
+                builtin("arg", vec![ident("a"), str_lit("x")]),
+            )],
+        )];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn argc_in_const_is_e0130() {
+        // const N: i64 = @argc();   — runtime-only (SPEC §44.1).
+        let items = vec![const_item("N", "i64", builtin("argc", vec![]))];
+        assert!(codes(items).contains(&"E0130"));
+    }
+
+    #[test]
+    fn write_file_in_const_is_e0130() {
+        // const B: bool = @writeFile("p", "d");   — runtime-only (SPEC §44.1).
+        let items = vec![const_item(
+            "B",
+            "bool",
+            builtin("writeFile", vec![str_lit("p"), str_lit("d")]),
+        )];
+        assert!(codes(items).contains(&"E0130"));
     }
 
     #[test]

@@ -1607,3 +1607,71 @@ Receiver-precise method liveness (per-struct rather than per-name);
 instantiation-level liveness for generics whose only call sites are dead;
 struct/enum/union typedef pruning (cheap text, kept for simplicity); and
 `const` pruning.
+
+## 44. File output + program arguments (v0.158)
+
+Four `@`-builtins completing §41's minimal input with **output** and **argv**
+access — the self-hosting prerequisites (a compiler must write the files it
+produces and read its own command line):
+
+- `@writeFile(path, data)` — write `data` (a `[]u8`) as the whole contents of
+  the file named by `path` (a `[]u8`), creating it or **truncating** an
+  existing one. Yields a `bool`: `true` on success, `false` on any open/write
+  error.
+- `@appendFile(path, data)` — like `@writeFile` but **appends** to the file
+  (still creating it if missing). Same `bool` result.
+- `@argc()` — the number of program arguments as an `i64`, **including**
+  `argv[0]` (the executable name), so it is always ≥ 1.
+- `@arg(a, i)` — the `i`-th program argument (`0 ≤ i < @argc()`) copied into a
+  **fresh** `[]u8` allocated on the `Allocator` `a` (the same allocator
+  convention as `@readLine`, §41). An out-of-range `i` — negative or
+  `≥ @argc()` — yields an **empty** slice (`len == 0`).
+
+Why `bool` and not `!void` for the write builtins: an error union would carry
+exactly the same single success/failure bit (there is no error *payload* to
+distinguish), while complicating the builtin's signature and its lowering —
+and §41's input builtins already established the no-error-channel convention
+(empty slice on failure). The `bool` is the honest equivalent.
+
+Why an indexed accessor pair and not a single `args()` returning all
+arguments: `[][]u8` is not expressible — a slice's element must be a *named*
+type (§15.2) — so the argument list is exposed as a count (`@argc`) plus a
+per-index copy (`@arg`).
+
+### 44.1 Semantics (`sema`)
+`Expr::Builtin{ name: "writeFile"/"appendFile"/"argc"/"arg" }`.
+`@writeFile`/`@appendFile` take exactly two `[]u8` arguments (path, data) and
+have type `bool`; a wrong count is `E0320`, a non-`[]u8` path or data is
+`E0110`. `@argc` takes no arguments (`E0320` otherwise) and has type `i64`.
+`@arg` takes exactly two arguments — an `Allocator` and an integer index
+(`E0320` on count, `E0321` on a non-`Allocator` first argument, `E0110` on a
+non-integer index; a flexible literal index defaults to `i64`) — and has type
+`[]u8`. All four are runtime-only: `const_eval` rejects them in a constant
+initializer (`E0130`, the generic `@`-builtin arm).
+
+### 44.2 Backend (`emit_c`)
+One shared write helper `kd_write_file(kd_slice_uint8_t path, kd_slice_uint8_t
+data, int append) -> int` (NUL-copies the path exactly like `kd_read_file`,
+`fopen`s with `"wb"`/`"ab"`, `fwrite`s the data, returns 1 on full success and
+0 otherwise) is emitted at the tail of the type-def section (after the
+`kd_slice_uint8_t` typedef it takes), gated on actual `@writeFile`/
+`@appendFile` use — the §41 pattern. `@writeFile(p, d)` →
+`(kd_write_file((p), (d), 0) != 0)`; `@appendFile(p, d)` → the same with `1`.
+
+Argv access is **usage-gated on `@argc`/`@arg`**: only then does the prelude
+declare `static int kd_argc_v; static char **kd_argv_v;` and the generated
+`main` store its parameters into them (`kd_argc_v = argc; kd_argv_v = argv;`
+— in both program `main` and the test-harness `main`). A module using neither
+builtin emits a **byte-identical** `main` to v0.157 (`(void)argc;(void)argv;`).
+`@argc()` → `((int64_t)kd_argc_v)`. `@arg(a, i)` → `kd_arg((a), (i))`, a
+helper (emitted at the type-def tail, gated on `@arg` use specifically, so an
+`@argc`-only module gets no unused `static`) that bounds-checks `i`,
+`strlen`s `argv[i]` and copies it into a `malloc`-backed slice — empty slice
+when out of range. As in §41, the allocator is the malloc-backed stub (§16.2),
+so the result is freeable with `free(a, s)`.
+
+### 44.3 Deferred (honest)
+No `@deleteFile`/`@renameFile` (a round-trip test cannot clean up after
+itself in-language); no error *cause* for a failed write (the `bool` carries
+one bit, see above); no byte-exact binary-mode guarantees beyond C's `"wb"`
+(`fopen` binary mode covers POSIX + macOS, the supported targets).

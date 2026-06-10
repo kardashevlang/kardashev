@@ -18,6 +18,26 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.158.0] — File output + argv (`@writeFile` / `@appendFile` / `@argc` / `@arg`)
+
+The self-hosting prerequisites (SPEC §44): programs can now write files and
+read their command line.
+
+### Added
+- **`@writeFile(path, data) bool`** — create/truncate-write a whole file;
+  `false` on any open/write error (the §41 single-bit convention; §44
+  documents why not `!void`).
+- **`@appendFile(path, data) bool`** — append, creating if missing.
+- **`@argc() i64`** / **`@arg(a, i) []u8`** — argument count (incl.
+  `argv[0]`) and the i-th argument as a fresh allocation (empty slice when
+  out of range). `[][]u8` stays inexpressible (§15.2), hence the indexed
+  accessor pair.
+- C `main` gains `argc`/`argv` capture **only when used** (otherwise
+  byte-identical, pinned); `kd_write_file`/`kd_arg` helpers usage-gated like
+  `kd_read_*`; works in the test harness too.
+- 20 unit + 4 e2e + 9 corpus pins (`s44_output_args/`, 616 corpus files
+  total) + `examples/write_args.ks`; 1047 unit + 52 e2e green.
+
 ## [0.157.0] — std wave 2: formats & text
 
 The embedded `std` grows 1,136 → 3,092 in-language lines. Six new modules

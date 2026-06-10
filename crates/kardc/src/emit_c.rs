@@ -56,6 +56,17 @@ pub fn emit(module: &Module, structs: &crate::types::StructTable, mode: EmitMode
     // (SPEC §41.2): emitted only when an `@readFile`/`@readLine` lowering will
     // appear, so a program doing no I/O keeps its smaller output.
     em.uses_io = module_uses_io(module);
+    // Whether the `kd_write_file` runtime helper is needed (SPEC §44.2):
+    // emitted only when an `@writeFile`/`@appendFile` lowering will appear.
+    em.uses_file_out = module_uses_file_out(module);
+    // Whether argv access is needed (SPEC §44.2): only an `@argc`/`@arg` use
+    // makes the prelude declare the `kd_argc_v`/`kd_argv_v` statics and the
+    // generated `main` store its parameters — otherwise `main` stays
+    // byte-identical to the pre-v0.158 output.
+    em.uses_argv = module_uses_argv(module);
+    // The `kd_arg` helper specifically requires an `@arg` use (an `@argc`-only
+    // module must not carry an unused `static` helper).
+    em.uses_arg = module_uses_builtin(module, |n| n == "arg");
     em.emit_prelude();
     em.emit_type_defs();
     em.emit_consts(module);
@@ -94,6 +105,22 @@ fn module_uses_panic(m: &Module) -> bool {
 /// `kd_slice_uint8_t` typedef).
 fn module_uses_io(m: &Module) -> bool {
     module_uses_builtin(m, |n| n == "readFile" || n == "readLine")
+}
+
+/// Whether the module references `@writeFile`/`@appendFile` anywhere (SPEC
+/// §44.2). Drives whether the shared `kd_write_file` runtime helper is
+/// emitted (at the tail of `emit_type_defs`, since it takes the
+/// `kd_slice_uint8_t` typedef).
+fn module_uses_file_out(m: &Module) -> bool {
+    module_uses_builtin(m, |n| n == "writeFile" || n == "appendFile")
+}
+
+/// Whether the module references `@argc`/`@arg` anywhere (SPEC §44.2). Drives
+/// the `kd_argc_v`/`kd_argv_v` prelude statics and the `main` parameter
+/// store; without either builtin the generated `main` is byte-identical to
+/// the pre-v0.158 output.
+fn module_uses_argv(m: &Module) -> bool {
+    module_uses_builtin(m, |n| n == "argc" || n == "arg")
 }
 
 /// Whether the module contains any `@builtin(..)` whose name satisfies `pred`
@@ -620,6 +647,22 @@ struct Emitter<'a> {
     /// typedef they return), so a program with no I/O keeps its smaller output
     /// and avoids unused-function warnings. Computed once in [`emit`].
     uses_io: bool,
+    /// v0.158: whether the module references `@writeFile`/`@appendFile` (SPEC
+    /// §44). Drives whether the shared `kd_write_file` runtime helper is
+    /// emitted at the tail of `emit_type_defs` (after the `kd_slice_uint8_t`
+    /// typedef it takes). Computed once in [`emit`].
+    uses_file_out: bool,
+    /// v0.158: whether the module references `@argc`/`@arg` (SPEC §44). Drives
+    /// the `kd_argc_v`/`kd_argv_v` prelude statics and the `main` parameter
+    /// store (`kd_argc_v = argc; kd_argv_v = argv;`); when false, the
+    /// generated `main` stays byte-identical to the pre-v0.158 output.
+    /// Computed once in [`emit`].
+    uses_argv: bool,
+    /// v0.158: whether the module references `@arg` specifically (SPEC §44).
+    /// Gates the `kd_arg` runtime helper — an `@argc`-only module needs the
+    /// statics but must not carry an unused `static` helper. Computed once in
+    /// [`emit`].
+    uses_arg: bool,
     /// v0.153: the reachable function sets (SPEC §43.1), computed once in
     /// [`emit`] by [`live_functions`] before any pass. The forward-declaration
     /// pass and the definition pass both skip any function not in here, so the
@@ -654,6 +697,9 @@ impl<'a> Emitter<'a> {
             generics: HashMap::new(),
             uses_panic: false,
             uses_io: false,
+            uses_file_out: false,
+            uses_argv: false,
+            uses_arg: false,
             live: LiveFns::empty(),
         }
     }
@@ -1124,6 +1170,15 @@ impl<'a> Emitter<'a> {
         self.out.push_str(
             "_Noreturn void kd_unreachable(void) { fputs(\"reached unreachable code\\n\", stderr); exit(101); }\n",
         );
+        // v0.158 argv access (SPEC §44.2): the statics `main` stores its
+        // parameters into, read by `@argc` (`kd_argc_v`) and the `kd_arg`
+        // helper (`kd_argv_v`). Gated on actual `@argc`/`@arg` use — without
+        // either, the prelude and the generated `main` are byte-identical to
+        // the pre-v0.158 output. No typedef dependency, so they live here.
+        if self.uses_argv {
+            self.out
+                .push_str("static int kd_argc_v = 0;\nstatic char **kd_argv_v = 0;\n");
+        }
         self.blank();
     }
 
@@ -1302,6 +1357,28 @@ impl<'a> Emitter<'a> {
             );
             self.line(
                 "static kd_slice_uint8_t kd_read_line(kd_allocator a) { (void)a; uintptr_t cap = 64, len = 0; uint8_t* buf = (uint8_t*)malloc(cap); kd_slice_uint8_t r; r.ptr = buf; r.len = 0; if (!buf) return r; int c; while ((c = getchar()) != EOF && c != 10) { if (len + 1 > cap) { cap *= 2; uint8_t* nb = (uint8_t*)realloc(buf, cap); if (!nb) { r.ptr = buf; r.len = len; return r; } buf = nb; } buf[len++] = (uint8_t)c; } r.ptr = buf; r.len = len; return r; }",
+            );
+        }
+        // v0.158 (SPEC §44.2): the file-output helper. Same placement + gating
+        // pattern as the §41 readers above — it takes two `kd_slice_uint8_t`s,
+        // so it must follow that typedef, and is emitted only on actual
+        // `@writeFile`/`@appendFile` use (the `[]u8` guard is then always
+        // satisfied, since both arguments are `[]u8`). The path is NUL-copied
+        // exactly like `kd_read_file`'s; `append` picks `"ab"` over `"wb"`.
+        // Returns 1 only when every byte was written and the close succeeded.
+        if self.uses_file_out && self.structs.slices().any(|(_, e)| e == Type::U8) {
+            self.line(
+                "static int kd_write_file(kd_slice_uint8_t path, kd_slice_uint8_t data, int append) { char* p = (char*)malloc(path.len + 1); if (!p) return 0; for (uintptr_t i = 0; i < path.len; i++) p[i] = (char)path.ptr[i]; p[path.len] = 0; FILE* f = fopen(p, append ? \"ab\" : \"wb\"); free(p); if (!f) return 0; size_t put = data.len ? fwrite(data.ptr, 1, data.len, f) : 0; int ok = (put == data.len); if (fclose(f) != 0) ok = 0; return ok; }",
+            );
+        }
+        // v0.158 (SPEC §44.2): the per-index argv copy. Gated on `@arg` use
+        // specifically (an `@argc`-only module gets the statics but no unused
+        // `static` helper); returns a fresh `malloc`-backed `[]u8` — freeable
+        // via `free(a, s)`, like the §41 readers — or an empty slice when `i`
+        // is out of range (negative or ≥ argc).
+        if self.uses_arg && self.structs.slices().any(|(_, e)| e == Type::U8) {
+            self.line(
+                "static kd_slice_uint8_t kd_arg(kd_allocator a, int64_t i) { (void)a; kd_slice_uint8_t r; r.ptr = 0; r.len = 0; if (i < 0 || i >= (int64_t)kd_argc_v || !kd_argv_v) return r; const char* s = kd_argv_v[i]; size_t n = strlen(s); uint8_t* buf = (uint8_t*)malloc(n + 1); if (!buf) return r; for (size_t j = 0; j < n; j++) buf[j] = (uint8_t)s[j]; r.ptr = buf; r.len = (uintptr_t)n; return r; }",
             );
         }
         self.blank();
@@ -3598,6 +3675,39 @@ impl<'a> Emitter<'a> {
                         };
                         format!("kd_read_line(({}))", a)
                     }
+                    // `@writeFile(p, d)` → `(kd_write_file((p), (d), 0) != 0)`;
+                    // `@appendFile(p, d)` passes `1` for the append flag. The
+                    // `!= 0` carries the helper's C `int` into the kardashev
+                    // `bool` result (SPEC §44.2).
+                    "writeFile" | "appendFile" => {
+                        let p = match args.first() {
+                            Some(e) => self.emit_expr(e),
+                            None => "((kd_slice_uint8_t){0})".to_string(),
+                        };
+                        let d = match args.get(1) {
+                            Some(e) => self.emit_expr(e),
+                            None => "((kd_slice_uint8_t){0})".to_string(),
+                        };
+                        let append = if name == "appendFile" { 1 } else { 0 };
+                        format!("(kd_write_file(({}), ({}), {}) != 0)", p, d, append)
+                    }
+                    // `@argc()` → the stored argument count widened to the
+                    // builtin's `i64` type (SPEC §44.2).
+                    "argc" => "((int64_t)kd_argc_v)".to_string(),
+                    // `@arg(a, i)` → `kd_arg((a), (i))` — the `i`-th argument
+                    // copied into a fresh `malloc`-backed `[]u8`, empty when
+                    // out of range (SPEC §44.2).
+                    "arg" => {
+                        let a = match args.first() {
+                            Some(e) => self.emit_expr(e),
+                            None => "((kd_allocator){0})".to_string(),
+                        };
+                        let i = match args.get(1) {
+                            Some(e) => self.emit_expr(e),
+                            None => "0".to_string(),
+                        };
+                        format!("kd_arg(({}), ({}))", a, i)
+                    }
                     // Unknown builtins are rejected by sema; emit a placeholder.
                     _ => "0".to_string(),
                 }
@@ -4558,14 +4668,19 @@ impl<'a> Emitter<'a> {
                     .slices()
                     .find(|(_, e)| *e == Type::U8)
                     .map(|(id, _)| Type::Slice(id)),
-                // `@readFile(a, p)` / `@readLine(a)` → `[]u8` (SPEC §41.1): map
-                // back to the interned `[]u8` slice (it exists whenever either
-                // builtin appears), so `var s = @readLine(a);` infers `[]u8`.
-                "readFile" | "readLine" => self
+                // `@readFile(a, p)` / `@readLine(a)` → `[]u8` (SPEC §41.1), and
+                // `@arg(a, i)` → `[]u8` too (SPEC §44.1): map back to the
+                // interned `[]u8` slice (it exists whenever any of them
+                // appears), so `var s = @readLine(a);` infers `[]u8`.
+                "readFile" | "readLine" | "arg" => self
                     .structs
                     .slices()
                     .find(|(_, e)| *e == Type::U8)
                     .map(|(id, _)| Type::Slice(id)),
+                // `@writeFile(p, d)` / `@appendFile(p, d)` → `bool`; `@argc()`
+                // → `i64` (SPEC §44.1).
+                "writeFile" | "appendFile" => Some(Type::Bool),
+                "argc" => Some(Type::I64),
                 // `@as(T, e)` has type `T` (the cast target).
                 "as" => match args.first() {
                     Some(Expr::Ident { name, .. }) => Some(self.base_type(name)),
@@ -4834,9 +4949,18 @@ impl<'a> Emitter<'a> {
         } else {
             "kd_main(); return 0;"
         };
+        // v0.158 (SPEC §44.2): when the module uses `@argc`/`@arg`, `main`
+        // stores its parameters into the prelude statics; otherwise the
+        // signature AND body prefix stay byte-identical to the pre-v0.158
+        // output (the `(void)` casts).
+        let store = if self.uses_argv {
+            "kd_argc_v = argc; kd_argv_v = argv;"
+        } else {
+            "(void)argc;(void)argv;"
+        };
         self.out.push_str(&format!(
-            "int main(int argc, char **argv){{ (void)argc;(void)argv; {} }}\n",
-            wire
+            "int main(int argc, char **argv){{ {} {} }}\n",
+            store, wire
         ));
     }
 
@@ -4871,6 +4995,11 @@ impl<'a> Emitter<'a> {
         self.blank();
         self.line("int main(int argc, char **argv) {");
         self.indent += 1;
+        // v0.158 (SPEC §44.2): a test body may use `@argc`/`@arg` too — store
+        // the parameters into the prelude statics exactly like program `main`.
+        if self.uses_argv {
+            self.line("kd_argc_v = argc; kd_argv_v = argv;");
+        }
         // `--filter SUBSTR` / a bare SUBSTR runs only tests whose name contains
         // it; `--bench` times each test. (v0.150)
         self.line("const char *filter = 0; int bench = 0;");
@@ -12537,6 +12666,216 @@ mod tests {
         assert_eq!(
             stdout, "5\nhello\n",
             "@readFile program printed wrong output:\nstdout={stdout}\n--- C ---\n{c}"
+        );
+    }
+
+    // -- v0.158 file output + program arguments (SPEC §44) ------------------
+
+    #[test]
+    fn writefile_lowers_to_helper_call_and_emits_helper() {
+        // fn f() void { var ok = @writeFile(p, d); }
+        // The builtin lowers to `(kd_write_file((p), (d), 0) != 0)`, the
+        // binding infers `bool`, and the runtime helper definition is emitted
+        // at the tail of the type-defs (after the `kd_slice_uint8_t` typedef
+        // it takes).
+        let f = func(
+            "f",
+            vec![],
+            "void",
+            vec![let_infer(
+                "ok",
+                io_builtin("writeFile", vec![ident("p"), ident("d")]),
+            )],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(
+            out.contains("bool kd_ok = (kd_write_file((kd_p), (kd_d), 0) != 0);"),
+            "@writeFile should lower to (kd_write_file((p), (d), 0) != 0) into a bool binding:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "static int kd_write_file(kd_slice_uint8_t path, kd_slice_uint8_t data, int append)"
+            ),
+            "the kd_write_file runtime helper should be emitted:\n{out}"
+        );
+        // It follows the `[]u8` slice typedef it takes.
+        let typedef_at = out
+            .find("} kd_slice_uint8_t;")
+            .expect("[]u8 slice typedef should be emitted");
+        let helper_at = out
+            .find("static int kd_write_file(")
+            .expect("kd_write_file helper should be emitted");
+        assert!(
+            typedef_at < helper_at,
+            "kd_write_file must follow the kd_slice_uint8_t typedef:\n{out}"
+        );
+    }
+
+    #[test]
+    fn appendfile_lowers_with_append_flag() {
+        // fn f() void { var ok = @appendFile(p, d); }  — same helper, flag 1.
+        let f = func(
+            "f",
+            vec![],
+            "void",
+            vec![let_infer(
+                "ok",
+                io_builtin("appendFile", vec![ident("p"), ident("d")]),
+            )],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(
+            out.contains("bool kd_ok = (kd_write_file((kd_p), (kd_d), 1) != 0);"),
+            "@appendFile should lower with append flag 1:\n{out}"
+        );
+        assert!(
+            out.contains("static int kd_write_file("),
+            "the kd_write_file runtime helper should be emitted:\n{out}"
+        );
+    }
+
+    #[test]
+    fn no_output_program_omits_write_helper() {
+        // A `[]u8`-using program without `@writeFile`/`@appendFile`: the
+        // `kd_slice_uint8_t` typedef is present, yet the write helper is not
+        // emitted (the gate is on actual use — the §41 pattern).
+        //   fn main() void { print("hi"); }
+        let f = func("main", vec![], "void", vec![print(str_lit("hi"))]);
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(
+            out.contains("} kd_slice_uint8_t;"),
+            "[]u8 slice typedef should still be emitted:\n{out}"
+        );
+        assert!(
+            !out.contains("kd_write_file"),
+            "kd_write_file must NOT be emitted for an output-free program:\n{out}"
+        );
+    }
+
+    #[test]
+    fn argc_and_arg_lower_and_emit_statics_and_main_store() {
+        // fn main() void { var n = @argc(); var s = @arg(a, 1); }
+        // `@argc` lowers to the widened static, `@arg` to the helper call; the
+        // prelude declares the statics and `main` stores its parameters.
+        let f = func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_infer("n", io_builtin("argc", vec![])),
+                let_infer("s", io_builtin("arg", vec![ident("a"), int(1)])),
+            ],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(
+            out.contains("int64_t kd_n = ((int64_t)kd_argc_v);"),
+            "@argc should lower to the widened kd_argc_v static into an i64 binding:\n{out}"
+        );
+        assert!(
+            out.contains("kd_slice_uint8_t kd_s = kd_arg((kd_a), (1));"),
+            "@arg should lower to kd_arg((a), (i)) into a []u8 binding:\n{out}"
+        );
+        assert!(
+            out.contains("static int kd_argc_v = 0;")
+                && out.contains("static char **kd_argv_v = 0;"),
+            "the argv statics should be declared in the prelude:\n{out}"
+        );
+        assert!(
+            out.contains("static kd_slice_uint8_t kd_arg(kd_allocator a, int64_t i)"),
+            "the kd_arg runtime helper should be emitted:\n{out}"
+        );
+        assert!(
+            out.contains("int main(int argc, char **argv){ kd_argc_v = argc; kd_argv_v = argv; "),
+            "main must store its parameters into the statics:\n{out}"
+        );
+        assert!(
+            !out.contains("(void)argc;"),
+            "the (void) casts are replaced by the store:\n{out}"
+        );
+    }
+
+    #[test]
+    fn no_args_program_keeps_main_byte_identical() {
+        // PIN (SPEC §44.2): a module using neither `@argc` nor `@arg` emits
+        // the exact pre-v0.158 `main` — signature AND body prefix — and none
+        // of the argv statics/helper.
+        let f = func("main", vec![], "void", vec![print(str_lit("hi"))]);
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(
+            out.contains(
+                "int main(int argc, char **argv){ (void)argc;(void)argv; kd_main(); return 0; }"
+            ),
+            "an args-free program's main must stay byte-identical:\n{out}"
+        );
+        assert!(
+            !out.contains("kd_argc_v") && !out.contains("kd_argv_v") && !out.contains("kd_arg("),
+            "no argv statics/helper for an args-free program:\n{out}"
+        );
+    }
+
+    #[test]
+    fn argc_only_program_omits_kd_arg_helper() {
+        // fn main() void { var n = @argc(); print("hi"); }
+        // `@argc` alone needs the statics + the main store, but NOT the
+        // `kd_arg` helper (which would be an unused `static`).
+        let f = func(
+            "main",
+            vec![],
+            "void",
+            vec![
+                let_infer("n", io_builtin("argc", vec![])),
+                print(str_lit("hi")),
+            ],
+        );
+        let m = Module {
+            items: vec![Item::Func(f)],
+        };
+        let out = emit(&m, &u8_slice_table(), EmitMode::Program);
+        assert!(
+            out.contains("static int kd_argc_v = 0;"),
+            "@argc needs the statics:\n{out}"
+        );
+        assert!(
+            out.contains("kd_argc_v = argc; kd_argv_v = argv;"),
+            "@argc needs the main store:\n{out}"
+        );
+        assert!(
+            !out.contains("static kd_slice_uint8_t kd_arg("),
+            "the kd_arg helper must NOT be emitted without @arg use:\n{out}"
+        );
+    }
+
+    #[test]
+    fn test_harness_main_stores_argv_when_used() {
+        // A test block using `@argc`: the harness `main` stores its parameters
+        // into the statics (before the v0.150 filter loop reads argv).
+        let t = TestBlock {
+            name: "argc_in_test".to_string(),
+            body: block(vec![let_infer("n", io_builtin("argc", vec![]))]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Test(t)],
+        };
+        let out = emit(&m, &StructTable::new(), EmitMode::Test);
+        assert!(
+            out.contains("kd_argc_v = argc; kd_argv_v = argv;"),
+            "the test-harness main must store argv for an @argc-using test:\n{out}"
         );
     }
 
