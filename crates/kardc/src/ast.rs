@@ -627,6 +627,15 @@ pub(crate) mod fixtures {
     }
 
     /// An optional type expression `?name` (v0.114).
+    /// A generic type-constructor application `Name(A, B, …)` in type position
+    /// (v0.152, SPEC §42.1).
+    pub fn app_ty(name: &str, args: Vec<TypeExpr>) -> TypeExpr {
+        TypeExpr {
+            ctor_args: Some(args),
+            ..ty(name)
+        }
+    }
+
     pub fn opt_ty(name: &str) -> TypeExpr {
         TypeExpr {
             optional: true,
