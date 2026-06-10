@@ -1959,6 +1959,15 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// True for the integer types C *promotes* to `int` before arithmetic —
+    /// the sub-32-bit widths. A `~`/`<<` over one of these must truncate its
+    /// result back to the operand type to honour §28.2's "yields the
+    /// operand's type" (32/64-bit operands keep their C type through C's
+    /// usual conversions, so they never need it).
+    fn promotes_in_c(t: Type) -> bool {
+        matches!(t, Type::I8 | Type::I16 | Type::U8 | Type::U16)
+    }
+
     fn cty_of(&self, t: Type) -> String {
         match t {
             Type::Struct(id) => self.structs.c_name(id),
@@ -3517,12 +3526,40 @@ impl<'a> Emitter<'a> {
                     // Bitwise complement (v0.132): `~x`, mirroring `-`/`!`.
                     UnOp::BitNot => "~",
                 };
-                format!("({}{})", opc, inner)
+                let s = format!("({}{})", opc, inner);
+                // §28.2: `~x` yields the OPERAND's type. C promotes sub-`int`
+                // operands before `~`, so a narrow complement consumed
+                // directly would otherwise leak the promoted value (u8 170 →
+                // -171 instead of 85; found by the wave-B corpus). Truncate
+                // back to the operand's C type — the same two's-complement
+                // narrowing `@as` (§33) and stores already perform. 32/64-bit
+                // operands never promote, so they keep the bare form.
+                if matches!(op, UnOp::BitNot) {
+                    if let Some(t) = self.type_of_expr(expr) {
+                        if Self::promotes_in_c(t) {
+                            return format!("(({}){})", self.cty_of(t), s);
+                        }
+                    }
+                }
+                s
             }
             Expr::Binary { op, lhs, rhs, .. } => {
                 let l = self.emit_binop_operand(lhs, rhs);
                 let r = self.emit_binop_operand(rhs, lhs);
-                format!("({} {} {})", l, op.c_op(), r)
+                let s = format!("({} {} {})", l, op.c_op(), r);
+                // §28.2: `x << n` yields `x`'s type. As with `~` above, a
+                // narrow left-shift would leak C's promoted value when read
+                // directly (u8 200 << 1 → 400 instead of 144); truncate back.
+                // `>>` never grows a value and the other operators cannot
+                // exceed the operand width, so only `<<` needs the cast.
+                if matches!(op, BinOp::Shl) {
+                    if let Some(t) = self.type_of_expr(lhs) {
+                        if Self::promotes_in_c(t) {
+                            return format!("(({}){})", self.cty_of(t), s);
+                        }
+                    }
+                }
+                s
             }
             Expr::Call { callee, args, .. } => {
                 if callee == "print" {

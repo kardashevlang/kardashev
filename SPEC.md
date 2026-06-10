@@ -1101,6 +1101,15 @@ Direct C lowering: `a & b`, `a | b`, `a ^ b`, `a << b`, `a >> b`, `~a` (the
 operands keep their C integer types). `const_eval` folds all of them (and `~`)
 on integer constants, so `const MASK = (1 << 8) - 1;` works.
 
+### 28.4 Width fidelity on narrow operands (v0.156)
+`~x` and `x << n` yield the **operand's** type (§28.2) even where C's integer
+promotion would widen the intermediate: for 8/16-bit operands the backend
+truncates the result back to the operand's C type (two's-complement, exactly
+the `@as` narrowing of §33), so `~(u8 170)` is `85` and `(u8 200) << 1` is
+`144` whether stored or consumed directly. 32/64-bit operands never promote.
+`>>` and the masking operators cannot exceed the operand width and keep the
+bare lowering. (Found by the v0.156 conformance corpus.)
+
 ## 29. `for` loops over arrays & slices (v0.133)
 
 `for (iter) |elem| { … }` iterates the elements of an array (`[N]T`) or slice
