@@ -15,6 +15,9 @@
 //!                       exclusive with EXIT/OUT/STDIN)
 //! ```
 //!
+//! Files (or directories) whose name starts with `_` are import fixtures —
+//! helper modules a test `@import`s — and are skipped by the walk.
+//!
 //! The runner compiles each file through the file-based pipeline (so
 //! `@import("std")` works), builds at `-O0` (the v0.151 dev level — these are
 //! correctness pins, not benchmarks), runs, and compares. Files run on a small
@@ -154,6 +157,13 @@ fn collect_ks(dir: &Path, into: &mut Vec<PathBuf>) {
     };
     for e in rd.flatten() {
         let p = e.path();
+        // A leading underscore (file or directory) marks an import FIXTURE —
+        // a helper module some test `@import`s — not a test program itself
+        // (it has no directives and never runs standalone).
+        let name = e.file_name();
+        if name.to_string_lossy().starts_with('_') {
+            continue;
+        }
         if p.is_dir() {
             collect_ks(&p, into);
         } else if p.extension().is_some_and(|x| x == "ks") {
