@@ -1448,9 +1448,16 @@ impl<'a> Emitter<'a> {
         let elem_cty = self.cty_of(structs.array_elem(id));
         let len = structs.array_len(id);
         let cname = structs.array_c_name(id);
+        // A zero-length array still reserves ONE storage element: `T data[0]`
+        // is a GNU extension clang rejects (and `{0}` cannot initialize an
+        // empty aggregate in C11), so the portable lowering keeps a dummy
+        // element that no program can reach — `.len` stays 0 and the `_get` /
+        // `_at` bounds checks (against the true `len`) always panic. Found by
+        // the v0.155 conformance corpus on macOS/clang (s14 zero_length_array).
+        let storage = len.max(1);
         self.line(&format!(
             "typedef struct {{ {} data[{}]; }} {};",
-            elem_cty, len, cname
+            elem_cty, storage, cname
         ));
         self.line(&format!(
             "static inline {ec} {cn}_get({cn} a, int64_t i) {{ if (i < 0 || (uint64_t)i >= {n}) {{ fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); }} return a.data[i]; }}",
