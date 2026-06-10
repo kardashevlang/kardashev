@@ -18,6 +18,44 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.155.0] — Conformance suite A (SPEC §1–§21) + 3 bugs it found
+
+`tests/spec/` is born: **311 directive-driven conformance programs** across 15
+section directories pin the observable rules of SPEC §1–§21 — the full
+operator-precedence/associativity table, every documented coercion site,
+defer/errdefer ordering witnesses, monomorphisation behaviours, exact
+diagnostic codes — each `//OUT` hand-computed and probed against the real
+compiler. A parallel Rust runner (`spec_suite.rs`, directive format
+`//SPEC://EXIT://OUT://STDIN://ERR`) runs the whole corpus in ~1.4s
+(thread pool × `-O0` dev builds).
+
+The corpus immediately earned its keep — **4 real bugs found, all fixed** (the fourth by macOS CI running it under clang):
+
+### Fixed
+- **`Stmt::Block` emitted no C braces**: sibling bare blocks redeclaring a
+  local produced two definitions in one C scope — cc rejected sema-valid
+  programs (§3 scoping).
+- **Root-file diagnostics were wrapped in `E0294`** (documented as
+  imported-files-only), masking the SPEC-documented `E0001`/`E0002`/
+  `E0200`/`E0201` from structured consumers. Root lex/parse diagnostics now
+  pass through untouched.
+- **Index places lowered through by-value getters**: `arr[i].f = e`,
+  `&a[i]`, `a[i].inc()` (pointer-receiver auto-ref) and `xs[i].buf[lo..hi]`
+  emitted non-lvalue C (cc failure) or views of temporary copies. New
+  bounds-checked element-pointer `_at` helpers (same out-of-bounds exit-101
+  behaviour as `_get`) carry every index-place shape: nested chains,
+  compound `arr[i].f += e` (place read once, §27.3), write-through-`&`.
+
+- **Zero-length arrays lowered non-portably**: `[0]T` emitted `T data[0]`
+  (a GNU extension) with a `{0}` initializer (invalid C11 for an empty
+  aggregate) — gcc accepted, clang rejected. The typedef now reserves one
+  unreachable storage element; `.len` stays 0, bounds checks still panic.
+
+### Added
+- 311-file corpus + runner; 4 new emit_c unit pins (1013 unit + 48 e2e +
+  std suite all green, corpus verified under both gcc and clang).
+  LOC 58,043 → ~64,500.
+
 ## [0.154.0] — std wave 1: algorithms & data structures
 
 The embedded `std` grows 246 → 1,136 lines of in-language code (all
