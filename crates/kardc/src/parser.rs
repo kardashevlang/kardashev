@@ -441,6 +441,7 @@ impl<'a> Parser<'a> {
                 array_len: None,
                 pointer: true,
                 slice: false,
+                ctor_args: None,
                 span: start.merge(name_span),
             });
         }
@@ -461,6 +462,7 @@ impl<'a> Parser<'a> {
                     array_len: None,
                     pointer: false,
                     slice: true,
+                    ctor_args: None,
                     span: start.merge(name_span),
                 });
             }
@@ -475,6 +477,7 @@ impl<'a> Parser<'a> {
                 array_len: Some(size),
                 pointer: false,
                 slice: false,
+                ctor_args: None,
                 span: start.merge(name_span),
             });
         }
@@ -513,6 +516,7 @@ impl<'a> Parser<'a> {
                 array_len: None,
                 pointer: false,
                 slice: false,
+                ctor_args: None,
                 span: name_span.merge(payload_span),
             });
         }
@@ -528,6 +532,7 @@ impl<'a> Parser<'a> {
             array_len: None,
             pointer: false,
             slice: false,
+            ctor_args: None,
             span,
         })
     }

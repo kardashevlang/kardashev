@@ -168,6 +168,15 @@ pub struct TypeExpr {
     pub pointer: bool,
     /// True if written as `[]T` (a slice of `T`). v0.118.
     pub slice: bool,
+    /// `Some(args)` if written as `Name(A, B, …)` — a **generic type-constructor
+    /// application** directly in type position (v0.152, SPEC §31.4); `name` is
+    /// then the constructor. Each argument is itself a base type reference: a
+    /// bare name or a nested application (no `?`/`!`/`*`/`[]`/`[N]` argument
+    /// forms — the same restriction as alias arguments, §25.2). `None` for a
+    /// plain named type. Composes with the prefix forms (`?Name(A)`, `!Name(A)`,
+    /// `*Name(A)`, `[]Name(A)`, `[N]Name(A)`); never combined with the named
+    /// error-set form (`Set` in `Set!T` is always a plain name).
+    pub ctor_args: Option<Vec<TypeExpr>>,
     pub span: Span,
 }
 
@@ -612,6 +621,7 @@ pub(crate) mod fixtures {
             array_len: None,
             pointer: false,
             slice: false,
+            ctor_args: None,
             span: Span::DUMMY,
         }
     }
