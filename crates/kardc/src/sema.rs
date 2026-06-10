@@ -2111,6 +2111,19 @@ impl Checker {
         span: Span,
     ) {
         let mut covered: HashSet<i64> = HashSet::new();
+        // Every value already claimed by a label or range, as inclusive
+        // intervals (a value label is the interval `[v, v]`). Two arms (or two
+        // labels of one arm) claiming an overlapping value would lower to
+        // overlapping GNU `case` ranges — cc rejects that with its own raw
+        // error, so before v0.156 an overlap was a C-compile failure instead
+        // of a diagnostic (found by the conformance corpus, s39). Arm counts
+        // are small; the pairwise scan is fine.
+        let mut intervals: Vec<(i64, i64)> = Vec::new();
+        let overlaps = |lo: i64, hi: i64, ivs: &mut Vec<(i64, i64)>| -> bool {
+            let hit = ivs.iter().any(|&(a, b)| lo <= b && a <= hi);
+            ivs.push((lo, hi));
+            hit
+        };
         for arm in arms {
             for label in &arm.labels {
                 if let Some(v) = self.switch_int_label_value(scrut_ty, label) {
@@ -2120,7 +2133,27 @@ impl Checker {
                             "E0211",
                             format!("duplicate `switch` label `{}`", v),
                         );
+                    } else if overlaps(v, v, &mut intervals) {
+                        self.error(
+                            label.span(),
+                            "E0211",
+                            format!("`switch` label `{}` is already covered by a range", v),
+                        );
                     }
+                } else {
+                    // Unevaluable label: already diagnosed; keep scanning.
+                }
+            }
+            for &(lo, hi) in &arm.ranges {
+                if overlaps(lo, hi, &mut intervals) {
+                    self.error(
+                        arm.span,
+                        "E0211",
+                        format!(
+                            "`switch` range `{}..{}` overlaps an earlier label or range",
+                            lo, hi
+                        ),
+                    );
                 }
             }
             self.check_block(&arm.body);
@@ -4056,6 +4089,31 @@ impl Checker {
                         "E0110",
                         "`Allocator` values do not support comparison",
                     );
+                    return None;
+                }
+                // The remaining aggregates (slices, arrays, optionals, error
+                // unions, tagged unions) are not comparable either (§3:
+                // operands must be int/bool — §38 adds f64; enums compare by
+                // value §13; pointers compare by address §15). Before v0.156
+                // a slice operand slipped through to emit and died in cc with
+                // "invalid operands to binary ==" (found by the conformance
+                // corpus, s23) — diagnose it here like the other aggregates.
+                let aggregate = |t: Type| {
+                    matches!(
+                        t,
+                        Type::Slice(_)
+                            | Type::Array(_)
+                            | Type::Optional(_)
+                            | Type::ErrorUnion(_)
+                            | Type::Union(_)
+                    )
+                };
+                if aggregate(lt) || aggregate(rt) {
+                    let msg = format!(
+                        "`{}` values do not support comparison",
+                        self.type_name(if aggregate(lt) { lt } else { rt })
+                    );
+                    self.error(span, "E0110", msg);
                     return None;
                 }
                 if lt != rt {
