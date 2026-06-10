@@ -87,7 +87,11 @@
 //!   `struct { … }` type value used outside such a body (SPEC §25.2).
 //! - `E0311` — instantiating in a type alias (`const Alias = Name(C);`) a callee
 //!   that is not a type-constructor, or a type-constructor argument that does not
-//!   name a concrete type (SPEC §25.2).
+//!   name a concrete type (SPEC §25.2); a direct application `Name(A, …)`
+//!   (v0.152, SPEC §42.2) reports the same arity / argument errors.
+//! - `E0312` — a direct generic-type application `Name(A, …)` whose name is not
+//!   a registered type-constructor, or a type-constructor used in ordinary
+//!   *value* position (a generic type is not a value) (v0.152, SPEC §42.2).
 
 use std::collections::{HashMap, HashSet};
 
@@ -252,6 +256,18 @@ impl Checker {
 
     fn error(&mut self, span: Span, code: &'static str, message: impl Into<String>) {
         self.diags.push(Diagnostic::error(span, code, message));
+    }
+
+    /// Like [`error`](Self::error), but skipped when an *identical* diagnostic
+    /// (same span, code and message) was already reported. A type-constructor
+    /// application `Name(A, …)` (v0.152, SPEC §42.2) is resolved in both the
+    /// signature pass and the body pass, so a failing one would otherwise
+    /// report its `E0312`/`E0311` twice for the same source position.
+    fn error_once(&mut self, span: Span, code: &'static str, message: impl Into<String>) {
+        let d = Diagnostic::error(span, code, message);
+        if !self.diags.contains(&d) {
+            self.diags.push(d);
+        }
     }
 
     /// The source spelling of a type for diagnostics — struct types are named
@@ -598,7 +614,9 @@ impl Checker {
                 let declared = match &c.ty {
                     Some(te) => {
                         let d = self.resolve_type_opt(te);
-                        if d.is_none() {
+                        // A failed application annotation already reported its
+                        // own `E0312`/`E0311` (v0.152, SPEC §42.2).
+                        if d.is_none() && te.ctor_args.is_none() {
                             self.error(
                                 te.span,
                                 "E0100",
@@ -651,19 +669,8 @@ impl Checker {
 
         // Pass 2b (v0.138): now that free-function signatures (Pass 1) and
         // top-level consts (Pass 2) are registered, type-check the deferred
-        // generic-struct method bodies, so a method may reference both. Look the
-        // constructor up by name to recover its methods (its signatures were
-        // already registered during Pass 0d instantiation).
-        let pending = std::mem::take(&mut self.pending_ctor_methods);
-        for (ctor_name, id, msubst) in &pending {
-            if let Some(ctor) = self.type_ctors.get(ctor_name).cloned() {
-                if let Some(methods) = type_ctor_struct_methods(&ctor) {
-                    for f in methods {
-                        self.check_type_ctor_method(f, *id, msubst);
-                    }
-                }
-            }
-        }
+        // generic-struct method bodies, so a method may reference both.
+        self.drain_pending_ctor_methods();
 
         // Pass 3: type-check function and test bodies.
         for item in &m.items {
@@ -695,6 +702,12 @@ impl Checker {
                 ),
             }
         }
+
+        // Pass 3b (v0.152, SPEC §42.2): a body checked in Pass 3 may *lazily*
+        // instantiate a type-constructor application with no prior alias
+        // (`var l: ArrayList(i32)` / `ArrayList(i32).init(a)`), enqueueing its
+        // method bodies after the Pass-2b drain already ran; check them now.
+        self.drain_pending_ctor_methods();
     }
 
     fn check_func(&mut self, f: &Func) {
@@ -803,7 +816,11 @@ impl Checker {
     }
 
     /// Resolve a type name to a builtin or a registered struct, without
-    /// emitting a diagnostic. Returns `None` for an unknown name.
+    /// emitting a diagnostic. Returns `None` for an unknown name. (A
+    /// type-constructor application `Name(A, …)` — v0.152, SPEC §42.2 — is the
+    /// exception: its `E0312`/`E0311` diagnostics are emitted right here in
+    /// [`resolve_type_application`], so [`resolve_type`] skips its own `E0100`
+    /// for applications.)
     ///
     /// When the [`TypeExpr`] is written `?T` (`optional`), the inner type is
     /// resolved first and the result is `Type::Optional(intern_optional(inner))`
@@ -817,13 +834,22 @@ impl Checker {
     /// here; the result is still a valid (zero-length) array type so callers do
     /// not additionally flag the name as unknown.
     fn resolve_type_opt(&mut self, te: &TypeExpr) -> Option<Type> {
-        // A bound type parameter (under the active substitution, SPEC §17.2)
-        // takes priority over the ordinary name lookup; otherwise this is the
+        // A type-constructor application `Name(A, …)` (v0.152, SPEC §42.2)
+        // instantiates the constructor at its recursively-resolved arguments;
+        // otherwise a bound type parameter (under the active substitution, SPEC
+        // §17.2) takes priority over the ordinary name lookup, then this is the
         // normal builtin / struct / enum resolution. During the normal pass the
         // substitution is empty, so behaviour is unchanged.
-        let inner = match self.subst.get(&te.name).copied() {
-            Some(t) => t,
-            None => self.resolve_base(&te.name)?,
+        let inner = if te.ctor_args.is_some() {
+            // Cloned for the same `&mut self` reason as `value_subst` below;
+            // empty (a no-cost clone) outside generic bodies.
+            let subst = self.subst.clone();
+            self.resolve_type_application(te, &subst)?
+        } else {
+            match self.subst.get(&te.name).copied() {
+                Some(t) => t,
+                None => self.resolve_base(&te.name)?,
+            }
         };
         // The (small) value substitution is cloned so `wrap_type` can borrow it
         // while still taking `&mut self` for array interning. It is empty during
@@ -843,9 +869,17 @@ impl Checker {
         subst: &HashMap<String, Type>,
         value_subst: &HashMap<String, i64>,
     ) -> Option<Type> {
-        let inner = match subst.get(&te.name).copied() {
-            Some(t) => t,
-            None => self.resolve_base(&te.name)?,
+        // An application resolves its arguments under the *explicit*
+        // substitution (v0.152, SPEC §42.2), so a nested application inside a
+        // type-constructor body (`items: ArrayList(T)`) or a generic signature
+        // instantiates per monomorphisation (generic composition).
+        let inner = if te.ctor_args.is_some() {
+            self.resolve_type_application(te, subst)?
+        } else {
+            match subst.get(&te.name).copied() {
+                Some(t) => t,
+                None => self.resolve_base(&te.name)?,
+            }
         };
         Some(self.wrap_type(inner, te, value_subst))
     }
@@ -974,7 +1008,12 @@ impl Checker {
         match self.resolve_type_opt(te) {
             Some(t) => Some(t),
             None => {
-                self.error(te.span, "E0100", format!("unknown type `{}`", te.name));
+                // A failed application (`ctor_args: Some`) already reported its
+                // own `E0312`/`E0311` inside `resolve_type_application` (v0.152,
+                // SPEC §42.2); a second `unknown type` here would only cascade.
+                if te.ctor_args.is_none() {
+                    self.error(te.span, "E0100", format!("unknown type `{}`", te.name));
+                }
                 None
             }
         }
@@ -1089,69 +1128,201 @@ impl Checker {
     }
 
     /// Instantiate a type-constructor for a type alias `const Alias = Name(C, …);`
-    /// (SPEC §25.2 / §31.1). The call must pass **exactly as many** type
-    /// arguments as the constructor has type parameters (`E0311` otherwise);
-    /// each must resolve to a concrete type (`E0311` otherwise). The constructor
-    /// is instantiated at those types (a monomorphised struct, memoised on the
-    /// argument tuple) and the alias is bound to it.
+    /// (SPEC §25.2 / §31.1). The arity / argument checks and the memoised
+    /// instantiation are shared with the v0.152 application forms via
+    /// [`instantiate_application_expr`] (SPEC §42.2 — alias initializers thereby
+    /// also accept nested-application arguments); on success the alias is bound
+    /// to the monomorphised struct in the [`StructTable`] (the single source of
+    /// truth shared with the backend) so an alias name resolves in emitted
+    /// types + struct literals (v0.129). On a failed instantiation (`E0311`
+    /// already emitted) the alias stays unbound, matching the v0.129 behaviour.
     fn instantiate_alias(&mut self, alias_name: &str, ctor_name: &str, args: &[Expr], span: Span) {
-        let ctor = match self.type_ctors.get(ctor_name) {
+        if let Some(id) = self.instantiate_application_expr(ctor_name, args, span) {
+            self.structs.add_alias(alias_name, Type::Struct(id));
+        }
+    }
+
+    /// Instantiate a type-constructor application written with **expression**
+    /// arguments (v0.152, SPEC §42.2): the associated-call receiver
+    /// `ArrayList(i32).init(a)` (which parses as an ordinary `Expr::Call`), the
+    /// `const Alias = Name(C, …);` initializer, and nested application
+    /// arguments all route here. The call must pass **exactly as many** type
+    /// arguments as the constructor has type parameters (`E0311` otherwise);
+    /// each must resolve to a concrete type (`E0311` otherwise, via
+    /// [`resolve_alias_type_arg`]). Returns the §25.2-memoised monomorphised
+    /// struct id, so every spelling of the same `(constructor, argument tuple)`
+    /// shares one struct. The caller guarantees `callee` is a registered
+    /// type-constructor.
+    fn instantiate_application_expr(
+        &mut self,
+        callee: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<u32> {
+        let ctor = match self.type_ctors.get(callee) {
             Some(f) => f.clone(),
-            None => return, // unreachable: the caller checked membership
+            None => return None, // unreachable: the caller checked membership
         };
         // A valid type-constructor's parameters are all `comptime _: type`, so
         // the parameter count is the expected type-argument count (a malformed
         // constructor — already `E0310` — still uses its parameter count, so a
-        // dependent alias degrades gracefully rather than cascading).
+        // dependent use degrades gracefully rather than cascading).
         let nparams = ctor.params.len();
         if args.len() != nparams {
             let msg = format!(
                 "type-constructor `{}` takes {} type argument{}, found {}",
-                ctor_name,
+                callee,
                 nparams,
                 if nparams == 1 { "" } else { "s" },
                 args.len()
             );
             self.error(span, "E0311", msg);
-            return;
+            return None;
         }
         // Resolve every argument to a concrete type, in parameter order. A
-        // non-type argument is `E0311` (already emitted); bail without binding
-        // the alias (matching the single-argument v0.129 behaviour).
+        // non-type argument is `E0311` (already emitted); bail without
+        // instantiating (matching the single-argument v0.129 behaviour).
         let mut concretes: Vec<Type> = Vec::with_capacity(nparams);
         for arg in args {
-            match self.resolve_alias_type_arg(arg) {
-                Some(t) => concretes.push(t),
-                None => return, // `E0311` already emitted
-            }
+            concretes.push(self.resolve_alias_type_arg(arg)?);
         }
-        let id = self.instantiate_type_ctor(ctor_name, &ctor, &concretes);
-        // Record the alias in the StructTable (the single source of truth shared
-        // with the backend) so an alias name resolves in emitted types + struct
-        // literals (v0.129).
-        self.structs.add_alias(alias_name, Type::Struct(id));
+        Some(self.instantiate_type_ctor(callee, &ctor, &concretes))
     }
 
-    /// Resolve one type-constructor argument (SPEC §25.2 / §31.1): it must be an
-    /// identifier naming a concrete type — a builtin, a struct/enum/union, or
-    /// another type alias (all via [`resolve_base`]). Anything else is `E0311`.
+    /// Resolve one type-constructor argument written as an *expression* (SPEC
+    /// §25.2 / §31.1 / §42.2): an identifier naming a concrete type — a bound
+    /// type parameter (under the active substitution, so `ArrayList(T).init(…)`
+    /// resolves inside a generic body, v0.152), a builtin, a struct/enum/union,
+    /// or another type alias (via [`resolve_base`]) — or a **nested
+    /// application** `List(List(i32))` (v0.152, SPEC §42.2; alias initializers
+    /// thereby also gain nested-application arguments). Anything else is
+    /// `E0311`; a nested call whose callee is not a type-constructor is `E0312`.
     fn resolve_alias_type_arg(&mut self, arg: &Expr) -> Option<Type> {
         match arg {
-            Expr::Ident { name, span } => match self.resolve_base(name) {
-                Some(t) => Some(t),
-                None => {
-                    let msg =
-                        format!("type-constructor argument `{}` does not name a type", name);
-                    self.error(*span, "E0311", msg);
+            Expr::Ident { name, span } => {
+                match self
+                    .subst
+                    .get(name)
+                    .copied()
+                    .or_else(|| self.resolve_base(name))
+                {
+                    Some(t) => Some(t),
+                    None => {
+                        let msg =
+                            format!("type-constructor argument `{}` does not name a type", name);
+                        self.error(*span, "E0311", msg);
+                        None
+                    }
+                }
+            }
+            // v0.152 (SPEC §42.2): a nested application argument. The callee
+            // must itself be a type-constructor (`E0312` otherwise — the same
+            // diagnostic as a non-constructor application in type position).
+            Expr::Call { callee, args, span } => {
+                if self.type_ctors.contains_key(callee) {
+                    self.instantiate_application_expr(callee, args, *span)
+                        .map(Type::Struct)
+                } else {
+                    let msg = format!(
+                        "`{}` is not a generic type (no type-constructor of that name)",
+                        callee
+                    );
+                    self.error(*span, "E0312", msg);
                     None
                 }
-            },
+            }
             other => {
                 self.error(
                     other.span(),
                     "E0311",
                     "a type-constructor argument must be an identifier naming a type",
                 );
+                None
+            }
+        }
+    }
+
+    /// Resolve a generic type-constructor **application** written directly in
+    /// type position — a [`TypeExpr`] whose `ctor_args` is `Some` (`Name(A, B,
+    /// …)`, v0.152, SPEC §42.2). `subst` is the active type-parameter
+    /// substitution, so `ArrayList(T)` inside a generic function or another
+    /// type-constructor body instantiates per monomorphisation.
+    ///
+    /// The name must be a registered type-constructor (anything else is
+    /// `E0312`); the arity check mirrors [`instantiate_application_expr`]
+    /// (`E0311`, same message text). Each argument — a bare name or a nested
+    /// application — resolves via [`resolve_application_arg`]. The §25.2
+    /// instantiation is memoised by the mangled `Ctor__<tag>…` name, so an
+    /// application and an alias of the same `(constructor, argument tuple)`
+    /// share one struct id. The caller applies the ordinary
+    /// `?`/`!`/`*`/`[]`/`[N]` wrappers on top. (Plain-struct *fields* resolve
+    /// in Pass 0b, before constructors are collected, and do not route here —
+    /// application-typed fields are supported in generic structs only, §42.4.)
+    /// Errors use [`error_once`](Self::error_once): a signature's application
+    /// is resolved again when its body is checked, and an identical diagnostic
+    /// for the same source position must not repeat.
+    fn resolve_type_application(
+        &mut self,
+        te: &TypeExpr,
+        subst: &HashMap<String, Type>,
+    ) -> Option<Type> {
+        let args = te.ctor_args.as_ref()?; // caller guarantees `Some`
+        let ctor = match self.type_ctors.get(&te.name) {
+            Some(f) => f.clone(),
+            None => {
+                let msg = format!(
+                    "`{}` is not a generic type (no type-constructor of that name)",
+                    te.name
+                );
+                self.error_once(te.span, "E0312", msg);
+                return None;
+            }
+        };
+        let nparams = ctor.params.len();
+        if args.len() != nparams {
+            let msg = format!(
+                "type-constructor `{}` takes {} type argument{}, found {}",
+                te.name,
+                nparams,
+                if nparams == 1 { "" } else { "s" },
+                args.len()
+            );
+            self.error_once(te.span, "E0311", msg);
+            return None;
+        }
+        let mut concretes: Vec<Type> = Vec::with_capacity(nparams);
+        for arg in args {
+            concretes.push(self.resolve_application_arg(arg, subst)?);
+        }
+        Some(Type::Struct(self.instantiate_type_ctor(&te.name, &ctor, &concretes)))
+    }
+
+    /// Resolve one *type-position* application argument (v0.152, SPEC §42.2): a
+    /// nested application recurses through [`resolve_type_application`]
+    /// (which reports its own diagnostics); a bare name resolves through the
+    /// active substitution `subst` first (a type parameter), then
+    /// [`resolve_base`]. An unknown bare name is `E0311` (the same message as
+    /// the §25.2 alias-argument rule).
+    fn resolve_application_arg(
+        &mut self,
+        arg: &TypeExpr,
+        subst: &HashMap<String, Type>,
+    ) -> Option<Type> {
+        if arg.ctor_args.is_some() {
+            return self.resolve_type_application(arg, subst);
+        }
+        match subst
+            .get(&arg.name)
+            .copied()
+            .or_else(|| self.resolve_base(&arg.name))
+        {
+            Some(t) => Some(t),
+            None => {
+                let msg = format!(
+                    "type-constructor argument `{}` does not name a type",
+                    arg.name
+                );
+                self.error_once(arg.span, "E0311", msg);
                 None
             }
         }
@@ -1208,11 +1379,16 @@ impl Checker {
                 let fty = match self.resolve_type_opt_with(&f.ty, &subst, &HashMap::new()) {
                     Some(t) => t,
                     None => {
-                        let msg = format!(
-                            "unknown type `{}` in generic struct `{}`",
-                            f.ty.name, ctor_name
-                        );
-                        self.error(f.ty.span, "E0161", msg);
+                        // A failed application field type already reported its
+                        // own `E0312`/`E0311` (v0.152, SPEC §42.2); only a plain
+                        // unknown name gets the `E0161`.
+                        if f.ty.ctor_args.is_none() {
+                            let msg = format!(
+                                "unknown type `{}` in generic struct `{}`",
+                                f.ty.name, ctor_name
+                            );
+                            self.error(f.ty.span, "E0161", msg);
+                        }
                         Type::I64
                     }
                 };
@@ -1364,6 +1540,32 @@ impl Checker {
         self.loop_depth = saved_loop;
         self.loop_labels = saved_loop_labels;
         self.scopes = saved_scopes;
+    }
+
+    /// Drain [`pending_ctor_methods`](Self::pending_ctor_methods): type-check
+    /// every deferred generic-struct method body (v0.138), looking the
+    /// constructor up by name to recover its methods (their signatures were
+    /// already registered at instantiation). Loops until the queue is empty
+    /// because checking one method body may itself instantiate a further
+    /// type-constructor application (`ArrayList(T)` in a method body, v0.152)
+    /// and so **enqueue new pending entries** — a single `mem::take` would
+    /// silently skip those second-round instances (SPEC §42.2,
+    /// instantiation-ordering note). Called after Pass 2 (so bodies may
+    /// reference top-level consts + free functions) and again after Pass 3 (an
+    /// application with no prior alias first instantiates inside a body).
+    fn drain_pending_ctor_methods(&mut self) {
+        while !self.pending_ctor_methods.is_empty() {
+            let pending = std::mem::take(&mut self.pending_ctor_methods);
+            for (ctor_name, id, msubst) in &pending {
+                if let Some(ctor) = self.type_ctors.get(ctor_name).cloned() {
+                    if let Some(methods) = type_ctor_struct_methods(&ctor) {
+                        for f in methods {
+                            self.check_type_ctor_method(f, *id, msubst);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ---- statements -------------------------------------------------------
@@ -3300,12 +3502,16 @@ impl Checker {
     }
 
     /// Type-check a method / associated-function call `receiver.method(args)`
-    /// (SPEC §10). Resolution has two shapes:
+    /// (SPEC §10). Resolution has three shapes:
     ///
     /// - **(b) associated/static call** — `receiver` is an [`Expr::Ident`] that
     ///   names a struct *type* and is not a value in scope: bind `args` to *all*
     ///   of the function's parameters (so `Counter.get(c)` is the explicit-self
     ///   form and `Counter.zero()` the static form).
+    /// - **(b') application associated call** — `receiver` is an [`Expr::Call`]
+    ///   whose callee names a type-constructor (`ArrayList(i32).init(a)`,
+    ///   v0.152, SPEC §42.2): instantiate the application (memoised) and treat
+    ///   it as case (b) on the resulting struct.
     /// - **(a) method call** — otherwise `receiver` is evaluated as a value; it
     ///   must have a struct type, the resolved function must be a method (first
     ///   parameter `self`), and `args` bind to the parameters *after* `self`.
@@ -3337,6 +3543,35 @@ impl Checker {
                 if let Some(id) = static_id {
                     return self.check_static_call(id, name, method, args, span);
                 }
+            }
+        }
+        // Case (b'), v0.152 (SPEC §42.2): a type-constructor **application**
+        // receiver — `ArrayList(i32).init(a)`, which parses as a method call on
+        // an ordinary `Expr::Call`. When the callee names a type-constructor,
+        // the call's value-argument list is resolved as *type* arguments
+        // (identifiers or nested applications, the §25.2 rule), the instance is
+        // instantiated (memoised — shared with the alias / type-position forms)
+        // and the call proceeds as a static call on it, exactly like the
+        // Ident-alias case above. A call whose callee is NOT a type-constructor
+        // falls through to the value path (case a) unchanged, so a real
+        // function's result still chains: `make().method()`.
+        if let Expr::Call { callee, args: type_args, span: app_span } = receiver {
+            if self.type_ctors.contains_key(callee) {
+                return match self.instantiate_application_expr(callee, type_args, *app_span) {
+                    Some(id) => {
+                        // Diagnostics name the instance by its interned
+                        // (mangled) struct name — the same spelling `type_name`
+                        // uses for it everywhere else.
+                        let sname = self.structs.get(id).name.clone();
+                        self.check_static_call(id, &sname, method, args, span)
+                    }
+                    None => {
+                        // The application's own `E0311` was already emitted;
+                        // still surface diagnostics in the value arguments.
+                        self.check_args_for_recovery(args);
+                        None
+                    }
+                };
             }
         }
         // Case (a): evaluate the receiver as a value; it must be a struct or a
@@ -4185,6 +4420,23 @@ impl Checker {
                 Some(Type::Void)
             }
             _ => {
+                // v0.152 (SPEC §42.2): a type-constructor application in
+                // ordinary *value* position — `var x = ArrayList(i32);`,
+                // `print(Box(i32))` — is `E0312`. The associated-call receiver
+                // form never reaches here (`check_method_call` intercepts it),
+                // and a type-constructor name never collides with a value
+                // function (Pass 1 skips type-constructors), so this lookup is
+                // unambiguous. The arguments are (intended) type names, not
+                // values, so they are not value-checked.
+                if self.type_ctors.contains_key(callee) {
+                    let msg = format!(
+                        "a generic type is not a value; use it in type position or call an \
+                         associated function (`{}(…).init(…)`)",
+                        callee
+                    );
+                    self.error(span, "E0312", msg);
+                    return None;
+                }
                 // A generic function (any `comptime` type parameter) resolves
                 // through monomorphisation, never the ordinary signature path
                 // (SPEC §17.2). Its first arguments are type arguments, not
@@ -4606,10 +4858,10 @@ fn needs_inference_context(e: &Expr) -> bool {
 mod tests {
     use super::*;
     use crate::ast::fixtures::{
-        arr_param_ty as te_arr_param, arr_ty as te_arr, bin, block, call, catch_capture_expr,
-        catch_expr, err_ty as te_err, error_lit, ident, int, null as null_lit, opt_ty as te_opt,
-        orelse, ptr_ty as te_ptr, set_err_ty as te_err_set, slice_ty as te_slice, try_expr,
-        ty as te, unwrap,
+        app_ty, arr_param_ty as te_arr_param, arr_ty as te_arr, bin, block, call,
+        catch_capture_expr, catch_expr, err_ty as te_err, error_lit, ident, int,
+        null as null_lit, opt_ty as te_opt, orelse, ptr_ty as te_ptr, set_err_ty as te_err_set,
+        slice_ty as te_slice, try_expr, ty as te, unwrap,
     };
     use crate::ast::{
         ConstDecl, EnumDecl, EnumVariant, ErrorSetDecl, FieldDecl, FieldInit, Func, Param,
@@ -10408,6 +10660,415 @@ mod tests {
         assert!(table.id_of("List__int64_t").is_some());
         // Two distinct instances recorded.
         assert_eq!(table.struct_instances().len(), 2);
+    }
+
+    // ---- direct generic-type application `Name(T)` (v0.152, SPEC §42) -----
+
+    /// A parameter with an arbitrary [`TypeExpr`] (e.g. an application
+    /// `Box(i32)`): `name: ty`.
+    fn param_te(name: &str, ty: TypeExpr) -> Param {
+        Param {
+            name: name.into(),
+            ty,
+            is_comptime: false,
+            span: sp(),
+        }
+    }
+    /// `var name: ty = value;` with an arbitrary [`TypeExpr`] annotation.
+    fn let_var_te(name: &str, ty: TypeExpr, value: Expr) -> Stmt {
+        Stmt::Let {
+            is_const: false,
+            name: name.into(),
+            ty: Some(ty),
+            value,
+            span: sp(),
+        }
+    }
+
+    #[test]
+    fn application_in_type_position_shares_struct_id_with_alias() {
+        // const IB = Box(i32);
+        // fn make() Box(i32) { return IB{ .v = 1 }; }   ← application return type
+        // fn take(b: Box(i32)) i32 { return b.v; }      ← application param type
+        // The application and the alias must agree on ONE struct id, or the
+        // `IB{…}` literal would mismatch the `Box(i32)` return type.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            const_item_infer("IB", call("Box", vec![ident("i32")])),
+            func_te(
+                "make",
+                vec![],
+                app_ty("Box", vec![te("i32")]),
+                vec![ret(Some(struct_lit("IB", vec![("v", int(1))])))],
+            ),
+            func(
+                "take",
+                vec![param_te("b", app_ty("Box", vec![te("i32")]))],
+                "i32",
+                vec![ret(Some(field(ident("b"), "v")))],
+            ),
+        ];
+        let table = check_ok(items);
+        assert!(table.id_of("Box__int32_t").is_some());
+    }
+
+    #[test]
+    fn application_arity_mismatch_is_e0311() {
+        // fn f(x: Box(i32, i64)) void {}  → `Box` takes 1 type argument.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            func(
+                "f",
+                vec![param_te("x", app_ty("Box", vec![te("i32"), te("i64")]))],
+                "void",
+                vec![],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0311"));
+    }
+
+    #[test]
+    fn application_of_non_constructor_is_e0312() {
+        // struct Point { x: i32 }   fn f(p: Point(i32)) void {}  → a plain
+        // struct is not a generic type.
+        let items = vec![
+            struct_item("Point", vec![("x", "i32")]),
+            func(
+                "f",
+                vec![param_te("p", app_ty("Point", vec![te("i32")]))],
+                "void",
+                vec![],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0312"));
+    }
+
+    #[test]
+    fn application_of_unknown_name_is_e0312() {
+        // fn f(p: Nope(i32)) void {}  → no type-constructor of that name.
+        let items = vec![func(
+            "f",
+            vec![param_te("p", app_ty("Nope", vec![te("i32")]))],
+            "void",
+            vec![],
+        )];
+        assert!(codes(items).contains(&"E0312"));
+    }
+
+    #[test]
+    fn application_unknown_argument_is_e0311_without_e0100_cascade() {
+        // fn main() void { var x: Box(Nope) = 1; }  → the argument names no
+        // type (E0311); the failed application must NOT also report the plain
+        // `unknown type` E0100 for `Box`.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var_te("x", app_ty("Box", vec![te("Nope")]), int(1))],
+            ),
+        ];
+        let cs = codes(items);
+        assert!(cs.contains(&"E0311"));
+        assert!(!cs.contains(&"E0100"));
+    }
+
+    #[test]
+    fn nested_application_resolves() {
+        // fn f(b: Box(Box(i32))) i32 { return b.v.v; }
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            func(
+                "f",
+                vec![param_te(
+                    "b",
+                    app_ty("Box", vec![app_ty("Box", vec![te("i32")])]),
+                )],
+                "i32",
+                vec![ret(Some(field(field(ident("b"), "v"), "v")))],
+            ),
+        ];
+        let table = check_ok(items);
+        // Both the inner and the outer instantiation exist, with the §25.2
+        // mangle (the same names the alias-of-alias form produces).
+        let inner = table.id_of("Box__int32_t").unwrap();
+        let outer = table.id_of("Box__struct_Box__int32_t").unwrap();
+        assert_eq!(
+            table.get(outer).fields,
+            vec![("v".to_string(), Type::Struct(inner))]
+        );
+    }
+
+    #[test]
+    fn application_under_substitution_is_generic_composition() {
+        // fn Box(comptime T: type) type { return struct { v: T }; }
+        // fn Wrap(comptime T: type) type { return struct { inner: Box(T) }; }
+        // const WI = Wrap(i32);
+        // fn f(w: WI) i32 { return w.inner.v; }
+        // The application field `Box(T)` resolves under the type-constructor's
+        // parameter substitution, so `Wrap(i32)` composes `Box(i32)`.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            Item::Func(raw_func(
+                "Wrap",
+                vec![param_comptime("T")],
+                "type",
+                vec![ret(Some(struct_type_expr_te(vec![(
+                    "inner",
+                    app_ty("Box", vec![te("T")]),
+                )])))],
+            )),
+            const_item_infer("WI", call("Wrap", vec![ident("i32")])),
+            func(
+                "f",
+                vec![param("w", "WI")],
+                "i32",
+                vec![ret(Some(field(field(ident("w"), "inner"), "v")))],
+            ),
+        ];
+        let table = check_ok(items);
+        let bid = table.id_of("Box__int32_t").unwrap();
+        let wid = table.id_of("Wrap__int32_t").unwrap();
+        assert_eq!(
+            table.get(wid).fields,
+            vec![("inner".to_string(), Type::Struct(bid))]
+        );
+    }
+
+    #[test]
+    fn assoc_call_on_application_typechecks_and_shares_instance() {
+        // fn List(comptime T: type) type {
+        //   return struct { v: T, fn get(self: Self) T { return self.v; } };
+        // }
+        // const IL = List(i32);
+        // fn f(l: IL) i32 { return List(i32).get(l); }  ← application receiver,
+        // explicit-self static form; its return type is the substituted `i32`.
+        let get = raw_func(
+            "get",
+            vec![param("self", "Self")],
+            "T",
+            vec![ret(Some(field(ident("self"), "v")))],
+        );
+        let items = vec![
+            type_ctor_m("List", "T", vec![("v", te("T"))], vec![get]),
+            const_item_infer("IL", call("List", vec![ident("i32")])),
+            func(
+                "f",
+                vec![param("l", "IL")],
+                "i32",
+                vec![ret(Some(method_call(
+                    call("List", vec![ident("i32")]),
+                    "get",
+                    vec![ident("l")],
+                )))],
+            ),
+        ];
+        let table = check_ok(items);
+        // The alias and the application share ONE memoised instance (passing
+        // an `IL` as the explicit `self` of `List(i32).get` already pins the
+        // shared struct id).
+        assert_eq!(table.struct_instances().len(), 1);
+    }
+
+    #[test]
+    fn assoc_call_on_application_without_alias_typechecks() {
+        // fn List(comptime T: type) type {
+        //   return struct { v: T, fn mk(x: T) Self { return Self{ .v = x }; } };
+        // }
+        // fn f() i32 { var b = List(i32).mk(7); return b.v; }
+        // No alias anywhere: the application instantiates lazily during the
+        // body pass (Pass 3) and its method bodies are checked by the
+        // post-Pass-3 drain (SPEC §42.2).
+        let mk = raw_func(
+            "mk",
+            vec![param("x", "T")],
+            "Self",
+            vec![ret(Some(struct_lit("Self", vec![("v", ident("x"))])))],
+        );
+        let items = vec![
+            type_ctor_m("List", "T", vec![("v", te("T"))], vec![mk]),
+            func(
+                "f",
+                vec![],
+                "i32",
+                vec![
+                    let_var_infer(
+                        "b",
+                        method_call(call("List", vec![ident("i32")]), "mk", vec![int(7)]),
+                    ),
+                    ret(Some(field(ident("b"), "v"))),
+                ],
+            ),
+        ];
+        let table = check_ok(items);
+        assert!(table.id_of("List__int32_t").is_some());
+    }
+
+    #[test]
+    fn application_in_value_position_is_e0312() {
+        // fn main() void { var x = Box(i32); }  → a generic type is not a value.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var_infer("x", call("Box", vec![ident("i32")]))],
+            ),
+        ];
+        assert!(codes(items).contains(&"E0312"));
+    }
+
+    #[test]
+    fn pending_method_drain_processes_second_round_instances() {
+        // fn Inner(comptime T: type) type {
+        //   return struct {
+        //     v: T,
+        //     fn mk(x: T) Self { return Self{ .v = x }; }
+        //     fn bad(self: Self) i32 { return true; }   ← a body type error
+        //   };
+        // }
+        // fn Outer(comptime T: type) type {
+        //   return struct {
+        //     w: T,
+        //     fn go(self: Self) i32 { var b = Inner(i32).mk(7); return b.v; }
+        //   };
+        // }
+        // const O = Outer(i64);
+        // Checking `Outer`'s method during the pending drain instantiates
+        // `Inner(i32)`, enqueueing a SECOND round of pending method bodies; the
+        // drain must loop so `bad`'s `return true;` mismatch (E0110) surfaces.
+        let mk = raw_func(
+            "mk",
+            vec![param("x", "T")],
+            "Self",
+            vec![ret(Some(struct_lit("Self", vec![("v", ident("x"))])))],
+        );
+        let bad = raw_func(
+            "bad",
+            vec![param("self", "Self")],
+            "i32",
+            vec![ret(Some(boolean(true)))],
+        );
+        let go = raw_func(
+            "go",
+            vec![param("self", "Self")],
+            "i32",
+            vec![
+                let_var_infer(
+                    "b",
+                    method_call(call("Inner", vec![ident("i32")]), "mk", vec![int(7)]),
+                ),
+                ret(Some(field(ident("b"), "v"))),
+            ],
+        );
+        let items = vec![
+            type_ctor_m("Inner", "T", vec![("v", te("T"))], vec![mk, bad]),
+            type_ctor_m("Outer", "T", vec![("w", te("T"))], vec![go]),
+            const_item_infer("O", call("Outer", vec![ident("i64")])),
+        ];
+        assert!(codes(items).contains(&"E0110"));
+    }
+
+    #[test]
+    fn call_result_method_chain_still_resolves_as_value() {
+        // fn mk() P { … }   fn f() i32 { return mk().getx(); }  — a receiver
+        // call whose callee is NOT a type-constructor stays on the value path.
+        let getx = raw_func(
+            "getx",
+            vec![param("self", "P")],
+            "i32",
+            vec![ret(Some(field(ident("self"), "x")))],
+        );
+        let items = vec![
+            struct_item_m("P", vec![("x", "i32")], vec![getx]),
+            func(
+                "mk",
+                vec![],
+                "P",
+                vec![ret(Some(struct_lit("P", vec![("x", int(3))])))],
+            ),
+            func(
+                "f",
+                vec![],
+                "i32",
+                vec![ret(Some(method_call(call("mk", vec![]), "getx", vec![])))],
+            ),
+        ];
+        assert!(codes(items).is_empty());
+    }
+
+    #[test]
+    fn optional_wraps_an_application() {
+        // fn main() void { var x: ?Box(i32) = null; }  — the ordinary `?`
+        // prefix composes on top of the application (SPEC §42.1).
+        let opt_app = TypeExpr {
+            optional: true,
+            ..app_ty("Box", vec![te("i32")])
+        };
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var_te("x", opt_app, null_lit())],
+            ),
+        ];
+        check_ok(items);
+    }
+
+    #[test]
+    fn alias_initializer_accepts_nested_application_argument() {
+        // const BB = Box(Box(i32));  — the alias path shares the application
+        // argument rule, so a nested application now works there too.
+        let items = vec![
+            type_ctor("Box", "T", vec![("v", "T")]),
+            const_item_infer("BB", call("Box", vec![call("Box", vec![ident("i32")])])),
+        ];
+        let table = check_ok(items);
+        assert!(table.id_of("Box__struct_Box__int32_t").is_some());
+    }
+
+    #[test]
+    fn assoc_call_application_in_generic_fn_body_uses_substitution() {
+        // fn Box(comptime T: type) type {
+        //   return struct { v: T, fn mk(x: T) Self { return Self{ .v = x }; } };
+        // }
+        // fn g(comptime T: type, x: T) T { var b = Box(T).mk(x); return b.v; }
+        // fn main() void { var y: i32 = g(i32, 7); }
+        // `Box(T)` as an associated-call receiver resolves `T` through the
+        // generic instantiation's active substitution (T → i32).
+        let mk = raw_func(
+            "mk",
+            vec![param("x", "T")],
+            "Self",
+            vec![ret(Some(struct_lit("Self", vec![("v", ident("x"))])))],
+        );
+        let items = vec![
+            type_ctor_m("Box", "T", vec![("v", te("T"))], vec![mk]),
+            func(
+                "g",
+                vec![param_comptime("T"), param("x", "T")],
+                "T",
+                vec![
+                    let_var_infer(
+                        "b",
+                        method_call(call("Box", vec![ident("T")]), "mk", vec![ident("x")]),
+                    ),
+                    ret(Some(field(ident("b"), "v"))),
+                ],
+            ),
+            func(
+                "main",
+                vec![],
+                "void",
+                vec![let_var("y", "i32", call("g", vec![ident("i32"), int(7)]))],
+            ),
+        ];
+        let table = check_ok(items);
+        assert!(table.id_of("Box__int32_t").is_some());
     }
 
     // ---- multiple type parameters for type-constructors (v0.135, §31) -----

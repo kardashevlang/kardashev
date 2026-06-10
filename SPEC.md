@@ -1003,9 +1003,11 @@ functions); `Expr::StructType` therefore never reaches the backend. Type-alias
 ordinary C struct typedefs (in dependency order) and used like any struct.
 
 ### 25.4 Deferred (honest)
-Multiple type parameters, comptime-value type-constructor params, and direct
-`Name(T)` / `Name(T){…}` in type / literal position (use a `const` type alias) —
-all later work. (Methods inside a generic struct land in v0.130.)
+Multiple type parameters (landed v0.135, §31), comptime-value type-constructor
+params, and direct `Name(T)` / `Name(T){…}` in type / literal position — the
+type-position and associated-call forms landed in v0.152 (§42); the literal
+form `Name(T){…}` remains deferred. (Methods inside a generic struct land in
+v0.130.)
 
 ## 26. Generic-struct methods + `ArrayList(T)` (v0.130)
 
@@ -1419,3 +1421,90 @@ failure) and `kd_read_line(kd_allocator) -> kd_slice_uint8_t` (`getchar` loop to
 a `\n`/EOF), both `malloc`-backed (the allocator is the malloc-backed stub,
 §16.2; the result is freeable with `free(a, slice)`). Emitted only when used.
 `@readFile(a, p)` → `kd_read_file((a), (p))`; `@readLine(a)` → `kd_read_line((a))`.
+
+## 42. Direct generic-type application `Name(T)` (v0.152)
+
+The v0.129 alias requirement falls: a generic type-constructor may be applied
+**directly in type position** and as the **receiver of an associated call**,
+without declaring a `const` type alias first:
+
+```zig
+var l: ArrayList(i32) = ArrayList(i32).init(a);
+var m: HashMap(i64) = HashMap(i64).init(a);
+fn Stack(comptime T: type) type {
+    return struct { items: ArrayList(T) };  // nested application — generic composition
+}
+```
+
+`const L = ArrayList(i32);` aliases keep working unchanged (§25.2).
+
+### 42.1 Syntax & AST
+- In **type position**, a plain base name may be followed by a parenthesised
+  type-argument list: `Name(A, B, …)`. `TypeExpr` gains `ctor_args:
+  Option<Vec<TypeExpr>>` — `Some(args)` for an application (`name` is the
+  constructor), `None` for a plain named type. Each argument is itself a *base*
+  type reference: a bare name or a **nested application** (`ArrayList(
+  ArrayList(i32))`); the `?`/`!`/`*`/`[]`/`[N]` argument forms are **not**
+  accepted (the same restriction as alias arguments, §25.2 — `E0311`-shaped
+  recovery applies: the argument parse expects an identifier).
+- The application **composes with every prefix form**: `?Name(A)`, `!Name(A)`,
+  `Set!Name(A)` (the payload), `*Name(A)`, `[]Name(A)`, `[N]Name(A)`. It is
+  never an error *set* (`Set` in `Set!T` is always a plain name) and `@This()`
+  never takes arguments. In type position a `(` after a base name is
+  unambiguous — no legal type is followed by `(`.
+- In **expression position** there is no new syntax: `ArrayList(i32).init(a)`
+  already parses as `Expr::MethodCall{ receiver: Expr::Call{ callee:
+  "ArrayList", args: [Ident("i32")] }, method: "init", … }`. v0.152 gives that
+  shape *meaning* (§42.2). The struct-literal form `Name(T){ .f = v }` stays
+  deferred (§42.4).
+
+### 42.2 Semantics (`sema`)
+- **Type position**: resolving a `TypeExpr` whose `ctor_args` is `Some(args)`
+  (1) requires `name` to be a registered type-constructor — anything else is
+  `E0312` (`` `X` is not a generic type ``; an unknown plain name stays the
+  existing unknown-type diagnostic); (2) checks arity exactly like an alias
+  (`E0311`, same message text); (3) resolves every argument **under the active
+  substitution** (so `ArrayList(T)` inside a generic function or another
+  type-constructor body instantiates per monomorphisation — nested applications
+  recurse); (4) calls the §25.2 instantiation (memoised by the mangled
+  `Ctor__<tag>…` name — an application and an alias of the same `(ctor, args)`
+  share one struct id), yielding `Type::Struct(id)`; (5) applies the ordinary
+  prefix wrapping (`?`/`!`/`*`/`[]`/`[N]`) on top.
+- **Associated calls**: `check_method_call` case (b) gains the `Expr::Call`
+  receiver: when the callee names a type-constructor, the call's value-argument
+  list is resolved as *type* arguments (identifiers or nested applications —
+  the §25.2 argument rule, `E0311` otherwise), the instance is instantiated
+  (memoised) and the call proceeds as a static call on it. A type-constructor
+  application anywhere else in value position is `E0312` (`` a generic type is
+  not a value ``).
+- **Instantiation ordering**: applications instantiate lazily at resolution
+  time; type-constructors are collected in Pass 0d, before signatures (Pass 1)
+  and bodies (Pass 2), so applications work in parameter/return types, locals,
+  generic-struct fields and method bodies. Instantiation during the
+  post-Pass-2 `pending_ctor_methods` drain may **enqueue further pending
+  instances** (a method body using `ArrayList(T)` instantiates it), so the
+  drain loops until the queue is empty instead of taking it once. Plain
+  (non-generic) struct **fields** still resolve in Pass 0b, before Pass 0d —
+  so a *plain* struct field of application type stays unsupported, exactly as
+  alias-typed plain-struct fields are (§42.4).
+
+### 42.3 Backend (`emit_c`)
+The backend never instantiates: every application that survived sema has its
+monomorphised struct in the `StructTable`. `resolve_ty` maps an application
+`TypeExpr` to that struct by recomputing the §25.2 mangle — each argument
+resolves recursively (under the active emit substitution for generic bodies)
+and `Ctor__<tag>…` is looked up with `id_of` (the same hand-mirrored naming
+contract as `Emitter::cty`, pinned by the e2e suite). `emit_method_call`
+resolves an `Expr::Call` receiver the same way, so
+`ArrayList(i32).init(a)` lowers to `kd_ArrayList__int32_t_init(a)` exactly like
+the alias form. `type_of_expr` does the matching lookup for the call's result
+type.
+
+### 42.4 Deferred (honest)
+The struct-literal application `Name(T){ .f = v }` (use an alias, or an
+associated constructor like `init`); composite-type *arguments*
+(`ArrayList([]u8)` — the same named-type-only limitation as aliases, §25.2);
+applications as `comptime` type arguments to **generic functions**
+(`alloc(a, ArrayList(i32), n)` — generic-fn type args stay bare names, §17);
+and application-typed fields in *plain* (non-generic) structs (Pass-0b
+ordering, §42.2 — generic-struct fields support them).
