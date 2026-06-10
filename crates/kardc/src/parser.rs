@@ -406,6 +406,59 @@ impl<'a> Parser<'a> {
         self.expect_ident()
     }
 
+    /// Parse a type *base* — a [`Parser::parse_type_name`] optionally followed
+    /// by a parenthesised generic type-constructor **application**
+    /// `Name(A, B, …)` (SPEC §42.1, v0.152).
+    ///
+    /// Returns `(name, ctor_args, span)`. For a plain name `ctor_args` is
+    /// `None` and the span is the name's. When the name came from a plain
+    /// identifier (NOT the `@This()` form — `@This()` never takes arguments)
+    /// and a `(` immediately follows, the comma-separated type-argument list is
+    /// consumed: `ctor_args` is `Some(args)` and the span extends through the
+    /// closing `)`. In type position a `(` after a base name is unambiguous —
+    /// no legal type is followed by `(` (SPEC §42.1).
+    ///
+    /// Each argument is itself a *base* reference via recursion — a bare name
+    /// or a nested application (`ArrayList(ArrayList(i32))`) — built as a
+    /// `TypeExpr` with only `name`/`ctor_args` set; the `?`/`!`/`*`/`[]`/`[N]`
+    /// argument forms are **not** accepted (the same restriction as alias
+    /// arguments, SPEC §25.2: the argument parse expects an identifier).
+    /// `Name()` parses as `Some(vec![])` — arity is a sema concern (`E0311`),
+    /// not the parser's.
+    fn parse_type_base(&mut self) -> PResult<(String, Option<Vec<TypeExpr>>, Span)> {
+        // Remember whether the base is the `@This()` builtin form *before* its
+        // tokens are consumed: its trailing `()` is part of the builtin, so a
+        // `(` after it never opens an argument list (SPEC §42.1).
+        let is_builtin_this = self.at_punct(&TokenKind::At);
+        let (name, name_span) = self.parse_type_name()?;
+        if is_builtin_this || !self.at_punct(&TokenKind::LParen) {
+            return Ok((name, None, name_span));
+        }
+        self.bump(); // `(`
+        let mut args = Vec::new();
+        if !self.at_punct(&TokenKind::RParen) {
+            loop {
+                let (arg_name, arg_ctor_args, arg_span) = self.parse_type_base()?;
+                args.push(TypeExpr {
+                    name: arg_name,
+                    optional: false,
+                    error_union: false,
+                    error_set: None,
+                    array_len: None,
+                    pointer: false,
+                    slice: false,
+                    ctor_args: arg_ctor_args,
+                    span: arg_span,
+                });
+                if !self.eat_punct(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        let rparen = self.expect_punct(&TokenKind::RParen, "`)`")?;
+        Ok((name, Some(args), name_span.merge(rparen)))
+    }
+
     /// Parse a type reference (SPEC §11.1, §12.1, §14.1, §15). A leading `?`
     /// marks an optional type `?T` (`optional = true`); a leading `!` marks an
     /// error union `!T` (`error_union = true`). The two prefixes are **mutually
@@ -425,6 +478,18 @@ impl<'a> Parser<'a> {
     /// requires a plain element type name after its prefix (`[N]?T`, `*?T`,
     /// `[]?T` all fail with "expected identifier"). The node's span covers the
     /// prefix when present.
+    ///
+    /// v0.152 (SPEC §42.1): every base-name position may instead be a generic
+    /// type-constructor **application** `Name(A, B, …)` — parsed by
+    /// [`Parser::parse_type_base`] — carrying `ctor_args = Some(args)`, with
+    /// the node span extended through the application's `)`. The application
+    /// composes with every prefix form (`?Name(A)`, `!Name(A)`, `*Name(A)`,
+    /// `[]Name(A)`, `[N]Name(A)`, and the `Set!T` *payload*), but the error-set
+    /// NAME in `Set!T` is always plain: after a base with `Some(ctor_args)` a
+    /// following `!` is NOT the named-error-set form (an application is never
+    /// an error *set*), so the name-then-`!` branch fires only for `None`
+    /// ctor_args and a stray `!` after an application is the caller's
+    /// "expected …" diagnostic.
     fn parse_type(&mut self) -> PResult<TypeExpr> {
         // `*T` — a single pointer (SPEC §15.1). `parse_type` is only ever
         // called in type position, so a leading `*` here never collides with
@@ -432,7 +497,7 @@ impl<'a> Parser<'a> {
         if self.at_punct(&TokenKind::Star) {
             let start = self.peek_span();
             self.bump(); // `*`
-            let (name, name_span) = self.parse_type_name()?;
+            let (name, ctor_args, base_span) = self.parse_type_base()?;
             return Ok(TypeExpr {
                 name,
                 optional: false,
@@ -441,8 +506,8 @@ impl<'a> Parser<'a> {
                 array_len: None,
                 pointer: true,
                 slice: false,
-                ctor_args: None,
-                span: start.merge(name_span),
+                ctor_args,
+                span: start.merge(base_span),
             });
         }
         if self.at_punct(&TokenKind::LBracket) {
@@ -453,7 +518,7 @@ impl<'a> Parser<'a> {
             // §24.1). Distinguish by whether a `]` immediately follows the `[`.
             if self.at_punct(&TokenKind::RBracket) {
                 self.bump(); // `]`
-                let (name, name_span) = self.parse_type_name()?;
+                let (name, ctor_args, base_span) = self.parse_type_base()?;
                 return Ok(TypeExpr {
                     name,
                     optional: false,
@@ -462,13 +527,13 @@ impl<'a> Parser<'a> {
                     array_len: None,
                     pointer: false,
                     slice: true,
-                    ctor_args: None,
-                    span: start.merge(name_span),
+                    ctor_args,
+                    span: start.merge(base_span),
                 });
             }
             let size = self.parse_array_size()?;
             self.expect_punct(&TokenKind::RBracket, "`]`")?;
-            let (name, name_span) = self.parse_type_name()?;
+            let (name, ctor_args, base_span) = self.parse_type_base()?;
             return Ok(TypeExpr {
                 name,
                 optional: false,
@@ -477,8 +542,8 @@ impl<'a> Parser<'a> {
                 array_len: Some(size),
                 pointer: false,
                 slice: false,
-                ctor_args: None,
-                span: start.merge(name_span),
+                ctor_args,
+                span: start.merge(base_span),
             });
         }
         let opt_span = if self.at_punct(&TokenKind::Question) {
@@ -497,7 +562,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let (name, name_span) = self.parse_type_name()?;
+        let (name, ctor_args, base_span) = self.parse_type_base()?;
         // `Set!T` — a *named* error union (SPEC §34.1, v0.139): a base type name
         // `Set` immediately followed by `!` in type position, where `Set` is the
         // error set and the type after the `!` is the payload. This is only the
@@ -505,9 +570,18 @@ impl<'a> Parser<'a> {
         // error union `!T`) was already consumed, keeping those forms unchanged.
         // The base-name-then-`!` shape only arises in type position, so it never
         // disturbs expression parsing (where `!` is logical negation / `!=`).
-        if opt_span.is_none() && err_span.is_none() && self.at_punct(&TokenKind::Bang) {
+        // The error-set NAME is always plain (SPEC §42.1): after a base with
+        // `Some(ctor_args)` a following `!` is NOT the named-error-set form (an
+        // application is never an error *set*), so it is left for the caller's
+        // "expected …" diagnostic. The *payload* may itself be an application
+        // (`Set!Name(A)`).
+        if opt_span.is_none()
+            && err_span.is_none()
+            && ctor_args.is_none()
+            && self.at_punct(&TokenKind::Bang)
+        {
             self.bump(); // `!`
-            let (payload, payload_span) = self.parse_type_name()?;
+            let (payload, payload_ctor_args, payload_span) = self.parse_type_base()?;
             return Ok(TypeExpr {
                 name: payload,
                 optional: false,
@@ -516,13 +590,13 @@ impl<'a> Parser<'a> {
                 array_len: None,
                 pointer: false,
                 slice: false,
-                ctor_args: None,
-                span: name_span.merge(payload_span),
+                ctor_args: payload_ctor_args,
+                span: base_span.merge(payload_span),
             });
         }
         let span = match opt_span.or(err_span) {
-            Some(prefix) => prefix.merge(name_span),
-            None => name_span,
+            Some(prefix) => prefix.merge(base_span),
+            None => base_span,
         };
         Ok(TypeExpr {
             name,
@@ -532,7 +606,7 @@ impl<'a> Parser<'a> {
             array_len: None,
             pointer: false,
             slice: false,
-            ctor_args: None,
+            ctor_args,
             span,
         })
     }
@@ -8052,5 +8126,307 @@ mod tests {
     #[test]
     fn describe_kind_names_float() {
         assert_eq!(describe_kind(&TokenKind::Float(2.5)), "float `2.5`");
+    }
+
+    // ---- v0.152: direct generic-type application `Name(T)` (SPEC §42.1) ----
+
+    /// Parse a type annotation by wrapping it in `fn f() void { var x: <ty> =
+    /// y; }` and returning the annotation's `TypeExpr`. The type's tokens start
+    /// at stream index 9, so span assertions can count from there.
+    fn parse_var_ty(ty_kinds: Vec<TokenKind>) -> TypeExpr {
+        let m = parse_var_ty_result(ty_kinds).expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => match &f.body.stmts[0] {
+                Stmt::Let { ty: Some(ty), .. } => ty.clone(),
+                other => panic!("expected annotated `var`, got {:?}", other),
+            },
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    /// Like [`parse_var_ty`] but returns the raw parse result, so a test can
+    /// assert that an ill-formed type is *rejected*.
+    fn parse_var_ty_result(ty_kinds: Vec<TokenKind>) -> Result<Module, Vec<Diagnostic>> {
+        let mut kinds = vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Var),
+            id("x"),
+            TokenKind::Colon,
+        ];
+        kinds.extend(ty_kinds);
+        kinds.extend(vec![
+            TokenKind::Eq,
+            id("y"),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]);
+        parse(&toks(kinds))
+    }
+
+    #[test]
+    fn application_type_on_var() {
+        // var l: ArrayList(i32) = y;  — a generic type-constructor applied
+        // directly in type position (SPEC §42.1): `ctor_args` is Some([i32])
+        // and the node span extends through the application's `)`.
+        let ty = parse_var_ty(vec![
+            id("ArrayList"),
+            TokenKind::LParen,
+            id("i32"),
+            TokenKind::RParen,
+        ]);
+        assert_eq!(ty.name, "ArrayList");
+        let args = ty.ctor_args.as_ref().expect("application carries Some(args)");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].name, "i32");
+        assert!(args[0].ctor_args.is_none(), "a bare argument stays None");
+        assert!(!ty.optional && !ty.error_union && !ty.pointer && !ty.slice);
+        assert!(ty.error_set.is_none() && ty.array_len.is_none());
+        // Tokens are 1-wide at sequential positions; the type starts at index 9
+        // (`ArrayList`) and its `)` is index 12 — the span covers the `)`.
+        assert_eq!(ty.span, Span::new(9, 13));
+    }
+
+    #[test]
+    fn application_type_multi_arg() {
+        // var m: Map(i32, i64) = y;  — a comma-separated argument list.
+        let ty = parse_var_ty(vec![
+            id("Map"),
+            TokenKind::LParen,
+            id("i32"),
+            TokenKind::Comma,
+            id("i64"),
+            TokenKind::RParen,
+        ]);
+        assert_eq!(ty.name, "Map");
+        let args = ty.ctor_args.as_ref().expect("application carries Some(args)");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].name, "i32");
+        assert_eq!(args[1].name, "i64");
+    }
+
+    #[test]
+    fn application_type_nested() {
+        // var l: ArrayList(ArrayList(i32)) = y;  — an argument may itself be a
+        // nested application (generic composition, SPEC §42.1).
+        let ty = parse_var_ty(vec![
+            id("ArrayList"),
+            TokenKind::LParen,
+            id("ArrayList"),
+            TokenKind::LParen,
+            id("i32"),
+            TokenKind::RParen,
+            TokenKind::RParen,
+        ]);
+        assert_eq!(ty.name, "ArrayList");
+        let args = ty.ctor_args.as_ref().expect("outer application");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].name, "ArrayList");
+        let inner = args[0].ctor_args.as_ref().expect("nested application");
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0].name, "i32");
+        assert!(inner[0].ctor_args.is_none());
+    }
+
+    #[test]
+    fn application_type_composes_with_prefix_forms() {
+        // ?Name(A), *Name(A), []Name(A), [3]Name(A), !Name(A) — the application
+        // rides on the base name under every prefix form (SPEC §42.1).
+        let app = |prefix: Vec<TokenKind>| {
+            let mut v = prefix;
+            v.extend(vec![
+                id("Name"),
+                TokenKind::LParen,
+                id("A"),
+                TokenKind::RParen,
+            ]);
+            let ty = parse_var_ty(v);
+            assert_eq!(ty.name, "Name");
+            let args = ty.ctor_args.as_ref().expect("application carries Some(args)");
+            assert_eq!(args.len(), 1);
+            assert_eq!(args[0].name, "A");
+            ty
+        };
+        let opt = app(vec![TokenKind::Question]);
+        assert!(opt.optional, "`?Name(A)` is optional");
+        let err = app(vec![TokenKind::Bang]);
+        assert!(err.error_union, "`!Name(A)` is an error union");
+        assert!(err.error_set.is_none(), "prefix `!` has no named set");
+        let ptr = app(vec![TokenKind::Star]);
+        assert!(ptr.pointer, "`*Name(A)` is a pointer");
+        let slice = app(vec![TokenKind::LBracket, TokenKind::RBracket]);
+        assert!(slice.slice, "`[]Name(A)` is a slice");
+        let arr = app(vec![
+            TokenKind::LBracket,
+            TokenKind::Int(3),
+            TokenKind::RBracket,
+        ]);
+        assert_eq!(
+            arr.array_len,
+            Some(ArraySize::Lit(3)),
+            "`[3]Name(A)` is a fixed-size array"
+        );
+    }
+
+    #[test]
+    fn application_type_in_param_list() {
+        // fn f(p: Map(i32, i64), q: bool) void {}  — the application's comma
+        // binds inside its parentheses and does not end the parameter.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            id("p"),
+            TokenKind::Colon,
+            id("Map"),
+            TokenKind::LParen,
+            id("i32"),
+            TokenKind::Comma,
+            id("i64"),
+            TokenKind::RParen,
+            TokenKind::Comma,
+            id("q"),
+            TokenKind::Colon,
+            id("bool"),
+            TokenKind::RParen,
+            id("void"),
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert_eq!(f.params.len(), 2);
+                assert_eq!(f.params[0].name, "p");
+                assert_eq!(f.params[0].ty.name, "Map");
+                let args = f.params[0]
+                    .ty
+                    .ctor_args
+                    .as_ref()
+                    .expect("`p` has an application type");
+                assert_eq!(args.len(), 2);
+                assert_eq!(f.params[1].name, "q");
+                assert_eq!(f.params[1].ty.name, "bool");
+                assert!(f.params[1].ty.ctor_args.is_none());
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn application_type_in_return_position() {
+        // fn f() ArrayList(i32) { return y; }  — the argument list after the
+        // return type's base name is consumed before the body `{`.
+        let m = parse(&toks(vec![
+            TokenKind::Keyword(Kw::Fn),
+            id("f"),
+            TokenKind::LParen,
+            TokenKind::RParen,
+            id("ArrayList"),
+            TokenKind::LParen,
+            id("i32"),
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::Keyword(Kw::Return),
+            id("y"),
+            TokenKind::Semicolon,
+            TokenKind::RBrace,
+        ]))
+        .expect("should parse");
+        match &m.items[0] {
+            Item::Func(f) => {
+                assert_eq!(f.ret.name, "ArrayList");
+                let args = f.ret.ctor_args.as_ref().expect("application return type");
+                assert_eq!(args.len(), 1);
+                assert_eq!(args[0].name, "i32");
+                assert_eq!(f.body.stmts.len(), 1, "body parsed normally");
+            }
+            other => panic!("expected func, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn application_type_empty_args() {
+        // var x: Name() = y;  — `Name()` parses as Some(vec![]); the arity
+        // mismatch is sema's concern (E0311), not the parser's (SPEC §42.1).
+        let ty = parse_var_ty(vec![id("Name"), TokenKind::LParen, TokenKind::RParen]);
+        assert_eq!(ty.name, "Name");
+        let args = ty.ctor_args.as_ref().expect("`Name()` is an application");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn application_type_rejects_composite_arguments() {
+        // `ArrayList(?i32)` / `ArrayList([]u8)` — arguments are bare names or
+        // nested applications only (the alias-argument restriction, SPEC
+        // §25.2): the argument parse expects an identifier.
+        for bad in vec![
+            vec![
+                id("ArrayList"),
+                TokenKind::LParen,
+                TokenKind::Question,
+                id("i32"),
+                TokenKind::RParen,
+            ],
+            vec![
+                id("ArrayList"),
+                TokenKind::LParen,
+                TokenKind::LBracket,
+                TokenKind::RBracket,
+                id("u8"),
+                TokenKind::RParen,
+            ],
+        ] {
+            let err =
+                parse_var_ty_result(bad).expect_err("a composite argument should fail");
+            assert!(
+                err.iter()
+                    .any(|d| d.code == "E0200" && d.message.contains("expected identifier")),
+                "expected an `expected identifier` diagnostic, got {:?}",
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn named_error_union_application_payload() {
+        // var x: E!Name(A) = y;  — the payload of a named error union carries
+        // the application; the set name `E` is always plain (SPEC §42.1).
+        let ty = parse_var_ty(vec![
+            id("E"),
+            TokenKind::Bang,
+            id("Name"),
+            TokenKind::LParen,
+            id("A"),
+            TokenKind::RParen,
+        ]);
+        assert!(ty.error_union, "`E!Name(A)` is an error union");
+        assert_eq!(ty.error_set, Some("E".to_string()), "the set is plain `E`");
+        assert_eq!(ty.name, "Name");
+        let args = ty.ctor_args.as_ref().expect("payload application");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].name, "A");
+    }
+
+    #[test]
+    fn application_is_never_an_error_set() {
+        // `Name(A)!i32` — after a base with Some(ctor_args) a following `!` is
+        // NOT the named-error-set form (an application is never an error *set*,
+        // SPEC §42.1); the `!` is left over and the `var` then fails expecting
+        // `=`.
+        let err = parse_var_ty_result(vec![
+            id("Name"),
+            TokenKind::LParen,
+            id("A"),
+            TokenKind::RParen,
+            TokenKind::Bang,
+            id("i32"),
+        ])
+        .expect_err("`Name(A)!i32` should fail");
+        assert!(err.iter().any(|d| d.code == "E0200"));
     }
 }

@@ -314,6 +314,23 @@ and `kard bench [FILE]` runs the harness with **per-test wall-clock timing**
 (`<name>: <ms> ms`). The harness `main` parses argv (`--filter`/`--bench`) via a
 name+fn table. **This completes Arc 4 (v0.141–v0.150).**
 
+### v0.151.0 — Optimization sweep ✅
+Behaviour-preserving codebase optimization (generated C byte-identical):
+`kard run`/`test` build dev binaries at `-O0` (`--release` restores `-O2`;
+build/bench/cross stay `-O2`), plus internal dedup across all stages
+(~−600 lines). No language change.
+
+### v0.152.0 — Direct generic-type application `Name(T)` ✅
+The v0.129 alias requirement falls: `var l: ArrayList(i32) = ArrayList(i32)
+.init(a);` works directly — in every type position (composing with `?`/`!`/
+`*`/`[]`/`[N]`), as an associated-call receiver, nested
+(`ArrayList(ArrayList(i32))`), and under generic substitution (`ArrayList(T)`
+inside another type-constructor — generic composition). An application and an
+alias of the same `(ctor, args)` share one memoised struct (SPEC §42). Still
+deferred: the literal form `Name(T){…}`, composite arguments
+(`ArrayList([]u8)`), applications as generic-fn type arguments, and
+application-typed fields in plain structs (Pass-0b ordering).
+
 ### Beyond (Arc 5+, each multi-session)
 Bundled cross-compilation sysroots; the full imperative `build.ks` graph (a
 `build(*Builder)` entry point); re-self-hosting (the compiler in kardashev); a

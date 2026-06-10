@@ -56,6 +56,10 @@
 //!   the bare keyword, both as a statement (`unreachable;`) and in a switch arm
 //!   body. `@panic(msg)` is an `Expr::Builtin` and prints through the shared
 //!   builtin printer as `@panic(<msg>)`, its `[]u8` argument a string literal.
+//! - `ArrayList(i32)` — a generic type-constructor application directly in type
+//!   position (SPEC §42.1) prints as `Name(a1, a2)` with each argument rendered
+//!   recursively (`ArrayList(ArrayList(i32))`), composing with the `?`/`!`/
+//!   `*`/`[]`/`[N]` prefix forms through the single [`fmt_type`] spelling.
 //!
 //! ## Idempotence
 //!
@@ -595,7 +599,12 @@ impl Printer {
 
 // ----- types ----------------------------------------------------------------
 
-/// Format a type reference (SPEC §11.1 / §12.1 / §14.1 / §15 / §24 / §34). A
+/// Format a type reference (SPEC §11.1 / §12.1 / §14.1 / §15 / §24 / §34 /
+/// §42.1). The *base* spelling is the bare type name or, when `ctor_args` is
+/// `Some(args)` (a generic type-constructor application, v0.152, SPEC §42.1),
+/// the application `Name(a1, a2)` with each argument rendered recursively — so
+/// a nested application (`ArrayList(ArrayList(i32))`) prints, and `Some(vec![])`
+/// prints `Name()` (it re-lexes to the same `TypeExpr`; sema rejects it). A
 /// pointer (`TypeExpr.pointer`) prints with a leading `*` — e.g. `*i32` — a slice
 /// (`TypeExpr.slice`) with a leading `[]` — e.g. `[]i32` — an array
 /// (`TypeExpr.array_len = Some(..)`) with a leading `[N]` whose `N` is either a
@@ -605,16 +614,31 @@ impl Printer {
 /// error union (`TypeExpr.error_union`) with a leading `!` — e.g. `!i32` — or, for
 /// a *named* error union over the error set `Set` (`TypeExpr.error_set =
 /// Some("Set")`, v0.139), the set name before the `!` — e.g. `E!i32` — and a
-/// plain type as its bare name. The qualifiers are mutually exclusive (v0.115:
-/// `?` and `!` are never combined; v0.117: `[N]` is not combined with either;
-/// v0.118: `*`/`[]` are not combined with the others), so at most one prefix is
-/// emitted. Used wherever a type appears: params, return types, `var`/`const`
-/// annotations and struct fields.
+/// plain type as its base spelling. The qualifiers are mutually exclusive
+/// (v0.115: `?` and `!` are never combined; v0.117: `[N]` is not combined with
+/// either; v0.118: `*`/`[]` are not combined with the others), so at most one
+/// prefix is emitted; each wraps the base spelling, so an application composes
+/// with every prefix form (`?Name(A)`, `*Name(A)`, …, SPEC §42.1). Used
+/// wherever a type appears: params, return types, `var`/`const` annotations and
+/// struct fields.
 fn fmt_type(ty: &TypeExpr) -> String {
+    // The base spelling (SPEC §42.1): the bare name, or — for a generic
+    // type-constructor application (v0.152) — `Name(a1, a2)` with the
+    // arguments `, `-joined and each rendered recursively (a nested
+    // application recurses through `fmt_type`). Every prefix branch below
+    // wraps this one spelling. The error-*set* name in `Set!T` is never an
+    // application (SPEC §42.1), so only the payload spelling is involved.
+    let base = match &ty.ctor_args {
+        Some(args) => {
+            let parts: Vec<String> = args.iter().map(fmt_type).collect();
+            format!("{}({})", ty.name, parts.join(", "))
+        }
+        None => ty.name.clone(),
+    };
     if ty.pointer {
-        format!("*{}", ty.name)
+        format!("*{}", base)
     } else if ty.slice {
-        format!("[]{}", ty.name)
+        format!("[]{}", base)
     } else if let Some(size) = &ty.array_len {
         // A fixed-size array `[N]T`: the size prints inside the `[…]` prefix
         // before the element type. `ArraySize::Lit(n)` prints the literal
@@ -622,11 +646,11 @@ fn fmt_type(ty: &TypeExpr) -> String {
         // value-parameter name (`[n]i32`, v0.128). Both forms re-lex to the
         // same `TypeExpr`, so re-formatting is idempotent.
         match size {
-            ArraySize::Lit(n) => format!("[{}]{}", n, ty.name),
-            ArraySize::Param(name) => format!("[{}]{}", name, ty.name),
+            ArraySize::Lit(n) => format!("[{}]{}", n, base),
+            ArraySize::Param(name) => format!("[{}]{}", name, base),
         }
     } else if ty.optional {
-        format!("?{}", ty.name)
+        format!("?{}", base)
     } else if ty.error_union {
         // An error union (SPEC §12/§34). The global form `!T` (`error_set ==
         // None`) prints with a bare leading `!` — `!i32` — unchanged from
@@ -636,11 +660,11 @@ fn fmt_type(ty: &TypeExpr) -> String {
         // `TypeExpr` (the parser reads a base type name `Set` followed by `!` as
         // a named error union).
         match &ty.error_set {
-            Some(set) => format!("{}!{}", set, ty.name),
-            None => format!("!{}", ty.name),
+            Some(set) => format!("{}!{}", set, base),
+            None => format!("!{}", base),
         }
     } else {
-        ty.name.clone()
+        base
     }
 }
 
@@ -1565,7 +1589,7 @@ fn escape_string(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::ast::fixtures::{
-        arr_param_ty as arr_ty_param, arr_ty, bin, call, catch_capture_expr as catch_cap,
+        app_ty, arr_param_ty as arr_ty_param, arr_ty, bin, call, catch_capture_expr as catch_cap,
         catch_expr as catch_, err_ty, error_lit, ident, int, null, opt_ty, orelse, ptr_ty,
         set_err_ty, slice_ty, try_expr as try_, ty, unwrap,
     };
@@ -5908,6 +5932,19 @@ mod tests {
     }
 
     #[test]
+    fn direct_application_source_round_trips() {
+        // End-to-end (lex → parse → print), SPEC §42.1: a direct generic-type
+        // application in type position — composed with prefix forms, nested,
+        // and as an assoc-call receiver — is already canonical, so formatting
+        // reproduces the source byte-for-byte and is idempotent.
+        let src = "fn f(a: Allocator) void {\n    var l: ArrayList(i32) = ArrayList(i32).init(a);\n    var m: Map(i32, i64) = Map(i32, i64).init(a);\n    var n: ?Box(Box(i32)) = null;\n}\n";
+        let once = format_source(src).expect("source formats");
+        assert_eq!(once, src);
+        let twice = format_source(&once).expect("canonical source re-formats");
+        assert_eq!(twice, once, "re-formatting is idempotent");
+    }
+
+    #[test]
     fn float_let_source_round_trips() {
         // End-to-end (lex → parse → print), SPEC §38: `var x = 3.14;` is already
         // canonical — the lexer decodes the `digits.digits` literal into a
@@ -5943,5 +5980,284 @@ mod tests {
         assert_eq!(once, src, "integer literal stays an integer");
         let twice = format_source(&once).expect("canonical source re-formats");
         assert_eq!(twice, once, "re-formatting is idempotent");
+    }
+
+    // ----- direct generic-type application (v0.152, SPEC §42) ---------------
+
+    /// Assert that `ty_expr` renders as `spelling` in BOTH printers (SPEC
+    /// §42.1): as a `var` annotation in a multi-line function body
+    /// ([`Printer::print_stmt`]) and as the same statement inline inside an
+    /// [`Expr::StructType`] method body ([`fmt_stmt_inline`]) — pinning that
+    /// the application spelling is single-sourced in [`fmt_type`], so both
+    /// printers get it for free. The printer is syntax-only, so the dummy `0`
+    /// initializer never matters.
+    fn assert_type_spelling_in_both_printers(ty_expr: TypeExpr, spelling: &str) {
+        let decl = |ty_expr: TypeExpr| Stmt::Let {
+            is_const: false,
+            name: "l".to_string(),
+            ty: Some(ty_expr),
+            value: int(0),
+            span: D,
+        };
+        // Multi-line: a `var` decl in a function body, one indent deep.
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![decl(ty_expr.clone())],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        assert_eq!(
+            print_module(&m),
+            format!("fn f() void {{\n    var l: {} = 0;\n}}\n", spelling),
+            "multi-line printer spelling for `{spelling}`"
+        );
+        // Inline: the same statement inside an `Expr::StructType` method body
+        // (the generic-struct method context, SPEC §26).
+        let st = Expr::StructType {
+            fields: vec![],
+            methods: vec![Func {
+                is_pub: false,
+                name: "m".to_string(),
+                params: vec![],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![decl(ty_expr)],
+                    span: D,
+                },
+                span: D,
+            }],
+            span: D,
+        };
+        assert_eq!(
+            fmt_expr(&st),
+            format!("struct {{ fn m() void {{ var l: {} = 0; }} }}", spelling),
+            "inline printer spelling for `{spelling}`"
+        );
+    }
+
+    #[test]
+    fn application_type_spelling() {
+        // A generic type-constructor application in type position (SPEC §42.1)
+        // prints as `Name(args…)`: single-arg, multi-arg (`, `-joined) and a
+        // nested application (each argument renders recursively through
+        // `fmt_type`).
+        assert_eq!(
+            fmt_type(&app_ty("ArrayList", vec![ty("i32")])),
+            "ArrayList(i32)"
+        );
+        assert_eq!(
+            fmt_type(&app_ty("Map", vec![ty("i64"), ty("Point")])),
+            "Map(i64, Point)"
+        );
+        assert_eq!(
+            fmt_type(&app_ty("ArrayList", vec![app_ty("ArrayList", vec![ty("i32")])])),
+            "ArrayList(ArrayList(i32))"
+        );
+        // `Some(vec![])` prints `Name()` — it re-lexes to the same `TypeExpr`
+        // (sema rejects the zero-arg application; the printer stays total).
+        assert_eq!(fmt_type(&app_ty("ArrayList", vec![])), "ArrayList()");
+        // A plain named type (`ctor_args == None`) is unchanged.
+        assert_eq!(fmt_type(&ty("ArrayList")), "ArrayList");
+    }
+
+    #[test]
+    fn application_type_composes_with_prefixes() {
+        // The application composes with every prefix form (SPEC §42.1): each
+        // prefix wraps the `Name(args)` base spelling exactly as it wraps a
+        // bare name.
+        let app = || app_ty("ArrayList", vec![ty("i32")]);
+        assert_eq!(
+            fmt_type(&TypeExpr {
+                optional: true,
+                ..app()
+            }),
+            "?ArrayList(i32)"
+        );
+        assert_eq!(
+            fmt_type(&TypeExpr {
+                error_union: true,
+                ..app()
+            }),
+            "!ArrayList(i32)"
+        );
+        // A *named* error union `Set!T` (SPEC §34/§42.1): the set name is
+        // always a plain name — only the payload may be an application.
+        assert_eq!(
+            fmt_type(&TypeExpr {
+                error_union: true,
+                error_set: Some("E".to_string()),
+                ..app()
+            }),
+            "E!ArrayList(i32)"
+        );
+        assert_eq!(
+            fmt_type(&TypeExpr {
+                pointer: true,
+                ..app()
+            }),
+            "*ArrayList(i32)"
+        );
+        assert_eq!(
+            fmt_type(&TypeExpr {
+                slice: true,
+                ..app()
+            }),
+            "[]ArrayList(i32)"
+        );
+        assert_eq!(
+            fmt_type(&TypeExpr {
+                array_len: Some(ArraySize::Lit(3)),
+                ..app()
+            }),
+            "[3]ArrayList(i32)"
+        );
+        assert_eq!(
+            fmt_type(&TypeExpr {
+                array_len: Some(ArraySize::Param("n".to_string())),
+                ..app()
+            }),
+            "[n]ArrayList(i32)"
+        );
+    }
+
+    #[test]
+    fn application_type_in_both_printers_all_forms() {
+        // Every §42.1 form — plain, multi-arg, nested and each prefix
+        // composition — renders identically in the multi-line and inline
+        // printers through the single `fmt_type` spelling (SPEC §42.1).
+        let app = || app_ty("ArrayList", vec![ty("i32")]);
+        assert_type_spelling_in_both_printers(app(), "ArrayList(i32)");
+        assert_type_spelling_in_both_printers(
+            app_ty("Map", vec![ty("i64"), ty("Point")]),
+            "Map(i64, Point)",
+        );
+        assert_type_spelling_in_both_printers(
+            app_ty("ArrayList", vec![app()]),
+            "ArrayList(ArrayList(i32))",
+        );
+        assert_type_spelling_in_both_printers(
+            TypeExpr {
+                optional: true,
+                ..app()
+            },
+            "?ArrayList(i32)",
+        );
+        assert_type_spelling_in_both_printers(
+            TypeExpr {
+                error_union: true,
+                ..app()
+            },
+            "!ArrayList(i32)",
+        );
+        assert_type_spelling_in_both_printers(
+            TypeExpr {
+                error_union: true,
+                error_set: Some("E".to_string()),
+                ..app()
+            },
+            "E!ArrayList(i32)",
+        );
+        assert_type_spelling_in_both_printers(
+            TypeExpr {
+                pointer: true,
+                ..app()
+            },
+            "*ArrayList(i32)",
+        );
+        assert_type_spelling_in_both_printers(
+            TypeExpr {
+                slice: true,
+                ..app()
+            },
+            "[]ArrayList(i32)",
+        );
+        assert_type_spelling_in_both_printers(
+            TypeExpr {
+                array_len: Some(ArraySize::Lit(3)),
+                ..app()
+            },
+            "[3]ArrayList(i32)",
+        );
+        assert_type_spelling_in_both_printers(
+            TypeExpr {
+                array_len: Some(ArraySize::Param("n".to_string())),
+                ..app()
+            },
+            "[n]ArrayList(i32)",
+        );
+    }
+
+    #[test]
+    fn application_type_var_decl_with_assoc_init_prints() {
+        // SPEC §42's flagship line, multi-line context:
+        // `var l: ArrayList(i32) = ArrayList(i32).init(a);` — the annotation
+        // prints through the shared `fmt_type` (§42.1) and the initializer is
+        // the *existing* `Expr::MethodCall` over an `Expr::Call` receiver
+        // (§42.1: no new expression syntax), which already prints
+        // `ArrayList(i32).init(a)` unparenthesised (a call is a primary).
+        let m = Module {
+            items: vec![Item::Func(Func {
+                is_pub: false,
+                name: "f".to_string(),
+                params: vec![Param {
+                    name: "a".to_string(),
+                    ty: ty("Allocator"),
+                    is_comptime: false,
+                    span: D,
+                }],
+                ret: ty("void"),
+                body: Block {
+                    stmts: vec![Stmt::Let {
+                        is_const: false,
+                        name: "l".to_string(),
+                        ty: Some(app_ty("ArrayList", vec![ty("i32")])),
+                        value: Expr::MethodCall {
+                            receiver: Box::new(call("ArrayList", vec![ident("i32")])),
+                            method: "init".to_string(),
+                            args: vec![ident("a")],
+                            span: D,
+                        },
+                        span: D,
+                    }],
+                    span: D,
+                },
+                span: D,
+            })],
+        };
+        let expected = concat!(
+            "fn f(a: Allocator) void {\n",
+            "    var l: ArrayList(i32) = ArrayList(i32).init(a);\n",
+            "}\n",
+        );
+        let printed = print_module(&m);
+        assert_eq!(printed, expected);
+        // Idempotence as determinism: the pure printer re-prints identically.
+        assert_eq!(print_module(&m), printed);
+    }
+
+    #[test]
+    fn application_type_in_struct_type_field_inline() {
+        // Generic composition, inline context (SPEC §42.1): a field of
+        // application type inside an anonymous `struct { … }` type value —
+        // `fn Stack(comptime T: type) type { return struct { items:
+        // ArrayList(T) }; }`'s payload — prints the application through the
+        // shared `fmt_type` in the inline field-decl spelling.
+        let st = Expr::StructType {
+            fields: vec![FieldDecl {
+                name: "items".to_string(),
+                ty: app_ty("ArrayList", vec![ty("T")]),
+                span: D,
+            }],
+            methods: vec![],
+            span: D,
+        };
+        assert_eq!(fmt_expr(&st), "struct { items: ArrayList(T) }");
     }
 }

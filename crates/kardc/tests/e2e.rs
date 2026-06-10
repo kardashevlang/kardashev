@@ -1234,3 +1234,136 @@ pub fn main() i32 {
     assert_eq!(code, 0);
     assert_eq!(out, "26\n99\n6\n");
 }
+
+// --- v0.152 direct generic-type application --------------------------------
+
+#[test]
+fn direct_generic_application_type_position_and_assoc_call() {
+    // `Box(i32)` directly in a local's type and as the receiver of an
+    // associated call — no `const B = Box(i32);` alias (SPEC §42).
+    let src = r#"
+fn Box(comptime T: type) type {
+    return struct {
+        v: T,
+        fn mk(x: T) Self { return Self{ .v = x }; }
+        fn get(self: Self) T { return self.v; }
+    };
+}
+pub fn main() i32 {
+    var b: Box(i32) = Box(i32).mk(41);
+    print(b.get() + 1);   // 42
+    var c: Box(i64) = Box(i64).mk(100);
+    print(c.get());       // 100 (a second, distinct instantiation)
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "42\n100\n");
+}
+
+#[test]
+fn generic_composition_application_under_substitution() {
+    // A type-constructor whose struct holds ANOTHER application at its own
+    // type parameter (`Pair(T)` under substitution) — generic composition,
+    // including an assoc call on the inner application inside a method body
+    // (SPEC §42.2; exercises the looped pending_ctor_methods drain).
+    let src = r#"
+fn Pair(comptime T: type) type {
+    return struct {
+        x: T,
+        y: T,
+        fn mk(a: T, b: T) Self { return Self{ .x = a, .y = b }; }
+        fn sum(self: Self) T { return self.x + self.y; }
+    };
+}
+fn Holder(comptime T: type) type {
+    return struct {
+        p: Pair(T),
+        fn make(a: T, b: T) Self { return Self{ .p = Pair(T).mk(a, b) }; }
+        fn total(self: Self) T { return self.p.sum(); }
+    };
+}
+pub fn main() i32 {
+    var h: Holder(i32) = Holder(i32).make(20, 22);
+    print(h.total());   // 42
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn application_alias_parity_and_nesting_and_optional_wrap() {
+    // An application and an alias of the same (ctor, args) are ONE struct
+    // (assignable across the two spellings); applications nest
+    // (`Box(Box(i32))`) and compose with the `?` prefix (SPEC §42.1/§42.2).
+    let src = r#"
+fn Box(comptime T: type) type {
+    return struct {
+        v: T,
+        fn mk(x: T) Self { return Self{ .v = x }; }
+        fn get(self: Self) T { return self.v; }
+    };
+}
+const BI = Box(i32);
+pub fn main() i32 {
+    var a: Box(i32) = BI.mk(5);       // alias value into application type
+    var b: BI = Box(i32).mk(6);       // application value into alias type
+    print(a.get() + b.get());         // 11
+    var bb: Box(Box(i32)) = Box(Box(i32)).mk(Box(i32).mk(9));
+    print(bb.get().get());            // 9
+    var ob: ?Box(i32) = Box(i32).mk(3);
+    if (ob) |x| {
+        print(x.get());               // 3
+    }
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "11\n9\n3\n");
+}
+
+#[test]
+fn direct_application_with_std_containers() {
+    // The headline: std's `ArrayList(T)` / `HashMap(V)` used directly, no
+    // alias — type position, assoc-receiver `init`, methods (SPEC §42).
+    // `@import` needs the file-based driver (E0290 from a bare string), so
+    // this test goes through `compile_program` like the CLI does.
+    let src = r#"
+@import("std");
+pub fn main() i32 {
+    const a = c_allocator();
+    var l: ArrayList(i64) = ArrayList(i64).init(a);
+    l.push(a, 10);
+    l.push(a, 20);
+    l.push(a, 30);
+    print(l.get(0) + l.get(1) + l.get(2));  // 60
+    l.deinit(a);
+    var m: HashMap(i64) = HashMap(i64).init(a);
+    m.put(a, 1, 42);
+    print(m.get(1, 0));                     // 42
+    m.deinit(a);
+    return 0;
+}
+"#;
+    let root = temp_path("std_direct").with_extension("ks");
+    std::fs::write(&root, src).expect("should write the temp source");
+    let c = kardc::compile_program(&root, EmitMode::Program).unwrap_or_else(|d| {
+        panic!(
+            "compile failed:\n{}",
+            kardc::diag::render_all(&d, &root.display().to_string(), src)
+        )
+    });
+    let _ = std::fs::remove_file(&root);
+    let exe = temp_path("exe");
+    kardc::backend::cc_build(&c, &exe, &kardc::backend::BuildOptions::default())
+        .expect("cc should build the emitted program");
+    let output = Command::new(&exe).output().expect("should run the program");
+    let _ = std::fs::remove_file(&exe);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "60\n42\n");
+}

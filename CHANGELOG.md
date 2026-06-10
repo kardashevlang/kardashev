@@ -18,6 +18,44 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.152.0] — Direct generic-type application `Name(T)`
+
+The v0.129 alias requirement falls (SPEC §42): generic type-constructors are
+usable **directly**, without a `const L = ArrayList(i32);` alias.
+
+### Added
+- **Type position**: `var l: ArrayList(i32)` — in every position a type is
+  written (locals, params, returns, generic-struct fields), composing with all
+  prefix forms (`?Name(A)`, `!Name(A)`, `Set!Name(A)` payloads, `*Name(A)`,
+  `[]Name(A)`, `[N]Name(A)`) and **nesting** (`Box(Box(i32))`). `TypeExpr`
+  gains `ctor_args: Option<Vec<TypeExpr>>`.
+- **Associated calls**: `ArrayList(i32).init(a)` — an application as the
+  receiver of a static/associated call (no new syntax; the existing
+  `MethodCall` over `Call` shape gains meaning).
+- **Generic composition**: `ArrayList(T)` inside another type-constructor's
+  fields/methods resolves under the active substitution — containers can now
+  be built from containers. The post-Pass-2 `pending_ctor_methods` drain loops
+  until empty (in-drain instantiations enqueue more), with a second drain
+  after Pass 3 for instances first reached from function bodies.
+- An application and an alias of the same `(ctor, args)` share **one**
+  memoised struct (the §25.2 `Ctor__<tag>…` mangle); alias arguments also
+  gained nested applications (`const A = ArrayList(ArrayList(i32));`).
+- Diagnostics: `E0312` (`X` is not a generic type / a generic type is not a
+  value), `E0311` arity & argument errors now also fire in type position with
+  the alias-form message text.
+- `kard fmt` prints applications canonically in both printers (shared
+  spelling helper); byte-exact round-trip pinned.
+- `examples/generic_direct.ks` (ArrayList/HashMap direct + a `Stack(T)`
+  composed of `ArrayList(T)`); 38 new unit tests + 5 e2e tests
+  (1001 unit + 48 e2e total). Generated C for all pre-existing examples is
+  byte-identical (the feature is pay-as-you-go).
+
+### Deferred (honest, SPEC §42.4)
+The literal form `Name(T){ .f = v }`; composite-type arguments
+(`ArrayList([]u8)`); applications as generic-*function* type arguments
+(`alloc(a, ArrayList(i32), n)`); application-typed fields in plain
+(non-generic) structs (Pass-0b ordering).
+
 ## [0.151.0] — Optimization sweep: fast dev loop + internal dedup
 
 A codebase-optimization release. Every change was adversarially verified to be
