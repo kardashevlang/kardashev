@@ -18,6 +18,52 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.161.0] — Self-hosting stage 3: the C emitter (scalar subset), in kardashev
+
+`selfhost/emit.ks` (1,626 lines) is a **C emitter written in kardashev** for
+the first slice of the roadmap's "growing subset": `i32`/`i64`/`bool`/`void`,
+top-level `fn`/`const`, the full statement set (lets, compound assignment,
+`if`/`else`, `while` with continue-clause, `break`/`continue`, **`defer`**,
+bare blocks) and the full scalar expression ladder with `comptime` folding.
+It mirrors `emit_c.rs` decision-for-decision — the fixed prelude, §43.1
+dead-function elimination (worklist liveness rooted at `main`), source-order
+`const_eval` folding with skip-on-failure, the `type_of_expr` inference
+mirror (including its quirks, e.g. a const-name initializer infers `i64`),
+the §4.4 defer scope stack (LIFO fall-through flush, the `__kd_ret` hoist on
+non-void returns, break/continue flushing to the loop scope with the
+continue-clause re-emitted on every edge), and the exact formatting rules —
+so for every subset program the emitted C is **byte-identical** to
+`emit_c::emit(.., EmitMode::Program)`, and therefore compiles and runs
+identically by construction.
+
+### Added
+- `selfhost/emit.ks` (the emitter + `es_detect`, a subset detector walking
+  the arena in a fixed depth-first order), `selfhost/cdump.ks` (the driver:
+  prints `ERROR <code> <pos>`, `SKIP <word> <pos>`, or the full C text —
+  always exit 0) + `tests/selfhost/emit_suite.ks` (21 in-language test
+  blocks: spelling tables, detector verdicts with exact positions, fold
+  rules and fallbacks, inference, liveness, defer shapes, whole-program byte
+  equality).
+- **Every corpus file classified, three buckets byte-compared**
+  (`crates/kardc/tests/selfhost_emit.rs`): over all **703 repo sources** the
+  driver and the Rust pipeline agree byte-for-byte on 50 full C lowerings
+  (39,337 bytes), 600 `SKIP` verdicts (the Rust side hand-mirrors
+  `es_detect`, so subset membership — word AND position — is itself
+  differentially tested), and 25 `ERROR` lines; the remaining 28
+  subset-shaped-but-sema-invalid fixtures are pinned by exact path
+  (`SEMA_INVALID`, asserted equal to the observed set) and exit-checked —
+  emission is total, but `emit_c` documents validated input, and sema is a
+  later stage. Plus 29 targeted inputs (the defer matrix, divergence,
+  liveness, folding, inference quirks, main wiring, tricky SKIP positions).
+- 1,110 tests green across the workspace.
+
+### Notes
+- The const-fold mirrors Rust's wrapping `i64` arithmetic with plain
+  kardashev ops plus explicit guards (`i64::MIN` negate/divide/remainder,
+  shift-amount mask `& 63`); a `comptime` overflow folds identically on
+  production targets but is implementation-defined here rather than
+  guaranteed (documented in the `emit.ks` header).
+
 ## [0.160.0] — Self-hosting stage 2: the parser, in kardashev
 
 `selfhost/parser.ks` (1,729 lines) is a **full kardashev parser written in
