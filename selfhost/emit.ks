@@ -1,19 +1,24 @@
-// emit.ks — self-host stage 3 (v0.161): a C emitter for the SCALAR SUBSET,
-// written in kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for
-// decision so that — for every subset program — the emitted C is
-// BYTE-IDENTICAL to the Rust emitter's `EmitMode::Program` output.
+// emit.ks — self-host stages 3+4 (v0.161–v0.162): a C emitter for the
+// SCALAR + STRING SUBSET, written in kardashev, mirroring
+// `crates/kardc/src/emit_c.rs` decision for decision so that — for every
+// subset program — the emitted C is BYTE-IDENTICAL to the Rust emitter's
+// `EmitMode::Program` output.
 //
-// The subset (the "growing subset" of ROADMAP v0.159.0+, first slice):
+// The subset (the "growing subset" of ROADMAP v0.159.0+; v0.161 shipped the
+// scalar slice, v0.162 adds strings):
 //
-//   - types: `i32`, `i64`, `bool`, `void` — bare names only (no `?`/`!`/`*`/
-//     `[]`/`[N]`/`Name(..)` forms);
+//   - types: `i32`, `i64`, `bool`, `void`, `u8`, `usize` bare names, plus
+//     the one composite `[]u8` (no other `?`/`!`/`*`/`[]T`/`[N]`/`Name(..)`
+//     forms);
 //   - items: top-level `fn` (non-generic) and top-level `const`;
 //   - statements: `var`/`const` lets, (compound) name-assignment, `if`/
 //     `else if`/`else`, `while` with continue-clause, unlabeled `break`/
 //     `continue`, `defer`, `return`, bare blocks, expression statements;
-//   - expressions: integer/bool literals, names, unary `-`/`!`/`~`, the full
-//     binary ladder (arithmetic, comparison, `and`/`or`, bitwise, shifts),
-//     free-function calls, `print`, `expect`, `comptime` folds.
+//   - expressions: integer/bool/STRING literals, names, unary `-`/`!`/`~`,
+//     the full binary ladder (arithmetic, comparison, `and`/`or`, bitwise,
+//     shifts), free-function calls, `print` (integers and `[]u8` strings),
+//     `expect`, `comptime` folds, `.len` on a slice, and the read index
+//     `s[i]` (index WRITES are place-assignments and stay out).
 //
 // Everything else is OUT of the subset. `es_detect` walks the AST in a fixed
 // depth-first order and reports the FIRST unsupported construct as a
@@ -48,10 +53,21 @@
 //     the `while` continue-clause runs after those defers and before the C
 //     `continue;`;
 //   - local type inference (`type_of_expr` mirror): int literal → `i64`,
-//     bool → `bool`, name → the scope stack, unary/binary by operator shape,
-//     call → the collected return type; an un-inferable initializer falls
-//     back to `i64` — including the Rust emitter's own quirks (a top-level
-//     const referenced as an initializer infers `i64`, not its own type);
+//     bool → `bool`, string → `[]u8`, name → the scope stack, unary/binary
+//     by operator shape, call → the collected return type, `s.len` →
+//     `usize`, `s[i]` → `u8`; an un-inferable initializer falls back to
+//     `i64` — including the Rust emitter's own quirks (a top-level const
+//     referenced as an initializer infers `i64`, not its own type);
+//   - the string machinery (v0.162, SPEC §23.2): the `kd_slice_uint8_t`
+//     typedef + `_get`/`_at`/`_alloc` helpers are emitted exactly when the
+//     module interns `[]u8` — i.e. writes a `[]u8` type or a string literal
+//     anywhere (sema's interning triggers, mirrored by a whole-tree scan);
+//     a string literal lowers to a compound literal over `c_string_literal`
+//     bytes (escape `\` `"` and `\n`/`\t`/`\r`, hex-escape everything
+//     outside printable ASCII, split the literal when a hex escape would
+//     absorb a following hex digit); `print(s)` hoists the slice into a
+//     fresh `__kd_str{N}` temporary (counter reset per function); `~`/`<<`
+//     over a `u8` operand truncate back through `((uint8_t)...)` (§28.2);
 //   - `int main(int argc, char **argv){ (void)argc;(void)argv; <wire> }`
 //     where `<wire>` is `return (int) kd_main();` for an integer `main`,
 //     else `kd_main(); return 0;`.
@@ -77,32 +93,48 @@ pub const ET_I32: i64 = 1;
 pub const ET_I64: i64 = 2;
 pub const ET_BOOL: i64 = 3;
 pub const ET_NONE: i64 = 4;
+pub const ET_U8: i64 = 5;
+pub const ET_USIZE: i64 = 6;
+pub const ET_SLICE_U8: i64 = 7;
 
-/// `Type::from_name` over the subset: the four spellings map to their codes,
-/// anything else is `ET_NONE` (the caller decides the fallback, mirroring the
-/// two distinct Rust fallbacks: `resolve_ty` → void, `cty` → `int64_t`).
+/// `Type::from_name` over the subset: the six bare spellings map to their
+/// codes, anything else is `ET_NONE` (the caller decides the fallback,
+/// mirroring the two distinct Rust fallbacks: `resolve_ty` → void, `cty` →
+/// `int64_t`). `[]u8` is not a name — `resolve_ty`/`cty` map the slice FORM.
 pub fn et_from_name(name: []u8) i64 {
     if (str_eq(name, "i32")) { return ET_I32; }
     if (str_eq(name, "i64")) { return ET_I64; }
     if (str_eq(name, "bool")) { return ET_BOOL; }
     if (str_eq(name, "void")) { return ET_VOID; }
+    if (str_eq(name, "u8")) { return ET_U8; }
+    if (str_eq(name, "usize")) { return ET_USIZE; }
     return ET_NONE;
 }
 
-/// `Type::c_name` over the subset. `ET_NONE` never reaches C spelling through
-/// `et_cty_of` in a detector-approved program; spell it `int64_t` (the same
+/// `Type::c_name` over the subset (+ the `[]u8` slice's table-derived C name,
+/// `kd_slice_<type_mangle(u8)>`). `ET_NONE` never reaches C spelling through
+/// `et_c_name` in a detector-approved program; spell it `int64_t` (the same
 /// defensive fallback the Rust `cty` uses for an unresolvable name).
 pub fn et_c_name(t: i64) []u8 {
     if (t == ET_I32) { return "int32_t"; }
     if (t == ET_I64) { return "int64_t"; }
     if (t == ET_BOOL) { return "bool"; }
     if (t == ET_VOID) { return "void"; }
+    if (t == ET_U8) { return "uint8_t"; }
+    if (t == ET_USIZE) { return "uintptr_t"; }
+    if (t == ET_SLICE_U8) { return "kd_slice_uint8_t"; }
     return "int64_t";
 }
 
-/// `Type::is_int` over the subset (only `i32`/`i64` exist here).
+/// `Type::is_int` over the subset (`i32`/`i64`/`u8`/`usize`).
 pub fn et_is_int(t: i64) bool {
-    return t == ET_I32 or t == ET_I64;
+    return t == ET_I32 or t == ET_I64 or t == ET_U8 or t == ET_USIZE;
+}
+
+/// `Emitter::promotes_in_c` over the subset: `u8` is the only sub-32-bit
+/// integer here, so a `~`/`<<` over it must truncate back (§28.2).
+pub fn et_promotes_in_c(t: i64) bool {
+    return t == ET_U8;
 }
 
 // --- operator spellings ----------------------------------------------------------
@@ -164,15 +196,16 @@ pub const Det = struct {
         self.pos = pos;
     }
 
-    /// A type reference: any composite form is out, then the base name must
-    /// be one of the four subset spellings. (`@This()` carries no source
-    /// name; it reports `type-name` exactly like the Rust mirror, whose
-    /// synthesized name `Self` is not a subset spelling.)
+    /// A type reference: any composite form other than a slice is out; a
+    /// slice must be exactly `[]u8`; a bare base name must be one of the six
+    /// subset spellings. (`@This()` carries no source name; it reports
+    /// `type-name` exactly like the Rust mirror, whose synthesized name
+    /// `Self` is not a subset spelling — sliced or not.)
     fn check_type(self: *Self, n: i32) void {
         if (self.found or n < 0) { return; }
         var u: usize = @as(usize, n);
         var fl: i64 = self.nodes[u].flags;
-        var forms: i64 = F_OPT | F_ERR | F_PTR | F_SLICE | F_ARRLIT | F_ARRPARAM | F_ERRSET | F_APP | F_ESETTHIS;
+        var forms: i64 = F_OPT | F_ERR | F_PTR | F_ARRLIT | F_ARRPARAM | F_ERRSET | F_APP | F_ESETTHIS;
         if ((fl & forms) != 0) {
             self.hit("type-form", self.nodes[u].off);
             return;
@@ -182,6 +215,13 @@ pub const Det = struct {
             return;
         }
         var name: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
+        if ((fl & F_SLICE) != 0) {
+            // The one composite in the subset: `[]u8` (v0.162).
+            if (!str_eq(name, "u8")) {
+                self.hit("type-name", self.nodes[u].off);
+            }
+            return;
+        }
         if (et_from_name(name) == ET_NONE) {
             self.hit("type-name", self.nodes[u].off);
         }
@@ -224,12 +264,33 @@ pub const Det = struct {
             self.check_expr(self.nodes[u].a);
             return;
         }
+        if (k == ND_STR) {
+            // A string literal is in the subset (v0.162).
+            return;
+        }
+        if (k == ND_FIELD) {
+            // The one field access in the subset: `.len` (v0.162, on a
+            // slice for validated input); any other name is out. The base
+            // is walked either way.
+            var fname: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
+            if (!str_eq(fname, "len")) {
+                self.hit("field", off);
+                return;
+            }
+            self.check_expr(self.nodes[u].a);
+            return;
+        }
+        if (k == ND_INDEX) {
+            // A read index `s[i]` is in the subset (v0.162); index WRITES
+            // are `ND_PASSIGN` places and stay out.
+            self.check_expr(self.nodes[u].a);
+            self.check_expr(self.nodes[u].b);
+            return;
+        }
         if (k == ND_FLOAT) { self.hit("float", off); return; }
-        if (k == ND_STR) { self.hit("string", off); return; }
         if (k == ND_BUILTIN) { self.hit("builtin", off); return; }
         if (k == ND_SLIT) { self.hit("struct-lit", off); return; }
         if (k == ND_STRUCTTYPE) { self.hit("struct-type", off); return; }
-        if (k == ND_FIELD) { self.hit("field", off); return; }
         if (k == ND_MCALL) { self.hit("method-call", off); return; }
         if (k == ND_NULL) { self.hit("null", off); return; }
         if (k == ND_ORELSE) { self.hit("orelse", off); return; }
@@ -237,7 +298,6 @@ pub const Det = struct {
         if (k == ND_ERRLIT) { self.hit("error-lit", off); return; }
         if (k == ND_ENUMLIT) { self.hit("enum-lit", off); return; }
         if (k == ND_ALIT) { self.hit("array-lit", off); return; }
-        if (k == ND_INDEX) { self.hit("index", off); return; }
         if (k == ND_ADDROF) { self.hit("addrof", off); return; }
         if (k == ND_DEREF) { self.hit("deref", off); return; }
         if (k == ND_SLICEX) { self.hit("slice-expr", off); return; }
@@ -413,6 +473,98 @@ fn ev_i64_min() i64 {
     return (0 - 9223372036854775807) - 1;
 }
 
+// --- string literals ---------------------------------------------------------------
+
+/// Decode a string-literal token span (quotes included) to its bytes: the
+/// four legal escapes `\n \t \\ \"` become their bytes, everything else is
+/// verbatim (the lexer already rejected any other escape). Mirrors the Rust
+/// lexer's decode that fills `Expr::StrLit.value`.
+pub fn es_decode_str(a: Allocator, src: []u8, off: usize, len: usize) []u8 {
+    var sb: StrBuilder = StrBuilder.init(a);
+    var i: usize = off + 1;
+    var end: usize = off + len - 1;
+    while (i < end) {
+        var b: u8 = src[i];
+        if (b == 92 and i + 1 < end) {
+            var e: u8 = src[i + 1];
+            if (e == 110) { sb.append_byte(a, 10); }
+            if (e == 116) { sb.append_byte(a, 9); }
+            if (e == 92) { sb.append_byte(a, 92); }
+            if (e == 34) { sb.append_byte(a, 34); }
+            i += 2;
+        } else {
+            sb.append_byte(a, b);
+            i += 1;
+        }
+    }
+    var s: []u8 = sb.build(a);
+    sb.deinit(a);
+    return s;
+}
+
+/// Whether `b` is an ASCII hex digit (`0-9a-fA-F`).
+fn es_is_hex_digit(b: u8) bool {
+    if (b >= 48 and b <= 57) { return true; }
+    if (b >= 97 and b <= 102) { return true; }
+    return b >= 65 and b <= 70;
+}
+
+/// Append one lowercase hex digit for the value `v` (0..15).
+fn es_hex_digit(a: Allocator, sb: *StrBuilder, v: u8) void {
+    if (v < 10) {
+        sb.append_byte(a, 48 + v);
+    } else {
+        sb.append_byte(a, 97 + (v - 10));
+    }
+}
+
+/// `c_string_literal`: render decoded bytes as a complete double-quoted C
+/// string literal. Byte-exact escaping: `\` `"` are escaped, `\n`/`\t`/`\r`
+/// stay readable, every byte outside printable ASCII becomes a two-digit
+/// `\xNN` escape — and when such an escape is immediately followed by a
+/// literal hex digit, the literal is split with `" "` so C cannot absorb
+/// that digit into the escape.
+pub fn es_c_string_literal(a: Allocator, bytes: []u8) []u8 {
+    var sb: StrBuilder = StrBuilder.init(a);
+    sb.append_byte(a, 34);
+    var prev_hex: bool = false;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        var b: u8 = bytes[i];
+        if (b == 92) {
+            sb.append(a, "\\\\");
+            prev_hex = false;
+        } else if (b == 34) {
+            sb.append(a, "\\\"");
+            prev_hex = false;
+        } else if (b == 10) {
+            sb.append(a, "\\n");
+            prev_hex = false;
+        } else if (b == 9) {
+            sb.append(a, "\\t");
+            prev_hex = false;
+        } else if (b == 13) {
+            sb.append(a, "\\r");
+            prev_hex = false;
+        } else if (b >= 32 and b <= 126) {
+            if (prev_hex and es_is_hex_digit(b)) {
+                sb.append(a, "\" \"");
+            }
+            sb.append_byte(a, b);
+            prev_hex = false;
+        } else {
+            sb.append(a, "\\x");
+            es_hex_digit(a, &sb, b >> 4);
+            es_hex_digit(a, &sb, b & 15);
+            prev_hex = true;
+        }
+    }
+    sb.append_byte(a, 34);
+    var s: []u8 = sb.build(a);
+    sb.deinit(a);
+    return s;
+}
+
 // --- the emitter -------------------------------------------------------------------
 
 /// One lexical scope active during emission (`emit_c.rs::Scope`). The defers
@@ -480,6 +632,9 @@ pub const Em = struct {
     ct_len: usize,
     // Return type of the function being emitted.
     cur_ret: i64,
+    // Monotonic counter for the `__kd_str{N}` print-hoist temporaries
+    // (`Emitter::str_counter`), reset at the start of every function body.
+    str_count: i64,
 
     fn init(a: Allocator, src: []u8, nodes: []Node, root: i32) Self {
         return Em{
@@ -500,6 +655,7 @@ pub const Em = struct {
             .consts = alloc(a, CEnt, 16),
             .ct_len = 0,
             .cur_ret = ET_VOID,
+            .str_count = 0,
         };
     }
 
@@ -657,17 +813,22 @@ pub const Em = struct {
 
     // -- type resolution -----------------------------------------------------------
 
-    /// `Emitter::resolve_ty`: the base name through `from_name`, else the
+    /// `Emitter::resolve_ty`: a slice form maps to the interned `[]u8`
+    /// (sema interns every written slice, and `[]u8` is the only one the
+    /// detector admits); a bare name goes through `from_name`, else the
     /// `Void` fallback (struct/enum/... paths are empty in the subset).
     fn resolve_ty(self: *Self, n: i32) i64 {
+        if ((self.nodes[@as(usize, n)].flags & F_SLICE) != 0) { return ET_SLICE_U8; }
         var t: i64 = et_from_name(self.xname(n));
         if (t == ET_NONE) { return ET_VOID; }
         return t;
     }
 
-    /// `Emitter::cty`: the base name through `from_name`, else the `int64_t`
+    /// `Emitter::cty`: a slice form spells `kd_slice_<type_mangle(elem)>`
+    /// directly; a bare name goes through `from_name`, else the `int64_t`
     /// fallback.
     fn cty(self: *Self, n: i32) []u8 {
+        if ((self.nodes[@as(usize, n)].flags & F_SLICE) != 0) { return "kd_slice_uint8_t"; }
         var t: i64 = et_from_name(self.xname(n));
         if (t == ET_NONE) { return "int64_t"; }
         return et_c_name(t);
@@ -765,6 +926,19 @@ pub const Em = struct {
         return ev_int(l.val >> (r.val & 63));
     }
 
+    /// `promotes_in_c` truncate-back: `(({cty}){s})` (§28.2).
+    fn trunc_back(self: *Self, a: Allocator, t: i64, s: []u8) []u8 {
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "((");
+        sb.append(a, et_c_name(t));
+        sb.append(a, ")");
+        sb.append(a, s);
+        sb.append(a, ")");
+        var r: []u8 = sb.build(a);
+        sb.deinit(a);
+        return r;
+    }
+
     /// `const_literal`: a folded value as C source.
     fn const_literal(self: *Self, a: Allocator, v: EvRes) []u8 {
         if (v.isb) {
@@ -790,6 +964,7 @@ pub const Em = struct {
         var k: u8 = self.nodes[u].kind;
         if (k == ND_INT) { return ET_I64; }
         if (k == ND_BOOL) { return ET_BOOL; }
+        if (k == ND_STR) { return ET_SLICE_U8; }
         if (k == ND_IDENT) { return self.vt_lookup(self.xname(n)); }
         if (k == ND_UNARY) {
             if (self.nodes[u].val == UOP_NOT) { return ET_BOOL; }
@@ -803,6 +978,19 @@ pub const Em = struct {
             return self.fn_ret_of(self.xname(n));
         }
         if (k == ND_COMPTIME) { return self.type_of_expr(self.nodes[u].a); }
+        if (k == ND_FIELD) {
+            // `s.len` on a slice is a `usize`; anything else is untypeable
+            // here (an untyped base propagates its `None`).
+            var bt: i64 = self.type_of_expr(self.nodes[u].a);
+            if (bt == ET_SLICE_U8 and str_eq(self.xname(n), "len")) { return ET_USIZE; }
+            return ET_NONE;
+        }
+        if (k == ND_INDEX) {
+            // `s[i]` yields the slice's element type (`u8`).
+            var bt2: i64 = self.type_of_expr(self.nodes[u].a);
+            if (bt2 == ET_SLICE_U8) { return ET_U8; }
+            return ET_NONE;
+        }
         return ET_NONE;
     }
 
@@ -824,6 +1012,22 @@ pub const Em = struct {
             if (self.nodes[u].val != 0) { return "true"; }
             return "false";
         }
+        if (k == ND_STR) {
+            // A string literal is a `[]u8` over static bytes (SPEC §23.2):
+            // a compound literal whose `.ptr` is the escaped C string and
+            // whose `.len` is the DECODED byte count.
+            var bytes: []u8 = es_decode_str(a, self.src, self.nodes[u].off, self.nodes[u].len);
+            var lit: []u8 = es_c_string_literal(a, bytes);
+            var sb: StrBuilder = StrBuilder.init(a);
+            sb.append(a, "((kd_slice_uint8_t){ .ptr = (uint8_t *)");
+            sb.append(a, lit);
+            sb.append(a, ", .len = ");
+            sb.append_i64(a, @as(i64, bytes.len));
+            sb.append(a, " })");
+            var s: []u8 = sb.build(a);
+            sb.deinit(a);
+            return s;
+        }
         if (k == ND_IDENT) {
             var sb: StrBuilder = StrBuilder.init(a);
             sb.append(a, "kd_");
@@ -844,6 +1048,14 @@ pub const Em = struct {
             sb.append(a, ")");
             var s: []u8 = sb.build(a);
             sb.deinit(a);
+            // §28.2: `~x` yields the operand's type; a narrow (`u8`) operand
+            // would leak C's `int` promotion, so truncate back.
+            if (op == UOP_BNOT) {
+                var t: i64 = self.type_of_expr(self.nodes[u].a);
+                if (et_promotes_in_c(t)) {
+                    return self.trunc_back(a, t, s);
+                }
+            }
             return s;
         }
         if (k == ND_BIN) {
@@ -859,14 +1071,96 @@ pub const Em = struct {
             sb.append(a, ")");
             var s: []u8 = sb.build(a);
             sb.deinit(a);
+            // §28.2: `x << n` yields `x`'s type; only `<<` can outgrow a
+            // narrow operand, so only it truncates back.
+            if (self.nodes[u].val == OPC_SHL) {
+                var t: i64 = self.type_of_expr(self.nodes[u].a);
+                if (et_promotes_in_c(t)) {
+                    return self.trunc_back(a, t, s);
+                }
+            }
             return s;
+        }
+        if (k == ND_FIELD) {
+            var fname: []u8 = self.xname(n);
+            if (str_eq(fname, "len")) {
+                // `s.len` on a slice → the runtime `.len` field (SPEC §15.2;
+                // the array arm cannot appear in the subset).
+                var bt: i64 = self.type_of_expr(self.nodes[u].a);
+                if (bt == ET_SLICE_U8) {
+                    var b: []u8 = self.emit_expr(a, self.nodes[u].a);
+                    var sb: StrBuilder = StrBuilder.init(a);
+                    sb.append(a, "(");
+                    sb.append(a, b);
+                    sb.append(a, ").len");
+                    var s: []u8 = sb.build(a);
+                    sb.deinit(a);
+                    return s;
+                }
+            }
+            // Ordinary field access — sema-invalid in the subset; mirrored
+            // for totality (`(<base>).kd_<field>`, no pointer auto-deref).
+            var b2: []u8 = self.emit_expr(a, self.nodes[u].a);
+            var sb2: StrBuilder = StrBuilder.init(a);
+            sb2.append(a, "(");
+            sb2.append(a, b2);
+            sb2.append(a, ").kd_");
+            sb2.append(a, fname);
+            var s2: []u8 = sb2.build(a);
+            sb2.deinit(a);
+            return s2;
+        }
+        if (k == ND_INDEX) {
+            // `s[i]` (read) → the bounds-checked `_get` helper (SPEC §15.2).
+            var b3: []u8 = self.emit_expr(a, self.nodes[u].a);
+            var i3: []u8 = self.emit_expr(a, self.nodes[u].b);
+            var bt3: i64 = self.type_of_expr(self.nodes[u].a);
+            var sb3: StrBuilder = StrBuilder.init(a);
+            if (bt3 == ET_SLICE_U8) {
+                sb3.append(a, "kd_slice_uint8_t_get(");
+                sb3.append(a, b3);
+                sb3.append(a, ", ");
+                sb3.append(a, i3);
+                sb3.append(a, ")");
+            } else {
+                // Unreachable for validated input (`base` is a slice).
+                sb3.append(a, "(");
+                sb3.append(a, b3);
+                sb3.append(a, ")[");
+                sb3.append(a, i3);
+                sb3.append(a, "]");
+            }
+            var s3: []u8 = sb3.build(a);
+            sb3.deinit(a);
+            return s3;
         }
         if (k == ND_CALL) {
             var callee: []u8 = self.xname(n);
             if (str_eq(callee, "print")) {
-                // `print(<int>)` → `kd_print((long long)(<e>))` (the slice /
-                // f64 routes cannot appear in the subset).
                 var arg: i32 = self.nodes[u].a;
+                // `print(s)` of a `[]u8` string (SPEC §23.2): hoist the
+                // slice into a fresh `__kd_str{N}` temporary so it is
+                // evaluated once, then `fwrite` + newline. (The f64 route
+                // cannot appear in the subset.)
+                if (arg >= 0 and self.type_of_expr(arg) == ET_SLICE_U8) {
+                    var sstr: []u8 = self.emit_expr(a, arg);
+                    var nn: i64 = self.str_count;
+                    self.str_count += 1;
+                    var sbs: StrBuilder = StrBuilder.init(a);
+                    sbs.append(a, "{ kd_slice_uint8_t __kd_str");
+                    sbs.append_i64(a, nn);
+                    sbs.append(a, " = (");
+                    sbs.append(a, sstr);
+                    sbs.append(a, "); fwrite(__kd_str");
+                    sbs.append_i64(a, nn);
+                    sbs.append(a, ".ptr, 1, __kd_str");
+                    sbs.append_i64(a, nn);
+                    sbs.append(a, ".len, stdout); fputc('\\n', stdout); }");
+                    var ss: []u8 = sbs.build(a);
+                    sbs.deinit(a);
+                    return ss;
+                }
+                // `print(<int>)` → `kd_print((long long)(<e>))`.
                 var astr: []u8 = "0";
                 if (arg >= 0) { astr = self.emit_expr(a, arg); }
                 var sb: StrBuilder = StrBuilder.init(a);
@@ -1274,10 +1568,11 @@ pub const Em = struct {
     /// emit the body, close.
     fn emit_func(self: *Self, a: Allocator, fnode: i32) void {
         var u: usize = @as(usize, fnode);
-        // Reset the scope machinery (per-function, like `scopes.clear()`).
+        // Reset the scope machinery and the per-function temp counters.
         self.sc_len = 0;
         self.df_len = 0;
         self.vt_len = 0;
+        self.str_count = 0;
         self.cur_ret = self.resolve_ty(self.nodes[u].b);
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, self.cty(self.nodes[u].b));
@@ -1333,11 +1628,11 @@ pub const Em = struct {
             }
             return;
         }
-        if (k == ND_UNARY or k == ND_COMPTIME) {
+        if (k == ND_UNARY or k == ND_COMPTIME or k == ND_FIELD) {
             self.collect_calls_expr(a, pend, self.nodes[u].a);
             return;
         }
-        if (k == ND_BIN) {
+        if (k == ND_BIN or k == ND_INDEX) {
             self.collect_calls_expr(a, pend, self.nodes[u].a);
             self.collect_calls_expr(a, pend, self.nodes[u].b);
             return;
@@ -1444,6 +1739,115 @@ pub const Em = struct {
             }
             cur = self.nodes[u].next;
         }
+    }
+
+    // -- string interning scan (the sema mirror) --------------------------------------
+    //
+    // Sema interns `[]u8` when it resolves a written `[]u8` type (sema.rs
+    // `resolve_type`) or checks a string literal (`Expr::StrLit`), anywhere
+    // in the module — including functions that §43.1 later drops. The scan
+    // below mirrors exactly that: any slice-flagged TYPE node or any STR
+    // node reachable from the item tree.
+
+    fn scan_str_ty(self: *Self, n: i32) bool {
+        if (n < 0) { return false; }
+        return (self.nodes[@as(usize, n)].flags & F_SLICE) != 0;
+    }
+
+    fn scan_str_expr(self: *Self, n: i32) bool {
+        if (n < 0) { return false; }
+        var u: usize = @as(usize, n);
+        var k: u8 = self.nodes[u].kind;
+        if (k == ND_STR) { return true; }
+        if (k == ND_UNARY or k == ND_COMPTIME or k == ND_FIELD) {
+            return self.scan_str_expr(self.nodes[u].a);
+        }
+        if (k == ND_BIN or k == ND_INDEX) {
+            if (self.scan_str_expr(self.nodes[u].a)) { return true; }
+            return self.scan_str_expr(self.nodes[u].b);
+        }
+        if (k == ND_CALL) {
+            var cur: i32 = self.nodes[u].a;
+            while (cur >= 0) {
+                if (self.scan_str_expr(cur)) { return true; }
+                cur = self.nodes[@as(usize, cur)].next;
+            }
+        }
+        return false;
+    }
+
+    fn scan_str_block(self: *Self, block: i32) bool {
+        if (block < 0) { return false; }
+        var cur: i32 = self.nodes[@as(usize, block)].a;
+        while (cur >= 0) {
+            if (self.scan_str_stmt(cur)) { return true; }
+            cur = self.nodes[@as(usize, cur)].next;
+        }
+        return false;
+    }
+
+    fn scan_str_stmt(self: *Self, n: i32) bool {
+        if (n < 0) { return false; }
+        var u: usize = @as(usize, n);
+        var k: u8 = self.nodes[u].kind;
+        if (k == ND_LET) {
+            if (self.scan_str_ty(self.nodes[u].a)) { return true; }
+            return self.scan_str_expr(self.nodes[u].b);
+        }
+        if (k == ND_ASSIGN) { return self.scan_str_expr(self.nodes[u].a); }
+        if (k == ND_RETURN) { return self.scan_str_expr(self.nodes[u].a); }
+        if (k == ND_IF) {
+            if (self.scan_str_expr(self.nodes[u].a)) { return true; }
+            if (self.scan_str_block(self.nodes[u].b)) { return true; }
+            return self.scan_str_stmt(self.nodes[u].c);
+        }
+        if (k == ND_WHILE) {
+            if (self.scan_str_expr(self.nodes[u].a)) { return true; }
+            if (self.scan_str_stmt(self.nodes[u].b)) { return true; }
+            return self.scan_str_block(self.nodes[u].c);
+        }
+        if (k == ND_DEFER) { return self.scan_str_stmt(self.nodes[u].a); }
+        if (k == ND_BLOCK) { return self.scan_str_block(n); }
+        if (k == ND_BREAK or k == ND_CONTINUE) { return false; }
+        return self.scan_str_expr(n);
+    }
+
+    /// Whether the module interns `[]u8` (see the section comment).
+    fn module_interns_str(self: *Self) bool {
+        var cur: i32 = self.root;
+        while (cur >= 0) {
+            var u: usize = @as(usize, cur);
+            var k: u8 = self.nodes[u].kind;
+            if (k == ND_FN) {
+                var p: i32 = self.nodes[u].a;
+                while (p >= 0) {
+                    var pu: usize = @as(usize, p);
+                    if (self.scan_str_ty(self.nodes[pu].a)) { return true; }
+                    p = self.nodes[pu].next;
+                }
+                if (self.scan_str_ty(self.nodes[u].b)) { return true; }
+                if (self.scan_str_block(self.nodes[u].c)) { return true; }
+            } else if (k == ND_CONST) {
+                if (self.scan_str_ty(self.nodes[u].a)) { return true; }
+                if (self.scan_str_expr(self.nodes[u].b)) { return true; }
+            }
+            cur = self.nodes[u].next;
+        }
+        return false;
+    }
+
+    /// `emit_type_defs` for the subset: the only internable composite is the
+    /// `[]u8` slice — its typedef and `_get`/`_at`/`_alloc` helpers
+    /// (`emit_one_slice`), then the section blank. Nothing at all when the
+    /// module interns nothing (the Rust early-return keeps even the blank
+    /// out).
+    fn emit_type_defs(self: *Self, a: Allocator) void {
+        if (!self.module_interns_str()) { return; }
+        self.line(a, "typedef struct { uint8_t *ptr; uintptr_t len; } kd_slice_uint8_t;");
+        self.line(a, "static inline uint8_t kd_slice_uint8_t_get(kd_slice_uint8_t s, int64_t i) { if (i < 0 || (uint64_t)i >= s.len) { fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); } return s.ptr[i]; }");
+        self.line(a, "static inline uint8_t *kd_slice_uint8_t_at(kd_slice_uint8_t s, int64_t i) { if (i < 0 || (uint64_t)i >= s.len) { fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); } return s.ptr + i; }");
+        self.line(a, "static inline kd_slice_uint8_t kd_slice_uint8_t_alloc(uintptr_t n) { kd_slice_uint8_t s; s.ptr = malloc(n * sizeof(uint8_t)); if (!s.ptr && n != 0) { fputs(\"panic: out of memory\\n\", stderr); exit(101); } s.len = n; return s; }");
+        self.blank(a);
     }
 
     fn emit_prelude(self: *Self, a: Allocator) void {
@@ -1557,8 +1961,7 @@ pub const Em = struct {
         self.collect_signatures(a);
         self.compute_live(a);
         self.emit_prelude(a);
-        // `emit_type_defs` emits nothing: the subset interns no composite
-        // types (no structs, optionals, error unions, enums, arrays, slices).
+        self.emit_type_defs(a);
         self.emit_consts(a);
         self.emit_forward_decls(a);
         self.emit_func_defs(a);
