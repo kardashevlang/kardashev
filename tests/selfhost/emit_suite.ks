@@ -1,5 +1,5 @@
 // emit_suite.ks — in-language tests for the self-hosted subset C emitter
-// (v0.161).
+// (v0.161 scalars + v0.162 strings).
 //
 // Run: kard test tests/selfhost/emit_suite.ks (driven from
 // `crates/kardc/tests/selfhost_emit.rs` so it is part of `cargo test`).
@@ -107,28 +107,39 @@ fn eh_prelude(a: Allocator, sb: *StrBuilder) void {
 
 // --- spelling tables --------------------------------------------------------------
 
-test "type codes: from_name maps the four subset spellings" {
+test "type codes: from_name maps the six subset spellings" {
     expect(et_from_name("i32") == ET_I32);
     expect(et_from_name("i64") == ET_I64);
     expect(et_from_name("bool") == ET_BOOL);
     expect(et_from_name("void") == ET_VOID);
-    expect(et_from_name("u8") == ET_NONE);
+    expect(et_from_name("u8") == ET_U8);
+    expect(et_from_name("usize") == ET_USIZE);
     expect(et_from_name("f64") == ET_NONE);
     expect(et_from_name("Self") == ET_NONE);
     expect(et_from_name("") == ET_NONE);
 }
 
-test "type codes: C spellings and is_int" {
+test "type codes: C spellings, is_int and the u8 promotion class" {
     expect(str_eq(et_c_name(ET_I32), "int32_t"));
     expect(str_eq(et_c_name(ET_I64), "int64_t"));
     expect(str_eq(et_c_name(ET_BOOL), "bool"));
     expect(str_eq(et_c_name(ET_VOID), "void"));
+    expect(str_eq(et_c_name(ET_U8), "uint8_t"));
+    expect(str_eq(et_c_name(ET_USIZE), "uintptr_t"));
+    expect(str_eq(et_c_name(ET_SLICE_U8), "kd_slice_uint8_t"));
     // The defensive fallback spelling mirrors the Rust `cty` fallback.
     expect(str_eq(et_c_name(ET_NONE), "int64_t"));
     expect(et_is_int(ET_I32));
     expect(et_is_int(ET_I64));
+    expect(et_is_int(ET_U8));
+    expect(et_is_int(ET_USIZE));
     expect(!et_is_int(ET_BOOL));
     expect(!et_is_int(ET_VOID));
+    expect(!et_is_int(ET_SLICE_U8));
+    // Only `u8` is sub-32-bit here, so only it truncates back (§28.2).
+    expect(et_promotes_in_c(ET_U8));
+    expect(!et_promotes_in_c(ET_I32));
+    expect(!et_promotes_in_c(ET_USIZE));
 }
 
 test "operator spellings: c_op and bool-result classification" {
@@ -188,30 +199,38 @@ test "detect: float literal, first hit with position" {
     expect(d.pos == 23);
 }
 
-test "detect: string literal position" {
+test "detect: strings, []u8, .len and s[i] are in the subset (v0.162)" {
     var a: Allocator = c_allocator();
-    //                          0         1         2
-    //                          01234567890123456789012345
-    var d: Det = eh_detect(a, "fn main() void { var s = \"x\"; }");
-    expect(d.found);
-    expect(str_eq(d.word, "string"));
-    expect(d.pos == 25);
+    var d: Det = eh_detect(a, "fn grab(s: []u8) []u8 { return s; }\npub fn main() void {\n    var s: []u8 = \"x\";\n    var c: u8 = s[0];\n    var n: usize = s.len;\n    print(grab(s));\n    print(c);\n    print(n);\n}\n");
+    expect(!d.found);
 }
 
 test "detect: composite type forms and non-subset type names" {
     var a: Allocator = c_allocator();
-    var d: Det = eh_detect(a, "fn main() void { var s: []u8 = q(); }");
+    // `[]u8` is the ONE admitted composite; any other slice element is out.
+    var d: Det = eh_detect(a, "fn main() void { var s: []i32 = q(); }");
     expect(d.found);
-    expect(str_eq(d.word, "type-form"));
-    var d2: Det = eh_detect(a, "fn main() void { var c: u8 = q(); }");
+    expect(str_eq(d.word, "type-name"));
+    var d2: Det = eh_detect(a, "fn main() void { var p: *i32 = q(); }");
     expect(d2.found);
-    expect(str_eq(d2.word, "type-name"));
+    expect(str_eq(d2.word, "type-form"));
     var d3: Det = eh_detect(a, "fn main() f64 { return q(); }");
     expect(d3.found);
     expect(str_eq(d3.word, "type-name"));
     var d4: Det = eh_detect(a, "fn main() ?i32 { return q(); }");
     expect(d4.found);
     expect(str_eq(d4.word, "type-form"));
+}
+
+test "detect: a non-len field access is out, its base is still walked" {
+    var a: Allocator = c_allocator();
+    var d: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"x\"; print(s.ptr); }");
+    expect(d.found);
+    expect(str_eq(d.word, "field"));
+    // A `.len` whose BASE is out still reports the base's construct.
+    var d2: Det = eh_detect(a, "pub fn main() void { print(a.b.len); }");
+    expect(d2.found);
+    expect(str_eq(d2.word, "field"));
 }
 
 test "detect: out-of-subset statements" {
@@ -397,6 +416,130 @@ test "emit: integer main wires the exit code, params and consts" {
     sb.append(a, "}\n");
     sb.append(a, "\n");
     sb.append(a, "int main(int argc, char **argv){ (void)argc;(void)argv; return (int) kd_main(); }\n");
+    var want: []u8 = sb.build(a);
+    expect(str_eq(c, want));
+    free(a, want);
+    sb.deinit(a);
+}
+
+// --- strings (v0.162) ------------------------------------------------------------------
+
+test "strings: escape decode + re-encode through emission" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void { print(\"a\\nb\\tc\"); print(\"q\\\"w\\\\e\"); print(\"\"); }");
+    // `\n`/`\t` decode to bytes and re-encode readably; `.len` is the
+    // DECODED byte count (5, not the 7 source characters).
+    expect(eh_find(c, "((kd_slice_uint8_t){ .ptr = (uint8_t *)\"a\\nb\\tc\", .len = 5 })"));
+    expect(eh_find(c, "((kd_slice_uint8_t){ .ptr = (uint8_t *)\"q\\\"w\\\\e\", .len = 5 })"));
+    expect(eh_find(c, "((kd_slice_uint8_t){ .ptr = (uint8_t *)\"\", .len = 0 })"));
+}
+
+test "strings: c_string_literal hex escapes and the hex-digit split" {
+    var a: Allocator = c_allocator();
+    // Bytes that cannot appear readably: 0x07 then 'f' must split the C
+    // literal so the escape cannot absorb the digit.
+    var sb: StrBuilder = StrBuilder.init(a);
+    sb.append_byte(a, 97);
+    sb.append_byte(a, 7);
+    sb.append(a, "fb");
+    var bytes: []u8 = sb.build(a);
+    sb.deinit(a);
+    var lit: []u8 = es_c_string_literal(a, bytes);
+    expect(str_eq(lit, "\"a\\x07\" \"fb\""));
+    // A non-hex-digit follower needs no split; a high byte hex-escapes.
+    var sb2: StrBuilder = StrBuilder.init(a);
+    sb2.append_byte(a, 1);
+    sb2.append_byte(a, 122);
+    sb2.append_byte(a, 195);
+    sb2.append_byte(a, 169);
+    var bytes2: []u8 = sb2.build(a);
+    sb2.deinit(a);
+    var lit2: []u8 = es_c_string_literal(a, bytes2);
+    expect(str_eq(lit2, "\"\\x01z\\xc3\\xa9\""));
+    // Carriage return stays readable; consecutive escapes never split.
+    var sb3: StrBuilder = StrBuilder.init(a);
+    sb3.append_byte(a, 13);
+    sb3.append_byte(a, 2);
+    sb3.append_byte(a, 3);
+    var bytes3: []u8 = sb3.build(a);
+    sb3.deinit(a);
+    var lit3: []u8 = es_c_string_literal(a, bytes3);
+    expect(str_eq(lit3, "\"\\r\\x02\\x03\""));
+}
+
+test "strings: decode handles all four legal escapes" {
+    var a: Allocator = c_allocator();
+    // Source text: "x\n\t\\\"y" (12 bytes with quotes) decodes to 6 bytes.
+    var srct: []u8 = "\"x\\n\\t\\\\\\\"y\"";
+    var bytes: []u8 = es_decode_str(a, srct, 0, srct.len);
+    expect(bytes.len == 6);
+    expect(bytes[0] == 120);
+    expect(bytes[1] == 10);
+    expect(bytes[2] == 9);
+    expect(bytes[3] == 92);
+    expect(bytes[4] == 34);
+    expect(bytes[5] == 121);
+}
+
+test "strings: slice typedef gating mirrors sema interning" {
+    var a: Allocator = c_allocator();
+    // No string literal, no []u8 type → no typedef block.
+    var c: []u8 = eh_emit(a, "pub fn main() void { print(1); }");
+    expect(!eh_find(c, "kd_slice_uint8_t"));
+    // A string in a §43.1-DEAD function still interns (sema checks the
+    // whole module; typedefs ignore liveness).
+    var c2: []u8 = eh_emit(a, "fn dead() void { print(\"never\"); }\npub fn main() void { print(1); }");
+    expect(eh_find(c2, "typedef struct { uint8_t *ptr; uintptr_t len; } kd_slice_uint8_t;\n"));
+    expect(eh_find(c2, "kd_slice_uint8_t_get"));
+    expect(eh_find(c2, "kd_slice_uint8_t_at"));
+    expect(eh_find(c2, "kd_slice_uint8_t_alloc"));
+    expect(!eh_find(c2, "kd_dead"));
+    // A []u8 type annotation alone (no literal) also interns.
+    var c3: []u8 = eh_emit(a, "fn id(s: []u8) []u8 { return s; }\npub fn main() void { print(1); }");
+    expect(eh_find(c3, "typedef struct { uint8_t *ptr; uintptr_t len; } kd_slice_uint8_t;\n"));
+}
+
+test "strings: print hoists into __kd_strN, counter resets per function" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "fn f() void { print(\"a\"); print(\"b\"); }\npub fn main() void { f(); print(\"c\"); }");
+    // Two hoists in f → __kd_str0 and __kd_str1; main resets → __kd_str0.
+    expect(eh_find(c, "{ kd_slice_uint8_t __kd_str0 = (((kd_slice_uint8_t){ .ptr = (uint8_t *)\"a\", .len = 1 })); fwrite(__kd_str0.ptr, 1, __kd_str0.len, stdout); fputc('\\n', stdout); };"));
+    expect(eh_find(c, "__kd_str1 = (((kd_slice_uint8_t){ .ptr = (uint8_t *)\"b\", .len = 1 }))"));
+    expect(eh_find(c, "__kd_str0 = (((kd_slice_uint8_t){ .ptr = (uint8_t *)\"c\", .len = 1 }))"));
+    expect(!eh_find(c, "__kd_str2"));
+}
+
+test "strings: .len, s[i] and u8 lowering with truncate-back" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void {\n    var s: []u8 = \"kz\";\n    var n = s.len;\n    var c: u8 = s[0];\n    print(n);\n    print(s[s.len - 1]);\n    print(~c);\n    print(c << 1);\n    var d = c - 32;\n    print(d);\n}");
+    // `.len` infers usize; the read index goes through the `_get` helper.
+    expect(eh_find(c, "uintptr_t kd_n = (kd_s).len;"));
+    expect(eh_find(c, "uint8_t kd_c = kd_slice_uint8_t_get(kd_s, 0);"));
+    expect(eh_find(c, "kd_print((long long)(kd_slice_uint8_t_get(kd_s, ((kd_s).len - 1))));"));
+    // §28.2: `~`/`<<` over a u8 operand truncate back through a cast.
+    expect(eh_find(c, "kd_print((long long)(((uint8_t)(~kd_c))));"));
+    expect(eh_find(c, "kd_print((long long)(((uint8_t)(kd_c << 1))));"));
+    // Ordinary u8 arithmetic keeps the operand type but needs no cast.
+    expect(eh_find(c, "uint8_t kd_d = (kd_c - 32);"));
+}
+
+test "strings: whole-program byte equality with the typedef section" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void { print(\"hi\"); }");
+    var sb: StrBuilder = StrBuilder.init(a);
+    eh_prelude(a, &sb);
+    sb.append(a, "typedef struct { uint8_t *ptr; uintptr_t len; } kd_slice_uint8_t;\n");
+    sb.append(a, "static inline uint8_t kd_slice_uint8_t_get(kd_slice_uint8_t s, int64_t i) { if (i < 0 || (uint64_t)i >= s.len) { fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); } return s.ptr[i]; }\n");
+    sb.append(a, "static inline uint8_t *kd_slice_uint8_t_at(kd_slice_uint8_t s, int64_t i) { if (i < 0 || (uint64_t)i >= s.len) { fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); } return s.ptr + i; }\n");
+    sb.append(a, "static inline kd_slice_uint8_t kd_slice_uint8_t_alloc(uintptr_t n) { kd_slice_uint8_t s; s.ptr = malloc(n * sizeof(uint8_t)); if (!s.ptr && n != 0) { fputs(\"panic: out of memory\\n\", stderr); exit(101); } s.len = n; return s; }\n");
+    sb.append(a, "\n");
+    sb.append(a, "void kd_main(void);\n");
+    sb.append(a, "\n");
+    sb.append(a, "void kd_main(void) {\n");
+    sb.append(a, "    { kd_slice_uint8_t __kd_str0 = (((kd_slice_uint8_t){ .ptr = (uint8_t *)\"hi\", .len = 2 })); fwrite(__kd_str0.ptr, 1, __kd_str0.len, stdout); fputc('\\n', stdout); };\n");
+    sb.append(a, "}\n");
+    sb.append(a, "\n");
+    sb.append(a, "int main(int argc, char **argv){ (void)argc;(void)argv; kd_main(); return 0; }\n");
     var want: []u8 = sb.build(a);
     expect(str_eq(c, want));
     free(a, want);

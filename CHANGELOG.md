@@ -18,6 +18,43 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.162.0] — Self-hosting stage 4: strings in the self-hosted emitter
+
+The v0.161 subset grows by the string layer: the `u8`/`usize` scalars, the
+one composite type `[]u8`, string literals, `print([]u8)`, `.len` on a
+slice, and the bounds-checked read index `s[i]` (index writes — place
+assignments — stay out). `selfhost/emit.ks` (2,029 lines) keeps the
+byte-identical contract by mirroring the string machinery of `emit_c.rs`:
+
+- the `kd_slice_uint8_t` typedef + `_get`/`_at`/`_alloc` helpers are
+  emitted exactly when sema would intern `[]u8` — a written `[]u8` type or
+  a string literal anywhere in the module, including §43.1-dead functions
+  (a whole-tree scan mirrors the interning triggers);
+- a string literal decodes its `\n \t \\ \"` escapes and re-encodes through
+  a `c_string_literal` mirror (escape `\` `"`, keep `\n`/`\t`/`\r`
+  readable, hex-escape everything outside printable ASCII, and split the
+  literal with `" "` when an `\xNN` escape would absorb a following hex
+  digit) with `.len` = the decoded byte count;
+- `print(s)` hoists the slice into a fresh `__kd_str{N}` temporary
+  (`fwrite` + newline), counter reset per function;
+- `s.len` → `(<s>).len` typed `usize`; `s[i]` → the bounds-checked
+  `kd_slice_uint8_t_get(<s>, <i>)` typed `u8`; and §28.2's narrow-operand
+  rule: `~`/`<<` over a `u8` truncate back through `((uint8_t)...)`.
+
+### Added
+- `es_decode_str` / `es_c_string_literal` + the interning scan and string
+  lowerings in `selfhost/emit.ks`; the detector now admits strings, `[]u8`,
+  `u8`, `usize`, `.len` and read indexing (`selfhost/cdump.ks` unchanged).
+- Differential coverage grew: **57 of 704 corpus files C byte-identical
+  (48,612 bytes)** — including `s23_strings` and the `s28_bitwise` narrow
+  promotion-truncation fixtures — with 589 `SKIP` and 25 `ERROR`
+  agreements; the pinned `SEMA_INVALID` list grew 28 → 33 (the string/index
+  type-error fixtures now parse as subset-shaped). 7 new targeted inputs
+  (escape zoo, raw-byte hex splits, slice params/returns, u8 bytes +
+  promotion, string defers, typedef gating) and 8 new in-language suite
+  tests (29 blocks total).
+- 1,110 tests green across the workspace.
+
 ## [0.161.0] — Self-hosting stage 3: the C emitter (scalar subset), in kardashev
 
 `selfhost/emit.ks` (1,626 lines) is a **C emitter written in kardashev** for

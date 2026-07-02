@@ -1,6 +1,6 @@
-//! Self-host stage 3 (v0.161): differential test of `selfhost/emit.ks` — a C
-//! emitter for the SCALAR SUBSET written in kardashev — against the Rust
-//! reference emitter.
+//! Self-host stages 3+4 (v0.161–v0.162): differential test of
+//! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING SUBSET written
+//! in kardashev — against the Rust reference emitter.
 //!
 //! `selfhost/cdump.ks` is compiled ONCE (full file-based pipeline + `-O0`
 //! cc build) and then executed on every corpus file; its stdout must be
@@ -12,7 +12,7 @@
 //!   E0001/E0002, 200/201 = E0200/E0201, pos = the first diagnostic's span
 //!   start).
 //! - **`SKIP <word> <pos>`** — the module parses but uses a construct
-//!   outside the v0.161 subset. `<word>`/`<pos>` name the FIRST unsupported
+//!   outside the subset. `<word>`/`<pos>` name the FIRST unsupported
 //!   construct in a fixed depth-first walk ([`detect_subset`], mirrored
 //!   word-for-word by `es_detect` in `selfhost/emit.ks`): items in source
 //!   order; per function, parameters (comptime flag, then type), return
@@ -23,11 +23,14 @@
 //! - **the full C text** — the module is in the subset: byte-for-byte the
 //!   Rust `emit_c::emit(.., EmitMode::Program)` output.
 //!
-//! The subset: `i32`/`i64`/`bool`/`void` bare types; top-level `fn`/`const`;
-//! `var`/`const` lets, (compound) name-assignment, `if`/`else`, `while` with
+//! The subset: `i32`/`i64`/`bool`/`void`/`u8`/`usize` bare types plus the
+//! one composite `[]u8` (v0.162); top-level `fn`/`const`; `var`/`const`
+//! lets, (compound) name-assignment, `if`/`else`, `while` with
 //! continue-clause, unlabeled `break`/`continue`, `defer`, `return`, bare
-//! blocks, expression statements; int/bool literals, names, unary `-`/`!`/
-//! `~`, the full binary ladder, free calls, `print`, `expect`, `comptime`.
+//! blocks, expression statements; int/bool/STRING literals, names, unary
+//! `-`/`!`/`~`, the full binary ladder, free calls, `print` (integers and
+//! `[]u8` strings), `expect`, `comptime`, `.len` on a slice, and the read
+//! index `s[i]` (index writes are place-assignments and stay out).
 //!
 //! # The sema-invalid remainder
 //!
@@ -68,7 +71,9 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s03_sema/block_scope_name_dies_err.ks",               // E0100
     "tests/spec/s03_sema/bool_arith_err.ks",                          // E0110
     "tests/spec/s03_sema/break_outside_loop_err.ks",                  // E0120
+    "tests/spec/s03_sema/call_arg_type_mismatch_err.ks",              // E0110
     "tests/spec/s03_sema/call_arity_err.ks",                          // E0110
+    "tests/spec/s03_sema/comparison_mixed_types_err.ks",              // E0110
     "tests/spec/s03_sema/condition_must_be_bool_err.ks",              // E0110
     "tests/spec/s03_sema/const_call_not_constant_err.ks",             // E0130
     "tests/spec/s03_sema/const_eval_type_error_err.ks",               // E0132
@@ -79,8 +84,11 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s03_sema/return_void_rules_err.ks",                   // E0110
     "tests/spec/s03_sema/unknown_name_err.ks",                        // E0100
     "tests/spec/s03_sema/void_result_unusable_err.ks",                // E0110
+    "tests/spec/s14_arrays/index_non_array_err.ks",                   // E0220
     "tests/spec/s18_inference/infer_const_stays_immutable_err.ks",    // E0110
     "tests/spec/s18_inference/infer_default_not_i32_err.ks",          // E0110
+    "tests/spec/s23_strings/string_eq_operator_err.ks",               // E0110
+    "tests/spec/s23_strings/string_plus_operator_err.ks",             // E0110
     "tests/spec/s25_generic_structs/err_alias_of_non_ctor.ks",        // E0311
     "tests/spec/s27_compound/bool_rhs_err.ks",                        // E0110
     "tests/spec/s27_compound/const_place_err.ks",                     // E0110
@@ -91,7 +99,7 @@ const SEMA_INVALID: &[&str] = &[
 
 /// Floor on the number of corpus files whose C is byte-compared: catches a
 /// subset-detector regression that silently skips what used to be compared.
-const MIN_C_COMPARED: usize = 45;
+const MIN_C_COMPARED: usize = 55;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -115,22 +123,29 @@ type Hit = (&'static str, usize);
 
 /// The subset type spellings.
 fn subset_type_name(name: &str) -> bool {
-    matches!(name, "i32" | "i64" | "bool" | "void")
+    matches!(name, "i32" | "i64" | "bool" | "void" | "u8" | "usize")
 }
 
-/// A type reference: any composite form is out, then the base name must be a
-/// subset spelling (`@This()` parses to the synthesized name `Self`, which is
-/// not one — the selfhost side reports its `F_THIS` flag identically).
+/// A type reference: any composite form other than a slice is out; a slice
+/// must be exactly `[]u8` (v0.162); a bare base name must be a subset
+/// spelling (`@This()` parses to the synthesized name `Self`, which is not
+/// one — the selfhost side reports its `F_THIS` flag identically, sliced or
+/// not).
 fn det_type(t: &TypeExpr) -> Option<Hit> {
     if t.optional
         || t.error_union
         || t.error_set.is_some()
         || t.array_len.is_some()
         || t.pointer
-        || t.slice
         || t.ctor_args.is_some()
     {
         return Some(("type-form", t.span.start));
+    }
+    if t.slice {
+        if t.name != "u8" {
+            return Some(("type-name", t.span.start));
+        }
+        return None;
     }
     if !subset_type_name(&t.name) {
         return Some(("type-name", t.span.start));
@@ -151,12 +166,23 @@ fn det_expr(e: &Expr) -> Option<Hit> {
             args.iter().find_map(det_expr)
         }
         Expr::Comptime { expr, .. } => det_expr(expr),
+        // A string literal is in the subset (v0.162).
+        Expr::StrLit { .. } => None,
+        // The one field access in the subset: `.len` (v0.162); the base is
+        // walked either way.
+        Expr::Field { base, field, .. } => {
+            if field != "len" {
+                return Some(("field", pos));
+            }
+            det_expr(base)
+        }
+        // A read index `s[i]` is in the subset (v0.162); index WRITES are
+        // `Stmt::FieldAssign` places and stay out.
+        Expr::Index { base, index, .. } => det_expr(base).or_else(|| det_expr(index)),
         Expr::Float { .. } => Some(("float", pos)),
-        Expr::StrLit { .. } => Some(("string", pos)),
         Expr::Builtin { .. } => Some(("builtin", pos)),
         Expr::StructLit { .. } => Some(("struct-lit", pos)),
         Expr::StructType { .. } => Some(("struct-type", pos)),
-        Expr::Field { .. } => Some(("field", pos)),
         Expr::MethodCall { .. } => Some(("method-call", pos)),
         Expr::Null { .. } => Some(("null", pos)),
         Expr::Orelse { .. } => Some(("orelse", pos)),
@@ -164,7 +190,6 @@ fn det_expr(e: &Expr) -> Option<Hit> {
         Expr::ErrorLit { .. } => Some(("error-lit", pos)),
         Expr::EnumLit { .. } => Some(("enum-lit", pos)),
         Expr::ArrayLit { .. } => Some(("array-lit", pos)),
-        Expr::Index { .. } => Some(("index", pos)),
         Expr::AddrOf { .. } => Some(("addrof", pos)),
         Expr::Deref { .. } => Some(("deref", pos)),
         Expr::SliceExpr { .. } => Some(("slice-expr", pos)),
@@ -599,18 +624,47 @@ fn selfhost_emit_differential_targeted_inputs() {
             "bool_main_wire",
             "fn t() bool { return true; }\npub fn main() bool { return t(); }\n",
         ),
+        // -- strings (v0.162) ----------------------------------------------------
+        (
+            "string_escape_zoo",
+            "pub fn main() void {\n    print(\"hello\");\n    print(\"a\\nb\\tc\");\n    print(\"q\\\"w\\\\e\");\n    print(\"\");\n}\n",
+        ),
+        (
+            "string_hex_split",
+            "pub fn main() void {\n    print(\"a\x07fb\");\n    print(\"\x01\x02X\x030\");\n    print(\"\u{e9}\");\n}\n",
+        ),
+        (
+            "string_slices_params_returns",
+            "fn pick(s: []u8, alt: []u8, b: bool) []u8 {\n    if (b) { return s; }\n    return alt;\n}\nfn measure(s: []u8) usize {\n    return s.len;\n}\npub fn main() void {\n    var s: []u8 = \"kardashev\";\n    var t = pick(s, \"other\", true);\n    print(t);\n    print(t.len);\n    print(measure(\"abc\"));\n    var i: usize = 0;\n    while (i < s.len) : (i += 1) {\n        print(s[i]);\n    }\n    print(s[s.len - 1]);\n}\n",
+        ),
+        (
+            "u8_bytes_and_promotion",
+            "fn double_u8(n: u8) u8 { return n * 2; }\npub fn main() void {\n    var s: []u8 = \"kz\";\n    var c: u8 = s[0];\n    var d = double_u8(c);\n    print(d);\n    print(~c);\n    print(c << 1);\n    print(~(c << 1));\n    var e: u8 = 65;\n    var f = e + 1;\n    print(f);\n}\n",
+        ),
+        (
+            "string_defer_and_hoist_counter",
+            "fn f() []u8 {\n    defer print(\"bye\");\n    defer print(\"later\");\n    return \"val\";\n}\npub fn main() void {\n    defer print(\"end\");\n    print(f());\n    print(\"mid\");\n}\n",
+        ),
+        (
+            "slice_typedef_gating_absent",
+            "pub fn main() void { print(1); }\n",
+        ),
+        (
+            "slice_typedef_gating_dead_fn",
+            "fn dead() void { print(\"never\"); }\npub fn main() void { print(1); }\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
             "skip_float_deep_in_defer",
             "pub fn main() void {\n    defer {\n        var x: i64 = 1;\n        print(x + 1.5);\n    }\n}\n",
         ),
         (
-            "skip_string_in_cont_clause",
-            "pub fn main() void {\n    var i: i64 = 0;\n    while (i < 3) : (i += str_len(\"ab\")) {\n        print(i);\n    }\n}\n",
+            "skip_slice_of_i32",
+            "pub fn main() void {\n    if (true) {\n        var s: []i32 = q();\n    }\n}\n",
         ),
         (
-            "skip_type_in_nested_let",
-            "pub fn main() void {\n    if (true) {\n        var s: []u8 = arg();\n    }\n}\n",
+            "skip_field_not_len",
+            "pub fn main() void {\n    var s: []u8 = \"x\";\n    print(s.ptr);\n}\n",
         ),
         ("skip_nomain", "fn helper() void {}\n"),
         ("skip_empty_module", ""),
