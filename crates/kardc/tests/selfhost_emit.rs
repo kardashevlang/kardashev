@@ -1,7 +1,7 @@
-//! Self-host stages 3–6 (v0.161–v0.164): differential test of
+//! Self-host stages 3–7 (v0.161–v0.165): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
-//! SUBSET (with generalized `[]T` slices and `@as` casts) written in
-//! kardashev — against the Rust reference emitter.
+//! SUBSET (with generalized `[]T` slices, `@as` casts and the `s[lo..hi]`
+//! slicing view) written in kardashev — against the Rust reference emitter.
 //!
 //! `selfhost/cdump.ks` is compiled ONCE (full file-based pipeline + `-O0`
 //! cc build) and then executed on every corpus file; its stdout must be
@@ -33,8 +33,9 @@
 //! statements; int/bool/STRING literals, names, unary `-`/`!`/`~`, the full
 //! binary ladder, free calls, `print` (integers and `[]u8` strings),
 //! `expect`, `comptime`, `@as(T, e)` casts (v0.164), `.len` on a slice, the
-//! read index `s[i]`, and the allocator builtins `c_allocator()` /
-//! `alloc(a, T, n)` / `free(a, s)`.
+//! read index `s[i]`, the slicing view `s[lo..hi]` (v0.165 — a `{ptr, len}`
+//! view with the bounds check folded into a `_Noreturn` conditional), and
+//! the allocator builtins `c_allocator()` / `alloc(a, T, n)` / `free(a, s)`.
 //!
 //! v0.164's load-bearing piece: the typedef section emits one
 //! `kd_slice_<tag>` block per interned slice IN SEMA'S FIRST-INTERN ORDER,
@@ -97,6 +98,7 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s03_sema/unknown_name_err.ks",                        // E0100
     "tests/spec/s03_sema/void_result_unusable_err.ks",                // E0110
     "tests/spec/s14_arrays/index_non_array_err.ks",                   // E0220
+    "tests/spec/s15_ptr_slices/slice_non_sliceable_err.ks",           // E0232
     "tests/spec/s16_alloc/free_non_slice_err.ks",                     // E0242
     "tests/spec/s18_inference/infer_const_stays_immutable_err.ks",    // E0110
     "tests/spec/s18_inference/infer_default_not_i32_err.ks",          // E0110
@@ -114,7 +116,7 @@ const SEMA_INVALID: &[&str] = &[
 
 /// Floor on the number of corpus files whose C is byte-compared: catches a
 /// subset-detector regression that silently skips what used to be compared.
-const MIN_C_COMPARED: usize = 60;
+const MIN_C_COMPARED: usize = 65;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -243,9 +245,12 @@ fn det_expr(e: &Expr) -> Option<Hit> {
         Expr::ErrorLit { .. } => Some(("error-lit", pos)),
         Expr::EnumLit { .. } => Some(("enum-lit", pos)),
         Expr::ArrayLit { .. } => Some(("array-lit", pos)),
+        // The slicing view `base[lo..hi]` is in the subset (v0.165).
+        Expr::SliceExpr { base, lo, hi, .. } => det_expr(base)
+            .or_else(|| det_expr(lo))
+            .or_else(|| det_expr(hi)),
         Expr::AddrOf { .. } => Some(("addrof", pos)),
         Expr::Deref { .. } => Some(("deref", pos)),
-        Expr::SliceExpr { .. } => Some(("slice-expr", pos)),
         Expr::Try { .. } => Some(("try", pos)),
         Expr::Catch { .. } => Some(("catch", pos)),
         Expr::Unreachable { .. } => Some(("unreachable", pos)),
@@ -768,6 +773,19 @@ fn selfhost_emit_differential_targeted_inputs() {
         (
             "multi_elem_slices_and_writes",
             "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var bs: []bool = alloc(al, bool, 2);\n    bs[0] = true;\n    bs[1] = !bs[0];\n    var us: []usize = alloc(al, usize, 2);\n    us[0] = bs.len;\n    us[1] += us[0];\n    if (bs[1]) { print(1); } else { print(@as(i64, us[1])); }\n    free(al, us);\n    free(al, bs);\n}\n",
+        ),
+        // -- the slicing view (v0.165) --------------------------------------------
+        (
+            "slicing_views_and_reslices",
+            "fn head(s: []u8, n: usize) []u8 { return s[0..n]; }\npub fn main() void {\n    var al: Allocator = c_allocator();\n    var b: []u8 = alloc(al, u8, 5);\n    var i: usize = 0;\n    while (i < b.len) : (i += 1) {\n        b[i] = 65 + @as(u8, i);\n    }\n    print(b);\n    print(head(b, 3));\n    var mid: []u8 = b[1..4];\n    print(mid);\n    print(mid[2..3]);\n    var q: []i64 = alloc(al, i64, 4);\n    q[2] = 9;\n    var qv: []i64 = q[1..3];\n    print(qv[1]);\n    print(qv.len);\n    free(al, q);\n    free(al, b);\n}\n",
+        ),
+        (
+            "slicing_string_literal_direct",
+            "pub fn main() void {\n    print((\"kardashev\")[0..4]);\n    var e: []u8 = \"abc\"[1..1];\n    print(e.len);\n}\n",
+        ),
+        (
+            "slicing_side_effect_free_ops_respliced",
+            "fn lo2() usize { return 1; }\npub fn main() void {\n    var s: []u8 = \"abcdef\";\n    var t: []u8 = s[lo2()..s.len - 1];\n    print(t);\n    print(t.len);\n}\n",
         ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (

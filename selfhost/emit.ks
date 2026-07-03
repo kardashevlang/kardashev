@@ -1,13 +1,14 @@
-// emit.ks — self-host stages 3–6 (v0.161–v0.164): a C emitter for the
-// SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices and
-// `@as` casts), written in kardashev, mirroring
-// `crates/kardc/src/emit_c.rs` decision for decision so that — for every
-// subset program — the emitted C is BYTE-IDENTICAL to the Rust emitter's
-// `EmitMode::Program` output.
+// emit.ks — self-host stages 3–7 (v0.161–v0.165): a C emitter for the
+// SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
+// `@as` casts and the `s[lo..hi]` slicing view), written in kardashev,
+// mirroring `crates/kardc/src/emit_c.rs` decision for decision so that —
+// for every subset program — the emitted C is BYTE-IDENTICAL to the Rust
+// emitter's `EmitMode::Program` output.
 //
 // The subset (the "growing subset" of ROADMAP v0.159.0+; v0.161 shipped the
 // scalar slice, v0.162 added strings, v0.163 index writes + the allocator
-// builtins, v0.164 generalizes slices to `[]T` and adds `@as`):
+// builtins, v0.164 generalized slices to `[]T` and added `@as`, v0.165 adds
+// the slicing view `s[lo..hi]`):
 //
 //   - types: `i32`, `i64`, `bool`, `void`, `u8`, `usize`, `Allocator` bare
 //     names, plus `[]T` over the five scalar element types (no other
@@ -23,8 +24,11 @@
 //     the full binary ladder (arithmetic, comparison, `and`/`or`, bitwise,
 //     shifts), free-function calls, `print` (integers and `[]u8` strings),
 //     `expect`, `comptime` folds, `@as(T, e)` casts over the subset type
-//     names, `.len` on a slice, the read index `s[i]`, and the allocator
-//     builtins `c_allocator()` / `alloc(a, T, n)` / `free(a, s)`.
+//     names, `.len` on a slice, the read index `s[i]`, the slicing view
+//     `s[lo..hi]` (a `{ptr, len}` view with the bounds check folded into a
+//     `_Noreturn` conditional — base/lo/hi re-spliced textually, exactly
+//     like the Rust format string), and the allocator builtins
+//     `c_allocator()` / `alloc(a, T, n)` / `free(a, s)`.
 //
 // v0.164's load-bearing piece: the typedef section carries one
 // `kd_slice_<tag>` block per interned slice IN SEMA'S FIRST-INTERN ORDER —
@@ -412,9 +416,16 @@ pub const Det = struct {
         if (k == ND_ERRLIT) { self.hit("error-lit", off); return; }
         if (k == ND_ENUMLIT) { self.hit("enum-lit", off); return; }
         if (k == ND_ALIT) { self.hit("array-lit", off); return; }
+        if (k == ND_SLICEX) {
+            // The slicing view `base[lo..hi]` is in the subset (v0.165);
+            // base, lo and hi are ordinary subset expressions.
+            self.check_expr(self.nodes[u].a);
+            self.check_expr(self.nodes[u].b);
+            self.check_expr(self.nodes[u].c);
+            return;
+        }
         if (k == ND_ADDROF) { self.hit("addrof", off); return; }
         if (k == ND_DEREF) { self.hit("deref", off); return; }
-        if (k == ND_SLICEX) { self.hit("slice-expr", off); return; }
         if (k == ND_TRY) { self.hit("try", off); return; }
         if (k == ND_CATCH) { self.hit("catch", off); return; }
         if (k == ND_UNREACHABLE) { self.hit("unreachable", off); return; }
@@ -1179,6 +1190,14 @@ pub const Em = struct {
             if (et_is_slice(bt2)) { return et_slice_elem(bt2); }
             return ET_NONE;
         }
+        if (k == ND_SLICEX) {
+            // `base[lo..hi]` yields `[]T` over the base's element — for a
+            // slice base, the base's own slice type (the array arm cannot
+            // appear in the subset).
+            var bt3: i64 = self.type_of_expr(self.nodes[u].a);
+            if (et_is_slice(bt3)) { return bt3; }
+            return ET_NONE;
+        }
         return ET_NONE;
     }
 
@@ -1322,6 +1341,58 @@ pub const Em = struct {
             var s3: []u8 = sb3.build(a);
             sb3.deinit(a);
             return s3;
+        }
+        if (k == ND_SLICEX) {
+            // `base[lo..hi]` (SPEC §15.2): a `{ptr, len}` view over the
+            // base's storage with the bounds check folded into a portable
+            // conditional whose failing branch never returns. The base, lo
+            // and hi strings are spliced in MULTIPLE times, exactly like
+            // the Rust format string. A slice base reads `.ptr`/`.len`;
+            // the non-slice fallback (unreachable behind the detector)
+            // mirrors the Rust `(<base>)` / `0` / `kd_slice_void` arms.
+            var bs4: []u8 = self.emit_expr(a, self.nodes[u].a);
+            var lo4: []u8 = self.emit_expr(a, self.nodes[u].b);
+            var hi4: []u8 = self.emit_expr(a, self.nodes[u].c);
+            var bt4: i64 = self.type_of_expr(self.nodes[u].a);
+            var sn4: []u8 = "kd_slice_void";
+            if (et_is_slice(bt4)) { sn4 = et_slice_c_name(bt4); }
+            var sb4: StrBuilder = StrBuilder.init(a);
+            sb4.append(a, "(( (");
+            sb4.append(a, lo4);
+            sb4.append(a, ") < 0 || (");
+            sb4.append(a, hi4);
+            sb4.append(a, ") < (");
+            sb4.append(a, lo4);
+            sb4.append(a, ") || (");
+            sb4.append(a, hi4);
+            sb4.append(a, ") > (");
+            if (et_is_slice(bt4)) {
+                sb4.append(a, "(");
+                sb4.append(a, bs4);
+                sb4.append(a, ").len");
+            } else {
+                sb4.append(a, "0");
+            }
+            sb4.append(a, ") ) ? (fputs(\"panic: slice bounds out of range\\n\", stderr), exit(101), (");
+            sb4.append(a, sn4);
+            sb4.append(a, "){0}) : (");
+            sb4.append(a, sn4);
+            sb4.append(a, "){ .ptr = (");
+            sb4.append(a, bs4);
+            if (et_is_slice(bt4)) {
+                sb4.append(a, ").ptr + (");
+            } else {
+                sb4.append(a, ") + (");
+            }
+            sb4.append(a, lo4);
+            sb4.append(a, "), .len = (");
+            sb4.append(a, hi4);
+            sb4.append(a, ") - (");
+            sb4.append(a, lo4);
+            sb4.append(a, ") })");
+            var s4: []u8 = sb4.build(a);
+            sb4.deinit(a);
+            return s4;
         }
         if (k == ND_CALL) {
             var callee: []u8 = self.xname(n);
@@ -2002,6 +2073,12 @@ pub const Em = struct {
             self.collect_calls_expr(a, pend, self.nodes[u].b);
             return;
         }
+        if (k == ND_SLICEX) {
+            self.collect_calls_expr(a, pend, self.nodes[u].a);
+            self.collect_calls_expr(a, pend, self.nodes[u].b);
+            self.collect_calls_expr(a, pend, self.nodes[u].c);
+            return;
+        }
         if (k == ND_BUILTIN) {
             // `visit_expr` recurses into a builtin's arguments (the `@as`
             // value may contain calls; the type-name Ident is harmless).
@@ -2189,6 +2266,18 @@ pub const Em = struct {
         if (k == ND_BIN or k == ND_INDEX) {
             self.intern_expr(a, self.nodes[u].a);
             self.intern_expr(a, self.nodes[u].b);
+            return;
+        }
+        if (k == ND_SLICEX) {
+            // Sema checks base, lo, hi, THEN re-interns the base slice's
+            // element (sema.rs:3110-3128). For a slice base — the only kind
+            // in the subset — that final intern is always a no-op (the
+            // base's slice type was interned when the type was formed), so
+            // only the operand walk is replayed here; the first-intern arm
+            // exists only for ARRAY bases, which stay out of the subset.
+            self.intern_expr(a, self.nodes[u].a);
+            self.intern_expr(a, self.nodes[u].b);
+            self.intern_expr(a, self.nodes[u].c);
             return;
         }
         if (k == ND_CALL) {
