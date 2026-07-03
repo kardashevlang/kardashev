@@ -1,6 +1,6 @@
-//! Self-host stages 3+4 (v0.161–v0.162): differential test of
-//! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING SUBSET written
-//! in kardashev — against the Rust reference emitter.
+//! Self-host stages 3–5 (v0.161–v0.163): differential test of
+//! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
+//! SUBSET written in kardashev — against the Rust reference emitter.
 //!
 //! `selfhost/cdump.ks` is compiled ONCE (full file-based pipeline + `-O0`
 //! cc build) and then executed on every corpus file; its stdout must be
@@ -23,14 +23,17 @@
 //! - **the full C text** — the module is in the subset: byte-for-byte the
 //!   Rust `emit_c::emit(.., EmitMode::Program)` output.
 //!
-//! The subset: `i32`/`i64`/`bool`/`void`/`u8`/`usize` bare types plus the
-//! one composite `[]u8` (v0.162); top-level `fn`/`const`; `var`/`const`
-//! lets, (compound) name-assignment, `if`/`else`, `while` with
-//! continue-clause, unlabeled `break`/`continue`, `defer`, `return`, bare
-//! blocks, expression statements; int/bool/STRING literals, names, unary
-//! `-`/`!`/`~`, the full binary ladder, free calls, `print` (integers and
-//! `[]u8` strings), `expect`, `comptime`, `.len` on a slice, and the read
-//! index `s[i]` (index writes are place-assignments and stay out).
+//! The subset: `i32`/`i64`/`bool`/`void`/`u8`/`usize`/`Allocator` bare
+//! types plus the one composite `[]u8`; top-level `fn`/`const`;
+//! `var`/`const` lets, (compound) name-assignment, the (compound) DIRECT
+//! index write `s[i] (op)= e` (v0.163 — chains through an index stay out),
+//! `if`/`else`, `while` with continue-clause, unlabeled `break`/`continue`,
+//! `defer`, `return`, bare blocks, expression statements; int/bool/STRING
+//! literals, names, unary `-`/`!`/`~`, the full binary ladder, free calls,
+//! `print` (integers and `[]u8` strings), `expect`, `comptime`, `.len` on a
+//! slice, the read index `s[i]`, and the allocator builtins
+//! `c_allocator()` / `alloc(a, u8, n)` / `free(a, s)` (v0.163; the `alloc`
+//! element type is pinned to `u8` until slices generalize).
 //!
 //! # The sema-invalid remainder
 //!
@@ -85,6 +88,7 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s03_sema/unknown_name_err.ks",                        // E0100
     "tests/spec/s03_sema/void_result_unusable_err.ks",                // E0110
     "tests/spec/s14_arrays/index_non_array_err.ks",                   // E0220
+    "tests/spec/s16_alloc/free_non_slice_err.ks",                     // E0242
     "tests/spec/s18_inference/infer_const_stays_immutable_err.ks",    // E0110
     "tests/spec/s18_inference/infer_default_not_i32_err.ks",          // E0110
     "tests/spec/s23_strings/string_eq_operator_err.ks",               // E0110
@@ -123,7 +127,20 @@ type Hit = (&'static str, usize);
 
 /// The subset type spellings.
 fn subset_type_name(name: &str) -> bool {
-    matches!(name, "i32" | "i64" | "bool" | "void" | "u8" | "usize")
+    matches!(
+        name,
+        "i32" | "i64" | "bool" | "void" | "u8" | "usize" | "Allocator"
+    )
+}
+
+/// `Emitter::place_chain_has_index` (the `es_chain_has_index` mirror):
+/// whether a place reaches its target THROUGH an index via value links.
+fn chain_has_index(e: &Expr) -> bool {
+    match e {
+        Expr::Index { .. } => true,
+        Expr::Field { base, .. } => chain_has_index(base),
+        _ => false,
+    }
 }
 
 /// A type reference: any composite form other than a slice is out; a slice
@@ -160,8 +177,16 @@ fn det_expr(e: &Expr) -> Option<Hit> {
         Expr::Unary { expr, .. } => det_expr(expr),
         Expr::Binary { lhs, rhs, .. } => det_expr(lhs).or_else(|| det_expr(rhs)),
         Expr::Call { callee, args, .. } => {
-            if callee == "alloc" || callee == "free" || callee == "c_allocator" {
-                return Some(("builtin-call", pos));
+            // `alloc(a, u8, n)` is in the subset (v0.163) — exactly three
+            // arguments with the element type pinned to `u8`; any other
+            // shape is out. `free(a, s)` / `c_allocator()` walk their
+            // arguments like ordinary calls.
+            if callee == "alloc" {
+                let shaped = args.len() == 3
+                    && matches!(&args[1], Expr::Ident { name, .. } if name == "u8");
+                if !shaped {
+                    return Some(("builtin-call", pos));
+                }
             }
             args.iter().find_map(det_expr)
         }
@@ -211,7 +236,20 @@ fn det_stmt(s: &Stmt) -> Option<Hit> {
             .and_then(det_type)
             .or_else(|| det_expr(value)),
         Stmt::Assign { value, .. } => det_expr(value),
-        Stmt::FieldAssign { .. } => Some(("place-assign", pos)),
+        // The one place-assignment in the subset (v0.163): a DIRECT index
+        // write `s[i] (op)= e` — an `Index` place whose base does not
+        // itself pass through an index (that shape takes the `_at`
+        // lowering and stays out). Walk base, index, value, in that order.
+        Stmt::FieldAssign { place, value, .. } => {
+            if let Expr::Index { base, index, .. } = place {
+                if !chain_has_index(base) {
+                    return det_expr(base)
+                        .or_else(|| det_expr(index))
+                        .or_else(|| det_expr(value));
+                }
+            }
+            Some(("place-assign", pos))
+        }
         Stmt::Expr(e) => det_expr(e),
         Stmt::Return { value, .. } => value.as_ref().and_then(det_expr),
         Stmt::If {
@@ -653,7 +691,44 @@ fn selfhost_emit_differential_targeted_inputs() {
             "slice_typedef_gating_dead_fn",
             "fn dead() void { print(\"never\"); }\npub fn main() void { print(1); }\n",
         ),
+        // -- index writes + allocator builtins (v0.163) --------------------------
+        (
+            "alloc_fill_print_free",
+            "pub fn main() void {\n    var a: Allocator = c_allocator();\n    var buf: []u8 = alloc(a, u8, 5);\n    var i: usize = 0;\n    while (i < buf.len) : (i += 1) {\n        buf[i] = 65;\n    }\n    buf[0] = 107;\n    buf[1] += 2;\n    buf[2] *= 1;\n    print(buf);\n    print(buf[0]);\n    free(a, buf);\n}\n",
+        ),
+        (
+            "index_write_counter_resets",
+            "fn f(s: []u8) void {\n    s[0] = 1;\n    s[1] = 2;\n    print(s);\n}\npub fn main() void {\n    var a: Allocator = c_allocator();\n    var s: []u8 = alloc(a, u8, 3);\n    s[0] = 9;\n    f(s);\n    s[s.len - 1] = s[0] + 1;\n    print(s[2]);\n    free(a, s);\n}\n",
+        ),
+        (
+            "index_write_in_defer",
+            "pub fn main() void {\n    var a: Allocator = c_allocator();\n    var s: []u8 = alloc(a, u8, 2);\n    defer free(a, s);\n    defer s[0] = 42;\n    s[0] = 1;\n    s[1] = 2;\n    print(s[0] + s[1]);\n}\n",
+        ),
+        (
+            "allocator_values_and_params",
+            "fn fill(al: Allocator, n: usize) []u8 {\n    var s: []u8 = alloc(al, u8, n);\n    var i: usize = 0;\n    while (i < n) : (i += 1) {\n        s[i] = 48 + 1;\n    }\n    return s;\n}\npub fn main() void {\n    var a: Allocator = c_allocator();\n    var b: Allocator = a;\n    var s = fill(b, 4);\n    print(s);\n    free(a, s);\n}\n",
+        ),
+        (
+            "typedef_gating_alloc_only",
+            "pub fn main() void {\n    var a: Allocator = c_allocator();\n    free(a, alloc(a, u8, 3));\n    print(1);\n}\n",
+        ),
+        (
+            "compound_index_write_single_eval",
+            "fn idx() usize { return 1; }\npub fn main() void {\n    var a: Allocator = c_allocator();\n    var s: []u8 = alloc(a, u8, 4);\n    s[idx()] += 7;\n    s[idx() + 1] %= 5;\n    print(s[1]);\n    free(a, s);\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
+        (
+            "skip_place_chain_through_index",
+            "pub fn main() void {\n    var a: Allocator = c_allocator();\n    var s: []u8 = alloc(a, u8, 2);\n    s[0].f = 1;\n}\n",
+        ),
+        (
+            "skip_alloc_wrong_arity",
+            "pub fn main() void {\n    var a: Allocator = c_allocator();\n    var s: []u8 = alloc(a, u8);\n}\n",
+        ),
+        (
+            "skip_alloc_elem_not_u8",
+            "pub fn main() void {\n    var a: Allocator = c_allocator();\n    var s = alloc(a, i64, 3);\n}\n",
+        ),
         (
             "skip_float_deep_in_defer",
             "pub fn main() void {\n    defer {\n        var x: i64 = 1;\n        print(x + 1.5);\n    }\n}\n",

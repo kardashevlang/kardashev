@@ -1,24 +1,30 @@
-// emit.ks — self-host stages 3+4 (v0.161–v0.162): a C emitter for the
-// SCALAR + STRING SUBSET, written in kardashev, mirroring
+// emit.ks — self-host stages 3–5 (v0.161–v0.163): a C emitter for the
+// SCALAR + STRING + HEAP-BUFFER SUBSET, written in kardashev, mirroring
 // `crates/kardc/src/emit_c.rs` decision for decision so that — for every
 // subset program — the emitted C is BYTE-IDENTICAL to the Rust emitter's
 // `EmitMode::Program` output.
 //
 // The subset (the "growing subset" of ROADMAP v0.159.0+; v0.161 shipped the
-// scalar slice, v0.162 adds strings):
+// scalar slice, v0.162 added strings, v0.163 adds index writes and the
+// allocator builtins):
 //
-//   - types: `i32`, `i64`, `bool`, `void`, `u8`, `usize` bare names, plus
-//     the one composite `[]u8` (no other `?`/`!`/`*`/`[]T`/`[N]`/`Name(..)`
-//     forms);
+//   - types: `i32`, `i64`, `bool`, `void`, `u8`, `usize`, `Allocator` bare
+//     names, plus the one composite `[]u8` (no other `?`/`!`/`*`/`[]T`/
+//     `[N]`/`Name(..)` forms);
 //   - items: top-level `fn` (non-generic) and top-level `const`;
-//   - statements: `var`/`const` lets, (compound) name-assignment, `if`/
+//   - statements: `var`/`const` lets, (compound) name-assignment, the
+//     (compound) INDEX WRITE `s[i] = e` / `s[i] op= e` — a place-assignment
+//     whose place is a DIRECT index (a place whose chain merely passes
+//     through an index, like `s[i].f` or `s[i][j]`, stays out) — `if`/
 //     `else if`/`else`, `while` with continue-clause, unlabeled `break`/
 //     `continue`, `defer`, `return`, bare blocks, expression statements;
 //   - expressions: integer/bool/STRING literals, names, unary `-`/`!`/`~`,
 //     the full binary ladder (arithmetic, comparison, `and`/`or`, bitwise,
 //     shifts), free-function calls, `print` (integers and `[]u8` strings),
-//     `expect`, `comptime` folds, `.len` on a slice, and the read index
-//     `s[i]` (index WRITES are place-assignments and stay out).
+//     `expect`, `comptime` folds, `.len` on a slice, the read index `s[i]`,
+//     and the allocator builtins `c_allocator()` / `alloc(a, u8, n)` /
+//     `free(a, s)` (the `alloc` element type is pinned to `u8`; other
+//     element types arrive with generalized `[]T` slices in a later stage).
 //
 // Everything else is OUT of the subset. `es_detect` walks the AST in a fixed
 // depth-first order and reports the FIRST unsupported construct as a
@@ -96,8 +102,9 @@ pub const ET_NONE: i64 = 4;
 pub const ET_U8: i64 = 5;
 pub const ET_USIZE: i64 = 6;
 pub const ET_SLICE_U8: i64 = 7;
+pub const ET_ALLOC: i64 = 8;
 
-/// `Type::from_name` over the subset: the six bare spellings map to their
+/// `Type::from_name` over the subset: the seven bare spellings map to their
 /// codes, anything else is `ET_NONE` (the caller decides the fallback,
 /// mirroring the two distinct Rust fallbacks: `resolve_ty` → void, `cty` →
 /// `int64_t`). `[]u8` is not a name — `resolve_ty`/`cty` map the slice FORM.
@@ -108,6 +115,7 @@ pub fn et_from_name(name: []u8) i64 {
     if (str_eq(name, "void")) { return ET_VOID; }
     if (str_eq(name, "u8")) { return ET_U8; }
     if (str_eq(name, "usize")) { return ET_USIZE; }
+    if (str_eq(name, "Allocator")) { return ET_ALLOC; }
     return ET_NONE;
 }
 
@@ -123,6 +131,7 @@ pub fn et_c_name(t: i64) []u8 {
     if (t == ET_U8) { return "uint8_t"; }
     if (t == ET_USIZE) { return "uintptr_t"; }
     if (t == ET_SLICE_U8) { return "kd_slice_uint8_t"; }
+    if (t == ET_ALLOC) { return "kd_allocator"; }
     return "int64_t";
 }
 
@@ -165,6 +174,19 @@ pub fn es_c_op(op: i64) []u8 {
 
 pub fn es_is_bool_result(op: i64) bool {
     return (op >= OPC_EQ and op <= OPC_GE) or op == OPC_AND or op == OPC_OR;
+}
+
+/// `Emitter::place_chain_has_index`: whether a place expression reaches its
+/// target THROUGH an index via value links (an `Index`, or a `Field` whose
+/// base does). Decides which place-assignment arm a place takes: a direct
+/// `s[i]` place (base index-free) uses the legacy hoisted-`__kd_idx` block;
+/// anything else needs the `_at` lowering and stays out of the subset.
+pub fn es_chain_has_index(nodes: []Node, n: i32) bool {
+    if (n < 0) { return false; }
+    var u: usize = @as(usize, n);
+    if (nodes[u].kind == ND_INDEX) { return true; }
+    if (nodes[u].kind == ND_FIELD) { return es_chain_has_index(nodes, nodes[u].a); }
+    return false;
 }
 
 // --- subset detection ------------------------------------------------------------
@@ -253,10 +275,35 @@ pub const Det = struct {
         }
         if (k == ND_CALL) {
             var callee: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
-            if (str_eq(callee, "alloc") or str_eq(callee, "free") or str_eq(callee, "c_allocator")) {
-                self.hit("builtin-call", off);
+            if (str_eq(callee, "alloc")) {
+                // `alloc(a, u8, n)` is in the subset (v0.163) — exactly
+                // three arguments with the element type pinned to `u8`; any
+                // other shape (another element type, wrong arity) is out.
+                var a0: i32 = self.nodes[u].a;
+                var a1: i32 = 0 - 1;
+                var a2: i32 = 0 - 1;
+                var a3: i32 = 0 - 1;
+                if (a0 >= 0) { a1 = self.nodes[@as(usize, a0)].next; }
+                if (a1 >= 0) { a2 = self.nodes[@as(usize, a1)].next; }
+                if (a2 >= 0) { a3 = self.nodes[@as(usize, a2)].next; }
+                var shaped: bool = a2 >= 0 and a3 < 0;
+                if (shaped) {
+                    var eu: usize = @as(usize, a1);
+                    if (self.nodes[eu].kind != ND_IDENT) { shaped = false; }
+                    if (shaped) {
+                        var ename: []u8 = self.src[self.nodes[eu].xoff .. self.nodes[eu].xoff + self.nodes[eu].xlen];
+                        if (!str_eq(ename, "u8")) { shaped = false; }
+                    }
+                }
+                if (!shaped) {
+                    self.hit("builtin-call", off);
+                    return;
+                }
+                self.check_expr_list(self.nodes[u].a);
                 return;
             }
+            // `free(a, s)` and `c_allocator()` are in the subset (v0.163);
+            // their arguments are ordinary subset expressions.
             self.check_expr_list(self.nodes[u].a);
             return;
         }
@@ -334,7 +381,25 @@ pub const Det = struct {
             self.check_expr(self.nodes[u].a);
             return;
         }
-        if (k == ND_PASSIGN) { self.hit("place-assign", off); return; }
+        if (k == ND_PASSIGN) {
+            // The one place-assignment in the subset (v0.163): a DIRECT
+            // index write `s[i] (op)= e` — the place is an `Index` whose
+            // base does not itself pass through an index (that shape takes
+            // the Rust `_at` lowering, which stays out). Walk the place's
+            // base, its index, then the value, in that order.
+            var place: i32 = self.nodes[u].a;
+            if (place >= 0) {
+                var pu: usize = @as(usize, place);
+                if (self.nodes[pu].kind == ND_INDEX and !es_chain_has_index(self.nodes, self.nodes[pu].a)) {
+                    self.check_expr(self.nodes[pu].a);
+                    self.check_expr(self.nodes[pu].b);
+                    self.check_expr(self.nodes[u].b);
+                    return;
+                }
+            }
+            self.hit("place-assign", off);
+            return;
+        }
         if (k == ND_RETURN) {
             self.check_expr(self.nodes[u].a);
             return;
@@ -635,6 +700,9 @@ pub const Em = struct {
     // Monotonic counter for the `__kd_str{N}` print-hoist temporaries
     // (`Emitter::str_counter`), reset at the start of every function body.
     str_count: i64,
+    // Monotonic counter for the `__kd_idx{N}` bounds-checked index-write
+    // temporaries (`Emitter::idx_counter`), reset per function body.
+    idx_count: i64,
 
     fn init(a: Allocator, src: []u8, nodes: []Node, root: i32) Self {
         return Em{
@@ -656,6 +724,7 @@ pub const Em = struct {
             .ct_len = 0,
             .cur_ret = ET_VOID,
             .str_count = 0,
+            .idx_count = 0,
         };
     }
 
@@ -975,7 +1044,24 @@ pub const Em = struct {
             return self.type_of_expr(self.nodes[u].a);
         }
         if (k == ND_CALL) {
-            return self.fn_ret_of(self.xname(n));
+            // The allocator builtins have synthetic result types (SPEC §16),
+            // checked BEFORE the collected signatures exactly as in Rust.
+            var callee: []u8 = self.xname(n);
+            if (str_eq(callee, "c_allocator")) { return ET_ALLOC; }
+            if (str_eq(callee, "alloc")) {
+                // `alloc(a, T, n)` is `[]T`, resolved from the type-name
+                // identifier (arg 1). The detector pins `T` to `u8`; any
+                // other shape mirrors the Rust `None` outcomes (a non-ident
+                // arg, or an element with no interned slice).
+                var a0: i32 = self.nodes[u].a;
+                var a1: i32 = 0 - 1;
+                if (a0 >= 0) { a1 = self.nodes[@as(usize, a0)].next; }
+                if (a1 >= 0 and self.nodes[@as(usize, a1)].kind == ND_IDENT) {
+                    if (str_eq(self.xname(a1), "u8")) { return ET_SLICE_U8; }
+                }
+                return ET_NONE;
+            }
+            return self.fn_ret_of(callee);
         }
         if (k == ND_COMPTIME) { return self.type_of_expr(self.nodes[u].a); }
         if (k == ND_FIELD) {
@@ -1177,8 +1263,52 @@ pub const Em = struct {
                 return "((void)0)";
             }
             if (str_eq(callee, "c_allocator")) {
-                // Unreachable behind the detector; mirrored for totality.
+                // The malloc/free-backed allocator value (SPEC §16.2): a
+                // zero-initialised compound literal IS the whole allocator.
                 return "((kd_allocator){0})";
+            }
+            if (str_eq(callee, "alloc")) {
+                // `alloc(a, T, n)` → the slice's inline `_alloc` helper
+                // (SPEC §16.2). The allocator argument is accepted but
+                // UNUSED (never emitted); arg 1 names the element type
+                // (`u8` behind the detector); arg 2 is the element count.
+                var a0: i32 = self.nodes[u].a;
+                var a1: i32 = 0 - 1;
+                var a2: i32 = 0 - 1;
+                if (a0 >= 0) { a1 = self.nodes[@as(usize, a0)].next; }
+                if (a1 >= 0) { a2 = self.nodes[@as(usize, a1)].next; }
+                var tag: []u8 = "void";
+                if (a1 >= 0 and self.nodes[@as(usize, a1)].kind == ND_IDENT) {
+                    var et: i64 = et_from_name(self.xname(a1));
+                    if (et != ET_NONE) { tag = et_c_name(et); }
+                }
+                var nstr: []u8 = "0";
+                if (a2 >= 0) { nstr = self.emit_expr(a, a2); }
+                var sba: StrBuilder = StrBuilder.init(a);
+                sba.append(a, "kd_slice_");
+                sba.append(a, tag);
+                sba.append(a, "_alloc((uintptr_t)(");
+                sba.append(a, nstr);
+                sba.append(a, "))");
+                var sa: []u8 = sba.build(a);
+                sba.deinit(a);
+                return sa;
+            }
+            if (str_eq(callee, "free")) {
+                // `free(a, s)` → release the slice's backing pointer (SPEC
+                // §16.2); the allocator argument is unused and not emitted.
+                var f0: i32 = self.nodes[u].a;
+                var f1: i32 = 0 - 1;
+                if (f0 >= 0) { f1 = self.nodes[@as(usize, f0)].next; }
+                var fstr: []u8 = "0";
+                if (f1 >= 0) { fstr = self.emit_expr(a, f1); }
+                var sbf: StrBuilder = StrBuilder.init(a);
+                sbf.append(a, "free((");
+                sbf.append(a, fstr);
+                sbf.append(a, ").ptr)");
+                var sf: []u8 = sbf.build(a);
+                sbf.deinit(a);
+                return sf;
             }
             var sb: StrBuilder = StrBuilder.init(a);
             sb.append(a, "kd_");
@@ -1327,6 +1457,103 @@ pub const Em = struct {
         self.line(a, s);
     }
 
+    /// `Emitter::store_str` into `sb`: the C store for a side-effect-free
+    /// (already-hoisted) lvalue `target` (SPEC §27.3). A plain `=` is
+    /// `target = (val);`; a compound `op=` re-spells the place on both
+    /// sides — `target = target <c-op> (val);` — correct precisely because
+    /// the target re-read re-evaluates nothing.
+    fn put_store(self: *Self, a: Allocator, sb: *StrBuilder, target: []u8, op: i64, val: []u8) void {
+        sb.append(a, target);
+        sb.append(a, " = ");
+        if (op >= 0) {
+            sb.append(a, target);
+            sb.append(a, " ");
+            sb.append(a, es_c_op(op));
+            sb.append(a, " ");
+        }
+        sb.append(a, "(");
+        sb.append(a, val);
+        sb.append(a, ");");
+    }
+
+    /// `Stmt::FieldAssign`, restricted to the subset's DIRECT index write
+    /// `s[i] (op)= e` (SPEC §15.2/§27.3): one bounds-checked block hoisting
+    /// the index into a fresh `__kd_idx{k}` — the SINGLE evaluation of the
+    /// index, so the compound form re-spells the element slot without
+    /// re-evaluating `i`. A slice base writes through `.ptr` and the
+    /// runtime `.len`; the non-slice fallback mirrors the Rust
+    /// unreachable-for-validated-input array arm (length 0, `.data`, the
+    /// "array" panic message). Any non-index place takes the field-chain
+    /// default (`(<place>) = (<value>);`) — equally unreachable behind the
+    /// detector, mirrored for totality.
+    fn emit_place_assign(self: *Self, a: Allocator, n: i32) void {
+        var u: usize = @as(usize, n);
+        var place: i32 = self.nodes[u].a;
+        var value: i32 = self.nodes[u].b;
+        var op: i64 = self.nodes[u].val;
+        if (place >= 0 and self.nodes[@as(usize, place)].kind == ND_INDEX) {
+            var pu: usize = @as(usize, place);
+            var kctr: i64 = self.idx_count;
+            self.idx_count += 1;
+            var idx: []u8 = self.emit_expr(a, self.nodes[pu].b);
+            var base_str: []u8 = self.emit_expr(a, self.nodes[pu].a);
+            var bt: i64 = self.type_of_expr(self.nodes[pu].a);
+            var val: []u8 = self.emit_expr(a, value);
+            // The hoisted-slot target: `(<base>).ptr[__kd_idx{k}]` for a
+            // slice, `(<base>).data[__kd_idx{k}]` for the fallback arm.
+            var tsb: StrBuilder = StrBuilder.init(a);
+            tsb.append(a, "(");
+            tsb.append(a, base_str);
+            if (bt == ET_SLICE_U8) {
+                tsb.append(a, ").ptr[__kd_idx");
+            } else {
+                tsb.append(a, ").data[__kd_idx");
+            }
+            tsb.append_i64(a, kctr);
+            tsb.append(a, "]");
+            var target: []u8 = tsb.build(a);
+            tsb.deinit(a);
+            var sb: StrBuilder = StrBuilder.init(a);
+            sb.append(a, "{ int64_t __kd_idx");
+            sb.append_i64(a, kctr);
+            sb.append(a, " = (");
+            sb.append(a, idx);
+            sb.append(a, "); if (__kd_idx");
+            sb.append_i64(a, kctr);
+            sb.append(a, " < 0 || (uint64_t)__kd_idx");
+            sb.append_i64(a, kctr);
+            if (bt == ET_SLICE_U8) {
+                sb.append(a, " >= (");
+                sb.append(a, base_str);
+                sb.append(a, ").len) { fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); } ");
+            } else {
+                sb.append(a, " >= 0) { fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); } ");
+            }
+            self.put_store(a, &sb, target, op, val);
+            sb.append(a, " }");
+            var s: []u8 = sb.build(a);
+            sb.deinit(a);
+            self.line(a, s);
+            return;
+        }
+        // Non-index place (unreachable behind the detector): the Rust
+        // field-chain default — `(<place>) (op)= (<value>);`.
+        var ps: []u8 = "0";
+        if (place >= 0) { ps = self.emit_expr(a, place); }
+        var es: []u8 = self.emit_expr(a, value);
+        var tsb2: StrBuilder = StrBuilder.init(a);
+        tsb2.append(a, "(");
+        tsb2.append(a, ps);
+        tsb2.append(a, ")");
+        var target2: []u8 = tsb2.build(a);
+        tsb2.deinit(a);
+        var sb2: StrBuilder = StrBuilder.init(a);
+        self.put_store(a, &sb2, target2, op, es);
+        var s2: []u8 = sb2.build(a);
+        sb2.deinit(a);
+        self.line(a, s2);
+    }
+
     /// `finish_return`: the deferred-temp dance. `has_val` distinguishes
     /// `return;` from `return <e>;` (`es` is meaningful only when set).
     fn finish_return(self: *Self, a: Allocator, has_val: bool, es: []u8) void {
@@ -1453,6 +1680,10 @@ pub const Em = struct {
             self.emit_assign(a, n);
             return false;
         }
+        if (k == ND_PASSIGN) {
+            self.emit_place_assign(a, n);
+            return false;
+        }
         if (k == ND_RETURN) {
             var v: i32 = self.nodes[u].a;
             if (v >= 0) {
@@ -1573,6 +1804,7 @@ pub const Em = struct {
         self.df_len = 0;
         self.vt_len = 0;
         self.str_count = 0;
+        self.idx_count = 0;
         self.cur_ret = self.resolve_ty(self.nodes[u].b);
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, self.cty(self.nodes[u].b));
@@ -1656,6 +1888,12 @@ pub const Em = struct {
             var v: i32 = self.nodes[u].b;
             if (k == ND_ASSIGN) { v = self.nodes[u].a; }
             self.collect_calls_expr(a, pend, v);
+            return;
+        }
+        if (k == ND_PASSIGN) {
+            // `visit_stmt_exprs` visits the place, then the value.
+            self.collect_calls_expr(a, pend, self.nodes[u].a);
+            self.collect_calls_expr(a, pend, self.nodes[u].b);
             return;
         }
         if (k == ND_RETURN) {
@@ -1767,6 +2005,18 @@ pub const Em = struct {
             return self.scan_str_expr(self.nodes[u].b);
         }
         if (k == ND_CALL) {
+            // `alloc(a, u8, n)` makes sema intern `[]u8` (sema.rs's alloc
+            // arm) — a trigger of its own, beyond any strings in the args.
+            var callee: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
+            if (str_eq(callee, "alloc")) {
+                var a0: i32 = self.nodes[u].a;
+                var a1: i32 = 0 - 1;
+                if (a0 >= 0) { a1 = self.nodes[@as(usize, a0)].next; }
+                if (a1 >= 0 and self.nodes[@as(usize, a1)].kind == ND_IDENT) {
+                    var ename: []u8 = self.src[self.nodes[@as(usize, a1)].xoff .. self.nodes[@as(usize, a1)].xoff + self.nodes[@as(usize, a1)].xlen];
+                    if (str_eq(ename, "u8")) { return true; }
+                }
+            }
             var cur: i32 = self.nodes[u].a;
             while (cur >= 0) {
                 if (self.scan_str_expr(cur)) { return true; }
@@ -1795,6 +2045,10 @@ pub const Em = struct {
             return self.scan_str_expr(self.nodes[u].b);
         }
         if (k == ND_ASSIGN) { return self.scan_str_expr(self.nodes[u].a); }
+        if (k == ND_PASSIGN) {
+            if (self.scan_str_expr(self.nodes[u].a)) { return true; }
+            return self.scan_str_expr(self.nodes[u].b);
+        }
         if (k == ND_RETURN) { return self.scan_str_expr(self.nodes[u].a); }
         if (k == ND_IF) {
             if (self.scan_str_expr(self.nodes[u].a)) { return true; }

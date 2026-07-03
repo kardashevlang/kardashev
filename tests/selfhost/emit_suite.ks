@@ -107,13 +107,14 @@ fn eh_prelude(a: Allocator, sb: *StrBuilder) void {
 
 // --- spelling tables --------------------------------------------------------------
 
-test "type codes: from_name maps the six subset spellings" {
+test "type codes: from_name maps the seven subset spellings" {
     expect(et_from_name("i32") == ET_I32);
     expect(et_from_name("i64") == ET_I64);
     expect(et_from_name("bool") == ET_BOOL);
     expect(et_from_name("void") == ET_VOID);
     expect(et_from_name("u8") == ET_U8);
     expect(et_from_name("usize") == ET_USIZE);
+    expect(et_from_name("Allocator") == ET_ALLOC);
     expect(et_from_name("f64") == ET_NONE);
     expect(et_from_name("Self") == ET_NONE);
     expect(et_from_name("") == ET_NONE);
@@ -127,6 +128,7 @@ test "type codes: C spellings, is_int and the u8 promotion class" {
     expect(str_eq(et_c_name(ET_U8), "uint8_t"));
     expect(str_eq(et_c_name(ET_USIZE), "uintptr_t"));
     expect(str_eq(et_c_name(ET_SLICE_U8), "kd_slice_uint8_t"));
+    expect(str_eq(et_c_name(ET_ALLOC), "kd_allocator"));
     // The defensive fallback spelling mirrors the Rust `cty` fallback.
     expect(str_eq(et_c_name(ET_NONE), "int64_t"));
     expect(et_is_int(ET_I32));
@@ -136,6 +138,7 @@ test "type codes: C spellings, is_int and the u8 promotion class" {
     expect(!et_is_int(ET_BOOL));
     expect(!et_is_int(ET_VOID));
     expect(!et_is_int(ET_SLICE_U8));
+    expect(!et_is_int(ET_ALLOC));
     // Only `u8` is sub-32-bit here, so only it truncates back (§28.2).
     expect(et_promotes_in_c(ET_U8));
     expect(!et_promotes_in_c(ET_I32));
@@ -271,17 +274,48 @@ test "detect: out-of-subset items and parameters" {
 
 test "detect: allocator builtins and deep expressions" {
     var a: Allocator = c_allocator();
-    var d: Det = eh_detect(a, "fn main() void { free(q, r); }");
-    expect(d.found);
-    expect(str_eq(d.word, "builtin-call"));
-    expect(d.pos == 17);
-    // The walk reaches into defer bodies, continue-clauses and nested calls.
-    var d2: Det = eh_detect(a, "fn main() void { defer { print(g(1.25)); } }");
+    // The full allocator round-trip is IN the subset (v0.163).
+    var d: Det = eh_detect(a, "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var s: []u8 = alloc(al, u8, 3);\n    s[0] = 1;\n    s[1] += 2;\n    free(al, s);\n}");
+    expect(!d.found);
+    // A mis-shaped `alloc` is out: wrong arity or a non-`u8` element.
+    //                            0         1         2         3
+    //                            0123456789012345678901234567890123456
+    var d2: Det = eh_detect(a, "fn main() void { var s = alloc(q, u8); }");
     expect(d2.found);
-    expect(str_eq(d2.word, "float"));
-    var d3: Det = eh_detect(a, "fn main() void { var o = q(); if (o) |v| { } }");
+    expect(str_eq(d2.word, "builtin-call"));
+    expect(d2.pos == 25);
+    var d3: Det = eh_detect(a, "fn main() void { var s = alloc(q, i64, 3); }");
     expect(d3.found);
-    expect(str_eq(d3.word, "capture"));
+    expect(str_eq(d3.word, "builtin-call"));
+    // The walk reaches into defer bodies, continue-clauses and nested calls.
+    var d4: Det = eh_detect(a, "fn main() void { defer { print(g(1.25)); } }");
+    expect(d4.found);
+    expect(str_eq(d4.word, "float"));
+    var d5: Det = eh_detect(a, "fn main() void { var o = q(); if (o) |v| { } }");
+    expect(d5.found);
+    expect(str_eq(d5.word, "capture"));
+}
+
+test "detect: index writes — direct places in, chains out" {
+    var a: Allocator = c_allocator();
+    var d: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"ab\"; s[0] = 1; s[1] *= 2; }");
+    expect(!d.found);
+    // A place whose chain passes THROUGH an index takes the `_at` lowering
+    // and stays out.
+    var d2: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"ab\"; s[0].f = 1; }");
+    expect(d2.found);
+    expect(str_eq(d2.word, "place-assign"));
+    var d3: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"ab\"; s[0][1] = 1; }");
+    expect(d3.found);
+    expect(str_eq(d3.word, "place-assign"));
+    // Field places never joined; deref places stay out too.
+    var d4: Det = eh_detect(a, "pub fn main() void { p.* = 1; }");
+    expect(d4.found);
+    expect(str_eq(d4.word, "place-assign"));
+    // Out-of-subset constructs inside an admissible write still surface.
+    var d5: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"ab\"; s[0] = 1.5; }");
+    expect(d5.found);
+    expect(str_eq(d5.word, "float"));
 }
 
 // --- const folding -------------------------------------------------------------------
@@ -544,6 +578,43 @@ test "strings: whole-program byte equality with the typedef section" {
     expect(str_eq(c, want));
     free(a, want);
     sb.deinit(a);
+}
+
+// --- index writes + allocator builtins (v0.163) -------------------------------------------
+
+test "heap: alloc, free and c_allocator lowering shapes" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "fn take(al: Allocator, n: usize) []u8 { return alloc(al, u8, n + 1); }\npub fn main() void {\n    var al: Allocator = c_allocator();\n    var s: []u8 = take(al, 3);\n    free(al, s);\n}");
+    // `Allocator` spells `kd_allocator` in params and locals; the builtins
+    // lower to the slice helper / a compound literal / a raw `free`.
+    expect(eh_find(c, "kd_slice_uint8_t kd_take(kd_allocator kd_al, uintptr_t kd_n);"));
+    expect(eh_find(c, "    return (kd_slice_uint8_t_alloc((uintptr_t)((kd_n + 1))));\n"));
+    expect(eh_find(c, "    kd_allocator kd_al = ((kd_allocator){0});\n"));
+    expect(eh_find(c, "    free((kd_s).ptr);\n"));
+    // The allocator ARGUMENT of alloc/free is accepted but never emitted.
+    expect(!eh_find(c, "kd_slice_uint8_t_alloc(kd_al"));
+    // `alloc(a, u8, n)` alone interns `[]u8`: the typedef block appears.
+    expect(eh_find(c, "typedef struct { uint8_t *ptr; uintptr_t len; } kd_slice_uint8_t;\n"));
+    // `var s = c_allocator();` infers the Allocator type.
+    var c2: []u8 = eh_emit(a, "pub fn main() void { var x = c_allocator(); free(x, alloc(x, u8, 1)); }");
+    expect(eh_find(c2, "    kd_allocator kd_x = ((kd_allocator){0});\n"));
+    // ...and `var s = alloc(a, u8, n);` infers `[]u8`.
+    var c3: []u8 = eh_emit(a, "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var s = alloc(al, u8, 2);\n    print(s.len);\n}");
+    expect(eh_find(c3, "    kd_slice_uint8_t kd_s = kd_slice_uint8_t_alloc((uintptr_t)(2));\n"));
+}
+
+test "heap: index writes hoist __kd_idx, compound re-spells the slot" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var s: []u8 = alloc(al, u8, 4);\n    s[0] = 65;\n    s[s.len - 1] += 2;\n    free(al, s);\n}");
+    // Plain write: hoist, bounds-check against the runtime `.len`, store.
+    expect(eh_find(c, "    { int64_t __kd_idx0 = (0); if (__kd_idx0 < 0 || (uint64_t)__kd_idx0 >= (kd_s).len) { fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); } (kd_s).ptr[__kd_idx0] = (65); }\n"));
+    // Compound write: ONE index evaluation, the slot re-spelled both sides.
+    expect(eh_find(c, "    { int64_t __kd_idx1 = (((kd_s).len - 1)); if (__kd_idx1 < 0 || (uint64_t)__kd_idx1 >= (kd_s).len) { fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); } (kd_s).ptr[__kd_idx1] = (kd_s).ptr[__kd_idx1] + (2); }\n"));
+    // The counter resets per function.
+    var c2: []u8 = eh_emit(a, "fn f(s: []u8) void { s[0] = 1; s[1] = 2; }\nfn g(s: []u8) void { s[2] = 3; }\npub fn main() void {\n    var al: Allocator = c_allocator();\n    var s: []u8 = alloc(al, u8, 4);\n    f(s);\n    g(s);\n    free(al, s);\n}");
+    expect(eh_count(c2, "__kd_idx0") > 0);
+    expect(eh_find(c2, "__kd_idx1"));
+    expect(!eh_find(c2, "__kd_idx2"));
 }
 
 test "emit: if/else ladder, bare block, expression statement shapes" {

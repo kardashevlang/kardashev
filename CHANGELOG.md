@@ -18,6 +18,48 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.163.0] — Self-hosting stage 5: index writes + the allocator builtins
+
+The subset grows by the heap-buffer layer — the shape `selfhost/emit.ks`'s
+own growth arrays are made of: the DIRECT index write `s[i] (op)= e` and the
+allocator builtins `c_allocator()` / `alloc(a, u8, n)` / `free(a, s)`, plus
+the `Allocator` type. `selfhost/emit.ks` (2,283 lines) keeps the
+byte-identical contract by mirroring:
+
+- the `Stmt::FieldAssign` legacy-Index arm (SPEC §15.2/§27.3): one
+  bounds-checked block hoisting the index into a fresh `__kd_idx{k}`
+  temporary (counter reset per function) — the SINGLE index evaluation, so
+  a compound `s[i] op= e` re-spells the element slot on both sides without
+  re-evaluating `i`; a place whose chain merely passes THROUGH an index
+  (`s[i].f`, `s[i][j]`) takes the Rust `_at` lowering and stays out
+  (`place_chain_has_index` is mirrored to draw exactly that line);
+- the §16.2 builtin lowerings: `c_allocator()` →
+  `((kd_allocator){0})`, `alloc(a, u8, n)` →
+  `kd_slice_uint8_t_alloc((uintptr_t)(<n>))` (the allocator argument is
+  accepted but never emitted), `free(a, s)` → `free((<s>).ptr)`; `alloc`'s
+  element type is pinned to `u8` until slices generalize;
+- the interning trigger: `alloc(a, u8, n)` alone makes sema intern `[]u8`,
+  so the whole-tree scan now fires on it too (an alloc-only module gets the
+  typedef block with no string literal in sight);
+- `type_of_expr`: `c_allocator()` → `Allocator`, `alloc(a, u8, n)` →
+  `[]u8` — both checked BEFORE the collected signatures, as in Rust.
+
+### Added
+- `es_chain_has_index`, the `emit_place_assign`/`put_store` lowerings, the
+  `__kd_idx{N}` counter, and the `Allocator` type code in
+  `selfhost/emit.ks`; the detector admits direct index writes and
+  well-shaped allocator calls (`selfhost/cdump.ks` unchanged).
+- Corpus: 57 of 704 files stay C byte-identical (48,612 bytes) with 588
+  `SKIP` and 25 `ERROR` agreements; the pinned `SEMA_INVALID` list grew
+  33 → 34 (`free_non_slice_err.ks`, E0242, now parses as subset-shaped).
+  The stage's differential weight is carried by 9 new targeted inputs
+  (alloc-fill-print-free round trips, per-function `__kd_idx` counter
+  resets, index writes inside `defer`s, allocator values as
+  parameters/copies, alloc-only typedef gating, compound single-evaluation
+  writes, and the mis-shaped-place/mis-shaped-alloc SKIP verdicts) and 4
+  new in-language suite tests (32 blocks total).
+- 1,110 tests green across the workspace.
+
 ## [0.162.0] — Self-hosting stage 4: strings in the self-hosted emitter
 
 The v0.161 subset grows by the string layer: the `u8`/`usize` scalars, the
