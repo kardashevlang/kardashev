@@ -29,7 +29,7 @@ use emit_c::EmitMode;
 
 /// The toolchain version. Single source of truth; keep in sync with
 /// `Cargo.toml` and `CHANGELOG.md`.
-pub const VERSION: &str = "0.163.0";
+pub const VERSION: &str = "0.164.0";
 
 /// Front-to-middle pipeline: lex, parse and type-check `src`, then lower the
 /// validated module to C source text for `mode`.

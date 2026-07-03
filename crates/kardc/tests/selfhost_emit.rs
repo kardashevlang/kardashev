@@ -1,6 +1,7 @@
-//! Self-host stages 3–5 (v0.161–v0.163): differential test of
+//! Self-host stages 3–6 (v0.161–v0.164): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
-//! SUBSET written in kardashev — against the Rust reference emitter.
+//! SUBSET (with generalized `[]T` slices and `@as` casts) written in
+//! kardashev — against the Rust reference emitter.
 //!
 //! `selfhost/cdump.ks` is compiled ONCE (full file-based pipeline + `-O0`
 //! cc build) and then executed on every corpus file; its stdout must be
@@ -24,16 +25,24 @@
 //!   Rust `emit_c::emit(.., EmitMode::Program)` output.
 //!
 //! The subset: `i32`/`i64`/`bool`/`void`/`u8`/`usize`/`Allocator` bare
-//! types plus the one composite `[]u8`; top-level `fn`/`const`;
-//! `var`/`const` lets, (compound) name-assignment, the (compound) DIRECT
-//! index write `s[i] (op)= e` (v0.163 — chains through an index stay out),
-//! `if`/`else`, `while` with continue-clause, unlabeled `break`/`continue`,
-//! `defer`, `return`, bare blocks, expression statements; int/bool/STRING
-//! literals, names, unary `-`/`!`/`~`, the full binary ladder, free calls,
-//! `print` (integers and `[]u8` strings), `expect`, `comptime`, `.len` on a
-//! slice, the read index `s[i]`, and the allocator builtins
-//! `c_allocator()` / `alloc(a, u8, n)` / `free(a, s)` (v0.163; the `alloc`
-//! element type is pinned to `u8` until slices generalize).
+//! types plus `[]T` over the five scalar elements (v0.164); top-level
+//! `fn`/`const`; `var`/`const` lets, (compound) name-assignment, the
+//! (compound) DIRECT index write `s[i] (op)= e` (chains through an index
+//! stay out), `if`/`else`, `while` with continue-clause, unlabeled
+//! `break`/`continue`, `defer`, `return`, bare blocks, expression
+//! statements; int/bool/STRING literals, names, unary `-`/`!`/`~`, the full
+//! binary ladder, free calls, `print` (integers and `[]u8` strings),
+//! `expect`, `comptime`, `@as(T, e)` casts (v0.164), `.len` on a slice, the
+//! read index `s[i]`, and the allocator builtins `c_allocator()` /
+//! `alloc(a, T, n)` / `free(a, s)`.
+//!
+//! v0.164's load-bearing piece: the typedef section emits one
+//! `kd_slice_<tag>` block per interned slice IN SEMA'S FIRST-INTERN ORDER,
+//! which `selfhost/emit.ks` reproduces by replaying sema's walk (all fn
+//! signatures params-then-return in item order, then const annotations,
+//! then bodies — with Let annotation-before-initializer, While
+//! cond/CONT/body, index-writes index-first, `alloc` interning AFTER its
+//! allocator/count args, and `comptime` subtrees never interning).
 //!
 //! # The sema-invalid remainder
 //!
@@ -99,11 +108,13 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s27_compound/mismatch_err.ks",                        // E0110
     "tests/spec/s28_bitwise/bitand_bool_err.ks",                      // E0110
     "tests/spec/s28_bitwise/bitnot_bool_err.ks",                      // E0110
+    "tests/spec/s33_casts/err_as_not_constant.ks",                    // E0130
+    "tests/spec/s33_casts/err_as_value_not_numeric.ks",               // E0321
 ];
 
 /// Floor on the number of corpus files whose C is byte-compared: catches a
 /// subset-detector regression that silently skips what used to be compared.
-const MIN_C_COMPARED: usize = 55;
+const MIN_C_COMPARED: usize = 60;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -133,6 +144,11 @@ fn subset_type_name(name: &str) -> bool {
     )
 }
 
+/// The subset slice ELEMENT spellings (`[]T` and `alloc(a, T, n)`, v0.164).
+fn subset_slice_elem(name: &str) -> bool {
+    matches!(name, "i32" | "i64" | "bool" | "u8" | "usize")
+}
+
 /// `Emitter::place_chain_has_index` (the `es_chain_has_index` mirror):
 /// whether a place reaches its target THROUGH an index via value links.
 fn chain_has_index(e: &Expr) -> bool {
@@ -159,7 +175,8 @@ fn det_type(t: &TypeExpr) -> Option<Hit> {
         return Some(("type-form", t.span.start));
     }
     if t.slice {
-        if t.name != "u8" {
+        // `[]T` over the five scalar element types (v0.164).
+        if !subset_slice_elem(&t.name) {
             return Some(("type-name", t.span.start));
         }
         return None;
@@ -177,13 +194,13 @@ fn det_expr(e: &Expr) -> Option<Hit> {
         Expr::Unary { expr, .. } => det_expr(expr),
         Expr::Binary { lhs, rhs, .. } => det_expr(lhs).or_else(|| det_expr(rhs)),
         Expr::Call { callee, args, .. } => {
-            // `alloc(a, u8, n)` is in the subset (v0.163) — exactly three
-            // arguments with the element type pinned to `u8`; any other
-            // shape is out. `free(a, s)` / `c_allocator()` walk their
-            // arguments like ordinary calls.
+            // `alloc(a, T, n)` is in the subset (v0.163, elements
+            // generalized in v0.164) — exactly three arguments with a
+            // scalar element type; any other shape is out. `free(a, s)` /
+            // `c_allocator()` walk their arguments like ordinary calls.
             if callee == "alloc" {
                 let shaped = args.len() == 3
-                    && matches!(&args[1], Expr::Ident { name, .. } if name == "u8");
+                    && matches!(&args[1], Expr::Ident { name, .. } if subset_slice_elem(name));
                 if !shaped {
                     return Some(("builtin-call", pos));
                 }
@@ -205,7 +222,18 @@ fn det_expr(e: &Expr) -> Option<Hit> {
         // `Stmt::FieldAssign` places and stay out.
         Expr::Index { base, index, .. } => det_expr(base).or_else(|| det_expr(index)),
         Expr::Float { .. } => Some(("float", pos)),
-        Expr::Builtin { .. } => Some(("builtin", pos)),
+        // `@as(T, e)` is in the subset (v0.164): exactly two arguments, the
+        // first an identifier naming a subset type; only the VALUE argument
+        // is walked. Every other `@`-builtin stays out.
+        Expr::Builtin { name, args, .. } => {
+            if name == "as"
+                && args.len() == 2
+                && matches!(&args[0], Expr::Ident { name, .. } if subset_type_name(name))
+            {
+                return det_expr(&args[1]);
+            }
+            Some(("builtin", pos))
+        }
         Expr::StructLit { .. } => Some(("struct-lit", pos)),
         Expr::StructType { .. } => Some(("struct-type", pos)),
         Expr::MethodCall { .. } => Some(("method-call", pos)),
@@ -716,7 +744,40 @@ fn selfhost_emit_differential_targeted_inputs() {
             "compound_index_write_single_eval",
             "fn idx() usize { return 1; }\npub fn main() void {\n    var a: Allocator = c_allocator();\n    var s: []u8 = alloc(a, u8, 4);\n    s[idx()] += 7;\n    s[idx() + 1] %= 5;\n    print(s[1]);\n    free(a, s);\n}\n",
         ),
+        // -- generalized []T slices + @as (v0.164) --------------------------------
+        (
+            "slice_i64_fib_roundtrip",
+            "fn make_fibs(a: Allocator, n: usize) []i64 {\n    var s: []i64 = alloc(a, i64, n);\n    s[0] = 1;\n    s[1] = 1;\n    var i: usize = 2;\n    while (i < n) : (i += 1) {\n        s[i] = s[i - 1] + s[i - 2];\n    }\n    return s;\n}\npub fn main() void {\n    var al: Allocator = c_allocator();\n    var fibs: []i64 = make_fibs(al, 8);\n    print(fibs[7]);\n    var sum: i64 = 0;\n    var i: usize = 0;\n    while (i < fibs.len) : (i += 1) {\n        sum = sum + fibs[i];\n    }\n    print(sum);\n    free(al, fibs);\n}\n",
+        ),
+        (
+            "intern_order_sigs_before_bodies",
+            "fn f() void { print(\"x\"); }\nfn g(v: []i64) usize { return v.len; }\npub fn main() void { f(); }\n",
+        ),
+        (
+            "intern_order_params_then_ret_then_cont",
+            "fn h(x: []i32) []i64 { return alloc(c_allocator(), i64, x.len); }\nfn cnt(x: usize) usize { return x; }\npub fn main() void {\n    var al: Allocator = c_allocator();\n    var i: usize = 0;\n    while (i < 3) : (i += cnt(\"ab\".len)) {\n        var v: []bool = alloc(al, bool, 1);\n        free(al, v);\n    }\n}\n",
+        ),
+        (
+            "intern_order_alloc_after_count_arg",
+            "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var q = alloc(al, i64, \"x\".len);\n    print(q.len);\n    free(al, q);\n}\n",
+        ),
+        (
+            "as_cast_zoo",
+            "pub fn main() void {\n    var i: usize = 200;\n    var b: u8 = @as(u8, i);\n    var w: i64 = @as(i64, b) * 3;\n    var n: i32 = @as(i32, w);\n    var z: usize = @as(usize, n);\n    print(b);\n    print(w);\n    print(n);\n    print(z);\n    print(@as(i64, @as(u8, 300)));\n}\n",
+        ),
+        (
+            "multi_elem_slices_and_writes",
+            "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var bs: []bool = alloc(al, bool, 2);\n    bs[0] = true;\n    bs[1] = !bs[0];\n    var us: []usize = alloc(al, usize, 2);\n    us[0] = bs.len;\n    us[1] += us[0];\n    if (bs[1]) { print(1); } else { print(@as(i64, us[1])); }\n    free(al, us);\n    free(al, bs);\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
+        (
+            "skip_slice_elem_f64",
+            "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var s: []f64 = alloc(al, f64, 2);\n}\n",
+        ),
+        (
+            "skip_as_wrong_shape",
+            "pub fn main() void {\n    var x: i64 = 1;\n    print(@as(f64, x));\n}\n",
+        ),
         (
             "skip_place_chain_through_index",
             "pub fn main() void {\n    var a: Allocator = c_allocator();\n    var s: []u8 = alloc(a, u8, 2);\n    s[0].f = 1;\n}\n",
@@ -726,16 +787,16 @@ fn selfhost_emit_differential_targeted_inputs() {
             "pub fn main() void {\n    var a: Allocator = c_allocator();\n    var s: []u8 = alloc(a, u8);\n}\n",
         ),
         (
-            "skip_alloc_elem_not_u8",
-            "pub fn main() void {\n    var a: Allocator = c_allocator();\n    var s = alloc(a, i64, 3);\n}\n",
+            "skip_alloc_elem_not_scalar",
+            "pub fn main() void {\n    var a: Allocator = c_allocator();\n    var s = alloc(a, Allocator, 3);\n}\n",
         ),
         (
             "skip_float_deep_in_defer",
             "pub fn main() void {\n    defer {\n        var x: i64 = 1;\n        print(x + 1.5);\n    }\n}\n",
         ),
         (
-            "skip_slice_of_i32",
-            "pub fn main() void {\n    if (true) {\n        var s: []i32 = q();\n    }\n}\n",
+            "skip_slice_of_f64",
+            "pub fn main() void {\n    if (true) {\n        var s: []f64 = q();\n    }\n}\n",
         ),
         (
             "skip_field_not_len",
@@ -745,7 +806,7 @@ fn selfhost_emit_differential_targeted_inputs() {
         ("skip_empty_module", ""),
         (
             "skip_alloc_call",
-            "pub fn main() void {\n    var n: i64 = 4;\n    free(a, alloc(a, i64, n));\n}\n",
+            "pub fn main() void {\n    var n: i64 = 4;\n    free(a, alloc(a, f64, n));\n}\n",
         ),
         (
             "skip_test_block_after_main",

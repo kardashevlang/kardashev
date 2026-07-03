@@ -1,5 +1,6 @@
 // emit_suite.ks — in-language tests for the self-hosted subset C emitter
-// (v0.161 scalars + v0.162 strings).
+// (v0.161 scalars + v0.162 strings + v0.163 heap buffers + v0.164
+// generalized `[]T` slices and `@as` casts).
 //
 // Run: kard test tests/selfhost/emit_suite.ks (driven from
 // `crates/kardc/tests/selfhost_emit.rs` so it is part of `cargo test`).
@@ -63,6 +64,24 @@ fn eh_find(hay: []u8, needle: []u8) bool {
         if (all) { return true; }
     }
     return false;
+}
+
+/// The byte position of the first occurrence of `needle` in `hay`, or -1.
+fn eh_pos(hay: []u8, needle: []u8) i64 {
+    if (needle.len == 0 or needle.len > hay.len) { return 0 - 1; }
+    var i: usize = 0;
+    while (i + needle.len <= hay.len) : (i += 1) {
+        var j: usize = 0;
+        var all: bool = true;
+        while (j < needle.len) : (j += 1) {
+            if (hay[i + j] != needle[j]) {
+                all = false;
+                break;
+            }
+        }
+        if (all) { return @as(i64, i); }
+    }
+    return 0 - 1;
 }
 
 /// Count non-overlapping occurrences of `needle` in `hay`.
@@ -210,10 +229,13 @@ test "detect: strings, []u8, .len and s[i] are in the subset (v0.162)" {
 
 test "detect: composite type forms and non-subset type names" {
     var a: Allocator = c_allocator();
-    // `[]u8` is the ONE admitted composite; any other slice element is out.
-    var d: Det = eh_detect(a, "fn main() void { var s: []i32 = q(); }");
+    // `[]T` ranges over the five scalar elements (v0.164); anything else
+    // is out.
+    var d: Det = eh_detect(a, "fn main() void { var s: []f64 = q(); }");
     expect(d.found);
     expect(str_eq(d.word, "type-name"));
+    var d1: Det = eh_detect(a, "fn main() void { var s: []i32 = q(); var t: []usize = q(); var w: []bool = q(); }");
+    expect(!d1.found);
     var d2: Det = eh_detect(a, "fn main() void { var p: *i32 = q(); }");
     expect(d2.found);
     expect(str_eq(d2.word, "type-form"));
@@ -284,7 +306,7 @@ test "detect: allocator builtins and deep expressions" {
     expect(d2.found);
     expect(str_eq(d2.word, "builtin-call"));
     expect(d2.pos == 25);
-    var d3: Det = eh_detect(a, "fn main() void { var s = alloc(q, i64, 3); }");
+    var d3: Det = eh_detect(a, "fn main() void { var s = alloc(q, f64, 3); }");
     expect(d3.found);
     expect(str_eq(d3.word, "builtin-call"));
     // The walk reaches into defer bodies, continue-clauses and nested calls.
@@ -578,6 +600,72 @@ test "strings: whole-program byte equality with the typedef section" {
     expect(str_eq(c, want));
     free(a, want);
     sb.deinit(a);
+}
+
+// --- generalized []T slices + @as (v0.164) -------------------------------------------------
+
+test "slices: the type-code family and its C spellings" {
+    expect(et_slice_of(ET_U8) == ET_SLICE_U8);
+    expect(et_is_slice(ET_SLICE_U8));
+    expect(!et_is_slice(ET_U8));
+    expect(!et_is_slice(ET_NONE));
+    expect(et_slice_elem(et_slice_of(ET_I64)) == ET_I64);
+    expect(str_eq(et_slice_c_name(et_slice_of(ET_I32)), "kd_slice_int32_t"));
+    expect(str_eq(et_slice_c_name(et_slice_of(ET_I64)), "kd_slice_int64_t"));
+    expect(str_eq(et_slice_c_name(et_slice_of(ET_BOOL)), "kd_slice_bool"));
+    expect(str_eq(et_slice_c_name(et_slice_of(ET_U8)), "kd_slice_uint8_t"));
+    expect(str_eq(et_slice_c_name(et_slice_of(ET_USIZE)), "kd_slice_uintptr_t"));
+    expect(str_eq(et_c_name(et_slice_of(ET_I64)), "kd_slice_int64_t"));
+    expect(et_is_slice_elem(ET_I32));
+    expect(et_is_slice_elem(ET_BOOL));
+    expect(!et_is_slice_elem(ET_VOID));
+    expect(!et_is_slice_elem(ET_ALLOC));
+    expect(!et_is_slice_elem(ET_NONE));
+}
+
+test "slices: typedef blocks follow sema's first-intern order" {
+    var a: Allocator = c_allocator();
+    // Signatures intern before bodies: g's `[]i64` param beats f's body
+    // string even though f comes first.
+    var c: []u8 = eh_emit(a, "fn f() void { print(\"x\"); }\nfn g(v: []i64) usize { return v.len; }\npub fn main() void { f(); }");
+    var i64pos: i64 = eh_pos(c, "} kd_slice_int64_t;");
+    var u8pos: i64 = eh_pos(c, "} kd_slice_uint8_t;");
+    expect(i64pos >= 0);
+    expect(u8pos >= 0);
+    expect(i64pos < u8pos);
+    // Params left-to-right, then the return type.
+    var c2: []u8 = eh_emit(a, "fn h(x: []i32) []i64 { return alloc(c_allocator(), i64, x.len); }\npub fn main() void { }");
+    expect(eh_pos(c2, "} kd_slice_int32_t;") < eh_pos(c2, "} kd_slice_int64_t;"));
+    // The while continue-clause is checked BEFORE the body...
+    var c3: []u8 = eh_emit(a, "fn cnt(x: usize) usize { return x; }\npub fn main() void {\n    var al: Allocator = c_allocator();\n    var i: usize = 0;\n    while (i < 3) : (i += cnt(\"ab\".len)) {\n        var v: []i64 = alloc(al, i64, 1);\n        free(al, v);\n    }\n}");
+    expect(eh_pos(c3, "} kd_slice_uint8_t;") < eh_pos(c3, "} kd_slice_int64_t;"));
+    // ...and alloc interns its element AFTER the count argument.
+    var c4: []u8 = eh_emit(a, "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var q = alloc(al, i64, \"x\".len);\n    free(al, q);\n}");
+    expect(eh_pos(c4, "} kd_slice_uint8_t;") < eh_pos(c4, "} kd_slice_int64_t;"));
+    // A Let annotation interns BEFORE its initializer's strings.
+    var c5: []u8 = eh_emit(a, "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var q: []i64 = alloc(al, i64, \"abc\".len);\n    free(al, q);\n}");
+    expect(eh_pos(c5, "} kd_slice_int64_t;") < eh_pos(c5, "} kd_slice_uint8_t;"));
+}
+
+test "slices: generalized lowering — typed helpers, writes, inference" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var v: []i64 = alloc(al, i64, 3);\n    v[0] = 7;\n    v[1] += v[0];\n    print(v[1]);\n    print(v.len);\n    var w = alloc(al, bool, 1);\n    w[0] = true;\n    free(al, w);\n    free(al, v);\n}");
+    expect(eh_find(c, "kd_slice_int64_t kd_v = kd_slice_int64_t_alloc((uintptr_t)(3));"));
+    expect(eh_find(c, "(kd_v).ptr[__kd_idx0] = (7);"));
+    expect(eh_find(c, "(kd_v).ptr[__kd_idx1] = (kd_v).ptr[__kd_idx1] + (kd_slice_int64_t_get(kd_v, 0));"));
+    expect(eh_find(c, "kd_print((long long)(kd_slice_int64_t_get(kd_v, 1)));"));
+    // `var w = alloc(al, bool, 1);` infers `[]bool`.
+    expect(eh_find(c, "kd_slice_bool kd_w = kd_slice_bool_alloc((uintptr_t)(1));"));
+    expect(eh_find(c, "(kd_w).ptr[__kd_idx2] = (true);"));
+}
+
+test "casts: @as lowering and its result type" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void {\n    var i: usize = 200;\n    var b: u8 = @as(u8, i);\n    var w = @as(i64, b) * 3;\n    print(w);\n    print(@as(i32, w));\n}");
+    expect(eh_find(c, "uint8_t kd_b = ((uint8_t)(kd_i));"));
+    // `@as(i64, b) * 3` infers i64 through the cast's target type.
+    expect(eh_find(c, "int64_t kd_w = (((int64_t)(kd_b)) * 3);"));
+    expect(eh_find(c, "kd_print((long long)(((int32_t)(kd_w))));"));
 }
 
 // --- index writes + allocator builtins (v0.163) -------------------------------------------
