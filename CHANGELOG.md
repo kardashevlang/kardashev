@@ -18,6 +18,53 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.164.0] — Self-hosting stage 6: generalized `[]T` slices + `@as` casts
+
+The subset's slices generalize from `[]u8` to **`[]T` over the five scalar
+element types** (`i32`/`i64`/`bool`/`u8`/`usize`, matching `alloc(a, T, n)`),
+and **`@as(T, e)` casts** arrive — the two features most of the real
+`tests/spec` buffer programs were waiting on. `selfhost/emit.ks` (2,590
+lines) keeps the byte-identical contract; the stage's load-bearing piece is
+the **sema-intern-order mirror**:
+
+- with several slice types live, `emit_type_defs` emits one
+  `kd_slice_<tag>` typedef block per interned slice in
+  `StructTable::slices()` order = sema's FIRST-INTERN order. `emit.ks`
+  reproduces it by replaying `sema::check`'s walk over the untyped AST
+  (verified against sema.rs line-by-line AND by typedef-order probes): all
+  fn signatures in item order (params left-to-right, then the return type),
+  then const ANNOTATIONS (initializers fold through `const_eval` and can
+  never intern), then bodies in order — Let resolves its annotation BEFORE
+  the initializer, While checks cond → CONTINUE-CLAUSE → body, an index
+  write checks the INDEX first, `alloc(a, T, n)` checks the allocator arg,
+  then the count arg, and interns `[]T` LAST (its type arg is never walked
+  as an expression), a string literal interns `[]u8` where it sits, and
+  `comptime` subtrees never intern;
+- `@as(T, e)` → `((<cty>)(<e>))` with the target type checked before the
+  collected signatures in `type_of_expr` (an unresolvable name mirrors the
+  `base_type` → `void` fallback);
+- index reads/writes, `.len`, alloc/free and local inference all
+  generalize over the slice family (`kd_slice_<tag>_get`, typed `_alloc`,
+  `.ptr` writes) — including `var q = alloc(al, i64, n);` inferring
+  `[]i64`.
+
+### Added
+- The `ET_SLICE_BASE` code family + `et_slice_*` helpers, the ordered
+  `intern_scan`/`emit_one_slice` machinery, and the `@as` lowering in
+  `selfhost/emit.ks`; the detector admits `[]T`/`alloc` over the five
+  scalar elements and well-shaped `@as` casts (`selfhost/cdump.ks`
+  unchanged).
+- Corpus: **64 of 704 files C byte-identical (62,137 bytes — up from 57
+  files / 48.6 KB)**, now including the `s16_alloc` `[]i64` buffer programs
+  (fibs-through-a-helper, alloc/free loops, zero-length allocs, multiple
+  independent allocs, allocator values) and `main_exit_code_i32`; 579
+  `SKIP` and 25 `ERROR` agreements; `SEMA_INVALID` pinned 34 → 36 (the two
+  `s33_casts` fixtures, E0130/E0321). +8 targeted inputs (a fib round
+  trip, three intern-order probes, an `@as` zoo, multi-element slices with
+  writes, mis-shaped `[]f64`/`@as(f64, ..)` SKIP verdicts) and 4 new
+  in-language suite tests (36 blocks total).
+- 1,110 tests green across the workspace.
+
 ## [0.163.0] — Self-hosting stage 5: index writes + the allocator builtins
 
 The subset grows by the heap-buffer layer — the shape `selfhost/emit.ks`'s
