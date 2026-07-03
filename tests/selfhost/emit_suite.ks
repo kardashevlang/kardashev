@@ -668,6 +668,32 @@ test "casts: @as lowering and its result type" {
     expect(eh_find(c, "kd_print((long long)(((int32_t)(kd_w))));"));
 }
 
+// --- the slicing view (v0.165) --------------------------------------------------------------
+
+test "slicing: detector admits base/lo/hi, walks them for skips" {
+    var a: Allocator = c_allocator();
+    var d: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"abcd\"; print(s[1..3]); }");
+    expect(!d.found);
+    // Out-of-subset constructs inside the operands still surface.
+    var d2: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"abcd\"; print(s[1..g(1.5)]); }");
+    expect(d2.found);
+    expect(str_eq(d2.word, "float"));
+}
+
+test "slicing: the bounds-checked view lowering, re-spliced operands" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void {\n    var s: []u8 = \"abcdef\";\n    var t: []u8 = s[1..4];\n    print(t);\n    print(t.len);\n}");
+    // The exact ternary: lo/hi/base re-spliced, `_Noreturn` failing branch,
+    // `{ptr, len}` success branch.
+    expect(eh_find(c, "kd_slice_uint8_t kd_t = (( (1) < 0 || (4) < (1) || (4) > ((kd_s).len) ) ? (fputs(\"panic: slice bounds out of range\\n\", stderr), exit(101), (kd_slice_uint8_t){0}) : (kd_slice_uint8_t){ .ptr = (kd_s).ptr + (1), .len = (4) - (1) });"));
+    // The view's type is the base's slice type: `var t` infers `[]u8` and a
+    // non-u8 base keeps its own helper family.
+    var c2: []u8 = eh_emit(a, "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var q: []i64 = alloc(al, i64, 4);\n    var v = q[1..3];\n    print(v[0]);\n    free(al, q);\n}");
+    expect(eh_find(c2, "kd_slice_int64_t kd_v = (( (1) < 0 ||"));
+    expect(eh_find(c2, "(kd_slice_int64_t){ .ptr = (kd_q).ptr + (1), .len = (3) - (1) });"));
+    expect(eh_find(c2, "kd_print((long long)(kd_slice_int64_t_get(kd_v, 0)));"));
+}
+
 // --- index writes + allocator builtins (v0.163) -------------------------------------------
 
 test "heap: alloc, free and c_allocator lowering shapes" {

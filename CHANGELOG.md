@@ -18,6 +18,41 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.165.0] — Self-hosting stage 7: the slicing view `s[lo..hi]`
+
+The subset gains the last piece of the slice story: the **slicing view**
+`base[lo..hi]` (SPEC §15.2). `selfhost/emit.ks` (2,679 lines) mirrors the
+Rust lowering byte-for-byte: a `{ptr, len}` view whose bounds check
+(`0 <= lo <= hi <= len`) folds into a portable conditional with a
+`_Noreturn` failing branch —
+
+```c
+(( (lo) < 0 || (hi) < (lo) || (hi) > ((s).len) ) ?
+  (fputs("panic: slice bounds out of range\n", stderr), exit(101), (kd_slice_<tag>){0})
+  : (kd_slice_<tag>){ .ptr = (s).ptr + (lo), .len = (hi) - (lo) })
+```
+
+— with the base/lo/hi operand strings RE-SPLICED textually exactly as the
+Rust format string does, and the view typed as the base's own slice type.
+The intern-order scan replays sema's SliceExpr walk (base, lo, hi; the
+final re-intern of the base's element is a provable no-op for slice bases,
+the only kind in the subset — the first-intern arm exists only for array
+bases, which stay out).
+
+### Added
+- The `ND_SLICEX` detector/type/lowering arms in `selfhost/emit.ks`
+  (`selfhost/cdump.ks` unchanged).
+- Corpus: **69 of 704 files C byte-identical (72,891 bytes — up from 64 /
+  62.1 KB)** — newly `string_slice_interplay`, `string_empty`,
+  `string_fn_args_and_returns`, `alloc_u8_print_string` and
+  `alloc_slice_reslice`; 573 `SKIP` and 25 `ERROR` agreements;
+  `SEMA_INVALID` pinned 36 → 37 (`slice_non_sliceable_err`, E0232). +3
+  targeted inputs (view/reslice round trips over `[]u8`/`[]i64`, direct
+  string-literal slicing, re-spliced call/`.len` bounds) and 2 in-language
+  suite tests (38 blocks total); the emitted bounds panic verified
+  end-to-end (stderr + exit 101 identical to `kard run`).
+- 1,110 tests green across the workspace.
+
 ## [0.164.0] — Self-hosting stage 6: generalized `[]T` slices + `@as` casts
 
 The subset's slices generalize from `[]u8` to **`[]T` over the five scalar
