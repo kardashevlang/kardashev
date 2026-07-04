@@ -128,8 +128,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 70;
-const MIN_C_COMPARED_TEST: usize = 85;
+const MIN_C_COMPARED_PROGRAM: usize = 80;
+const MIN_C_COMPARED_TEST: usize = 100;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -352,40 +352,237 @@ fn det_fn(f: &Func) -> Option<Hit> {
     det_type(&f.ret).or_else(|| det_block(&f.body))
 }
 
-/// The subset verdict for a parsed module: `None` = in the subset, else the
-/// FIRST unsupported construct. Mirrors `es_detect_mode` in
-/// `selfhost/emit.ks` (which walks the arena in the same order); the
-/// differential compares both the word and the position on every corpus
-/// file, in BOTH modes. `program_mode = false` (`EmitMode::Test`, v0.166)
-/// drops the `nomain` gate; test blocks are subset items in both modes,
-/// their bodies ordinary statement blocks.
-fn detect_subset(module: &Module, program_mode: bool) -> Option<Hit> {
-    if program_mode {
-        let has_main = module
-            .items
-            .iter()
-            .any(|it| matches!(it, Item::Func(f) if f.name == "main"));
-        if !has_main {
-            return Some(("nomain", 0));
+// (The single-file `detect_subset` of v0.161–v0.166 is superseded by
+// `detect_flat` over the resolved module — see the resolution mirror.)
+
+// ---- the import-resolution mirror (v0.167) -------------------------------------
+//
+// `selfhost/modres.ks` resolves the root's `@import`s into one flattened
+// module over a CONCATENATED virtual source; every downstream position
+// (ERROR/SKIP lines, detector hits) is in those coordinates. This mirror
+// replays the same walk over the Rust AST: files load depth-first in
+// import order, each file's source base = the sum of previously-read
+// files' lengths, a file's imported items precede its own, dedup/cycle
+// keys are LEXICALLY normalized paths, a `std`/`std.ks` basename naming no
+// readable (non-empty) file is the out-of-subset embedded library (SKIP
+// `import`), a missing/empty import is E0291, a cycle E0292, an imported
+// file's lex/parse failure E0294 at 0, and the first duplicate top-level
+// name E0293 at the duplicate's rebased position.
+
+/// One flattened file: its parsed module and its base offset into the
+/// virtual concatenated source.
+struct FlatFile {
+    module: Module,
+    base: usize,
+}
+
+enum Resolved {
+    /// An `ERROR <code> <pos>` or `SKIP import <pos>` line.
+    Line(String),
+    /// The flattened module, per file in APPEND order.
+    Flat(Vec<FlatFile>),
+}
+
+/// The `mr_normalize` mirror: fold `.` and `//`, resolve `..` against a
+/// poppable segment, keep a leading `/`.
+fn normalize_path(p: &str) -> String {
+    let absolute = p.starts_with('/');
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." && segs.last().is_some_and(|s| *s != "..") {
+            segs.pop();
+            continue;
+        }
+        segs.push(seg);
+    }
+    let joined = segs.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
+/// The `mr_dir_of` mirror (prefix including the trailing `/`).
+fn dir_of(p: &str) -> String {
+    match p.rfind('/') {
+        Some(i) => p[..=i].to_string(),
+        None => String::new(),
+    }
+}
+
+fn basename(p: &str) -> &str {
+    match p.rfind('/') {
+        Some(i) => &p[i + 1..],
+        None => p,
+    }
+}
+
+struct Resolver {
+    src_len: usize,
+    /// normalized path → state (true = on the DFS stack, false = done).
+    states: std::collections::HashMap<String, bool>,
+    out: Vec<FlatFile>,
+    fail: Option<String>,
+}
+
+impl Resolver {
+    fn resolve_file(&mut self, norm: &str, import_pos: usize, is_root: bool) {
+        if self.fail.is_some() {
+            return;
+        }
+        let content = std::fs::read_to_string(norm).unwrap_or_default();
+        let base_name = basename(norm);
+        if (base_name == "std" || base_name == "std.ks") && content.is_empty() {
+            self.fail = Some(format!("SKIP import {}\n", import_pos));
+            return;
+        }
+        if let Some(&on_stack) = self.states.get(norm) {
+            if on_stack {
+                self.fail = Some(format!("ERROR 292 {}\n", import_pos));
+            }
+            return;
+        }
+        if content.is_empty() && !is_root {
+            self.fail = Some(format!("ERROR 291 {}\n", import_pos));
+            return;
+        }
+        self.states.insert(norm.to_string(), true);
+
+        let base = self.src_len;
+        self.src_len += content.len();
+        let module = match kardc::lexer::lex(&content) {
+            Ok(tokens) => match kardc::parser::parse(&tokens) {
+                Ok(m) => m,
+                Err(diags) => {
+                    let d = &diags[0];
+                    self.fail = Some(if is_root {
+                        let code = match d.code {
+                            "E0200" => 200,
+                            "E0201" => 201,
+                            other => panic!("unexpected parser diagnostic code {other}"),
+                        };
+                        format!("ERROR {} {}\n", code, base + d.span.start)
+                    } else {
+                        "ERROR 294 0\n".to_string()
+                    });
+                    self.states.insert(norm.to_string(), false);
+                    return;
+                }
+            },
+            Err(diags) => {
+                let d = &diags[0];
+                self.fail = Some(if is_root {
+                    let code = match d.code {
+                        "E0001" => 1,
+                        "E0002" => 2,
+                        other => panic!("unexpected lexer diagnostic code {other}"),
+                    };
+                    format!("ERROR {} {}\n", code, base + d.span.start)
+                } else {
+                    "ERROR 294 0\n".to_string()
+                });
+                self.states.insert(norm.to_string(), false);
+                return;
+            }
+        };
+
+        // Pass 1 — imports depth-first, in item order.
+        let dir = dir_of(norm);
+        for item in &module.items {
+            if self.fail.is_some() {
+                break;
+            }
+            if let Item::Import(imp) = item {
+                let target = normalize_path(&format!("{}{}", dir, imp.path));
+                self.resolve_file(&target, base + imp.span.start, false);
+            }
+        }
+        if self.fail.is_none() {
+            // Pass 2 — append this file's own items.
+            self.out.push(FlatFile { module, base });
+        }
+        self.states.insert(norm.to_string(), false);
+    }
+}
+
+/// Resolve `root` exactly as `selfhost/modres.ks` does.
+fn mirror_resolve(root: &Path) -> Resolved {
+    let mut r = Resolver {
+        src_len: 0,
+        states: std::collections::HashMap::new(),
+        out: Vec::new(),
+        fail: None,
+    };
+    let norm = normalize_path(&root.display().to_string());
+    r.resolve_file(&norm, 0, true);
+    if let Some(line) = r.fail {
+        return Resolved::Line(line);
+    }
+    // `check_unique` (E0293): first duplicate top-level name, at the
+    // DUPLICATE item's rebased position. Tests carry no shared name.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ff in &r.out {
+        for item in &ff.module.items {
+            let named: Option<(&str, usize)> = match item {
+                Item::Func(f) => Some((&f.name, f.span.start)),
+                Item::Const(c) => Some((&c.name, c.span.start)),
+                Item::Struct(s) => Some((&s.name, s.span.start)),
+                Item::Enum(e) => Some((&e.name, e.span.start)),
+                Item::Union(u) => Some((&u.name, u.span.start)),
+                Item::ErrorSet(e) => Some((&e.name, e.span.start)),
+                Item::Test(_) | Item::Import(_) => None,
+            };
+            if let Some((name, pos)) = named {
+                if !seen.insert(name.to_string()) {
+                    return Resolved::Line(format!("ERROR 293 {}\n", ff.base + pos));
+                }
+            }
         }
     }
-    for item in &module.items {
-        let hit = match item {
-            Item::Func(f) => det_fn(f),
-            Item::Const(c) => c
-                .ty
-                .as_ref()
-                .and_then(det_type)
-                .or_else(|| det_expr(&c.value)),
-            Item::Test(t) => det_block(&t.body),
-            Item::Struct(s) => Some(("struct", s.span.start)),
-            Item::Enum(e) => Some(("enum", e.span.start)),
-            Item::Union(u) => Some(("union", u.span.start)),
-            Item::Import(i) => Some(("import", i.span.start)),
-            Item::ErrorSet(e) => Some(("errorset", e.span.start)),
-        };
-        if hit.is_some() {
-            return hit;
+    Resolved::Flat(r.out)
+}
+
+/// The flattened-module detector: `nomain` (Program mode) over every
+/// file's items, then each file's non-import items in append order, hit
+/// positions rebased by the file's base.
+fn detect_flat(files: &[FlatFile], program_mode: bool) -> Option<(String, usize)> {
+    if program_mode {
+        let has_main = files.iter().any(|ff| {
+            ff.module
+                .items
+                .iter()
+                .any(|it| matches!(it, Item::Func(f) if f.name == "main"))
+        });
+        if !has_main {
+            return Some(("nomain".to_string(), 0));
+        }
+    }
+    for ff in files {
+        for item in &ff.module.items {
+            if matches!(item, Item::Import(_)) {
+                continue;
+            }
+            let hit = match item {
+                Item::Func(f) => det_fn(f),
+                Item::Const(c) => c
+                    .ty
+                    .as_ref()
+                    .and_then(det_type)
+                    .or_else(|| det_expr(&c.value)),
+                Item::Test(t) => det_block(&t.body),
+                Item::Struct(s) => Some(("struct", s.span.start)),
+                Item::Enum(e) => Some(("enum", e.span.start)),
+                Item::Union(u) => Some(("union", u.span.start)),
+                Item::Import(_) => None,
+                Item::ErrorSet(e) => Some(("errorset", e.span.start)),
+            };
+            if let Some((word, pos)) = hit {
+                return Some((word.to_string(), ff.base + pos));
+            }
         }
     }
     None
@@ -403,33 +600,17 @@ enum Expected {
     SemaInvalid(String),
 }
 
-/// Classify `path` with the Rust pipeline for `mode` (see the module docs).
-fn rust_expected(path: &Path, src: &str, mode: EmitMode) -> Expected {
-    let tokens = match kardc::lexer::lex(src) {
-        Ok(t) => t,
-        Err(diags) => {
-            let d = &diags[0];
-            let code = match d.code {
-                "E0001" => 1,
-                "E0002" => 2,
-                other => panic!("unexpected lexer diagnostic code {other}"),
-            };
-            return Expected::Bytes(format!("ERROR {} {}\n", code, d.span.start));
-        }
+/// Classify `path` with the Rust pipeline for `mode` (see the module docs):
+/// resolve imports (ERROR 291/292/293/294 lines, the std-import SKIP), then
+/// the flattened-module detector, then the REAL `compile_program` for the C
+/// bytes (its internal `modules::resolve` agrees with the mirror on every
+/// comparable input by construction).
+fn rust_expected(path: &Path, _src: &str, mode: EmitMode) -> Expected {
+    let files = match mirror_resolve(path) {
+        Resolved::Line(line) => return Expected::Bytes(line),
+        Resolved::Flat(files) => files,
     };
-    let module = match kardc::parser::parse(&tokens) {
-        Ok(m) => m,
-        Err(diags) => {
-            let d = &diags[0];
-            let code = match d.code {
-                "E0200" => 200,
-                "E0201" => 201,
-                other => panic!("unexpected parser diagnostic code {other}"),
-            };
-            return Expected::Bytes(format!("ERROR {} {}\n", code, d.span.start));
-        }
-    };
-    if let Some((word, pos)) = detect_subset(&module, mode == EmitMode::Program) {
+    if let Some((word, pos)) = detect_flat(&files, mode == EmitMode::Program) {
         return Expected::Bytes(format!("SKIP {} {}\n", word, pos));
     }
     match kardc::compile_program(path, mode) {
@@ -913,6 +1094,160 @@ fn selfhost_emit_differential_targeted_inputs() {
     assert!(
         failures.is_empty(),
         "{} targeted inputs mismatched:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// (b2) Multi-file import fixtures (v0.167): each case builds a fresh temp
+/// directory of `.ks` files and diffs the ROOT in both modes — flatten
+/// order, diamond dedup, back references, `..` paths, import-at-end,
+/// cycles (E0292), missing files (E0291), duplicate names (E0293),
+/// wrapped sub-file errors (E0294), and root/nested `std` imports (SKIP).
+#[test]
+fn selfhost_emit_differential_import_fixtures() {
+    let exe = build_cdump();
+    // (tag, &[(filename, source)], root-filename)
+    let cases: &[(&str, &[(&str, &str)], &str)] = &[
+        (
+            "flatten_chain_and_values",
+            &[
+                ("c.ks", "pub fn cv() i64 { return 7; }\n"),
+                ("b.ks", "@import(\"c.ks\");\npub fn bv() i64 { return cv() * 2; }\n"),
+                ("a.ks", "@import(\"b.ks\");\npub fn main() void { print(bv() + cv()); }\n"),
+            ],
+            "a.ks",
+        ),
+        (
+            "diamond_dedup_once",
+            &[
+                ("d.ks", "pub fn fd() i64 { return 4; }\n"),
+                ("l.ks", "@import(\"d.ks\");\npub fn fl() i64 { return fd() + 1; }\n"),
+                ("r.ks", "@import(\"d.ks\");\npub fn fr() i64 { return fd() + 2; }\n"),
+                ("a.ks", "@import(\"l.ks\");\n@import(\"r.ks\");\npub fn main() void { print(fl() + fr()); }\n"),
+            ],
+            "a.ks",
+        ),
+        (
+            "back_reference_and_import_at_end",
+            &[
+                ("helper.ks", "pub fn helper() i64 { return root_fn() + 1; }\n"),
+                ("a.ks", "pub fn root_fn() i64 { return 10; }\npub fn main() void { print(helper()); }\n@import(\"helper.ks\");\n"),
+            ],
+            "a.ks",
+        ),
+        (
+            "parent_relative_paths",
+            &[
+                ("shared.ks", "pub fn sv() i64 { return 14; }\n"),
+                ("sub/child.ks", "@import(\"../shared.ks\");\npub fn cvv() i64 { return sv() * 3; }\n"),
+                ("a.ks", "@import(\"sub/child.ks\");\npub fn main() void { print(cvv()); }\n"),
+            ],
+            "a.ks",
+        ),
+        (
+            "imports_with_tests_both_modes",
+            &[
+                ("util.ks", "pub fn twice(x: i64) i64 { return x * 2; }\ntest \"imported test\" { expect(twice(2) == 4); }\n"),
+                ("a.ks", "@import(\"util.ks\");\ntest \"root test\" { expect(twice(3) == 6); }\npub fn main() void { print(twice(5)); }\n"),
+            ],
+            "a.ks",
+        ),
+        (
+            "cycle_pair_e0292",
+            &[
+                ("a.ks", "@import(\"b.ks\");\nfn fa() void { }\npub fn main() void { }\n"),
+                ("b.ks", "@import(\"a.ks\");\nfn fb() void { }\n"),
+            ],
+            "a.ks",
+        ),
+        (
+            "cycle_self_e0292",
+            &[("a.ks", "@import(\"a.ks\");\npub fn main() void { }\n")],
+            "a.ks",
+        ),
+        (
+            "missing_import_e0291",
+            &[("a.ks", "@import(\"nope.ks\");\npub fn main() void { }\n")],
+            "a.ks",
+        ),
+        (
+            "empty_import_is_e0291_by_contract",
+            &[
+                ("empty.ks", ""),
+                ("a.ks", "@import(\"empty.ks\");\npub fn main() void { }\n"),
+            ],
+            "a.ks",
+        ),
+        (
+            "duplicate_name_e0293_position",
+            &[
+                ("one.ks", "fn shared() void { }\n"),
+                ("a.ks", "@import(\"one.ks\");\nfn shared() void { }\npub fn main() void { }\n"),
+            ],
+            "a.ks",
+        ),
+        (
+            "subfile_parse_error_e0294",
+            &[
+                ("bad.ks", "fn oops( {\n"),
+                ("a.ks", "@import(\"bad.ks\");\npub fn main() void { }\n"),
+            ],
+            "a.ks",
+        ),
+        (
+            "subfile_lex_error_e0294",
+            &[
+                ("bad.ks", "const X = \"unterminated;\n"),
+                ("a.ks", "@import(\"bad.ks\");\npub fn main() void { }\n"),
+            ],
+            "a.ks",
+        ),
+        (
+            "std_import_root_skip",
+            &[("a.ks", "@import(\"std\");\npub fn main() void { print(1); }\n")],
+            "a.ks",
+        ),
+        (
+            "std_import_nested_skip_rebased",
+            &[
+                ("mid.ks", "pub fn mv() i64 { return 1; }\n@import(\"std\");\n"),
+                ("a.ks", "@import(\"mid.ks\");\npub fn main() void { print(mv()); }\n"),
+            ],
+            "a.ks",
+        ),
+    ];
+
+    let mut failures: Vec<String> = Vec::new();
+    for (tag, files, root_name) in cases {
+        let dir = temp_path(&format!("imp_{tag}"));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        for (name, src) in *files {
+            let p = dir.join(name);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).expect("create fixture subdir");
+            }
+            std::fs::write(&p, src).expect("write fixture file");
+        }
+        let root = dir.join(root_name);
+        for mode in [EmitMode::Program, EmitMode::Test] {
+            let expected = rust_expected(&root, "", mode);
+            if let Expected::SemaInvalid(code) = &expected {
+                failures.push(format!(
+                    "[{tag} {mode:?}] fixture is sema-invalid ({code}) — every case must classify as ERROR, SKIP or valid C"
+                ));
+                continue;
+            }
+            if let Err(msg) = diff_one(&exe, &root, &expected, mode) {
+                failures.push(format!("[{tag}] {msg}"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let _ = std::fs::remove_file(&exe);
+    assert!(
+        failures.is_empty(),
+        "{} import fixtures mismatched:\n{}",
         failures.len(),
         failures.join("\n")
     );
