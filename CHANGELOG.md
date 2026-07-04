@@ -18,6 +18,49 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.171.0] — Self-hosting stage 13: enums
+
+The self-hosted emitter's subset gains ENUMS — declarations, qualified
+literals, equality, and the integer conversions. The C-identical corpus
+moves 157/175 → 160/179 (Program/Test); the `switch`-heavy remainder of
+`s13_enums` stays SKIP-agreed until a switch stage.
+
+- `selfhost/emit.ks` (stage 13): enum declarations with explicit values
+  and the C auto-increment rule (counter = used + 1, wrapping as i64; a
+  duplicate variant — sema's E0211 — still advances the counter but
+  records nothing, replayed exactly), registered in sema's PASS 0
+  (before structs) and seeded FIRST in the typedef dependency walk:
+  `typedef enum { kd_enum_<N>_<V> = <val>, … } kd_enum_<N>;` with every
+  enumerator's resolved value explicit (the degenerate empty enum keeps
+  the `__empty = 0` placeholder). Qualified literals `Enum.V` reuse the
+  FIELD shape and lower to the C enumerator, checked BEFORE the `.len`
+  arms exactly like Rust; enum equality is plain C `==`/`!=`;
+  `@intFromEnum(e)` → `((int64_t)(<e>))` and `@enumFromInt(E, n)` →
+  `((kd_enum_E)(<n>))` join `@as` in the builtin arm (the type argument
+  resolves without walking; the scan checks only the value argument).
+  Enum names join struct names as nominal types anywhere a type may
+  appear, including `[N]Enum` / `[]Enum` (mangle `enum_<Name>`; the
+  slice C-name fallback-to-`kd_slice_void` bug for non-scalar elements
+  was caught by a targeted case and fixed). Unqualified `.V` literals
+  (expected-type plumbing) and `switch` stay out; enum-typed struct
+  FIELDS are sema-invalid (E0161 — `resolve_field_type` has no enum
+  arm), a pinned language limit.
+- Differential (`selfhost_emit.rs`): the named-type set gains enum
+  names; `Item::Enum` admitted; the two conversion gates mirror `@as`
+  (exact arity, identifier type argument). 5 new sema-invalid pins
+  (`s13_enums` E0211/E0212, `s37_enum_values` E0321×3); floors
+  150/165 → 155/170 (160/179 observed); 3 new in-subset targeted cases
+  (declarations/literals/equality/conversions, arrays + slices + `for`
+  over enums, i64-wrapping and negative explicit values) and 2 new
+  skip cases (unqualified literal, `switch` on an enum).
+- Suite (`tests/selfhost/emit_suite.ks`): 56 → 58 tests — the resolved-
+  value typedef shapes (auto-increment past an explicit value), enum
+  seeds preceding struct typedefs, qualified-literal and equality
+  lowerings, both conversions, and the `enum_<Name>` mangles for
+  arrays/slices of enums. All 705 corpus files keep three-bucket
+  agreement in both modes; enum programs verified end-to-end at
+  runtime.
+
 ## [0.170.0] — Self-hosting stage 12: struct methods + associated functions
 
 The self-hosted emitter's subset gains STRUCT FUNCTIONS — the
