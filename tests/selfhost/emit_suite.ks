@@ -2,7 +2,7 @@
 // (v0.161 scalars + v0.162 strings + v0.163 heap buffers + v0.164
 // generalized `[]T` slices and `@as` casts + v0.165 slicing views + v0.166
 // test blocks / EmitMode::Test + v0.167 `@import` resolution + v0.168 fixed
-// arrays `[N]T` and `for` loops).
+// arrays `[N]T` and `for` loops + v0.169 plain data structs).
 //
 // Run: kard test tests/selfhost/emit_suite.ks (driven from
 // `crates/kardc/tests/selfhost_emit.rs` so it is part of `cargo test`).
@@ -256,15 +256,18 @@ test "detect: composite type forms and non-subset type names" {
     expect(str_eq(d4.word, "type-form"));
 }
 
-test "detect: a non-len field access is out, its base is still walked" {
+test "detect: field access is in (v0.169), method calls stay out" {
     var a: Allocator = c_allocator();
+    // Any field NAME is a subset shape now — `s.ptr` on a slice is
+    // sema-invalid (E0165 territory), not a skip.
     var d: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"x\"; print(s.ptr); }");
-    expect(d.found);
-    expect(str_eq(d.word, "field"));
-    // A `.len` whose BASE is out still reports the base's construct.
+    expect(!d.found);
     var d2: Det = eh_detect(a, "pub fn main() void { print(a.b.len); }");
-    expect(d2.found);
-    expect(str_eq(d2.word, "field"));
+    expect(!d2.found);
+    // A method CALL keeps its verdict.
+    var d3: Det = eh_detect(a, "pub fn main() void { p.dist(1); }");
+    expect(d3.found);
+    expect(str_eq(d3.word, "method-call"));
 }
 
 test "detect: out-of-subset statements" {
@@ -285,7 +288,9 @@ test "detect: out-of-subset statements" {
     var d4: Det = eh_detect(a, "fn main() void { lab: while (true) { break :lab; } }");
     expect(d4.found);
     expect(str_eq(d4.word, "label"));
-    var d5: Det = eh_detect(a, "fn main() void { s.f = 1; }");
+    // (`s.f = 1;` joined the subset in v0.169 — field places are in; a
+    // place rooted in a CALL is still out)
+    var d5: Det = eh_detect(a, "fn main() void { f().x = 1; }");
     expect(d5.found);
     expect(str_eq(d5.word, "place-assign"));
 }
@@ -306,9 +311,16 @@ test "detect: out-of-subset items and parameters" {
     var d3: Det = eh_detect(a, "pub fn main() void {}\n@import(\"other.ks\");");
     expect(d3.found);
     expect(str_eq(d3.word, "import"));
+    // A plain data-struct declaration is a subset item (v0.169)...
     var d4: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: i32 };");
-    expect(d4.found);
-    expect(str_eq(d4.word, "struct"));
+    expect(!d4.found);
+    // ...a method inside one is the finding; a non-subset FIELD type too.
+    var d5: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: i32, fn m(self: S) void {} };");
+    expect(d5.found);
+    expect(str_eq(d5.word, "method"));
+    var d6: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: f64 };");
+    expect(d6.found);
+    expect(str_eq(d6.word, "type-name"));
 }
 
 test "detect: the nomain gate is Program-mode only (v0.166)" {
@@ -346,26 +358,27 @@ test "detect: allocator builtins and deep expressions" {
     expect(str_eq(d5.word, "capture"));
 }
 
-test "detect: index writes — direct places in, chains out" {
+test "detect: place chains in (v0.169), non-name roots out" {
     var a: Allocator = c_allocator();
     var d: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"ab\"; s[0] = 1; s[1] *= 2; }");
     expect(!d.found);
-    // A place whose chain passes THROUGH an index takes the `_at` lowering
-    // and stays out.
+    // Chains THROUGH an index (the `_at` lowering) joined in v0.169 —
+    // these are sema's E0165/E0220 territory now, not skips.
     var d2: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"ab\"; s[0].f = 1; }");
-    expect(d2.found);
-    expect(str_eq(d2.word, "place-assign"));
+    expect(!d2.found);
     var d3: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"ab\"; s[0][1] = 1; }");
-    expect(d3.found);
-    expect(str_eq(d3.word, "place-assign"));
-    // Field places never joined; deref places stay out too.
+    expect(!d3.found);
+    // A deref place (pointers) and a call-rooted place stay out.
     var d4: Det = eh_detect(a, "pub fn main() void { p.* = 1; }");
     expect(d4.found);
     expect(str_eq(d4.word, "place-assign"));
-    // Out-of-subset constructs inside an admissible write still surface.
-    var d5: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"ab\"; s[0] = 1.5; }");
+    var d5: Det = eh_detect(a, "pub fn main() void { g()[0] = 1; }");
     expect(d5.found);
-    expect(str_eq(d5.word, "float"));
+    expect(str_eq(d5.word, "place-assign"));
+    // Out-of-subset constructs inside an admissible write still surface.
+    var d6: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"ab\"; s[0] = 1.5; }");
+    expect(d6.found);
+    expect(str_eq(d6.word, "float"));
 }
 
 // --- const folding -------------------------------------------------------------------
@@ -938,4 +951,62 @@ test "harness: for_count resets per test fn too" {
     var c: []u8 = eh_emit_test(a, "test \"a\" {\n    var xs: [1]i64 = [1]i64{ 7 };\n    for (xs) |x| { print(x); }\n}\ntest \"b\" {\n    var ys: [1]i64 = [1]i64{ 8 };\n    for (ys) |y| { print(y); }\n}");
     expect(eh_count(c, "__kd_for0 = ") == 2);
     expect(!eh_find(c, "__kd_for1"));
+}
+
+test "structs: typedef shapes, dependency order, empty struct (v0.169)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const Buf = struct { data: [4]i32, n: i32 };\nconst Empty = struct {};\npub fn main() void {\n    var b: Buf = Buf{ .data = [4]i32{ 0, 0, 0, 0 }, .n = 0 };\n    var e: Empty = Empty{};\n    b.data[1] = 5;\n    print(b.data[1]);\n    var e2 = e;\n}");
+    // A struct field list joins with single spaces; fields spell kd_<f>.
+    expect(eh_find(c, "typedef struct { kd_arr_int32_t_4 kd_data; int32_t kd_n; } kd_struct_Buf;\n"));
+    // The empty struct keeps one char slot (the allocator uses int).
+    expect(eh_find(c, "typedef struct { char _unused; } kd_struct_Empty;\n"));
+    // The dependency walk emits a struct's ARRAY FIELD dep before it: the
+    // array block's `_at` line is directly followed by the struct typedef.
+    expect(eh_find(c, "return (int32_t *)a->data + i; }\ntypedef struct { kd_arr_int32_t_4 kd_data; int32_t kd_n; } kd_struct_Buf;\n"));
+    // Arrays OF structs and slices OF structs mangle struct_<Name>.
+    var c2: []u8 = eh_emit(a, "const Cell = struct { v: i64 };\npub fn main() void {\n    var cs: [2]Cell = [2]Cell{ Cell{ .v = 1 }, Cell{ .v = 2 } };\n    var sl: []Cell = cs[0..1];\n    print(sl.len);\n    print(cs[1].v);\n}");
+    expect(eh_find(c2, "typedef struct { kd_struct_Cell data[2]; } kd_arr_struct_Cell_2;\n"));
+    expect(eh_find(c2, "typedef struct { kd_struct_Cell *ptr; uintptr_t len; } kd_slice_struct_Cell;\n"));
+}
+
+test "structs: literals, field reads/writes, aggregate copies" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const Point = struct { x: i64, y: i64 };\npub fn main() void {\n    var p: Point = Point{ .x = 1, .y = 2 };\n    var q: Point = p;\n    q.x = 100;\n    q.y += 3;\n    print(p.x);\n    print(q.y);\n}");
+    // The literal is a designated compound literal in SOURCE order.
+    expect(eh_find(c, "    kd_struct_Point kd_p = ((kd_struct_Point){ .kd_x = 1, .kd_y = 2 });\n"));
+    // An aggregate copy is a plain C assignment.
+    expect(eh_find(c, "    kd_struct_Point kd_q = kd_p;\n"));
+    // Plain field write; compound re-spells the place on both sides.
+    expect(eh_find(c, "    ((kd_q).kd_x) = (100);\n"));
+    expect(eh_find(c, "    ((kd_q).kd_y) = ((kd_q).kd_y) + (3);\n"));
+    // Field reads parenthesize the base.
+    expect(eh_find(c, "kd_print((long long)((kd_p).kd_x));\n"));
+    // Nested field-chain write: parens nest per step.
+    var c2: []u8 = eh_emit(a, "const In = struct { n: i64 };\nconst Out = struct { i: In };\npub fn main() void {\n    var o: Out = Out{ .i = In{ .n = 0 } };\n    o.i.n = 3;\n    print(o.i.n);\n}");
+    expect(eh_find(c2, "    (((kd_o).kd_i).kd_n) = (3);\n"));
+}
+
+test "structs: place chains through indexes — _at lowering, shared counter" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const Cell = struct { v: i64, w: i64 };\npub fn main() void {\n    var cs: [3]Cell = [3]Cell{ Cell{ .v = 1, .w = 0 }, Cell{ .v = 2, .w = 0 }, Cell{ .v = 3, .w = 0 } };\n    var i: i64 = 1;\n    cs[i].v += 10;\n    cs[0].w = cs[i].v;\n    var s: []u8 = \"xy\";\n    s[0] = 65;\n    print(cs[0].w);\n}");
+    // Compound through an index hoists the place ADDRESS once (__kd_pl),
+    // through the bounds-checked _at element pointer.
+    expect(eh_find(c, "    { int64_t *__kd_pl0 = (&(kd_arr_struct_Cell_3_at(&(kd_cs), kd_i)->kd_v)); *__kd_pl0 = *__kd_pl0 + (10); }\n"));
+    // A plain chain write spells `at(...)->kd_f`; the RHS reads by value
+    // through `_get`.
+    expect(eh_find(c, "    (kd_arr_struct_Cell_3_at(&(kd_cs), 0)->kd_w) = ((kd_arr_struct_Cell_3_get(kd_cs, kd_i)).kd_v);\n"));
+    // __kd_pl shares the __kd_idx counter: the later direct slice write
+    // numbers __kd_idx1.
+    expect(eh_find(c, "__kd_idx1"));
+    expect(!eh_find(c, "__kd_idx0"));
+}
+
+test "structs: an array view through an indexed element spells _at" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const B = struct { buf: [3]i64 };\npub fn main() void {\n    var xs: [2]B = [2]B{ B{ .buf = [3]i64{ 1, 2, 3 } }, B{ .buf = [3]i64{ 4, 5, 6 } } };\n    var v: []i64 = xs[0].buf[0..3];\n    v[1] = 99;\n    print(xs[0].buf[1]);\n    print(v[2]);\n}");
+    // The view's backing pointer reaches the REAL element storage through
+    // `_at` (a `_get` copy would dangle).
+    expect(eh_find(c, ".ptr = (kd_arr_struct_B_2_at(&(kd_xs), 0)->kd_buf).data + (0)"));
+    // The rvalue read of the same chain uses `_get` + field access.
+    expect(eh_find(c, "kd_print((long long)(kd_arr_int64_t_3_get((kd_arr_struct_B_2_get(kd_xs, 0)).kd_buf, 1)));\n"));
 }

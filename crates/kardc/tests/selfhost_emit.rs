@@ -1,9 +1,13 @@
-//! Self-host stages 3–10 (v0.161–v0.168): differential test of
+//! Self-host stages 3–11 (v0.161–v0.169): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
-//! `@import` resolution, and — v0.168 — fixed arrays `[N]T` with array
-//! literals and `for` loops) written in kardashev — against the Rust
+//! `@import` resolution, fixed arrays `[N]T` with array literals and
+//! `for` loops, and — v0.169 — plain data STRUCTS: declarations, literals,
+//! field reads, generalized place-assignment chains through fields and
+//! indexes with the `_at` element-pointer lowering, and the typedef
+//! DEPENDENCY WALK over structs/arrays/slices) written in kardashev —
+//! against the Rust
 //! reference emitter. Since v0.166 every corpus file is classified and
 //! compared in BOTH modes: `cdump <file>` prints the Program lowering,
 //! `cdump <file> test` the Test-mode harness (no `nomain` gate; a module
@@ -68,6 +72,7 @@
 //! `crates/kardc/src/std.ks`.
 
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -103,6 +108,20 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s03_sema/return_void_rules_err.ks",                   // E0110
     "tests/spec/s03_sema/unknown_name_err.ks",                        // E0100
     "tests/spec/s03_sema/void_result_unusable_err.ks",                // E0110
+    "tests/spec/s09_structs/err_duplicate_field_decl.ks",             // E0162
+    "tests/spec/s09_structs/err_field_access_on_non_struct.ks",       // E0165
+    "tests/spec/s09_structs/err_field_assign_non_var_root.ks",        // E0167
+    "tests/spec/s09_structs/err_field_assign_type_mismatch.ks",       // E0110
+    "tests/spec/s09_structs/err_forward_or_cyclic_field.ks",          // E0160
+    "tests/spec/s09_structs/err_literal_duplicate_init.ks",           // E0164
+    "tests/spec/s09_structs/err_literal_extra_field.ks",              // E0164
+    "tests/spec/s09_structs/err_literal_field_type_mismatch.ks",      // E0110
+    "tests/spec/s09_structs/err_literal_missing_field.ks",            // E0164
+    "tests/spec/s09_structs/err_literal_of_non_struct.ks",            // E0163
+    "tests/spec/s09_structs/err_nominal_typing.ks",                   // E0110
+    "tests/spec/s09_structs/err_print_struct.ks",                     // E0110
+    "tests/spec/s09_structs/err_struct_equality.ks",                  // E0110
+    "tests/spec/s09_structs/err_unknown_field_access.ks",             // E0166
     "tests/spec/s14_arrays/index_assign_const_err.ks",                // E0223
     "tests/spec/s14_arrays/index_assign_param_err.ks",                // E0223
     "tests/spec/s14_arrays/index_non_array_err.ks",                   // E0220
@@ -138,8 +157,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 115;
-const MIN_C_COMPARED_TEST: usize = 130;
+const MIN_C_COMPARED_PROGRAM: usize = 140;
+const MIN_C_COMPARED_TEST: usize = 155;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -189,7 +208,7 @@ fn chain_has_index(e: &Expr) -> bool {
 /// spelling (`@This()` parses to the synthesized name `Self`, which is not
 /// one — the selfhost side reports its `F_THIS` flag identically, sliced or
 /// not).
-fn det_type(t: &TypeExpr) -> Option<Hit> {
+fn det_type(sn: &HashSet<String>, t: &TypeExpr) -> Option<Hit> {
     if t.optional
         || t.error_union
         || t.error_set.is_some()
@@ -200,24 +219,25 @@ fn det_type(t: &TypeExpr) -> Option<Hit> {
         return Some(("type-form", t.span.start));
     }
     if t.array_len.is_some() || t.slice {
-        // `[N]T` (v0.168) / `[]T` (v0.164) over the five scalar elements.
-        if !subset_slice_elem(&t.name) {
+        // `[N]T` (v0.168) / `[]T` (v0.164) over the five scalar elements,
+        // or a declared struct element (v0.169).
+        if !subset_slice_elem(&t.name) && !sn.contains(&t.name) {
             return Some(("type-name", t.span.start));
         }
         return None;
     }
-    if !subset_type_name(&t.name) {
+    if !subset_type_name(&t.name) && !sn.contains(&t.name) {
         return Some(("type-name", t.span.start));
     }
     None
 }
 
-fn det_expr(e: &Expr) -> Option<Hit> {
+fn det_expr(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
     let pos = e.span().start;
     match e {
         Expr::Int { .. } | Expr::Bool { .. } | Expr::Ident { .. } => None,
-        Expr::Unary { expr, .. } => det_expr(expr),
-        Expr::Binary { lhs, rhs, .. } => det_expr(lhs).or_else(|| det_expr(rhs)),
+        Expr::Unary { expr, .. } => det_expr(sn, expr),
+        Expr::Binary { lhs, rhs, .. } => det_expr(sn, lhs).or_else(|| det_expr(sn, rhs)),
         Expr::Call { callee, args, .. } => {
             // `alloc(a, T, n)` is in the subset (v0.163, elements
             // generalized in v0.164) — exactly three arguments with a
@@ -230,22 +250,18 @@ fn det_expr(e: &Expr) -> Option<Hit> {
                     return Some(("builtin-call", pos));
                 }
             }
-            args.iter().find_map(det_expr)
+            args.iter().find_map(|x| det_expr(sn, x))
         }
-        Expr::Comptime { expr, .. } => det_expr(expr),
+        Expr::Comptime { expr, .. } => det_expr(sn, expr),
         // A string literal is in the subset (v0.162).
         Expr::StrLit { .. } => None,
-        // The one field access in the subset: `.len` (v0.162); the base is
-        // walked either way.
-        Expr::Field { base, field, .. } => {
-            if field != "len" {
-                return Some(("field", pos));
-            }
-            det_expr(base)
+        // Field access is in the subset (v0.169: struct fields; `.len`
+        // since v0.162) — only the base walks, names are sema's business.
+        Expr::Field { base, .. } => det_expr(sn, base),
+        // A read index `s[i]` is in the subset (v0.162).
+        Expr::Index { base, index, .. } => {
+            det_expr(sn, base).or_else(|| det_expr(sn, index))
         }
-        // A read index `s[i]` is in the subset (v0.162); index WRITES are
-        // `Stmt::FieldAssign` places and stay out.
-        Expr::Index { base, index, .. } => det_expr(base).or_else(|| det_expr(index)),
         Expr::Float { .. } => Some(("float", pos)),
         // `@as(T, e)` is in the subset (v0.164): exactly two arguments, the
         // first an identifier naming a subset type; only the VALUE argument
@@ -255,11 +271,15 @@ fn det_expr(e: &Expr) -> Option<Hit> {
                 && args.len() == 2
                 && matches!(&args[0], Expr::Ident { name, .. } if subset_type_name(name))
             {
-                return det_expr(&args[1]);
+                return det_expr(sn, &args[1]);
             }
             Some(("builtin", pos))
         }
-        Expr::StructLit { .. } => Some(("struct-lit", pos)),
+        // A struct literal `Name{ .f = e, … }` is in the subset (v0.169):
+        // the initializer values walk in source order.
+        Expr::StructLit { fields, .. } => {
+            fields.iter().find_map(|fi| det_expr(sn, &fi.value))
+        }
         Expr::StructType { .. } => Some(("struct-type", pos)),
         Expr::MethodCall { .. } => Some(("method-call", pos)),
         Expr::Null { .. } => Some(("null", pos)),
@@ -270,12 +290,12 @@ fn det_expr(e: &Expr) -> Option<Hit> {
         // An array literal `[N]T{ … }` is in the subset (v0.168): its
         // `[N]T` reference, then the elements, in order.
         Expr::ArrayLit { elem, elems, .. } => {
-            det_type(elem).or_else(|| elems.iter().find_map(det_expr))
+            det_type(sn, elem).or_else(|| elems.iter().find_map(|x| det_expr(sn, x)))
         }
         // The slicing view `base[lo..hi]` is in the subset (v0.165).
-        Expr::SliceExpr { base, lo, hi, .. } => det_expr(base)
-            .or_else(|| det_expr(lo))
-            .or_else(|| det_expr(hi)),
+        Expr::SliceExpr { base, lo, hi, .. } => det_expr(sn, base)
+            .or_else(|| det_expr(sn, lo))
+            .or_else(|| det_expr(sn, hi)),
         Expr::AddrOf { .. } => Some(("addrof", pos)),
         Expr::Deref { .. } => Some(("deref", pos)),
         Expr::Try { .. } => Some(("try", pos)),
@@ -284,34 +304,30 @@ fn det_expr(e: &Expr) -> Option<Hit> {
     }
 }
 
-fn det_block(b: &kardc::ast::Block) -> Option<Hit> {
-    b.stmts.iter().find_map(det_stmt)
+fn det_block(sn: &HashSet<String>, b: &kardc::ast::Block) -> Option<Hit> {
+    b.stmts.iter().find_map(|x| det_stmt(sn, x))
 }
 
-fn det_stmt(s: &Stmt) -> Option<Hit> {
+fn det_stmt(sn: &HashSet<String>, s: &Stmt) -> Option<Hit> {
     let pos = s.span().start;
     match s {
         Stmt::Let { ty, value, .. } => ty
             .as_ref()
-            .and_then(det_type)
-            .or_else(|| det_expr(value)),
-        Stmt::Assign { value, .. } => det_expr(value),
-        // The one place-assignment in the subset (v0.163): a DIRECT index
-        // write `s[i] (op)= e` — an `Index` place whose base does not
-        // itself pass through an index (that shape takes the `_at`
-        // lowering and stays out). Walk base, index, value, in that order.
+            .and_then(|t| det_type(sn, t))
+            .or_else(|| det_expr(sn, value)),
+        Stmt::Assign { value, .. } => det_expr(sn, value),
+        // A place-assignment over any FIELD/INDEX chain rooted at a NAME
+        // is in the subset (v0.169; v0.163 admitted the direct index
+        // write). Bases descend first, each index expression where it
+        // sits, then the value; a non-name root stays out.
         Stmt::FieldAssign { place, value, .. } => {
-            if let Expr::Index { base, index, .. } = place {
-                if !chain_has_index(base) {
-                    return det_expr(base)
-                        .or_else(|| det_expr(index))
-                        .or_else(|| det_expr(value));
-                }
+            if !place_rooted_in_name(place) {
+                return Some(("place-assign", pos));
             }
-            Some(("place-assign", pos))
+            det_place(sn, place).or_else(|| det_expr(sn, value))
         }
-        Stmt::Expr(e) => det_expr(e),
-        Stmt::Return { value, .. } => value.as_ref().and_then(det_expr),
+        Stmt::Expr(e) => det_expr(sn, e),
+        Stmt::Return { value, .. } => value.as_ref().and_then(|v| det_expr(sn, v)),
         Stmt::If {
             cond,
             capture,
@@ -322,9 +338,9 @@ fn det_stmt(s: &Stmt) -> Option<Hit> {
             if capture.is_some() {
                 return Some(("capture", pos));
             }
-            det_expr(cond)
-                .or_else(|| det_block(then))
-                .or_else(|| els.as_deref().and_then(det_stmt))
+            det_expr(sn, cond)
+                .or_else(|| det_block(sn, then))
+                .or_else(|| els.as_deref().and_then(|e| det_stmt(sn, e)))
         }
         Stmt::While {
             cond,
@@ -336,9 +352,9 @@ fn det_stmt(s: &Stmt) -> Option<Hit> {
             if label.is_some() {
                 return Some(("label", pos));
             }
-            det_expr(cond)
-                .or_else(|| cont.as_deref().and_then(det_stmt))
-                .or_else(|| det_block(body))
+            det_expr(sn, cond)
+                .or_else(|| cont.as_deref().and_then(|c| det_stmt(sn, c)))
+                .or_else(|| det_block(sn, body))
         }
         // `for` is in the subset (v0.168); a LABELED `for` stays out.
         Stmt::For {
@@ -347,7 +363,7 @@ fn det_stmt(s: &Stmt) -> Option<Hit> {
             if label.is_some() {
                 return Some(("label", pos));
             }
-            det_expr(iter).or_else(|| det_block(body))
+            det_expr(sn, iter).or_else(|| det_block(sn, body))
         }
         Stmt::Break { target, .. } | Stmt::Continue { target, .. } => {
             if target.is_some() {
@@ -355,23 +371,44 @@ fn det_stmt(s: &Stmt) -> Option<Hit> {
             }
             None
         }
-        Stmt::Defer { stmt, .. } => det_stmt(stmt),
+        Stmt::Defer { stmt, .. } => det_stmt(sn, stmt),
         Stmt::ErrDefer { .. } => Some(("errdefer", pos)),
-        Stmt::Block(b) => det_block(b),
+        Stmt::Block(b) => det_block(sn, b),
         Stmt::Switch { .. } => Some(("switch", pos)),
     }
 }
 
-fn det_fn(f: &Func) -> Option<Hit> {
+/// Whether a place chain bottoms out at a bare name — the only
+/// assignable root in the subset (v0.169).
+fn place_rooted_in_name(e: &Expr) -> bool {
+    match e {
+        Expr::Ident { .. } => true,
+        Expr::Field { base, .. } | Expr::Index { base, .. } => place_rooted_in_name(base),
+        _ => false,
+    }
+}
+
+/// Walk a place chain: bases inward, each index expression where it sits.
+fn det_place(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
+    match e {
+        Expr::Index { base, index, .. } => {
+            det_place(sn, base).or_else(|| det_expr(sn, index))
+        }
+        Expr::Field { base, .. } => det_place(sn, base),
+        _ => None,
+    }
+}
+
+fn det_fn(sn: &HashSet<String>, f: &Func) -> Option<Hit> {
     for p in &f.params {
         if p.is_comptime {
             return Some(("generic-param", p.span.start));
         }
-        if let Some(hit) = det_type(&p.ty) {
+        if let Some(hit) = det_type(sn, &p.ty) {
             return Some(hit);
         }
     }
-    det_type(&f.ret).or_else(|| det_block(&f.body))
+    det_type(sn, &f.ret).or_else(|| det_block(sn, &f.body))
 }
 
 // (The single-file `detect_subset` of v0.161–v0.166 is superseded by
@@ -583,20 +620,41 @@ fn detect_flat(files: &[FlatFile], program_mode: bool) -> Option<(String, usize)
             return Some(("nomain".to_string(), 0));
         }
     }
+    // The declared struct names (v0.169): collected over ALL flattened
+    // files before the walk (sema pass 0a interns every name first).
+    let sn: HashSet<String> = files
+        .iter()
+        .flat_map(|ff| ff.module.items.iter())
+        .filter_map(|it| match it {
+            Item::Struct(s) => Some(s.name.clone()),
+            _ => None,
+        })
+        .collect();
     for ff in files {
         for item in &ff.module.items {
             if matches!(item, Item::Import(_)) {
                 continue;
             }
             let hit = match item {
-                Item::Func(f) => det_fn(f),
+                Item::Func(f) => det_fn(&sn, f),
                 Item::Const(c) => c
                     .ty
                     .as_ref()
-                    .and_then(det_type)
-                    .or_else(|| det_expr(&c.value)),
-                Item::Test(t) => det_block(&t.body),
-                Item::Struct(s) => Some(("struct", s.span.start)),
+                    .and_then(|t| det_type(&sn, t))
+                    .or_else(|| det_expr(&sn, &c.value)),
+                Item::Test(t) => det_block(&sn, &t.body),
+                // A plain data-struct declaration is a subset item
+                // (v0.169): field types walk in order; the FIRST method
+                // is the finding.
+                Item::Struct(s) => s
+                    .fields
+                    .iter()
+                    .find_map(|fd| det_type(&sn, &fd.ty))
+                    .or_else(|| {
+                        s.methods
+                            .first()
+                            .map(|m| ("method", m.span.start))
+                    }),
                 Item::Enum(e) => Some(("enum", e.span.start)),
                 Item::Union(u) => Some(("union", u.span.start)),
                 Item::Import(_) => None,
@@ -1068,6 +1126,35 @@ fn selfhost_emit_differential_targeted_inputs() {
             "arrays_typedef_order_and_empty_view",
             "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var h: []i64 = alloc(al, i64, 1);\n    var xs: [2]u8 = [2]u8{ 1, 2 };\n    var v: []u8 = xs[1..1];\n    print(v.len);\n    print(h.len);\n    print(xs[1]);\n    free(al, h);\n}\n",
         ),
+        // -- plain data structs (v0.169) ------------------------------------------
+        (
+            "structs_literals_fields_copies",
+            "const Point = struct {\n    x: i64,\n    y: i64,\n};\nfn make(seed: i64) Point {\n    return Point{ .y = seed * 2, .x = seed };\n}\npub fn main() void {\n    var p: Point = make(5);\n    var q: Point = p;\n    q.x = 100;\n    print(p.x);\n    print(p.y);\n    print(q.x);\n    q.y += 3;\n    print(q.y);\n}\n",
+        ),
+        (
+            "structs_nested_and_empty",
+            "const Empty = struct {};\nconst Inner = struct {\n    v: i64,\n};\nconst Outer = struct {\n    a: Inner,\n    b: Inner,\n    tag: u8,\n};\npub fn main() void {\n    var e: Empty = Empty{};\n    var o: Outer = Outer{ .a = Inner{ .v = 1 }, .b = Inner{ .v = 2 }, .tag = 7 };\n    o.a.v = 10;\n    o.b.v += 5;\n    print(o.a.v);\n    print(o.b.v);\n    print(o.tag);\n    var e2 = e;\n}\n",
+        ),
+        (
+            "structs_array_fields_and_arrays_of_structs",
+            "const Buf = struct {\n    data: [4]i32,\n    n: i32,\n};\nconst Cell = struct {\n    v: i64,\n};\npub fn main() void {\n    var b: Buf = Buf{ .data = [4]i32{ 0, 0, 0, 0 }, .n = 0 };\n    var i: i32 = 0;\n    while (i < 4) : (i += 1) {\n        b.data[i] = (i + 1) * (i + 1);\n        b.n += 1;\n    }\n    print(b.data[2]);\n    print(b.data.len);\n    print(b.n);\n    var cs: [2]Cell = [2]Cell{ Cell{ .v = 1 }, Cell{ .v = 2 } };\n    cs[1].v += 10;\n    cs[0].v = cs[1].v;\n    print(cs[0].v);\n    for (cs) |c| { print(c.v); }\n}\n",
+        ),
+        (
+            "structs_slice_fields_and_views",
+            "const Named = struct {\n    name: []u8,\n    id: i64,\n};\nconst B = struct {\n    buf: [3]i64,\n};\npub fn main() void {\n    var n: Named = Named{ .name = \"kardashev\", .id = 42 };\n    print(n.name);\n    print(n.name.len);\n    print(n.name[0]);\n    print(n.id);\n    var xs: [2]B = [2]B{ B{ .buf = [3]i64{ 1, 2, 3 } }, B{ .buf = [3]i64{ 4, 5, 6 } } };\n    var v: []i64 = xs[0].buf[0..3];\n    v[1] = 99;\n    print(xs[0].buf[1]);\n    print(v[2]);\n    var sl: []B = xs[0..2];\n    print(sl.len);\n    print(sl[1].buf[0]);\n}\n",
+        ),
+        (
+            "structs_deep_chain_compound_writes",
+            "const Cell = struct {\n    v: i64,\n    w: i64,\n};\nconst Pack = struct {\n    cells: [3]Cell,\n    top: Cell,\n};\npub fn main() void {\n    var p: Pack = Pack{ .cells = [3]Cell{ Cell{ .v = 1, .w = 0 }, Cell{ .v = 2, .w = 0 }, Cell{ .v = 3, .w = 0 } }, .top = Cell{ .v = 0, .w = 0 } };\n    var i: i64 = 1;\n    p.cells[i].v += 10;\n    p.cells[0].w = p.cells[i].v;\n    p.top.v = p.cells[2].v;\n    p.top.w += 9;\n    print(p.cells[1].v);\n    print(p.cells[0].w);\n    print(p.top.v);\n    print(p.top.w);\n}\n",
+        ),
+        (
+            "structs_params_returns_and_liveness",
+            "const Acc = struct {\n    total: i64,\n    count: i64,\n};\nfn bump(acc: Acc, x: i64) Acc {\n    return Acc{ .total = acc.total + x, .count = acc.count + 1 };\n}\nfn dead_helper(acc: Acc) Acc {\n    return acc;\n}\npub fn main() void {\n    var a: Acc = Acc{ .total = 0, .count = 0 };\n    a = bump(bump(a, 5), 7);\n    print(a.total);\n    print(a.count);\n}\n",
+        ),
+        (
+            "structs_typedef_dependency_order",
+            "const Late = struct {\n    s: []u8,\n};\npub fn main() void {\n    var xs: [1]Late = [1]Late{ Late{ .s = \"z\" } };\n    var t: [2]i64 = [2]i64{ 1, 2 };\n    print(xs[0].s);\n    print(t[0]);\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
             "skip_slice_elem_f64",
@@ -1078,8 +1165,8 @@ fn selfhost_emit_differential_targeted_inputs() {
             "pub fn main() void {\n    var x: i64 = 1;\n    print(@as(f64, x));\n}\n",
         ),
         (
-            "skip_place_chain_through_index",
-            "pub fn main() void {\n    var a: Allocator = c_allocator();\n    var s: []u8 = alloc(a, u8, 2);\n    s[0].f = 1;\n}\n",
+            "skip_place_root_call",
+            "pub fn main() void {\n    var a: Allocator = c_allocator();\n    var s: []u8 = alloc(a, u8, 2);\n    g()[0] = 1;\n}\n",
         ),
         (
             "skip_alloc_wrong_arity",
@@ -1098,8 +1185,8 @@ fn selfhost_emit_differential_targeted_inputs() {
             "pub fn main() void {\n    if (true) {\n        var s: []f64 = q();\n    }\n}\n",
         ),
         (
-            "skip_field_not_len",
-            "pub fn main() void {\n    var s: []u8 = \"x\";\n    print(s.ptr);\n}\n",
+            "skip_method_call_on_value",
+            "pub fn main() void {\n    var s: []u8 = \"x\";\n    s.foo();\n}\n",
         ),
         ("skip_nomain", "fn helper() void {}\n"),
         ("skip_empty_module", ""),
@@ -1134,6 +1221,14 @@ fn selfhost_emit_differential_targeted_inputs() {
         (
             "skip_labeled_for",
             "pub fn main() void {\n    var xs: [1]i64 = [1]i64{ 1 };\n    lab: for (xs) |x| {\n        break :lab;\n    }\n}\n",
+        ),
+        (
+            "skip_struct_with_method",
+            "const P = struct {\n    x: i64,\n    fn get(self: P) i64 { return self.x; }\n};\npub fn main() void {\n    var p: P = P{ .x = 1 };\n    print(p.x);\n}\n",
+        ),
+        (
+            "skip_struct_field_f64",
+            "const P = struct {\n    x: f64,\n};\npub fn main() void { print(1); }\n",
         ),
         (
             "skip_unreachable_stmt",
