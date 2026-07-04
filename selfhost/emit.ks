@@ -1,8 +1,8 @@
-// emit.ks — self-host stages 3–11 (v0.161–v0.169): a C emitter for the
+// emit.ks — self-host stages 3–12 (v0.161–v0.170): a C emitter for the
 // SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
 // `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
-// `[N]T` with array literals and `for` loops, and — v0.169 — plain data
-// STRUCTS), written in
+// `[N]T` with array literals and `for` loops, plain data STRUCTS, and —
+// v0.170 — struct METHODS + associated functions), written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
 // the Rust emitter's output in BOTH `EmitMode::Program` and (v0.166)
@@ -19,10 +19,23 @@
 // `@import` resolution (in `modres.ks`), v0.168 fixed arrays `[N]T` with
 // literal sizes, array literals `[N]T{ … }`, and unlabeled `for`, v0.169
 // adds plain data structs — `const Name = struct { f: T, … };`
-// declarations (methods stay out), nominal struct types anywhere a type
-// may appear (params, returns, annotations, array/slice elements),
-// literals `Name{ .f = e, … }`, field reads, and place-assignment CHAINS
-// through fields and indexes with the `_at` element-pointer lowering):
+// declarations, nominal struct types anywhere a type may appear (params,
+// returns, annotations, array/slice elements), literals
+// `Name{ .f = e, … }`, field reads, and place-assignment CHAINS through
+// fields and indexes with the `_at` element-pointer lowering; v0.170
+// adds struct METHODS and associated functions — VALUE receivers only
+// (`self: Name`; a pointer receiver `self: *T` stays a `type-form`
+// skip), each lowering to a free C function `kd_<Struct>_<method>` whose
+// `self` is an ordinary by-value parameter; calls in all three forms
+// (`v.m(args)`, the explicit-self `Type.m(v, args)`, and the associated
+// `Type.f(args)` — the first two identical in C); liveness gains the
+// NAME-LEVEL method set (SPEC §43.1: a live method name marks that
+// method on EVERY struct; deliberately receiver-agnostic); the intern
+// replay gains sema's pass 1b (struct-function signatures — after all
+// fn signatures, before const annotations; a `self` receiver's
+// annotation is NEVER resolved and interns nothing) and pass 3 walks
+// method bodies in the same item loop as fn/test bodies, with `self`
+// bound to the ENCLOSING STRUCT regardless of its written annotation):
 //
 //   - types: `i32`, `i64`, `bool`, `void`, `u8`, `usize`, `Allocator` bare
 //     names, plus `[]T` slices AND `[N]T` fixed arrays (literal `N` only —
@@ -531,7 +544,14 @@ pub const Det = struct {
             return;
         }
         if (k == ND_STRUCTTYPE) { self.hit("struct-type", off); return; }
-        if (k == ND_MCALL) { self.hit("method-call", off); return; }
+        if (k == ND_MCALL) {
+            // A method / associated call is in the subset (v0.170): the
+            // receiver walks, then the arguments in order (name resolution
+            // is sema's business — E0170/E0171/E0173 territory).
+            self.check_expr(self.nodes[u].a);
+            self.check_expr_list(self.nodes[u].b);
+            return;
+        }
         if (k == ND_NULL) { self.hit("null", off); return; }
         if (k == ND_ORELSE) { self.hit("orelse", off); return; }
         if (k == ND_UNWRAP) { self.hit("unwrap", off); return; }
@@ -710,16 +730,20 @@ pub fn es_detect_mode(src: []u8, nodes: []Node, root: i32, program_mode: bool) D
             // body is an ordinary statement block.
             d.check_block(nodes[u].a);
         } else if (k == ND_STRUCT) {
-            // A plain data-struct declaration is a subset item (v0.169):
-            // every field type must be admissible; methods (v0.113+) are
-            // out — the FIRST method is the finding.
+            // A struct declaration is a subset item (v0.169 fields;
+            // v0.170 admits its METHODS too): every field type must be
+            // admissible, then every struct function walks exactly like a
+            // top-level one — value receivers are ordinary parameters; a
+            // pointer receiver (`self: *T`) is a `type-form` skip.
             var fcur: i32 = nodes[u].a;
             while (fcur >= 0 and !d.found) {
                 d.check_type(nodes[@as(usize, fcur)].a);
                 fcur = nodes[@as(usize, fcur)].next;
             }
-            if (!d.found and nodes[u].b >= 0) {
-                d.hit("method", nodes[@as(usize, nodes[u].b)].off);
+            var mcur: i32 = nodes[u].b;
+            while (mcur >= 0 and !d.found) {
+                d.check_fn(mcur);
+                mcur = nodes[@as(usize, mcur)].next;
             }
         } else if (k == ND_ENUM) {
             d.hit("enum", nodes[u].off);
@@ -993,6 +1017,17 @@ pub const Em = struct {
     sf_name_len: []i64,
     sf_ty: []i64,
     sf_count: usize,
+    // The struct-method table (v0.170) — one row per struct function, in
+    // struct item order then declaration order: owning struct code, name
+    // span, resolved return ET, the ND_FN node, and the name-level
+    // liveness flag (SPEC §43.1 — receiver-agnostic).
+    mt_sid: []i64,
+    mt_noff: []i64,
+    mt_nlen: []i64,
+    mt_ret: []i64,
+    mt_node: []i32,
+    mt_live: []bool,
+    mt_count: usize,
     // `EmitMode::Test` (v0.166): swaps the entry-point wiring for the test
     // harness, roots liveness at the test bodies (every function live when
     // there are none), and enables the statement-level `expect` lowering.
@@ -1034,6 +1069,13 @@ pub const Em = struct {
             .sf_name_len = alloc(a, i64, 16),
             .sf_ty = alloc(a, i64, 16),
             .sf_count = 0,
+            .mt_sid = alloc(a, i64, 8),
+            .mt_noff = alloc(a, i64, 8),
+            .mt_nlen = alloc(a, i64, 8),
+            .mt_ret = alloc(a, i64, 8),
+            .mt_node = alloc(a, i32, 8),
+            .mt_live = alloc(a, bool, 8),
+            .mt_count = 0,
             .is_test = false,
         };
     }
@@ -1709,6 +1751,22 @@ pub const Em = struct {
             // sema's E0163 — untypeable here).
             return self.st_code_of(self.xname(n));
         }
+        if (k == ND_MCALL) {
+            // A method call's type is the invoked struct function's
+            // recorded return: a type-name receiver resolves through the
+            // struct table FIRST, else the receiver expression's struct.
+            var rn: i32 = self.nodes[u].a;
+            var rsid: i64 = ET_NONE;
+            if (rn >= 0 and self.nodes[@as(usize, rn)].kind == ND_IDENT) {
+                rsid = self.st_code_of(self.xname(rn));
+            }
+            if (rsid == ET_NONE) {
+                var rt: i64 = self.type_of_expr(rn);
+                if (et_is_struct(rt)) { rsid = rt; }
+            }
+            if (rsid == ET_NONE) { return ET_NONE; }
+            return self.mt_ret_of(rsid, self.xname(n));
+        }
         if (k == ND_INDEX) {
             // `a[i]` / `s[i]` yields the element type.
             var bt2: i64 = self.type_of_expr(self.nodes[u].a);
@@ -1893,6 +1951,48 @@ pub const Em = struct {
             var s3: []u8 = sb3.build(a);
             sb3.deinit(a);
             return s3;
+        }
+        if (k == ND_MCALL) {
+            // `Emitter::emit_method_call` (v0.170). Associated form — the
+            // receiver is an identifier naming a struct — lowers to
+            // `kd_<Struct>_<method>(<args>)`, the receiver NOT passed
+            // (an explicit-self `Counter.get(c)` call already carries it).
+            // The value form prepends the receiver as the leading `self`
+            // argument. The unresolvable-receiver fallback keeps the empty
+            // struct name, mirroring the Rust `unwrap_or_default` arm.
+            var mrecv: i32 = self.nodes[u].a;
+            var msid: i64 = ET_NONE;
+            var is_assoc: bool = false;
+            if (mrecv >= 0 and self.nodes[@as(usize, mrecv)].kind == ND_IDENT) {
+                msid = self.st_code_of(self.xname(mrecv));
+                if (msid != ET_NONE) { is_assoc = true; }
+            }
+            if (!is_assoc) {
+                var mrt: i64 = self.type_of_expr(mrecv);
+                if (et_is_struct(mrt)) { msid = mrt; }
+            }
+            var msb: StrBuilder = StrBuilder.init(a);
+            msb.append(a, "kd_");
+            if (msid != ET_NONE) { msb.append(a, self.st_name_of(msid)); }
+            msb.append(a, "_");
+            msb.append(a, self.xname(n));
+            msb.append(a, "(");
+            var first: bool = true;
+            if (!is_assoc) {
+                msb.append(a, self.emit_expr(a, mrecv));
+                first = false;
+            }
+            var marg: i32 = self.nodes[u].b;
+            while (marg >= 0) {
+                if (!first) { msb.append(a, ", "); }
+                first = false;
+                msb.append(a, self.emit_expr(a, marg));
+                marg = self.nodes[@as(usize, marg)].next;
+            }
+            msb.append(a, ")");
+            var ms: []u8 = msb.build(a);
+            msb.deinit(a);
+            return ms;
         }
         if (k == ND_SLIT) {
             // `Name{ .f = e, … }` → the C99 compound literal
@@ -2962,6 +3062,15 @@ pub const Em = struct {
     /// signature line, seed the function scope with the parameter types,
     /// emit the body, close.
     fn emit_func(self: *Self, a: Allocator, fnode: i32) void {
+        self.emit_func_named(a, fnode, "", self.xname(fnode));
+    }
+
+    /// `Emitter::emit_func_named` (v0.170): emit a function definition
+    /// under `kd_<prefix><name>` — ordinary functions pass an empty
+    /// prefix; struct functions pass `<Struct>_` so a `self` parameter is
+    /// just an ordinary by-value struct parameter and the body reuses
+    /// every lowering unchanged.
+    fn emit_func_named(self: *Self, a: Allocator, fnode: i32, prefix: []u8, fname: []u8) void {
         var u: usize = @as(usize, fnode);
         // Reset the scope machinery and the per-function temp counters.
         self.sc_len = 0;
@@ -2974,7 +3083,8 @@ pub const Em = struct {
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, self.cty(a, self.nodes[u].b));
         sb.append(a, " kd_");
-        sb.append(a, self.xname(fnode));
+        sb.append(a, prefix);
+        sb.append(a, fname);
         sb.append(a, "(");
         self.put_params(a, &sb, fnode);
         sb.append(a, ") {");
@@ -3012,7 +3122,7 @@ pub const Em = struct {
     /// Collect every free-call name in a statement subtree into the pending
     /// worklist (the `collect_called_names` visitor: `Call{callee}` only —
     /// the subset has no method calls).
-    fn collect_calls_expr(self: *Self, a: Allocator, pend: *PendList, n: i32) void {
+    fn collect_calls_expr(self: *Self, a: Allocator, pend: *PendList, pendm: *PendList, n: i32) void {
         if (n < 0) { return; }
         var u: usize = @as(usize, n);
         var k: u8 = self.nodes[u].kind;
@@ -3020,30 +3130,30 @@ pub const Em = struct {
             pend.push(a, self.nodes[u].xoff, self.nodes[u].xlen);
             var cur: i32 = self.nodes[u].a;
             while (cur >= 0) {
-                self.collect_calls_expr(a, pend, cur);
+                self.collect_calls_expr(a, pend, pendm, cur);
                 cur = self.nodes[@as(usize, cur)].next;
             }
             return;
         }
         if (k == ND_UNARY or k == ND_COMPTIME or k == ND_FIELD) {
-            self.collect_calls_expr(a, pend, self.nodes[u].a);
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
             return;
         }
         if (k == ND_BIN or k == ND_INDEX) {
-            self.collect_calls_expr(a, pend, self.nodes[u].a);
-            self.collect_calls_expr(a, pend, self.nodes[u].b);
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].b);
             return;
         }
         if (k == ND_SLICEX) {
-            self.collect_calls_expr(a, pend, self.nodes[u].a);
-            self.collect_calls_expr(a, pend, self.nodes[u].b);
-            self.collect_calls_expr(a, pend, self.nodes[u].c);
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].b);
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].c);
             return;
         }
         if (k == ND_ALIT) {
             var alc: i32 = self.nodes[u].b;
             while (alc >= 0) {
-                self.collect_calls_expr(a, pend, alc);
+                self.collect_calls_expr(a, pend, pendm, alc);
                 alc = self.nodes[@as(usize, alc)].next;
             }
             return;
@@ -3052,8 +3162,20 @@ pub const Em = struct {
             // `visit_expr` walks a struct literal's initializer values.
             var fcur: i32 = self.nodes[u].a;
             while (fcur >= 0) {
-                self.collect_calls_expr(a, pend, self.nodes[@as(usize, fcur)].a);
+                self.collect_calls_expr(a, pend, pendm, self.nodes[@as(usize, fcur)].a);
                 fcur = self.nodes[@as(usize, fcur)].next;
+            }
+            return;
+        }
+        if (k == ND_MCALL) {
+            // `MethodCall{method}` contributes a METHOD name (name-level,
+            // receiver-agnostic, SPEC §43.1); receiver and args walk.
+            pendm.push(a, self.nodes[u].xoff, self.nodes[u].xlen);
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
+            var mcur: i32 = self.nodes[u].b;
+            while (mcur >= 0) {
+                self.collect_calls_expr(a, pend, pendm, mcur);
+                mcur = self.nodes[@as(usize, mcur)].next;
             }
             return;
         }
@@ -3062,70 +3184,70 @@ pub const Em = struct {
             // value may contain calls; the type-name Ident is harmless).
             var bcur: i32 = self.nodes[u].a;
             while (bcur >= 0) {
-                self.collect_calls_expr(a, pend, bcur);
+                self.collect_calls_expr(a, pend, pendm, bcur);
                 bcur = self.nodes[@as(usize, bcur)].next;
             }
             return;
         }
     }
 
-    fn collect_calls_block(self: *Self, a: Allocator, pend: *PendList, block: i32) void {
+    fn collect_calls_block(self: *Self, a: Allocator, pend: *PendList, pendm: *PendList, block: i32) void {
         if (block < 0) { return; }
         var cur: i32 = self.nodes[@as(usize, block)].a;
         while (cur >= 0) {
-            self.collect_calls_stmt(a, pend, cur);
+            self.collect_calls_stmt(a, pend, pendm, cur);
             cur = self.nodes[@as(usize, cur)].next;
         }
     }
 
-    fn collect_calls_stmt(self: *Self, a: Allocator, pend: *PendList, n: i32) void {
+    fn collect_calls_stmt(self: *Self, a: Allocator, pend: *PendList, pendm: *PendList, n: i32) void {
         if (n < 0) { return; }
         var u: usize = @as(usize, n);
         var k: u8 = self.nodes[u].kind;
         if (k == ND_LET or k == ND_ASSIGN) {
             var v: i32 = self.nodes[u].b;
             if (k == ND_ASSIGN) { v = self.nodes[u].a; }
-            self.collect_calls_expr(a, pend, v);
+            self.collect_calls_expr(a, pend, pendm, v);
             return;
         }
         if (k == ND_PASSIGN) {
             // `visit_stmt_exprs` visits the place, then the value.
-            self.collect_calls_expr(a, pend, self.nodes[u].a);
-            self.collect_calls_expr(a, pend, self.nodes[u].b);
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].b);
             return;
         }
         if (k == ND_RETURN) {
-            self.collect_calls_expr(a, pend, self.nodes[u].a);
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
             return;
         }
         if (k == ND_IF) {
-            self.collect_calls_expr(a, pend, self.nodes[u].a);
-            self.collect_calls_block(a, pend, self.nodes[u].b);
-            self.collect_calls_stmt(a, pend, self.nodes[u].c);
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
+            self.collect_calls_block(a, pend, pendm, self.nodes[u].b);
+            self.collect_calls_stmt(a, pend, pendm, self.nodes[u].c);
             return;
         }
         if (k == ND_WHILE) {
-            self.collect_calls_expr(a, pend, self.nodes[u].a);
-            self.collect_calls_stmt(a, pend, self.nodes[u].b);
-            self.collect_calls_block(a, pend, self.nodes[u].c);
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
+            self.collect_calls_stmt(a, pend, pendm, self.nodes[u].b);
+            self.collect_calls_block(a, pend, pendm, self.nodes[u].c);
             return;
         }
         if (k == ND_FOR) {
-            self.collect_calls_expr(a, pend, self.nodes[u].a);
-            self.collect_calls_block(a, pend, self.nodes[u].b);
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
+            self.collect_calls_block(a, pend, pendm, self.nodes[u].b);
             return;
         }
         if (k == ND_DEFER) {
-            self.collect_calls_stmt(a, pend, self.nodes[u].a);
+            self.collect_calls_stmt(a, pend, pendm, self.nodes[u].a);
             return;
         }
         if (k == ND_BLOCK) {
-            self.collect_calls_block(a, pend, n);
+            self.collect_calls_block(a, pend, pendm, n);
             return;
         }
         if (k == ND_BREAK or k == ND_CONTINUE) { return; }
         // An expression statement.
-        self.collect_calls_expr(a, pend, n);
+        self.collect_calls_expr(a, pend, pendm, n);
     }
 
     /// `live_functions` for the subset: the worklist closure of called
@@ -3137,7 +3259,9 @@ pub const Em = struct {
     /// top-level `fn` of that name and walks each of their bodies.
     fn compute_live(self: *Self, a: Allocator) void {
         var pend: PendList = PendList.init(a);
+        var pendm: PendList = PendList.init(a);
         var done: PendList = PendList.init(a);
+        var donem: PendList = PendList.init(a);
         if (self.is_test) {
             var any_test: bool = false;
             var tcur: i32 = self.root;
@@ -3145,43 +3269,76 @@ pub const Em = struct {
                 var tu: usize = @as(usize, tcur);
                 if (self.nodes[tu].kind == ND_TEST) {
                     any_test = true;
-                    self.collect_calls_block(a, &pend, self.nodes[tu].a);
+                    self.collect_calls_block(a, &pend, &pendm, self.nodes[tu].a);
                 }
                 tcur = self.nodes[tu].next;
             }
             if (!any_test) {
-                // The no-root fallback: mark everything live.
+                // The no-root fallback: mark everything live — free
+                // functions AND struct functions (`LiveFns::all_of`).
                 var fi: usize = 0;
                 while (fi < self.fn_len) : (fi += 1) {
                     self.fns[fi].live = true;
                 }
+                var mj: usize = 0;
+                while (mj < self.mt_count) : (mj += 1) {
+                    self.mt_live[mj] = true;
+                }
                 pend.deinit(a);
+                pendm.deinit(a);
                 done.deinit(a);
+                donem.deinit(a);
                 return;
             }
         } else {
             pend.push(a, 0, 0);
         }
-        while (pend.len > 0) {
-            pend.len -= 1;
-            var noff: usize = pend.offs[pend.len];
-            var nlen: usize = pend.lens[pend.len];
-            var name: []u8 = self.pend_text(noff, nlen);
-            if (done.contains(self.src, name)) { continue; }
-            done.push(a, noff, nlen);
-            // Mark and walk every function of this name.
-            var i: usize = 0;
-            while (i < self.fn_len) : (i += 1) {
-                var fname: []u8 = self.src[self.fns[i].off .. self.fns[i].off + self.fns[i].len];
-                if (str_eq(fname, name)) {
-                    self.fns[i].live = true;
-                    var fu: usize = @as(usize, self.fns[i].node);
-                    self.collect_calls_block(a, &pend, self.nodes[fu].c);
+        // Worklist closure over BOTH name spaces (SPEC §43.1): free names
+        // drain first, then method names (drain order does not affect the
+        // final sets — both queues feed each other until empty).
+        while (pend.len > 0 or pendm.len > 0) {
+            if (pend.len > 0) {
+                pend.len -= 1;
+                var noff: usize = pend.offs[pend.len];
+                var nlen: usize = pend.lens[pend.len];
+                var name: []u8 = self.pend_text(noff, nlen);
+                if (done.contains(self.src, name)) { continue; }
+                done.push(a, noff, nlen);
+                // Mark and walk every function of this name.
+                var i: usize = 0;
+                while (i < self.fn_len) : (i += 1) {
+                    var fname: []u8 = self.src[self.fns[i].off .. self.fns[i].off + self.fns[i].len];
+                    if (str_eq(fname, name)) {
+                        self.fns[i].live = true;
+                        var fu: usize = @as(usize, self.fns[i].node);
+                        self.collect_calls_block(a, &pend, &pendm, self.nodes[fu].c);
+                    }
+                }
+            } else {
+                pendm.len -= 1;
+                var moff: usize = pendm.offs[pendm.len];
+                var mlen: usize = pendm.lens[pendm.len];
+                var mname: []u8 = self.src[moff .. moff + mlen];
+                if (donem.contains(self.src, mname)) { continue; }
+                donem.push(a, moff, mlen);
+                // Name-level: the method of this name on EVERY struct goes
+                // live; each of their bodies is walked.
+                var mi: usize = 0;
+                while (mi < self.mt_count) : (mi += 1) {
+                    var off2: usize = @as(usize, self.mt_noff[mi]);
+                    var len2: usize = @as(usize, self.mt_nlen[mi]);
+                    if (str_eq(self.src[off2 .. off2 + len2], mname)) {
+                        self.mt_live[mi] = true;
+                        var mnu: usize = @as(usize, self.mt_node[mi]);
+                        self.collect_calls_block(a, &pend, &pendm, self.nodes[mnu].c);
+                    }
                 }
             }
         }
         pend.deinit(a);
+        pendm.deinit(a);
         done.deinit(a);
+        donem.deinit(a);
     }
 
     /// The text of a pending name: a span into `src` — except the synthetic
@@ -3203,8 +3360,88 @@ pub const Em = struct {
             if (self.nodes[u].kind == ND_FN) {
                 self.push_fn(a, self.nodes[u].xoff, self.nodes[u].xlen, self.resolve_ty(self.nodes[u].b), cur);
             }
+            if (self.nodes[u].kind == ND_STRUCT) {
+                // Register every struct function's return type under
+                // (struct, name) — the `method_ret` mirror (v0.170); the
+                // rows double as the emission worklist (nodes + liveness).
+                var scode: i64 = ET_STRUCT_BASE + @as(i64, self.st_index_of(self.nodes[u].xoff, self.nodes[u].xlen));
+                var m: i32 = self.nodes[u].b;
+                while (m >= 0) {
+                    var mu: usize = @as(usize, m);
+                    self.push_mt(a, scode, self.nodes[mu].xoff, self.nodes[mu].xlen, self.resolve_ty(self.nodes[mu].b), m);
+                    m = self.nodes[mu].next;
+                }
+            }
             cur = self.nodes[u].next;
         }
+    }
+
+    /// The struct-table index for a name SPAN (collect-time helper: the
+    /// table is already populated by `st_collect`, so the span always
+    /// resolves; `0` is the defensive miss).
+    fn st_index_of(self: *Self, off: usize, len: usize) i64 {
+        var i: usize = 0;
+        while (i < self.st_count) : (i += 1) {
+            if (self.st_name_off[i] == @as(i64, off) and self.st_name_len[i] == @as(i64, len)) {
+                return @as(i64, i);
+            }
+        }
+        return 0;
+    }
+
+    fn push_mt(self: *Self, a: Allocator, sid: i64, noff: usize, nlen: usize, ret: i64, node: i32) void {
+        if (self.mt_count == self.mt_sid.len) {
+            var g0: []i64 = alloc(a, i64, self.mt_sid.len * 2);
+            var g1: []i64 = alloc(a, i64, self.mt_noff.len * 2);
+            var g2: []i64 = alloc(a, i64, self.mt_nlen.len * 2);
+            var g3: []i64 = alloc(a, i64, self.mt_ret.len * 2);
+            var g4: []i32 = alloc(a, i32, self.mt_node.len * 2);
+            var g5: []bool = alloc(a, bool, self.mt_live.len * 2);
+            var i: usize = 0;
+            while (i < self.mt_count) : (i += 1) {
+                g0[i] = self.mt_sid[i];
+                g1[i] = self.mt_noff[i];
+                g2[i] = self.mt_nlen[i];
+                g3[i] = self.mt_ret[i];
+                g4[i] = self.mt_node[i];
+                g5[i] = self.mt_live[i];
+            }
+            free(a, self.mt_sid);
+            free(a, self.mt_noff);
+            free(a, self.mt_nlen);
+            free(a, self.mt_ret);
+            free(a, self.mt_node);
+            free(a, self.mt_live);
+            self.mt_sid = g0;
+            self.mt_noff = g1;
+            self.mt_nlen = g2;
+            self.mt_ret = g3;
+            self.mt_node = g4;
+            self.mt_live = g5;
+        }
+        self.mt_sid[self.mt_count] = sid;
+        self.mt_noff[self.mt_count] = @as(i64, noff);
+        self.mt_nlen[self.mt_count] = @as(i64, nlen);
+        self.mt_ret[self.mt_count] = ret;
+        self.mt_node[self.mt_count] = node;
+        self.mt_live[self.mt_count] = false;
+        self.mt_count += 1;
+    }
+
+    /// `method_ret[(sid, name)]`: the recorded return ET of the named
+    /// struct function, `ET_NONE` when the struct has none of that name.
+    fn mt_ret_of(self: *Self, scode: i64, name: []u8) i64 {
+        var i: usize = 0;
+        while (i < self.mt_count) : (i += 1) {
+            if (self.mt_sid[i] == scode) {
+                var off: usize = @as(usize, self.mt_noff[i]);
+                var len: usize = @as(usize, self.mt_nlen[i]);
+                if (str_eq(self.src[off .. off + len], name)) {
+                    return self.mt_ret[i];
+                }
+            }
+        }
+        return ET_NONE;
     }
 
     // -- the slice interning scan (the sema-order mirror, v0.164) ---------------------
@@ -3291,12 +3528,48 @@ pub const Em = struct {
         self.intern_expr(a, n);
     }
 
+    /// Whether any active binding carries `name` (the scan's mirror of
+    /// sema's `lookup(name)` presence check — the assoc-call gate).
+    fn vt_has(self: *Self, name: []u8) bool {
+        var i: usize = self.vt_len;
+        while (i > 0) {
+            i -= 1;
+            var off: usize = self.vts[i].off;
+            var len: usize = self.vts[i].len;
+            if (str_eq(self.src[off .. off + len], name)) { return true; }
+        }
+        return false;
+    }
+
     fn intern_expr(self: *Self, a: Allocator, n: i32) void {
         if (n < 0) { return; }
         var u: usize = @as(usize, n);
         var k: u8 = self.nodes[u].kind;
         if (k == ND_STR) {
             self.intern_elem(a, ET_U8);
+            return;
+        }
+        if (k == ND_MCALL) {
+            // `check_method_call`: an Ident receiver naming a struct and
+            // NOT shadowed by a value binding is the associated/static
+            // form — only the args check (in order). Otherwise the
+            // receiver checks first, then the args (L→R), each against
+            // its parameter type.
+            var mrecv: i32 = self.nodes[u].a;
+            var massoc: bool = false;
+            if (mrecv >= 0 and self.nodes[@as(usize, mrecv)].kind == ND_IDENT) {
+                if (!self.vt_has(self.xname(mrecv)) and self.st_code_of(self.xname(mrecv)) != ET_NONE) {
+                    massoc = true;
+                }
+            }
+            if (!massoc) {
+                self.intern_expr(a, mrecv);
+            }
+            var marg: i32 = self.nodes[u].b;
+            while (marg >= 0) {
+                self.intern_expr(a, marg);
+                marg = self.nodes[@as(usize, marg)].next;
+            }
             return;
         }
         if (k == ND_SLIT) {
@@ -3506,6 +3779,35 @@ pub const Em = struct {
             }
             cur = self.nodes[u].next;
         }
+        // Pass 1b (v0.170): every struct function's signature — structs
+        // in item order, methods in declaration order, params left to
+        // right then the return. A leading `self` receiver's annotation
+        // is NEVER resolved (sema substitutes the enclosing struct type
+        // without touching it), so it interns nothing.
+        cur = self.root;
+        while (cur >= 0) {
+            var u1: usize = @as(usize, cur);
+            if (self.nodes[u1].kind == ND_STRUCT) {
+                var m1: i32 = self.nodes[u1].b;
+                while (m1 >= 0) {
+                    var mu1: usize = @as(usize, m1);
+                    var p1: i32 = self.nodes[mu1].a;
+                    var pi: i64 = 0;
+                    while (p1 >= 0) {
+                        var pu1: usize = @as(usize, p1);
+                        var skip_self: bool = pi == 0 and str_eq(self.src[self.nodes[pu1].xoff .. self.nodes[pu1].xoff + self.nodes[pu1].xlen], "self");
+                        if (!skip_self) {
+                            self.intern_ty(a, self.nodes[pu1].a);
+                        }
+                        pi += 1;
+                        p1 = self.nodes[pu1].next;
+                    }
+                    self.intern_ty(a, self.nodes[mu1].b);
+                    m1 = self.nodes[mu1].next;
+                }
+            }
+            cur = self.nodes[u1].next;
+        }
         // Pass 2: const annotations (initializers fold via const_eval and
         // never intern).
         cur = self.root;
@@ -3545,6 +3847,38 @@ pub const Em = struct {
                 self.pop_scope();
             } else if (self.nodes[u3].kind == ND_TEST) {
                 self.intern_block(a, self.nodes[u3].a);
+            } else if (self.nodes[u3].kind == ND_STRUCT) {
+                // `check_struct_methods` (v0.170): each method body checks
+                // in declaration order. A leading `self` receiver binds
+                // the ENCLOSING STRUCT type regardless of its written
+                // annotation (sema never resolves it); other params
+                // resolve normally.
+                var scode3: i64 = ET_STRUCT_BASE + @as(i64, self.st_index_of(self.nodes[u3].xoff, self.nodes[u3].xlen));
+                var m3: i32 = self.nodes[u3].b;
+                while (m3 >= 0) {
+                    var mu3: usize = @as(usize, m3);
+                    self.push_scope(a, false, 0 - 1, 0 - 1);
+                    var mp3: i32 = self.nodes[mu3].a;
+                    var mpi: i64 = 0;
+                    while (mp3 >= 0) {
+                        var mpu3: usize = @as(usize, mp3);
+                        var is_self: bool = mpi == 0 and str_eq(self.src[self.nodes[mpu3].xoff .. self.nodes[mpu3].xoff + self.nodes[mpu3].xlen], "self");
+                        if (is_self) {
+                            self.push_vt(a, self.nodes[mpu3].xoff, self.nodes[mpu3].xlen, scode3);
+                        } else {
+                            self.push_vt(a, self.nodes[mpu3].xoff, self.nodes[mpu3].xlen, self.resolve_ty(self.nodes[mpu3].a));
+                        }
+                        mpi += 1;
+                        mp3 = self.nodes[mpu3].next;
+                    }
+                    var mb3: i32 = self.nodes[@as(usize, self.nodes[mu3].c)].a;
+                    while (mb3 >= 0) {
+                        self.intern_stmt(a, mb3);
+                        mb3 = self.nodes[@as(usize, mb3)].next;
+                    }
+                    self.pop_scope();
+                    m3 = self.nodes[mu3].next;
+                }
             }
             cur = self.nodes[u3].next;
         }
@@ -3842,16 +4176,59 @@ pub const Em = struct {
             self.line(a, s);
             any = true;
         }
+        // Then every struct function (v0.170), declared alongside ordinary
+        // ones as `kd_<Struct>_<method>` — name-level liveness gated.
+        var mi: usize = 0;
+        while (mi < self.mt_count) : (mi += 1) {
+            if (!self.mt_live[mi]) { continue; }
+            var mnode: i32 = self.mt_node[mi];
+            var mu: usize = @as(usize, mnode);
+            var sb2: StrBuilder = StrBuilder.init(a);
+            sb2.append(a, self.cty(a, self.nodes[mu].b));
+            sb2.append(a, " kd_");
+            sb2.append(a, self.st_name_of(self.mt_sid[mi]));
+            sb2.append(a, "_");
+            sb2.append(a, self.xname(mnode));
+            sb2.append(a, "(");
+            self.put_params(a, &sb2, mnode);
+            sb2.append(a, ");");
+            var s2: []u8 = sb2.build(a);
+            sb2.deinit(a);
+            self.line(a, s2);
+            any = true;
+        }
         if (any) { self.blank(a); }
     }
 
-    /// `emit_func_defs`: every live function, each followed by a blank.
+    /// The bare source name of a struct code (no `kd_struct_` prefix).
+    fn st_name_of(self: *Self, scode: i64) []u8 {
+        var i: usize = @as(usize, scode - ET_STRUCT_BASE);
+        var off: usize = @as(usize, self.st_name_off[i]);
+        var len: usize = @as(usize, self.st_name_len[i]);
+        return self.src[off .. off + len];
+    }
+
+    /// `emit_func_defs`: every live function, each followed by a blank —
+    /// free functions first, then struct functions (v0.170), matching the
+    /// forward-declaration order.
     fn emit_func_defs(self: *Self, a: Allocator) void {
         var i: usize = 0;
         while (i < self.fn_len) : (i += 1) {
             if (!self.fns[i].live) { continue; }
             self.emit_func(a, self.fns[i].node);
             self.blank(a);
+        }
+        var mi: usize = 0;
+        while (mi < self.mt_count) : (mi += 1) {
+            if (!self.mt_live[mi]) { continue; }
+            var pfx: StrBuilder = StrBuilder.init(a);
+            pfx.append(a, self.st_name_of(self.mt_sid[mi]));
+            pfx.append(a, "_");
+            var pl: []u8 = pfx.build(a);
+            pfx.deinit(a);
+            self.emit_func_named(a, self.mt_node[mi], pl, self.xname(self.mt_node[mi]));
+            self.blank(a);
+            free(a, pl);
         }
     }
 
