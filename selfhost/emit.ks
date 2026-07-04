@@ -1,8 +1,8 @@
-// emit.ks — self-host stages 3–12 (v0.161–v0.170): a C emitter for the
+// emit.ks — self-host stages 3–13 (v0.161–v0.171): a C emitter for the
 // SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
 // `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
-// `[N]T` with array literals and `for` loops, plain data STRUCTS, and —
-// v0.170 — struct METHODS + associated functions), written in
+// `[N]T` with array literals and `for` loops, plain data STRUCTS, struct
+// METHODS + associated functions, and — v0.171 — ENUMS), written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
 // the Rust emitter's output in BOTH `EmitMode::Program` and (v0.166)
@@ -35,7 +35,23 @@
 // fn signatures, before const annotations; a `self` receiver's
 // annotation is NEVER resolved and interns nothing) and pass 3 walks
 // method bodies in the same item loop as fn/test bodies, with `self`
-// bound to the ENCLOSING STRUCT regardless of its written annotation):
+// bound to the ENCLOSING STRUCT regardless of its written annotation;
+// v0.171 adds ENUMS — declarations with explicit values and the C
+// auto-increment rule (counter = used + 1, wrapping; duplicates advance
+// the counter but record nothing), registered in sema's pass 0 BEFORE
+// structs and seeded FIRST in the typedef dependency walk
+// (`typedef enum { kd_enum_<N>_<V> = <val>, … } kd_enum_<N>;`, every
+// enumerator's value explicit); qualified literals `Enum.V` reuse the
+// FIELD shape and lower to the C enumerator (checked before the `.len`
+// arms, exactly like Rust); enum equality is plain C `==`/`!=`; the
+// conversions `@intFromEnum(e)` → `((int64_t)(<e>))` and
+// `@enumFromInt(E, n)` → `((kd_enum_E)(<n>))` join `@as` in the builtin
+// arm (the type argument never walks); unqualified `.V` literals stay
+// OUT (`enum-lit`) — they need expected-type plumbing — as does
+// `switch`. Enum names join struct names as nominal types anywhere a
+// type may appear, including `[N]Enum` / `[]Enum` (mangle `enum_<N>`);
+// enum-typed STRUCT FIELDS are sema-invalid (E0161 — resolve_field_type
+// has no enum arm), a pinned language limit:
 //
 //   - types: `i32`, `i64`, `bool`, `void`, `u8`, `usize`, `Allocator` bare
 //     names, plus `[]T` slices AND `[N]T` fixed arrays (literal `N` only —
@@ -177,8 +193,13 @@ pub const ET_SLICE_U8: i64 = 105;
 pub const ET_ARR_BASE: i64 = 10000;
 pub const ET_STRUCT_BASE: i64 = 1000000000;
 pub const ET_SLICE_STRUCT_BASE: i64 = 2000000000;
+pub const ET_ENUM_BASE: i64 = 3000000000;
+pub const ET_SLICE_ENUM_BASE: i64 = 4000000000;
 
 pub fn et_slice_of(elem: i64) i64 {
+    if (elem >= ET_ENUM_BASE) {
+        return ET_SLICE_ENUM_BASE + (elem - ET_ENUM_BASE);
+    }
     if (elem >= ET_STRUCT_BASE) {
         return ET_SLICE_STRUCT_BASE + (elem - ET_STRUCT_BASE);
     }
@@ -186,10 +207,13 @@ pub fn et_slice_of(elem: i64) i64 {
 }
 
 pub fn et_is_slice(t: i64) bool {
-    return (t >= ET_SLICE_BASE and t < ET_ARR_BASE) or t >= ET_SLICE_STRUCT_BASE;
+    return (t >= ET_SLICE_BASE and t < ET_ARR_BASE) or (t >= ET_SLICE_STRUCT_BASE and t < ET_ENUM_BASE) or t >= ET_SLICE_ENUM_BASE;
 }
 
 pub fn et_slice_elem(t: i64) i64 {
+    if (t >= ET_SLICE_ENUM_BASE) {
+        return ET_ENUM_BASE + (t - ET_SLICE_ENUM_BASE);
+    }
     if (t >= ET_SLICE_STRUCT_BASE) {
         return ET_STRUCT_BASE + (t - ET_SLICE_STRUCT_BASE);
     }
@@ -202,6 +226,10 @@ pub fn et_is_arr(t: i64) bool {
 
 pub fn et_is_struct(t: i64) bool {
     return t >= ET_STRUCT_BASE and t < ET_SLICE_STRUCT_BASE;
+}
+
+pub fn et_is_enum(t: i64) bool {
+    return t >= ET_ENUM_BASE and t < ET_SLICE_ENUM_BASE;
 }
 
 /// `StructTable::slice_c_name` over the subset: `kd_slice_<type_mangle(elem)>`
@@ -336,12 +364,14 @@ pub const Det = struct {
         return Det{ .src = src, .nodes = nodes, .found = false, .word = "", .pos = 0, .droot = root };
     }
 
-    /// Whether `name` names a struct declared anywhere in the module.
+    /// Whether `name` names a struct OR an enum declared anywhere in the
+    /// module (the named-type set for type positions; sema pass 0/0a
+    /// interns every name before any resolution).
     fn is_struct_name(self: *Self, name: []u8) bool {
         var cur: i32 = self.droot;
         while (cur >= 0) {
             var u: usize = @as(usize, cur);
-            if (self.nodes[u].kind == ND_STRUCT) {
+            if (self.nodes[u].kind == ND_STRUCT or self.nodes[u].kind == ND_ENUM) {
                 if (str_eq(self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen], name)) {
                     return true;
                 }
@@ -508,8 +538,30 @@ pub const Det = struct {
         if (k == ND_BUILTIN) {
             // `@as(T, e)` is in the subset (v0.164): exactly two arguments,
             // the first an identifier naming a subset type; the VALUE
-            // argument is walked. Every other `@`-builtin stays out.
+            // argument is walked. v0.171 adds `@intFromEnum(e)` (exactly
+            // one argument, walked) and `@enumFromInt(E, n)` (exactly two,
+            // the first an identifier — any name; a non-enum is sema's
+            // E0321 — only the VALUE walks). Every other `@`-builtin
+            // stays out.
             var bname: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
+            if (str_eq(bname, "intFromEnum")) {
+                var i0: i32 = self.nodes[u].a;
+                if (i0 >= 0 and self.nodes[@as(usize, i0)].next < 0) {
+                    self.check_expr(i0);
+                    return;
+                }
+            }
+            if (str_eq(bname, "enumFromInt")) {
+                var e0: i32 = self.nodes[u].a;
+                var e1: i32 = 0 - 1;
+                var e2: i32 = 0 - 1;
+                if (e0 >= 0) { e1 = self.nodes[@as(usize, e0)].next; }
+                if (e1 >= 0) { e2 = self.nodes[@as(usize, e1)].next; }
+                if (e0 >= 0 and e1 >= 0 and e2 < 0 and self.nodes[@as(usize, e0)].kind == ND_IDENT) {
+                    self.check_expr(e1);
+                    return;
+                }
+            }
             if (str_eq(bname, "as")) {
                 var b0: i32 = self.nodes[u].a;
                 var b1: i32 = 0 - 1;
@@ -746,7 +798,9 @@ pub fn es_detect_mode(src: []u8, nodes: []Node, root: i32, program_mode: bool) D
                 mcur = nodes[@as(usize, mcur)].next;
             }
         } else if (k == ND_ENUM) {
-            d.hit("enum", nodes[u].off);
+            // An enum declaration is a subset item (v0.171): variant names
+            // and literal integer values carry nothing to walk (a
+            // duplicate variant is sema's E0211).
         } else if (k == ND_UNION) {
             d.hit("union", nodes[u].off);
         } else if (k == ND_IMPORT) {
@@ -1028,6 +1082,18 @@ pub const Em = struct {
     mt_node: []i32,
     mt_live: []bool,
     mt_count: usize,
+    // The enum table (v0.171) — sema pass 0's mirror. Ids are declaration
+    // order; variants live flat in the `ev_*` arrays (name span + resolved
+    // integer value), one `(start, count)` window per enum.
+    en_name_off: []i64,
+    en_name_len: []i64,
+    en_v_start: []i64,
+    en_v_count: []i64,
+    en_count: usize,
+    ev_name_off: []i64,
+    ev_name_len: []i64,
+    ev_val: []i64,
+    ev_count: usize,
     // `EmitMode::Test` (v0.166): swaps the entry-point wiring for the test
     // harness, roots liveness at the test bodies (every function live when
     // there are none), and enables the statement-level `expect` lowering.
@@ -1076,6 +1142,15 @@ pub const Em = struct {
             .mt_node = alloc(a, i32, 8),
             .mt_live = alloc(a, bool, 8),
             .mt_count = 0,
+            .en_name_off = alloc(a, i64, 4),
+            .en_name_len = alloc(a, i64, 4),
+            .en_v_start = alloc(a, i64, 4),
+            .en_v_count = alloc(a, i64, 4),
+            .en_count = 0,
+            .ev_name_off = alloc(a, i64, 8),
+            .ev_name_len = alloc(a, i64, 8),
+            .ev_val = alloc(a, i64, 8),
+            .ev_count = 0,
             .is_test = false,
         };
     }
@@ -1138,6 +1213,7 @@ pub const Em = struct {
     fn cty_of(self: *Self, a: Allocator, t: i64) []u8 {
         if (et_is_arr(t)) { return self.arr_c_name(a, t); }
         if (et_is_struct(t)) { return self.st_c_name(a, t); }
+        if (et_is_enum(t)) { return self.en_c_name(a, t); }
         if (et_is_slice(t)) { return self.sl_c_name(a, t); }
         return et_c_name(t);
     }
@@ -1191,6 +1267,14 @@ pub const Em = struct {
     /// `StructTable::type_mangle` over the subset: scalars spell their C
     /// name, a struct spells `struct_<Name>` (no `kd_` prefix).
     fn mangle_of(self: *Self, a: Allocator, t: i64) []u8 {
+        if (et_is_enum(t)) {
+            var sbz: StrBuilder = StrBuilder.init(a);
+            sbz.append(a, "enum_");
+            sbz.append(a, self.en_name_of(t));
+            var oz: []u8 = sbz.build(a);
+            sbz.deinit(a);
+            return oz;
+        }
         if (et_is_struct(t)) {
             var i: usize = @as(usize, t - ET_STRUCT_BASE);
             var off: usize = @as(usize, self.st_name_off[i]);
@@ -1206,10 +1290,11 @@ pub const Em = struct {
     }
 
     /// `slice_c_name`: `kd_slice_<type_mangle(elem)>` — the static-string
-    /// fast path for scalar elements, built fresh for struct elements.
+    /// fast path for scalar elements, built fresh for struct and enum
+    /// elements (v0.171 fixed the enum arm falling to `kd_slice_void`).
     fn sl_c_name(self: *Self, a: Allocator, t: i64) []u8 {
         var e: i64 = et_slice_elem(t);
-        if (!et_is_struct(e)) { return et_slice_c_name(t); }
+        if (!et_is_struct(e) and !et_is_enum(e)) { return et_slice_c_name(t); }
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, "kd_slice_");
         sb.append(a, self.mangle_of(a, e));
@@ -1323,12 +1408,140 @@ pub const Em = struct {
         return base;
     }
 
-    /// A bare type-name's ET code: builtins first, then declared structs
-    /// (the `base_type` resolution order), else `ET_NONE`.
+    /// A bare type-name's ET code: builtins first, then declared structs,
+    /// then declared enums (the `base_type` resolution order), else
+    /// `ET_NONE`.
     fn base_code(self: *Self, name: []u8) i64 {
         var t: i64 = et_from_name(name);
         if (t != ET_NONE) { return t; }
-        return self.st_code_of(name);
+        var st: i64 = self.st_code_of(name);
+        if (st != ET_NONE) { return st; }
+        return self.en_code_of(name);
+    }
+
+    // -- the enum table (sema pass 0 mirror, v0.171) -----------------------------
+
+    /// The enum id for a source name, as an ET code (`ET_ENUM_BASE + id`),
+    /// or `ET_NONE` when no enum of that name is declared.
+    fn en_code_of(self: *Self, name: []u8) i64 {
+        var i: usize = 0;
+        while (i < self.en_count) : (i += 1) {
+            var off: usize = @as(usize, self.en_name_off[i]);
+            var len: usize = @as(usize, self.en_name_len[i]);
+            if (str_eq(self.src[off .. off + len], name)) {
+                return ET_ENUM_BASE + @as(i64, i);
+            }
+        }
+        return ET_NONE;
+    }
+
+    /// The bare source name of an enum code.
+    fn en_name_of(self: *Self, ecode: i64) []u8 {
+        var i: usize = @as(usize, ecode - ET_ENUM_BASE);
+        var off: usize = @as(usize, self.en_name_off[i]);
+        var len: usize = @as(usize, self.en_name_len[i]);
+        return self.src[off .. off + len];
+    }
+
+    /// `enum_c_name`: `kd_enum_<Name>`.
+    fn en_c_name(self: *Self, a: Allocator, ecode: i64) []u8 {
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "kd_enum_");
+        sb.append(a, self.en_name_of(ecode));
+        var out: []u8 = sb.build(a);
+        sb.deinit(a);
+        return out;
+    }
+
+    /// Sema pass 0 (v0.171): register every enum in item order — variants
+    /// resolve their integer values with the C auto-increment rule (an
+    /// explicit `= N` sets the running counter to `N` and is used; a bare
+    /// variant takes the counter; after each, the counter is the used
+    /// value plus one, wrapping as i64). A duplicate variant name (E0211,
+    /// sema-invalid) still advances the counter but records nothing —
+    /// replayed exactly for totality.
+    fn en_collect(self: *Self, a: Allocator) void {
+        var cur: i32 = self.root;
+        while (cur >= 0) {
+            var u: usize = @as(usize, cur);
+            if (self.nodes[u].kind == ND_ENUM) {
+                if (self.en_count == self.en_name_off.len) {
+                    var g0: []i64 = alloc(a, i64, self.en_name_off.len * 2);
+                    var g1: []i64 = alloc(a, i64, self.en_name_len.len * 2);
+                    var g2: []i64 = alloc(a, i64, self.en_v_start.len * 2);
+                    var g3: []i64 = alloc(a, i64, self.en_v_count.len * 2);
+                    var i0: usize = 0;
+                    while (i0 < self.en_count) : (i0 += 1) {
+                        g0[i0] = self.en_name_off[i0];
+                        g1[i0] = self.en_name_len[i0];
+                        g2[i0] = self.en_v_start[i0];
+                        g3[i0] = self.en_v_count[i0];
+                    }
+                    free(a, self.en_name_off);
+                    free(a, self.en_name_len);
+                    free(a, self.en_v_start);
+                    free(a, self.en_v_count);
+                    self.en_name_off = g0;
+                    self.en_name_len = g1;
+                    self.en_v_start = g2;
+                    self.en_v_count = g3;
+                }
+                self.en_name_off[self.en_count] = @as(i64, self.nodes[u].xoff);
+                self.en_name_len[self.en_count] = @as(i64, self.nodes[u].xlen);
+                self.en_v_start[self.en_count] = @as(i64, self.ev_count);
+                var nvar: i64 = 0;
+                var counter: i64 = 0;
+                var vcur: i32 = self.nodes[u].a;
+                while (vcur >= 0) {
+                    var vu: usize = @as(usize, vcur);
+                    var used: i64 = counter;
+                    if ((self.nodes[vu].flags & F_VAL) != 0) {
+                        used = self.nodes[vu].val;
+                    }
+                    counter = used + 1;
+                    // Duplicate check against the variants already recorded
+                    // for THIS enum (sema's per-enum seen-set).
+                    var vstart: usize = @as(usize, self.en_v_start[self.en_count]);
+                    var dup: bool = false;
+                    var dj: usize = vstart;
+                    while (dj < self.ev_count) : (dj += 1) {
+                        var doff: usize = @as(usize, self.ev_name_off[dj]);
+                        var dlen: usize = @as(usize, self.ev_name_len[dj]);
+                        if (str_eq(self.src[doff .. doff + dlen], self.src[self.nodes[vu].xoff .. self.nodes[vu].xoff + self.nodes[vu].xlen])) {
+                            dup = true;
+                        }
+                    }
+                    if (!dup) {
+                        if (self.ev_count == self.ev_name_off.len) {
+                            var h0: []i64 = alloc(a, i64, self.ev_name_off.len * 2);
+                            var h1: []i64 = alloc(a, i64, self.ev_name_len.len * 2);
+                            var h2: []i64 = alloc(a, i64, self.ev_val.len * 2);
+                            var j0: usize = 0;
+                            while (j0 < self.ev_count) : (j0 += 1) {
+                                h0[j0] = self.ev_name_off[j0];
+                                h1[j0] = self.ev_name_len[j0];
+                                h2[j0] = self.ev_val[j0];
+                            }
+                            free(a, self.ev_name_off);
+                            free(a, self.ev_name_len);
+                            free(a, self.ev_val);
+                            self.ev_name_off = h0;
+                            self.ev_name_len = h1;
+                            self.ev_val = h2;
+                        }
+                        self.ev_name_off[self.ev_count] = @as(i64, self.nodes[vu].xoff);
+                        self.ev_name_len[self.ev_count] = @as(i64, self.nodes[vu].xlen);
+                        self.ev_val[self.ev_count] = used;
+                        self.ev_count += 1;
+                        nvar += 1;
+                    }
+                    vcur = self.nodes[vu].next;
+                }
+                self.en_v_count[self.en_count] = nvar;
+                self.en_count += 1;
+            }
+            cur = self.nodes[u].next;
+        }
     }
 
     // -- raw output -----------------------------------------------------------
@@ -1727,14 +1940,31 @@ pub const Em = struct {
                     return t2;
                 }
             }
+            if (str_eq(self.xname(n), "intFromEnum")) { return ET_I64; }
+            if (str_eq(self.xname(n), "enumFromInt")) {
+                // The enum type named by the first argument (`base_type`
+                // fallback = the Rust `None` arm).
+                var eb0: i32 = self.nodes[u].a;
+                if (eb0 >= 0 and self.nodes[@as(usize, eb0)].kind == ND_IDENT) {
+                    return self.base_code(self.xname(eb0));
+                }
+                return ET_NONE;
+            }
             return ET_NONE;
         }
         if (k == ND_FIELD) {
-            // A struct base yields the named field's type (v0.169); `.len`
+            // A qualified enum literal `Enum.V` (the base Ident names an
+            // enum) has that enum's type — checked FIRST, like Rust. A
+            // struct base yields the named field's type (v0.169); `.len`
             // is a `usize` on arrays (a compile-time constant) and slices
             // alike; anything else is untypeable here. The struct arm
             // precedes the `.len` arms exactly as in Rust — a struct field
             // named `len` is an ordinary member.
+            var fb0: i32 = self.nodes[u].a;
+            if (fb0 >= 0 and self.nodes[@as(usize, fb0)].kind == ND_IDENT) {
+                var fec0: i64 = self.en_code_of(self.xname(fb0));
+                if (fec0 != ET_NONE) { return fec0; }
+            }
             var bt: i64 = self.type_of_expr(self.nodes[u].a);
             if (et_is_struct(bt)) {
                 var ft: i64 = self.st_field_ty(bt, self.xname(n));
@@ -1881,6 +2111,23 @@ pub const Em = struct {
         }
         if (k == ND_FIELD) {
             var fname: []u8 = self.xname(n);
+            // A qualified enum literal `Enum.Variant` reuses the field
+            // shape (its base is an Ident naming an enum) and lowers to
+            // the C enumerator — checked BEFORE everything else, exactly
+            // like the Rust arm.
+            var fb: i32 = self.nodes[u].a;
+            if (fb >= 0 and self.nodes[@as(usize, fb)].kind == ND_IDENT) {
+                var fec: i64 = self.en_code_of(self.xname(fb));
+                if (fec != ET_NONE) {
+                    var sbe: StrBuilder = StrBuilder.init(a);
+                    sbe.append(a, self.en_c_name(a, fec));
+                    sbe.append(a, "_");
+                    sbe.append(a, fname);
+                    var se: []u8 = sbe.build(a);
+                    sbe.deinit(a);
+                    return se;
+                }
+            }
             if (str_eq(fname, "len")) {
                 // `a.len` on an array → the compile-time length as a
                 // `usize` constant (SPEC §14.3) — checked BEFORE the slice
@@ -2280,10 +2527,47 @@ pub const Em = struct {
             // `@as(T, e)` → a C cast `((T)(e))` (v0.137, SPEC §33). The
             // first argument names the target type (an unresolvable name
             // falls back through `base_type` to `void`, a missing value to
-            // `0`, mirroring the Rust arms). Every other builtin is out of
-            // the subset; its sema-invalid remnants take the Rust
-            // unknown-builtin placeholder `0`.
-            if (str_eq(self.xname(n), "as")) {
+            // `0`, mirroring the Rust arms). v0.171 adds the enum
+            // conversions `@intFromEnum(e)` → `((int64_t)(<e>))` and
+            // `@enumFromInt(E, n)` → `((kd_enum_E)(<n>))`. Every other
+            // builtin is out of the subset; its sema-invalid remnants take
+            // the Rust unknown-builtin placeholder `0`.
+            var bname0: []u8 = self.xname(n);
+            if (str_eq(bname0, "intFromEnum")) {
+                var ia: i32 = self.nodes[u].a;
+                var iv: []u8 = "0";
+                if (ia >= 0) { iv = self.emit_expr(a, ia); }
+                var sbi: StrBuilder = StrBuilder.init(a);
+                sbi.append(a, "((int64_t)(");
+                sbi.append(a, iv);
+                sbi.append(a, "))");
+                var si2: []u8 = sbi.build(a);
+                sbi.deinit(a);
+                return si2;
+            }
+            if (str_eq(bname0, "enumFromInt")) {
+                var ea: i32 = self.nodes[u].a;
+                var ecty: []u8 = "void";
+                var ev: []u8 = "0";
+                if (ea >= 0) {
+                    if (self.nodes[@as(usize, ea)].kind == ND_IDENT) {
+                        var ec2: i64 = self.base_code(self.xname(ea));
+                        if (ec2 != ET_NONE) { ecty = self.cty_of(a, ec2); }
+                    }
+                    var eb: i32 = self.nodes[@as(usize, ea)].next;
+                    if (eb >= 0) { ev = self.emit_expr(a, eb); }
+                }
+                var sbe2: StrBuilder = StrBuilder.init(a);
+                sbe2.append(a, "((");
+                sbe2.append(a, ecty);
+                sbe2.append(a, ")(");
+                sbe2.append(a, ev);
+                sbe2.append(a, "))");
+                var se2: []u8 = sbe2.build(a);
+                sbe2.deinit(a);
+                return se2;
+            }
+            if (str_eq(bname0, "as")) {
                 var b0: i32 = self.nodes[u].a;
                 var b1: i32 = 0 - 1;
                 if (b0 >= 0) { b1 = self.nodes[@as(usize, b0)].next; }
@@ -3655,11 +3939,17 @@ pub const Em = struct {
         if (k == ND_BUILTIN) {
             // `@as(T, e)`: only the value expression is walked (the type
             // arg resolves through `resolve_type_arg`, identifier-only).
-            if (str_eq(self.xname(n), "as")) {
+            // v0.171: `@intFromEnum(e)` checks its one value argument;
+            // `@enumFromInt(E, n)` resolves `E` without walking it and
+            // checks only `n` — the same shape as `@as`.
+            if (str_eq(self.xname(n), "as") or str_eq(self.xname(n), "enumFromInt")) {
                 var b0: i32 = self.nodes[u].a;
                 var b1: i32 = 0 - 1;
                 if (b0 >= 0) { b1 = self.nodes[@as(usize, b0)].next; }
                 self.intern_expr(a, b1);
+            }
+            if (str_eq(self.xname(n), "intFromEnum")) {
+                self.intern_expr(a, self.nodes[u].a);
             }
             return;
         }
@@ -4002,11 +4292,17 @@ pub const Em = struct {
     /// first, deduplicated by a seen-set. v0.168's arrays-then-slices was
     /// this walk's struct-free special case.
     fn emit_type_defs(self: *Self, a: Allocator) void {
-        if (self.sl_len == 0 and self.ar_count == 0 and self.st_count == 0) { return; }
-        var total: usize = self.st_count + self.ar_count + self.sl_len;
+        if (self.sl_len == 0 and self.ar_count == 0 and self.st_count == 0 and self.en_count == 0) { return; }
+        var total: usize = self.en_count + self.st_count + self.ar_count + self.sl_len;
         var seen: []bool = alloc(a, bool, total);
         var si: usize = 0;
         while (si < total) : (si += 1) { seen[si] = false; }
+        // Enums seed FIRST (the Rust walk visits them before structs);
+        // they have no dependencies of their own.
+        var en_i: usize = 0;
+        while (en_i < self.en_count) : (en_i += 1) {
+            self.visit_type_def(a, seen, ET_ENUM_BASE + @as(i64, en_i));
+        }
         var st_i: usize = 0;
         while (st_i < self.st_count) : (st_i += 1) {
             self.visit_type_def(a, seen, ET_STRUCT_BASE + @as(i64, st_i));
@@ -4026,14 +4322,15 @@ pub const Em = struct {
     /// The seen-set slot for a type-def node: structs first, then arrays,
     /// then slices (slice codes map through the intern table's index).
     fn type_def_slot(self: *Self, t: i64) i64 {
-        if (et_is_struct(t)) { return t - ET_STRUCT_BASE; }
-        if (et_is_arr(t)) { return @as(i64, self.st_count) + (t - ET_ARR_BASE); }
+        if (et_is_enum(t)) { return t - ET_ENUM_BASE; }
+        if (et_is_struct(t)) { return @as(i64, self.en_count) + (t - ET_STRUCT_BASE); }
+        if (et_is_arr(t)) { return @as(i64, self.en_count + self.st_count) + (t - ET_ARR_BASE); }
         // A slice: find its element's intern index.
         var e: i64 = et_slice_elem(t);
         var i: usize = 0;
         while (i < self.sl_len) : (i += 1) {
             if (self.slices[i] == e) {
-                return @as(i64, self.st_count + self.ar_count + i);
+                return @as(i64, self.en_count + self.st_count + self.ar_count + i);
             }
         }
         return 0 - 1;
@@ -4044,6 +4341,10 @@ pub const Em = struct {
         if (slot < 0) { return; }
         if (seen[@as(usize, slot)]) { return; }
         seen[@as(usize, slot)] = true;
+        if (et_is_enum(t)) {
+            self.emit_one_enum(a, t);
+            return;
+        }
         if (et_is_struct(t)) {
             var i: usize = @as(usize, t - ET_STRUCT_BASE);
             var start: usize = @as(usize, self.st_f_start[i]);
@@ -4051,7 +4352,7 @@ pub const Em = struct {
             var j: usize = 0;
             while (j < n) : (j += 1) {
                 var ft: i64 = self.sf_ty[start + j];
-                if (et_is_struct(ft) or et_is_arr(ft) or et_is_slice(ft)) {
+                if (et_is_struct(ft) or et_is_arr(ft) or et_is_slice(ft) or et_is_enum(ft)) {
                     self.visit_type_def(a, seen, ft);
                 }
             }
@@ -4060,17 +4361,52 @@ pub const Em = struct {
         }
         if (et_is_arr(t)) {
             var ae: i64 = self.arr_elem_of(t);
-            if (et_is_struct(ae) or et_is_arr(ae) or et_is_slice(ae)) {
+            if (et_is_struct(ae) or et_is_arr(ae) or et_is_slice(ae) or et_is_enum(ae)) {
                 self.visit_type_def(a, seen, ae);
             }
             self.emit_one_array(a, t);
             return;
         }
         var se: i64 = et_slice_elem(t);
-        if (et_is_struct(se) or et_is_arr(se) or et_is_slice(se)) {
+        if (et_is_struct(se) or et_is_arr(se) or et_is_slice(se) or et_is_enum(se)) {
             self.visit_type_def(a, seen, se);
         }
         self.emit_one_slice(a, se);
+    }
+
+    /// `emit_one_enum`: `typedef enum { kd_enum_<N>_<V> = <val>, … } kd_enum_<N>;`
+    /// — every enumerator carries its RESOLVED value explicitly; the
+    /// degenerate variant-less enum (sema-invalid) keeps a placeholder so
+    /// the output stays compilable.
+    fn emit_one_enum(self: *Self, a: Allocator, t: i64) void {
+        var i: usize = @as(usize, t - ET_ENUM_BASE);
+        var start: usize = @as(usize, self.en_v_start[i]);
+        var n: usize = @as(usize, self.en_v_count[i]);
+        var cn: []u8 = self.en_c_name(a, t);
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "typedef enum { ");
+        if (n == 0) {
+            sb.append(a, cn);
+            sb.append(a, "__empty = 0");
+        } else {
+            var j: usize = 0;
+            while (j < n) : (j += 1) {
+                if (j > 0) { sb.append(a, ", "); }
+                sb.append(a, cn);
+                sb.append(a, "_");
+                var voff: usize = @as(usize, self.ev_name_off[start + j]);
+                var vlen: usize = @as(usize, self.ev_name_len[start + j]);
+                sb.append(a, self.src[voff .. voff + vlen]);
+                sb.append(a, " = ");
+                sb.append_i64(a, self.ev_val[start + j]);
+            }
+        }
+        sb.append(a, " } ");
+        sb.append(a, cn);
+        sb.append(a, ";");
+        var out: []u8 = sb.build(a);
+        sb.deinit(a);
+        self.line(a, out);
     }
 
     /// `emit_one_struct`: `typedef struct { <cty> kd_<f>; … } kd_struct_<Name>;`
@@ -4392,11 +4728,13 @@ pub const Em = struct {
     /// `EmitMode::Test` emits the harness). The result is
     /// `self.out[0 .. self.out_len]`.
     fn run(self: *Self, a: Allocator) void {
-        // Sema's pass order: struct names + field types FIRST (0a/0b —
-        // field slices/arrays intern here), then signatures, then bodies.
-        // Interning passes 1+2 fill the array table BEFORE the signature
-        // collection resolves `[N]T` params/returns; the type-aware body
-        // pass then consults those signatures.
+        // Sema's pass order: enums FIRST (pass 0 — no dependencies), then
+        // struct names + field types (0a/0b — field slices/arrays intern
+        // here), then signatures, then bodies. Interning passes 1+2 fill
+        // the array table BEFORE the signature collection resolves `[N]T`
+        // params/returns; the type-aware body pass then consults those
+        // signatures.
+        self.en_collect(a);
         self.st_collect(a);
         self.intern_scan_sigs(a);
         self.collect_signatures(a);

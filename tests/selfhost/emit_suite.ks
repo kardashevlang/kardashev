@@ -3,7 +3,7 @@
 // generalized `[]T` slices and `@as` casts + v0.165 slicing views + v0.166
 // test blocks / EmitMode::Test + v0.167 `@import` resolution + v0.168 fixed
 // arrays `[N]T` and `for` loops + v0.169 plain data structs + v0.170
-// struct methods and associated functions).
+// struct methods and associated functions + v0.171 enums).
 //
 // Run: kard test tests/selfhost/emit_suite.ks (driven from
 // `crates/kardc/tests/selfhost_emit.rs` so it is part of `cargo test`).
@@ -1051,4 +1051,30 @@ test "methods: name-level liveness — dead names dropped, all structs marked" {
     var c2: []u8 = eh_emit_test(a, "const A = struct {\n    x: i64,\n    fn solo(self: A) i64 { return self.x; }\n};\nfn lone() void {}\npub fn main() void { print(1); }");
     expect(eh_find(c2, "kd_A_solo"));
     expect(eh_find(c2, "kd_lone"));
+}
+
+test "enums: typedef with resolved values, seeds before structs (v0.171)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const Color = enum { Red, Green, Blue };\nconst Status = enum { Ok = 200, NotFound = 404, Teapot };\nconst P = struct { x: i64 };\npub fn main() void {\n    var c: Color = Color.Red;\n    var s: Status = Status.Teapot;\n    var p: P = P{ .x = 1 };\n    if (c == Color.Red) { print(@intFromEnum(s)); }\n    print(p.x);\n}");
+    // Every enumerator carries its RESOLVED value; auto-increment
+    // continues from an explicit one (Teapot = 405).
+    expect(eh_find(c, "typedef enum { kd_enum_Color_Red = 0, kd_enum_Color_Green = 1, kd_enum_Color_Blue = 2 } kd_enum_Color;\n"));
+    expect(eh_find(c, "typedef enum { kd_enum_Status_Ok = 200, kd_enum_Status_NotFound = 404, kd_enum_Status_Teapot = 405 } kd_enum_Status;\n"));
+    // Enum seeds precede struct typedefs in the dependency walk.
+    expect(eh_find(c, " } kd_enum_Status;\ntypedef struct { int64_t kd_x; } kd_struct_P;\n"));
+    // Qualified literals lower to the C enumerator; equality is plain ==.
+    expect(eh_find(c, "    kd_enum_Color kd_c = kd_enum_Color_Red;\n"));
+    expect(eh_find(c, "    if ((kd_c == kd_enum_Color_Red)) {\n"));
+}
+
+test "enums: conversions and composite positions" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const Dir = enum { N, E, S, W };\nfn spin(d: Dir) Dir {\n    return @enumFromInt(Dir, @intFromEnum(d) + 1);\n}\npub fn main() void {\n    var ds: [2]Dir = [2]Dir{ Dir.E, Dir.W };\n    print(@intFromEnum(ds[1]));\n    var v: []Dir = ds[0..2];\n    print(@intFromEnum(v[0]));\n    print(@as(i32, @intFromEnum(spin(Dir.N))));\n}");
+    // @intFromEnum → an int64_t cast; @enumFromInt → an enum-type cast.
+    expect(eh_find(c, "((int64_t)(kd_arr_enum_Dir_2_get(kd_ds, 1)))"));
+    expect(eh_find(c, "    return (((kd_enum_Dir)((((int64_t)(kd_d)) + 1))));\n"));
+    // Arrays and slices of enums mangle enum_<Name>.
+    expect(eh_find(c, "typedef struct { kd_enum_Dir data[2]; } kd_arr_enum_Dir_2;\n"));
+    expect(eh_find(c, "typedef struct { kd_enum_Dir *ptr; uintptr_t len; } kd_slice_enum_Dir;\n"));
+    expect(eh_find(c, "kd_enum_Dir kd_spin(kd_enum_Dir kd_d);\n"));
 }

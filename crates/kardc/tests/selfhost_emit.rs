@@ -1,4 +1,4 @@
-//! Self-host stages 3–12 (v0.161–v0.170): differential test of
+//! Self-host stages 3–13 (v0.161–v0.171): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -9,7 +9,10 @@
 //! DEPENDENCY WALK over structs/arrays/slices, and — v0.170 — struct
 //! METHODS and associated functions: `kd_<Struct>_<method>` lowering for
 //! the receiver, explicit-self and `Type.assoc(…)` call forms, with
-//! name-level method liveness) written in kardashev —
+//! name-level method liveness — and, v0.171, ENUMS: declarations with
+//! explicit values + C auto-increment, qualified `Enum.V` literals, enum
+//! equality, and the `@intFromEnum`/`@enumFromInt` conversions) written
+//! in kardashev —
 //! against the Rust
 //! reference emitter. Since v0.166 every corpus file is classified and
 //! compared in BOTH modes: `cdump <file>` prints the Program lowering,
@@ -131,6 +134,8 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s10_methods/err_static_call_missing_self.ks",         // E0171
     "tests/spec/s10_methods/err_unknown_assoc_fn.ks",                 // E0173
     "tests/spec/s10_methods/err_unknown_method.ks",                   // E0171
+    "tests/spec/s13_enums/dup_variant_decl_err.ks",                   // E0211
+    "tests/spec/s13_enums/unknown_variant_qualified_err.ks",          // E0212
     "tests/spec/s14_arrays/index_assign_const_err.ks",                // E0223
     "tests/spec/s14_arrays/index_assign_param_err.ks",                // E0223
     "tests/spec/s14_arrays/index_non_array_err.ks",                   // E0220
@@ -148,6 +153,9 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s27_compound/bool_rhs_err.ks",                        // E0110
     "tests/spec/s27_compound/const_place_err.ks",                     // E0110
     "tests/spec/s27_compound/mismatch_err.ks",                        // E0110
+    "tests/spec/s37_enum_values/enum_from_int_first_arg_err.ks",      // E0321
+    "tests/spec/s37_enum_values/enum_from_int_value_not_integer_err.ks", // E0321
+    "tests/spec/s37_enum_values/int_from_enum_non_enum_err.ks",       // E0321
     "tests/spec/s28_bitwise/bitand_bool_err.ks",                      // E0110
     "tests/spec/s28_bitwise/bitnot_bool_err.ks",                      // E0110
     "tests/spec/s29_for/elem_immutable_err.ks",                       // E0110
@@ -166,8 +174,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 150;
-const MIN_C_COMPARED_TEST: usize = 165;
+const MIN_C_COMPARED_PROGRAM: usize = 155;
+const MIN_C_COMPARED_TEST: usize = 170;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -279,6 +287,18 @@ fn det_expr(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
             if name == "as"
                 && args.len() == 2
                 && matches!(&args[0], Expr::Ident { name, .. } if subset_type_name(name))
+            {
+                return det_expr(sn, &args[1]);
+            }
+            // `@intFromEnum(e)` — exactly one argument, walked (v0.171).
+            if name == "intFromEnum" && args.len() == 1 {
+                return det_expr(sn, &args[0]);
+            }
+            // `@enumFromInt(E, n)` — exactly two, the first an identifier
+            // (ANY name; a non-enum is sema's E0321); only `n` walks.
+            if name == "enumFromInt"
+                && args.len() == 2
+                && matches!(&args[0], Expr::Ident { .. })
             {
                 return det_expr(sn, &args[1]);
             }
@@ -633,13 +653,15 @@ fn detect_flat(files: &[FlatFile], program_mode: bool) -> Option<(String, usize)
             return Some(("nomain".to_string(), 0));
         }
     }
-    // The declared struct names (v0.169): collected over ALL flattened
-    // files before the walk (sema pass 0a interns every name first).
+    // The declared struct AND enum names (v0.169/v0.171): collected over
+    // ALL flattened files before the walk (sema pass 0/0a interns every
+    // name before any resolution).
     let sn: HashSet<String> = files
         .iter()
         .flat_map(|ff| ff.module.items.iter())
         .filter_map(|it| match it {
             Item::Struct(s) => Some(s.name.clone()),
+            Item::Enum(e) => Some(e.name.clone()),
             _ => None,
         })
         .collect();
@@ -665,7 +687,9 @@ fn detect_flat(files: &[FlatFile], program_mode: bool) -> Option<(String, usize)
                     .iter()
                     .find_map(|fd| det_type(&sn, &fd.ty))
                     .or_else(|| s.methods.iter().find_map(|m| det_fn(&sn, m))),
-                Item::Enum(e) => Some(("enum", e.span.start)),
+                // An enum declaration is a subset item (v0.171): variant
+                // names and literal values carry nothing to walk.
+                Item::Enum(_) => None,
                 Item::Union(u) => Some(("union", u.span.start)),
                 Item::Import(_) => None,
                 Item::ErrorSet(e) => Some(("errorset", e.span.start)),
@@ -1186,6 +1210,19 @@ fn selfhost_emit_differential_targeted_inputs() {
             "methods_on_elements_and_test_mode",
             "const Cell = struct {\n    v: i64,\n\n    fn dbl(self: Cell) i64 { return self.v * 2; }\n};\npub fn main() void {\n    var cs: [2]Cell = [2]Cell{ Cell{ .v = 1 }, Cell{ .v = 5 } };\n    print(cs[1].dbl());\n    var sl: []Cell = cs[0..2];\n    print(sl[0].dbl());\n}\ntest \"elems\" {\n    var c: Cell = Cell{ .v = 3 };\n    expect(c.dbl() == 6);\n}\n",
         ),
+        // -- enums (v0.171) -------------------------------------------------------
+        (
+            "enums_decls_literals_equality",
+            "const Color = enum { Red, Green, Blue };\nconst Status = enum { Ok = 200, NotFound = 404, Teapot };\nfn next(c: Color) Color {\n    if (c == Color.Red) { return Color.Green; }\n    if (c == Color.Green) { return Color.Blue; }\n    return Color.Red;\n}\npub fn main() void {\n    var c: Color = Color.Red;\n    c = next(c);\n    if (c == Color.Green) { print(1); }\n    if (c != Color.Blue) { print(2); }\n    print(@intFromEnum(Status.Teapot));\n    var s: Status = @enumFromInt(Status, 404);\n    print(@intFromEnum(s));\n    print(@as(i32, @intFromEnum(c)));\n}\n",
+        ),
+        (
+            "enums_in_arrays_params_returns",
+            "const Dir = enum { N, E, S, W };\nfn spin(d: Dir) Dir {\n    if (d == Dir.W) { return Dir.N; }\n    return @enumFromInt(Dir, @intFromEnum(d) + 1);\n}\npub fn main() void {\n    var ds: [2]Dir = [2]Dir{ Dir.E, Dir.W };\n    print(@intFromEnum(ds[1]));\n    ds[0] = spin(ds[0]);\n    print(@intFromEnum(ds[0]));\n    for (ds) |d| { print(@intFromEnum(d)); }\n    var v: []Dir = ds[0..2];\n    print(@intFromEnum(v[1]));\n    print(v.len);\n}\n",
+        ),
+        (
+            "enums_values_wrap_and_negative_start",
+            "const T = enum { A = 9223372036854775807, B, C = 0 - 3, D };\npub fn main() void {\n    print(@intFromEnum(T.A));\n    print(@intFromEnum(T.B));\n    print(@intFromEnum(T.C));\n    print(@intFromEnum(T.D));\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
             "skip_slice_elem_f64",
@@ -1264,6 +1301,14 @@ fn selfhost_emit_differential_targeted_inputs() {
         (
             "skip_struct_field_f64",
             "const P = struct {\n    x: f64,\n};\npub fn main() void { print(1); }\n",
+        ),
+        (
+            "skip_unqualified_enum_lit",
+            "const Color = enum { Red, Green };\npub fn main() void {\n    var c: Color = .Red;\n    if (c == Color.Red) { print(1); }\n}\n",
+        ),
+        (
+            "skip_switch_on_enum",
+            "const Color = enum { Red, Green };\npub fn main() void {\n    var c: Color = Color.Red;\n    switch (c) {\n        Color.Red => { print(1); },\n        else => { print(2); },\n    }\n}\n",
         ),
         (
             "skip_unreachable_stmt",
