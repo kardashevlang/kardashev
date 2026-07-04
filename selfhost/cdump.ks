@@ -33,6 +33,7 @@
 @import("lexer.ks");
 @import("ast.ks");
 @import("parser.ks");
+@import("modres.ks");
 @import("emit.ks");
 @import("std");
 
@@ -67,33 +68,26 @@ pub fn main() i32 {
     var path: []u8 = @arg(a, 1);
     var mode: []u8 = @arg(a, 2);
     var testmode: bool = str_eq(mode, "test");
-    var src: []u8 = @readFile(a, path);
 
-    // Lex everything up front, mirroring astdump: a lex error is the whole
-    // output.
-    var toks: ArrayList(Token) = ArrayList(Token).init(a);
-    var lx: Lexer = Lexer.init(src);
-    while (true) {
-        var t: Token = lx.next();
-        if (t.kind == TK_ERROR) {
-            cd_error(a, @as(i64, t.len), t.off);
-            return 0;
-        }
-        toks.push(a, t);
-        if (t.kind == TK_EOF) { break; }
+    // Resolve the root and its transitive imports into one flattened
+    // module over a concatenated virtual source (v0.167): a root lex/parse
+    // failure keeps its structural code; an imported file's is E0294; a
+    // missing import E0291, a cycle E0292, a duplicate top-level name
+    // E0293 — all positions in concatenated coordinates. A `std` import is
+    // the SKIP verdict `import` (the embedded library is out of subset).
+    var m: MrOut = mr_resolve(a, path);
+    if (m.kind == MR_ERROR) {
+        cd_error(a, m.code, m.pos);
+        return 0;
     }
-
-    var p: Parser = Parser.init(a, src, toks.items[0..toks.count]);
-    var items: i32 = p.parse_module(a) catch 0 - 1;
-    if (p.failed) {
-        cd_error(a, p.ecode, p.epos);
+    if (m.kind == MR_SKIP_STD) {
+        cd_skip(a, "import", m.pos);
         return 0;
     }
 
-    // In Program mode an empty module (`items < 0`) has no `fn main`, so
-    // `es_detect` reports it as `nomain` like any other main-less module;
-    // Test mode drops that gate (an empty module is the trivial harness).
-    var det: Det = es_detect_mode(src, p.nodes, items, !testmode);
+    // In Program mode a main-less flattened module is `nomain`; Test mode
+    // drops that gate (an empty module is the trivial harness).
+    var det: Det = es_detect_mode(m.src, m.nodes, m.root, !testmode);
     if (det.found) {
         cd_skip(a, det.word, det.pos);
         return 0;
@@ -101,9 +95,9 @@ pub fn main() i32 {
 
     var c: []u8 = "";
     if (testmode) {
-        c = es_emit_test(a, src, p.nodes, items);
+        c = es_emit_test(a, m.src, m.nodes, m.root);
     } else {
-        c = es_emit_program(a, src, p.nodes, items);
+        c = es_emit_program(a, m.src, m.nodes, m.root);
     }
     // The C text is newline-terminated per line; `print` appends one more,
     // so print everything except the final newline.

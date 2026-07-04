@@ -15,6 +15,7 @@
 @import("../../selfhost/lexer.ks");
 @import("../../selfhost/ast.ks");
 @import("../../selfhost/parser.ks");
+@import("../../selfhost/modres.ks");
 @import("../../selfhost/emit.ks");
 @import("std");
 
@@ -690,6 +691,32 @@ test "casts: @as lowering and its result type" {
     // `@as(i64, b) * 3` infers i64 through the cast's target type.
     expect(eh_find(c, "int64_t kd_w = (((int64_t)(kd_b)) * 3);"));
     expect(eh_find(c, "kd_print((long long)(((int32_t)(kd_w))));"));
+}
+
+// --- import resolution (v0.167) ---------------------------------------------------------------
+
+test "modres: lexical path normalization mirrors the canonical keys" {
+    var a: Allocator = c_allocator();
+    expect(str_eq(mr_normalize(a, "a/b/c.ks"), "a/b/c.ks"));
+    expect(str_eq(mr_normalize(a, "a//b/./c.ks"), "a/b/c.ks"));
+    expect(str_eq(mr_normalize(a, "a/b/../c.ks"), "a/c.ks"));
+    expect(str_eq(mr_normalize(a, "tests/selfhost/../../selfhost/lexer.ks"), "selfhost/lexer.ks"));
+    // `..` with nothing to pop is kept, so relative paths may escape.
+    expect(str_eq(mr_normalize(a, "../x.ks"), "../x.ks"));
+    expect(str_eq(mr_normalize(a, "a/../../x.ks"), "../x.ks"));
+    // A leading `/` (absolute) is preserved.
+    expect(str_eq(mr_normalize(a, "/r/a/../b.ks"), "/r/b.ks"));
+    expect(str_eq(mr_normalize(a, "./x.ks"), "x.ks"));
+}
+
+test "modres: dir_of and basename split on the last separator" {
+    var a: Allocator = c_allocator();
+    expect(str_eq(mr_dir_of(a, "a/b/c.ks"), "a/b/"));
+    expect(str_eq(mr_dir_of(a, "c.ks"), ""));
+    expect(str_eq(mr_dir_of(a, "/c.ks"), "/"));
+    expect(str_eq(mr_basename("a/b/std"), "std"));
+    expect(str_eq(mr_basename("std.ks"), "std.ks"));
+    expect(str_eq(mr_basename("a/x.ks"), "x.ks"));
 }
 
 // --- test blocks + EmitMode::Test (v0.166) ---------------------------------------------------

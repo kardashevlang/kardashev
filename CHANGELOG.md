@@ -18,6 +18,53 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.167.0] — Self-hosting stage 9: `@import` resolution
+
+The self-hosted pipeline gains the MODULE FLATTENER: `selfhost/modres.ks`
+(495 lines) mirrors `modules::resolve` — the driver now compiles
+multi-file programs. Because the self-hosted AST stores names as SPANS,
+the resolver builds a CONCATENATED virtual source: files load depth-first
+in import order (bases assigned at first read), every span is rebased by
+its file's base and every arena link by the arena base, and the flattened
+item chain is spliced in append order (a file's imported items PRECEDE its
+own, imports erased). All downstream machinery — the detector, the
+sema-intern-order scan, liveness, both emitters — runs unchanged over the
+merged arena.
+
+- Mirrored diagnostics, now part of the byte-compared `ERROR` contract:
+  E0291 (missing import, at the `@import`'s rebased position), E0292
+  (cycle), E0293 (first duplicate top-level name, at the DUPLICATE's
+  rebased position, checked after the flatten), E0294 (an imported file's
+  lex/parse failure, at 0 = `Span::DUMMY`); the root's own lex/parse
+  failures keep their structural 1/2/200/201 codes.
+- `@import("std")` (a `std`/`std.ks` basename naming no readable file —
+  the `.exists()` rule mirrored) is the compiler-EMBEDDED library, far
+  outside the subset: the resolver reports the SKIP verdict `import` at
+  the import's rebased position, at any DFS depth.
+- Documented-and-pinned limits (both differential sides apply the same
+  rule): dedup/cycle keys are lexically normalized paths where Rust
+  canonicalizes (identical on symlink-free trees), and `@readFile` cannot
+  distinguish missing from empty — an EMPTY import target is E0291 (no
+  corpus file has one; a targeted fixture pins the rule).
+
+### Added
+- `selfhost/modres.ks` (the resolver/merger: path normalization, the file
+  registry, the arena/source merge, `check_unique`); `selfhost/cdump.ks`
+  resolves before detecting; the Rust test grew `mirror_resolve` +
+  `detect_flat` (per-file bases) and a new `import_fixtures` differential
+  (14 fresh-tempdir multi-file cases × both modes: flatten chains,
+  diamonds, back references, `..` paths, import-at-end, cycles, missing/
+  empty targets, duplicate names, wrapped sub-file lex/parse errors,
+  root and NESTED std imports).
+- Corpus (705 files, `modres.ks` joined): Program — **86 C byte-identical
+  (90,784 bytes)**, Test — **104 (150,688 bytes)**; `ERROR` agreements 25
+  → **34 per mode** (the s22 resolution fixtures now byte-compare); 548/529
+  `SKIP` agreements; the sema-invalid pins held with NO drift (37 + 1
+  Test-only). The s22 root programs (flatten/diamond/transitive/parent-
+  relative/back-reference/order fixtures) joined the C buckets in both
+  modes; 2 in-language suite tests for the path helpers (45 blocks total).
+- 1,111 tests green across the workspace.
+
 ## [0.166.0] — Self-hosting stage 8: `test` blocks + `EmitMode::Test`
 
 The self-hosted emitter gains its SECOND MODE: `test` blocks are subset
