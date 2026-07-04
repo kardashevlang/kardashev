@@ -1,19 +1,26 @@
-// emit.ks — self-host stages 3–7 (v0.161–v0.165): a C emitter for the
+// emit.ks — self-host stages 3–8 (v0.161–v0.166): a C emitter for the
 // SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
-// `@as` casts and the `s[lo..hi]` slicing view), written in kardashev,
-// mirroring `crates/kardc/src/emit_c.rs` decision for decision so that —
-// for every subset program — the emitted C is BYTE-IDENTICAL to the Rust
-// emitter's `EmitMode::Program` output.
+// `@as` casts, the `s[lo..hi]` slicing view, and `test` blocks), written in
+// kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
+// so that — for every subset program — the emitted C is BYTE-IDENTICAL to
+// the Rust emitter's output in BOTH `EmitMode::Program` and (v0.166)
+// `EmitMode::Test`: the harness of `static int kd_test_<idx>(void)`
+// functions, the name/function-pointer tables, the v0.150
+// `--filter`/`--bench` driver `main`, the statement-level `expect`
+// lowering, and Test-mode liveness (rooted at the test bodies; EVERY
+// function live when there are none).
 //
 // The subset (the "growing subset" of ROADMAP v0.159.0+; v0.161 shipped the
 // scalar slice, v0.162 added strings, v0.163 index writes + the allocator
-// builtins, v0.164 generalized slices to `[]T` and added `@as`, v0.165 adds
-// the slicing view `s[lo..hi]`):
+// builtins, v0.164 generalized slices to `[]T` and added `@as`, v0.165 the
+// slicing view `s[lo..hi]`, v0.166 adds `test` blocks + the Test mode):
 //
 //   - types: `i32`, `i64`, `bool`, `void`, `u8`, `usize`, `Allocator` bare
 //     names, plus `[]T` over the five scalar element types (no other
 //     `?`/`!`/`*`/`[N]`/`Name(..)` forms);
-//   - items: top-level `fn` (non-generic) and top-level `const`;
+//   - items: top-level `fn` (non-generic), top-level `const`, and `test`
+//     blocks (v0.166 — interned/checked in both modes, emitted only by the
+//     Test harness);
 //   - statements: `var`/`const` lets, (compound) name-assignment, the
 //     (compound) INDEX WRITE `s[i] = e` / `s[i] op= e` — a place-assignment
 //     whose place is a DIRECT index (a place whose chain merely passes
@@ -534,27 +541,37 @@ pub const Det = struct {
     }
 };
 
-/// Subset verdict for a parsed module (`root` = the item-chain head). The
-/// FIRST check is for a top-level `fn main` — a module without one cannot be
-/// a Program-mode subset program (the Rust pipeline rejects it as E0150
-/// before emission), reported as `nomain` at position 0.
+/// Subset verdict for a parsed module (`root` = the item-chain head), for
+/// `EmitMode::Program`: the FIRST check is for a top-level `fn main` — a
+/// module without one cannot be a Program-mode subset program (the Rust
+/// pipeline rejects it as E0150 before emission), reported as `nomain` at
+/// position 0. Test blocks are subset items in both modes (v0.166).
 pub fn es_detect(src: []u8, nodes: []Node, root: i32) Det {
+    return es_detect_mode(src, nodes, root, true);
+}
+
+/// The mode-aware verdict: `program_mode = false` (`EmitMode::Test`) drops
+/// the `nomain` gate — Test-mode emission needs no `main` (a module without
+/// test blocks lowers to the trivial harness with EVERY function live).
+pub fn es_detect_mode(src: []u8, nodes: []Node, root: i32, program_mode: bool) Det {
     var d: Det = Det.init(src, nodes);
-    var has_main: bool = false;
-    var cur: i32 = root;
-    while (cur >= 0) {
-        var u: usize = @as(usize, cur);
-        if (nodes[u].kind == ND_FN) {
-            var name: []u8 = src[nodes[u].xoff .. nodes[u].xoff + nodes[u].xlen];
-            if (str_eq(name, "main")) { has_main = true; }
+    if (program_mode) {
+        var has_main: bool = false;
+        var cur0: i32 = root;
+        while (cur0 >= 0) {
+            var u0: usize = @as(usize, cur0);
+            if (nodes[u0].kind == ND_FN) {
+                var name: []u8 = src[nodes[u0].xoff .. nodes[u0].xoff + nodes[u0].xlen];
+                if (str_eq(name, "main")) { has_main = true; }
+            }
+            cur0 = nodes[u0].next;
         }
-        cur = nodes[u].next;
+        if (!has_main) {
+            d.hit("nomain", 0);
+            return d;
+        }
     }
-    if (!has_main) {
-        d.hit("nomain", 0);
-        return d;
-    }
-    cur = root;
+    var cur: i32 = root;
     while (cur >= 0) {
         if (d.found) { return d; }
         var u: usize = @as(usize, cur);
@@ -565,7 +582,9 @@ pub fn es_detect(src: []u8, nodes: []Node, root: i32) Det {
             d.check_type(nodes[u].a);
             d.check_expr(nodes[u].b);
         } else if (k == ND_TEST) {
-            d.hit("test", nodes[u].off);
+            // A `test "name" { … }` block is a subset item (v0.166); its
+            // body is an ordinary statement block.
+            d.check_block(nodes[u].a);
         } else if (k == ND_STRUCT) {
             d.hit("struct", nodes[u].off);
         } else if (k == ND_ENUM) {
@@ -659,6 +678,35 @@ fn es_hex_digit(a: Allocator, sb: *StrBuilder, v: u8) void {
     } else {
         sb.append_byte(a, 97 + (v - 10));
     }
+}
+
+/// `c_escape`: escape decoded bytes for a C double-quoted literal WITHOUT
+/// the surrounding quotes — only `\` `"` `\n` `\t` `\r` are escaped, every
+/// other byte passes through VERBATIM (unlike `c_string_literal`: no hex
+/// escapes, no literal splitting). Used for the harness test-name table
+/// (v0.166, `emit_test_harness`).
+pub fn es_c_escape(a: Allocator, bytes: []u8) []u8 {
+    var sb: StrBuilder = StrBuilder.init(a);
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        var b: u8 = bytes[i];
+        if (b == 92) {
+            sb.append(a, "\\\\");
+        } else if (b == 34) {
+            sb.append(a, "\\\"");
+        } else if (b == 10) {
+            sb.append(a, "\\n");
+        } else if (b == 9) {
+            sb.append(a, "\\t");
+        } else if (b == 13) {
+            sb.append(a, "\\r");
+        } else {
+            sb.append_byte(a, b);
+        }
+    }
+    var s: []u8 = sb.build(a);
+    sb.deinit(a);
+    return s;
 }
 
 /// `c_string_literal`: render decoded bytes as a complete double-quoted C
@@ -786,6 +834,10 @@ pub const Em = struct {
     // and ORDER, which mirror `StructTable::slices()` iteration.
     slices: []i64,
     sl_len: usize,
+    // `EmitMode::Test` (v0.166): swaps the entry-point wiring for the test
+    // harness, roots liveness at the test bodies (every function live when
+    // there are none), and enables the statement-level `expect` lowering.
+    is_test: bool,
 
     fn init(a: Allocator, src: []u8, nodes: []Node, root: i32) Self {
         return Em{
@@ -810,6 +862,7 @@ pub const Em = struct {
             .idx_count = 0,
             .slices = alloc(a, i64, 8),
             .sl_len = 0,
+            .is_test = false,
         };
     }
 
@@ -1940,6 +1993,27 @@ pub const Em = struct {
             self.line(a, "}");
             return d;
         }
+        // In Test mode, `expect(c)` is a statement-level construct returning
+        // a failure code through the deferred-return path (SPEC §4.5):
+        // `if (!(<c>)) { <flush all defers> return 1; }`.
+        if (self.is_test and k == ND_CALL and str_eq(self.xname(n), "expect")) {
+            var earg: i32 = self.nodes[u].a;
+            var ecs: []u8 = "0";
+            if (earg >= 0) { ecs = self.emit_expr(a, earg); }
+            var esb: StrBuilder = StrBuilder.init(a);
+            esb.append(a, "if (!(");
+            esb.append(a, ecs);
+            esb.append(a, ")) {");
+            var esl: []u8 = esb.build(a);
+            esb.deinit(a);
+            self.line(a, esl);
+            self.indent += 1;
+            self.flush_all(a);
+            self.line(a, "return 1;");
+            self.indent -= 1;
+            self.line(a, "}");
+            return false;
+        }
         // An expression statement: `<e>;`.
         var es2: []u8 = self.emit_expr(a, n);
         var sb2: StrBuilder = StrBuilder.init(a);
@@ -2145,15 +2219,40 @@ pub const Em = struct {
         self.collect_calls_expr(a, pend, n);
     }
 
-    /// `live_functions` for the subset: the worklist closure of called names
-    /// rooted at `main`. A name goes live once; going live marks EVERY
-    /// top-level `fn` of that name and walks each of their bodies. The
-    /// synthetic root name `main` is encoded as the (0, 0) span, which
-    /// `pend_text` decodes back to the text `main`.
+    /// `live_functions` for the subset: the worklist closure of called
+    /// names. Roots (SPEC §43.1): `main` in Program mode (the synthetic
+    /// (0, 0) span, which `pend_text` decodes back to the text `main`);
+    /// every `test` block body in Test mode — and a Test-mode module with
+    /// NO test blocks has no root, so EVERY function is live
+    /// (`LiveFns::all_of`). A name goes live once; going live marks EVERY
+    /// top-level `fn` of that name and walks each of their bodies.
     fn compute_live(self: *Self, a: Allocator) void {
         var pend: PendList = PendList.init(a);
         var done: PendList = PendList.init(a);
-        pend.push(a, 0, 0);
+        if (self.is_test) {
+            var any_test: bool = false;
+            var tcur: i32 = self.root;
+            while (tcur >= 0) {
+                var tu: usize = @as(usize, tcur);
+                if (self.nodes[tu].kind == ND_TEST) {
+                    any_test = true;
+                    self.collect_calls_block(a, &pend, self.nodes[tu].a);
+                }
+                tcur = self.nodes[tu].next;
+            }
+            if (!any_test) {
+                // The no-root fallback: mark everything live.
+                var fi: usize = 0;
+                while (fi < self.fn_len) : (fi += 1) {
+                    self.fns[fi].live = true;
+                }
+                pend.deinit(a);
+                done.deinit(a);
+                return;
+            }
+        } else {
+            pend.push(a, 0, 0);
+        }
         while (pend.len > 0) {
             pend.len -= 1;
             var noff: usize = pend.offs[pend.len];
@@ -2424,12 +2523,15 @@ pub const Em = struct {
             }
             cur = self.nodes[u2].next;
         }
-        // Pass 3: fn bodies, in source order.
+        // Pass 3: fn AND test bodies, interleaved in source order (sema
+        // checks both in one item loop; a test body is an ordinary block).
         cur = self.root;
         while (cur >= 0) {
             var u3: usize = @as(usize, cur);
             if (self.nodes[u3].kind == ND_FN) {
                 self.intern_block(a, self.nodes[u3].c);
+            } else if (self.nodes[u3].kind == ND_TEST) {
+                self.intern_block(a, self.nodes[u3].a);
             }
             cur = self.nodes[u3].next;
         }
@@ -2605,8 +2707,144 @@ pub const Em = struct {
         }
     }
 
-    /// The whole `emit_c::emit` pass sequence for `EmitMode::Program`. The
-    /// result is `self.out[0 .. self.out_len]`.
+    // -- the test harness (EmitMode::Test, v0.166) ------------------------------------
+
+    /// `emit_test_fn`: one `static int kd_test_<idx>(void)` per test block.
+    /// Resets the scope machinery and the per-function temp counters —
+    /// EXCEPT `str_count`, which the Rust `emit_test_fn` does not reset (the
+    /// `__kd_str{N}` numbering continues across test functions; mirrored
+    /// quirk). The trailing `return 0;` is unconditional.
+    fn emit_test_fn(self: *Self, a: Allocator, idx: i64, tnode: i32) void {
+        var u: usize = @as(usize, tnode);
+        self.sc_len = 0;
+        self.df_len = 0;
+        self.vt_len = 0;
+        self.idx_count = 0;
+        self.cur_ret = ET_I32;
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "static int kd_test_");
+        sb.append_i64(a, idx);
+        sb.append(a, "(void) {");
+        var s: []u8 = sb.build(a);
+        sb.deinit(a);
+        self.line(a, s);
+        self.indent += 1;
+        self.push_scope(a, false, 0 - 1);
+        var diverged: bool = false;
+        var cur: i32 = self.nodes[@as(usize, self.nodes[u].a)].a;
+        while (cur >= 0) {
+            diverged = self.emit_stmt(a, cur);
+            if (diverged) { break; }
+            cur = self.nodes[@as(usize, cur)].next;
+        }
+        if (!diverged) {
+            self.flush_current(a);
+        }
+        self.pop_scope();
+        self.line(a, "return 0;");
+        self.indent -= 1;
+        self.line(a, "}");
+    }
+
+    /// `emit_test_harness`: every test function (each + a blank), the name
+    /// and function-pointer tables (only when any test exists), a blank,
+    /// then the driver `main` with the v0.150 `--filter`/`--bench` loop.
+    fn emit_test_harness(self: *Self, a: Allocator) void {
+        var total: i64 = 0;
+        var cur: i32 = self.root;
+        while (cur >= 0) {
+            var u: usize = @as(usize, cur);
+            if (self.nodes[u].kind == ND_TEST) {
+                self.emit_test_fn(a, total, cur);
+                self.blank(a);
+                total += 1;
+            }
+            cur = self.nodes[u].next;
+        }
+        if (total > 0) {
+            var nsb: StrBuilder = StrBuilder.init(a);
+            nsb.append(a, "static const char *kd_test_names[] = { ");
+            var first: bool = true;
+            cur = self.root;
+            while (cur >= 0) {
+                var u2: usize = @as(usize, cur);
+                if (self.nodes[u2].kind == ND_TEST) {
+                    if (!first) { nsb.append(a, ", "); }
+                    first = false;
+                    var raw: []u8 = es_decode_str(a, self.src, self.nodes[u2].xoff, self.nodes[u2].xlen);
+                    nsb.append_byte(a, 34);
+                    nsb.append(a, es_c_escape(a, raw));
+                    nsb.append_byte(a, 34);
+                }
+                cur = self.nodes[u2].next;
+            }
+            nsb.append(a, " };");
+            var ns: []u8 = nsb.build(a);
+            nsb.deinit(a);
+            self.line(a, ns);
+            var fsb: StrBuilder = StrBuilder.init(a);
+            fsb.append(a, "static int (*kd_test_fns[])(void) = { ");
+            var i: i64 = 0;
+            while (i < total) : (i += 1) {
+                if (i > 0) { fsb.append(a, ", "); }
+                fsb.append(a, "kd_test_");
+                fsb.append_i64(a, i);
+            }
+            fsb.append(a, " };");
+            var fs: []u8 = fsb.build(a);
+            fsb.deinit(a);
+            self.line(a, fs);
+        }
+        self.blank(a);
+        self.line(a, "int main(int argc, char **argv) {");
+        self.indent += 1;
+        self.line(a, "const char *filter = 0; int bench = 0;");
+        self.line(a, "for (int ai = 1; ai < argc; ai++) {");
+        self.indent += 1;
+        self.line(a, "if (strcmp(argv[ai], \"--bench\") == 0) { bench = 1; }");
+        self.line(a, "else if (strcmp(argv[ai], \"--filter\") == 0) { if (ai + 1 < argc) { filter = argv[++ai]; } }");
+        self.line(a, "else { filter = argv[ai]; }");
+        self.indent -= 1;
+        self.line(a, "}");
+        var tsb: StrBuilder = StrBuilder.init(a);
+        tsb.append(a, "int total = ");
+        tsb.append_i64(a, total);
+        tsb.append(a, ";");
+        var ts: []u8 = tsb.build(a);
+        tsb.deinit(a);
+        self.line(a, ts);
+        self.line(a, "int failures = 0; int ran = 0;");
+        if (total > 0) {
+            self.line(a, "for (int ti = 0; ti < total; ti++) {");
+            self.indent += 1;
+            self.line(a, "if (filter && !strstr(kd_test_names[ti], filter)) { continue; }");
+            self.line(a, "ran++;");
+            self.line(a, "int rc; clock_t t0 = clock();");
+            self.line(a, "rc = kd_test_fns[ti]();");
+            self.line(a, "if (bench) {");
+            self.indent += 1;
+            self.line(a, "double ms = (double)(clock() - t0) * 1000.0 / (double)CLOCKS_PER_SEC;");
+            self.line(a, "fprintf(stderr, \"%s: %.3f ms%s\\n\", kd_test_names[ti], ms, rc == 0 ? \"\" : \" (FAIL)\");");
+            self.indent -= 1;
+            self.line(a, "} else {");
+            self.indent += 1;
+            self.line(a, "fprintf(stderr, \"%s: %s\\n\", rc == 0 ? \"ok\" : \"FAIL\", kd_test_names[ti]);");
+            self.indent -= 1;
+            self.line(a, "}");
+            self.line(a, "if (rc != 0) { failures++; }");
+            self.indent -= 1;
+            self.line(a, "}");
+        }
+        self.line(a, "fprintf(stderr, \"%d/%d tests passed%s\\n\", ran - failures, ran, filter ? \" (filtered)\" : \"\");");
+        self.line(a, "return failures;");
+        self.indent -= 1;
+        self.line(a, "}");
+    }
+
+    /// The whole `emit_c::emit` pass sequence: the shared sections, then
+    /// the mode-specific entry point (`EmitMode::Program` wires `kd_main`;
+    /// `EmitMode::Test` emits the harness). The result is
+    /// `self.out[0 .. self.out_len]`.
     fn run(self: *Self, a: Allocator) void {
         self.collect_signatures(a);
         self.compute_live(a);
@@ -2615,7 +2853,11 @@ pub const Em = struct {
         self.emit_consts(a);
         self.emit_forward_decls(a);
         self.emit_func_defs(a);
-        self.emit_program_main(a);
+        if (self.is_test) {
+            self.emit_test_harness(a);
+        } else {
+            self.emit_program_main(a);
+        }
     }
 };
 
@@ -2674,6 +2916,16 @@ pub const PendList = struct {
 /// yields unspecified — but total — output).
 pub fn es_emit_program(a: Allocator, src: []u8, nodes: []Node, root: i32) []u8 {
     var em: Em = Em.init(a, src, nodes, root);
+    em.run(a);
+    return em.out[0 .. em.out_len];
+}
+
+/// Convenience entry point: emit `EmitMode::Test` C — the test harness —
+/// for a parsed subset module (v0.166). The caller must have run
+/// `es_detect_mode(.., false)` first.
+pub fn es_emit_test(a: Allocator, src: []u8, nodes: []Node, root: i32) []u8 {
+    var em: Em = Em.init(a, src, nodes, root);
+    em.is_test = true;
     em.run(a);
     return em.out[0 .. em.out_len];
 }

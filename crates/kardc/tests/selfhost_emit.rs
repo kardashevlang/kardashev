@@ -1,7 +1,12 @@
-//! Self-host stages 3–7 (v0.161–v0.165): differential test of
+//! Self-host stages 3–8 (v0.161–v0.166): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
-//! SUBSET (with generalized `[]T` slices, `@as` casts and the `s[lo..hi]`
-//! slicing view) written in kardashev — against the Rust reference emitter.
+//! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
+//! slicing view, and — v0.166 — `test` blocks with the full
+//! `EmitMode::Test` harness) written in kardashev — against the Rust
+//! reference emitter. Since v0.166 every corpus file is classified and
+//! compared in BOTH modes: `cdump <file>` prints the Program lowering,
+//! `cdump <file> test` the Test-mode harness (no `nomain` gate; a module
+//! without tests is the trivial harness with EVERY function live).
 //!
 //! `selfhost/cdump.ks` is compiled ONCE (full file-based pipeline + `-O0`
 //! cc build) and then executed on every corpus file; its stdout must be
@@ -116,7 +121,15 @@ const SEMA_INVALID: &[&str] = &[
 
 /// Floor on the number of corpus files whose C is byte-compared: catches a
 /// subset-detector regression that silently skips what used to be compared.
-const MIN_C_COMPARED: usize = 65;
+/// Files that additionally fail sema when classified for `EmitMode::Test`
+/// (v0.166): a module fragment is `nomain`-skipped in Program mode but
+/// reaches sema in Test mode, where its cross-module reference is E0100.
+const SEMA_INVALID_TEST_ONLY: &[&str] = &[
+    "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
+];
+
+const MIN_C_COMPARED_PROGRAM: usize = 70;
+const MIN_C_COMPARED_TEST: usize = 85;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -340,16 +353,21 @@ fn det_fn(f: &Func) -> Option<Hit> {
 }
 
 /// The subset verdict for a parsed module: `None` = in the subset, else the
-/// FIRST unsupported construct. Mirrors `es_detect` in `selfhost/emit.ks`
-/// (which walks the arena in the same order); the differential compares both
-/// the word and the position on every corpus file.
-fn detect_subset(module: &Module) -> Option<Hit> {
-    let has_main = module
-        .items
-        .iter()
-        .any(|it| matches!(it, Item::Func(f) if f.name == "main"));
-    if !has_main {
-        return Some(("nomain", 0));
+/// FIRST unsupported construct. Mirrors `es_detect_mode` in
+/// `selfhost/emit.ks` (which walks the arena in the same order); the
+/// differential compares both the word and the position on every corpus
+/// file, in BOTH modes. `program_mode = false` (`EmitMode::Test`, v0.166)
+/// drops the `nomain` gate; test blocks are subset items in both modes,
+/// their bodies ordinary statement blocks.
+fn detect_subset(module: &Module, program_mode: bool) -> Option<Hit> {
+    if program_mode {
+        let has_main = module
+            .items
+            .iter()
+            .any(|it| matches!(it, Item::Func(f) if f.name == "main"));
+        if !has_main {
+            return Some(("nomain", 0));
+        }
     }
     for item in &module.items {
         let hit = match item {
@@ -359,7 +377,7 @@ fn detect_subset(module: &Module) -> Option<Hit> {
                 .as_ref()
                 .and_then(det_type)
                 .or_else(|| det_expr(&c.value)),
-            Item::Test(t) => Some(("test", t.span.start)),
+            Item::Test(t) => det_block(&t.body),
             Item::Struct(s) => Some(("struct", s.span.start)),
             Item::Enum(e) => Some(("enum", e.span.start)),
             Item::Union(u) => Some(("union", u.span.start)),
@@ -385,8 +403,8 @@ enum Expected {
     SemaInvalid(String),
 }
 
-/// Classify `path` with the Rust pipeline (see the module docs).
-fn rust_expected(path: &Path, src: &str) -> Expected {
+/// Classify `path` with the Rust pipeline for `mode` (see the module docs).
+fn rust_expected(path: &Path, src: &str, mode: EmitMode) -> Expected {
     let tokens = match kardc::lexer::lex(src) {
         Ok(t) => t,
         Err(diags) => {
@@ -411,10 +429,10 @@ fn rust_expected(path: &Path, src: &str) -> Expected {
             return Expected::Bytes(format!("ERROR {} {}\n", code, d.span.start));
         }
     };
-    if let Some((word, pos)) = detect_subset(&module) {
+    if let Some((word, pos)) = detect_subset(&module, mode == EmitMode::Program) {
         return Expected::Bytes(format!("SKIP {} {}\n", word, pos));
     }
-    match kardc::compile_program(path, EmitMode::Program) {
+    match kardc::compile_program(path, mode) {
         Ok(c) => Expected::Bytes(c),
         Err(diags) => Expected::SemaInvalid(diags[0].code.to_string()),
     }
@@ -455,16 +473,22 @@ fn collect_ks(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Run the cdump binary on `input`; assert exit 0 and return its stdout.
-fn run_driver(exe: &Path, input: &Path) -> Result<String, String> {
-    let out = Command::new(exe)
-        .arg(input)
+/// Run the cdump binary on `input` (passing `test` for `EmitMode::Test`);
+/// assert exit 0 and return its stdout.
+fn run_driver(exe: &Path, input: &Path, mode: EmitMode) -> Result<String, String> {
+    let mut cmd = Command::new(exe);
+    cmd.arg(input);
+    if mode == EmitMode::Test {
+        cmd.arg("test");
+    }
+    let out = cmd
         .output()
         .unwrap_or_else(|e| panic!("failed to run cdump on {}: {e}", input.display()));
     if out.status.code() != Some(0) {
         return Err(format!(
-            "{}: cdump exited {:?}\n--- stderr ---\n{}",
+            "{} [{:?}]: cdump exited {:?}\n--- stderr ---\n{}",
             input.display(),
+            mode,
             out.status.code(),
             String::from_utf8_lossy(&out.stderr)
         ));
@@ -472,11 +496,17 @@ fn run_driver(exe: &Path, input: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Diff the driver's stdout for `input` against the Rust classification.
-/// `Ok(Some(bytes))` = compared (that many bytes identical); `Ok(None)` =
-/// a declared-invalid file (exit checked, output uncompared).
-fn diff_one(exe: &Path, input: &Path, expected: &Expected) -> Result<Option<usize>, String> {
-    let got = run_driver(exe, input)?;
+/// Diff the driver's stdout for `input` in `mode` against the Rust
+/// classification. `Ok(Some(bytes))` = compared (that many bytes
+/// identical); `Ok(None)` = a declared-invalid file (exit checked, output
+/// uncompared).
+fn diff_one(
+    exe: &Path,
+    input: &Path,
+    expected: &Expected,
+    mode: EmitMode,
+) -> Result<Option<usize>, String> {
+    let got = run_driver(exe, input, mode)?;
     let want = match expected {
         Expected::Bytes(b) => b,
         Expected::SemaInvalid(_) => return Ok(None),
@@ -489,8 +519,9 @@ fn diff_one(exe: &Path, input: &Path, expected: &Expected) -> Result<Option<usiz
             i += 1;
         }
         return Err(format!(
-            "{}: output mismatch at line {} — rust `{}` vs selfhost `{}` ({} vs {} lines)",
+            "{} [{:?}]: output mismatch at line {} — rust `{}` vs selfhost `{}` ({} vs {} lines)",
             input.display(),
+            mode,
             i + 1,
             e.get(i).unwrap_or(&"<eof>"),
             g.get(i).unwrap_or(&"<eof>"),
@@ -526,77 +557,91 @@ fn selfhost_emit_differential_corpus() {
     );
 
     let mut failures: Vec<String> = Vec::new();
-    let mut sema_invalid_seen: BTreeSet<String> = BTreeSet::new();
-    let mut n_error = 0usize;
-    let mut n_skip = 0usize;
-    let mut n_c = 0usize;
-    let mut c_bytes = 0usize;
-    for file in &corpus {
-        let src = match std::fs::read_to_string(file) {
-            Ok(s) => s,
-            Err(e) => {
-                failures.push(format!("{}: unreadable corpus file: {e}", file.display()));
-                continue;
-            }
-        };
-        let expected = rust_expected(file, &src);
-        match &expected {
-            Expected::Bytes(b) if b.starts_with("ERROR ") => n_error += 1,
-            Expected::Bytes(b) if b.starts_with("SKIP ") => n_skip += 1,
-            Expected::Bytes(_) => {}
-            Expected::SemaInvalid(_) => {
-                let rel = file
-                    .strip_prefix(&root)
-                    .expect("corpus file under repo root")
-                    .display()
-                    .to_string();
-                sema_invalid_seen.insert(rel);
-            }
-        }
-        match diff_one(&exe, file, &expected) {
-            Ok(Some(bytes)) => {
-                if matches!(&expected, Expected::Bytes(b) if !b.starts_with("ERROR ") && !b.starts_with("SKIP "))
-                {
-                    n_c += 1;
-                    c_bytes += bytes;
+    for (mode, declared_list, floor) in [
+        (EmitMode::Program, SEMA_INVALID.to_vec(), MIN_C_COMPARED_PROGRAM),
+        (
+            EmitMode::Test,
+            SEMA_INVALID
+                .iter()
+                .chain(SEMA_INVALID_TEST_ONLY.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            MIN_C_COMPARED_TEST,
+        ),
+    ] {
+        let mut sema_invalid_seen: BTreeSet<String> = BTreeSet::new();
+        let mut n_error = 0usize;
+        let mut n_skip = 0usize;
+        let mut n_c = 0usize;
+        let mut c_bytes = 0usize;
+        for file in &corpus {
+            let src = match std::fs::read_to_string(file) {
+                Ok(s) => s,
+                Err(e) => {
+                    failures.push(format!("{}: unreadable corpus file: {e}", file.display()));
+                    continue;
+                }
+            };
+            let expected = rust_expected(file, &src, mode);
+            match &expected {
+                Expected::Bytes(b) if b.starts_with("ERROR ") => n_error += 1,
+                Expected::Bytes(b) if b.starts_with("SKIP ") => n_skip += 1,
+                Expected::Bytes(_) => {}
+                Expected::SemaInvalid(_) => {
+                    let rel = file
+                        .strip_prefix(&root)
+                        .expect("corpus file under repo root")
+                        .display()
+                        .to_string();
+                    sema_invalid_seen.insert(rel);
                 }
             }
-            Ok(None) => {}
-            Err(msg) => failures.push(msg),
+            match diff_one(&exe, file, &expected, mode) {
+                Ok(Some(bytes)) => {
+                    if matches!(&expected, Expected::Bytes(b) if !b.starts_with("ERROR ") && !b.starts_with("SKIP "))
+                    {
+                        n_c += 1;
+                        c_bytes += bytes;
+                    }
+                }
+                Ok(None) => {}
+                Err(msg) => failures.push(msg),
+            }
         }
+
+        // The sema-invalid remainder is pinned exactly PER MODE: a drift in
+        // either direction (a new uncompared file, or a file that became
+        // comparable) must update the lists consciously.
+        let declared: BTreeSet<String> = declared_list.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            sema_invalid_seen, declared,
+            "[{mode:?}] subset-shaped sema-invalid files drifted:\n  observed only: {:?}\n  declared only: {:?}",
+            sema_invalid_seen.difference(&declared).collect::<Vec<_>>(),
+            declared.difference(&sema_invalid_seen).collect::<Vec<_>>()
+        );
+        assert!(
+            n_c >= floor,
+            "[{mode:?}] only {} corpus files were C-compared (floor {floor}) — did the subset detector regress?",
+            n_c
+        );
+        println!(
+            "selfhost emit differential [{:?}]: {} files — {} C byte-identical ({} bytes), {} SKIP-agreed, {} ERROR-agreed, {} declared sema-invalid (exit-checked)",
+            mode,
+            corpus.len(),
+            n_c,
+            c_bytes,
+            n_skip,
+            n_error,
+            sema_invalid_seen.len()
+        );
     }
     let _ = std::fs::remove_file(&exe);
 
-    // The sema-invalid remainder is pinned exactly: a drift in either
-    // direction (a new uncompared file, or a file that became comparable)
-    // must update SEMA_INVALID consciously.
-    let declared: BTreeSet<String> = SEMA_INVALID.iter().map(|s| s.to_string()).collect();
-    assert_eq!(
-        sema_invalid_seen, declared,
-        "subset-shaped sema-invalid files drifted from SEMA_INVALID:\n  observed only: {:?}\n  declared only: {:?}",
-        sema_invalid_seen.difference(&declared).collect::<Vec<_>>(),
-        declared.difference(&sema_invalid_seen).collect::<Vec<_>>()
-    );
-    assert!(
-        n_c >= MIN_C_COMPARED,
-        "only {} corpus files were C-compared (floor {MIN_C_COMPARED}) — did the subset detector regress?",
-        n_c
-    );
     assert!(
         failures.is_empty(),
-        "{} of {} corpus files mismatched the Rust emitter:\n{}",
+        "{} corpus comparisons mismatched the Rust emitter:\n{}",
         failures.len(),
-        corpus.len(),
         failures.join("\n")
-    );
-    println!(
-        "selfhost emit differential: {} files — {} C byte-identical ({} bytes), {} SKIP-agreed, {} ERROR-agreed, {} declared sema-invalid (exit-checked)",
-        corpus.len(),
-        n_c,
-        c_bytes,
-        n_skip,
-        n_error,
-        sema_invalid_seen.len()
     );
 }
 
@@ -847,16 +892,20 @@ fn selfhost_emit_differential_targeted_inputs() {
     for (tag, src) in cases {
         let input = temp_path(&format!("cerr_{tag}"));
         std::fs::write(&input, src).expect("write temp emit input");
-        let expected = rust_expected(&input, src);
-        if let Expected::SemaInvalid(code) = &expected {
-            failures.push(format!(
-                "[{tag}] targeted input is sema-invalid ({code}) — every case must classify as ERROR, SKIP or valid C"
-            ));
-            let _ = std::fs::remove_file(&input);
-            continue;
-        }
-        if let Err(msg) = diff_one(&exe, &input, &expected) {
-            failures.push(format!("[{tag}] {msg}"));
+        // Every targeted case is checked in BOTH modes (v0.166): the same
+        // source must byte-agree as a Program lowering and as a Test-mode
+        // harness (with its distinct liveness and expect lowering).
+        for mode in [EmitMode::Program, EmitMode::Test] {
+            let expected = rust_expected(&input, src, mode);
+            if let Expected::SemaInvalid(code) = &expected {
+                failures.push(format!(
+                    "[{tag} {mode:?}] targeted input is sema-invalid ({code}) — every case must classify as ERROR, SKIP or valid C"
+                ));
+                continue;
+            }
+            if let Err(msg) = diff_one(&exe, &input, &expected, mode) {
+                failures.push(format!("[{tag}] {msg}"));
+            }
         }
         let _ = std::fs::remove_file(&input);
     }

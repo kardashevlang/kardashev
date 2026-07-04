@@ -1,6 +1,6 @@
-// cdump.ks — driver for the self-hosted subset C emitter (v0.161).
+// cdump.ks — driver for the self-hosted subset C emitter (v0.161–v0.166).
 //
-//   kard run selfhost/cdump.ks -- <file.ks>
+//   kard run selfhost/cdump.ks -- <file.ks> [test]
 //
 // Reads the file named by the first program argument, lexes it with
 // `selfhost/lexer.ks`, parses it with `selfhost/parser.ks`, and then prints
@@ -11,16 +11,18 @@
 //                          200/201 = E0200/E0201; pos = first diagnostic);
 //
 //   SKIP <word> <pos>      the module parses but uses a construct outside
-//                          the v0.161 scalar subset; <word> names the FIRST
-//                          unsupported construct found by `es_detect`'s
-//                          fixed depth-first walk and <pos> is its byte
-//                          offset (`nomain 0` for a module with no `fn
-//                          main`);
+//                          the subset; <word> names the FIRST unsupported
+//                          construct found by `es_detect`'s fixed
+//                          depth-first walk and <pos> is its byte offset
+//                          (`nomain 0` — Program mode only — for a module
+//                          with no `fn main`);
 //
-//   <C source>             the module is in the subset: the full
-//                          `EmitMode::Program` C lowering from
-//                          `selfhost/emit.ks`, byte-identical to the Rust
-//                          emitter's output for every sema-valid program.
+//   <C source>             the module is in the subset: the full C
+//                          lowering from `selfhost/emit.ks`, byte-identical
+//                          to the Rust emitter's output for every
+//                          sema-valid program — `EmitMode::Program` by
+//                          default, `EmitMode::Test` (the test harness)
+//                          when the second argument is `test` (v0.166).
 //
 // The format contract lives in `crates/kardc/tests/selfhost_emit.rs`, whose
 // Rust reference must produce these exact bytes (the C by running the real
@@ -63,6 +65,8 @@ fn cd_skip(a: Allocator, word: []u8, pos: usize) void {
 pub fn main() i32 {
     var a: Allocator = c_allocator();
     var path: []u8 = @arg(a, 1);
+    var mode: []u8 = @arg(a, 2);
+    var testmode: bool = str_eq(mode, "test");
     var src: []u8 = @readFile(a, path);
 
     // Lex everything up front, mirroring astdump: a lex error is the whole
@@ -86,15 +90,21 @@ pub fn main() i32 {
         return 0;
     }
 
-    // An empty module (`items < 0`) has no `fn main`, so `es_detect` reports
-    // it as `nomain` like any other main-less module.
-    var det: Det = es_detect(src, p.nodes, items);
+    // In Program mode an empty module (`items < 0`) has no `fn main`, so
+    // `es_detect` reports it as `nomain` like any other main-less module;
+    // Test mode drops that gate (an empty module is the trivial harness).
+    var det: Det = es_detect_mode(src, p.nodes, items, !testmode);
     if (det.found) {
         cd_skip(a, det.word, det.pos);
         return 0;
     }
 
-    var c: []u8 = es_emit_program(a, src, p.nodes, items);
+    var c: []u8 = "";
+    if (testmode) {
+        c = es_emit_test(a, src, p.nodes, items);
+    } else {
+        c = es_emit_program(a, src, p.nodes, items);
+    }
     // The C text is newline-terminated per line; `print` appends one more,
     // so print everything except the final newline.
     if (c.len > 0) {
