@@ -1,6 +1,7 @@
-// emit.ks — self-host stages 3–8 (v0.161–v0.166): a C emitter for the
+// emit.ks — self-host stages 3–10 (v0.161–v0.168): a C emitter for the
 // SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
-// `@as` casts, the `s[lo..hi]` slicing view, and `test` blocks), written in
+// `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, and — v0.168 —
+// fixed arrays `[N]T` with array literals and `for` loops), written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
 // the Rust emitter's output in BOTH `EmitMode::Program` and (v0.166)
@@ -13,33 +14,51 @@
 // The subset (the "growing subset" of ROADMAP v0.159.0+; v0.161 shipped the
 // scalar slice, v0.162 added strings, v0.163 index writes + the allocator
 // builtins, v0.164 generalized slices to `[]T` and added `@as`, v0.165 the
-// slicing view `s[lo..hi]`, v0.166 adds `test` blocks + the Test mode):
+// slicing view `s[lo..hi]`, v0.166 `test` blocks + the Test mode, v0.167
+// `@import` resolution (in `modres.ks`), v0.168 adds fixed arrays `[N]T`
+// with literal sizes, array literals `[N]T{ … }`, and unlabeled `for`):
 //
 //   - types: `i32`, `i64`, `bool`, `void`, `u8`, `usize`, `Allocator` bare
-//     names, plus `[]T` over the five scalar element types (no other
-//     `?`/`!`/`*`/`[N]`/`Name(..)` forms);
+//     names, plus `[]T` slices AND `[N]T` fixed arrays (literal `N` only —
+//     a comptime-parameter size stays out) over the five scalar element
+//     types (no other `?`/`!`/`*`/`Name(..)` forms);
 //   - items: top-level `fn` (non-generic), top-level `const`, and `test`
 //     blocks (v0.166 — interned/checked in both modes, emitted only by the
 //     Test harness);
 //   - statements: `var`/`const` lets, (compound) name-assignment, the
 //     (compound) INDEX WRITE `s[i] = e` / `s[i] op= e` — a place-assignment
 //     whose place is a DIRECT index (a place whose chain merely passes
-//     through an index, like `s[i].f` or `s[i][j]`, stays out) — `if`/
-//     `else if`/`else`, `while` with continue-clause, unlabeled `break`/
+//     through an index, like `s[i].f` or `s[i][j]`, stays out; the base
+//     may be a slice OR an array, the array bound checked against its
+//     CONSTANT length) — `if`/`else if`/`else`, `while` with
+//     continue-clause, unlabeled `for` over an array/slice value in both
+//     capture forms (`|x|` and `, 0..) |x, i|`, lowered through the
+//     `__kd_for{N}` snapshot temp + `__kd_fi{N}` counter with `continue`
+//     stepping the counter first — see `emit_for`), unlabeled `break`/
 //     `continue`, `defer`, `return`, bare blocks, expression statements;
 //   - expressions: integer/bool/STRING literals, names, unary `-`/`!`/`~`,
 //     the full binary ladder (arithmetic, comparison, `and`/`or`, bitwise,
 //     shifts), free-function calls, `print` (integers and `[]u8` strings),
 //     `expect`, `comptime` folds, `@as(T, e)` casts over the subset type
-//     names, `.len` on a slice, the read index `s[i]`, the slicing view
-//     `s[lo..hi]` (a `{ptr, len}` view with the bounds check folded into a
-//     `_Noreturn` conditional — base/lo/hi re-spliced textually, exactly
-//     like the Rust format string), and the allocator builtins
-//     `c_allocator()` / `alloc(a, T, n)` / `free(a, s)`.
+//     names, `.len` on a slice (runtime field) or array (folds to the
+//     constant count), the read index `s[i]` (slice getter or array
+//     `_get`), array literals `[N]T{ … }` (a C compound literal; the empty
+//     one is `{0}`), the slicing view `s[lo..hi]` over slices AND arrays
+//     (a `{ptr, len}` view with the bounds check folded into a `_Noreturn`
+//     conditional — base/lo/hi re-spliced textually, exactly like the Rust
+//     format string; an array base reads `.data` and bounds against the
+//     constant length), and the allocator builtins `c_allocator()` /
+//     `alloc(a, T, n)` / `free(a, s)`.
 //
 // v0.164's load-bearing piece: the typedef section carries one
 // `kd_slice_<tag>` block per interned slice IN SEMA'S FIRST-INTERN ORDER —
 // reproduced here by replaying sema's walk (see the intern-scan section).
+// v0.168 doubles it: `kd_arr_<tag>_<N>` blocks (typedef + `_get` + `_at`,
+// storage `max(N, 1)`) for every interned ARRAY come first — the Rust
+// dependency walk visits arrays before slices — each table in its own
+// first-intern order, and the interning replay is now TYPE-AWARE (a
+// `for` elem binding or an array-base `s[lo..hi]` interns the element
+// type at the point sema resolves it, so the scan carries scopes).
 //
 // Everything else is OUT of the subset. `es_detect` walks the AST in a fixed
 // depth-first order and reports the FIRST unsupported construct as a
@@ -120,20 +139,27 @@ pub const ET_ALLOC: i64 = 8;
 
 // Slice types are a code FAMILY (v0.164): `ET_SLICE_BASE + <elem code>`,
 // one code per element type. `[]u8` keeps a named constant since the string
-// machinery pins it specifically.
+// machinery pins it specifically. Fixed arrays (v0.168) are a second
+// family: `ET_ARR_BASE + <index into the emitter's interned-array table>`
+// (an `(elem, len)` pair cannot pack into a flat code range).
 pub const ET_SLICE_BASE: i64 = 100;
 pub const ET_SLICE_U8: i64 = 105;
+pub const ET_ARR_BASE: i64 = 10000;
 
 pub fn et_slice_of(elem: i64) i64 {
     return ET_SLICE_BASE + elem;
 }
 
 pub fn et_is_slice(t: i64) bool {
-    return t >= ET_SLICE_BASE;
+    return t >= ET_SLICE_BASE and t < ET_ARR_BASE;
 }
 
 pub fn et_slice_elem(t: i64) i64 {
     return t - ET_SLICE_BASE;
+}
+
+pub fn et_is_arr(t: i64) bool {
+    return t >= ET_ARR_BASE;
 }
 
 /// `StructTable::slice_c_name` over the subset: `kd_slice_<type_mangle(elem)>`
@@ -271,16 +297,18 @@ pub const Det = struct {
         self.pos = pos;
     }
 
-    /// A type reference: any composite form other than a slice is out; a
-    /// slice must be exactly `[]u8`; a bare base name must be one of the six
-    /// subset spellings. (`@This()` carries no source name; it reports
+    /// A type reference: composite forms other than a slice or a
+    /// literal-length array are out; `[]T` (v0.164) and `[N]T` (v0.168)
+    /// range over the five scalar element types; a bare base name must be
+    /// a subset spelling. (`@This()` carries no source name; it reports
     /// `type-name` exactly like the Rust mirror, whose synthesized name
-    /// `Self` is not a subset spelling — sliced or not.)
+    /// `Self` is not a subset spelling. A `[n]T` comptime-parameter length
+    /// is generics territory — `type-form`.)
     fn check_type(self: *Self, n: i32) void {
         if (self.found or n < 0) { return; }
         var u: usize = @as(usize, n);
         var fl: i64 = self.nodes[u].flags;
-        var forms: i64 = F_OPT | F_ERR | F_PTR | F_ARRLIT | F_ARRPARAM | F_ERRSET | F_APP | F_ESETTHIS;
+        var forms: i64 = F_OPT | F_ERR | F_PTR | F_ARRPARAM | F_ERRSET | F_APP | F_ESETTHIS;
         if ((fl & forms) != 0) {
             self.hit("type-form", self.nodes[u].off);
             return;
@@ -290,8 +318,8 @@ pub const Det = struct {
             return;
         }
         var name: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
-        if ((fl & F_SLICE) != 0) {
-            // `[]T` over the five scalar element types (v0.164).
+        if ((fl & F_ARRLIT) != 0 or (fl & F_SLICE) != 0) {
+            // `[N]T` / `[]T` over the five scalar element types.
             if (!et_is_slice_elem(et_from_name(name))) {
                 self.hit("type-name", self.nodes[u].off);
             }
@@ -422,7 +450,13 @@ pub const Det = struct {
         if (k == ND_UNWRAP) { self.hit("unwrap", off); return; }
         if (k == ND_ERRLIT) { self.hit("error-lit", off); return; }
         if (k == ND_ENUMLIT) { self.hit("enum-lit", off); return; }
-        if (k == ND_ALIT) { self.hit("array-lit", off); return; }
+        if (k == ND_ALIT) {
+            // An array literal `[N]T{ … }` is in the subset (v0.168): its
+            // `[N]T` reference, then the elements, in order.
+            self.check_type(self.nodes[u].a);
+            self.check_expr_list(self.nodes[u].b);
+            return;
+        }
         if (k == ND_SLICEX) {
             // The slicing view `base[lo..hi]` is in the subset (v0.165);
             // base, lo and hi are ordinary subset expressions.
@@ -503,7 +537,15 @@ pub const Det = struct {
             self.check_block(self.nodes[u].c);
             return;
         }
-        if (k == ND_FOR) { self.hit("for", off); return; }
+        if (k == ND_FOR) {
+            // `for (iter) |elem| { … }` / `for (iter, 0..) |elem, i| { … }`
+            // is in the subset (v0.168); a LABELED `for` stays out. The
+            // iterable, then the body.
+            if ((fl & F_LABEL) != 0) { self.hit("label", off); return; }
+            self.check_expr(self.nodes[u].a);
+            self.check_block(self.nodes[u].b);
+            return;
+        }
         if (k == ND_BREAK or k == ND_CONTINUE) {
             if ((fl & F_LABEL) != 0) { self.hit("label", off); }
             return;
@@ -766,6 +808,9 @@ pub fn es_c_string_literal(a: Allocator, bytes: []u8) []u8 {
 pub const EmScope = struct {
     is_loop: bool,
     cont: i32,
+    // The `for` counter whose `__kd_fi{N} += 1;` is this loop scope's raw
+    // continue-clause (`Scope::cont_raw`, SPEC §29.2); -1 = none.
+    raw_fi: i64,
     dstart: i64,
     vstart: i64,
 };
@@ -834,6 +879,16 @@ pub const Em = struct {
     // and ORDER, which mirror `StructTable::slices()` iteration.
     slices: []i64,
     sl_len: usize,
+    // The interned ARRAY (elem, len) pairs, in sema's first-intern order
+    // (v0.168) — the `StructTable::array_info` mirror. Array type codes
+    // are `ET_ARR_BASE + <index>` into these parallel tables. In emit's
+    // dependency-ordered typedef walk, arrays precede slices.
+    ar_elem: []i64,
+    ar_len_: []i64,
+    ar_count: usize,
+    // Monotonic counter for the `__kd_for{N}`/`__kd_fi{N}` loop temporaries
+    // (`Emitter::for_counter`), reset per function AND per test body.
+    for_count: i64,
     // `EmitMode::Test` (v0.166): swaps the entry-point wiring for the test
     // harness, roots liveness at the test bodies (every function live when
     // there are none), and enables the statement-level `expect` lowering.
@@ -862,8 +917,71 @@ pub const Em = struct {
             .idx_count = 0,
             .slices = alloc(a, i64, 8),
             .sl_len = 0,
+            .ar_elem = alloc(a, i64, 8),
+            .ar_len_ = alloc(a, i64, 8),
+            .ar_count = 0,
+            .for_count = 0,
             .is_test = false,
         };
+    }
+
+    // -- the interned-array table (the `array_info` mirror, v0.168) -------------
+
+    /// `intern_array`: dedup-append of an `(elem, len)` pair; returns the
+    /// array TYPE CODE (`ET_ARR_BASE + index`).
+    fn arr_intern(self: *Self, a: Allocator, elem: i64, alen: i64) i64 {
+        var i: usize = 0;
+        while (i < self.ar_count) : (i += 1) {
+            if (self.ar_elem[i] == elem and self.ar_len_[i] == alen) {
+                return ET_ARR_BASE + @as(i64, i);
+            }
+        }
+        if (self.ar_count == self.ar_elem.len) {
+            var ge: []i64 = alloc(a, i64, self.ar_elem.len * 2);
+            var gl: []i64 = alloc(a, i64, self.ar_len_.len * 2);
+            var j: usize = 0;
+            while (j < self.ar_count) : (j += 1) {
+                ge[j] = self.ar_elem[j];
+                gl[j] = self.ar_len_[j];
+            }
+            free(a, self.ar_elem);
+            free(a, self.ar_len_);
+            self.ar_elem = ge;
+            self.ar_len_ = gl;
+        }
+        self.ar_elem[self.ar_count] = elem;
+        self.ar_len_[self.ar_count] = alen;
+        self.ar_count += 1;
+        return ET_ARR_BASE + @as(i64, self.ar_count) - 1;
+    }
+
+    /// The element type / length of an interned array code.
+    fn arr_elem_of(self: *Self, t: i64) i64 {
+        return self.ar_elem[@as(usize, t - ET_ARR_BASE)];
+    }
+
+    fn arr_len_of(self: *Self, t: i64) i64 {
+        return self.ar_len_[@as(usize, t - ET_ARR_BASE)];
+    }
+
+    /// `array_c_name`: `kd_arr_<type_mangle(elem)>_<N>` (built fresh — the
+    /// length makes a static table impossible).
+    fn arr_c_name(self: *Self, a: Allocator, t: i64) []u8 {
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "kd_arr_");
+        sb.append(a, et_c_name(self.arr_elem_of(t)));
+        sb.append(a, "_");
+        sb.append_i64(a, self.arr_len_of(t));
+        var s: []u8 = sb.build(a);
+        sb.deinit(a);
+        return s;
+    }
+
+    /// `Emitter::cty_of` with the array family included: arrays spell
+    /// through the table, everything else through `et_c_name`.
+    fn cty_of(self: *Self, a: Allocator, t: i64) []u8 {
+        if (et_is_arr(t)) { return self.arr_c_name(a, t); }
+        return et_c_name(t);
     }
 
     // -- raw output -----------------------------------------------------------
@@ -908,7 +1026,7 @@ pub const Em = struct {
 
     // -- stack growth -----------------------------------------------------------
 
-    fn push_scope(self: *Self, a: Allocator, is_loop: bool, cont: i32) void {
+    fn push_scope(self: *Self, a: Allocator, is_loop: bool, cont: i32, raw_fi: i64) void {
         if (self.sc_len == self.scopes.len) {
             var grown: []EmScope = alloc(a, EmScope, self.scopes.len * 2);
             var i: usize = 0;
@@ -919,6 +1037,7 @@ pub const Em = struct {
         self.scopes[self.sc_len] = EmScope{
             .is_loop = is_loop,
             .cont = cont,
+            .raw_fi = raw_fi,
             .dstart = @as(i64, self.df_len),
             .vstart = @as(i64, self.vt_len),
         };
@@ -1026,7 +1145,23 @@ pub const Em = struct {
     /// A bare name goes through `from_name`, else the `Void` fallback
     /// (struct/enum/... paths are empty in the subset).
     fn resolve_ty(self: *Self, n: i32) i64 {
-        if ((self.nodes[@as(usize, n)].flags & F_SLICE) != 0) {
+        var u: usize = @as(usize, n);
+        if ((self.nodes[u].flags & F_ARRLIT) != 0) {
+            // `[N]T` maps back to the interned array (the scan interned
+            // every written one); the miss fallback mirrors the Rust
+            // `unwrap_or(base)` (base = the element, `Void` if unknown).
+            var ae: i64 = et_from_name(self.xname(n));
+            if (ae == ET_NONE) { return ET_VOID; }
+            var alen: i64 = self.nodes[u].val;
+            var i: usize = 0;
+            while (i < self.ar_count) : (i += 1) {
+                if (self.ar_elem[i] == ae and self.ar_len_[i] == alen) {
+                    return ET_ARR_BASE + @as(i64, i);
+                }
+            }
+            return ae;
+        }
+        if ((self.nodes[u].flags & F_SLICE) != 0) {
             var e: i64 = et_from_name(self.xname(n));
             if (e == ET_NONE) { return ET_VOID; }
             return et_slice_of(e);
@@ -1040,8 +1175,25 @@ pub const Em = struct {
     /// directly (an unresolvable element falls back through the base's
     /// `int64_t`, mirroring the Rust cty base fallback); a bare name goes
     /// through `from_name`, else the `int64_t` fallback.
-    fn cty(self: *Self, n: i32) []u8 {
-        if ((self.nodes[@as(usize, n)].flags & F_SLICE) != 0) {
+    fn cty(self: *Self, a: Allocator, n: i32) []u8 {
+        var u: usize = @as(usize, n);
+        if ((self.nodes[u].flags & F_ARRLIT) != 0) {
+            // `kd_arr_<type_mangle(base)>_<N>` spelled directly; an
+            // unresolvable element goes through the cty base fallback
+            // (`int64_t`), mirroring the Rust arm.
+            var ae: i64 = et_from_name(self.xname(n));
+            var tag: []u8 = "int64_t";
+            if (ae != ET_NONE) { tag = et_c_name(ae); }
+            var sb: StrBuilder = StrBuilder.init(a);
+            sb.append(a, "kd_arr_");
+            sb.append(a, tag);
+            sb.append(a, "_");
+            sb.append_i64(a, self.nodes[u].val);
+            var s: []u8 = sb.build(a);
+            sb.deinit(a);
+            return s;
+        }
+        if ((self.nodes[u].flags & F_SLICE) != 0) {
             var e: i64 = et_from_name(self.xname(n));
             if (e == ET_NONE) { return "kd_slice_int64_t"; }
             return et_slice_c_name(et_slice_of(e));
@@ -1231,24 +1383,34 @@ pub const Em = struct {
             return ET_NONE;
         }
         if (k == ND_FIELD) {
-            // `s.len` on a slice is a `usize`; anything else is untypeable
-            // here (an untyped base propagates its `None`).
+            // `.len` is a `usize` on arrays (a compile-time constant) and
+            // slices alike; anything else is untypeable here.
             var bt: i64 = self.type_of_expr(self.nodes[u].a);
-            if (et_is_slice(bt) and str_eq(self.xname(n), "len")) { return ET_USIZE; }
+            if (str_eq(self.xname(n), "len")) {
+                if (et_is_arr(bt) or et_is_slice(bt)) { return ET_USIZE; }
+            }
             return ET_NONE;
         }
         if (k == ND_INDEX) {
-            // `s[i]` yields the slice's element type.
+            // `a[i]` / `s[i]` yields the element type.
             var bt2: i64 = self.type_of_expr(self.nodes[u].a);
+            if (et_is_arr(bt2)) { return self.arr_elem_of(bt2); }
             if (et_is_slice(bt2)) { return et_slice_elem(bt2); }
             return ET_NONE;
         }
         if (k == ND_SLICEX) {
-            // `base[lo..hi]` yields `[]T` over the base's element — for a
-            // slice base, the base's own slice type (the array arm cannot
-            // appear in the subset).
+            // `base[lo..hi]` yields `[]T` over the base's element — the
+            // base's own slice type for a slice base, the interned
+            // `[]elem` for an array base (v0.168).
             var bt3: i64 = self.type_of_expr(self.nodes[u].a);
+            if (et_is_arr(bt3)) { return et_slice_of(self.arr_elem_of(bt3)); }
             if (et_is_slice(bt3)) { return bt3; }
+            return ET_NONE;
+        }
+        if (k == ND_ALIT) {
+            // `[N]T{ … }` has the array type of its full `elem` reference.
+            var at: i64 = self.resolve_ty(self.nodes[u].a);
+            if (et_is_arr(at)) { return at; }
             return ET_NONE;
         }
         return ET_NONE;
@@ -1344,9 +1506,21 @@ pub const Em = struct {
         if (k == ND_FIELD) {
             var fname: []u8 = self.xname(n);
             if (str_eq(fname, "len")) {
-                // `s.len` on a slice → the runtime `.len` field (SPEC §15.2;
-                // the array arm cannot appear in the subset).
-                var bt: i64 = self.type_of_expr(self.nodes[u].a);
+                // `a.len` on an array → the compile-time length as a
+                // `usize` constant (SPEC §14.3) — checked BEFORE the slice
+                // arm, exactly as in Rust.
+                var bta: i64 = self.type_of_expr(self.nodes[u].a);
+                if (et_is_arr(bta)) {
+                    var sba: StrBuilder = StrBuilder.init(a);
+                    sba.append(a, "((uintptr_t)");
+                    sba.append_i64(a, self.arr_len_of(bta));
+                    sba.append(a, ")");
+                    var saa: []u8 = sba.build(a);
+                    sba.deinit(a);
+                    return saa;
+                }
+                // `s.len` on a slice → the runtime `.len` field (SPEC §15.2).
+                var bt: i64 = bta;
                 if (et_is_slice(bt)) {
                     var b: []u8 = self.emit_expr(a, self.nodes[u].a);
                     var sb: StrBuilder = StrBuilder.init(a);
@@ -1376,7 +1550,14 @@ pub const Em = struct {
             var i3: []u8 = self.emit_expr(a, self.nodes[u].b);
             var bt3: i64 = self.type_of_expr(self.nodes[u].a);
             var sb3: StrBuilder = StrBuilder.init(a);
-            if (et_is_slice(bt3)) {
+            if (et_is_arr(bt3)) {
+                sb3.append(a, self.arr_c_name(a, bt3));
+                sb3.append(a, "_get(");
+                sb3.append(a, b3);
+                sb3.append(a, ", ");
+                sb3.append(a, i3);
+                sb3.append(a, ")");
+            } else if (et_is_slice(bt3)) {
                 sb3.append(a, et_slice_c_name(bt3));
                 sb3.append(a, "_get(");
                 sb3.append(a, b3);
@@ -1395,6 +1576,56 @@ pub const Em = struct {
             sb3.deinit(a);
             return s3;
         }
+        if (k == ND_ALIT) {
+            // `[N]T{ e0, e1, … }` → `((kd_arr_<tag>_<N>){ .data = { … } })`
+            // (SPEC §14.3); a zero-element literal zero-initialises; an
+            // unresolvable literal type takes the Rust brace-init fallback.
+            var alt: i64 = self.resolve_ty(self.nodes[u].a);
+            if (et_is_arr(alt)) {
+                var acn: []u8 = self.arr_c_name(a, alt);
+                var e0: i32 = self.nodes[u].b;
+                if (e0 < 0) {
+                    var sbz: StrBuilder = StrBuilder.init(a);
+                    sbz.append(a, "((");
+                    sbz.append(a, acn);
+                    sbz.append(a, "){0})");
+                    var sz: []u8 = sbz.build(a);
+                    sbz.deinit(a);
+                    return sz;
+                }
+                var sbal: StrBuilder = StrBuilder.init(a);
+                sbal.append(a, "((");
+                sbal.append(a, acn);
+                sbal.append(a, "){ .data = { ");
+                var acur: i32 = e0;
+                var afirst: bool = true;
+                while (acur >= 0) {
+                    if (!afirst) { sbal.append(a, ", "); }
+                    afirst = false;
+                    sbal.append(a, self.emit_expr(a, acur));
+                    acur = self.nodes[@as(usize, acur)].next;
+                }
+                sbal.append(a, " } })");
+                var sal: []u8 = sbal.build(a);
+                sbal.deinit(a);
+                return sal;
+            }
+            // Unreachable for validated input: the brace-init fallback.
+            var sbf: StrBuilder = StrBuilder.init(a);
+            sbf.append(a, "{ ");
+            var fcur: i32 = self.nodes[u].b;
+            var ffirst: bool = true;
+            while (fcur >= 0) {
+                if (!ffirst) { sbf.append(a, ", "); }
+                ffirst = false;
+                sbf.append(a, self.emit_expr(a, fcur));
+                fcur = self.nodes[@as(usize, fcur)].next;
+            }
+            sbf.append(a, " }");
+            var sf: []u8 = sbf.build(a);
+            sbf.deinit(a);
+            return sf;
+        }
         if (k == ND_SLICEX) {
             // `base[lo..hi]` (SPEC §15.2): a `{ptr, len}` view over the
             // base's storage with the bounds check folded into a portable
@@ -1408,7 +1639,11 @@ pub const Em = struct {
             var hi4: []u8 = self.emit_expr(a, self.nodes[u].c);
             var bt4: i64 = self.type_of_expr(self.nodes[u].a);
             var sn4: []u8 = "kd_slice_void";
-            if (et_is_slice(bt4)) { sn4 = et_slice_c_name(bt4); }
+            if (et_is_arr(bt4)) {
+                sn4 = et_slice_c_name(et_slice_of(self.arr_elem_of(bt4)));
+            } else if (et_is_slice(bt4)) {
+                sn4 = et_slice_c_name(bt4);
+            }
             var sb4: StrBuilder = StrBuilder.init(a);
             sb4.append(a, "(( (");
             sb4.append(a, lo4);
@@ -1419,7 +1654,9 @@ pub const Em = struct {
             sb4.append(a, ") || (");
             sb4.append(a, hi4);
             sb4.append(a, ") > (");
-            if (et_is_slice(bt4)) {
+            if (et_is_arr(bt4)) {
+                sb4.append_i64(a, self.arr_len_of(bt4));
+            } else if (et_is_slice(bt4)) {
                 sb4.append(a, "(");
                 sb4.append(a, bs4);
                 sb4.append(a, ").len");
@@ -1432,7 +1669,9 @@ pub const Em = struct {
             sb4.append(a, sn4);
             sb4.append(a, "){ .ptr = (");
             sb4.append(a, bs4);
-            if (et_is_slice(bt4)) {
+            if (et_is_arr(bt4)) {
+                sb4.append(a, ").data + (");
+            } else if (et_is_slice(bt4)) {
                 sb4.append(a, ").ptr + (");
             } else {
                 sb4.append(a, ") + (");
@@ -1684,6 +1923,16 @@ pub const Em = struct {
     fn emit_loop_cont(self: *Self, a: Allocator, idx: usize) void {
         var c: i32 = self.scopes[idx].cont;
         if (c >= 0) { self.emit_cont(a, c); }
+        var rf: i64 = self.scopes[idx].raw_fi;
+        if (rf >= 0) {
+            var sb: StrBuilder = StrBuilder.init(a);
+            sb.append(a, "__kd_fi");
+            sb.append_i64(a, rf);
+            sb.append(a, " += 1;");
+            var s: []u8 = sb.build(a);
+            sb.deinit(a);
+            self.line(a, s);
+        }
     }
 
     /// The (compound) name-assignment lowering, shared by `Stmt::Assign` and
@@ -1784,7 +2033,13 @@ pub const Em = struct {
                 sb.append(a, base_str);
                 sb.append(a, ").len) { fputs(\"panic: slice index out of bounds\\n\", stderr); exit(101); } ");
             } else {
-                sb.append(a, " >= 0) { fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); } ");
+                // The array arm bounds against the compile-time length
+                // (0 for the unreachable non-array fallback).
+                var pal: i64 = 0;
+                if (et_is_arr(bt)) { pal = self.arr_len_of(bt); }
+                sb.append(a, " >= ");
+                sb.append_i64(a, pal);
+                sb.append(a, ") { fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); } ");
             }
             self.put_store(a, &sb, target, op, val);
             sb.append(a, " }");
@@ -1823,7 +2078,7 @@ pub const Em = struct {
             var v: []u8 = "0";
             if (has_val) { v = es; }
             var sb: StrBuilder = StrBuilder.init(a);
-            sb.append(a, et_c_name(self.cur_ret));
+            sb.append(a, self.cty_of(a, self.cur_ret));
             sb.append(a, " __kd_ret = (");
             sb.append(a, v);
             sb.append(a, ");");
@@ -1900,6 +2155,129 @@ pub const Em = struct {
         return false;
     }
 
+    /// The secondary name text of node `n` (its `y` span — the `for`
+    /// index capture).
+    fn yname(self: *Self, n: i32) []u8 {
+        var u: usize = @as(usize, n);
+        return self.src[self.nodes[u].yoff .. self.nodes[u].yoff + self.nodes[u].ylen];
+    }
+
+    /// `Emitter::emit_for` (SPEC §29.2): evaluate the iterable ONCE into
+    /// `__kd_for{N}`, walk a `uintptr_t __kd_fi{N}` from 0 to the length
+    /// (the compile-time length of an array, the runtime `.len` of a
+    /// slice), bind the element by value each iteration (and, for the
+    /// index form, the index), with the loop-body scope carrying the raw
+    /// continue-clause `__kd_fi{N} += 1;` so `continue` still advances.
+    /// An untypeable iterable emits NOTHING (the Rust `return false` arm).
+    fn emit_for(self: *Self, a: Allocator, n: i32) bool {
+        var u: usize = @as(usize, n);
+        var itn: i32 = self.nodes[u].a;
+        var it_t: i64 = self.type_of_expr(itn);
+        if (!et_is_arr(it_t) and !et_is_slice(it_t)) { return false; }
+        var iter_cty: []u8 = "";
+        var elem_ty: i64 = ET_NONE;
+        if (et_is_arr(it_t)) {
+            iter_cty = self.arr_c_name(a, it_t);
+            elem_ty = self.arr_elem_of(it_t);
+        } else {
+            iter_cty = et_slice_c_name(it_t);
+            elem_ty = et_slice_elem(it_t);
+        }
+        var nctr: i64 = self.for_count;
+        self.for_count += 1;
+        var iter_str: []u8 = self.emit_expr(a, itn);
+        self.line(a, "{");
+        self.indent += 1;
+        var sb1: StrBuilder = StrBuilder.init(a);
+        sb1.append(a, iter_cty);
+        sb1.append(a, " __kd_for");
+        sb1.append_i64(a, nctr);
+        sb1.append(a, " = ");
+        sb1.append(a, iter_str);
+        sb1.append(a, ";");
+        var s1: []u8 = sb1.build(a);
+        sb1.deinit(a);
+        self.line(a, s1);
+        var sb2: StrBuilder = StrBuilder.init(a);
+        sb2.append(a, "uintptr_t __kd_fi");
+        sb2.append_i64(a, nctr);
+        sb2.append(a, " = 0;");
+        var s2: []u8 = sb2.build(a);
+        sb2.deinit(a);
+        self.line(a, s2);
+        var sb3: StrBuilder = StrBuilder.init(a);
+        sb3.append(a, "while (__kd_fi");
+        sb3.append_i64(a, nctr);
+        sb3.append(a, " < ");
+        if (et_is_arr(it_t)) {
+            sb3.append_i64(a, self.arr_len_of(it_t));
+        } else {
+            sb3.append(a, "__kd_for");
+            sb3.append_i64(a, nctr);
+            sb3.append(a, ".len");
+        }
+        sb3.append(a, ") {");
+        var s3: []u8 = sb3.build(a);
+        sb3.deinit(a);
+        self.line(a, s3);
+        // The loop-body scope: no AST continue-clause, the raw index
+        // increment instead; the element/index binding types recorded.
+        self.push_scope(a, true, 0 - 1, nctr);
+        self.push_vt(a, self.nodes[u].xoff, self.nodes[u].xlen, elem_ty);
+        if ((self.nodes[u].flags & F_IDX) != 0) {
+            self.push_vt(a, self.nodes[u].yoff, self.nodes[u].ylen, ET_USIZE);
+        }
+        self.indent += 1;
+        var sb4: StrBuilder = StrBuilder.init(a);
+        sb4.append(a, self.cty_of(a, elem_ty));
+        sb4.append(a, " kd_");
+        sb4.append(a, self.xname(n));
+        sb4.append(a, " = __kd_for");
+        sb4.append_i64(a, nctr);
+        if (et_is_arr(it_t)) {
+            sb4.append(a, ".data[__kd_fi");
+        } else {
+            sb4.append(a, ".ptr[__kd_fi");
+        }
+        sb4.append_i64(a, nctr);
+        sb4.append(a, "];");
+        var s4: []u8 = sb4.build(a);
+        sb4.deinit(a);
+        self.line(a, s4);
+        if ((self.nodes[u].flags & F_IDX) != 0) {
+            var sb5: StrBuilder = StrBuilder.init(a);
+            sb5.append(a, "uintptr_t kd_");
+            sb5.append(a, self.yname(n));
+            sb5.append(a, " = __kd_fi");
+            sb5.append_i64(a, nctr);
+            sb5.append(a, ";");
+            var s5: []u8 = sb5.build(a);
+            sb5.deinit(a);
+            self.line(a, s5);
+        }
+        var diverged: bool = false;
+        var cur: i32 = self.nodes[@as(usize, self.nodes[u].b)].a;
+        while (cur >= 0) {
+            diverged = self.emit_stmt(a, cur);
+            if (diverged) { break; }
+            cur = self.nodes[@as(usize, cur)].next;
+        }
+        if (!diverged) {
+            self.flush_current(a);
+        }
+        var top: usize = self.sc_len - 1;
+        if (!diverged) {
+            self.emit_loop_cont(a, top);
+        }
+        self.pop_scope();
+        self.indent -= 1;
+        self.line(a, "}");
+        self.indent -= 1;
+        self.line(a, "}");
+        // A `for` may iterate zero times, so it never diverges.
+        return false;
+    }
+
     /// `Emitter::emit_stmt`. Returns true if the statement unconditionally
     /// transfers control.
     fn emit_stmt(self: *Self, a: Allocator, n: i32) bool {
@@ -1912,11 +2290,11 @@ pub const Em = struct {
             var ct: []u8 = "";
             if (ann >= 0) {
                 lty = self.resolve_ty(ann);
-                ct = self.cty(ann);
+                ct = self.cty(a, ann);
             } else {
                 lty = self.type_of_expr(self.nodes[u].b);
                 if (lty == ET_NONE) { lty = ET_I64; }
-                ct = et_c_name(lty);
+                ct = self.cty_of(a, lty);
             }
             var es: []u8 = self.emit_expr(a, self.nodes[u].b);
             var sb: StrBuilder = StrBuilder.init(a);
@@ -1968,6 +2346,9 @@ pub const Em = struct {
             self.line(a, "}");
             // A `while` may iterate zero times, so it never diverges.
             return false;
+        }
+        if (k == ND_FOR) {
+            return self.emit_for(a, n);
         }
         if (k == ND_BREAK) {
             var i: i64 = self.flush_to_loop(a);
@@ -2030,7 +2411,7 @@ pub const Em = struct {
     /// continue-clause. The braces belong to the caller.
     fn emit_block(self: *Self, a: Allocator, block: i32, is_loop: bool, cont: i32) bool {
         self.indent += 1;
-        self.push_scope(a, is_loop, cont);
+        self.push_scope(a, is_loop, cont, 0 - 1);
         var diverged: bool = false;
         var cur: i32 = self.nodes[@as(usize, block)].a;
         while (cur >= 0) {
@@ -2065,7 +2446,7 @@ pub const Em = struct {
             var pu: usize = @as(usize, p);
             if (!first) { sb.append(a, ", "); }
             first = false;
-            sb.append(a, self.cty(self.nodes[pu].a));
+            sb.append(a, self.cty(a, self.nodes[pu].a));
             sb.append(a, " kd_");
             sb.append(a, self.src[self.nodes[pu].xoff .. self.nodes[pu].xoff + self.nodes[pu].xlen]);
             p = self.nodes[pu].next;
@@ -2083,9 +2464,10 @@ pub const Em = struct {
         self.vt_len = 0;
         self.str_count = 0;
         self.idx_count = 0;
+        self.for_count = 0;
         self.cur_ret = self.resolve_ty(self.nodes[u].b);
         var sb: StrBuilder = StrBuilder.init(a);
-        sb.append(a, self.cty(self.nodes[u].b));
+        sb.append(a, self.cty(a, self.nodes[u].b));
         sb.append(a, " kd_");
         sb.append(a, self.xname(fnode));
         sb.append(a, "(");
@@ -2095,7 +2477,7 @@ pub const Em = struct {
         sb.deinit(a);
         self.line(a, s);
         // The function scope, seeded with the parameters.
-        self.push_scope(a, false, 0 - 1);
+        self.push_scope(a, false, 0 - 1, 0 - 1);
         var p: i32 = self.nodes[u].a;
         while (p >= 0) {
             var pu: usize = @as(usize, p);
@@ -2153,6 +2535,14 @@ pub const Em = struct {
             self.collect_calls_expr(a, pend, self.nodes[u].c);
             return;
         }
+        if (k == ND_ALIT) {
+            var alc: i32 = self.nodes[u].b;
+            while (alc >= 0) {
+                self.collect_calls_expr(a, pend, alc);
+                alc = self.nodes[@as(usize, alc)].next;
+            }
+            return;
+        }
         if (k == ND_BUILTIN) {
             // `visit_expr` recurses into a builtin's arguments (the `@as`
             // value may contain calls; the type-name Ident is harmless).
@@ -2204,6 +2594,11 @@ pub const Em = struct {
             self.collect_calls_expr(a, pend, self.nodes[u].a);
             self.collect_calls_stmt(a, pend, self.nodes[u].b);
             self.collect_calls_block(a, pend, self.nodes[u].c);
+            return;
+        }
+        if (k == ND_FOR) {
+            self.collect_calls_expr(a, pend, self.nodes[u].a);
+            self.collect_calls_block(a, pend, self.nodes[u].b);
             return;
         }
         if (k == ND_DEFER) {
@@ -2341,11 +2736,21 @@ pub const Em = struct {
         self.sl_len += 1;
     }
 
-    /// A written `[]T` type interns its element (unknown elements resolve
-    /// to `None` before `wrap_type` and intern nothing).
+    /// A written `[]T` type interns its element; a written `[N]T` interns
+    /// the `(elem, len)` array pair (v0.168). Unknown elements resolve to
+    /// `None` before `wrap_type` and intern nothing.
     fn intern_ty(self: *Self, a: Allocator, n: i32) void {
         if (n < 0) { return; }
-        if ((self.nodes[@as(usize, n)].flags & F_SLICE) == 0) { return; }
+        var u: usize = @as(usize, n);
+        if ((self.nodes[u].flags & F_ARRLIT) != 0) {
+            var ae: i64 = et_from_name(self.xname(n));
+            if (ae != ET_NONE) {
+                var unused: i64 = self.arr_intern(a, ae, self.nodes[u].val);
+                if (unused == 0) { }
+            }
+            return;
+        }
+        if ((self.nodes[u].flags & F_SLICE) == 0) { return; }
         var e: i64 = et_from_name(self.xname(n));
         if (e != ET_NONE) { self.intern_elem(a, e); }
     }
@@ -2368,15 +2773,29 @@ pub const Em = struct {
             return;
         }
         if (k == ND_SLICEX) {
-            // Sema checks base, lo, hi, THEN re-interns the base slice's
-            // element (sema.rs:3110-3128). For a slice base — the only kind
-            // in the subset — that final intern is always a no-op (the
-            // base's slice type was interned when the type was formed), so
-            // only the operand walk is replayed here; the first-intern arm
-            // exists only for ARRAY bases, which stay out of the subset.
+            // Sema checks base, lo, hi, THEN interns the result slice's
+            // element (sema.rs:3110-3128). For a slice base that final
+            // intern is a no-op; for an ARRAY base (v0.168) it can
+            // FIRST-intern `[]elem` — which is why this scan carries the
+            // full type environment.
             self.intern_expr(a, self.nodes[u].a);
             self.intern_expr(a, self.nodes[u].b);
             self.intern_expr(a, self.nodes[u].c);
+            var sxt: i64 = self.type_of_expr(self.nodes[u].a);
+            if (et_is_arr(sxt)) {
+                self.intern_elem(a, self.arr_elem_of(sxt));
+            }
+            return;
+        }
+        if (k == ND_ALIT) {
+            // Sema resolves the literal's `[N]T` FIRST (interning the
+            // array), then checks the elements left to right.
+            self.intern_ty(a, self.nodes[u].a);
+            var alc: i32 = self.nodes[u].b;
+            while (alc >= 0) {
+                self.intern_expr(a, alc);
+                alc = self.nodes[@as(usize, alc)].next;
+            }
             return;
         }
         if (k == ND_CALL) {
@@ -2430,11 +2849,13 @@ pub const Em = struct {
 
     fn intern_block(self: *Self, a: Allocator, block: i32) void {
         if (block < 0) { return; }
+        self.push_scope(a, false, 0 - 1, 0 - 1);
         var cur: i32 = self.nodes[@as(usize, block)].a;
         while (cur >= 0) {
             self.intern_stmt(a, cur);
             cur = self.nodes[@as(usize, cur)].next;
         }
+        self.pop_scope();
     }
 
     fn intern_stmt(self: *Self, a: Allocator, n: i32) void {
@@ -2444,10 +2865,41 @@ pub const Em = struct {
         if (k == ND_LET) {
             self.intern_ty(a, self.nodes[u].a);
             self.intern_expr(a, self.nodes[u].b);
+            // Record the binding so later SLICEX/for typing resolves
+            // (annotation first, else the emit-identical inference).
+            var slty: i64 = ET_NONE;
+            if (self.nodes[u].a >= 0) {
+                slty = self.resolve_ty(self.nodes[u].a);
+            } else {
+                slty = self.type_of_expr(self.nodes[u].b);
+                if (slty == ET_NONE) { slty = ET_I64; }
+            }
+            self.push_vt(a, self.nodes[u].xoff, self.nodes[u].xlen, slty);
             return;
         }
         if (k == ND_ASSIGN) {
             self.intern_expr(a, self.nodes[u].a);
+            return;
+        }
+        if (k == ND_FOR) {
+            // iter first (sema 1888), then the body with the element and
+            // index captures bound (1915).
+            self.intern_expr(a, self.nodes[u].a);
+            var fit: i64 = self.type_of_expr(self.nodes[u].a);
+            var felem: i64 = ET_NONE;
+            if (et_is_arr(fit)) { felem = self.arr_elem_of(fit); }
+            if (et_is_slice(fit)) { felem = et_slice_elem(fit); }
+            self.push_scope(a, false, 0 - 1, 0 - 1);
+            self.push_vt(a, self.nodes[u].xoff, self.nodes[u].xlen, felem);
+            if ((self.nodes[u].flags & F_IDX) != 0) {
+                self.push_vt(a, self.nodes[u].yoff, self.nodes[u].ylen, ET_USIZE);
+            }
+            var fcur: i32 = self.nodes[@as(usize, self.nodes[u].b)].a;
+            while (fcur >= 0) {
+                self.intern_stmt(a, fcur);
+                fcur = self.nodes[@as(usize, fcur)].next;
+            }
+            self.pop_scope();
             return;
         }
         if (k == ND_PASSIGN) {
@@ -2495,10 +2947,10 @@ pub const Em = struct {
         self.intern_expr(a, n);
     }
 
-    /// The whole-module interning replay: signatures, const annotations,
-    /// then bodies (see the section comment). Fills `slices` in sema's
-    /// first-intern order.
-    fn intern_scan(self: *Self, a: Allocator) void {
+    /// Interning passes 1+2 (type-blind): every fn signature, then every
+    /// const annotation — run BEFORE `collect_signatures` so a `[N]T`
+    /// param/return resolves against a populated array table.
+    fn intern_scan_sigs(self: *Self, a: Allocator) void {
         // Pass 1: every fn signature — params left-to-right, then return.
         var cur: i32 = self.root;
         while (cur >= 0) {
@@ -2523,18 +2975,42 @@ pub const Em = struct {
             }
             cur = self.nodes[u2].next;
         }
+    }
+
+    /// Interning pass 3 (type-aware): fn and test bodies — run AFTER
+    /// `collect_signatures` (the SLICEX/for typing consults `fn_ret`).
+    fn intern_scan_bodies(self: *Self, a: Allocator) void {
+        var cur: i32 = 0 - 1;
         // Pass 3: fn AND test bodies, interleaved in source order (sema
         // checks both in one item loop; a test body is an ordinary block).
-        cur = self.root;
+        // The scan carries the emit-identical type environment (scopes +
+        // bindings) so the SLICEX-over-array intern point resolves.
+        if (cur < 0) { cur = self.root; }
         while (cur >= 0) {
             var u3: usize = @as(usize, cur);
             if (self.nodes[u3].kind == ND_FN) {
-                self.intern_block(a, self.nodes[u3].c);
+                self.push_scope(a, false, 0 - 1, 0 - 1);
+                var p3: i32 = self.nodes[u3].a;
+                while (p3 >= 0) {
+                    var pu3: usize = @as(usize, p3);
+                    self.push_vt(a, self.nodes[pu3].xoff, self.nodes[pu3].xlen, self.resolve_ty(self.nodes[pu3].a));
+                    p3 = self.nodes[pu3].next;
+                }
+                var bc3: i32 = self.nodes[@as(usize, self.nodes[u3].c)].a;
+                while (bc3 >= 0) {
+                    self.intern_stmt(a, bc3);
+                    bc3 = self.nodes[@as(usize, bc3)].next;
+                }
+                self.pop_scope();
             } else if (self.nodes[u3].kind == ND_TEST) {
                 self.intern_block(a, self.nodes[u3].a);
             }
             cur = self.nodes[u3].next;
         }
+        // Leave the stacks clean for emission.
+        self.sc_len = 0;
+        self.vt_len = 0;
+        self.df_len = 0;
     }
 
     /// `emit_one_slice`: the typedef and its three `static inline` helpers
@@ -2588,13 +3064,68 @@ pub const Em = struct {
         self.line(a, ws);
     }
 
-    /// `emit_type_defs` for the subset: one typedef block per interned
-    /// slice, in first-intern order, then the section blank. Nothing at all
-    /// when the module interns nothing (the Rust early-return keeps even
-    /// the blank out).
+    /// `emit_one_array` (SPEC §14.3): the value-struct typedef (a
+    /// zero-length array still reserves ONE storage element so the C stays
+    /// portable) plus the bounds-checked `_get` / `_at` helpers, both
+    /// checking against the TRUE length.
+    fn emit_one_array(self: *Self, a: Allocator, t: i64) void {
+        var ec: []u8 = et_c_name(self.arr_elem_of(t));
+        var alen: i64 = self.arr_len_of(t);
+        var storage: i64 = alen;
+        if (storage < 1) { storage = 1; }
+        var cn: []u8 = self.arr_c_name(a, t);
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "typedef struct { ");
+        sb.append(a, ec);
+        sb.append(a, " data[");
+        sb.append_i64(a, storage);
+        sb.append(a, "]; } ");
+        sb.append(a, cn);
+        sb.append(a, ";");
+        var s1: []u8 = sb.build(a);
+        sb.deinit(a);
+        self.line(a, s1);
+        var g: StrBuilder = StrBuilder.init(a);
+        g.append(a, "static inline ");
+        g.append(a, ec);
+        g.append(a, " ");
+        g.append(a, cn);
+        g.append(a, "_get(");
+        g.append(a, cn);
+        g.append(a, " a, int64_t i) { if (i < 0 || (uint64_t)i >= ");
+        g.append_i64(a, alen);
+        g.append(a, ") { fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); } return a.data[i]; }");
+        var s2: []u8 = g.build(a);
+        g.deinit(a);
+        self.line(a, s2);
+        var t2: StrBuilder = StrBuilder.init(a);
+        t2.append(a, "static inline ");
+        t2.append(a, ec);
+        t2.append(a, " *");
+        t2.append(a, cn);
+        t2.append(a, "_at(const ");
+        t2.append(a, cn);
+        t2.append(a, " *a, int64_t i) { if (i < 0 || (uint64_t)i >= ");
+        t2.append_i64(a, alen);
+        t2.append(a, ") { fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); } return (");
+        t2.append(a, ec);
+        t2.append(a, " *)a->data + i; }");
+        var s3: []u8 = t2.build(a);
+        t2.deinit(a);
+        self.line(a, s3);
+    }
+
+    /// `emit_type_defs` for the subset: the dependency-ordered walk visits
+    /// ARRAYS (in first-intern order) before SLICES (likewise) — scalar
+    /// elements carry no dependencies, so each family keeps its intern
+    /// order — then the section blank. Nothing at all when the module
+    /// interns nothing (the Rust early-return keeps even the blank out).
     fn emit_type_defs(self: *Self, a: Allocator) void {
-        self.intern_scan(a);
-        if (self.sl_len == 0) { return; }
+        if (self.sl_len == 0 and self.ar_count == 0) { return; }
+        var ai: usize = 0;
+        while (ai < self.ar_count) : (ai += 1) {
+            self.emit_one_array(a, ET_ARR_BASE + @as(i64, ai));
+        }
         var i: usize = 0;
         while (i < self.sl_len) : (i += 1) {
             self.emit_one_slice(a, self.slices[i]);
@@ -2628,7 +3159,7 @@ pub const Em = struct {
                 if (v.ok) {
                     var ct: []u8 = "";
                     if (self.nodes[u].a >= 0) {
-                        ct = self.cty(self.nodes[u].a);
+                        ct = self.cty(a, self.nodes[u].a);
                     } else if (v.isb) {
                         ct = "bool";
                     } else {
@@ -2663,7 +3194,7 @@ pub const Em = struct {
             var fnode: i32 = self.fns[i].node;
             var u: usize = @as(usize, fnode);
             var sb: StrBuilder = StrBuilder.init(a);
-            sb.append(a, self.cty(self.nodes[u].b));
+            sb.append(a, self.cty(a, self.nodes[u].b));
             sb.append(a, " kd_");
             sb.append(a, self.xname(fnode));
             sb.append(a, "(");
@@ -2720,6 +3251,7 @@ pub const Em = struct {
         self.df_len = 0;
         self.vt_len = 0;
         self.idx_count = 0;
+        self.for_count = 0;
         self.cur_ret = ET_I32;
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, "static int kd_test_");
@@ -2729,7 +3261,7 @@ pub const Em = struct {
         sb.deinit(a);
         self.line(a, s);
         self.indent += 1;
-        self.push_scope(a, false, 0 - 1);
+        self.push_scope(a, false, 0 - 1, 0 - 1);
         var diverged: bool = false;
         var cur: i32 = self.nodes[@as(usize, self.nodes[u].a)].a;
         while (cur >= 0) {
@@ -2846,7 +3378,12 @@ pub const Em = struct {
     /// `EmitMode::Test` emits the harness). The result is
     /// `self.out[0 .. self.out_len]`.
     fn run(self: *Self, a: Allocator) void {
+        // Interning passes 1+2 fill the array table BEFORE the signature
+        // collection resolves `[N]T` params/returns; the type-aware body
+        // pass then consults those signatures.
+        self.intern_scan_sigs(a);
         self.collect_signatures(a);
+        self.intern_scan_bodies(a);
         self.compute_live(a);
         self.emit_prelude(a);
         self.emit_type_defs(a);
