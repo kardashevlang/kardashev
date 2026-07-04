@@ -18,6 +18,48 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.166.0] — Self-hosting stage 8: `test` blocks + `EmitMode::Test`
+
+The self-hosted emitter gains its SECOND MODE: `test` blocks are subset
+items, and `selfhost/emit.ks` (2,931 lines) now mirrors the full
+`EmitMode::Test` harness byte-for-byte — every corpus file is classified
+and compared in BOTH modes (`cdump <file>` / `cdump <file> test`):
+
+- one `static int kd_test_<idx>(void)` per test block (unconditional
+  trailing `return 0;`), the `kd_test_names[]` table (names decoded then
+  `c_escape`d — `\` `"` `\n` `\t` `\r` only, no hex escapes) and the
+  `kd_test_fns[]` pointer table, then the v0.150 driver `main` with the
+  `--filter`/`--bench` loop and the `%d/%d tests passed` tally returning
+  the failure count;
+- the statement-level `expect(c)` lowering —
+  `if (!(<c>)) { <flush all defers> return 1; }`;
+- Test-mode §43.1 liveness: rooted at every test body; a module with NO
+  tests has no root, so EVERY function is live (`LiveFns::all_of`) — and
+  the `nomain` gate is Program-mode only, so main-less module fragments
+  become Test-comparable;
+- the interning scan walks test bodies at their item position (sema checks
+  fn and test bodies interleaved in one pass — a string inside a test
+  interns `[]u8` even for Program-mode output);
+- a mirrored Rust quirk: `emit_test_fn` resets every per-function temp
+  counter EXCEPT `str_counter`, so `__kd_str{N}` numbering continues from
+  the last emitted function across test functions.
+
+### Added
+- `es_detect_mode` (the mode-aware detector), `es_emit_test`,
+  `es_c_escape`, the harness emitters and Test liveness in
+  `selfhost/emit.ks`; `selfhost/cdump.ks` takes `test` as a second
+  argument.
+- **Dual-mode differential**: Program — 77 of 704 files C byte-identical
+  (84,363 bytes; test-block files now compare with their tests interned
+  but unemitted); Test — 90 of 704 files (134,567 bytes; the main-less
+  fragments join). 565/551 `SKIP` and 25/25 `ERROR` agreements; the
+  sema-invalid pins are now PER MODE (37 shared + `_back_calls_root.ks`
+  Test-only, E0100). Every targeted input now runs in both modes; +4
+  in-language suite tests (43 blocks total). The emitted harness verified
+  end-to-end: `ok:`/`FAIL:` stderr lines, the tally, the failure-count
+  exit code and `--filter` behavior identical to the reference binary.
+- 1,110 tests green across the workspace.
+
 ## [0.165.0] — Self-hosting stage 7: the slicing view `s[lo..hi]`
 
 The subset gains the last piece of the slice story: the **slicing view**

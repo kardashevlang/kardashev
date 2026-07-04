@@ -1,6 +1,7 @@
 // emit_suite.ks — in-language tests for the self-hosted subset C emitter
 // (v0.161 scalars + v0.162 strings + v0.163 heap buffers + v0.164
-// generalized `[]T` slices and `@as` casts).
+// generalized `[]T` slices and `@as` casts + v0.165 slicing views + v0.166
+// test blocks / EmitMode::Test).
 //
 // Run: kard test tests/selfhost/emit_suite.ks (driven from
 // `crates/kardc/tests/selfhost_emit.rs` so it is part of `cargo test`).
@@ -46,6 +47,12 @@ fn eh_detect(a: Allocator, src: []u8) Det {
 fn eh_emit(a: Allocator, src: []u8) []u8 {
     var p: Parser = eh_parse(a, src);
     return es_emit_program(a, src, p.nodes, p.root);
+}
+
+/// The `EmitMode::Test` (harness) C for `src` (v0.166).
+fn eh_emit_test(a: Allocator, src: []u8) []u8 {
+    var p: Parser = eh_parse(a, src);
+    return es_emit_test(a, src, p.nodes, p.root);
 }
 
 /// Naive substring search (the suite's only string tool beyond `str_eq`).
@@ -281,10 +288,13 @@ test "detect: out-of-subset statements" {
 
 test "detect: out-of-subset items and parameters" {
     var a: Allocator = c_allocator();
+    // `test` blocks are subset items since v0.166 — their bodies are
+    // walked like any block (a float inside still skips).
     var d: Det = eh_detect(a, "pub fn main() void {}\ntest \"t\" { expect(true); }");
-    expect(d.found);
-    expect(str_eq(d.word, "test"));
-    expect(d.pos == 22);
+    expect(!d.found);
+    var d0: Det = eh_detect(a, "pub fn main() void {}\ntest \"t\" { print(1.5); }");
+    expect(d0.found);
+    expect(str_eq(d0.word, "float"));
     var d2: Det = eh_detect(a, "fn id(comptime T: type, x: i64) i64 { return x; }\npub fn main() void { print(id(i64, 1)); }");
     expect(d2.found);
     expect(str_eq(d2.word, "generic-param"));
@@ -292,6 +302,20 @@ test "detect: out-of-subset items and parameters" {
     var d3: Det = eh_detect(a, "pub fn main() void {}\n@import(\"other.ks\");");
     expect(d3.found);
     expect(str_eq(d3.word, "import"));
+    var d4: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: i32 };");
+    expect(d4.found);
+    expect(str_eq(d4.word, "struct"));
+}
+
+test "detect: the nomain gate is Program-mode only (v0.166)" {
+    var a: Allocator = c_allocator();
+    var s: []u8 = "fn helper() i64 { return 1; }\ntest \"t\" { expect(helper() == 1); }";
+    var p: Parser = eh_parse(a, s);
+    var dp: Det = es_detect_mode(s, p.nodes, p.root, true);
+    expect(dp.found);
+    expect(str_eq(dp.word, "nomain"));
+    var dt: Det = es_detect_mode(s, p.nodes, p.root, false);
+    expect(!dt.found);
 }
 
 test "detect: allocator builtins and deep expressions" {
@@ -666,6 +690,82 @@ test "casts: @as lowering and its result type" {
     // `@as(i64, b) * 3` infers i64 through the cast's target type.
     expect(eh_find(c, "int64_t kd_w = (((int64_t)(kd_b)) * 3);"));
     expect(eh_find(c, "kd_print((long long)(((int32_t)(kd_w))));"));
+}
+
+// --- test blocks + EmitMode::Test (v0.166) ---------------------------------------------------
+
+test "harness: c_escape keeps names readable, no hex escapes" {
+    var a: Allocator = c_allocator();
+    var sb: StrBuilder = StrBuilder.init(a);
+    sb.append(a, "a\"b\\c");
+    sb.append_byte(a, 10);
+    sb.append_byte(a, 9);
+    sb.append_byte(a, 13);
+    sb.append_byte(a, 7);
+    var raw: []u8 = sb.build(a);
+    sb.deinit(a);
+    var esc: []u8 = es_c_escape(a, raw);
+    // \ " \n \t \r escaped; the raw 0x07 byte passes through VERBATIM
+    // (unlike c_string_literal's \x07).
+    var want: StrBuilder = StrBuilder.init(a);
+    want.append(a, "a\\\"b\\\\c\\n\\t\\r");
+    want.append_byte(a, 7);
+    var w: []u8 = want.build(a);
+    want.deinit(a);
+    expect(str_eq(esc, w));
+}
+
+test "harness: expect lowering, tables, and the driver main" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit_test(a, "fn add(x: i64, y: i64) i64 { return x + y; }\ntest \"adds\" {\n    expect(add(1, 2) == 3);\n}\ntest \"quote \\\" name\" {\n    defer print(9);\n    expect(true);\n}");
+    // `expect(c)` → the failure-return block, flushing active defers.
+    expect(eh_find(c, "static int kd_test_0(void) {\n    if (!((kd_add(1, 2) == 3))) {\n        return 1;\n    }\n    return 0;\n}\n"));
+    // The second test's expect flushes its registered defer FIRST.
+    expect(eh_find(c, "    if (!(true)) {\n        kd_print((long long)(9));\n        return 1;\n    }\n    kd_print((long long)(9));\n    return 0;\n}\n"));
+    // The name table c_escapes the DECODED name; the fn table indexes.
+    expect(eh_find(c, "static const char *kd_test_names[] = { \"adds\", \"quote \\\" name\" };\n"));
+    expect(eh_find(c, "static int (*kd_test_fns[])(void) = { kd_test_0, kd_test_1 };\n"));
+    // The v0.150 driver main: filter/bench parsing, the run loop, the tally.
+    expect(eh_find(c, "int main(int argc, char **argv) {\n    const char *filter = 0; int bench = 0;\n"));
+    expect(eh_find(c, "if (strcmp(argv[ai], \"--bench\") == 0) { bench = 1; }"));
+    expect(eh_find(c, "if (filter && !strstr(kd_test_names[ti], filter)) { continue; }"));
+    expect(eh_find(c, "fprintf(stderr, \"%s: %s\\n\", rc == 0 ? \"ok\" : \"FAIL\", kd_test_names[ti]);"));
+    expect(eh_find(c, "fprintf(stderr, \"%d/%d tests passed%s\\n\", ran - failures, ran, filter ? \" (filtered)\" : \"\");"));
+    // No user main is wired in Test mode.
+    expect(!eh_find(c, "kd_main()"));
+}
+
+test "harness: no tests means the trivial driver and EVERY function live" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit_test(a, "fn unreferenced(x: i64) i64 { return x; }\nfn also_dead() void { print(1); }\npub fn main() void { print(2); }");
+    // The no-root fallback (`LiveFns::all_of`): every fn declared+defined,
+    // including ones Program mode would drop.
+    expect(eh_find(c, "int64_t kd_unreferenced(int64_t kd_x);"));
+    expect(eh_find(c, "void kd_also_dead(void);"));
+    expect(eh_find(c, "void kd_main(void);"));
+    // No tables; `int total = 0;`; no run loop; the tally still prints.
+    expect(!eh_find(c, "kd_test_names"));
+    expect(eh_find(c, "int total = 0;\n    int failures = 0; int ran = 0;\n    fprintf(stderr,"));
+    // Program mode over the same source drops the dead functions.
+    var cp: []u8 = eh_emit(a, "fn unreferenced(x: i64) i64 { return x; }\nfn also_dead() void { print(1); }\npub fn main() void { print(2); }");
+    expect(!eh_find(cp, "kd_unreferenced"));
+    expect(!eh_find(cp, "kd_also_dead"));
+}
+
+test "harness: test-body liveness roots and the str_count quirk" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit_test(a, "fn used_by_test(x: i64) i64 { return x; }\nfn never_called() void { print(0); }\nfn stringer() void { print(\"a\"); print(\"b\"); }\ntest \"one\" {\n    print(\"t1\");\n    expect(used_by_test(1) == 1);\n}\ntest \"two\" {\n    print(\"t2\");\n    stringer();\n}");
+    // Liveness roots at the test bodies: `never_called` is dropped.
+    expect(eh_find(c, "int64_t kd_used_by_test(int64_t kd_x);"));
+    expect(eh_find(c, "void kd_stringer(void);"));
+    expect(!eh_find(c, "kd_never_called"));
+    // The Rust emit_test_fn does NOT reset str_counter (mirrored quirk):
+    // stringer's fn body uses __kd_str0/__kd_str1 (its own reset), test
+    // "one" CONTINUES from the last emitted fn (__kd_str2), test "two"
+    // continues again (__kd_str3).
+    expect(eh_find(c, "void kd_stringer(void) {\n    { kd_slice_uint8_t __kd_str0"));
+    expect(eh_find(c, "static int kd_test_0(void) {\n    { kd_slice_uint8_t __kd_str2"));
+    expect(eh_find(c, "static int kd_test_1(void) {\n    { kd_slice_uint8_t __kd_str3"));
 }
 
 // --- the slicing view (v0.165) --------------------------------------------------------------
