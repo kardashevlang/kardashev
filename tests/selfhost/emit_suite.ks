@@ -1,7 +1,8 @@
 // emit_suite.ks — in-language tests for the self-hosted subset C emitter
 // (v0.161 scalars + v0.162 strings + v0.163 heap buffers + v0.164
 // generalized `[]T` slices and `@as` casts + v0.165 slicing views + v0.166
-// test blocks / EmitMode::Test).
+// test blocks / EmitMode::Test + v0.167 `@import` resolution + v0.168 fixed
+// arrays `[N]T` and `for` loops).
 //
 // Run: kard test tests/selfhost/emit_suite.ks (driven from
 // `crates/kardc/tests/selfhost_emit.rs` so it is part of `cargo test`).
@@ -268,9 +269,11 @@ test "detect: a non-len field access is out, its base is still walked" {
 
 test "detect: out-of-subset statements" {
     var a: Allocator = c_allocator();
-    var d: Det = eh_detect(a, "fn main() void { for (xs) |x| { } }");
+    // (unlabeled `for` joined the subset in v0.168; the labeled form
+    // keeps the verdict, like the labeled while below)
+    var d: Det = eh_detect(a, "fn main() void { lab: for (xs) |x| { break :lab; } }");
     expect(d.found);
-    expect(str_eq(d.word, "for"));
+    expect(str_eq(d.word, "label"));
     expect(d.pos == 17);
     var d2: Det = eh_detect(a, "fn main() void { switch (x) { else => {} } }");
     expect(d2.found);
@@ -865,4 +868,74 @@ test "emit: if/else ladder, bare block, expression statement shapes" {
     expect(eh_find(c, "    {\n        int64_t kd_t = 5;\n        kd_print((long long)(kd_t));\n    }\n"));
     expect(eh_find(c, "    kd_x = (kd_x + 1);\n"));
     expect(eh_find(c, "    kd_x = kd_x + (2);\n"));
+}
+
+test "detect: arrays and for are in the subset (v0.168)" {
+    var a: Allocator = c_allocator();
+    // Fixed arrays, array literals, and both `for` capture forms are in.
+    var d: Det = eh_detect(a, "pub fn main() void {\n    var xs: [3]i64 = [3]i64{ 1, 2, 3 };\n    for (xs) |x| { print(x); }\n    for (xs, 0..) |x, i| { print(x); print(i); }\n}");
+    expect(!d.found);
+    // A comptime-parameter size `[n]T` stays a type-form skip...
+    var d2: Det = eh_detect(a, "fn f(xs: [n]i64) void {}\npub fn main() void {}");
+    expect(d2.found);
+    expect(str_eq(d2.word, "type-form"));
+    expect(d2.pos == 9);
+    // ...and a non-scalar element is a type-name skip (the LET annotation
+    // walks before its initializer).
+    var d3: Det = eh_detect(a, "pub fn main() void { var xs: [2]f64 = [2]f64{ 1.5, 2.5 }; }");
+    expect(d3.found);
+    expect(str_eq(d3.word, "type-name"));
+    expect(d3.pos == 29);
+}
+
+test "arrays: typedefs before slices, storage max(len,1), get shape" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void {\n    var xs: [3]i64 = [3]i64{ 1, 2, 3 };\n    var e: [0]u8 = [0]u8{};\n    print(xs[0]);\n    print(e.len);\n    var v: []i64 = xs[0..2];\n    print(v.len);\n}");
+    // Array typedef + the bounds-checked value getter.
+    expect(eh_find(c, "typedef struct { int64_t data[3]; } kd_arr_int64_t_3;\n"));
+    expect(eh_find(c, "static inline int64_t kd_arr_int64_t_3_get(kd_arr_int64_t_3 a, int64_t i) { if (i < 0 || (uint64_t)i >= 3) { fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); } return a.data[i]; }\n"));
+    // A zero-length array keeps one storage slot but a 0 bound.
+    expect(eh_find(c, "typedef struct { uint8_t data[1]; } kd_arr_uint8_t_0;\n"));
+    expect(eh_find(c, "(uint64_t)i >= 0"));
+    // Dependency order: every array typedef precedes the first slice's
+    // (the last array's `_at` line is directly followed by it).
+    expect(eh_find(c, "return (uint8_t *)a->data + i; }\ntypedef struct { int64_t *ptr; uintptr_t len; } kd_slice_int64_t;\n"));
+}
+
+test "arrays: literal, get read, .len constant, index writes, empty" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void {\n    var xs: [3]i64 = [3]i64{ 1, 2, 3 };\n    xs[0] = 5;\n    xs[1] += 2;\n    print(xs[1]);\n    print(xs.len);\n    var e: [0]u8 = [0]u8{};\n    print(e.len);\n}");
+    // The literal is a compound literal with const-folded elements.
+    expect(eh_find(c, "    kd_arr_int64_t_3 kd_xs = ((kd_arr_int64_t_3){ .data = { 1, 2, 3 } });\n"));
+    // Reads go through the checked getter; `.len` folds to the count.
+    expect(eh_find(c, "kd_arr_int64_t_3_get(kd_xs, 1)"));
+    expect(eh_find(c, "((uintptr_t)3)"));
+    // Index writes hoist __kd_idx and bound against the CONSTANT length;
+    // the compound form re-spells the `.data` slot on both sides.
+    expect(eh_find(c, "    { int64_t __kd_idx0 = (0); if (__kd_idx0 < 0 || (uint64_t)__kd_idx0 >= 3) { fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); } (kd_xs).data[__kd_idx0] = (5); }\n"));
+    expect(eh_find(c, "    { int64_t __kd_idx1 = (1); if (__kd_idx1 < 0 || (uint64_t)__kd_idx1 >= 3) { fputs(\"panic: array index out of bounds\\n\", stderr); exit(101); } (kd_xs).data[__kd_idx1] = (kd_xs).data[__kd_idx1] + (2); }\n"));
+    // The empty literal is the zero-initializer.
+    expect(eh_find(c, "((kd_arr_uint8_t_0){0})"));
+}
+
+test "for: lowering — iter temp, fi counter, raw continue, index form" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void {\n    var xs: [3]i64 = [3]i64{ 1, 2, 3 };\n    for (xs, 0..) |x, i| {\n        if (x == 2) { continue; }\n        print(i);\n    }\n    var al: Allocator = c_allocator();\n    var s: []u8 = alloc(al, u8, 2);\n    for (s) |b| { print(b); }\n    free(al, s);\n}");
+    // The whole array-loop block, byte for byte: outer scope, snapshot
+    // temp, uintptr counter, CONSTANT bound, elem + index bindings, and
+    // `continue` stepping the counter first.
+    expect(eh_find(c, "    {\n        kd_arr_int64_t_3 __kd_for0 = kd_xs;\n        uintptr_t __kd_fi0 = 0;\n        while (__kd_fi0 < 3) {\n            int64_t kd_x = __kd_for0.data[__kd_fi0];\n            uintptr_t kd_i = __kd_fi0;\n            if ((kd_x == 2)) {\n                __kd_fi0 += 1;\n                continue;\n            }\n            kd_print((long long)(kd_i));\n            __kd_fi0 += 1;\n        }\n    }\n"));
+    // A slice loop bounds on the runtime `.len` and reads through `.ptr`.
+    expect(eh_find(c, "        while (__kd_fi1 < __kd_for1.len) {\n            uint8_t kd_b = __kd_for1.ptr[__kd_fi1];\n"));
+    // The counter resets per function (and per test fn, like str/idx).
+    var c2: []u8 = eh_emit(a, "fn f(xs: [2]i64) void { for (xs) |x| { print(x); } }\nfn g(xs: [2]i64) void { for (xs) |x| { print(x); } }\npub fn main() void {\n    var xs: [2]i64 = [2]i64{ 1, 2 };\n    f(xs);\n    g(xs);\n}");
+    expect(eh_count(c2, "__kd_for0 = ") == 2);
+    expect(!eh_find(c2, "__kd_for1"));
+}
+
+test "harness: for_count resets per test fn too" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit_test(a, "test \"a\" {\n    var xs: [1]i64 = [1]i64{ 7 };\n    for (xs) |x| { print(x); }\n}\ntest \"b\" {\n    var ys: [1]i64 = [1]i64{ 8 };\n    for (ys) |y| { print(y); }\n}");
+    expect(eh_count(c, "__kd_for0 = ") == 2);
+    expect(!eh_find(c, "__kd_for1"));
 }

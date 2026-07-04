@@ -1,8 +1,9 @@
-//! Self-host stages 3–8 (v0.161–v0.166): differential test of
+//! Self-host stages 3–10 (v0.161–v0.168): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
-//! slicing view, and — v0.166 — `test` blocks with the full
-//! `EmitMode::Test` harness) written in kardashev — against the Rust
+//! slicing view, `test` blocks with the full `EmitMode::Test` harness,
+//! `@import` resolution, and — v0.168 — fixed arrays `[N]T` with array
+//! literals and `for` loops) written in kardashev — against the Rust
 //! reference emitter. Since v0.166 every corpus file is classified and
 //! compared in BOTH modes: `cdump <file>` prints the Program lowering,
 //! `cdump <file> test` the Test-mode harness (no `nomain` gate; a module
@@ -102,12 +103,18 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s03_sema/return_void_rules_err.ks",                   // E0110
     "tests/spec/s03_sema/unknown_name_err.ks",                        // E0100
     "tests/spec/s03_sema/void_result_unusable_err.ks",                // E0110
+    "tests/spec/s14_arrays/index_assign_const_err.ks",                // E0223
+    "tests/spec/s14_arrays/index_assign_param_err.ks",                // E0223
     "tests/spec/s14_arrays/index_non_array_err.ks",                   // E0220
+    "tests/spec/s14_arrays/index_not_integer_err.ks",                 // E0110
+    "tests/spec/s14_arrays/literal_count_mismatch_err.ks",            // E0221
+    "tests/spec/s14_arrays/literal_element_type_err.ks",              // E0110
     "tests/spec/s15_ptr_slices/slice_non_sliceable_err.ks",           // E0232
     "tests/spec/s16_alloc/free_non_slice_err.ks",                     // E0242
     "tests/spec/s18_inference/infer_const_stays_immutable_err.ks",    // E0110
     "tests/spec/s18_inference/infer_default_not_i32_err.ks",          // E0110
     "tests/spec/s23_strings/string_eq_operator_err.ks",               // E0110
+    "tests/spec/s23_strings/string_print_non_u8_slice_err.ks",        // E0110
     "tests/spec/s23_strings/string_plus_operator_err.ks",             // E0110
     "tests/spec/s25_generic_structs/err_alias_of_non_ctor.ks",        // E0311
     "tests/spec/s27_compound/bool_rhs_err.ks",                        // E0110
@@ -115,6 +122,9 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s27_compound/mismatch_err.ks",                        // E0110
     "tests/spec/s28_bitwise/bitand_bool_err.ks",                      // E0110
     "tests/spec/s28_bitwise/bitnot_bool_err.ks",                      // E0110
+    "tests/spec/s29_for/elem_immutable_err.ks",                       // E0110
+    "tests/spec/s29_for/index_type_err.ks",                           // E0110
+    "tests/spec/s29_for/non_iterable_err.ks",                         // E0300
     "tests/spec/s33_casts/err_as_not_constant.ks",                    // E0130
     "tests/spec/s33_casts/err_as_value_not_numeric.ks",               // E0321
 ];
@@ -128,8 +138,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 80;
-const MIN_C_COMPARED_TEST: usize = 100;
+const MIN_C_COMPARED_PROGRAM: usize = 115;
+const MIN_C_COMPARED_TEST: usize = 130;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -183,14 +193,14 @@ fn det_type(t: &TypeExpr) -> Option<Hit> {
     if t.optional
         || t.error_union
         || t.error_set.is_some()
-        || t.array_len.is_some()
         || t.pointer
         || t.ctor_args.is_some()
+        || matches!(&t.array_len, Some(kardc::ast::ArraySize::Param(_)))
     {
         return Some(("type-form", t.span.start));
     }
-    if t.slice {
-        // `[]T` over the five scalar element types (v0.164).
+    if t.array_len.is_some() || t.slice {
+        // `[N]T` (v0.168) / `[]T` (v0.164) over the five scalar elements.
         if !subset_slice_elem(&t.name) {
             return Some(("type-name", t.span.start));
         }
@@ -257,7 +267,11 @@ fn det_expr(e: &Expr) -> Option<Hit> {
         Expr::Unwrap { .. } => Some(("unwrap", pos)),
         Expr::ErrorLit { .. } => Some(("error-lit", pos)),
         Expr::EnumLit { .. } => Some(("enum-lit", pos)),
-        Expr::ArrayLit { .. } => Some(("array-lit", pos)),
+        // An array literal `[N]T{ … }` is in the subset (v0.168): its
+        // `[N]T` reference, then the elements, in order.
+        Expr::ArrayLit { elem, elems, .. } => {
+            det_type(elem).or_else(|| elems.iter().find_map(det_expr))
+        }
         // The slicing view `base[lo..hi]` is in the subset (v0.165).
         Expr::SliceExpr { base, lo, hi, .. } => det_expr(base)
             .or_else(|| det_expr(lo))
@@ -326,7 +340,15 @@ fn det_stmt(s: &Stmt) -> Option<Hit> {
                 .or_else(|| cont.as_deref().and_then(det_stmt))
                 .or_else(|| det_block(body))
         }
-        Stmt::For { .. } => Some(("for", pos)),
+        // `for` is in the subset (v0.168); a LABELED `for` stays out.
+        Stmt::For {
+            iter, body, label, ..
+        } => {
+            if label.is_some() {
+                return Some(("label", pos));
+            }
+            det_expr(iter).or_else(|| det_block(body))
+        }
         Stmt::Break { target, .. } | Stmt::Continue { target, .. } => {
             if target.is_some() {
                 return Some(("label", pos));
@@ -1013,6 +1035,39 @@ fn selfhost_emit_differential_targeted_inputs() {
             "slicing_side_effect_free_ops_respliced",
             "fn lo2() usize { return 1; }\npub fn main() void {\n    var s: []u8 = \"abcdef\";\n    var t: []u8 = s[lo2()..s.len - 1];\n    print(t);\n    print(t.len);\n}\n",
         ),
+        // -- fixed arrays [N]T + for (v0.168) -----------------------------------
+        (
+            "arrays_literals_reads_copies",
+            "pub fn main() void {\n    var xs: [3]i64 = [3]i64{ 1, 2, 3 };\n    var ys: [3]i64 = xs;\n    ys[0] = 9;\n    print(xs[0]);\n    print(ys[0]);\n    print(xs.len);\n    var e: [0]u8 = [0]u8{};\n    print(e.len);\n    var one: [1]bool = [1]bool{ true };\n    if (one[0]) { print(1); }\n}\n",
+        ),
+        (
+            "arrays_index_writes_bounds",
+            "pub fn main() void {\n    var xs: [4]u8 = [4]u8{ 65, 66, 67, 68 };\n    xs[0] = 90;\n    xs[1] += 2;\n    xs[2] *= 2;\n    var i: i64 = 3;\n    xs[i] -= 1;\n    print(xs[0]); print(xs[1]); print(xs[2]); print(xs[3]);\n}\n",
+        ),
+        (
+            "arrays_params_returns_byvalue",
+            "fn sum(xs: [3]i64) i64 {\n    var t: i64 = 0;\n    for (xs) |x| { t += x; }\n    return t;\n}\nfn make(seed: i64) [3]i64 {\n    return [3]i64{ seed, seed + 1, seed + 2 };\n}\npub fn main() void {\n    var a: [3]i64 = make(10);\n    print(sum(a));\n    print(sum(make(1)));\n}\n",
+        ),
+        (
+            "for_iterable_call_evaluated_once",
+            "fn make() [2]i64 {\n    print(7);\n    return [2]i64{ 4, 6 };\n}\npub fn main() void {\n    var s: i64 = 0;\n    for (make()) |v| { s += v; }\n    print(s);\n}\n",
+        ),
+        (
+            "for_index_form_and_nesting",
+            "pub fn main() void {\n    var xs: [3]i64 = [3]i64{ 5, 6, 7 };\n    for (xs, 0..) |x, i| {\n        for (xs) |y| {\n            print(x + y);\n        }\n        print(i);\n    }\n}\n",
+        ),
+        (
+            "for_defer_break_continue",
+            "pub fn main() void {\n    var xs: [5]i64 = [5]i64{ 0, 1, 2, 3, 4 };\n    for (xs) |x| {\n        defer print(100 + x);\n        if (x == 1) { continue; }\n        if (x == 3) { break; }\n        print(x);\n    }\n    print(999);\n}\n",
+        ),
+        (
+            "for_over_slice_and_array_view",
+            "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var s: []u8 = alloc(al, u8, 3);\n    s[0] = 10; s[1] = 20; s[2] = 30;\n    for (s) |b| { print(b); }\n    var xs: [4]i64 = [4]i64{ 1, 2, 3, 4 };\n    var v: []i64 = xs[1..3];\n    for (v, 0..) |x, i| { print(x); print(i); }\n    for (\"ab\") |c| { print(c); }\n    free(al, s);\n}\n",
+        ),
+        (
+            "arrays_typedef_order_and_empty_view",
+            "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var h: []i64 = alloc(al, i64, 1);\n    var xs: [2]u8 = [2]u8{ 1, 2 };\n    var v: []u8 = xs[1..1];\n    print(v.len);\n    print(h.len);\n    print(xs[1]);\n    free(al, h);\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
             "skip_slice_elem_f64",
@@ -1063,6 +1118,22 @@ fn selfhost_emit_differential_targeted_inputs() {
         (
             "skip_labeled_while",
             "pub fn main() void {\n    outer: while (true) {\n        break :outer;\n    }\n}\n",
+        ),
+        (
+            "skip_array_size_param",
+            "fn f(xs: [n]i64) void {}\npub fn main() void {}\n",
+        ),
+        (
+            "skip_array_elem_f64",
+            "pub fn main() void {\n    var xs: [2]f64 = [2]f64{ 1.5, 2.5 };\n}\n",
+        ),
+        (
+            "skip_array_lit_elem_float",
+            "pub fn main() void {\n    var xs: [2]i64 = [2]i64{ 1, 2.5 };\n}\n",
+        ),
+        (
+            "skip_labeled_for",
+            "pub fn main() void {\n    var xs: [1]i64 = [1]i64{ 1 };\n    lab: for (xs) |x| {\n        break :lab;\n    }\n}\n",
         ),
         (
             "skip_unreachable_stmt",

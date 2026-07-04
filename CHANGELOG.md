@@ -18,6 +18,50 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.168.0] — Self-hosting stage 10: fixed arrays `[N]T` + `for`
+
+The self-hosted emitter's subset gains FIXED ARRAYS and `for` loops —
+the C-identical corpus jumps from 86/104 to 122/140 files
+(Program/Test), swallowing `s14_arrays` and `s29_for` nearly whole.
+
+- `selfhost/emit.ks` (stage 10): `[N]T` types with literal sizes (a
+  comptime-parameter size stays a `type-form` skip), array literals
+  `[N]T{ … }` (C compound literal, `{0}` when empty), bounds-checked
+  reads through `kd_arr_<tag>_<N>_get`, `.len` folding to the constant
+  count, (compound) index WRITES bounding against that constant,
+  aggregate copies, array params/returns by value, and `s[lo..hi]`
+  views over array bases (`.data` + constant-length bound). Unlabeled
+  `for` over arrays, slices, and string literals in both capture forms
+  (`|x|` / `, 0..) |x, i|`) lowers through the `__kd_for{N}` snapshot
+  temp + `uintptr_t __kd_fi{N}` counter — the iterable is evaluated
+  exactly once, `continue` steps the counter before jumping (the
+  `raw_fi` slot on the emitter's scope stack), and `for` never counts
+  as divergence.
+- The typedef section now emits `kd_arr_<tag>_<N>` blocks (typedef +
+  `_get` + `_at`, storage `max(N, 1)`) BEFORE the slice blocks — the
+  Rust dependency walk visits arrays first — each table in sema's
+  first-intern order. The interning replay is now TYPE-AWARE: the scan
+  carries the emitter's scope stack so a `for` element binding or an
+  array-base slicing view interns its element type exactly where sema
+  resolves it, and the signature pass runs BEFORE `collect_signatures`
+  so a `[N]T` param/return resolves against a populated array table
+  (an `[N]T`-returning call iterable was the one corpus mismatch the
+  split fixed).
+- Differential (`selfhost_emit.rs`): the mirrored detector admits
+  literal-sized array types/literals and unlabeled `for` (label →
+  `label`); 9 new sema-invalid pins (`s14_arrays` index/literal
+  errors, `s23_strings` non-u8 print, `s29_for` elem/index/iterable
+  errors); floors raised to ≥115 Program / ≥130 Test C-compared files
+  (122/140 observed); 12 new targeted cases (call-iterable
+  evaluated-once, `for`+`defer`+`break`/`continue`, typedef order,
+  zero-length arrays, index-form nesting, skip verdicts for
+  `[n]i64` / `f64` elements / labeled `for` / float literal elements).
+- Suite (`tests/selfhost/emit_suite.ks`): 45 → 50 tests — detector
+  verdicts, typedef shapes/order, literal/write/`.len` lowerings, the
+  full `for` block byte-for-byte, and the per-fn/per-test `for`
+  counter reset. In-language corpus untouched: all 705 files keep
+  their three-bucket agreement in both modes.
+
 ## [0.167.0] — Self-hosting stage 9: `@import` resolution
 
 The self-hosted pipeline gains the MODULE FLATTENER: `selfhost/modres.ks`
