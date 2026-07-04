@@ -2,7 +2,8 @@
 // (v0.161 scalars + v0.162 strings + v0.163 heap buffers + v0.164
 // generalized `[]T` slices and `@as` casts + v0.165 slicing views + v0.166
 // test blocks / EmitMode::Test + v0.167 `@import` resolution + v0.168 fixed
-// arrays `[N]T` and `for` loops + v0.169 plain data structs).
+// arrays `[N]T` and `for` loops + v0.169 plain data structs + v0.170
+// struct methods and associated functions).
 //
 // Run: kard test tests/selfhost/emit_suite.ks (driven from
 // `crates/kardc/tests/selfhost_emit.rs` so it is part of `cargo test`).
@@ -256,7 +257,7 @@ test "detect: composite type forms and non-subset type names" {
     expect(str_eq(d4.word, "type-form"));
 }
 
-test "detect: field access is in (v0.169), method calls stay out" {
+test "detect: field access (v0.169) and method calls (v0.170) are in" {
     var a: Allocator = c_allocator();
     // Any field NAME is a subset shape now — `s.ptr` on a slice is
     // sema-invalid (E0165 territory), not a skip.
@@ -264,10 +265,14 @@ test "detect: field access is in (v0.169), method calls stay out" {
     expect(!d.found);
     var d2: Det = eh_detect(a, "pub fn main() void { print(a.b.len); }");
     expect(!d2.found);
-    // A method CALL keeps its verdict.
+    // A method call walks its receiver and args (v0.170) — an unknown
+    // receiver is sema's E0170, not a skip...
     var d3: Det = eh_detect(a, "pub fn main() void { p.dist(1); }");
-    expect(d3.found);
-    expect(str_eq(d3.word, "method-call"));
+    expect(!d3.found);
+    // ...and an out-of-subset construct INSIDE one still surfaces.
+    var d4: Det = eh_detect(a, "pub fn main() void { p.dist(1.5); }");
+    expect(d4.found);
+    expect(str_eq(d4.word, "float"));
 }
 
 test "detect: out-of-subset statements" {
@@ -314,10 +319,13 @@ test "detect: out-of-subset items and parameters" {
     // A plain data-struct declaration is a subset item (v0.169)...
     var d4: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: i32 };");
     expect(!d4.found);
-    // ...a method inside one is the finding; a non-subset FIELD type too.
+    // ...a VALUE-receiver method inside one is admitted (v0.170), a
+    // POINTER receiver stays out, and a non-subset FIELD type skips.
     var d5: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: i32, fn m(self: S) void {} };");
-    expect(d5.found);
-    expect(str_eq(d5.word, "method"));
+    expect(!d5.found);
+    var d5b: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: i32, fn m(self: *S) void {} };");
+    expect(d5b.found);
+    expect(str_eq(d5b.word, "type-form"));
     var d6: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: f64 };");
     expect(d6.found);
     expect(str_eq(d6.word, "type-name"));
@@ -1009,4 +1017,38 @@ test "structs: an array view through an indexed element spells _at" {
     expect(eh_find(c, ".ptr = (kd_arr_struct_B_2_at(&(kd_xs), 0)->kd_buf).data + (0)"));
     // The rvalue read of the same chain uses `_get` + field access.
     expect(eh_find(c, "kd_print((long long)(kd_arr_int64_t_3_get((kd_arr_struct_B_2_get(kd_xs, 0)).kd_buf, 1)));\n"));
+}
+
+test "methods: kd_<Struct>_<method> naming, assoc/value/explicit-self (v0.170)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const Counter = struct {\n    n: i32,\n\n    fn get(self: Counter) i32 {\n        return self.n;\n    }\n\n    fn plus(self: Counter, k: i32) i32 {\n        return self.n + self.get() + k;\n    }\n\n    fn make(n: i32) Counter {\n        return Counter{ .n = n };\n    }\n};\n\npub fn main() void {\n    var c: Counter = Counter.make(4);\n    print(c.get());\n    print(Counter.plus(c, 5));\n    print(Counter.make(1).get());\n}");
+    // Declarations: `self` is an ordinary by-value parameter.
+    expect(eh_find(c, "int32_t kd_Counter_get(kd_struct_Counter kd_self);\n"));
+    expect(eh_find(c, "int32_t kd_Counter_plus(kd_struct_Counter kd_self, int32_t kd_k);\n"));
+    expect(eh_find(c, "kd_struct_Counter kd_Counter_make(int32_t kd_n);\n"));
+    // Assoc call: args as-is; value call: receiver prepended; the
+    // explicit-self form `Counter.plus(c, 5)` matches the value form.
+    expect(eh_find(c, "    kd_struct_Counter kd_c = kd_Counter_make(4);\n"));
+    expect(eh_find(c, "kd_print((long long)(kd_Counter_get(kd_c)));\n"));
+    expect(eh_find(c, "kd_print((long long)(kd_Counter_plus(kd_c, 5)));\n"));
+    // A call-result receiver chains.
+    expect(eh_find(c, "kd_print((long long)(kd_Counter_get(kd_Counter_make(1))));\n"));
+    // A method body calls a sibling through `self` (value form).
+    expect(eh_find(c, "    return ((((kd_self).kd_n + kd_Counter_get(kd_self)) + kd_k));\n"));
+    // Definitions: free fns first, then struct fns in declaration order.
+    expect(eh_find(c, "int32_t kd_Counter_get(kd_struct_Counter kd_self) {\n"));
+}
+
+test "methods: name-level liveness — dead names dropped, all structs marked" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const A = struct {\n    x: i64,\n    fn ping(self: A) i64 { return self.x; }\n    fn dead(self: A) i64 { return 0; }\n};\nconst B = struct {\n    y: i64,\n    fn ping(self: B) i64 { return self.y * 2; }\n};\npub fn main() void {\n    var v: A = A{ .x = 3 };\n    print(v.ping());\n}");
+    // `ping` is live NAME-LEVEL: BOTH structs' ping emit, though only A's
+    // receiver appears; `dead` emits nowhere.
+    expect(eh_find(c, "int64_t kd_A_ping(kd_struct_A kd_self);\n"));
+    expect(eh_find(c, "int64_t kd_B_ping(kd_struct_B kd_self);\n"));
+    expect(!eh_find(c, "kd_A_dead"));
+    // Test mode with NO tests: every function AND method lives.
+    var c2: []u8 = eh_emit_test(a, "const A = struct {\n    x: i64,\n    fn solo(self: A) i64 { return self.x; }\n};\nfn lone() void {}\npub fn main() void { print(1); }");
+    expect(eh_find(c2, "kd_A_solo"));
+    expect(eh_find(c2, "kd_lone"));
 }

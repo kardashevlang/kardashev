@@ -1,12 +1,15 @@
-//! Self-host stages 3–11 (v0.161–v0.169): differential test of
+//! Self-host stages 3–12 (v0.161–v0.170): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
 //! `@import` resolution, fixed arrays `[N]T` with array literals and
 //! `for` loops, and — v0.169 — plain data STRUCTS: declarations, literals,
 //! field reads, generalized place-assignment chains through fields and
-//! indexes with the `_at` element-pointer lowering, and the typedef
-//! DEPENDENCY WALK over structs/arrays/slices) written in kardashev —
+//! indexes with the `_at` element-pointer lowering, the typedef
+//! DEPENDENCY WALK over structs/arrays/slices, and — v0.170 — struct
+//! METHODS and associated functions: `kd_<Struct>_<method>` lowering for
+//! the receiver, explicit-self and `Type.assoc(…)` call forms, with
+//! name-level method liveness) written in kardashev —
 //! against the Rust
 //! reference emitter. Since v0.166 every corpus file is classified and
 //! compared in BOTH modes: `cdump <file>` prints the Program lowering,
@@ -122,6 +125,12 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s09_structs/err_print_struct.ks",                     // E0110
     "tests/spec/s09_structs/err_struct_equality.ks",                  // E0110
     "tests/spec/s09_structs/err_unknown_field_access.ks",             // E0166
+    "tests/spec/s10_methods/err_assoc_fn_on_value.ks",                // E0172
+    "tests/spec/s10_methods/err_method_arg_type_mismatch.ks",         // E0110
+    "tests/spec/s10_methods/err_method_arity.ks",                     // E0171
+    "tests/spec/s10_methods/err_static_call_missing_self.ks",         // E0171
+    "tests/spec/s10_methods/err_unknown_assoc_fn.ks",                 // E0173
+    "tests/spec/s10_methods/err_unknown_method.ks",                   // E0171
     "tests/spec/s14_arrays/index_assign_const_err.ks",                // E0223
     "tests/spec/s14_arrays/index_assign_param_err.ks",                // E0223
     "tests/spec/s14_arrays/index_non_array_err.ks",                   // E0220
@@ -157,8 +166,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 140;
-const MIN_C_COMPARED_TEST: usize = 155;
+const MIN_C_COMPARED_PROGRAM: usize = 150;
+const MIN_C_COMPARED_TEST: usize = 165;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -281,7 +290,11 @@ fn det_expr(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
             fields.iter().find_map(|fi| det_expr(sn, &fi.value))
         }
         Expr::StructType { .. } => Some(("struct-type", pos)),
-        Expr::MethodCall { .. } => Some(("method-call", pos)),
+        // A method / associated call is in the subset (v0.170): the
+        // receiver walks, then the arguments in order.
+        Expr::MethodCall { receiver, args, .. } => {
+            det_expr(sn, receiver).or_else(|| args.iter().find_map(|x| det_expr(sn, x)))
+        }
         Expr::Null { .. } => Some(("null", pos)),
         Expr::Orelse { .. } => Some(("orelse", pos)),
         Expr::Unwrap { .. } => Some(("unwrap", pos)),
@@ -643,18 +656,15 @@ fn detect_flat(files: &[FlatFile], program_mode: bool) -> Option<(String, usize)
                     .and_then(|t| det_type(&sn, t))
                     .or_else(|| det_expr(&sn, &c.value)),
                 Item::Test(t) => det_block(&sn, &t.body),
-                // A plain data-struct declaration is a subset item
-                // (v0.169): field types walk in order; the FIRST method
-                // is the finding.
+                // A struct declaration is a subset item (v0.169 fields;
+                // v0.170 admits its METHODS): field types walk in order,
+                // then every struct function exactly like a top-level one
+                // (a pointer receiver is a `type-form` skip).
                 Item::Struct(s) => s
                     .fields
                     .iter()
                     .find_map(|fd| det_type(&sn, &fd.ty))
-                    .or_else(|| {
-                        s.methods
-                            .first()
-                            .map(|m| ("method", m.span.start))
-                    }),
+                    .or_else(|| s.methods.iter().find_map(|m| det_fn(&sn, m))),
                 Item::Enum(e) => Some(("enum", e.span.start)),
                 Item::Union(u) => Some(("union", u.span.start)),
                 Item::Import(_) => None,
@@ -1155,6 +1165,27 @@ fn selfhost_emit_differential_targeted_inputs() {
             "structs_typedef_dependency_order",
             "const Late = struct {\n    s: []u8,\n};\npub fn main() void {\n    var xs: [1]Late = [1]Late{ Late{ .s = \"z\" } };\n    var t: [2]i64 = [2]i64{ 1, 2 };\n    print(xs[0].s);\n    print(t[0]);\n}\n",
         ),
+        // -- struct methods + associated functions (v0.170) ----------------------
+        (
+            "methods_value_assoc_explicit_self",
+            "const Counter = struct {\n    n: i32,\n\n    fn get(self: Counter) i32 {\n        return self.n;\n    }\n\n    fn plus(self: Counter, k: i32) i32 {\n        return self.n + self.get() + k;\n    }\n\n    fn make(n: i32) Counter {\n        return Counter{ .n = n };\n    }\n\n    fn dead_method(self: Counter) i32 {\n        return 0 - self.n;\n    }\n};\n\nfn dead_fn() void {}\n\npub fn main() void {\n    var c: Counter = Counter.make(4);\n    print(c.get());\n    print(c.plus(2));\n    print(Counter.plus(c, 5));\n    print(Counter.make(1).get());\n}\n",
+        ),
+        (
+            "methods_name_level_liveness_across_structs",
+            "const A = struct {\n    x: i64,\n    fn ping(self: A) i64 { return self.x; }\n};\nconst B = struct {\n    y: i64,\n    fn ping(self: B) i64 { return self.y * 2; }\n    fn solo(self: B) i64 { return 9; }\n};\npub fn main() void {\n    var a: A = A{ .x = 3 };\n    print(a.ping());\n}\n",
+        ),
+        (
+            "methods_sig_interning_and_string_args",
+            "fn helper(xs: []i64) usize { return xs.len; }\n\nconst S = struct {\n    id: i64,\n\n    fn tag(self: S, name: []u8) usize {\n        return name.len + @as(usize, self.id);\n    }\n};\n\npub fn main() void {\n    var s: S = S{ .id = 2 };\n    print(s.tag(\"ab\"));\n    var al: Allocator = c_allocator();\n    var q: []i64 = alloc(al, i64, 1);\n    print(helper(q));\n    free(al, q);\n}\n",
+        ),
+        (
+            "methods_field_vs_method_namespace",
+            "const P = struct {\n    v: i64,\n\n    fn v2(self: P) i64 { return self.v * 2; }\n};\npub fn main() void {\n    var p: P = P{ .v = 7 };\n    print(p.v);\n    print(p.v2());\n    p.v = 9;\n    print(p.v2());\n}\n",
+        ),
+        (
+            "methods_on_elements_and_test_mode",
+            "const Cell = struct {\n    v: i64,\n\n    fn dbl(self: Cell) i64 { return self.v * 2; }\n};\npub fn main() void {\n    var cs: [2]Cell = [2]Cell{ Cell{ .v = 1 }, Cell{ .v = 5 } };\n    print(cs[1].dbl());\n    var sl: []Cell = cs[0..2];\n    print(sl[0].dbl());\n}\ntest \"elems\" {\n    var c: Cell = Cell{ .v = 3 };\n    expect(c.dbl() == 6);\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
             "skip_slice_elem_f64",
@@ -1185,8 +1216,8 @@ fn selfhost_emit_differential_targeted_inputs() {
             "pub fn main() void {\n    if (true) {\n        var s: []f64 = q();\n    }\n}\n",
         ),
         (
-            "skip_method_call_on_value",
-            "pub fn main() void {\n    var s: []u8 = \"x\";\n    s.foo();\n}\n",
+            "skip_catch_expr",
+            "fn f() i64 { return 1; }\npub fn main() void {\n    var x: i64 = f() catch 0;\n    print(x);\n}\n",
         ),
         ("skip_nomain", "fn helper() void {}\n"),
         ("skip_empty_module", ""),
@@ -1223,8 +1254,12 @@ fn selfhost_emit_differential_targeted_inputs() {
             "pub fn main() void {\n    var xs: [1]i64 = [1]i64{ 1 };\n    lab: for (xs) |x| {\n        break :lab;\n    }\n}\n",
         ),
         (
-            "skip_struct_with_method",
-            "const P = struct {\n    x: i64,\n    fn get(self: P) i64 { return self.x; }\n};\npub fn main() void {\n    var p: P = P{ .x = 1 };\n    print(p.x);\n}\n",
+            "skip_ptr_receiver_method",
+            "const P = struct {\n    x: i64,\n    fn bump(self: *P) void { self.x += 1; }\n};\npub fn main() void {\n    var p: P = P{ .x = 1 };\n    print(p.x);\n}\n",
+        ),
+        (
+            "skip_self_type_in_method_ret",
+            "const P = struct {\n    x: i64,\n    fn me(self: P) Self { return self; }\n};\npub fn main() void { print(1); }\n",
         ),
         (
             "skip_struct_field_f64",

@@ -18,6 +18,56 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.170.0] — Self-hosting stage 12: struct methods + associated functions
+
+The self-hosted emitter's subset gains STRUCT FUNCTIONS — the
+C-identical corpus climbs 146/164 → 157/175 (Program/Test), absorbing
+`s10_methods`.
+
+- `selfhost/emit.ks` (stage 12): methods with VALUE receivers
+  (`self: Name` — a pointer receiver `self: *T` stays a `type-form`
+  skip; `Self` stays out) and associated functions, each lowering to a
+  free C function `kd_<Struct>_<method>` whose `self` is an ordinary
+  by-value parameter. All three call forms: `v.m(args)` (receiver
+  prepended as the leading argument), the explicit-self
+  `Type.m(v, args)` and the associated `Type.f(args)` (arguments
+  passed as-is — the emitter's associated gate is the struct-name
+  table alone, mirroring Rust). Emission order: free functions first,
+  then struct functions in declaration order, in both the
+  forward-declaration and definition passes.
+- Liveness gains the NAME-LEVEL method worklist (SPEC §43.1): every
+  `MethodCall{method}` contributes the method name receiver-
+  agnostically; a live name marks that method on EVERY struct and
+  walks each of their bodies; the Test-mode no-tests fallback marks
+  all methods live alongside all functions.
+- The intern replay gains sema's pass 1b — struct-function signatures
+  intern AFTER all fn signatures and BEFORE const annotations (structs
+  in item order, methods in declaration order, params left-to-right
+  then return; a `self` receiver's annotation is NEVER resolved and
+  interns nothing) — and pass 3 walks method bodies in the same item
+  loop as fn/test bodies, binding `self` to the ENCLOSING STRUCT
+  regardless of its written annotation (the sema rule) while the
+  emitter binds `resolve_ty` of the annotation (the emitter rule) —
+  both mirrored faithfully. The body scan's associated-call gate
+  replays sema exactly: an Ident receiver naming a struct AND not
+  shadowed by a value binding checks only the arguments.
+- Differential (`selfhost_emit.rs`): the mirrored detector walks
+  struct methods exactly like top-level fns (`det_fn` — a `comptime`
+  method param is `generic-param`, a pointer receiver `type-form`) and
+  admits `MethodCall` (receiver, then args). 6 new sema-invalid pins
+  (`s10_methods/err_*`); floors 140/155 → 150/165 (157/175 observed);
+  5 new in-subset targeted cases (assoc/value/explicit-self, name-
+  level liveness across structs, signature interning with strings,
+  field-vs-method namespace, element receivers + test mode) and 2 new
+  skip cases (pointer receiver, `Self` return); the stale
+  `skip_method_call_on_value` became `skip_catch_expr`.
+- Suite (`tests/selfhost/emit_suite.ks`): 54 → 56 tests — the
+  `kd_<Struct>_<method>` naming/decl shapes, all three call forms
+  byte-for-byte, sibling calls through `self`, name-level liveness
+  (both structs' `ping` emit, `dead` drops, no-tests Test mode keeps
+  everything). All 705 corpus files keep three-bucket agreement in
+  both modes; method programs verified end-to-end at runtime.
+
 ## [0.169.0] — Self-hosting stage 11: plain data structs
 
 The self-hosted emitter's subset gains STRUCTS — the C-identical corpus
