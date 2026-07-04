@@ -1,4 +1,4 @@
-// cdump.ks — driver for the self-hosted subset C emitter (v0.161–v0.166).
+// cdump.ks — driver for the self-hosted subset C emitter (v0.161–v0.169).
 //
 //   kard run selfhost/cdump.ks -- <file.ks> [test]
 //

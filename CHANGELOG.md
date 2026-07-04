@@ -18,6 +18,58 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.169.0] — Self-hosting stage 11: plain data structs
+
+The self-hosted emitter's subset gains STRUCTS — the C-identical corpus
+climbs 122/140 → 146/164 (Program/Test), taking `s09_structs` and the
+struct-flavored `s15` slicing cases.
+
+- `selfhost/emit.ks` (stage 11): `const Name = struct { f: T, … };`
+  declarations (data only — a struct with METHODS skips as `method`),
+  nominal struct types anywhere a type may appear (params, returns,
+  annotations, `[N]Struct` arrays, `[]Struct` slices), literals
+  `Name{ .f = e, … }` (C99 designated compound literal in SOURCE order,
+  `{0}` when empty, `char _unused;` for the empty struct's typedef),
+  field reads (`(<base>).kd_<f>`; the array/slice `.len` forms keep
+  precedence exactly as in Rust), aggregate copies, and GENERALIZED
+  place-assignment: any field/index chain rooted at a name — plain and
+  compound — including the `_at` element-pointer lowering for places
+  that pass THROUGH an index (`cs[i].v += 10` hoists `__kd_pl{k}`
+  sharing the `__kd_idx` counter; one index evaluation, one bounds
+  check), and `xs[i].buf[lo..hi]` views spelling their array base as an
+  lvalue so the view aims at the element's REAL storage.
+- The typedef section is now the full DEPENDENCY WALK: struct seeds in
+  declaration order, then arrays, then slices (each table in first-
+  intern order), each node's deps emitted first through a seen-set —
+  a struct with an array field pulls `kd_arr_…` above itself; arrays/
+  slices of structs mangle `struct_<Name>` (`kd_arr_struct_Cell_2`,
+  `kd_slice_struct_Cell`). v0.168's arrays-then-slices was this walk's
+  struct-free special case. The interning replay gains sema's pass
+  0a/0b: struct names, then field types in declaration order (field
+  slices/arrays intern BEFORE the signature pass); body scans replay
+  `check_struct_lit` (initializer values in source order) and
+  `resolve_place`/`resolve_index_base` (each index expression before
+  its base, outer chains before inner). ET codes gain two disjoint
+  bands: structs at `ET_STRUCT_BASE + id`, struct-element slices at
+  `ET_SLICE_STRUCT_BASE + id` (scalar slices keep their v0.164 codes).
+- Differential (`selfhost_emit.rs`): the mirrored detector collects the
+  flattened module's struct names first (any type position may name any
+  declared struct); field access and struct literals walk instead of
+  skipping; place chains walk bases-inward with a name-root gate;
+  `Item::Struct` admits data structs (first method = the finding). 14
+  new sema-invalid pins (the `s09_structs/err_*` family); floors raised
+  to ≥140 Program / ≥155 Test (146/164 observed); 7 new in-subset
+  targeted cases + 2 reworked skip cases (`skip_place_root_call`,
+  `skip_method_call_on_value`) + 2 new skip cases (struct-with-method,
+  `f64` field).
+- Suite (`tests/selfhost/emit_suite.ks`): 50 → 54 tests — typedef
+  shapes/dependency order/empty struct, literal + field write shapes,
+  the `_at` chain lowering with the shared counter pinned byte-for-byte
+  (`__kd_pl0` then `__kd_idx1`), and the indexed-element array view.
+  Updated 4 pre-v0.169 detector tests whose constructs joined the
+  subset. All 705 corpus files keep three-bucket agreement in both
+  modes; struct programs verified end-to-end at runtime.
+
 ## [0.168.0] — Self-hosting stage 10: fixed arrays `[N]T` + `for`
 
 The self-hosted emitter's subset gains FIXED ARRAYS and `for` loops —

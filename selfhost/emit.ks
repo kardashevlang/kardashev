@@ -1,7 +1,8 @@
-// emit.ks — self-host stages 3–10 (v0.161–v0.168): a C emitter for the
+// emit.ks — self-host stages 3–11 (v0.161–v0.169): a C emitter for the
 // SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
-// `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, and — v0.168 —
-// fixed arrays `[N]T` with array literals and `for` loops), written in
+// `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
+// `[N]T` with array literals and `for` loops, and — v0.169 — plain data
+// STRUCTS), written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
 // the Rust emitter's output in BOTH `EmitMode::Program` and (v0.166)
@@ -15,8 +16,13 @@
 // scalar slice, v0.162 added strings, v0.163 index writes + the allocator
 // builtins, v0.164 generalized slices to `[]T` and added `@as`, v0.165 the
 // slicing view `s[lo..hi]`, v0.166 `test` blocks + the Test mode, v0.167
-// `@import` resolution (in `modres.ks`), v0.168 adds fixed arrays `[N]T`
-// with literal sizes, array literals `[N]T{ … }`, and unlabeled `for`):
+// `@import` resolution (in `modres.ks`), v0.168 fixed arrays `[N]T` with
+// literal sizes, array literals `[N]T{ … }`, and unlabeled `for`, v0.169
+// adds plain data structs — `const Name = struct { f: T, … };`
+// declarations (methods stay out), nominal struct types anywhere a type
+// may appear (params, returns, annotations, array/slice elements),
+// literals `Name{ .f = e, … }`, field reads, and place-assignment CHAINS
+// through fields and indexes with the `_at` element-pointer lowering):
 //
 //   - types: `i32`, `i64`, `bool`, `void`, `u8`, `usize`, `Allocator` bare
 //     names, plus `[]T` slices AND `[N]T` fixed arrays (literal `N` only —
@@ -59,6 +65,13 @@
 // first-intern order, and the interning replay is now TYPE-AWARE (a
 // `for` elem binding or an array-base `s[lo..hi]` interns the element
 // type at the point sema resolves it, so the scan carries scopes).
+// v0.169 completes the walk: `kd_struct_<Name>` typedefs seed FIRST (id
+// order), each node's dependencies — a struct's field types, an
+// array's/slice's element — emit before it (post-order, seen-set), so a
+// struct with an array field pulls that array's block above itself and
+// an array OF structs pulls the struct. Struct declarations replay as
+// sema's pass 0a/0b (names, then field types in declaration order —
+// interning field slices/arrays BEFORE the signature pass).
 //
 // Everything else is OUT of the subset. `es_detect` walks the AST in a fixed
 // depth-first order and reports the FIRST unsupported construct as a
@@ -141,25 +154,41 @@ pub const ET_ALLOC: i64 = 8;
 // one code per element type. `[]u8` keeps a named constant since the string
 // machinery pins it specifically. Fixed arrays (v0.168) are a second
 // family: `ET_ARR_BASE + <index into the emitter's interned-array table>`
-// (an `(elem, len)` pair cannot pack into a flat code range).
+// (an `(elem, len)` pair cannot pack into a flat code range). Structs
+// (v0.169) are a third: `ET_STRUCT_BASE + <struct id>` (declaration order),
+// and a slice OVER a struct element moves to its own disjoint band
+// `ET_SLICE_STRUCT_BASE + <struct id>` so no arithmetic combination of the
+// families can collide (scalar-elem slices keep their v0.164 codes).
 pub const ET_SLICE_BASE: i64 = 100;
 pub const ET_SLICE_U8: i64 = 105;
 pub const ET_ARR_BASE: i64 = 10000;
+pub const ET_STRUCT_BASE: i64 = 1000000000;
+pub const ET_SLICE_STRUCT_BASE: i64 = 2000000000;
 
 pub fn et_slice_of(elem: i64) i64 {
+    if (elem >= ET_STRUCT_BASE) {
+        return ET_SLICE_STRUCT_BASE + (elem - ET_STRUCT_BASE);
+    }
     return ET_SLICE_BASE + elem;
 }
 
 pub fn et_is_slice(t: i64) bool {
-    return t >= ET_SLICE_BASE and t < ET_ARR_BASE;
+    return (t >= ET_SLICE_BASE and t < ET_ARR_BASE) or t >= ET_SLICE_STRUCT_BASE;
 }
 
 pub fn et_slice_elem(t: i64) i64 {
+    if (t >= ET_SLICE_STRUCT_BASE) {
+        return ET_STRUCT_BASE + (t - ET_SLICE_STRUCT_BASE);
+    }
     return t - ET_SLICE_BASE;
 }
 
 pub fn et_is_arr(t: i64) bool {
-    return t >= ET_ARR_BASE;
+    return t >= ET_ARR_BASE and t < ET_STRUCT_BASE;
+}
+
+pub fn et_is_struct(t: i64) bool {
+    return t >= ET_STRUCT_BASE and t < ET_SLICE_STRUCT_BASE;
 }
 
 /// `StructTable::slice_c_name` over the subset: `kd_slice_<type_mangle(elem)>`
@@ -284,9 +313,29 @@ pub const Det = struct {
     found: bool,
     word: []u8,
     pos: usize,
+    // The module's item-chain head (v0.169): a type reference anywhere may
+    // name any DECLARED struct (sema pass 0a interns every name before
+    // field/signature resolution; E0160 ordering is sema's rejection, not
+    // subset membership), so the walk consults the item list by need.
+    droot: i32,
 
-    fn init(src: []u8, nodes: []Node) Self {
-        return Det{ .src = src, .nodes = nodes, .found = false, .word = "", .pos = 0 };
+    fn init(src: []u8, nodes: []Node, root: i32) Self {
+        return Det{ .src = src, .nodes = nodes, .found = false, .word = "", .pos = 0, .droot = root };
+    }
+
+    /// Whether `name` names a struct declared anywhere in the module.
+    fn is_struct_name(self: *Self, name: []u8) bool {
+        var cur: i32 = self.droot;
+        while (cur >= 0) {
+            var u: usize = @as(usize, cur);
+            if (self.nodes[u].kind == ND_STRUCT) {
+                if (str_eq(self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen], name)) {
+                    return true;
+                }
+            }
+            cur = self.nodes[u].next;
+        }
+        return false;
     }
 
     /// Record the first finding; later ones are ignored.
@@ -319,14 +368,46 @@ pub const Det = struct {
         }
         var name: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
         if ((fl & F_ARRLIT) != 0 or (fl & F_SLICE) != 0) {
-            // `[N]T` / `[]T` over the five scalar element types.
-            if (!et_is_slice_elem(et_from_name(name))) {
+            // `[N]T` / `[]T` over the five scalar element types, or a
+            // declared struct element (v0.169).
+            if (!et_is_slice_elem(et_from_name(name)) and !self.is_struct_name(name)) {
                 self.hit("type-name", self.nodes[u].off);
             }
             return;
         }
-        if (et_from_name(name) == ET_NONE) {
+        if (et_from_name(name) == ET_NONE and !self.is_struct_name(name)) {
             self.hit("type-name", self.nodes[u].off);
+        }
+    }
+
+    /// Whether a place chain (FIELD/INDEX steps) bottoms out at a bare
+    /// name — the only assignable root in the subset (sema: E0167/E0223
+    /// otherwise, but a call/deref ROOT is out of the subset entirely).
+    fn place_rooted_in_name(self: *Self, n: i32) bool {
+        if (n < 0) { return false; }
+        var u: usize = @as(usize, n);
+        var k: u8 = self.nodes[u].kind;
+        if (k == ND_IDENT) { return true; }
+        if (k == ND_FIELD or k == ND_INDEX) {
+            return self.place_rooted_in_name(self.nodes[u].a);
+        }
+        return false;
+    }
+
+    /// Walk a place chain: bases inward, each index expression where it
+    /// sits (the root name itself carries nothing to check).
+    fn check_place(self: *Self, n: i32) void {
+        if (self.found or n < 0) { return; }
+        var u: usize = @as(usize, n);
+        var k: u8 = self.nodes[u].kind;
+        if (k == ND_INDEX) {
+            self.check_place(self.nodes[u].a);
+            self.check_expr(self.nodes[u].b);
+            return;
+        }
+        if (k == ND_FIELD) {
+            self.check_place(self.nodes[u].a);
+            return;
         }
     }
 
@@ -398,14 +479,9 @@ pub const Det = struct {
             return;
         }
         if (k == ND_FIELD) {
-            // The one field access in the subset: `.len` (v0.162, on a
-            // slice for validated input); any other name is out. The base
-            // is walked either way.
-            var fname: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
-            if (!str_eq(fname, "len")) {
-                self.hit("field", off);
-                return;
-            }
+            // Field access is in the subset (v0.169: struct fields; the
+            // `.len` special forms since v0.162) — the walk sees only the
+            // base, the name resolves in sema/emission.
             self.check_expr(self.nodes[u].a);
             return;
         }
@@ -442,7 +518,18 @@ pub const Det = struct {
             return;
         }
         if (k == ND_FLOAT) { self.hit("float", off); return; }
-        if (k == ND_SLIT) { self.hit("struct-lit", off); return; }
+        if (k == ND_SLIT) {
+            // A struct literal `Name{ .f = e, … }` is in the subset
+            // (v0.169): the initializer values walk in source order (the
+            // name is sema's business — an unknown one is E0163).
+            var fcur: i32 = self.nodes[u].a;
+            while (fcur >= 0) {
+                if (self.found) { return; }
+                self.check_expr(self.nodes[@as(usize, fcur)].a);
+                fcur = self.nodes[@as(usize, fcur)].next;
+            }
+            return;
+        }
         if (k == ND_STRUCTTYPE) { self.hit("struct-type", off); return; }
         if (k == ND_MCALL) { self.hit("method-call", off); return; }
         if (k == ND_NULL) { self.hit("null", off); return; }
@@ -501,22 +588,17 @@ pub const Det = struct {
             return;
         }
         if (k == ND_PASSIGN) {
-            // The one place-assignment in the subset (v0.163): a DIRECT
-            // index write `s[i] (op)= e` — the place is an `Index` whose
-            // base does not itself pass through an index (that shape takes
-            // the Rust `_at` lowering, which stays out). Walk the place's
-            // base, its index, then the value, in that order.
-            var place: i32 = self.nodes[u].a;
-            if (place >= 0) {
-                var pu: usize = @as(usize, place);
-                if (self.nodes[pu].kind == ND_INDEX and !es_chain_has_index(self.nodes, self.nodes[pu].a)) {
-                    self.check_expr(self.nodes[pu].a);
-                    self.check_expr(self.nodes[pu].b);
-                    self.check_expr(self.nodes[u].b);
-                    return;
-                }
+            // A place-assignment over any FIELD/INDEX chain rooted at a
+            // NAME is in the subset (v0.169; the v0.163 form was the
+            // direct index write). The walk descends the chain — each
+            // index expression where it sits — then the value; a place
+            // rooted in anything else (a call, a deref, …) stays out.
+            if (!self.place_rooted_in_name(self.nodes[u].a)) {
+                self.hit("place-assign", off);
+                return;
             }
-            self.hit("place-assign", off);
+            self.check_place(self.nodes[u].a);
+            self.check_expr(self.nodes[u].b);
             return;
         }
         if (k == ND_RETURN) {
@@ -596,7 +678,7 @@ pub fn es_detect(src: []u8, nodes: []Node, root: i32) Det {
 /// the `nomain` gate — Test-mode emission needs no `main` (a module without
 /// test blocks lowers to the trivial harness with EVERY function live).
 pub fn es_detect_mode(src: []u8, nodes: []Node, root: i32, program_mode: bool) Det {
-    var d: Det = Det.init(src, nodes);
+    var d: Det = Det.init(src, nodes, root);
     if (program_mode) {
         var has_main: bool = false;
         var cur0: i32 = root;
@@ -628,7 +710,17 @@ pub fn es_detect_mode(src: []u8, nodes: []Node, root: i32, program_mode: bool) D
             // body is an ordinary statement block.
             d.check_block(nodes[u].a);
         } else if (k == ND_STRUCT) {
-            d.hit("struct", nodes[u].off);
+            // A plain data-struct declaration is a subset item (v0.169):
+            // every field type must be admissible; methods (v0.113+) are
+            // out — the FIRST method is the finding.
+            var fcur: i32 = nodes[u].a;
+            while (fcur >= 0 and !d.found) {
+                d.check_type(nodes[@as(usize, fcur)].a);
+                fcur = nodes[@as(usize, fcur)].next;
+            }
+            if (!d.found and nodes[u].b >= 0) {
+                d.hit("method", nodes[@as(usize, nodes[u].b)].off);
+            }
         } else if (k == ND_ENUM) {
             d.hit("enum", nodes[u].off);
         } else if (k == ND_UNION) {
@@ -889,6 +981,18 @@ pub const Em = struct {
     // Monotonic counter for the `__kd_for{N}`/`__kd_fi{N}` loop temporaries
     // (`Emitter::for_counter`), reset per function AND per test body.
     for_count: i64,
+    // The struct table (v0.169) — the sema pass-0a/0b mirror. Ids are
+    // declaration order; fields live flat in the `sf_*` arrays, one
+    // `(start, count)` window per struct. Field types are ET codes.
+    st_name_off: []i64,
+    st_name_len: []i64,
+    st_f_start: []i64,
+    st_f_count: []i64,
+    st_count: usize,
+    sf_name_off: []i64,
+    sf_name_len: []i64,
+    sf_ty: []i64,
+    sf_count: usize,
     // `EmitMode::Test` (v0.166): swaps the entry-point wiring for the test
     // harness, roots liveness at the test bodies (every function live when
     // there are none), and enables the statement-level `expect` lowering.
@@ -921,6 +1025,15 @@ pub const Em = struct {
             .ar_len_ = alloc(a, i64, 8),
             .ar_count = 0,
             .for_count = 0,
+            .st_name_off = alloc(a, i64, 8),
+            .st_name_len = alloc(a, i64, 8),
+            .st_f_start = alloc(a, i64, 8),
+            .st_f_count = alloc(a, i64, 8),
+            .st_count = 0,
+            .sf_name_off = alloc(a, i64, 16),
+            .sf_name_len = alloc(a, i64, 16),
+            .sf_ty = alloc(a, i64, 16),
+            .sf_count = 0,
             .is_test = false,
         };
     }
@@ -969,7 +1082,7 @@ pub const Em = struct {
     fn arr_c_name(self: *Self, a: Allocator, t: i64) []u8 {
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, "kd_arr_");
-        sb.append(a, et_c_name(self.arr_elem_of(t)));
+        sb.append(a, self.mangle_of(a, self.arr_elem_of(t)));
         sb.append(a, "_");
         sb.append_i64(a, self.arr_len_of(t));
         var s: []u8 = sb.build(a);
@@ -977,11 +1090,203 @@ pub const Em = struct {
         return s;
     }
 
-    /// `Emitter::cty_of` with the array family included: arrays spell
-    /// through the table, everything else through `et_c_name`.
+    /// `Emitter::cty_of` with the array, struct and slice families
+    /// included: arrays/structs/struct-elem slices spell through their
+    /// tables, everything else through `et_c_name`.
     fn cty_of(self: *Self, a: Allocator, t: i64) []u8 {
         if (et_is_arr(t)) { return self.arr_c_name(a, t); }
+        if (et_is_struct(t)) { return self.st_c_name(a, t); }
+        if (et_is_slice(t)) { return self.sl_c_name(a, t); }
         return et_c_name(t);
+    }
+
+    // -- the struct table (sema pass 0a/0b mirror, v0.169) ---------------------
+
+    /// The struct id for a source name, as an ET code (`ET_STRUCT_BASE +
+    /// id`), or `ET_NONE` when no struct of that name is declared.
+    fn st_code_of(self: *Self, name: []u8) i64 {
+        var i: usize = 0;
+        while (i < self.st_count) : (i += 1) {
+            var off: usize = @as(usize, self.st_name_off[i]);
+            var len: usize = @as(usize, self.st_name_len[i]);
+            if (str_eq(self.src[off .. off + len], name)) {
+                return ET_STRUCT_BASE + @as(i64, i);
+            }
+        }
+        return ET_NONE;
+    }
+
+    /// `StructTable::c_name`: `kd_struct_<Name>`.
+    fn st_c_name(self: *Self, a: Allocator, t: i64) []u8 {
+        var i: usize = @as(usize, t - ET_STRUCT_BASE);
+        var off: usize = @as(usize, self.st_name_off[i]);
+        var len: usize = @as(usize, self.st_name_len[i]);
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "kd_struct_");
+        sb.append(a, self.src[off .. off + len]);
+        var out: []u8 = sb.build(a);
+        sb.deinit(a);
+        return out;
+    }
+
+    /// `StructInfo::field_type`: the ET code of field `fname` of the struct
+    /// coded `t`, or `ET_NONE` when it has no such field.
+    fn st_field_ty(self: *Self, t: i64, fname: []u8) i64 {
+        var i: usize = @as(usize, t - ET_STRUCT_BASE);
+        var start: usize = @as(usize, self.st_f_start[i]);
+        var n: usize = @as(usize, self.st_f_count[i]);
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            var off: usize = @as(usize, self.sf_name_off[start + j]);
+            var len: usize = @as(usize, self.sf_name_len[start + j]);
+            if (str_eq(self.src[off .. off + len], fname)) {
+                return self.sf_ty[start + j];
+            }
+        }
+        return ET_NONE;
+    }
+
+    /// `StructTable::type_mangle` over the subset: scalars spell their C
+    /// name, a struct spells `struct_<Name>` (no `kd_` prefix).
+    fn mangle_of(self: *Self, a: Allocator, t: i64) []u8 {
+        if (et_is_struct(t)) {
+            var i: usize = @as(usize, t - ET_STRUCT_BASE);
+            var off: usize = @as(usize, self.st_name_off[i]);
+            var len: usize = @as(usize, self.st_name_len[i]);
+            var sb: StrBuilder = StrBuilder.init(a);
+            sb.append(a, "struct_");
+            sb.append(a, self.src[off .. off + len]);
+            var out: []u8 = sb.build(a);
+            sb.deinit(a);
+            return out;
+        }
+        return et_c_name(t);
+    }
+
+    /// `slice_c_name`: `kd_slice_<type_mangle(elem)>` — the static-string
+    /// fast path for scalar elements, built fresh for struct elements.
+    fn sl_c_name(self: *Self, a: Allocator, t: i64) []u8 {
+        var e: i64 = et_slice_elem(t);
+        if (!et_is_struct(e)) { return et_slice_c_name(t); }
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "kd_slice_");
+        sb.append(a, self.mangle_of(a, e));
+        var out: []u8 = sb.build(a);
+        sb.deinit(a);
+        return out;
+    }
+
+    /// Sema pass 0a/0b (v0.169): register every struct name in item order,
+    /// then resolve every field type in item order (fields in declaration
+    /// order) — interning any `[]T`/`[N]T` field exactly where sema's
+    /// `wrap_type` does. Runs BEFORE the signature interning pass.
+    fn st_collect(self: *Self, a: Allocator) void {
+        // Pass 0a: names.
+        var cur: i32 = self.root;
+        while (cur >= 0) {
+            var u: usize = @as(usize, cur);
+            if (self.nodes[u].kind == ND_STRUCT) {
+                if (self.st_count == self.st_name_off.len) {
+                    var g0: []i64 = alloc(a, i64, self.st_name_off.len * 2);
+                    var g1: []i64 = alloc(a, i64, self.st_name_len.len * 2);
+                    var g2: []i64 = alloc(a, i64, self.st_f_start.len * 2);
+                    var g3: []i64 = alloc(a, i64, self.st_f_count.len * 2);
+                    var i0: usize = 0;
+                    while (i0 < self.st_count) : (i0 += 1) {
+                        g0[i0] = self.st_name_off[i0];
+                        g1[i0] = self.st_name_len[i0];
+                        g2[i0] = self.st_f_start[i0];
+                        g3[i0] = self.st_f_count[i0];
+                    }
+                    free(a, self.st_name_off);
+                    free(a, self.st_name_len);
+                    free(a, self.st_f_start);
+                    free(a, self.st_f_count);
+                    self.st_name_off = g0;
+                    self.st_name_len = g1;
+                    self.st_f_start = g2;
+                    self.st_f_count = g3;
+                }
+                self.st_name_off[self.st_count] = @as(i64, self.nodes[u].xoff);
+                self.st_name_len[self.st_count] = @as(i64, self.nodes[u].xlen);
+                self.st_f_start[self.st_count] = 0;
+                self.st_f_count[self.st_count] = 0;
+                self.st_count += 1;
+            }
+            cur = self.nodes[u].next;
+        }
+        // Pass 0b: field types (interning slice/array fields in order).
+        var sid: usize = 0;
+        cur = self.root;
+        while (cur >= 0) {
+            var u2: usize = @as(usize, cur);
+            if (self.nodes[u2].kind == ND_STRUCT) {
+                self.st_f_start[sid] = @as(i64, self.sf_count);
+                var nf: i64 = 0;
+                var fcur: i32 = self.nodes[u2].a;
+                while (fcur >= 0) {
+                    var fu: usize = @as(usize, fcur);
+                    var fty: i64 = self.st_resolve_field(a, self.nodes[fu].a);
+                    if (self.sf_count == self.sf_name_off.len) {
+                        var h0: []i64 = alloc(a, i64, self.sf_name_off.len * 2);
+                        var h1: []i64 = alloc(a, i64, self.sf_name_len.len * 2);
+                        var h2: []i64 = alloc(a, i64, self.sf_ty.len * 2);
+                        var j0: usize = 0;
+                        while (j0 < self.sf_count) : (j0 += 1) {
+                            h0[j0] = self.sf_name_off[j0];
+                            h1[j0] = self.sf_name_len[j0];
+                            h2[j0] = self.sf_ty[j0];
+                        }
+                        free(a, self.sf_name_off);
+                        free(a, self.sf_name_len);
+                        free(a, self.sf_ty);
+                        self.sf_name_off = h0;
+                        self.sf_name_len = h1;
+                        self.sf_ty = h2;
+                    }
+                    self.sf_name_off[self.sf_count] = @as(i64, self.nodes[fu].xoff);
+                    self.sf_name_len[self.sf_count] = @as(i64, self.nodes[fu].xlen);
+                    self.sf_ty[self.sf_count] = fty;
+                    self.sf_count += 1;
+                    nf += 1;
+                    fcur = self.nodes[fu].next;
+                }
+                self.st_f_count[sid] = nf;
+                sid += 1;
+            }
+            cur = self.nodes[u2].next;
+        }
+    }
+
+    /// `resolve_field_type` + `wrap_type` over the subset: the base name
+    /// resolves builtin-first then struct (any declaration position — the
+    /// forward/cyclic E0160 is sema's rejection, not emission's), and a
+    /// slice/array wrapper INTERNS its composite exactly like a body
+    /// annotation. An unresolvable field falls back to `i64` (sema records
+    /// the same fallback so field lookups still succeed).
+    fn st_resolve_field(self: *Self, a: Allocator, tn: i32) i64 {
+        var u: usize = @as(usize, tn);
+        var base: i64 = et_from_name(self.xname(tn));
+        if (base == ET_NONE) { base = self.st_code_of(self.xname(tn)); }
+        if ((self.nodes[u].flags & F_SLICE) != 0) {
+            if (base == ET_NONE) { return ET_I64; }
+            self.intern_elem(a, base);
+            return et_slice_of(base);
+        }
+        if ((self.nodes[u].flags & F_ARRLIT) != 0) {
+            if (base == ET_NONE) { return ET_I64; }
+            return self.arr_intern(a, base, self.nodes[u].val);
+        }
+        if (base == ET_NONE) { return ET_I64; }
+        return base;
+    }
+
+    /// A bare type-name's ET code: builtins first, then declared structs
+    /// (the `base_type` resolution order), else `ET_NONE`.
+    fn base_code(self: *Self, name: []u8) i64 {
+        var t: i64 = et_from_name(name);
+        if (t != ET_NONE) { return t; }
+        return self.st_code_of(name);
     }
 
     // -- raw output -----------------------------------------------------------
@@ -1150,7 +1455,7 @@ pub const Em = struct {
             // `[N]T` maps back to the interned array (the scan interned
             // every written one); the miss fallback mirrors the Rust
             // `unwrap_or(base)` (base = the element, `Void` if unknown).
-            var ae: i64 = et_from_name(self.xname(n));
+            var ae: i64 = self.base_code(self.xname(n));
             if (ae == ET_NONE) { return ET_VOID; }
             var alen: i64 = self.nodes[u].val;
             var i: usize = 0;
@@ -1162,11 +1467,11 @@ pub const Em = struct {
             return ae;
         }
         if ((self.nodes[u].flags & F_SLICE) != 0) {
-            var e: i64 = et_from_name(self.xname(n));
+            var e: i64 = self.base_code(self.xname(n));
             if (e == ET_NONE) { return ET_VOID; }
             return et_slice_of(e);
         }
-        var t: i64 = et_from_name(self.xname(n));
+        var t: i64 = self.base_code(self.xname(n));
         if (t == ET_NONE) { return ET_VOID; }
         return t;
     }
@@ -1181,9 +1486,9 @@ pub const Em = struct {
             // `kd_arr_<type_mangle(base)>_<N>` spelled directly; an
             // unresolvable element goes through the cty base fallback
             // (`int64_t`), mirroring the Rust arm.
-            var ae: i64 = et_from_name(self.xname(n));
+            var ae: i64 = self.base_code(self.xname(n));
             var tag: []u8 = "int64_t";
-            if (ae != ET_NONE) { tag = et_c_name(ae); }
+            if (ae != ET_NONE) { tag = self.mangle_of(a, ae); }
             var sb: StrBuilder = StrBuilder.init(a);
             sb.append(a, "kd_arr_");
             sb.append(a, tag);
@@ -1194,13 +1499,13 @@ pub const Em = struct {
             return s;
         }
         if ((self.nodes[u].flags & F_SLICE) != 0) {
-            var e: i64 = et_from_name(self.xname(n));
+            var e: i64 = self.base_code(self.xname(n));
             if (e == ET_NONE) { return "kd_slice_int64_t"; }
-            return et_slice_c_name(et_slice_of(e));
+            return self.sl_c_name(a, et_slice_of(e));
         }
-        var t: i64 = et_from_name(self.xname(n));
+        var t: i64 = self.base_code(self.xname(n));
         if (t == ET_NONE) { return "int64_t"; }
-        return et_c_name(t);
+        return self.cty_of(a, t);
     }
 
     // -- const evaluation -------------------------------------------------------------
@@ -1383,13 +1688,26 @@ pub const Em = struct {
             return ET_NONE;
         }
         if (k == ND_FIELD) {
-            // `.len` is a `usize` on arrays (a compile-time constant) and
-            // slices alike; anything else is untypeable here.
+            // A struct base yields the named field's type (v0.169); `.len`
+            // is a `usize` on arrays (a compile-time constant) and slices
+            // alike; anything else is untypeable here. The struct arm
+            // precedes the `.len` arms exactly as in Rust — a struct field
+            // named `len` is an ordinary member.
             var bt: i64 = self.type_of_expr(self.nodes[u].a);
+            if (et_is_struct(bt)) {
+                var ft: i64 = self.st_field_ty(bt, self.xname(n));
+                if (ft == ET_NONE) { return ET_NONE; }
+                return ft;
+            }
             if (str_eq(self.xname(n), "len")) {
                 if (et_is_arr(bt) or et_is_slice(bt)) { return ET_USIZE; }
             }
             return ET_NONE;
+        }
+        if (k == ND_SLIT) {
+            // `Name{ … }` has the named struct's type (an unknown name is
+            // sema's E0163 — untypeable here).
+            return self.st_code_of(self.xname(n));
         }
         if (k == ND_INDEX) {
             // `a[i]` / `s[i]` yields the element type.
@@ -1558,7 +1876,7 @@ pub const Em = struct {
                 sb3.append(a, i3);
                 sb3.append(a, ")");
             } else if (et_is_slice(bt3)) {
-                sb3.append(a, et_slice_c_name(bt3));
+                sb3.append(a, self.sl_c_name(a, bt3));
                 sb3.append(a, "_get(");
                 sb3.append(a, b3);
                 sb3.append(a, ", ");
@@ -1575,6 +1893,54 @@ pub const Em = struct {
             var s3: []u8 = sb3.build(a);
             sb3.deinit(a);
             return s3;
+        }
+        if (k == ND_SLIT) {
+            // `Name{ .f = e, … }` → the C99 compound literal
+            // `((kd_struct_<Name>){ .kd_<f> = <v>, … })` (initializers in
+            // SOURCE order — C designated initializers reorder); the empty
+            // literal zero-initialises. An unresolvable name falls back to
+            // the canonical spelling (`kd_struct_<name>`), mirroring the
+            // Rust defensive arm.
+            var scn: []u8 = "";
+            var slc: i64 = self.st_code_of(self.xname(n));
+            if (slc != ET_NONE) {
+                scn = self.st_c_name(a, slc);
+            } else {
+                var sbn: StrBuilder = StrBuilder.init(a);
+                sbn.append(a, "kd_struct_");
+                sbn.append(a, self.xname(n));
+                scn = sbn.build(a);
+                sbn.deinit(a);
+            }
+            var fin: i32 = self.nodes[u].a;
+            if (fin < 0) {
+                var sbe: StrBuilder = StrBuilder.init(a);
+                sbe.append(a, "((");
+                sbe.append(a, scn);
+                sbe.append(a, "){0})");
+                var se: []u8 = sbe.build(a);
+                sbe.deinit(a);
+                return se;
+            }
+            var sbl: StrBuilder = StrBuilder.init(a);
+            sbl.append(a, "((");
+            sbl.append(a, scn);
+            sbl.append(a, "){ ");
+            var lfirst: bool = true;
+            while (fin >= 0) {
+                var fu: usize = @as(usize, fin);
+                if (!lfirst) { sbl.append(a, ", "); }
+                lfirst = false;
+                sbl.append(a, ".kd_");
+                sbl.append(a, self.src[self.nodes[fu].xoff .. self.nodes[fu].xoff + self.nodes[fu].xlen]);
+                sbl.append(a, " = ");
+                sbl.append(a, self.emit_expr(a, self.nodes[fu].a));
+                fin = self.nodes[fu].next;
+            }
+            sbl.append(a, " })");
+            var sl: []u8 = sbl.build(a);
+            sbl.deinit(a);
+            return sl;
         }
         if (k == ND_ALIT) {
             // `[N]T{ e0, e1, … }` → `((kd_arr_<tag>_<N>){ .data = { … } })`
@@ -1634,15 +2000,24 @@ pub const Em = struct {
             // the Rust format string. A slice base reads `.ptr`/`.len`;
             // the non-slice fallback (unreachable behind the detector)
             // mirrors the Rust `(<base>)` / `0` / `kd_slice_void` arms.
-            var bs4: []u8 = self.emit_expr(a, self.nodes[u].a);
+            // An ARRAY base reached through an index (`xs[i].buf[lo..hi]`,
+            // v0.169) spells as an LVALUE via `_at` — the by-value `_get`
+            // would view a dangling temporary copy.
+            var bn4: i32 = self.nodes[u].a;
+            var bs4: []u8 = "";
+            if (et_is_arr(self.type_of_expr(bn4)) and es_chain_has_index(self.nodes, bn4)) {
+                bs4 = self.emit_place(a, bn4);
+            } else {
+                bs4 = self.emit_expr(a, bn4);
+            }
             var lo4: []u8 = self.emit_expr(a, self.nodes[u].b);
             var hi4: []u8 = self.emit_expr(a, self.nodes[u].c);
             var bt4: i64 = self.type_of_expr(self.nodes[u].a);
             var sn4: []u8 = "kd_slice_void";
             if (et_is_arr(bt4)) {
-                sn4 = et_slice_c_name(et_slice_of(self.arr_elem_of(bt4)));
+                sn4 = self.sl_c_name(a, et_slice_of(self.arr_elem_of(bt4)));
             } else if (et_is_slice(bt4)) {
-                sn4 = et_slice_c_name(bt4);
+                sn4 = self.sl_c_name(a, bt4);
             }
             var sb4: StrBuilder = StrBuilder.init(a);
             sb4.append(a, "(( (");
@@ -1992,11 +2367,141 @@ pub const Em = struct {
     /// "array" panic message). Any non-index place takes the field-chain
     /// default (`(<place>) = (<value>);`) — equally unreachable behind the
     /// detector, mirrored for totality.
+    /// `Emitter::emit_index_addr`: lower `base[index]` to an element
+    /// POINTER via the `_at` helper — `kd_arr_<tag>_<N>_at(&(<base>), <i>)`
+    /// for an array (the base spelled as an lvalue, recursively), or
+    /// `kd_slice_<tag>_at(<base>, <i>)` for a slice (by value). The index
+    /// is emitted FIRST, exactly like the Rust method.
+    fn emit_index_addr(self: *Self, a: Allocator, basen: i32, idxn: i32) []u8 {
+        var i: []u8 = self.emit_expr(a, idxn);
+        var bt: i64 = self.type_of_expr(basen);
+        var sb: StrBuilder = StrBuilder.init(a);
+        if (et_is_arr(bt)) {
+            sb.append(a, self.arr_c_name(a, bt));
+            sb.append(a, "_at(&(");
+            sb.append(a, self.emit_place(a, basen));
+            sb.append(a, "), ");
+            sb.append(a, i);
+            sb.append(a, ")");
+        } else if (et_is_slice(bt)) {
+            sb.append(a, self.sl_c_name(a, bt));
+            sb.append(a, "_at(");
+            sb.append(a, self.emit_expr(a, basen));
+            sb.append(a, ", ");
+            sb.append(a, i);
+            sb.append(a, ")");
+        } else {
+            // Unreachable for validated input (`base` is an array/slice).
+            sb.append(a, "(&((");
+            sb.append(a, self.emit_expr(a, basen));
+            sb.append(a, ")[");
+            sb.append(a, i);
+            sb.append(a, "]))");
+        }
+        var out: []u8 = sb.build(a);
+        sb.deinit(a);
+        return out;
+    }
+
+    /// `Emitter::emit_place`: a place as a C LVALUE string. Index-free
+    /// chains lower like ordinary expressions; an `Index` step goes
+    /// through the element-pointer `_at` helper (`(*at)` / `at->kd_f`).
+    fn emit_place(self: *Self, a: Allocator, n: i32) []u8 {
+        if (!es_chain_has_index(self.nodes, n)) {
+            return self.emit_expr(a, n);
+        }
+        var u: usize = @as(usize, n);
+        var k: u8 = self.nodes[u].kind;
+        if (k == ND_INDEX) {
+            var sb: StrBuilder = StrBuilder.init(a);
+            sb.append(a, "(*");
+            sb.append(a, self.emit_index_addr(a, self.nodes[u].a, self.nodes[u].b));
+            sb.append(a, ")");
+            var out: []u8 = sb.build(a);
+            sb.deinit(a);
+            return out;
+        }
+        if (k == ND_FIELD) {
+            var basen: i32 = self.nodes[u].a;
+            var bu: usize = @as(usize, basen);
+            var sb2: StrBuilder = StrBuilder.init(a);
+            if (self.nodes[bu].kind == ND_INDEX) {
+                // A field directly on an element: `at(...)->kd_f`.
+                sb2.append(a, self.emit_index_addr(a, self.nodes[bu].a, self.nodes[bu].b));
+                sb2.append(a, "->kd_");
+                sb2.append(a, self.xname(n));
+            } else {
+                sb2.append(a, "(");
+                sb2.append(a, self.emit_place(a, basen));
+                sb2.append(a, ").kd_");
+                sb2.append(a, self.xname(n));
+            }
+            var out2: []u8 = sb2.build(a);
+            sb2.deinit(a);
+            return out2;
+        }
+        // Unreachable: the two arms above cover every has-index chain.
+        return self.emit_expr(a, n);
+    }
+
     fn emit_place_assign(self: *Self, a: Allocator, n: i32) void {
         var u: usize = @as(usize, n);
         var place: i32 = self.nodes[u].a;
         var value: i32 = self.nodes[u].b;
         var op: i64 = self.nodes[u].val;
+        // A place whose chain passes THROUGH an index below the top step
+        // — `a[i].f = e`, `s[i].f.g = e`, `xs[i].buf[j] = e` — takes the
+        // `_at` element-pointer lowering (v0.169). A compound form hoists
+        // the place's address into `__kd_pl{k}` (one index evaluation,
+        // one bounds check), sharing the `__kd_idx` counter.
+        var needs_at: bool = false;
+        if (place >= 0) {
+            var pk: u8 = self.nodes[@as(usize, place)].kind;
+            if (pk == ND_INDEX or pk == ND_FIELD) {
+                needs_at = es_chain_has_index(self.nodes, self.nodes[@as(usize, place)].a);
+            }
+        }
+        if (needs_at) {
+            var lv: []u8 = self.emit_place(a, place);
+            var pt: i64 = self.type_of_expr(place);
+            var es0: []u8 = self.emit_expr(a, value);
+            if (op < 0) {
+                var sbp: StrBuilder = StrBuilder.init(a);
+                sbp.append(a, "(");
+                sbp.append(a, lv);
+                sbp.append(a, ") = (");
+                sbp.append(a, es0);
+                sbp.append(a, ");");
+                var sp: []u8 = sbp.build(a);
+                sbp.deinit(a);
+                self.line(a, sp);
+                return;
+            }
+            var kctr0: i64 = self.idx_count;
+            self.idx_count += 1;
+            var plcty: []u8 = "int64_t";
+            if (pt != ET_NONE) { plcty = self.cty_of(a, pt); }
+            var sbc: StrBuilder = StrBuilder.init(a);
+            sbc.append(a, "{ ");
+            sbc.append(a, plcty);
+            sbc.append(a, " *__kd_pl");
+            sbc.append_i64(a, kctr0);
+            sbc.append(a, " = (&(");
+            sbc.append(a, lv);
+            sbc.append(a, ")); *__kd_pl");
+            sbc.append_i64(a, kctr0);
+            sbc.append(a, " = *__kd_pl");
+            sbc.append_i64(a, kctr0);
+            sbc.append(a, " ");
+            sbc.append(a, es_c_op(op));
+            sbc.append(a, " (");
+            sbc.append(a, es0);
+            sbc.append(a, "); }");
+            var sc: []u8 = sbc.build(a);
+            sbc.deinit(a);
+            self.line(a, sc);
+            return;
+        }
         if (place >= 0 and self.nodes[@as(usize, place)].kind == ND_INDEX) {
             var pu: usize = @as(usize, place);
             var kctr: i64 = self.idx_count;
@@ -2180,7 +2685,7 @@ pub const Em = struct {
             iter_cty = self.arr_c_name(a, it_t);
             elem_ty = self.arr_elem_of(it_t);
         } else {
-            iter_cty = et_slice_c_name(it_t);
+            iter_cty = self.sl_c_name(a, it_t);
             elem_ty = et_slice_elem(it_t);
         }
         var nctr: i64 = self.for_count;
@@ -2543,6 +3048,15 @@ pub const Em = struct {
             }
             return;
         }
+        if (k == ND_SLIT) {
+            // `visit_expr` walks a struct literal's initializer values.
+            var fcur: i32 = self.nodes[u].a;
+            while (fcur >= 0) {
+                self.collect_calls_expr(a, pend, self.nodes[@as(usize, fcur)].a);
+                fcur = self.nodes[@as(usize, fcur)].next;
+            }
+            return;
+        }
         if (k == ND_BUILTIN) {
             // `visit_expr` recurses into a builtin's arguments (the `@as`
             // value may contain calls; the type-name Ident is harmless).
@@ -2743,7 +3257,7 @@ pub const Em = struct {
         if (n < 0) { return; }
         var u: usize = @as(usize, n);
         if ((self.nodes[u].flags & F_ARRLIT) != 0) {
-            var ae: i64 = et_from_name(self.xname(n));
+            var ae: i64 = self.base_code(self.xname(n));
             if (ae != ET_NONE) {
                 var unused: i64 = self.arr_intern(a, ae, self.nodes[u].val);
                 if (unused == 0) { }
@@ -2751,8 +3265,30 @@ pub const Em = struct {
             return;
         }
         if ((self.nodes[u].flags & F_SLICE) == 0) { return; }
-        var e: i64 = et_from_name(self.xname(n));
+        var e: i64 = self.base_code(self.xname(n));
         if (e != ET_NONE) { self.intern_elem(a, e); }
+    }
+
+    /// The `resolve_place`/`resolve_index_base` interning order over a
+    /// place chain: at an INDEX step the index expression is checked (and
+    /// so interns) BEFORE the base is descended; a FIELD step is a type
+    /// lookup only and just descends; the root name interns nothing.
+    fn intern_place(self: *Self, a: Allocator, n: i32) void {
+        if (n < 0) { return; }
+        var u: usize = @as(usize, n);
+        var k: u8 = self.nodes[u].kind;
+        if (k == ND_INDEX) {
+            self.intern_expr(a, self.nodes[u].b);
+            self.intern_place(a, self.nodes[u].a);
+            return;
+        }
+        if (k == ND_FIELD) {
+            self.intern_place(a, self.nodes[u].a);
+            return;
+        }
+        // A non-chain place (unreachable behind the detector) checks as an
+        // ordinary expression, exactly like sema's fallback arm.
+        self.intern_expr(a, n);
     }
 
     fn intern_expr(self: *Self, a: Allocator, n: i32) void {
@@ -2761,6 +3297,17 @@ pub const Em = struct {
         var k: u8 = self.nodes[u].kind;
         if (k == ND_STR) {
             self.intern_elem(a, ET_U8);
+            return;
+        }
+        if (k == ND_SLIT) {
+            // `check_struct_lit` checks each initializer value in SOURCE
+            // order (against its field type — a `check_coerce` walk, so
+            // interning inside the values fires here).
+            var fcur: i32 = self.nodes[u].a;
+            while (fcur >= 0) {
+                self.intern_expr(a, self.nodes[@as(usize, fcur)].a);
+                fcur = self.nodes[@as(usize, fcur)].next;
+            }
             return;
         }
         if (k == ND_UNARY or k == ND_FIELD) {
@@ -2903,17 +3450,11 @@ pub const Em = struct {
             return;
         }
         if (k == ND_PASSIGN) {
-            // `resolve_place` checks the INDEX first, then resolves the
-            // base place (lookups only — a compared base never interns),
-            // then the value is checked.
-            var place: i32 = self.nodes[u].a;
-            if (place >= 0 and self.nodes[@as(usize, place)].kind == ND_INDEX) {
-                var pu: usize = @as(usize, place);
-                self.intern_expr(a, self.nodes[pu].b);
-                self.intern_expr(a, self.nodes[pu].a);
-            } else {
-                self.intern_expr(a, place);
-            }
+            // `resolve_place`: every INDEX step checks its index expr
+            // FIRST, then descends into its base (`resolve_index_base`
+            // recurses the same way — outer indexes before inner ones);
+            // FIELD steps are lookups only. The value is checked last.
+            self.intern_place(a, self.nodes[u].a);
             self.intern_expr(a, self.nodes[u].b);
             return;
         }
@@ -3016,8 +3557,8 @@ pub const Em = struct {
     /// `emit_one_slice`: the typedef and its three `static inline` helpers
     /// for one interned element type.
     fn emit_one_slice(self: *Self, a: Allocator, e: i64) void {
-        var ec: []u8 = et_c_name(e);
-        var sn: []u8 = et_slice_c_name(et_slice_of(e));
+        var ec: []u8 = self.cty_of(a, e);
+        var sn: []u8 = self.sl_c_name(a, et_slice_of(e));
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, "typedef struct { ");
         sb.append(a, ec);
@@ -3069,7 +3610,7 @@ pub const Em = struct {
     /// portable) plus the bounds-checked `_get` / `_at` helpers, both
     /// checking against the TRUE length.
     fn emit_one_array(self: *Self, a: Allocator, t: i64) void {
-        var ec: []u8 = et_c_name(self.arr_elem_of(t));
+        var ec: []u8 = self.cty_of(a, self.arr_elem_of(t));
         var alen: i64 = self.arr_len_of(t);
         var storage: i64 = alen;
         if (storage < 1) { storage = 1; }
@@ -3120,17 +3661,113 @@ pub const Em = struct {
     /// elements carry no dependencies, so each family keeps its intern
     /// order — then the section blank. Nothing at all when the module
     /// interns nothing (the Rust early-return keeps even the blank out).
+    /// The typedef DEPENDENCY WALK (emit_c.rs `emit_type_defs`): seeds in
+    /// the fixed order structs (id order) → arrays (intern order) →
+    /// slices (intern order); each node's dependencies — a struct's field
+    /// types, an array's/slice's element — are visited (and so emitted)
+    /// first, deduplicated by a seen-set. v0.168's arrays-then-slices was
+    /// this walk's struct-free special case.
     fn emit_type_defs(self: *Self, a: Allocator) void {
-        if (self.sl_len == 0 and self.ar_count == 0) { return; }
+        if (self.sl_len == 0 and self.ar_count == 0 and self.st_count == 0) { return; }
+        var total: usize = self.st_count + self.ar_count + self.sl_len;
+        var seen: []bool = alloc(a, bool, total);
+        var si: usize = 0;
+        while (si < total) : (si += 1) { seen[si] = false; }
+        var st_i: usize = 0;
+        while (st_i < self.st_count) : (st_i += 1) {
+            self.visit_type_def(a, seen, ET_STRUCT_BASE + @as(i64, st_i));
+        }
         var ai: usize = 0;
         while (ai < self.ar_count) : (ai += 1) {
-            self.emit_one_array(a, ET_ARR_BASE + @as(i64, ai));
+            self.visit_type_def(a, seen, ET_ARR_BASE + @as(i64, ai));
         }
         var i: usize = 0;
         while (i < self.sl_len) : (i += 1) {
-            self.emit_one_slice(a, self.slices[i]);
+            self.visit_type_def(a, seen, et_slice_of(self.slices[i]));
         }
+        free(a, seen);
         self.blank(a);
+    }
+
+    /// The seen-set slot for a type-def node: structs first, then arrays,
+    /// then slices (slice codes map through the intern table's index).
+    fn type_def_slot(self: *Self, t: i64) i64 {
+        if (et_is_struct(t)) { return t - ET_STRUCT_BASE; }
+        if (et_is_arr(t)) { return @as(i64, self.st_count) + (t - ET_ARR_BASE); }
+        // A slice: find its element's intern index.
+        var e: i64 = et_slice_elem(t);
+        var i: usize = 0;
+        while (i < self.sl_len) : (i += 1) {
+            if (self.slices[i] == e) {
+                return @as(i64, self.st_count + self.ar_count + i);
+            }
+        }
+        return 0 - 1;
+    }
+
+    fn visit_type_def(self: *Self, a: Allocator, seen: []bool, t: i64) void {
+        var slot: i64 = self.type_def_slot(t);
+        if (slot < 0) { return; }
+        if (seen[@as(usize, slot)]) { return; }
+        seen[@as(usize, slot)] = true;
+        if (et_is_struct(t)) {
+            var i: usize = @as(usize, t - ET_STRUCT_BASE);
+            var start: usize = @as(usize, self.st_f_start[i]);
+            var n: usize = @as(usize, self.st_f_count[i]);
+            var j: usize = 0;
+            while (j < n) : (j += 1) {
+                var ft: i64 = self.sf_ty[start + j];
+                if (et_is_struct(ft) or et_is_arr(ft) or et_is_slice(ft)) {
+                    self.visit_type_def(a, seen, ft);
+                }
+            }
+            self.emit_one_struct(a, t);
+            return;
+        }
+        if (et_is_arr(t)) {
+            var ae: i64 = self.arr_elem_of(t);
+            if (et_is_struct(ae) or et_is_arr(ae) or et_is_slice(ae)) {
+                self.visit_type_def(a, seen, ae);
+            }
+            self.emit_one_array(a, t);
+            return;
+        }
+        var se: i64 = et_slice_elem(t);
+        if (et_is_struct(se) or et_is_arr(se) or et_is_slice(se)) {
+            self.visit_type_def(a, seen, se);
+        }
+        self.emit_one_slice(a, se);
+    }
+
+    /// `emit_one_struct`: `typedef struct { <cty> kd_<f>; … } kd_struct_<Name>;`
+    /// — fields joined by single spaces, the empty struct spelling
+    /// `char _unused;` (C forbids empty structs; `int` is the allocator's).
+    fn emit_one_struct(self: *Self, a: Allocator, t: i64) void {
+        var i: usize = @as(usize, t - ET_STRUCT_BASE);
+        var start: usize = @as(usize, self.st_f_start[i]);
+        var n: usize = @as(usize, self.st_f_count[i]);
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "typedef struct { ");
+        if (n == 0) {
+            sb.append(a, "char _unused;");
+        } else {
+            var j: usize = 0;
+            while (j < n) : (j += 1) {
+                if (j > 0) { sb.append(a, " "); }
+                sb.append(a, self.cty_of(a, self.sf_ty[start + j]));
+                sb.append(a, " kd_");
+                var noff: usize = @as(usize, self.sf_name_off[start + j]);
+                var nlen: usize = @as(usize, self.sf_name_len[start + j]);
+                sb.append(a, self.src[noff .. noff + nlen]);
+                sb.append(a, ";");
+            }
+        }
+        sb.append(a, " } ");
+        sb.append(a, self.st_c_name(a, t));
+        sb.append(a, ";");
+        var out: []u8 = sb.build(a);
+        sb.deinit(a);
+        self.line(a, out);
     }
 
     fn emit_prelude(self: *Self, a: Allocator) void {
@@ -3378,9 +4015,12 @@ pub const Em = struct {
     /// `EmitMode::Test` emits the harness). The result is
     /// `self.out[0 .. self.out_len]`.
     fn run(self: *Self, a: Allocator) void {
+        // Sema's pass order: struct names + field types FIRST (0a/0b —
+        // field slices/arrays intern here), then signatures, then bodies.
         // Interning passes 1+2 fill the array table BEFORE the signature
         // collection resolves `[N]T` params/returns; the type-aware body
         // pass then consults those signatures.
+        self.st_collect(a);
         self.intern_scan_sigs(a);
         self.collect_signatures(a);
         self.intern_scan_bodies(a);
