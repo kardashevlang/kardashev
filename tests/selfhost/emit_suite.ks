@@ -4,7 +4,8 @@
 // test blocks / EmitMode::Test + v0.167 `@import` resolution + v0.168 fixed
 // arrays `[N]T` and `for` loops + v0.169 plain data structs + v0.170
 // struct methods and associated functions + v0.171 enums + v0.172
-// switch with contextual enum literals + v0.173 optionals ?T).
+// switch with contextual enum literals + v0.173 optionals ?T + v0.174
+// error unions !T).
 //
 // Run: kard test tests/selfhost/emit_suite.ks (driven from
 // `crates/kardc/tests/selfhost_emit.rs` so it is part of `cargo test`).
@@ -253,14 +254,16 @@ test "detect: composite type forms and non-subset type names" {
     var d3: Det = eh_detect(a, "fn main() f64 { return q(); }");
     expect(d3.found);
     expect(str_eq(d3.word, "type-name"));
-    // (`?i32` joined the subset in v0.173 — an error union `!T` keeps
-    // the verdict, and a non-subset optional inner is a type-name)
+    // (`?i32` joined in v0.173 and `!i32` in v0.174 — non-subset inner
+    // names are type-names; pointer forms keep the type-form verdict)
     var d4: Det = eh_detect(a, "fn main() !i32 { return q(); }");
-    expect(d4.found);
-    expect(str_eq(d4.word, "type-form"));
+    expect(!d4.found);
     var d5: Det = eh_detect(a, "fn main() ?f64 { return q(); }");
     expect(d5.found);
     expect(str_eq(d5.word, "type-name"));
+    var d5b: Det = eh_detect(a, "fn main() !f64 { return q(); }");
+    expect(d5b.found);
+    expect(str_eq(d5b.word, "type-name"));
     var d6: Det = eh_detect(a, "fn main() ?i32 { return q(); }");
     expect(!d6.found);
 }
@@ -291,15 +294,14 @@ test "detect: out-of-subset statements" {
     expect(d.found);
     expect(str_eq(d.word, "label"));
     expect(d.pos == 17);
-    // (`switch` joined the subset in v0.172 — a payload-capture arm
-    // keeps a verdict, and `try` is still out)
-    var d2: Det = eh_detect(a, "fn main() void { try f(); }");
+    // (`switch` v0.172, `try` v0.174 — the addr-of place keeps a verdict)
+    var d2: Det = eh_detect(a, "fn main() void { var p = &x; }");
     expect(d2.found);
-    expect(str_eq(d2.word, "try"));
-    expect(d2.pos == 17);
-    var d3: Det = eh_detect(a, "fn main() void { errdefer print(1); }");
+    expect(str_eq(d2.word, "addrof"));
+    // (`errdefer` joined in v0.174; its body still walks)
+    var d3: Det = eh_detect(a, "fn main() void { errdefer print(1.5); }");
     expect(d3.found);
-    expect(str_eq(d3.word, "errdefer"));
+    expect(str_eq(d3.word, "float"));
     var d4: Det = eh_detect(a, "fn main() void { lab: while (true) { break :lab; } }");
     expect(d4.found);
     expect(str_eq(d4.word, "label"));
@@ -1153,4 +1155,39 @@ test "optionals: if-capture hoists once, binds payload, __kd_if counter" {
     expect(eh_find(c, "    {\n        kd_opt_int64_t __kd_if0 = kd_side(41);\n        if (__kd_if0.has) {\n            int64_t kd_v = __kd_if0.val;\n            kd_print((long long)(kd_v));\n        } else {\n            {\n                kd_print((long long)((0 - 1)));\n            }\n        }\n    }\n"));
     // The counter advances per capture within one function.
     expect(eh_find(c, "__kd_if1 = kd_side(1);"));
+}
+
+test "errunions: typedefs, code space, try/errdefer flushes (v0.174)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "fn may(n: i64) !i64 {\n    if (n < 0) { return error.Neg; }\n    return n * 2;\n}\nfn chain(n: i64) !i64 {\n    defer print(700);\n    errdefer print(800);\n    var v: i64 = try may(n);\n    return v + 1;\n}\npub fn main() void {\n    print(chain(5) catch 0 - 1);\n    print(chain(0 - 2) catch |e| @as(i64, e) * 10);\n}");
+    // The typedef + eager-catch helper, exact bytes.
+    expect(eh_find(c, "typedef struct { int32_t err; int64_t val; } kd_err_int64_t;\n"));
+    expect(eh_find(c, "static inline int64_t kd_err_int64_t_catch(kd_err_int64_t e, int64_t d) { return e.err == 0 ? e.val : d; }\n"));
+    // error.Neg is the FIRST error name → code 1; the failure value
+    // carries it at the return coercion site.
+    expect(eh_find(c, "        return (((kd_err_int64_t){ .err = 1 }));\n"));
+    // try: hoist, error-path flush runs the ERRDEFER (800) then the
+    // defer (700), the propagation re-wraps; success unwraps .val; the
+    // ordinary return flushes only the defer.
+    expect(eh_find(c, "    kd_err_int64_t __kd_try0 = kd_may(kd_n);\n    if (__kd_try0.err != 0) {\n        kd_print((long long)(800));\n        kd_print((long long)(700));\n        return (kd_err_int64_t){ .err = __kd_try0.err };\n    }\n    int64_t kd_v = __kd_try0.val;\n"));
+    expect(eh_find(c, "    kd_err_int64_t __kd_ret = (((kd_err_int64_t){ .err = 0, .val = (kd_v + 1) }));\n    kd_print((long long)(700));\n    return __kd_ret;\n"));
+    // The eager catch lowers through the helper; the capturing catch
+    // hoists __kd_eu/__kd_catch and binds the i32 code lazily.
+    expect(eh_find(c, "kd_err_int64_t_catch(kd_chain(5), (0 - 1))"));
+    expect(eh_find(c, "    kd_err_int64_t __kd_eu0 = kd_chain((0 - 2));\n    int64_t __kd_catch0;\n    if (__kd_eu0.err != 0) {\n        int32_t kd_e = __kd_eu0.err;\n        __kd_catch0 = (((int64_t)(kd_e)) * 10);\n    } else {\n        __kd_catch0 = __kd_eu0.val;\n    }\n"));
+}
+
+test "errunions: !void — no helper, lazy catch, fallthrough success" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "fn step(n: i64) !void {\n    if (n == 0) { return error.Zero; }\n    print(n);\n}\nfn run(n: i64) !void {\n    try step(n);\n}\npub fn main() void {\n    run(1) catch print(0 - 1);\n    run(0) catch |e| print(100 + e);\n}");
+    // The payload-less typedef; NO _catch helper for !void.
+    expect(eh_find(c, "typedef struct { int32_t err; } kd_err_void;\n"));
+    expect(!eh_find(c, "kd_err_void_catch"));
+    // The fallthrough success return lands at COLUMN 0 (the Rust quirk).
+    expect(eh_find(c, "\nreturn ((kd_err_void){ .err = 0 });\n}\n"));
+    // try over !void discards a void payload.
+    expect(eh_find(c, "    (void)(((void)0));\n"));
+    // Both catch forms over !void hoist and run the handler lazily.
+    expect(eh_find(c, "    kd_err_void __kd_eu0 = kd_run(1);\n    if (__kd_eu0.err != 0) {\n        kd_print((long long)((0 - 1)));\n    }\n"));
+    expect(eh_find(c, "        int32_t kd_e = __kd_eu1.err;\n        kd_print((long long)((100 + kd_e)));\n"));
 }

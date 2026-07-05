@@ -1,9 +1,9 @@
-// emit.ks — self-host stages 3–15 (v0.161–v0.173): a C emitter for the
+// emit.ks — self-host stages 3–16 (v0.161–v0.174): a C emitter for the
 // SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
 // `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
 // `[N]T` with array literals and `for` loops, plain data STRUCTS, struct
 // METHODS + associated functions, ENUMS, `switch` with contextual `.V`
-// literals, and — v0.173 — OPTIONALS `?T`), written in
+// literals, OPTIONALS `?T`, and — v0.174 — ERROR UNIONS `!T`), written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
 // the Rust emitter's output in BOTH `EmitMode::Program` and (v0.166)
@@ -68,7 +68,28 @@
 // are `.V`/matching `Enum.V` never check as expressions, every other
 // label checks fully (an INTEGER label checks + const-folds); an
 // unswitchable scrutinee checks bodies only; arm bodies per arm, else
-// last. v0.173 adds OPTIONALS `?T` — over bare subset names only (a
+// last. v0.174 adds ERROR UNIONS `!T` (and named sets `Set!T` — the set
+// name is sema's E0330 membership concern; the runtime type is the
+// payload's union either way): the GLOBAL 1-based error-code table
+// replays sema exactly — error-set members intern in pass 0 (after
+// enums, before struct names), then `error.X` literals in BODY-CHECK
+// order (the scan's ND_ERRLIT arm); `kd_err_<mangle>` typedefs
+// `{ int32_t err; T val; }` + `_catch` (the `!void` variant keeps only
+// `err` and SKIPS the helper) seed between optionals and arrays;
+// `error.X`/`T` widen through `emit_coerced` (`{ .err = code }` /
+// `{ .err = 0, .val = e }`; a `!void` target evaluates the void source
+// in a comma-expr); `try` hoists `__kd_try{N}`, early-returns the
+// re-wrapped error after an ERRDEFER-INCLUSIVE flush_all, and yields
+// `.val` (`((void)0)` for `!void`) — statement positions: let-init
+// (payload re-coerced via coerce_str), `return try e;` (NOT an error
+// edge), bare `try e;` → `(void)(…);`; `catch` lowers eager through
+// `_catch`, capturing through `__kd_eu{N}`/`__kd_catch{N}` with
+// `int32_t kd_<e>` bound lazily, and `!void` operands ALWAYS as lazy
+// statements; `errdefer` registers error-tagged defers that only
+// error edges flush (`return error.X` and try-propagation; plain
+// returns/breaks skip them); a `fn … !void` falling off its end
+// returns success — at COLUMN 0, the Rust indent quirk, mirrored.
+// v0.173 adds OPTIONALS `?T` — over bare subset names only (a
 // composite inner `?[]u8`/`??T` is a PARSE error): `kd_opt_<mangle>`
 // typedefs + `_orelse`/`_unwrap` helpers seed between structs and
 // arrays in the dependency walk (an optional-over-struct/enum visits
@@ -227,6 +248,7 @@ pub const ET_SLICE_STRUCT_BASE: i64 = 2000000000;
 pub const ET_ENUM_BASE: i64 = 3000000000;
 pub const ET_SLICE_ENUM_BASE: i64 = 4000000000;
 pub const ET_OPT_BASE: i64 = 5000000000;
+pub const ET_ERRU_BASE: i64 = 6000000000;
 
 pub fn et_slice_of(elem: i64) i64 {
     if (elem >= ET_ENUM_BASE) {
@@ -265,7 +287,11 @@ pub fn et_is_enum(t: i64) bool {
 }
 
 pub fn et_is_opt(t: i64) bool {
-    return t >= ET_OPT_BASE;
+    return t >= ET_OPT_BASE and t < ET_ERRU_BASE;
+}
+
+pub fn et_is_erru(t: i64) bool {
+    return t >= ET_ERRU_BASE;
 }
 
 /// `StructTable::slice_c_name` over the subset: `kd_slice_<type_mangle(elem)>`
@@ -436,7 +462,7 @@ pub const Det = struct {
         if (self.found or n < 0) { return; }
         var u: usize = @as(usize, n);
         var fl: i64 = self.nodes[u].flags;
-        var forms: i64 = F_ERR | F_PTR | F_ARRPARAM | F_ERRSET | F_APP | F_ESETTHIS;
+        var forms: i64 = F_PTR | F_ARRPARAM | F_APP | F_ESETTHIS;
         if ((fl & forms) != 0) {
             self.hit("type-form", self.nodes[u].off);
             return;
@@ -446,6 +472,15 @@ pub const Det = struct {
             // PARSE error, so `?` never coexists with the other forms).
             var oname: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
             if (et_from_name(oname) == ET_NONE and !self.is_struct_name(oname)) {
+                self.hit("type-name", self.nodes[u].off);
+            }
+            return;
+        }
+        if ((fl & F_ERR) != 0) {
+            // `!T` / `Set!T` over a bare subset payload name (v0.174; the
+            // set name is sema's E0330 membership concern).
+            var pname: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
+            if (et_from_name(pname) == ET_NONE and !self.is_struct_name(pname)) {
                 self.hit("type-name", self.nodes[u].off);
             }
             return;
@@ -665,7 +700,11 @@ pub const Det = struct {
             self.check_expr(self.nodes[u].a);
             return;
         }
-        if (k == ND_ERRLIT) { self.hit("error-lit", off); return; }
+        if (k == ND_ERRLIT) {
+            // `error.X` is in the subset (v0.174): its `!T` comes from the
+            // expected-type context (no context is sema's E0193).
+            return;
+        }
         if (k == ND_ENUMLIT) {
             // An unqualified `.V` is in the subset (v0.172): its enum
             // comes from the expected-type context (a no-context use is
@@ -689,8 +728,19 @@ pub const Det = struct {
         }
         if (k == ND_ADDROF) { self.hit("addrof", off); return; }
         if (k == ND_DEREF) { self.hit("deref", off); return; }
-        if (k == ND_TRY) { self.hit("try", off); return; }
-        if (k == ND_CATCH) { self.hit("catch", off); return; }
+        if (k == ND_TRY) {
+            // `try e` is in the subset (v0.174); its statement-position
+            // rule is sema's E0191.
+            self.check_expr(self.nodes[u].a);
+            return;
+        }
+        if (k == ND_CATCH) {
+            // `e catch d` / `e catch |x| d` are in the subset (v0.174):
+            // operand and default walk (the capture binds an i32).
+            self.check_expr(self.nodes[u].a);
+            self.check_expr(self.nodes[u].b);
+            return;
+        }
         if (k == ND_UNREACHABLE) { self.hit("unreachable", off); return; }
         // Any other kind in expression position is a walker bug; surface it
         // as a mismatch rather than silently accepting.
@@ -772,7 +822,11 @@ pub const Det = struct {
             self.check_stmt(self.nodes[u].a);
             return;
         }
-        if (k == ND_ERRDEFER) { self.hit("errdefer", off); return; }
+        if (k == ND_ERRDEFER) {
+            // `errdefer <stmt>` is in the subset (v0.174).
+            self.check_stmt(self.nodes[u].a);
+            return;
+        }
         if (k == ND_BLOCK) {
             self.check_block(n);
             return;
@@ -896,7 +950,9 @@ pub fn es_detect_mode(src: []u8, nodes: []Node, root: i32, program_mode: bool) D
         } else if (k == ND_IMPORT) {
             d.hit("import", nodes[u].off);
         } else if (k == ND_ERRSET) {
-            d.hit("errorset", nodes[u].off);
+            // A named error set `const E = error{ A, B };` is a subset
+            // item (v0.174): members carry nothing to walk (a duplicate
+            // member is sema's E0331).
         } else {
             d.hit("bad-item", nodes[u].off);
         }
@@ -1123,6 +1179,7 @@ pub const Em = struct {
     scopes: []EmScope,
     sc_len: usize,
     defers: []i32,
+    derr: []bool,
     df_len: usize,
     vts: []VtEnt,
     vt_len: usize,
@@ -1197,6 +1254,20 @@ pub const Em = struct {
     // `ET_OPT_BASE + index`.
     opt_inners: []i64,
     opt_count: usize,
+    // The interned ERROR-UNION payload codes (v0.174) — the
+    // `error_union_payloads` mirror; codes are `ET_ERRU_BASE + index`.
+    eu_payloads: []i64,
+    eu_count: usize,
+    // The GLOBAL error-name table (`error_names` mirror): 1-based codes
+    // in first-intern order — error-set members (pass 0), then `error.X`
+    // literals in body-check order.
+    er_off: []i64,
+    er_len: []i64,
+    er_count: usize,
+    // `__kd_try{N}` / `__kd_eu{N}`+`__kd_catch{N}` counters, reset per
+    // function AND per test body.
+    try_count: i64,
+    catch_count: i64,
     // Monotonic counter for the `__kd_if{N}` if-capture temporaries
     // (`Emitter::if_counter`), reset per function AND per test body.
     if_count: i64,
@@ -1220,6 +1291,7 @@ pub const Em = struct {
             .scopes = alloc(a, EmScope, 16),
             .sc_len = 0,
             .defers = alloc(a, i32, 16),
+            .derr = alloc(a, bool, 16),
             .df_len = 0,
             .vts = alloc(a, VtEnt, 32),
             .vt_len = 0,
@@ -1258,6 +1330,13 @@ pub const Em = struct {
             .mt_p_count = alloc(a, i64, 8),
             .opt_inners = alloc(a, i64, 4),
             .opt_count = 0,
+            .eu_payloads = alloc(a, i64, 4),
+            .eu_count = 0,
+            .er_off = alloc(a, i64, 8),
+            .er_len = alloc(a, i64, 8),
+            .er_count = 0,
+            .try_count = 0,
+            .catch_count = 0,
             .if_count = 0,
             .en_name_off = alloc(a, i64, 4),
             .en_name_len = alloc(a, i64, 4),
@@ -1332,6 +1411,7 @@ pub const Em = struct {
         if (et_is_struct(t)) { return self.st_c_name(a, t); }
         if (et_is_enum(t)) { return self.en_c_name(a, t); }
         if (et_is_opt(t)) { return self.opt_c_name(a, t); }
+        if (et_is_erru(t)) { return self.eu_c_name(a, t); }
         if (et_is_slice(t)) { return self.sl_c_name(a, t); }
         return et_c_name(t);
     }
@@ -1526,6 +1606,10 @@ pub const Em = struct {
             if (base == ET_NONE) { return ET_I64; }
             return self.opt_intern(a, base);
         }
+        if ((self.nodes[u].flags & F_ERR) != 0) {
+            if (base == ET_NONE) { return ET_I64; }
+            return self.eu_intern(a, base);
+        }
         if (base == ET_NONE) { return ET_I64; }
         return base;
     }
@@ -1607,6 +1691,101 @@ pub const Em = struct {
         var out: []u8 = sb.build(a);
         sb.deinit(a);
         return out;
+    }
+
+    /// `intern_error_union`: dedup-append of a payload code; returns the
+    /// error-union TYPE CODE (`ET_ERRU_BASE + index`).
+    fn eu_intern(self: *Self, a: Allocator, payload: i64) i64 {
+        var i: usize = 0;
+        while (i < self.eu_count) : (i += 1) {
+            if (self.eu_payloads[i] == payload) { return ET_ERRU_BASE + @as(i64, i); }
+        }
+        if (self.eu_count == self.eu_payloads.len) {
+            var g: []i64 = alloc(a, i64, self.eu_payloads.len * 2);
+            var j: usize = 0;
+            while (j < self.eu_count) : (j += 1) { g[j] = self.eu_payloads[j]; }
+            free(a, self.eu_payloads);
+            self.eu_payloads = g;
+        }
+        self.eu_payloads[self.eu_count] = payload;
+        self.eu_count += 1;
+        return ET_ERRU_BASE + @as(i64, self.eu_count) - 1;
+    }
+
+    fn eu_payload_of(self: *Self, t: i64) i64 {
+        return self.eu_payloads[@as(usize, t - ET_ERRU_BASE)];
+    }
+
+    /// `error_union_c_name`: `kd_err_<type_mangle(payload)>`.
+    fn eu_c_name(self: *Self, a: Allocator, t: i64) []u8 {
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "kd_err_");
+        sb.append(a, self.mangle_of(a, self.eu_payload_of(t)));
+        var out: []u8 = sb.build(a);
+        sb.deinit(a);
+        return out;
+    }
+
+    /// `intern_error`: the global error-name table — dedup by NAME, codes
+    /// are the 1-based first-intern positions (0 = "no error").
+    fn er_intern(self: *Self, a: Allocator, off: usize, len: usize) i64 {
+        var i: usize = 0;
+        while (i < self.er_count) : (i += 1) {
+            var eo: usize = @as(usize, self.er_off[i]);
+            var el: usize = @as(usize, self.er_len[i]);
+            if (str_eq(self.src[eo .. eo + el], self.src[off .. off + len])) {
+                return @as(i64, i) + 1;
+            }
+        }
+        if (self.er_count == self.er_off.len) {
+            var g0: []i64 = alloc(a, i64, self.er_off.len * 2);
+            var g1: []i64 = alloc(a, i64, self.er_len.len * 2);
+            var j: usize = 0;
+            while (j < self.er_count) : (j += 1) {
+                g0[j] = self.er_off[j];
+                g1[j] = self.er_len[j];
+            }
+            free(a, self.er_off);
+            free(a, self.er_len);
+            self.er_off = g0;
+            self.er_len = g1;
+        }
+        self.er_off[self.er_count] = @as(i64, off);
+        self.er_len[self.er_count] = @as(i64, len);
+        self.er_count += 1;
+        return @as(i64, self.er_count);
+    }
+
+    /// `error_code`: the 1-based code of a declared error name, or 0 (the
+    /// Rust `unwrap_or(0)` fallback for an unknown name).
+    fn er_code_of(self: *Self, name: []u8) i64 {
+        var i: usize = 0;
+        while (i < self.er_count) : (i += 1) {
+            var eo: usize = @as(usize, self.er_off[i]);
+            var el: usize = @as(usize, self.er_len[i]);
+            if (str_eq(self.src[eo .. eo + el], name)) { return @as(i64, i) + 1; }
+        }
+        return 0;
+    }
+
+    /// Sema pass 0 (error sets, v0.174): register every named set's
+    /// members as GLOBAL error names, in declaration order — after enums,
+    /// before struct names (the sema pass sequence).
+    fn er_collect(self: *Self, a: Allocator) void {
+        var cur: i32 = self.root;
+        while (cur >= 0) {
+            var u: usize = @as(usize, cur);
+            if (self.nodes[u].kind == ND_ERRSET) {
+                var m: i32 = self.nodes[u].a;
+                while (m >= 0) {
+                    var mu: usize = @as(usize, m);
+                    var unused: i64 = self.er_intern(a, self.nodes[mu].xoff, self.nodes[mu].xlen);
+                    if (unused == 0) { }
+                    m = self.nodes[mu].next;
+                }
+            }
+            cur = self.nodes[u].next;
+        }
     }
 
     /// Sema pass 0 (v0.171): register every enum in item order — variants
@@ -1768,15 +1947,22 @@ pub const Em = struct {
         self.sc_len -= 1;
     }
 
-    fn push_defer(self: *Self, a: Allocator, n: i32) void {
+    fn push_defer(self: *Self, a: Allocator, n: i32, is_err: bool) void {
         if (self.df_len == self.defers.len) {
             var grown: []i32 = alloc(a, i32, self.defers.len * 2);
+            var ge: []bool = alloc(a, bool, self.derr.len * 2);
             var i: usize = 0;
-            while (i < self.df_len) : (i += 1) { grown[i] = self.defers[i]; }
+            while (i < self.df_len) : (i += 1) {
+                grown[i] = self.defers[i];
+                ge[i] = self.derr[i];
+            }
             free(a, self.defers);
+            free(a, self.derr);
             self.defers = grown;
+            self.derr = ge;
         }
         self.defers[self.df_len] = n;
+        self.derr[self.df_len] = is_err;
         self.df_len += 1;
     }
 
@@ -1917,6 +2103,18 @@ pub const Em = struct {
             }
             return oe;
         }
+        if ((self.nodes[u].flags & F_ERR) != 0) {
+            // `!T` / `Set!T` maps back to the interned error union (the set
+            // name is sema's membership concern; the runtime type is the
+            // payload's union either way).
+            var ee: i64 = self.base_code(self.xname(n));
+            if (ee == ET_NONE) { return ET_VOID; }
+            var ei: usize = 0;
+            while (ei < self.eu_count) : (ei += 1) {
+                if (self.eu_payloads[ei] == ee) { return ET_ERRU_BASE + @as(i64, ei); }
+            }
+            return ee;
+        }
         var t: i64 = self.base_code(self.xname(n));
         if (t == ET_NONE) { return ET_VOID; }
         return t;
@@ -1960,6 +2158,17 @@ pub const Em = struct {
             var so: []u8 = sbo.build(a);
             sbo.deinit(a);
             return so;
+        }
+        if ((self.nodes[u].flags & F_ERR) != 0) {
+            // `kd_err_<type_mangle(base)>` spelled directly.
+            var ee: i64 = self.base_code(self.xname(n));
+            if (ee == ET_NONE) { return "kd_err_int64_t"; }
+            var sbe: StrBuilder = StrBuilder.init(a);
+            sbe.append(a, "kd_err_");
+            sbe.append(a, self.mangle_of(a, ee));
+            var se: []u8 = sbe.build(a);
+            sbe.deinit(a);
+            return se;
         }
         var t: i64 = self.base_code(self.xname(n));
         if (t == ET_NONE) { return "int64_t"; }
@@ -2185,6 +2394,17 @@ pub const Em = struct {
             return self.st_code_of(self.xname(n));
         }
         if (k == ND_NULL) { return ET_NONE; }
+        if (k == ND_ERRLIT) { return ET_NONE; }
+        if (k == ND_TRY) {
+            var tt: i64 = self.type_of_expr(self.nodes[u].a);
+            if (et_is_erru(tt)) { return self.eu_payload_of(tt); }
+            return tt;
+        }
+        if (k == ND_CATCH) {
+            var ct: i64 = self.type_of_expr(self.nodes[u].a);
+            if (et_is_erru(ct)) { return self.eu_payload_of(ct); }
+            return ct;
+        }
         if (k == ND_ORELSE) {
             // `x orelse y` yields the inner `T` of the `?T` lhs.
             var olt: i64 = self.type_of_expr(self.nodes[u].a);
@@ -2281,7 +2501,94 @@ pub const Em = struct {
             sb2.deinit(a);
             return o2;
         }
+        if (n >= 0 and et_is_erru(expected)) {
+            // The `!T` widenings (v0.174, SPEC §12.2): `error.X` → the
+            // failure value carrying its 1-based code; an already-union
+            // value passes through; a `!void` target evaluates the void
+            // source then constructs the payload-less success via a comma
+            // expression; else the success wrap.
+            var ename: []u8 = self.eu_c_name(a, expected);
+            if (self.nodes[@as(usize, n)].kind == ND_ERRLIT) {
+                var sb3: StrBuilder = StrBuilder.init(a);
+                sb3.append(a, "((");
+                sb3.append(a, ename);
+                sb3.append(a, "){ .err = ");
+                sb3.append_i64(a, self.er_code_of(self.xname(n)));
+                sb3.append(a, " })");
+                var o3: []u8 = sb3.build(a);
+                sb3.deinit(a);
+                return o3;
+            }
+            if (et_is_erru(self.type_of_expr(n))) {
+                return self.emit_expr(a, n);
+            }
+            if (self.eu_payload_of(expected) == ET_VOID) {
+                var vsrc: []u8 = self.emit_expr(a, n);
+                var sb4: StrBuilder = StrBuilder.init(a);
+                sb4.append(a, "((");
+                sb4.append(a, vsrc);
+                sb4.append(a, "), ((");
+                sb4.append(a, ename);
+                sb4.append(a, "){ .err = 0 }))");
+                var o4: []u8 = sb4.build(a);
+                sb4.deinit(a);
+                return o4;
+            }
+            var succ: []u8 = self.emit_expr(a, n);
+            var sb5: StrBuilder = StrBuilder.init(a);
+            sb5.append(a, "((");
+            sb5.append(a, ename);
+            sb5.append(a, "){ .err = 0, .val = ");
+            sb5.append(a, succ);
+            sb5.append(a, " })");
+            var o5: []u8 = sb5.build(a);
+            sb5.deinit(a);
+            return o5;
+        }
         return self.emit_expr(a, n);
+    }
+
+    /// `Emitter::coerce_str`: the string-level widening for an
+    /// ALREADY-EMITTED payload (the `try` positions). Optional and
+    /// error-union targets wrap; everything else passes through.
+    fn coerce_str(self: *Self, a: Allocator, raw: []u8, src: i64, expected: i64) []u8 {
+        if (et_is_opt(expected)) {
+            if (et_is_opt(src)) { return raw; }
+            var sb: StrBuilder = StrBuilder.init(a);
+            sb.append(a, "((");
+            sb.append(a, self.opt_c_name(a, expected));
+            sb.append(a, "){ .has = true, .val = ");
+            sb.append(a, raw);
+            sb.append(a, " })");
+            var o: []u8 = sb.build(a);
+            sb.deinit(a);
+            return o;
+        }
+        if (et_is_erru(expected)) {
+            if (et_is_erru(src)) { return raw; }
+            var ename: []u8 = self.eu_c_name(a, expected);
+            if (self.eu_payload_of(expected) == ET_VOID) {
+                var sb2: StrBuilder = StrBuilder.init(a);
+                sb2.append(a, "((");
+                sb2.append(a, raw);
+                sb2.append(a, "), ((");
+                sb2.append(a, ename);
+                sb2.append(a, "){ .err = 0 }))");
+                var o2: []u8 = sb2.build(a);
+                sb2.deinit(a);
+                return o2;
+            }
+            var sb3: StrBuilder = StrBuilder.init(a);
+            sb3.append(a, "((");
+            sb3.append(a, ename);
+            sb3.append(a, "){ .err = 0, .val = ");
+            sb3.append(a, raw);
+            sb3.append(a, " })");
+            var o3: []u8 = sb3.build(a);
+            sb3.deinit(a);
+            return o3;
+        }
+        return raw;
     }
 
     /// `Emitter::emit_binop_operand`: an `.V` operand takes its enum from
@@ -2335,6 +2642,53 @@ pub const Em = struct {
             // A bare `null` with no expected `?T` is sema-invalid (E0180);
             // the Rust arm emits a harmless `0` placeholder.
             return "0";
+        }
+        if (k == ND_ERRLIT) {
+            // A bare `error.X` with no expected `!T` is sema-invalid
+            // (E0193); the Rust arm emits the bare 1-based code.
+            var sbel: StrBuilder = StrBuilder.init(a);
+            sbel.append_i64(a, self.er_code_of(self.xname(n)));
+            var sel: []u8 = sbel.build(a);
+            sbel.deinit(a);
+            return sel;
+        }
+        if (k == ND_TRY) {
+            // A non-statement-position `try` is sema-invalid (E0191); the
+            // hoisting statement lowering still runs for totality.
+            return self.emit_try(a, self.nodes[u].a);
+        }
+        if (k == ND_CATCH) {
+            // `!void` operands (either form) run the handler lazily as a
+            // statement; the capturing form hoists; the eager form lowers
+            // through the `_catch` helper with a coerced default.
+            var cxt: i64 = self.type_of_expr(self.nodes[u].a);
+            if (et_is_erru(cxt) and self.eu_payload_of(cxt) == ET_VOID) {
+                return self.emit_catch_void(a, n);
+            }
+            if ((self.nodes[u].flags & F_CAP) != 0) {
+                return self.emit_catch_capture(a, n);
+            }
+            var cl: []u8 = self.emit_expr(a, self.nodes[u].a);
+            if (et_is_erru(cxt)) {
+                var cr: []u8 = self.emit_coerced(a, self.nodes[u].b, self.eu_payload_of(cxt));
+                var sbc: StrBuilder = StrBuilder.init(a);
+                sbc.append(a, self.eu_c_name(a, cxt));
+                sbc.append(a, "_catch(");
+                sbc.append(a, cl);
+                sbc.append(a, ", ");
+                sbc.append(a, cr);
+                sbc.append(a, ")");
+                var sc: []u8 = sbc.build(a);
+                sbc.deinit(a);
+                return sc;
+            }
+            var sbc2: StrBuilder = StrBuilder.init(a);
+            sbc2.append(a, "(");
+            sbc2.append(a, cl);
+            sbc2.append(a, ")");
+            var sc2: []u8 = sbc2.build(a);
+            sbc2.deinit(a);
+            return sc2;
         }
         if (k == ND_ORELSE) {
             // `x orelse y` → `kd_opt_<tag>_orelse(<x>, <y>)` (`y` eager);
@@ -2944,8 +3298,14 @@ pub const Em = struct {
 
     /// Whether any scope holds a deferred statement (`any_defer_active`;
     /// the subset has no `errdefer`, so there is no error-edge variant).
-    fn any_defer_active(self: *Self) bool {
-        return self.df_len > 0;
+    /// Whether any scope holds a pending defer; on an error-return edge
+    /// (`inc_err`) errdefers count too.
+    fn any_defer_active(self: *Self, inc_err: bool) bool {
+        var i: usize = 0;
+        while (i < self.df_len) : (i += 1) {
+            if (inc_err or !self.derr[i]) { return true; }
+        }
+        return false;
     }
 
     /// The end of scope `idx`'s defer span: the next scope's start, or the
@@ -2958,11 +3318,13 @@ pub const Em = struct {
     /// `flush_scope`: one scope's defers in reverse registration order. The
     /// span is snapshotted first (Rust clones the list), so a defer body
     /// that itself registers defers cannot extend the flush.
-    fn flush_scope(self: *Self, a: Allocator, idx: usize) void {
+    fn flush_scope(self: *Self, a: Allocator, idx: usize, inc_err: bool) void {
         var lo: i64 = self.scopes[idx].dstart;
         var hi: i64 = self.defer_end(idx);
         var i: i64 = hi - 1;
         while (i >= lo) : (i -= 1) {
+            // `errdefer`s run only on error-return edges (SPEC §34.3).
+            if (!inc_err and self.derr[@as(usize, i)]) { continue; }
             var st: i32 = self.defers[@as(usize, i)];
             var d: bool = self.emit_stmt(a, st);
             // The divergence verdict of a flushed defer body is discarded,
@@ -2972,13 +3334,13 @@ pub const Em = struct {
     }
 
     fn flush_current(self: *Self, a: Allocator) void {
-        if (self.sc_len > 0) { self.flush_scope(a, self.sc_len - 1); }
+        if (self.sc_len > 0) { self.flush_scope(a, self.sc_len - 1, false); }
     }
 
-    fn flush_all(self: *Self, a: Allocator) void {
+    fn flush_all(self: *Self, a: Allocator, inc_err: bool) void {
         var i: i64 = @as(i64, self.sc_len) - 1;
         while (i >= 0) : (i -= 1) {
-            self.flush_scope(a, @as(usize, i));
+            self.flush_scope(a, @as(usize, i), inc_err);
         }
     }
 
@@ -2998,7 +3360,7 @@ pub const Em = struct {
         if (loop_idx < 0) { return loop_idx; }
         i = @as(i64, self.sc_len) - 1;
         while (i >= loop_idx) : (i -= 1) {
-            self.flush_scope(a, @as(usize, i));
+            self.flush_scope(a, @as(usize, i), false);
         }
         return loop_idx;
     }
@@ -3306,9 +3668,9 @@ pub const Em = struct {
 
     /// `finish_return`: the deferred-temp dance. `has_val` distinguishes
     /// `return;` from `return <e>;` (`es` is meaningful only when set).
-    fn finish_return(self: *Self, a: Allocator, has_val: bool, es: []u8) void {
+    fn finish_return(self: *Self, a: Allocator, has_val: bool, es: []u8, inc_err: bool) void {
         var non_void: bool = self.cur_ret != ET_VOID;
-        var active: bool = self.any_defer_active();
+        var active: bool = self.any_defer_active(inc_err);
         if (active and non_void) {
             // Evaluate into a temporary before the defers run; a missing
             // value falls back to `0` (the `unwrap_or` arm — sema-invalid
@@ -3323,11 +3685,11 @@ pub const Em = struct {
             var s: []u8 = sb.build(a);
             sb.deinit(a);
             self.line(a, s);
-            self.flush_all(a);
+            self.flush_all(a, inc_err);
             self.line(a, "return __kd_ret;");
             return;
         }
-        if (active) { self.flush_all(a); }
+        if (active) { self.flush_all(a, inc_err); }
         if (has_val) {
             var sb2: StrBuilder = StrBuilder.init(a);
             sb2.append(a, "return (");
@@ -3339,6 +3701,231 @@ pub const Em = struct {
             return;
         }
         self.line(a, "return;");
+    }
+
+    /// `Emitter::emit_try` (v0.174): hoist the `!T` operand into
+    /// `__kd_try{N}`, early-return the error (flushing defers AND
+    /// errdefers — an error edge) re-wrapped in the enclosing return
+    /// type, and yield the success payload (`.val`, or `((void)0)` for a
+    /// `!void` operand).
+    fn emit_try(self: *Self, a: Allocator, inner: i32) []u8 {
+        var nctr: i64 = self.try_count;
+        self.try_count += 1;
+        var it: i64 = self.type_of_expr(inner);
+        var err_cty: []u8 = "";
+        if (et_is_erru(it)) {
+            err_cty = self.cty_of(a, it);
+        } else {
+            err_cty = self.cty_of(a, self.cur_ret);
+        }
+        var es: []u8 = self.emit_expr(a, inner);
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, err_cty);
+        sb.append(a, " __kd_try");
+        sb.append_i64(a, nctr);
+        sb.append(a, " = ");
+        sb.append(a, es);
+        sb.append(a, ";");
+        var s1: []u8 = sb.build(a);
+        sb.deinit(a);
+        self.line(a, s1);
+        var sb2: StrBuilder = StrBuilder.init(a);
+        sb2.append(a, "if (__kd_try");
+        sb2.append_i64(a, nctr);
+        sb2.append(a, ".err != 0) {");
+        var s2: []u8 = sb2.build(a);
+        sb2.deinit(a);
+        self.line(a, s2);
+        self.indent += 1;
+        self.flush_all(a, true);
+        var sb3: StrBuilder = StrBuilder.init(a);
+        sb3.append(a, "return (");
+        sb3.append(a, self.cty_of(a, self.cur_ret));
+        sb3.append(a, "){ .err = __kd_try");
+        sb3.append_i64(a, nctr);
+        sb3.append(a, ".err };");
+        var s3: []u8 = sb3.build(a);
+        sb3.deinit(a);
+        self.line(a, s3);
+        self.indent -= 1;
+        self.line(a, "}");
+        if (et_is_erru(it) and self.eu_payload_of(it) == ET_VOID) {
+            return "((void)0)";
+        }
+        var sb4: StrBuilder = StrBuilder.init(a);
+        sb4.append(a, "__kd_try");
+        sb4.append_i64(a, nctr);
+        sb4.append(a, ".val");
+        var s4: []u8 = sb4.build(a);
+        sb4.deinit(a);
+        return s4;
+    }
+
+    /// The payload `T` of a `try inner` (the enclosing function's payload
+    /// as the validated-input fallback).
+    fn try_payload_type(self: *Self, inner: i32) i64 {
+        var it: i64 = self.type_of_expr(inner);
+        if (et_is_erru(it)) { return self.eu_payload_of(it); }
+        if (et_is_erru(self.cur_ret)) { return self.eu_payload_of(self.cur_ret); }
+        return self.cur_ret;
+    }
+
+    /// `emit_catch_capture`: `e catch |name| d` — hoist the operand into
+    /// `__kd_eu{N}`, declare `__kd_catch{N}` of the payload type, run `d`
+    /// ONLY on the error path with `int32_t kd_<name>` bound to the code.
+    fn emit_catch_capture(self: *Self, a: Allocator, n: i32) []u8 {
+        var u: usize = @as(usize, n);
+        var nctr: i64 = self.catch_count;
+        self.catch_count += 1;
+        var xt: i64 = self.type_of_expr(self.nodes[u].a);
+        var err_cty: []u8 = "";
+        var payload: i64 = ET_NONE;
+        if (et_is_erru(xt)) {
+            err_cty = self.eu_c_name(a, xt);
+            payload = self.eu_payload_of(xt);
+        } else if (et_is_erru(self.cur_ret)) {
+            err_cty = self.eu_c_name(a, self.cur_ret);
+            payload = self.eu_payload_of(self.cur_ret);
+        } else {
+            err_cty = self.cty_of(a, self.cur_ret);
+            payload = self.cur_ret;
+        }
+        var es: []u8 = self.emit_expr(a, self.nodes[u].a);
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, err_cty);
+        sb.append(a, " __kd_eu");
+        sb.append_i64(a, nctr);
+        sb.append(a, " = ");
+        sb.append(a, es);
+        sb.append(a, ";");
+        var s1: []u8 = sb.build(a);
+        sb.deinit(a);
+        self.line(a, s1);
+        var sb2: StrBuilder = StrBuilder.init(a);
+        sb2.append(a, self.cty_of(a, payload));
+        sb2.append(a, " __kd_catch");
+        sb2.append_i64(a, nctr);
+        sb2.append(a, ";");
+        var s2: []u8 = sb2.build(a);
+        sb2.deinit(a);
+        self.line(a, s2);
+        var sb3: StrBuilder = StrBuilder.init(a);
+        sb3.append(a, "if (__kd_eu");
+        sb3.append_i64(a, nctr);
+        sb3.append(a, ".err != 0) {");
+        var s3: []u8 = sb3.build(a);
+        sb3.deinit(a);
+        self.line(a, s3);
+        self.indent += 1;
+        var sb4: StrBuilder = StrBuilder.init(a);
+        sb4.append(a, "int32_t kd_");
+        sb4.append(a, self.xname(n));
+        sb4.append(a, " = __kd_eu");
+        sb4.append_i64(a, nctr);
+        sb4.append(a, ".err;");
+        var s4: []u8 = sb4.build(a);
+        sb4.deinit(a);
+        self.line(a, s4);
+        self.push_scope(a, false, 0 - 1, 0 - 1);
+        self.push_vt(a, self.nodes[u].xoff, self.nodes[u].xlen, ET_I32);
+        var d: []u8 = self.emit_coerced(a, self.nodes[u].b, payload);
+        var sb5: StrBuilder = StrBuilder.init(a);
+        sb5.append(a, "__kd_catch");
+        sb5.append_i64(a, nctr);
+        sb5.append(a, " = ");
+        sb5.append(a, d);
+        sb5.append(a, ";");
+        var s5: []u8 = sb5.build(a);
+        sb5.deinit(a);
+        self.line(a, s5);
+        self.pop_scope();
+        self.indent -= 1;
+        self.line(a, "} else {");
+        self.indent += 1;
+        var sb6: StrBuilder = StrBuilder.init(a);
+        sb6.append(a, "__kd_catch");
+        sb6.append_i64(a, nctr);
+        sb6.append(a, " = __kd_eu");
+        sb6.append_i64(a, nctr);
+        sb6.append(a, ".val;");
+        var s6: []u8 = sb6.build(a);
+        sb6.deinit(a);
+        self.line(a, s6);
+        self.indent -= 1;
+        self.line(a, "}");
+        var sb7: StrBuilder = StrBuilder.init(a);
+        sb7.append(a, "__kd_catch");
+        sb7.append_i64(a, nctr);
+        var s7: []u8 = sb7.build(a);
+        sb7.deinit(a);
+        return s7;
+    }
+
+    /// `emit_catch_void`: a `catch` over `!void` — capturing or not —
+    /// hoists the operand and runs the (void) handler as a statement on
+    /// the error path only; yields `((void)0)`.
+    fn emit_catch_void(self: *Self, a: Allocator, n: i32) []u8 {
+        var u: usize = @as(usize, n);
+        var nctr: i64 = self.catch_count;
+        self.catch_count += 1;
+        var xt: i64 = self.type_of_expr(self.nodes[u].a);
+        var err_cty: []u8 = "";
+        if (et_is_erru(xt)) {
+            err_cty = self.cty_of(a, xt);
+        } else {
+            err_cty = self.cty_of(a, self.cur_ret);
+        }
+        var es: []u8 = self.emit_expr(a, self.nodes[u].a);
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, err_cty);
+        sb.append(a, " __kd_eu");
+        sb.append_i64(a, nctr);
+        sb.append(a, " = ");
+        sb.append(a, es);
+        sb.append(a, ";");
+        var s1: []u8 = sb.build(a);
+        sb.deinit(a);
+        self.line(a, s1);
+        var sb2: StrBuilder = StrBuilder.init(a);
+        sb2.append(a, "if (__kd_eu");
+        sb2.append_i64(a, nctr);
+        sb2.append(a, ".err != 0) {");
+        var s2: []u8 = sb2.build(a);
+        sb2.deinit(a);
+        self.line(a, s2);
+        self.indent += 1;
+        if ((self.nodes[u].flags & F_CAP) != 0) {
+            var sb3: StrBuilder = StrBuilder.init(a);
+            sb3.append(a, "int32_t kd_");
+            sb3.append(a, self.xname(n));
+            sb3.append(a, " = __kd_eu");
+            sb3.append_i64(a, nctr);
+            sb3.append(a, ".err;");
+            var s3: []u8 = sb3.build(a);
+            sb3.deinit(a);
+            self.line(a, s3);
+            self.push_scope(a, false, 0 - 1, 0 - 1);
+            self.push_vt(a, self.nodes[u].xoff, self.nodes[u].xlen, ET_I32);
+            var d: []u8 = self.emit_expr(a, self.nodes[u].b);
+            var sb4: StrBuilder = StrBuilder.init(a);
+            sb4.append(a, d);
+            sb4.append(a, ";");
+            var s4: []u8 = sb4.build(a);
+            sb4.deinit(a);
+            self.line(a, s4);
+            self.pop_scope();
+        } else {
+            var d2: []u8 = self.emit_expr(a, self.nodes[u].b);
+            var sb5: StrBuilder = StrBuilder.init(a);
+            sb5.append(a, d2);
+            sb5.append(a, ";");
+            var s5: []u8 = sb5.build(a);
+            sb5.deinit(a);
+            self.line(a, s5);
+        }
+        self.indent -= 1;
+        self.line(a, "}");
+        return "((void)0)";
     }
 
     /// `emit_if`: flatten the `else if` chain into one C ladder. Returns
@@ -3611,7 +4198,17 @@ pub const Em = struct {
                 if (lty == ET_NONE) { lty = ET_I64; }
                 ct = self.cty_of(a, lty);
             }
-            var es: []u8 = self.emit_coerced(a, self.nodes[u].b, lty);
+            // `var x = try e;` hoists the error propagation (which may
+            // early-return) and binds the unwrapped payload, coerced back
+            // to the binding's type.
+            var es: []u8 = "";
+            var ini: i32 = self.nodes[u].b;
+            if (ini >= 0 and self.nodes[@as(usize, ini)].kind == ND_TRY) {
+                var pay: []u8 = self.emit_try(a, self.nodes[@as(usize, ini)].a);
+                es = self.coerce_str(a, pay, self.try_payload_type(self.nodes[@as(usize, ini)].a), lty);
+            } else {
+                es = self.emit_coerced(a, ini, lty);
+            }
             var sb: StrBuilder = StrBuilder.init(a);
             if ((self.nodes[u].flags & F_CONST) != 0) { sb.append(a, "const "); }
             sb.append(a, ct);
@@ -3634,14 +4231,53 @@ pub const Em = struct {
             self.emit_place_assign(a, n);
             return false;
         }
+        if (k == ND_TRY) {
+            // `try e;` as a bare statement: hoist the propagation, discard
+            // the unwrapped payload.
+            var tval: []u8 = self.emit_try(a, self.nodes[u].a);
+            var sbt: StrBuilder = StrBuilder.init(a);
+            sbt.append(a, "(void)(");
+            sbt.append(a, tval);
+            sbt.append(a, ");");
+            var st: []u8 = sbt.build(a);
+            sbt.deinit(a);
+            self.line(a, st);
+            return false;
+        }
         if (k == ND_RETURN) {
             var v: i32 = self.nodes[u].a;
+            var has: bool = false;
+            var es: []u8 = "";
+            var inc_err: bool = false;
             if (v >= 0) {
-                var es: []u8 = self.emit_coerced(a, v, self.cur_ret);
-                self.finish_return(a, true, es);
+                if (self.nodes[@as(usize, v)].kind == ND_TRY) {
+                    // `return try e;` — the propagation early-returns
+                    // inside emit_try; the value returned HERE is the
+                    // success payload (not an error edge).
+                    var pay: []u8 = self.emit_try(a, self.nodes[@as(usize, v)].a);
+                    es = self.coerce_str(a, pay, self.try_payload_type(self.nodes[@as(usize, v)].a), self.cur_ret);
+                    has = true;
+                } else {
+                    es = self.emit_coerced(a, v, self.cur_ret);
+                    has = true;
+                    // `return error.X;` is an error-return edge: errdefers
+                    // run too.
+                    if (self.nodes[@as(usize, v)].kind == ND_ERRLIT) { inc_err = true; }
+                }
             } else {
-                self.finish_return(a, false, "");
+                // `return;` in a `!void` function is the success return:
+                // construct the payload-less value (SPEC §12.3).
+                if (et_is_erru(self.cur_ret) and self.eu_payload_of(self.cur_ret) == ET_VOID) {
+                    var sbv: StrBuilder = StrBuilder.init(a);
+                    sbv.append(a, "((");
+                    sbv.append(a, self.eu_c_name(a, self.cur_ret));
+                    sbv.append(a, "){ .err = 0 })");
+                    es = sbv.build(a);
+                    sbv.deinit(a);
+                    has = true;
+                }
             }
+            self.finish_return(a, has, es, inc_err);
             return true;
         }
         if (k == ND_IF) {
@@ -3682,7 +4318,13 @@ pub const Em = struct {
         }
         if (k == ND_DEFER) {
             // Register only; the body re-lowers at every exit edge.
-            self.push_defer(a, self.nodes[u].a);
+            self.push_defer(a, self.nodes[u].a, false);
+            return false;
+        }
+        if (k == ND_ERRDEFER) {
+            // Register tagged as errdefer (v0.174): runs only on
+            // error-return edges (`return error.X` / `try` propagation).
+            self.push_defer(a, self.nodes[u].a, true);
             return false;
         }
         if (k == ND_BLOCK) {
@@ -3710,7 +4352,7 @@ pub const Em = struct {
             esb.deinit(a);
             self.line(a, esl);
             self.indent += 1;
-            self.flush_all(a);
+            self.flush_all(a, false);
             self.line(a, "return 1;");
             self.indent -= 1;
             self.line(a, "}");
@@ -3891,6 +4533,8 @@ pub const Em = struct {
         self.idx_count = 0;
         self.for_count = 0;
         self.if_count = 0;
+        self.try_count = 0;
+        self.catch_count = 0;
         self.cur_ret = self.resolve_ty(self.nodes[u].b);
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, self.cty(a, self.nodes[u].b));
@@ -3926,6 +4570,19 @@ pub const Em = struct {
         }
         self.pop_scope();
         self.indent -= 1;
+        // A `fn … !void` body that falls off its end returns success
+        // (SPEC §12.3): the implicit exit constructs `{ .err = 0 }`.
+        // QUIRK: the Rust arm emits AFTER emit_block restored the
+        // function-level indent, so the line lands at column 0.
+        if (!diverged and et_is_erru(self.cur_ret) and self.eu_payload_of(self.cur_ret) == ET_VOID) {
+            var sbv2: StrBuilder = StrBuilder.init(a);
+            sbv2.append(a, "return ((");
+            sbv2.append(a, self.eu_c_name(a, self.cur_ret));
+            sbv2.append(a, "){ .err = 0 });");
+            var sv2: []u8 = sbv2.build(a);
+            sbv2.deinit(a);
+            self.line(a, sv2);
+        }
         self.line(a, "}");
     }
 
@@ -3947,11 +4604,11 @@ pub const Em = struct {
             }
             return;
         }
-        if (k == ND_UNARY or k == ND_COMPTIME or k == ND_FIELD or k == ND_UNWRAP) {
+        if (k == ND_UNARY or k == ND_COMPTIME or k == ND_FIELD or k == ND_UNWRAP or k == ND_TRY) {
             self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
             return;
         }
-        if (k == ND_BIN or k == ND_INDEX or k == ND_ORELSE) {
+        if (k == ND_BIN or k == ND_INDEX or k == ND_ORELSE or k == ND_CATCH) {
             self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
             self.collect_calls_expr(a, pend, pendm, self.nodes[u].b);
             return;
@@ -4049,7 +4706,7 @@ pub const Em = struct {
             self.collect_calls_block(a, pend, pendm, self.nodes[u].b);
             return;
         }
-        if (k == ND_DEFER) {
+        if (k == ND_DEFER or k == ND_ERRDEFER) {
             self.collect_calls_stmt(a, pend, pendm, self.nodes[u].a);
             return;
         }
@@ -4383,6 +5040,14 @@ pub const Em = struct {
             }
             return;
         }
+        if ((self.nodes[u].flags & F_ERR) != 0) {
+            var ee: i64 = self.base_code(self.xname(n));
+            if (ee != ET_NONE) {
+                var unused3: i64 = self.eu_intern(a, ee);
+                if (unused3 == 0) { }
+            }
+            return;
+        }
         if ((self.nodes[u].flags & F_SLICE) == 0) { return; }
         var e: i64 = self.base_code(self.xname(n));
         if (e != ET_NONE) { self.intern_elem(a, e); }
@@ -4462,6 +5127,32 @@ pub const Em = struct {
             while (fcur >= 0) {
                 self.intern_expr(a, self.nodes[@as(usize, fcur)].a);
                 fcur = self.nodes[@as(usize, fcur)].next;
+            }
+            return;
+        }
+        if (k == ND_ERRLIT) {
+            // `check_expr`'s ErrorLit arm interns the GLOBAL error name
+            // wherever the literal is checked — body-check order joins
+            // the pass-0 set members in one 1-based code space.
+            var unused: i64 = self.er_intern(a, self.nodes[u].xoff, self.nodes[u].xlen);
+            if (unused == 0) { }
+            return;
+        }
+        if (k == ND_TRY) {
+            self.intern_expr(a, self.nodes[u].a);
+            return;
+        }
+        if (k == ND_CATCH) {
+            // Operand first; a capturing form binds `|e|` (an i32) in a
+            // scope around the default; the default checks second.
+            self.intern_expr(a, self.nodes[u].a);
+            if ((self.nodes[u].flags & F_CAP) != 0) {
+                self.push_scope(a, false, 0 - 1, 0 - 1);
+                self.push_vt(a, self.nodes[u].xoff, self.nodes[u].xlen, ET_I32);
+                self.intern_expr(a, self.nodes[u].b);
+                self.pop_scope();
+            } else {
+                self.intern_expr(a, self.nodes[u].b);
             }
             return;
         }
@@ -4650,7 +5341,7 @@ pub const Em = struct {
             self.intern_block(a, self.nodes[u].c);
             return;
         }
-        if (k == ND_DEFER) {
+        if (k == ND_DEFER or k == ND_ERRDEFER) {
             self.intern_stmt(a, self.nodes[u].a);
             return;
         }
@@ -4942,8 +5633,8 @@ pub const Em = struct {
     /// first, deduplicated by a seen-set. v0.168's arrays-then-slices was
     /// this walk's struct-free special case.
     fn emit_type_defs(self: *Self, a: Allocator) void {
-        if (self.sl_len == 0 and self.ar_count == 0 and self.st_count == 0 and self.en_count == 0 and self.opt_count == 0) { return; }
-        var total: usize = self.en_count + self.st_count + self.opt_count + self.ar_count + self.sl_len;
+        if (self.sl_len == 0 and self.ar_count == 0 and self.st_count == 0 and self.en_count == 0 and self.opt_count == 0 and self.eu_count == 0) { return; }
+        var total: usize = self.en_count + self.st_count + self.opt_count + self.eu_count + self.ar_count + self.sl_len;
         var seen: []bool = alloc(a, bool, total);
         var si: usize = 0;
         while (si < total) : (si += 1) { seen[si] = false; }
@@ -4961,6 +5652,11 @@ pub const Em = struct {
         var op_i: usize = 0;
         while (op_i < self.opt_count) : (op_i += 1) {
             self.visit_type_def(a, seen, ET_OPT_BASE + @as(i64, op_i));
+        }
+        // Error unions seed after optionals, before arrays/slices.
+        var eu_i: usize = 0;
+        while (eu_i < self.eu_count) : (eu_i += 1) {
+            self.visit_type_def(a, seen, ET_ERRU_BASE + @as(i64, eu_i));
         }
         var ai: usize = 0;
         while (ai < self.ar_count) : (ai += 1) {
@@ -4980,13 +5676,14 @@ pub const Em = struct {
         if (et_is_enum(t)) { return t - ET_ENUM_BASE; }
         if (et_is_struct(t)) { return @as(i64, self.en_count) + (t - ET_STRUCT_BASE); }
         if (et_is_opt(t)) { return @as(i64, self.en_count + self.st_count) + (t - ET_OPT_BASE); }
-        if (et_is_arr(t)) { return @as(i64, self.en_count + self.st_count + self.opt_count) + (t - ET_ARR_BASE); }
+        if (et_is_erru(t)) { return @as(i64, self.en_count + self.st_count + self.opt_count) + (t - ET_ERRU_BASE); }
+        if (et_is_arr(t)) { return @as(i64, self.en_count + self.st_count + self.opt_count + self.eu_count) + (t - ET_ARR_BASE); }
         // A slice: find its element's intern index.
         var e: i64 = et_slice_elem(t);
         var i: usize = 0;
         while (i < self.sl_len) : (i += 1) {
             if (self.slices[i] == e) {
-                return @as(i64, self.en_count + self.st_count + self.opt_count + self.ar_count + i);
+                return @as(i64, self.en_count + self.st_count + self.opt_count + self.eu_count + self.ar_count + i);
             }
         }
         return 0 - 1;
@@ -5003,10 +5700,18 @@ pub const Em = struct {
         }
         if (et_is_opt(t)) {
             var oin: i64 = self.opt_inner_of(t);
-            if (et_is_struct(oin) or et_is_arr(oin) or et_is_slice(oin) or et_is_enum(oin) or et_is_opt(oin)) {
+            if (et_is_struct(oin) or et_is_arr(oin) or et_is_slice(oin) or et_is_enum(oin) or et_is_opt(oin) or et_is_erru(oin)) {
                 self.visit_type_def(a, seen, oin);
             }
             self.emit_one_optional(a, t);
+            return;
+        }
+        if (et_is_erru(t)) {
+            var epl: i64 = self.eu_payload_of(t);
+            if (et_is_struct(epl) or et_is_arr(epl) or et_is_slice(epl) or et_is_enum(epl) or et_is_opt(epl) or et_is_erru(epl)) {
+                self.visit_type_def(a, seen, epl);
+            }
+            self.emit_one_error_union(a, t);
             return;
         }
         if (et_is_struct(t)) {
@@ -5016,7 +5721,7 @@ pub const Em = struct {
             var j: usize = 0;
             while (j < n) : (j += 1) {
                 var ft: i64 = self.sf_ty[start + j];
-                if (et_is_struct(ft) or et_is_arr(ft) or et_is_slice(ft) or et_is_enum(ft) or et_is_opt(ft)) {
+                if (et_is_struct(ft) or et_is_arr(ft) or et_is_slice(ft) or et_is_enum(ft) or et_is_opt(ft) or et_is_erru(ft)) {
                     self.visit_type_def(a, seen, ft);
                 }
             }
@@ -5112,6 +5817,47 @@ pub const Em = struct {
         var s3: []u8 = h.build(a);
         h.deinit(a);
         self.line(a, s3);
+    }
+
+    /// `emit_one_error_union`: `typedef struct { int32_t err; <T> val; }`
+    /// plus the inline `_catch` helper; a `!void` union carries only the
+    /// `err` field and SKIPS the helper (its `catch` lowers lazily).
+    fn emit_one_error_union(self: *Self, a: Allocator, t: i64) void {
+        var ename: []u8 = self.eu_c_name(a, t);
+        var pl: i64 = self.eu_payload_of(t);
+        if (pl == ET_VOID) {
+            var sbv: StrBuilder = StrBuilder.init(a);
+            sbv.append(a, "typedef struct { int32_t err; } ");
+            sbv.append(a, ename);
+            sbv.append(a, ";");
+            var sv: []u8 = sbv.build(a);
+            sbv.deinit(a);
+            self.line(a, sv);
+            return;
+        }
+        var pcty: []u8 = self.cty_of(a, pl);
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "typedef struct { int32_t err; ");
+        sb.append(a, pcty);
+        sb.append(a, " val; } ");
+        sb.append(a, ename);
+        sb.append(a, ";");
+        var s1: []u8 = sb.build(a);
+        sb.deinit(a);
+        self.line(a, s1);
+        var g: StrBuilder = StrBuilder.init(a);
+        g.append(a, "static inline ");
+        g.append(a, pcty);
+        g.append(a, " ");
+        g.append(a, ename);
+        g.append(a, "_catch(");
+        g.append(a, ename);
+        g.append(a, " e, ");
+        g.append(a, pcty);
+        g.append(a, " d) { return e.err == 0 ? e.val : d; }");
+        var s2: []u8 = g.build(a);
+        g.deinit(a);
+        self.line(a, s2);
     }
 
     /// `emit_one_struct`: `typedef struct { <cty> kd_<f>; … } kd_struct_<Name>;`
@@ -5308,6 +6054,8 @@ pub const Em = struct {
         self.idx_count = 0;
         self.for_count = 0;
         self.if_count = 0;
+        self.try_count = 0;
+        self.catch_count = 0;
         self.cur_ret = ET_I32;
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, "static int kd_test_");
@@ -5441,6 +6189,7 @@ pub const Em = struct {
         // params/returns; the type-aware body pass then consults those
         // signatures.
         self.en_collect(a);
+        self.er_collect(a);
         self.st_collect(a);
         self.intern_scan_sigs(a);
         self.collect_signatures(a);

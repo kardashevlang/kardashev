@@ -1,6 +1,6 @@
 [package]
 name = "kardc"
-version = "0.173.0"
+version = "0.174.0"
 edition = "2021"
 description = "The kardashev compiler and self-contained toolchain (Gen 2: Rust implementation of a Zig-philosophy systems language)."
 license = "MIT OR Apache-2.0"

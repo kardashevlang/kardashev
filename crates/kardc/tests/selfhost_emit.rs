@@ -1,4 +1,4 @@
-//! Self-host stages 3–15 (v0.161–v0.173): differential test of
+//! Self-host stages 3–16 (v0.161–v0.174): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -19,7 +19,12 @@
 //! fields/array elements/binary siblings — and, v0.173, OPTIONALS `?T`:
 //! `null`/`T` widening through the same plumbing, `orelse`, `.?` unwrap,
 //! `if (opt) |v|` captures, `kd_opt_<tag>` typedefs with `_orelse` /
-//! `_unwrap` helpers seeded between structs and arrays) written
+//! `_unwrap` helpers seeded between structs and arrays — and, v0.174,
+//! ERROR UNIONS `!T`: the GLOBAL 1-based error-code table (set members
+//! then body-order `error.X` literals), `kd_err_<tag>` typedefs (+
+//! `_catch`; the payload-less `!void` variant), `try` propagation with
+//! errdefer-inclusive flushes, both `catch` forms, `errdefer`, and named
+//! error sets whose membership stays sema's concern) written
 //! in kardashev —
 //! against the Rust
 //! reference emitter. Since v0.166 every corpus file is classified and
@@ -148,6 +153,11 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s11_optionals/orelse_rhs_mismatch_err.ks",            // E0110
     "tests/spec/s11_optionals/unwrap_non_optional_err.ks",            // E0182
     "tests/spec/s11_optionals/widen_mismatch_err.ks",                 // E0110
+    "tests/spec/s12_errunions/catch_non_error_union_err.ks",          // E0195
+    "tests/spec/s12_errunions/named_set_membership_err.ks",           // E0330
+    "tests/spec/s12_errunions/try_nested_position_err.ks",            // E0191
+    "tests/spec/s12_errunions/try_on_non_error_union_err.ks",         // E0192
+    "tests/spec/s12_errunions/try_outside_error_fn_err.ks",           // E0190
     "tests/spec/s13_enums/bool_scrutinee_err.ks",                     // E0213
     "tests/spec/s13_enums/dup_switch_label_enum_err.ks",              // E0211
     "tests/spec/s13_enums/dup_switch_label_int_err.ks",               // E0211
@@ -179,7 +189,15 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s37_enum_values/enum_from_int_value_not_integer_err.ks", // E0321
     "tests/spec/s37_enum_values/int_from_enum_non_enum_err.ks",       // E0321
     "tests/spec/s18_inference/infer_enum_lit_err.ks",                 // E0215
+    "tests/spec/s18_inference/infer_error_lit_err.ks",                // E0193
     "tests/spec/s18_inference/infer_null_err.ks",                     // E0180
+    "tests/spec/s34_error_sets/cross_set_nonmember_err.ks",           // E0330
+    "tests/spec/s34_error_sets/dup_member_err.ks",                    // E0331
+    "tests/spec/s34_error_sets/init_site_nonmember_err.ks",           // E0330
+    "tests/spec/s34_error_sets/unknown_set_name_err.ks",              // E0331
+    "tests/spec/s36_catch/capture_default_type_mismatch_err.ks",      // E0110
+    "tests/spec/s36_catch/capture_out_of_scope_err.ks",               // E0100
+    "tests/spec/s36_catch/capture_requires_error_union_err.ks",       // E0195
     "tests/spec/s21_captures/err_capture_non_optional.ks",            // E0280
     "tests/spec/s21_captures/err_capture_not_visible_in_else.ks",     // E0100
     "tests/spec/s39_switch_ranges/else_required_with_ranges_err.ks",  // E0214
@@ -202,8 +220,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 195;
-const MIN_C_COMPARED_TEST: usize = 215;
+const MIN_C_COMPARED_PROGRAM: usize = 240;
+const MIN_C_COMPARED_TEST: usize = 260;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -254,12 +272,25 @@ fn chain_has_index(e: &Expr) -> bool {
 /// one — the selfhost side reports its `F_THIS` flag identically, sliced or
 /// not).
 fn det_type(sn: &HashSet<String>, t: &TypeExpr) -> Option<Hit> {
-    if t.error_union
-        || t.error_set.is_some()
-        || t.pointer
+    if t.pointer
         || t.ctor_args.is_some()
         || matches!(&t.array_len, Some(kardc::ast::ArraySize::Param(_)))
     {
+        return Some(("type-form", t.span.start));
+    }
+    if t.error_union {
+        // `!T` / `Set!T` over a bare subset payload name (v0.174; the set
+        // name is sema's E0330 membership concern). A `Self`-referencing
+        // set spelling stays a type-form.
+        if t.error_set.as_deref() == Some("Self") {
+            return Some(("type-form", t.span.start));
+        }
+        if !subset_type_name(&t.name) && !sn.contains(&t.name) {
+            return Some(("type-name", t.span.start));
+        }
+        return None;
+    }
+    if t.error_set.is_some() {
         return Some(("type-form", t.span.start));
     }
     if t.optional {
@@ -354,7 +385,9 @@ fn det_expr(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
         Expr::Null { .. } => None,
         Expr::Orelse { lhs, rhs, .. } => det_expr(sn, lhs).or_else(|| det_expr(sn, rhs)),
         Expr::Unwrap { expr, .. } => det_expr(sn, expr),
-        Expr::ErrorLit { .. } => Some(("error-lit", pos)),
+        // `error.X` is in the subset (v0.174): its `!T` comes from the
+        // expected-type context (no context is sema's E0193).
+        Expr::ErrorLit { .. } => None,
         // An unqualified `.V` is in the subset (v0.172): its enum comes
         // from the expected-type context (no-context = sema's E0215).
         Expr::EnumLit { .. } => None,
@@ -369,8 +402,11 @@ fn det_expr(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
             .or_else(|| det_expr(sn, hi)),
         Expr::AddrOf { .. } => Some(("addrof", pos)),
         Expr::Deref { .. } => Some(("deref", pos)),
-        Expr::Try { .. } => Some(("try", pos)),
-        Expr::Catch { .. } => Some(("catch", pos)),
+        // `try e` and both `catch` forms are in the subset (v0.174).
+        Expr::Try { expr, .. } => det_expr(sn, expr),
+        Expr::Catch { expr, default, .. } => {
+            det_expr(sn, expr).or_else(|| det_expr(sn, default))
+        }
         Expr::Unreachable { .. } => Some(("unreachable", pos)),
     }
 }
@@ -442,7 +478,8 @@ fn det_stmt(sn: &HashSet<String>, s: &Stmt) -> Option<Hit> {
             None
         }
         Stmt::Defer { stmt, .. } => det_stmt(sn, stmt),
-        Stmt::ErrDefer { .. } => Some(("errdefer", pos)),
+        // `errdefer <stmt>` is in the subset (v0.174).
+        Stmt::ErrDefer { stmt, .. } => det_stmt(sn, stmt),
         Stmt::Block(b) => det_block(sn, b),
         // `switch` is in the subset (v0.172): scrutinee, then per arm —
         // a payload capture (tagged unions) stays out — labels and body;
@@ -749,7 +786,9 @@ fn detect_flat(files: &[FlatFile], program_mode: bool) -> Option<(String, usize)
                 Item::Enum(_) => None,
                 Item::Union(u) => Some(("union", u.span.start)),
                 Item::Import(_) => None,
-                Item::ErrorSet(e) => Some(("errorset", e.span.start)),
+                // A named error set is a subset item (v0.174): members
+                // carry nothing to walk (a duplicate is sema's E0331).
+                Item::ErrorSet(_) => None,
             };
             if let Some((word, pos)) = hit {
                 return Some((word.to_string(), ff.base + pos));
@@ -1318,6 +1357,23 @@ fn selfhost_emit_differential_targeted_inputs() {
             "optionals_capture_counter_and_nesting",
             "fn side(n: i64) ?i64 {\n    return n;\n}\npub fn main() void {\n    if (side(41)) |a1| {\n        print(a1);\n    }\n    if (side(1)) |a2| {\n        if (side(2)) |a3| {\n            print(a2 + a3);\n        }\n    }\n}\n",
         ),
+        // -- error unions !T (v0.174) ---------------------------------------------
+        (
+            "errunions_try_catch_errdefer_roundtrip",
+            "fn may(n: i64) !i64 {\n    if (n < 0) { return error.Neg; }\n    return n * 2;\n}\nfn chain(n: i64) !i64 {\n    defer print(700);\n    errdefer print(800);\n    var v: i64 = try may(n);\n    return v + 1;\n}\npub fn main() void {\n    print(chain(5) catch 0 - 1);\n    print(chain(0 - 2) catch |e| @as(i64, e) * 10);\n}\n",
+        ),
+        (
+            "errunions_void_payload_forms",
+            "fn step(n: i64) !void {\n    if (n == 0) { return error.Zero; }\n    print(n);\n    if (n > 3) { return; }\n}\nfn run(n: i64) !void {\n    try step(n);\n    try step(n + 1);\n}\npub fn main() void {\n    run(1) catch print(0 - 1);\n    run(0) catch |e| print(100 + e);\n}\n",
+        ),
+        (
+            "errunions_code_space_and_sets",
+            "const E = error{ Alpha, Beta };\nfn a1() !i64 { return error.Shared; }\nfn a2() E!i64 { return error.Alpha; }\nfn a3() !i64 { return error.Other; }\npub fn main() void {\n    print(a1() catch |e| @as(i64, e));\n    print(a2() catch |e| @as(i64, e));\n    print(a3() catch |e| @as(i64, e));\n    print(a1() catch |e| @as(i64, e));\n}\n",
+        ),
+        (
+            "errunions_coercion_sites",
+            "const Box = struct {\n    r: !i64,\n};\nfn wrap(v: !i64) !i64 { return v; }\npub fn main() void {\n    var b: Box = Box{ .r = 7 };\n    b.r = error.Bad;\n    var x: !i64 = 5;\n    x = wrap(x);\n    print(x catch 0);\n    print(b.r catch |e| @as(i64, e));\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
             "skip_slice_elem_f64",
@@ -1352,8 +1408,8 @@ fn selfhost_emit_differential_targeted_inputs() {
             "pub fn main() void {\n    var x: ?f64 = null;\n}\n",
         ),
         (
-            "skip_catch_expr",
-            "fn f() i64 { return 1; }\npub fn main() void {\n    var x: i64 = f() catch 0;\n    print(x);\n}\n",
+            "skip_addrof_expr",
+            "pub fn main() void {\n    var x: i64 = 1;\n    var p = &x;\n}\n",
         ),
         ("skip_nomain", "fn helper() void {}\n"),
         ("skip_empty_module", ""),
