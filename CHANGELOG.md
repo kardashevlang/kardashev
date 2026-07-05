@@ -18,6 +18,51 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.174.0] — Self-hosting stage 16: error unions `!T`
+
+The self-hosted emitter's subset gains ERROR UNIONS — the biggest single
+jump yet: the C-identical corpus climbs 205/224 → 249/268 (Program/
+Test), absorbing `s12_errunions`, `s36_catch`, `s34_error_sets` and the
+try/catch users scattered across the corpus.
+
+- `selfhost/emit.ks` (stage 16): `!T` (and named sets `Set!T` — the set
+  name stays sema's E0330 membership concern; the runtime type is the
+  payload's union either way) with the GLOBAL 1-based error-code table
+  replayed exactly: error-set members intern in pass 0 (after enums,
+  before struct names), then `error.X` literals in body-check order.
+  `kd_err_<mangle>` typedefs `{ int32_t err; T val; }` + the `_catch`
+  helper (the payload-less `!void` variant skips it) seed between
+  optionals and arrays in the dependency walk.
+- `error.X` / `T` widen through `emit_coerced` (`{ .err = code }` /
+  `{ .err = 0, .val = e }`; a `!void` target evaluates its void source
+  inside a comma expression); `try` hoists `__kd_try{N}`, early-returns
+  the re-wrapped error after an ERRDEFER-INCLUSIVE flush, and yields
+  `.val` (`((void)0)` for `!void`) at all three statement positions
+  (let-init re-coerced via the new string-level `coerce_str`,
+  `return try e;` — NOT an error edge — and bare `try e;` →
+  `(void)(…);`); `catch` lowers eagerly through `_catch`, capturing
+  through `__kd_eu{N}`/`__kd_catch{N}` with `int32_t kd_<e>` bound
+  lazily on the error path, and ALWAYS as lazy statements over `!void`.
+- `errdefer` joins the defer machinery as error-tagged registrations:
+  only error-return edges (`return error.X`, try propagation) flush
+  them — plain returns, breaks and fall-throughs skip them. A
+  `fn … !void` falling off its end returns the `{ .err = 0 }` success —
+  at COLUMN 0, the Rust emitter's indent quirk, mirrored byte-for-byte.
+- Differential (`selfhost_emit.rs`): the mirrored detector admits `!T`/
+  `Set!T` (subset payload names; a `Self`-set spelling stays out),
+  `error.X`, both `catch` forms, `try`, `errdefer` and error-set items.
+  13 new sema-invalid pins (E0190/E0191/E0192/E0193/E0195/E0330/E0331
+  across s12/s18/s34/s36); floors 195/215 → 240/260 (249/268 observed);
+  4 new in-subset targeted cases (try/catch/errdefer round-trip, !void
+  forms, the shared code space across sets and literals, coercion
+  sites incl. a `!T` struct field) and 1 reworked skip case. Suite:
+  63 → 65 tests — typedefs + helper, the code-1 failure value, the
+  full try block with errdefer-then-defer flush order, both catch
+  lowerings, the `!void` no-helper/lazy-catch/column-0 shapes.
+- All 705 corpus files keep three-bucket agreement in both modes;
+  error-union programs verified end-to-end at runtime (propagation,
+  defer/errdefer ordering, code identity across mentions).
+
 ## [0.173.0] — Self-hosting stage 15: optionals `?T`
 
 The self-hosted emitter's subset gains OPTIONALS — the v0.172 coercion
