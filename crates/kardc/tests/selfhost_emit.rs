@@ -1,4 +1,4 @@
-//! Self-host stages 3–14 (v0.161–v0.172): differential test of
+//! Self-host stages 3–15 (v0.161–v0.173): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -16,7 +16,10 @@
 //! range cases, exhaustiveness-aware divergence, plus CONTEXTUAL `.V`
 //! literals through the expected-type coercion plumbing at every site:
 //! let/assign/place-assign/return/call args/method args/struct-literal
-//! fields/array elements/binary siblings) written
+//! fields/array elements/binary siblings — and, v0.173, OPTIONALS `?T`:
+//! `null`/`T` widening through the same plumbing, `orelse`, `.?` unwrap,
+//! `if (opt) |v|` captures, `kd_opt_<tag>` typedefs with `_orelse` /
+//! `_unwrap` helpers seeded between structs and arrays) written
 //! in kardashev —
 //! against the Rust
 //! reference emitter. Since v0.166 every corpus file is classified and
@@ -139,6 +142,12 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s10_methods/err_static_call_missing_self.ks",         // E0171
     "tests/spec/s10_methods/err_unknown_assoc_fn.ks",                 // E0173
     "tests/spec/s10_methods/err_unknown_method.ks",                   // E0171
+    "tests/spec/s11_optionals/if_capture_non_optional_err.ks",        // E0280
+    "tests/spec/s11_optionals/null_without_expected_err.ks",          // E0180
+    "tests/spec/s11_optionals/orelse_lhs_not_optional_err.ks",        // E0181
+    "tests/spec/s11_optionals/orelse_rhs_mismatch_err.ks",            // E0110
+    "tests/spec/s11_optionals/unwrap_non_optional_err.ks",            // E0182
+    "tests/spec/s11_optionals/widen_mismatch_err.ks",                 // E0110
     "tests/spec/s13_enums/bool_scrutinee_err.ks",                     // E0213
     "tests/spec/s13_enums/dup_switch_label_enum_err.ks",              // E0211
     "tests/spec/s13_enums/dup_switch_label_int_err.ks",               // E0211
@@ -170,6 +179,9 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s37_enum_values/enum_from_int_value_not_integer_err.ks", // E0321
     "tests/spec/s37_enum_values/int_from_enum_non_enum_err.ks",       // E0321
     "tests/spec/s18_inference/infer_enum_lit_err.ks",                 // E0215
+    "tests/spec/s18_inference/infer_null_err.ks",                     // E0180
+    "tests/spec/s21_captures/err_capture_non_optional.ks",            // E0280
+    "tests/spec/s21_captures/err_capture_not_visible_in_else.ks",     // E0100
     "tests/spec/s39_switch_ranges/else_required_with_ranges_err.ks",  // E0214
     "tests/spec/s39_switch_ranges/overlapping_ranges_err.ks",         // E0211
     "tests/spec/s28_bitwise/bitand_bool_err.ks",                      // E0110
@@ -190,8 +202,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 175;
-const MIN_C_COMPARED_TEST: usize = 190;
+const MIN_C_COMPARED_PROGRAM: usize = 195;
+const MIN_C_COMPARED_TEST: usize = 215;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -242,14 +254,21 @@ fn chain_has_index(e: &Expr) -> bool {
 /// one — the selfhost side reports its `F_THIS` flag identically, sliced or
 /// not).
 fn det_type(sn: &HashSet<String>, t: &TypeExpr) -> Option<Hit> {
-    if t.optional
-        || t.error_union
+    if t.error_union
         || t.error_set.is_some()
         || t.pointer
         || t.ctor_args.is_some()
         || matches!(&t.array_len, Some(kardc::ast::ArraySize::Param(_)))
     {
         return Some(("type-form", t.span.start));
+    }
+    if t.optional {
+        // `?T` over a bare subset name (v0.173; a composite inner is a
+        // parse error, so `?` never coexists with the other forms).
+        if !subset_type_name(&t.name) && !sn.contains(&t.name) {
+            return Some(("type-name", t.span.start));
+        }
+        return None;
     }
     if t.array_len.is_some() || t.slice {
         // `[N]T` (v0.168) / `[]T` (v0.164) over the five scalar elements,
@@ -331,9 +350,10 @@ fn det_expr(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
         Expr::MethodCall { receiver, args, .. } => {
             det_expr(sn, receiver).or_else(|| args.iter().find_map(|x| det_expr(sn, x)))
         }
-        Expr::Null { .. } => Some(("null", pos)),
-        Expr::Orelse { .. } => Some(("orelse", pos)),
-        Expr::Unwrap { .. } => Some(("unwrap", pos)),
+        // `null`, `orelse` and `.?` are in the subset (v0.173).
+        Expr::Null { .. } => None,
+        Expr::Orelse { lhs, rhs, .. } => det_expr(sn, lhs).or_else(|| det_expr(sn, rhs)),
+        Expr::Unwrap { expr, .. } => det_expr(sn, expr),
         Expr::ErrorLit { .. } => Some(("error-lit", pos)),
         // An unqualified `.V` is in the subset (v0.172): its enum comes
         // from the expected-type context (no-context = sema's E0215).
@@ -386,9 +406,8 @@ fn det_stmt(sn: &HashSet<String>, s: &Stmt) -> Option<Hit> {
             els,
             ..
         } => {
-            if capture.is_some() {
-                return Some(("capture", pos));
-            }
+            // The `if (opt) |v|` capture is in the subset (v0.173).
+            let _ = capture;
             det_expr(sn, cond)
                 .or_else(|| det_block(sn, then))
                 .or_else(|| els.as_deref().and_then(|e| det_stmt(sn, e)))
@@ -1282,6 +1301,23 @@ fn selfhost_emit_differential_targeted_inputs() {
             "switch_divergence_shapes",
             "fn f(n: i64) i64 {\n    switch (n) {\n        0 => { return 10; },\n        else => { return 20; },\n    }\n}\nfn g(n: i64) i64 {\n    switch (n) {\n        0 => { print(1); },\n        else => { return 5; },\n    }\n    return 6;\n}\npub fn main() void {\n    print(f(0));\n    print(g(0));\n    print(g(1));\n}\n",
         ),
+        // -- optionals ?T (v0.173) ------------------------------------------------
+        (
+            "optionals_widen_orelse_unwrap_capture",
+            "fn find(n: i64) ?i64 {\n    if (n > 0) { return n * 2; }\n    return null;\n}\npub fn main() void {\n    var x: ?i64 = find(5);\n    if (x) |v| {\n        print(v);\n    } else {\n        print(0 - 1);\n    }\n    print(find(0) orelse 99);\n    var y: ?i64 = null;\n    y = 7;\n    print(y.?);\n}\n",
+        ),
+        (
+            "optionals_struct_enum_payloads_and_fields",
+            "const Color = enum { Red, Green };\nconst P = struct {\n    x: i64,\n    tag: ?u8,\n};\nfn pick(b: bool) ?Color {\n    if (b) { return .Green; }\n    return null;\n}\npub fn main() void {\n    var p: P = P{ .x = 1, .tag = null };\n    p.tag = 7;\n    if (p.tag) |t| { print(t); }\n    var c: ?Color = pick(true);\n    if (c) |col| {\n        if (col == Color.Green) { print(2); }\n    }\n    var s: ?P = P{ .x = 9, .tag = null };\n    if (s) |sv| { print(sv.x); }\n}\n",
+        ),
+        (
+            "optionals_params_args_defer_for",
+            "fn use(o: ?i64, d: i64) i64 {\n    return o orelse d;\n}\npub fn main() void {\n    print(use(null, 5));\n    print(use(42, 5));\n    var xs: [2]i64 = [2]i64{ 1, 2 };\n    for (xs) |x| {\n        defer print(100 + x);\n        var o: ?i64 = x;\n        if (o) |v| {\n            if (v == 2) { continue; }\n            print(v);\n        }\n    }\n    print(use(3, 0));\n}\n",
+        ),
+        (
+            "optionals_capture_counter_and_nesting",
+            "fn side(n: i64) ?i64 {\n    return n;\n}\npub fn main() void {\n    if (side(41)) |a1| {\n        print(a1);\n    }\n    if (side(1)) |a2| {\n        if (side(2)) |a3| {\n            print(a2 + a3);\n        }\n    }\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
             "skip_slice_elem_f64",
@@ -1310,6 +1346,10 @@ fn selfhost_emit_differential_targeted_inputs() {
         (
             "skip_slice_of_f64",
             "pub fn main() void {\n    if (true) {\n        var s: []f64 = q();\n    }\n}\n",
+        ),
+        (
+            "skip_optional_f64_inner",
+            "pub fn main() void {\n    var x: ?f64 = null;\n}\n",
         ),
         (
             "skip_catch_expr",
