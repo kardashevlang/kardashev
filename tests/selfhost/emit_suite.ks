@@ -3,7 +3,8 @@
 // generalized `[]T` slices and `@as` casts + v0.165 slicing views + v0.166
 // test blocks / EmitMode::Test + v0.167 `@import` resolution + v0.168 fixed
 // arrays `[N]T` and `for` loops + v0.169 plain data structs + v0.170
-// struct methods and associated functions + v0.171 enums).
+// struct methods and associated functions + v0.171 enums + v0.172
+// switch with contextual enum literals).
 //
 // Run: kard test tests/selfhost/emit_suite.ks (driven from
 // `crates/kardc/tests/selfhost_emit.rs` so it is part of `cargo test`).
@@ -283,9 +284,11 @@ test "detect: out-of-subset statements" {
     expect(d.found);
     expect(str_eq(d.word, "label"));
     expect(d.pos == 17);
-    var d2: Det = eh_detect(a, "fn main() void { switch (x) { else => {} } }");
+    // (`switch` joined the subset in v0.172 — a payload-capture arm
+    // keeps a verdict, and `try` is still out)
+    var d2: Det = eh_detect(a, "fn main() void { try f(); }");
     expect(d2.found);
-    expect(str_eq(d2.word, "switch"));
+    expect(str_eq(d2.word, "try"));
     expect(d2.pos == 17);
     var d3: Det = eh_detect(a, "fn main() void { errdefer print(1); }");
     expect(d3.found);
@@ -1077,4 +1080,39 @@ test "enums: conversions and composite positions" {
     expect(eh_find(c, "typedef struct { kd_enum_Dir data[2]; } kd_arr_enum_Dir_2;\n"));
     expect(eh_find(c, "typedef struct { kd_enum_Dir *ptr; uintptr_t len; } kd_slice_enum_Dir;\n"));
     expect(eh_find(c, "kd_enum_Dir kd_spin(kd_enum_Dir kd_d);\n"));
+}
+
+test "switch: enum exhaustive lowering, case chains, divergence (v0.172)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const Op = enum { Add, Sub };\nfn apply(op: Op, x: i64) i64 {\n    switch (op) {\n        .Add => { return x + 1; },\n        .Sub => { return x - 1; },\n    }\n}\npub fn main() void {\n    print(apply(.Add, 41));\n}");
+    // Bare `.V` labels take the scrutinee's enum; the LAST case of an arm
+    // opens the brace; every arm closes `} break;` (no fallthrough).
+    expect(eh_find(c, "    switch (kd_op) {\n        case kd_enum_Op_Add: {\n            return ((kd_x + 1));\n        } break;\n        case kd_enum_Op_Sub: {\n            return ((kd_x - 1));\n        } break;\n    }\n"));
+    // An exhaustive enum switch with all-diverging arms DIVERGES: no code
+    // follows it inside kd_apply (and no fall-through flush).
+    expect(eh_find(c, "        } break;\n    }\n}\n"));
+    // A contextual `.V` argument takes the parameter's enum.
+    expect(eh_find(c, "kd_print((long long)(kd_apply(kd_enum_Op_Add, 41)));\n"));
+}
+
+test "switch: integer labels share arms, GNU ranges, else default" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void {\n    var n: i64 = 3;\n    switch (n) {\n        0, 1 => { print(10); },\n        2 .. 5 => { print(20); },\n        else => { print(30); },\n    }\n}");
+    // Multi-label arm: bare `case 0:` then `case 1: {`; a range spells
+    // the GNU `case 2 ... 5:`; `else` is `default:`.
+    expect(eh_find(c, "        case 0:\n        case 1: {\n            kd_print((long long)(10));\n        } break;\n        case 2 ... 5: {\n            kd_print((long long)(20));\n        } break;\n        default: {\n            kd_print((long long)(30));\n        } break;\n"));
+    // An integer switch (with else) does NOT diverge on its own: the
+    // implicit void return follows.
+    expect(eh_count(c, "} break;") == 3);
+}
+
+test "coercion: contextual .V at let/assign/return/args/array elems" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const C = enum { R, G, B };\nfn pick(c: C, d: C) C {\n    var out: C = c;\n    out = d;\n    out = .R;\n    return .G;\n}\npub fn main() void {\n    var cs: [2]C = [2]C{ .G, C.B };\n    print(@intFromEnum(pick(.B, cs[0])));\n}");
+    expect(eh_find(c, "    kd_enum_C kd_out = kd_c;\n"));
+    expect(eh_find(c, "    kd_out = kd_enum_C_R;\n"));
+    expect(eh_find(c, "    return (kd_enum_C_G);\n"));
+    // Array-literal elements coerce; call arguments coerce by position.
+    expect(eh_find(c, "((kd_arr_enum_C_2){ .data = { kd_enum_C_G, kd_enum_C_B } })"));
+    expect(eh_find(c, "kd_pick(kd_enum_C_B, kd_arr_enum_C_2_get(kd_cs, 0))"));
 }
