@@ -18,6 +18,39 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.176.0] — Self-hosting stage 18: labeled loops
+
+A tight stage: labeled loops land and — a milestone — the C-identical
+count now EXCEEDS the SKIP count in Program mode (287 vs 274; Test
+306): 249/268 → … → 287/306 across v0.174–v0.176, with `s40_labeled`
+absorbed whole.
+
+- `selfhost/emit.ks` (stage 18): `lab: while` / `lab: for` record their
+  label on the loop scope; `break :L` flushes defers out to AND
+  INCLUDING `L`'s scope then `goto __kd_brk_L;` (the break-label sits
+  past the loop's close — past the `for`'s OUTER block, so the jump
+  clears nested loops); `continue :L` flushes likewise then
+  `goto __kd_cont_L;` — the continue-label precedes the
+  continue-clause / index increment inside the loop tail, which for a
+  LABELED loop is emitted even when the body diverged (a deeper `goto`
+  still targets it). Unlabeled break/continue stay byte-identical.
+- The new targeted case caught a real bug before the corpus could: a
+  `continue :L` targeting the loop's OWN scope skipped the defer flush
+  when the `for`'s scope label went unset — fixed by wiring the label
+  through the pending-label channel into the for scope.
+- Differential (`selfhost_emit.rs`): the mirrored detector drops every
+  `label` gate (labeled loops, labeled break/continue — an unknown
+  target is sema's E0301). 1 new sema-invalid pin; floors
+  265/285 → 280/300 (287/306 observed); 2 new in-subset targeted cases
+  (two-level jumps with defers, for/while clause ordering) and the two
+  `skip_labeled_*` cases reworked into positive C-compared cases.
+  Suite: 66 → 67 tests (goto lowering, targeted flushes, the
+  clause-after-label ordering, break-labels past the loop closes);
+  2 stale detector tests updated.
+- All 705 corpus files keep three-bucket agreement in both modes;
+  labeled-loop programs verified end-to-end at runtime (LIFO defer
+  flushes on labeled exits, clause execution on labeled continue).
+
 ## [0.175.0] — Self-hosting stage 17: pointers `*T`
 
 The self-hosted emitter's subset gains POINTERS — the C-identical

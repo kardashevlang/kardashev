@@ -5,7 +5,7 @@
 // arrays `[N]T` and `for` loops + v0.169 plain data structs + v0.170
 // struct methods and associated functions + v0.171 enums + v0.172
 // switch with contextual enum literals + v0.173 optionals ?T + v0.174
-// error unions !T + v0.175 pointers *T).
+// error unions !T + v0.175 pointers *T + v0.176 labeled loops).
 //
 // Run: kard test tests/selfhost/emit_suite.ks (driven from
 // `crates/kardc/tests/selfhost_emit.rs` so it is part of `cargo test`).
@@ -295,12 +295,12 @@ test "detect: field access (v0.169) and method calls (v0.170) are in" {
 
 test "detect: out-of-subset statements" {
     var a: Allocator = c_allocator();
-    // (unlabeled `for` joined the subset in v0.168; the labeled form
-    // keeps the verdict, like the labeled while below)
-    var d: Det = eh_detect(a, "fn main() void { lab: for (xs) |x| { break :lab; } }");
+    // (labeled loops joined the subset in v0.176 — a tagged-union item
+    // keeps a verdict)
+    var d: Det = eh_detect(a, "const U = union(enum) { a: i64 };\nfn main() void { }");
     expect(d.found);
-    expect(str_eq(d.word, "label"));
-    expect(d.pos == 17);
+    expect(str_eq(d.word, "union"));
+    expect(d.pos == 0);
     // (`switch` v0.172, `try` v0.174, `&x` v0.175 — a generic call
     // parameter keeps a verdict)
     var d2: Det = eh_detect(a, "fn id(comptime T: type, x: i64) i64 { return x; }\nfn main() void { print(id(i64, 1)); }");
@@ -310,9 +310,10 @@ test "detect: out-of-subset statements" {
     var d3: Det = eh_detect(a, "fn main() void { errdefer print(1.5); }");
     expect(d3.found);
     expect(str_eq(d3.word, "float"));
+    // (labeled while joined in v0.176; an unknown break target is
+    // sema's E0301, not a skip)
     var d4: Det = eh_detect(a, "fn main() void { lab: while (true) { break :lab; } }");
-    expect(d4.found);
-    expect(str_eq(d4.word, "label"));
+    expect(!d4.found);
     // (`s.f = 1;` joined the subset in v0.169 — field places are in; a
     // place rooted in a CALL is still out)
     var d5: Det = eh_detect(a, "fn main() void { f().x = 1; }");
@@ -1221,4 +1222,22 @@ test "pointers: addrof/deref, auto-ref matrix, field auto-deref (v0.175)" {
     // compound write inside the method body alike.
     expect(eh_find(c, "kd_print((long long)((*(kd_pc)).kd_n));\n"));
     expect(eh_find(c, "    ((*(kd_self)).kd_n) = ((*(kd_self)).kd_n) + (kd_k);\n"));
+}
+
+test "labeled loops: goto lowering, targeted flushes, clause rule (v0.176)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void {\n    var xs: [2]i64 = [2]i64{ 1, 2 };\n    b: for (xs) |y| {\n        defer print(9);\n        if (y == 1) { continue :b; }\n        print(y);\n    }\n    outer: while (true) {\n        var i: i64 = 0;\n        while (i < 3) : (i += 1) {\n            if (i == 2) { break :outer; }\n        }\n    }\n}");
+    // `continue :b` flushes the loop's defers THEN gotos its cont-label;
+    // the label precedes the index increment, which runs for the
+    // fall-through path too (clause-after-label ordering).
+    expect(eh_find(c, "            if ((kd_y == 1)) {\n                kd_print((long long)(9));\n                goto __kd_cont_b;\n            }\n"));
+    expect(eh_find(c, "            __kd_cont_b:;\n            __kd_fi0 += 1;\n"));
+    // The for's break-label sits past the outer block close; the while's
+    // past its own close. `break :outer` from the inner while gotos it.
+    expect(eh_find(c, "    }\n    __kd_brk_b:;\n"));
+    expect(eh_find(c, "                goto __kd_brk_outer;\n"));
+    expect(eh_find(c, "    __kd_brk_outer:;\n"));
+    // The labeled while carries its cont-label before the re-test even
+    // with no continue-clause written.
+    expect(eh_find(c, "        __kd_cont_outer:;\n    }\n"));
 }
