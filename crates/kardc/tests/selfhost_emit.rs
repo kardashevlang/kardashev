@@ -1,4 +1,4 @@
-//! Self-host stages 3–17 (v0.161–v0.175): differential test of
+//! Self-host stages 3–18 (v0.161–v0.176): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -28,7 +28,10 @@
 //! POINTERS `*T`: the written-`*T` pre-pass registry with its
 //! miss-untypeable `&place` mirror, `p.*` reads/writes, field/method
 //! auto-deref through `*Struct`, and pointer receivers with the
-//! auto-ref/deref call matrix) written
+//! auto-ref/deref call matrix — and, v0.176, LABELED LOOPS: `lab:`
+//! while/for with `goto __kd_brk_L` / `__kd_cont_L` lowering, the
+//! label-targeted defer flushes, and the diverged-body clause rule)
+//! written
 //! in kardashev —
 //! against the Rust
 //! reference emitter. Since v0.166 every corpus file is classified and
@@ -201,6 +204,7 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s30_ptr_receivers/err_const_receiver_mutation.ks",    // E0233
     "tests/spec/s30_ptr_receivers/err_temp_receiver_autoref.ks",      // E0231
     "tests/spec/s34_error_sets/cross_set_nonmember_err.ks",           // E0330
+    "tests/spec/s40_labeled/unknown_label_err.ks",                    // E0301
     "tests/spec/s34_error_sets/dup_member_err.ks",                    // E0331
     "tests/spec/s34_error_sets/init_site_nonmember_err.ks",           // E0330
     "tests/spec/s34_error_sets/unknown_set_name_err.ks",              // E0331
@@ -229,8 +233,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 265;
-const MIN_C_COMPARED_TEST: usize = 285;
+const MIN_C_COMPARED_PROGRAM: usize = 280;
+const MIN_C_COMPARED_TEST: usize = 300;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -464,35 +468,17 @@ fn det_stmt(sn: &HashSet<String>, s: &Stmt) -> Option<Hit> {
                 .or_else(|| det_block(sn, then))
                 .or_else(|| els.as_deref().and_then(|e| det_stmt(sn, e)))
         }
+        // Labeled loops and labeled break/continue are in the subset
+        // since v0.176 (an unknown target label is sema's E0301).
         Stmt::While {
-            cond,
-            cont,
-            body,
-            label,
-            ..
-        } => {
-            if label.is_some() {
-                return Some(("label", pos));
-            }
-            det_expr(sn, cond)
-                .or_else(|| cont.as_deref().and_then(|c| det_stmt(sn, c)))
-                .or_else(|| det_block(sn, body))
-        }
-        // `for` is in the subset (v0.168); a LABELED `for` stays out.
-        Stmt::For {
-            iter, body, label, ..
-        } => {
-            if label.is_some() {
-                return Some(("label", pos));
-            }
+            cond, cont, body, ..
+        } => det_expr(sn, cond)
+            .or_else(|| cont.as_deref().and_then(|c| det_stmt(sn, c)))
+            .or_else(|| det_block(sn, body)),
+        Stmt::For { iter, body, .. } => {
             det_expr(sn, iter).or_else(|| det_block(sn, body))
         }
-        Stmt::Break { target, .. } | Stmt::Continue { target, .. } => {
-            if target.is_some() {
-                return Some(("label", pos));
-            }
-            None
-        }
+        Stmt::Break { .. } | Stmt::Continue { .. } => None,
         Stmt::Defer { stmt, .. } => det_stmt(sn, stmt),
         // `errdefer <stmt>` is in the subset (v0.174).
         Stmt::ErrDefer { stmt, .. } => det_stmt(sn, stmt),
@@ -1407,6 +1393,15 @@ fn selfhost_emit_differential_targeted_inputs() {
             "pointers_struct_fields_and_chains",
             "const Inner = struct {\n    v: i64,\n};\nconst Holder = struct {\n    ptr: *Inner,\n};\npub fn main() void {\n    var i: Inner = Inner{ .v = 3 };\n    var h: Holder = Holder{ .ptr = &i };\n    h.ptr.v = 9;\n    print(i.v);\n    print(h.ptr.v);\n    var pp: *Inner = h.ptr;\n    pp.v += 1;\n    print(i.v);\n}\n",
         ),
+        // -- labeled loops (v0.176) -------------------------------------------------
+        (
+            "labeled_break_continue_jumps",
+            "pub fn main() void {\n    var total: i64 = 0;\n    outer: while (true) {\n        var i: i64 = 0;\n        while (i < 10) : (i += 1) {\n            defer total += 1;\n            if (i == 2) { continue :outer; }\n            if (total > 5) { break :outer; }\n            print(i);\n        }\n    }\n    print(total);\n}\n",
+        ),
+        (
+            "labeled_for_and_clause_order",
+            "pub fn main() void {\n    var xs: [3]i64 = [3]i64{ 1, 2, 3 };\n    var seen: i64 = 0;\n    a: for (xs) |x| {\n        b: for (xs) |y| {\n            defer seen += 1;\n            if (y == 2) { continue :b; }\n            if (x == 3) { break :a; }\n            if (x + y == 4) { continue :a; }\n            print(x * 10 + y);\n        }\n    }\n    print(seen);\n    lab: while (seen > 0) : (seen -= 1) {\n        if (seen == 1) { continue :lab; }\n        print(seen);\n    }\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
             "skip_slice_elem_f64",
@@ -1459,8 +1454,8 @@ fn selfhost_emit_differential_targeted_inputs() {
             "fn id(comptime T: type, x: i64) i64 { return x; }\npub fn main() void { print(id(i64, 1)); }\n",
         ),
         (
-            "skip_labeled_while",
-            "pub fn main() void {\n    outer: while (true) {\n        break :outer;\n    }\n}\n",
+            "labeled_while_minimal",
+            "pub fn main() void {\n    outer: while (true) {\n        break :outer;\n    }\n    print(1);\n}\n",
         ),
         (
             "skip_array_size_param",
@@ -1475,8 +1470,8 @@ fn selfhost_emit_differential_targeted_inputs() {
             "pub fn main() void {\n    var xs: [2]i64 = [2]i64{ 1, 2.5 };\n}\n",
         ),
         (
-            "skip_labeled_for",
-            "pub fn main() void {\n    var xs: [1]i64 = [1]i64{ 1 };\n    lab: for (xs) |x| {\n        break :lab;\n    }\n}\n",
+            "labeled_for_minimal",
+            "pub fn main() void {\n    var xs: [1]i64 = [1]i64{ 1 };\n    lab: for (xs) |x| {\n        if (x == 1) { break :lab; }\n        print(x);\n    }\n    print(2);\n}\n",
         ),
         (
             "skip_ptr_receiver_method",

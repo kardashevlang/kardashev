@@ -3,8 +3,8 @@
 // `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
 // `[N]T` with array literals and `for` loops, plain data STRUCTS, struct
 // METHODS + associated functions, ENUMS, `switch` with contextual `.V`
-// literals, OPTIONALS `?T`, ERROR UNIONS `!T`, and — v0.175 — POINTERS
-// `*T`), written in
+// literals, OPTIONALS `?T`, ERROR UNIONS `!T`, POINTERS `*T`, and —
+// v0.176 — LABELED LOOPS), written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
 // the Rust emitter's output in BOTH `EmitMode::Program` and (v0.166)
@@ -103,7 +103,15 @@
 // (compound re-spells); field/method access through `*Struct`
 // auto-derefs `(*(<base>)).kd_f`; pointer RECEIVERS take the
 // auto-ref/deref matrix (value→&, element→`_at`, chain→&place,
-// ptr→pass-through / value-method over ptr → deref):
+// ptr→pass-through / value-method over ptr → deref). v0.176 adds
+// LABELED LOOPS: a `lab: while/for` records its label on the loop
+// scope; `break :L` flushes defers out to AND INCLUDING L's scope then
+// `goto __kd_brk_L;` (the label sits past the loop's close — past the
+// `for`'s OUTER block); `continue :L` flushes likewise then
+// `goto __kd_cont_L;` — the cont-label precedes the continue-clause /
+// index increment inside the loop tail, which for a LABELED loop is
+// emitted even when the body diverged (a deeper goto still targets
+// it); unlabeled break/continue are byte-identical to before:
 // v0.173 adds OPTIONALS `?T` — over bare subset names only (a
 // composite inner `?[]u8`/`??T` is a PARSE error): `kd_opt_<mangle>`
 // typedefs + `_orelse`/`_unwrap` helpers seed between structs and
@@ -845,7 +853,7 @@ pub const Det = struct {
             return;
         }
         if (k == ND_WHILE) {
-            if ((fl & F_LABEL) != 0) { self.hit("label", off); return; }
+            // Labeled loops are in the subset since v0.176.
             self.check_expr(self.nodes[u].a);
             self.check_stmt(self.nodes[u].b);
             self.check_block(self.nodes[u].c);
@@ -853,15 +861,15 @@ pub const Det = struct {
         }
         if (k == ND_FOR) {
             // `for (iter) |elem| { … }` / `for (iter, 0..) |elem, i| { … }`
-            // is in the subset (v0.168); a LABELED `for` stays out. The
+            // is in the subset (v0.168; labeled since v0.176). The
             // iterable, then the body.
-            if ((fl & F_LABEL) != 0) { self.hit("label", off); return; }
             self.check_expr(self.nodes[u].a);
             self.check_block(self.nodes[u].b);
             return;
         }
         if (k == ND_BREAK or k == ND_CONTINUE) {
-            if ((fl & F_LABEL) != 0) { self.hit("label", off); }
+            // Labeled targets are in the subset (v0.176; an unknown label
+            // is sema's E0301).
             return;
         }
         if (k == ND_DEFER) {
@@ -1173,6 +1181,9 @@ pub const EmScope = struct {
     // The `for` counter whose `__kd_fi{N} += 1;` is this loop scope's raw
     // continue-clause (`Scope::cont_raw`, SPEC §29.2); -1 = none.
     raw_fi: i64,
+    // The loop's label span (v0.176, `Scope::loop_label`); llen 0 = none.
+    loff: usize,
+    llen: usize,
     dstart: i64,
     vstart: i64,
 };
@@ -1312,6 +1323,9 @@ pub const Em = struct {
     pt_pointees: []i64,
     pt_local: []bool,
     pt_count: usize,
+    // The pending loop label for the next pushed scope (v0.176).
+    pend_loff: usize,
+    pend_llen: usize,
     // The GLOBAL error-name table (`error_names` mirror): 1-based codes
     // in first-intern order — error-set members (pass 0), then `error.X`
     // literals in body-check order.
@@ -1389,6 +1403,8 @@ pub const Em = struct {
             .pt_pointees = alloc(a, i64, 4),
             .pt_local = alloc(a, bool, 4),
             .pt_count = 0,
+            .pend_loff = 0,
+            .pend_llen = 0,
             .er_off = alloc(a, i64, 8),
             .er_len = alloc(a, i64, 8),
             .er_count = 0,
@@ -2134,6 +2150,14 @@ pub const Em = struct {
 
     // -- stack growth -----------------------------------------------------------
 
+    /// The label to attach to the NEXT pushed loop scope (set by the
+    /// labeled-`while` arm just before `emit_block`, consumed by
+    /// `push_scope`; `emit_for` sets its scope's label directly).
+    fn set_pending_label(self: *Self, off: usize, len: usize) void {
+        self.pend_loff = off;
+        self.pend_llen = len;
+    }
+
     fn push_scope(self: *Self, a: Allocator, is_loop: bool, cont: i32, raw_fi: i64) void {
         if (self.sc_len == self.scopes.len) {
             var grown: []EmScope = alloc(a, EmScope, self.scopes.len * 2);
@@ -2146,9 +2170,13 @@ pub const Em = struct {
             .is_loop = is_loop,
             .cont = cont,
             .raw_fi = raw_fi,
+            .loff = self.pend_loff,
+            .llen = self.pend_llen,
             .dstart = @as(i64, self.df_len),
             .vstart = @as(i64, self.vt_len),
         };
+        self.pend_loff = 0;
+        self.pend_llen = 0;
         self.sc_len += 1;
     }
 
@@ -3694,6 +3722,30 @@ pub const Em = struct {
         }
     }
 
+    /// Flush scopes innermost-first down to and including the loop-body
+    /// scope labeled `name` (normal exits — no errdefers); -1 (nothing
+    /// flushed) when no enclosing loop carries the label, mirroring the
+    /// Rust early-`None`.
+    fn flush_to_labeled_loop(self: *Self, a: Allocator, name: []u8) i64 {
+        var loop_idx: i64 = 0 - 1;
+        var i: i64 = @as(i64, self.sc_len) - 1;
+        while (i >= 0) : (i -= 1) {
+            var sc: usize = @as(usize, i);
+            if (self.scopes[sc].is_loop and self.scopes[sc].llen > 0) {
+                if (str_eq(self.src[self.scopes[sc].loff .. self.scopes[sc].loff + self.scopes[sc].llen], name)) {
+                    loop_idx = i;
+                    break;
+                }
+            }
+        }
+        if (loop_idx < 0) { return loop_idx; }
+        i = @as(i64, self.sc_len) - 1;
+        while (i >= loop_idx) : (i -= 1) {
+            self.flush_scope(a, @as(usize, i), false);
+        }
+        return loop_idx;
+    }
+
     fn flush_current(self: *Self, a: Allocator) void {
         if (self.sc_len > 0) { self.flush_scope(a, self.sc_len - 1, false); }
     }
@@ -4511,6 +4563,9 @@ pub const Em = struct {
         self.line(a, s3);
         // The loop-body scope: no AST continue-clause, the raw index
         // increment instead; the element/index binding types recorded.
+        if ((self.nodes[u].flags & F_LABEL) != 0) {
+            self.set_pending_label(self.nodes[u].zoff, self.nodes[u].zlen);
+        }
         self.push_scope(a, true, 0 - 1, nctr);
         self.push_vt(a, self.nodes[u].xoff, self.nodes[u].xlen, elem_ty);
         if ((self.nodes[u].flags & F_IDX) != 0) {
@@ -4555,7 +4610,21 @@ pub const Em = struct {
             self.flush_current(a);
         }
         var top: usize = self.sc_len - 1;
-        if (!diverged) {
+        // A labeled `for` (v0.176): the continue-label precedes the index
+        // increment (a `continue :L` `goto`s here past the flushed
+        // defers); the increment runs even when the body diverged, since
+        // a deeper `goto` still targets it.
+        var fhas_lbl: bool = (self.nodes[u].flags & F_LABEL) != 0;
+        if (fhas_lbl) {
+            var sbfl: StrBuilder = StrBuilder.init(a);
+            sbfl.append(a, "__kd_cont_");
+            sbfl.append(a, self.src[self.nodes[u].zoff .. self.nodes[u].zoff + self.nodes[u].zlen]);
+            sbfl.append(a, ":;");
+            var sfl: []u8 = sbfl.build(a);
+            sbfl.deinit(a);
+            self.line(a, sfl);
+        }
+        if (!diverged or fhas_lbl) {
             self.emit_loop_cont(a, top);
         }
         self.pop_scope();
@@ -4563,6 +4632,17 @@ pub const Em = struct {
         self.line(a, "}");
         self.indent -= 1;
         self.line(a, "}");
+        // A labeled `for` places its break-label past the outer block
+        // close, so `break :L` lands beyond the whole loop.
+        if (fhas_lbl) {
+            var sbfb: StrBuilder = StrBuilder.init(a);
+            sbfb.append(a, "__kd_brk_");
+            sbfb.append(a, self.src[self.nodes[u].zoff .. self.nodes[u].zoff + self.nodes[u].zlen]);
+            sbfb.append(a, ":;");
+            var sfb: []u8 = sbfb.build(a);
+            sbfb.deinit(a);
+            self.line(a, sfb);
+        }
         // A `for` may iterate zero times, so it never diverges.
         return false;
     }
@@ -4682,9 +4762,23 @@ pub const Em = struct {
             var s: []u8 = sb.build(a);
             sb.deinit(a);
             self.line(a, s);
+            if ((self.nodes[u].flags & F_LABEL) != 0) {
+                self.set_pending_label(self.nodes[u].xoff, self.nodes[u].xlen);
+            }
             var d: bool = self.emit_block(a, self.nodes[u].c, true, self.nodes[u].b);
             if (d) { }
             self.line(a, "}");
+            // A labeled loop's break-label sits past the closing brace, so
+            // a `break :L` `goto` lands beyond nested loops too (v0.176).
+            if ((self.nodes[u].flags & F_LABEL) != 0) {
+                var sbb: StrBuilder = StrBuilder.init(a);
+                sbb.append(a, "__kd_brk_");
+                sbb.append(a, self.xname(n));
+                sbb.append(a, ":;");
+                var sb2: []u8 = sbb.build(a);
+                sbb.deinit(a);
+                self.line(a, sb2);
+            }
             // A `while` may iterate zero times, so it never diverges.
             return false;
         }
@@ -4692,12 +4786,41 @@ pub const Em = struct {
             return self.emit_for(a, n);
         }
         if (k == ND_BREAK) {
+            if ((self.nodes[u].flags & F_LABEL) != 0) {
+                // `break :L` (v0.176): flush out to and including L's
+                // scope, then `goto` its break-label past the loop close.
+                var bl: i64 = self.flush_to_labeled_loop(a, self.xname(n));
+                if (bl >= 0) { }
+                var sbg: StrBuilder = StrBuilder.init(a);
+                sbg.append(a, "goto __kd_brk_");
+                sbg.append(a, self.xname(n));
+                sbg.append(a, ";");
+                var sg: []u8 = sbg.build(a);
+                sbg.deinit(a);
+                self.line(a, sg);
+                return true;
+            }
             var i: i64 = self.flush_to_loop(a);
             if (i >= 0) { }
             self.line(a, "break;");
             return true;
         }
         if (k == ND_CONTINUE) {
+            if ((self.nodes[u].flags & F_LABEL) != 0) {
+                // `continue :L` (v0.176): flush out to L's scope, then
+                // `goto` its continue-label — the TARGET runs L's clause,
+                // so it is not emitted here.
+                var cl: i64 = self.flush_to_labeled_loop(a, self.xname(n));
+                if (cl >= 0) { }
+                var sbg2: StrBuilder = StrBuilder.init(a);
+                sbg2.append(a, "goto __kd_cont_");
+                sbg2.append(a, self.xname(n));
+                sbg2.append(a, ";");
+                var sg2: []u8 = sbg2.build(a);
+                sbg2.deinit(a);
+                self.line(a, sg2);
+                return true;
+            }
             var j: i64 = self.flush_to_loop(a);
             if (j >= 0) { self.emit_loop_cont(a, @as(usize, j)); }
             self.line(a, "continue;");
@@ -4773,8 +4896,24 @@ pub const Em = struct {
             self.flush_current(a);
         }
         var top: usize = self.sc_len - 1;
-        if (self.scopes[top].is_loop and !diverged) {
-            self.emit_loop_cont(a, top);
+        if (self.scopes[top].is_loop) {
+            // A labeled loop's C continue-label precedes the clause (a
+            // `continue :L` `goto`s here, past the already-flushed
+            // defers); the clause runs even when the body diverged, since
+            // a deeper `goto` still targets it (v0.176).
+            var has_lbl: bool = self.scopes[top].llen > 0;
+            if (has_lbl) {
+                var sbl: StrBuilder = StrBuilder.init(a);
+                sbl.append(a, "__kd_cont_");
+                sbl.append(a, self.src[self.scopes[top].loff .. self.scopes[top].loff + self.scopes[top].llen]);
+                sbl.append(a, ":;");
+                var sl: []u8 = sbl.build(a);
+                sbl.deinit(a);
+                self.line(a, sl);
+            }
+            if (!diverged or has_lbl) {
+                self.emit_loop_cont(a, top);
+            }
         }
         self.pop_scope();
         self.indent -= 1;
