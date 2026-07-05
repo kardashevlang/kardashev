@@ -1,4 +1,4 @@
-//! Self-host stages 3–18 (v0.161–v0.176): differential test of
+//! Self-host stages 3–19 (v0.161–v0.177): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -30,8 +30,10 @@
 //! auto-deref through `*Struct`, and pointer receivers with the
 //! auto-ref/deref call matrix — and, v0.176, LABELED LOOPS: `lab:`
 //! while/for with `goto __kd_brk_L` / `__kd_cont_L` lowering, the
-//! label-targeted defer flushes, and the diverged-body clause rule)
-//! written
+//! label-targeted defer flushes, and the diverged-body clause rule —
+//! and, v0.177, F64: correctly-rounded literal parsing (big-integer
+//! exact division for any digit count) and the `{:?}` shortest-nearest
+//! formatting mirror with the Debug exponent thresholds) written
 //! in kardashev —
 //! against the Rust
 //! reference emitter. Since v0.166 every corpus file is classified and
@@ -204,6 +206,9 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s30_ptr_receivers/err_const_receiver_mutation.ks",    // E0233
     "tests/spec/s30_ptr_receivers/err_temp_receiver_autoref.ks",      // E0231
     "tests/spec/s34_error_sets/cross_set_nonmember_err.ks",           // E0330
+    "tests/spec/s38_floats/float_const_err.ks",                       // E0134
+    "tests/spec/s38_floats/mix_int_float_err.ks",                     // E0110
+    "tests/spec/s38_floats/rem_f64_err.ks",                           // E0110
     "tests/spec/s40_labeled/unknown_label_err.ks",                    // E0301
     "tests/spec/s34_error_sets/dup_member_err.ks",                    // E0331
     "tests/spec/s34_error_sets/init_site_nonmember_err.ks",           // E0330
@@ -215,6 +220,7 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s21_captures/err_capture_not_visible_in_else.ks",     // E0100
     "tests/spec/s39_switch_ranges/else_required_with_ranges_err.ks",  // E0214
     "tests/spec/s39_switch_ranges/overlapping_ranges_err.ks",         // E0211
+    "tests/spec/s27_compound/f64_place_err.ks",                       // E0110
     "tests/spec/s28_bitwise/bitand_bool_err.ks",                      // E0110
     "tests/spec/s28_bitwise/bitnot_bool_err.ks",                      // E0110
     "tests/spec/s29_for/elem_immutable_err.ks",                       // E0110
@@ -233,8 +239,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 280;
-const MIN_C_COMPARED_TEST: usize = 300;
+const MIN_C_COMPARED_PROGRAM: usize = 295;
+const MIN_C_COMPARED_TEST: usize = 315;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -260,13 +266,13 @@ type Hit = (&'static str, usize);
 fn subset_type_name(name: &str) -> bool {
     matches!(
         name,
-        "i32" | "i64" | "bool" | "void" | "u8" | "usize" | "Allocator"
+        "i32" | "i64" | "bool" | "void" | "u8" | "usize" | "f64" | "Allocator"
     )
 }
 
 /// The subset slice ELEMENT spellings (`[]T` and `alloc(a, T, n)`, v0.164).
 fn subset_slice_elem(name: &str) -> bool {
-    matches!(name, "i32" | "i64" | "bool" | "u8" | "usize")
+    matches!(name, "i32" | "i64" | "bool" | "u8" | "usize" | "f64")
 }
 
 /// `Emitter::place_chain_has_index` (the `es_chain_has_index` mirror):
@@ -364,7 +370,8 @@ fn det_expr(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
         Expr::Index { base, index, .. } => {
             det_expr(sn, base).or_else(|| det_expr(sn, index))
         }
-        Expr::Float { .. } => Some(("float", pos)),
+        // A float literal is in the subset (v0.177).
+        Expr::Float { .. } => None,
         // `@as(T, e)` is in the subset (v0.164): exactly two arguments, the
         // first an identifier naming a subset type; only the VALUE argument
         // is walked. Every other `@`-builtin stays out.
@@ -1402,6 +1409,15 @@ fn selfhost_emit_differential_targeted_inputs() {
             "labeled_for_and_clause_order",
             "pub fn main() void {\n    var xs: [3]i64 = [3]i64{ 1, 2, 3 };\n    var seen: i64 = 0;\n    a: for (xs) |x| {\n        b: for (xs) |y| {\n            defer seen += 1;\n            if (y == 2) { continue :b; }\n            if (x == 3) { break :a; }\n            if (x + y == 4) { continue :a; }\n            print(x * 10 + y);\n        }\n    }\n    print(seen);\n    lab: while (seen > 0) : (seen -= 1) {\n        if (seen == 1) { continue :lab; }\n        print(seen);\n    }\n}\n",
         ),
+        // -- f64 (v0.177) -----------------------------------------------------------
+        (
+            "f64_literals_arith_print",
+            "fn mid(x: f64, y: f64) f64 {\n    return (x + y) / 2.0;\n}\npub fn main() void {\n    var a2: f64 = 3.14;\n    var b: f64 = 0.1;\n    print(a2);\n    print(b);\n    print(mid(a2, b));\n    print(a2 * b - 1.5);\n    if (a2 > b) { print(1); }\n    print(@as(i64, a2));\n    print(@as(f64, 7));\n    var c: ?f64 = 2.5;\n    print(c orelse 0.0);\n}\n",
+        ),
+        (
+            "f64_formatting_edges",
+            "pub fn main() void {\n    var xs: [6]f64 = [6]f64{ 100.0, 0.0001, 0.30000000000000004, 1000000000000000.0, 9007199254740993.0, 123456789.123456789 };\n    for (xs) |x| { print(x); }\n    var s: []f64 = xs[1..4];\n    print(s[0]);\n    print(s.len);\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
             "skip_slice_elem_f64",
@@ -1424,12 +1440,12 @@ fn selfhost_emit_differential_targeted_inputs() {
             "pub fn main() void {\n    var a: Allocator = c_allocator();\n    var s = alloc(a, Allocator, 3);\n}\n",
         ),
         (
-            "skip_float_deep_in_defer",
-            "pub fn main() void {\n    defer {\n        var x: i64 = 1;\n        print(x + 1.5);\n    }\n}\n",
+            "float_in_defer",
+            "pub fn main() void {\n    defer {\n        var x: f64 = 1.5;\n        print(x + 0.25);\n    }\n    print(1);\n}\n",
         ),
         (
-            "skip_slice_of_f64",
-            "pub fn main() void {\n    if (true) {\n        var s: []f64 = q();\n    }\n}\n",
+            "slice_of_f64_roundtrip",
+            "fn head(s: []f64) f64 { return s[0]; }\npub fn main() void {\n    var al: Allocator = c_allocator();\n    var s: []f64 = alloc(al, f64, 2);\n    s[0] = 2.5;\n    s[1] = 0.125;\n    print(head(s));\n    print(s[1]);\n    free(al, s);\n}\n",
         ),
         (
             "skip_optional_f64_inner",
@@ -1442,8 +1458,8 @@ fn selfhost_emit_differential_targeted_inputs() {
         ("skip_nomain", "fn helper() void {}\n"),
         ("skip_empty_module", ""),
         (
-            "skip_alloc_call",
-            "pub fn main() void {\n    var n: i64 = 4;\n    free(a, alloc(a, f64, n));\n}\n",
+            "skip_alloc_unknown_elem",
+            "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var n: i64 = 4;\n    free(al, alloc(al, Foo, n));\n}\n",
         ),
         (
             "skip_test_block_after_main",
@@ -1466,8 +1482,8 @@ fn selfhost_emit_differential_targeted_inputs() {
             "pub fn main() void {\n    var xs: [2]f64 = [2]f64{ 1.5, 2.5 };\n}\n",
         ),
         (
-            "skip_array_lit_elem_float",
-            "pub fn main() void {\n    var xs: [2]i64 = [2]i64{ 1, 2.5 };\n}\n",
+            "array_lit_f64_elems",
+            "pub fn main() void {\n    var xs: [2]f64 = [2]f64{ 1.5, 2.5 };\n    print(xs[0]);\n    print(xs[1]);\n}\n",
         ),
         (
             "labeled_for_minimal",

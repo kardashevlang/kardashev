@@ -18,6 +18,45 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.177.0] — Self-hosting stage 19: f64
+
+The scalar story completes: f64 lands with a full float-formatting
+mirror, and the C-identical corpus climbs 287/306 → 304/323
+(Program/Test), absorbing `s38_floats` and the float pockets across
+optionals/casts/compound sections.
+
+- `selfhost/emit.ks` (stage 19): float literals canonicalize through
+  the `c_double_literal` mirror — a CORRECTLY-ROUNDED parse (32-bit-
+  limb big-integer exact division, valid for ANY digit count; digits
+  past 800 fold into a sticky bit, rigorous beyond every double
+  midpoint's 767-digit worst case) followed by the `{:?}` shortest-
+  round-trip search: candidate windows wide enough for the 17-digit
+  grid (an ulp there spans ~8 grid steps), exact big-int NEAREST
+  tie-breaking that prefers the LARGER equidistant mantissa, and the
+  Debug placement rules (exponent form iff the decimal exponent
+  k >= 16 or k <= -5; `.0` on integral values). Pinned against a
+  426-literal adversarial battery byte-for-byte — which flushed out
+  four successive bugs (i64 mantissa overflow past 19 digits, a
+  normalization fix-up error, the too-narrow candidate window, and
+  midpoint-crossing tail digits) before the corpus ever saw them.
+- `print(f64)` routes `kd_print_f64`; `@as` casts spell `double`;
+  `f64` joins every composite position (slices, arrays, optionals,
+  error unions, pointers, struct fields) and the `alloc` element set.
+  Float consts stay unfoldable (E0134 — the const pass skips, exactly
+  like Rust); `%` on floats stays sema-rejected.
+- Differential (`selfhost_emit.rs`): `subset_type_name` /
+  `subset_slice_elem` gain `f64`; `Float` literals admitted. 4 new
+  sema-invalid pins (E0110×3/E0134); floors 280/300 → 295/315
+  (304/323 observed); 2 new in-subset targeted cases (arith/print/
+  casts/optional-f64; the formatting edge battery incl. 0.3+ε and
+  2^53+1) and 4 stale float skip-cases reworked into positives.
+  Suite: 67 → 68 tests (canonicalization `3.140`→`3.14`, the
+  17-digit form, the 2^53+1 rounding, print routing, `double` casts);
+  10 stale detector tests swept.
+- All 705 corpus files keep three-bucket agreement in both modes;
+  float programs verified end-to-end at runtime under
+  `-ffp-contract=off`.
+
 ## [0.176.0] — Self-hosting stage 18: labeled loops
 
 A tight stage: labeled loops land and — a milestone — the C-identical
