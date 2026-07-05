@@ -5,7 +5,8 @@
 // arrays `[N]T` and `for` loops + v0.169 plain data structs + v0.170
 // struct methods and associated functions + v0.171 enums + v0.172
 // switch with contextual enum literals + v0.173 optionals ?T + v0.174
-// error unions !T + v0.175 pointers *T + v0.176 labeled loops).
+// error unions !T + v0.175 pointers *T + v0.176 labeled loops + v0.177
+// f64).
 //
 // Run: kard test tests/selfhost/emit_suite.ks (driven from
 // `crates/kardc/tests/selfhost_emit.rs` so it is part of `cargo test`).
@@ -138,7 +139,7 @@ fn eh_prelude(a: Allocator, sb: *StrBuilder) void {
 
 // --- spelling tables --------------------------------------------------------------
 
-test "type codes: from_name maps the seven subset spellings" {
+test "type codes: from_name maps the eight subset spellings" {
     expect(et_from_name("i32") == ET_I32);
     expect(et_from_name("i64") == ET_I64);
     expect(et_from_name("bool") == ET_BOOL);
@@ -146,7 +147,7 @@ test "type codes: from_name maps the seven subset spellings" {
     expect(et_from_name("u8") == ET_U8);
     expect(et_from_name("usize") == ET_USIZE);
     expect(et_from_name("Allocator") == ET_ALLOC);
-    expect(et_from_name("f64") == ET_NONE);
+    expect(et_from_name("f64") == ET_F64);
     expect(et_from_name("Self") == ET_NONE);
     expect(et_from_name("") == ET_NONE);
 }
@@ -223,14 +224,17 @@ test "detect: a module without fn main is nomain at 0" {
     expect(str_eq(d2.word, "nomain"));
 }
 
-test "detect: float literal, first hit with position" {
+test "detect: float literals are in (v0.177), unknown names still skip" {
     var a: Allocator = c_allocator();
-    //                          0         1         2
-    //                          0123456789012345678901234567
     var d: Det = eh_detect(a, "fn main() void { print(1.5); }");
-    expect(d.found);
-    expect(str_eq(d.word, "float"));
-    expect(d.pos == 23);
+    expect(!d.found);
+    // The FIRST unsupported construct still reports with its position.
+    //                           0         1         2
+    //                           012345678901234567890123456
+    var d2: Det = eh_detect(a, "fn main() void { var x: Foo = q(); print(2.5); }");
+    expect(d2.found);
+    expect(str_eq(d2.word, "type-name"));
+    expect(d2.pos == 24);
 }
 
 test "detect: strings, []u8, .len and s[i] are in the subset (v0.162)" {
@@ -243,7 +247,7 @@ test "detect: composite type forms and non-subset type names" {
     var a: Allocator = c_allocator();
     // `[]T` ranges over the five scalar elements (v0.164); anything else
     // is out.
-    var d: Det = eh_detect(a, "fn main() void { var s: []f64 = q(); }");
+    var d: Det = eh_detect(a, "fn main() void { var s: []Foo = q(); }");
     expect(d.found);
     expect(str_eq(d.word, "type-name"));
     var d1: Det = eh_detect(a, "fn main() void { var s: []i32 = q(); var t: []usize = q(); var w: []bool = q(); }");
@@ -255,20 +259,20 @@ test "detect: composite type forms and non-subset type names" {
     var d2b: Det = eh_detect(a, "fn f(xs: [n]i64) void {}\nfn main() void { }");
     expect(d2b.found);
     expect(str_eq(d2b.word, "type-form"));
-    var d2c: Det = eh_detect(a, "fn main() void { var p: *f64 = q(); }");
+    var d2c: Det = eh_detect(a, "fn main() void { var p: *Foo = q(); }");
     expect(d2c.found);
     expect(str_eq(d2c.word, "type-name"));
-    var d3: Det = eh_detect(a, "fn main() f64 { return q(); }");
+    var d3: Det = eh_detect(a, "fn main() Foo { return q(); }");
     expect(d3.found);
     expect(str_eq(d3.word, "type-name"));
     // (`?i32` joined in v0.173 and `!i32` in v0.174 — non-subset inner
     // names are type-names; pointer forms keep the type-form verdict)
     var d4: Det = eh_detect(a, "fn main() !i32 { return q(); }");
     expect(!d4.found);
-    var d5: Det = eh_detect(a, "fn main() ?f64 { return q(); }");
+    var d5: Det = eh_detect(a, "fn main() ?Foo { return q(); }");
     expect(d5.found);
     expect(str_eq(d5.word, "type-name"));
-    var d5b: Det = eh_detect(a, "fn main() !f64 { return q(); }");
+    var d5b: Det = eh_detect(a, "fn main() !Foo { return q(); }");
     expect(d5b.found);
     expect(str_eq(d5b.word, "type-name"));
     var d6: Det = eh_detect(a, "fn main() ?i32 { return q(); }");
@@ -288,9 +292,10 @@ test "detect: field access (v0.169) and method calls (v0.170) are in" {
     var d3: Det = eh_detect(a, "pub fn main() void { p.dist(1); }");
     expect(!d3.found);
     // ...and an out-of-subset construct INSIDE one still surfaces.
-    var d4: Det = eh_detect(a, "pub fn main() void { p.dist(1.5); }");
-    expect(d4.found);
-    expect(str_eq(d4.word, "float"));
+    var d4: Det = eh_detect(a, "pub fn main() void { p.dist(g(i64, 1)); }");
+    expect(!d4.found);
+    var d4b: Det = eh_detect(a, "pub fn main() void { p.dist(x.*.q()); }");
+    expect(!d4b.found);
 }
 
 test "detect: out-of-subset statements" {
@@ -306,10 +311,11 @@ test "detect: out-of-subset statements" {
     var d2: Det = eh_detect(a, "fn id(comptime T: type, x: i64) i64 { return x; }\nfn main() void { print(id(i64, 1)); }");
     expect(d2.found);
     expect(str_eq(d2.word, "generic-param"));
-    // (`errdefer` joined in v0.174; its body still walks)
-    var d3: Det = eh_detect(a, "fn main() void { errdefer print(1.5); }");
+    // (`errdefer` joined in v0.174, floats in v0.177; the body still
+    // walks — an unknown TYPE inside surfaces)
+    var d3: Det = eh_detect(a, "fn main() void { errdefer { var t: Foo = 1; } }");
     expect(d3.found);
-    expect(str_eq(d3.word, "float"));
+    expect(str_eq(d3.word, "type-name"));
     // (labeled while joined in v0.176; an unknown break target is
     // sema's E0301, not a skip)
     var d4: Det = eh_detect(a, "fn main() void { lab: while (true) { break :lab; } }");
@@ -328,8 +334,7 @@ test "detect: out-of-subset items and parameters" {
     var d: Det = eh_detect(a, "pub fn main() void {}\ntest \"t\" { expect(true); }");
     expect(!d.found);
     var d0: Det = eh_detect(a, "pub fn main() void {}\ntest \"t\" { print(1.5); }");
-    expect(d0.found);
-    expect(str_eq(d0.word, "float"));
+    expect(!d0.found);
     var d2: Det = eh_detect(a, "fn id(comptime T: type, x: i64) i64 { return x; }\npub fn main() void { print(id(i64, 1)); }");
     expect(d2.found);
     expect(str_eq(d2.word, "generic-param"));
@@ -349,7 +354,7 @@ test "detect: out-of-subset items and parameters" {
     var d5b: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: i32, fn m(comptime T: type) void {} };");
     expect(d5b.found);
     expect(str_eq(d5b.word, "generic-param"));
-    var d6: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: f64 };");
+    var d6: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: Foo };");
     expect(d6.found);
     expect(str_eq(d6.word, "type-name"));
 }
@@ -377,13 +382,13 @@ test "detect: allocator builtins and deep expressions" {
     expect(d2.found);
     expect(str_eq(d2.word, "builtin-call"));
     expect(d2.pos == 25);
-    var d3: Det = eh_detect(a, "fn main() void { var s = alloc(q, f64, 3); }");
+    var d3: Det = eh_detect(a, "fn main() void { var s = alloc(q, Foo, 3); }");
     expect(d3.found);
     expect(str_eq(d3.word, "builtin-call"));
     // The walk reaches into defer bodies, continue-clauses and nested calls.
-    var d4: Det = eh_detect(a, "fn main() void { defer { print(g(1.25)); } }");
+    var d4: Det = eh_detect(a, "fn main() void { defer { var z: Foo = g(); } }");
     expect(d4.found);
-    expect(str_eq(d4.word, "float"));
+    expect(str_eq(d4.word, "type-name"));
     // (`if (o) |v|` joined the subset in v0.173 — a switch payload
     // capture keeps the verdict)
     var d5: Det = eh_detect(a, "fn main() void { var o = q(); if (o) |v| { } }");
@@ -411,9 +416,11 @@ test "detect: place chains in (v0.169), non-name roots out" {
     expect(d5.found);
     expect(str_eq(d5.word, "place-assign"));
     // Out-of-subset constructs inside an admissible write still surface.
-    var d6: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"ab\"; s[0] = 1.5; }");
-    expect(d6.found);
-    expect(str_eq(d6.word, "float"));
+    var d6: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"ab\"; s[0] = w.*.f(); }");
+    expect(!d6.found);
+    var d7: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"ab\"; s[0] = @bad(1); }");
+    expect(d7.found);
+    expect(str_eq(d7.word, "builtin"));
 }
 
 // --- const folding -------------------------------------------------------------------
@@ -853,9 +860,9 @@ test "slicing: detector admits base/lo/hi, walks them for skips" {
     var d: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"abcd\"; print(s[1..3]); }");
     expect(!d.found);
     // Out-of-subset constructs inside the operands still surface.
-    var d2: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"abcd\"; print(s[1..g(1.5)]); }");
+    var d2: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"abcd\"; print(s[1..@bad(1)]); }");
     expect(d2.found);
-    expect(str_eq(d2.word, "float"));
+    expect(str_eq(d2.word, "builtin"));
 }
 
 test "slicing: the bounds-checked view lowering, re-spliced operands" {
@@ -930,10 +937,13 @@ test "detect: arrays and for are in the subset (v0.168)" {
     expect(d2.pos == 9);
     // ...and a non-scalar element is a type-name skip (the LET annotation
     // walks before its initializer).
+    // (f64 elements joined in v0.177 — an unknown element still skips)
     var d3: Det = eh_detect(a, "pub fn main() void { var xs: [2]f64 = [2]f64{ 1.5, 2.5 }; }");
-    expect(d3.found);
-    expect(str_eq(d3.word, "type-name"));
-    expect(d3.pos == 29);
+    expect(!d3.found);
+    var d3b: Det = eh_detect(a, "pub fn main() void { var xs: [2]Foo = [2]Foo{ 1, 2 }; }");
+    expect(d3b.found);
+    expect(str_eq(d3b.word, "type-name"));
+    expect(d3b.pos == 29);
 }
 
 test "arrays: typedefs before slices, storage max(len,1), get shape" {
@@ -1240,4 +1250,21 @@ test "labeled loops: goto lowering, targeted flushes, clause rule (v0.176)" {
     // The labeled while carries its cont-label before the re-test even
     // with no continue-clause written.
     expect(eh_find(c, "        __kd_cont_outer:;\n    }\n"));
+}
+
+test "f64: shortest-roundtrip literals, print route, casts (v0.177)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void {\n    var x: f64 = 3.140;\n    var y: f64 = 100.0;\n    var z: f64 = 0.30000000000000004;\n    var w: f64 = 9007199254740993.0;\n    print(x);\n    print(@as(i64, y));\n    print(@as(f64, 7));\n    print(z + w);\n}");
+    // Literals canonicalize to the shortest round-trip (`3.140` → `3.14`;
+    // the 2^53+1 literal rounds to ...992.0; the classic 0.3+ε keeps all
+    // 17 digits); `print(f64)` routes through kd_print_f64; casts spell
+    // `double`.
+    expect(eh_find(c, "    double kd_x = 3.14;\n"));
+    expect(eh_find(c, "    double kd_y = 100.0;\n"));
+    expect(eh_find(c, "    double kd_z = 0.30000000000000004;\n"));
+    expect(eh_find(c, "    double kd_w = 9007199254740992.0;\n"));
+    expect(eh_find(c, "    kd_print_f64(kd_x);\n"));
+    expect(eh_find(c, "kd_print((long long)(((int64_t)(kd_y))));\n"));
+    expect(eh_find(c, "((double)(7))"));
+    expect(eh_find(c, "    kd_print_f64((kd_z + kd_w));\n"));
 }

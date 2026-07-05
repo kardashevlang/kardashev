@@ -3,8 +3,8 @@
 // `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
 // `[N]T` with array literals and `for` loops, plain data STRUCTS, struct
 // METHODS + associated functions, ENUMS, `switch` with contextual `.V`
-// literals, OPTIONALS `?T`, ERROR UNIONS `!T`, POINTERS `*T`, and —
-// v0.176 — LABELED LOOPS), written in
+// literals, OPTIONALS `?T`, ERROR UNIONS `!T`, POINTERS `*T`, LABELED
+// LOOPS, and — v0.177 — F64), written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
 // the Rust emitter's output in BOTH `EmitMode::Program` and (v0.166)
@@ -111,7 +111,18 @@
 // `goto __kd_cont_L;` — the cont-label precedes the continue-clause /
 // index increment inside the loop tail, which for a LABELED loop is
 // emitted even when the body diverged (a deeper goto still targets
-// it); unlabeled break/continue are byte-identical to before:
+// it); unlabeled break/continue are byte-identical to before. v0.177
+// adds F64: literals canonicalize through the `c_double_literal`
+// mirror — a CORRECTLY-ROUNDED parse (32-bit-limb big-integer exact
+// division, valid for any digit count; digits past 800 fold into a
+// sticky bit, rigorous beyond every double midpoint) followed by the
+// `{:?}` shortest-round-trip search (candidate windows wide enough for
+// the p=17 grid, exact big-int NEAREST tie-breaks preferring the
+// LARGER equidistant mantissa) and the Debug placement rules
+// (exponent form iff k >= 16 or k <= -5, `.0` on integral values);
+// `print(f64)` routes `kd_print_f64`, `@as` casts spell `double`, and
+// f64 joins every composite position (slices, arrays, optionals,
+// error unions, pointers, struct fields):
 // v0.173 adds OPTIONALS `?T` — over bare subset names only (a
 // composite inner `?[]u8`/`??T` is a PARSE error): `kd_opt_<mangle>`
 // typedefs + `_orelse`/`_unwrap` helpers seed between structs and
@@ -252,6 +263,7 @@ pub const ET_BOOL: i64 = 3;
 pub const ET_NONE: i64 = 4;
 pub const ET_U8: i64 = 5;
 pub const ET_USIZE: i64 = 6;
+pub const ET_F64: i64 = 7;
 pub const ET_ALLOC: i64 = 8;
 
 // Slice types are a code FAMILY (v0.164): `ET_SLICE_BASE + <elem code>`,
@@ -332,6 +344,7 @@ pub fn et_slice_c_name(t: i64) []u8 {
     if (e == ET_BOOL) { return "kd_slice_bool"; }
     if (e == ET_U8) { return "kd_slice_uint8_t"; }
     if (e == ET_USIZE) { return "kd_slice_uintptr_t"; }
+    if (e == ET_F64) { return "kd_slice_double"; }
     if (e == ET_ALLOC) { return "kd_slice_kd_allocator"; }
     return "kd_slice_void";
 }
@@ -347,6 +360,7 @@ pub fn et_from_name(name: []u8) i64 {
     if (str_eq(name, "void")) { return ET_VOID; }
     if (str_eq(name, "u8")) { return ET_U8; }
     if (str_eq(name, "usize")) { return ET_USIZE; }
+    if (str_eq(name, "f64")) { return ET_F64; }
     if (str_eq(name, "Allocator")) { return ET_ALLOC; }
     return ET_NONE;
 }
@@ -364,6 +378,7 @@ pub fn et_c_name(t: i64) []u8 {
     if (t == ET_VOID) { return "void"; }
     if (t == ET_U8) { return "uint8_t"; }
     if (t == ET_USIZE) { return "uintptr_t"; }
+    if (t == ET_F64) { return "double"; }
     if (t == ET_ALLOC) { return "kd_allocator"; }
     return "int64_t";
 }
@@ -376,13 +391,506 @@ pub fn et_is_int(t: i64) bool {
 /// Whether `t` is a subset slice ELEMENT type — the five scalars `[]T` and
 /// `alloc(a, T, n)` range over (v0.164).
 pub fn et_is_slice_elem(t: i64) bool {
-    return t == ET_I32 or t == ET_I64 or t == ET_BOOL or t == ET_U8 or t == ET_USIZE;
+    return t == ET_I32 or t == ET_I64 or t == ET_BOOL or t == ET_U8 or t == ET_USIZE or t == ET_F64;
 }
 
 /// `Emitter::promotes_in_c` over the subset: `u8` is the only sub-32-bit
 /// integer here, so a `~`/`<<` over it must truncate back (§28.2).
 pub fn et_promotes_in_c(t: i64) bool {
     return t == ET_U8;
+}
+
+// --- float literals (`c_double_literal` mirror, v0.177) ---------------------------
+//
+// The Rust emitter renders a float literal via `{:?}` — the SHORTEST
+// round-tripping decimal — then guarantees a `.`/exponent so C parses a
+// `double`. The mirror: parse the source `digits.digits` lexeme to the
+// nearest f64 (exact single rounding whenever the mantissa fits 2^53 and
+// the scale within the exact-pow10 range — every corpus literal does),
+// then search precisions 1..=17 for the shortest mantissa that parses
+// back EXACTLY (a ±2 candidate window absorbs scaling slop), and place
+// the point / exponent by the empirically-pinned Debug thresholds
+// (exponent form iff k >= 16 or k <= -5).
+
+/// Exact powers of ten as f64 (0..=22 are exactly representable).
+fn fp_pow10(e: i64) f64 {
+    if (e <= 0) { return 1.0; }
+    if (e == 1) { return 10.0; }
+    if (e == 2) { return 100.0; }
+    if (e == 3) { return 1000.0; }
+    if (e == 4) { return 10000.0; }
+    if (e == 5) { return 100000.0; }
+    if (e == 6) { return 1000000.0; }
+    if (e == 7) { return 10000000.0; }
+    if (e == 8) { return 100000000.0; }
+    if (e == 9) { return 1000000000.0; }
+    if (e == 10) { return 10000000000.0; }
+    if (e == 11) { return 100000000000.0; }
+    if (e == 12) { return 1000000000000.0; }
+    if (e == 13) { return 10000000000000.0; }
+    if (e == 14) { return 100000000000000.0; }
+    if (e == 15) { return 1000000000000000.0; }
+    if (e == 16) { return 10000000000000000.0; }
+    if (e == 17) { return 100000000000000000.0; }
+    if (e == 18) { return 1000000000000000000.0; }
+    if (e == 19) { return 10000000000000000000.0; }
+    if (e == 20) { return 100000000000000000000.0; }
+    if (e == 21) { return 1000000000000000000000.0; }
+    return 10000000000000000000000.0;
+}
+
+/// Integer powers of ten (0..=18 fit i64).
+fn fp_ipow10(e: i64) i64 {
+    var r: i64 = 1;
+    var i: i64 = 0;
+    while (i < e) : (i += 1) { r *= 10; }
+    return r;
+}
+
+/// `m * 10^e` in f64 — the APPROXIMATE scaler (candidate windows only;
+/// every equality check goes through the exact `fp_exact`).
+fn fp_scale(m: f64, e: i64) f64 {
+    var v: f64 = m;
+    var k: i64 = e;
+    while (k > 22) {
+        v = v * fp_pow10(22);
+        k -= 22;
+    }
+    while (k < 0 - 22) {
+        v = v / fp_pow10(22);
+        k += 22;
+    }
+    if (k >= 0) { return v * fp_pow10(k); }
+    return v / fp_pow10(0 - k);
+}
+
+// -- exact decimal→binary conversion (32-bit-limb big integers) -------------
+//
+// `fp_exact(m, e, sticky)` computes the CORRECTLY-ROUNDED f64 of
+// `m × 10^e` (round-to-nearest, ties-to-even; a set `sticky` marks
+// dropped non-zero digits and breaks ties upward) — the `str::parse`
+// mirror, valid across the full literal range the lexer admits. Limbs
+// hold 32 bits each in an i64 (products fit exactly); 96 limbs cover
+// 800-digit parses with shifting headroom.
+
+fn fpb_zero(bi: []i64) void {
+    var i: usize = 0;
+    while (i < bi.len) : (i += 1) { bi[i] = 0; }
+}
+
+fn fpb_is_zero(bi: []i64) bool {
+    var i: usize = 0;
+    while (i < bi.len) : (i += 1) {
+        if (bi[i] != 0) { return false; }
+    }
+    return true;
+}
+
+/// bi = bi * small + add (small, add < 2^31).
+fn fpb_mul_add(bi: []i64, small: i64, add: i64) void {
+    var carry: i64 = add;
+    var i: usize = 0;
+    while (i < bi.len) : (i += 1) {
+        var cur: i64 = bi[i] * small + carry;
+        bi[i] = cur & 4294967295;
+        carry = cur >> 32;
+    }
+}
+
+/// bi <<= 1.
+fn fpb_shl1(bi: []i64) void {
+    var carry: i64 = 0;
+    var i: usize = 0;
+    while (i < bi.len) : (i += 1) {
+        var cur: i64 = (bi[i] << 1) | carry;
+        bi[i] = cur & 4294967295;
+        carry = cur >> 32;
+    }
+}
+
+/// The bit length of bi (0 for zero).
+fn fpb_bits(bi: []i64) i64 {
+    var i: i64 = @as(i64, bi.len) - 1;
+    while (i >= 0) : (i -= 1) {
+        var w: i64 = bi[@as(usize, i)];
+        if (w != 0) {
+            var b: i64 = 0;
+            while (w > 0) : (w = w >> 1) { b += 1; }
+            return i * 32 + b;
+        }
+    }
+    return 0;
+}
+
+/// compare: -1 / 0 / 1.
+fn fpb_cmp(x: []i64, y: []i64) i64 {
+    var i: i64 = @as(i64, x.len) - 1;
+    while (i >= 0) : (i -= 1) {
+        var u: usize = @as(usize, i);
+        if (x[u] < y[u]) { return 0 - 1; }
+        if (x[u] > y[u]) { return 1; }
+    }
+    return 0;
+}
+
+/// x -= y (requires x >= y).
+fn fpb_sub(x: []i64, y: []i64) void {
+    var borrow: i64 = 0;
+    var i: usize = 0;
+    while (i < x.len) : (i += 1) {
+        var cur: i64 = x[i] - y[i] - borrow;
+        if (cur < 0) {
+            cur += 4294967296;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        x[i] = cur;
+    }
+}
+
+fn fpb_copy(dst: []i64, src2: []i64) void {
+    var i: usize = 0;
+    while (i < dst.len) : (i += 1) { dst[i] = src2[i]; }
+}
+
+/// The correctly-rounded f64 of `m × 10^e` (m >= 0).
+fn fp_exact(a: Allocator, m: i64, e: i64, sticky: bool) f64 {
+    if (m == 0) { return 0.0; }
+    var nb: []i64 = alloc(a, i64, 96);
+    var db: []i64 = alloc(a, i64, 96);
+    fpb_zero(nb);
+    fpb_zero(db);
+    // N = m (split through two 31-bit-safe halves), then × 10^max(e,0).
+    var hi: i64 = m >> 31;
+    var lo: i64 = m & 2147483647;
+    if (hi > 0) {
+        nb[0] = hi;
+        // N <<= 31 via 31 doublings, then += lo.
+        var sh: i64 = 0;
+        while (sh < 31) : (sh += 1) { fpb_shl1(nb); }
+        fpb_mul_add(nb, 1, lo);
+    } else {
+        nb[0] = lo;
+    }
+    db[0] = 1;
+    var k: i64 = e;
+    while (k > 0) : (k -= 1) { fpb_mul_add(nb, 10, 0); }
+    while (k < 0) : (k += 1) { fpb_mul_add(db, 10, 0); }
+    var out: f64 = fp_exact_core(a, nb, db, sticky);
+    free(a, nb);
+    free(a, db);
+    return out;
+}
+
+/// The rounding core over prebuilt big-int N/D (consumed, not freed).
+fn fp_exact_core(a: Allocator, nb: []i64, db: []i64, sticky: bool) f64 {
+    if (fpb_is_zero(nb)) { return 0.0; }
+    var tb: []i64 = alloc(a, i64, 96);
+    // Normalize to the classical invariant D<<52 <= N < D<<53, so
+    // q = floor(N/D) lands in [2^52, 2^53) — a 53-bit mantissa. Coarse
+    // pre-positioning by the bit-length difference, then exact fix-up
+    // compares. Net left-shifts applied to N are tracked in `shift`
+    // (value = q × 2^(-shift) afterwards).
+    var shift: i64 = 0;
+    var pre: i64 = 52 - (fpb_bits(nb) - fpb_bits(db));
+    while (pre > 0) : (pre -= 1) {
+        fpb_shl1(nb);
+        shift += 1;
+    }
+    while (pre < 0) : (pre += 1) {
+        fpb_shl1(db);
+        shift -= 1;
+    }
+    // Exact fix-up: while N >= D<<53 → D <<= 1; while N < D<<52 → N <<= 1.
+    var fixing: bool = true;
+    while (fixing) {
+        fpb_copy(tb, db);
+        var s3: i64 = 0;
+        while (s3 < 53) : (s3 += 1) { fpb_shl1(tb); }
+        if (fpb_cmp(nb, tb) >= 0) {
+            fpb_shl1(db);
+            shift -= 1;
+        } else {
+            fixing = false;
+        }
+    }
+    fixing = true;
+    while (fixing) {
+        fpb_copy(tb, db);
+        var s4: i64 = 0;
+        while (s4 < 52) : (s4 += 1) { fpb_shl1(tb); }
+        if (fpb_cmp(nb, tb) < 0) {
+            fpb_shl1(nb);
+            shift += 1;
+        } else {
+            fixing = false;
+        }
+    }
+    // Long-divide 53 bits: R = N; for bit 52..0: R >= D<<bit → subtract.
+    var q: i64 = 0;
+    var bit: i64 = 52;
+    while (bit >= 0) : (bit -= 1) {
+        fpb_copy(tb, db);
+        var s2: i64 = 0;
+        while (s2 < bit) : (s2 += 1) { fpb_shl1(tb); }
+        if (fpb_cmp(nb, tb) >= 0) {
+            fpb_sub(nb, tb);
+            q = q | (@as(i64, 1) << @as(i64, bit));
+        }
+    }
+    // Round to nearest, ties to even (sticky breaks ties up): compare
+    // 2R vs D.
+    fpb_shl1(nb);
+    var cmp: i64 = fpb_cmp(nb, db);
+    var up: bool = false;
+    if (cmp > 0) { up = true; }
+    if (cmp == 0) {
+        if (sticky) {
+            up = true;
+        } else if ((q & 1) != 0) {
+            up = true;
+        }
+    }
+    if (up) {
+        q += 1;
+        if (q >= 9007199254740992) {
+            q = q >> 1;
+            shift -= 1;
+        }
+    }
+    free(a, tb);
+    // v = q * 2^(-shift), assembled by exact doublings/halvings.
+    var v: f64 = @as(f64, q);
+    var sh2: i64 = shift;
+    while (sh2 > 0) : (sh2 -= 1) { v = v * 0.5; }
+    while (sh2 < 0) : (sh2 += 1) { v = v * 2.0; }
+    return v;
+}
+
+/// Parse a `digits.digits` float lexeme to f64 — correctly rounded for
+/// ANY digit count: every significant digit (up to 800 — past every
+/// possible double midpoint, whose longest decimal expansion is 767
+/// digits) accumulates exactly into a big integer; deeper digits fold
+/// into the sticky flag.
+fn fp_parse(a: Allocator, src: []u8, off: usize, len: usize) f64 {
+    var nb: []i64 = alloc(a, i64, 96);
+    var db: []i64 = alloc(a, i64, 96);
+    fpb_zero(nb);
+    fpb_zero(db);
+    db[0] = 1;
+    var ndig: i64 = 0;
+    var extra: i64 = 0;
+    var frac: i64 = 0;
+    var sticky: bool = false;
+    var seen_dot: bool = false;
+    var started: bool = false;
+    var i: usize = off;
+    while (i < off + len) : (i += 1) {
+        var b: u8 = src[i];
+        if (b == 46) {
+            seen_dot = true;
+        } else {
+            var d: i64 = @as(i64, b - 48);
+            if (!started and d == 0) {
+                // Leading zeros: only position, never significance.
+                if (seen_dot) { frac += 1; }
+            } else {
+                started = true;
+                if (ndig < 800) {
+                    fpb_mul_add(nb, 10, d);
+                    ndig += 1;
+                    if (seen_dot) { frac += 1; }
+                } else {
+                    if (d != 0) { sticky = true; }
+                    if (!seen_dot) { extra += 1; }
+                }
+            }
+        }
+    }
+    var t: i64 = extra;
+    while (t > 0) : (t -= 1) { fpb_mul_add(nb, 10, 0); }
+    t = frac;
+    while (t > 0) : (t -= 1) { fpb_mul_add(db, 10, 0); }
+    var out: f64 = fp_exact_core(a, nb, db, sticky);
+    free(a, nb);
+    free(a, db);
+    return out;
+}
+
+/// Whether `v` is non-finite (inf/nan) — literals never are; the Rust
+/// arm falls back to `0.0` defensively.
+fn fp_nonfinite(v: f64) bool {
+    if (!(v == v)) { return true; }
+    return v != 0.0 and v * 0.5 == v;
+}
+
+/// The `{:?}` mirror: the shortest round-tripping decimal, `.0`-suffixed
+/// when integral, exponent form iff the decimal exponent k >= 16 or
+/// k <= -5 (empirically pinned against the Rust formatter).
+fn fp_fmt(a: Allocator, v0: f64) []u8 {
+    if (fp_nonfinite(v0)) { return "0.0"; }
+    if (v0 == 0.0) { return "0.0"; }
+    var neg: bool = v0 < 0.0;
+    var v: f64 = v0;
+    if (neg) { v = 0.0 - v; }
+    // The decimal exponent of the leading digit (approximate scan; the
+    // exact round-trip checks below self-correct via the retry belt).
+    var k: i64 = 0;
+    while (fp_scale(1.0, k + 1) <= v) : (k += 1) { }
+    while (fp_scale(1.0, k) > v) : (k -= 1) { }
+    // Shortest mantissa search with a k +/-1 retry belt. Several
+    // same-length candidates can round-trip (`0.30000000000000002` and
+    // `…04` hit the same double); Rust's formatter prints the NEAREST,
+    // decided here by an exact big-int distance comparison.
+    var ktry: i64 = 0;
+    while (ktry < 3) : (ktry += 1) {
+        var kk: i64 = k;
+        if (ktry == 1) { kk = k - 1; }
+        if (ktry == 2) { kk = k + 1; }
+        var p: i64 = 1;
+        while (p <= 17) : (p += 1) {
+            var scaled: f64 = fp_scale(v, p - 1 - kk);
+            var mid: i64 = @as(i64, scaled + 0.5);
+            var best: i64 = 0 - 1;
+            // The window must cover the WHOLE round-trip set: at p=17 the
+            // decimal grid is finer than an ulp (sets up to ~22 wide) and
+            // `scaled` itself carries ~8 ulp of slack.
+            var c: i64 = mid - 24;
+            while (c <= mid + 24) : (c += 1) {
+                if (c >= fp_ipow10(p - 1) and c < fp_ipow10(p)) {
+                    if (fp_exact(a, c, kk - p + 1, false) == v) {
+                        if (best < 0) {
+                            best = c;
+                        } else if (fp_nearer(a, c, best, kk - p + 1, v)) {
+                            best = c;
+                        }
+                    }
+                }
+            }
+            if (best >= 0) {
+                return fp_render(a, neg, best, p, kk);
+            }
+        }
+    }
+    // Unreachable fallback: 17 digits at the scanned exponent.
+    var scaled2: f64 = fp_scale(v, 16 - k);
+    return fp_render(a, neg, @as(i64, scaled2 + 0.5), 17, k);
+}
+
+/// Load `x × 10^p10 × 2^p2` into big-int `bi`.
+fn fpb_load_scaled(bi: []i64, x: i64, p10: i64, p2: i64) void {
+    fpb_zero(bi);
+    var hi: i64 = x >> 31;
+    var lo: i64 = x & 2147483647;
+    if (hi > 0) {
+        bi[0] = hi;
+        var sh: i64 = 0;
+        while (sh < 31) : (sh += 1) { fpb_shl1(bi); }
+        fpb_mul_add(bi, 1, lo);
+    } else {
+        bi[0] = lo;
+    }
+    var t: i64 = p10;
+    while (t > 0) : (t -= 1) { fpb_mul_add(bi, 10, 0); }
+    var b: i64 = p2;
+    while (b > 0) : (b -= 1) { fpb_shl1(bi); }
+}
+
+/// Whether candidate `c1 × 10^E` lies NO FARTHER from `v` than
+/// `c0 × 10^E` (exact: cross-multiplied big-int distances). The
+/// ascending candidate scan replaces on ties, matching the Rust
+/// formatter's pick of the LARGER equidistant mantissa.
+fn fp_nearer(a: Allocator, c1: i64, c0: i64, ee: i64, v: f64) bool {
+    // Recover v = qv × 2^(-sv) exactly.
+    var qf: f64 = v;
+    var sv: i64 = 0;
+    while (qf < 4503599627370496.0) {
+        qf = qf * 2.0;
+        sv += 1;
+    }
+    while (qf >= 9007199254740992.0) {
+        qf = qf * 0.5;
+        sv -= 1;
+    }
+    var qv: i64 = @as(i64, qf);
+    // Common scale: candidate side × 10^max(E,0) × 2^max(sv,0); value
+    // side × 10^max(-E,0) × 2^max(-sv,0).
+    var cp10: i64 = ee;
+    if (cp10 < 0) { cp10 = 0; }
+    var vp10: i64 = 0 - ee;
+    if (vp10 < 0) { vp10 = 0; }
+    var cp2: i64 = sv;
+    if (cp2 < 0) { cp2 = 0; }
+    var vp2: i64 = 0 - sv;
+    if (vp2 < 0) { vp2 = 0; }
+    var xb: []i64 = alloc(a, i64, 96);
+    var yb: []i64 = alloc(a, i64, 96);
+    var vb: []i64 = alloc(a, i64, 96);
+    fpb_load_scaled(vb, qv, vp10, vp2);
+    // d1 = |c1_scaled - v_scaled|
+    fpb_load_scaled(xb, c1, cp10, cp2);
+    if (fpb_cmp(xb, vb) >= 0) {
+        fpb_sub(xb, vb);
+    } else {
+        fpb_copy(yb, vb);
+        fpb_sub(yb, xb);
+        fpb_copy(xb, yb);
+    }
+    // d0 = |c0_scaled - v_scaled| (into yb)
+    fpb_load_scaled(yb, c0, cp10, cp2);
+    if (fpb_cmp(yb, vb) >= 0) {
+        fpb_sub(yb, vb);
+    } else {
+        var zb: []i64 = alloc(a, i64, 96);
+        fpb_copy(zb, vb);
+        fpb_sub(zb, yb);
+        fpb_copy(yb, zb);
+        free(a, zb);
+    }
+    var nearer: bool = fpb_cmp(xb, yb) <= 0;
+    free(a, xb);
+    free(a, yb);
+    free(a, vb);
+    return nearer;
+}
+
+/// Render `c` (p digits) at decimal exponent k in the Debug layout.
+fn fp_render(a: Allocator, neg: bool, c: i64, p: i64, k: i64) []u8 {
+    var dsb: StrBuilder = StrBuilder.init(a);
+    dsb.append_i64(a, c);
+    var digits: []u8 = dsb.build(a);
+    dsb.deinit(a);
+    var sb: StrBuilder = StrBuilder.init(a);
+    if (neg) { sb.append(a, "-"); }
+    if (k >= 16 or k <= 0 - 5) {
+        // Exponent form: `D[0].D[1..]eK` (no `+`, no zero padding).
+        sb.append(a, digits[0..1]);
+        if (p > 1) {
+            sb.append(a, ".");
+            sb.append(a, digits[1..digits.len]);
+        }
+        sb.append(a, "e");
+        sb.append_i64(a, k);
+    } else if (k >= p - 1) {
+        // Integral: digits, then zeros, then `.0`.
+        sb.append(a, digits);
+        var z: i64 = k - p + 1;
+        while (z > 0) : (z -= 1) { sb.append(a, "0"); }
+        sb.append(a, ".0");
+    } else if (k >= 0) {
+        sb.append(a, digits[0 .. @as(usize, k + 1)]);
+        sb.append(a, ".");
+        sb.append(a, digits[@as(usize, k + 1) .. digits.len]);
+    } else {
+        sb.append(a, "0.");
+        var z2: i64 = 0 - k - 1;
+        while (z2 > 0) : (z2 -= 1) { sb.append(a, "0"); }
+        sb.append(a, digits);
+    }
+    var out: []u8 = sb.build(a);
+    sb.deinit(a);
+    return out;
 }
 
 // --- operator spellings ----------------------------------------------------------
@@ -706,7 +1214,10 @@ pub const Det = struct {
             self.hit("builtin", off);
             return;
         }
-        if (k == ND_FLOAT) { self.hit("float", off); return; }
+        if (k == ND_FLOAT) {
+            // A float literal is in the subset (v0.177).
+            return;
+        }
         if (k == ND_SLIT) {
             // A struct literal `Name{ .f = e, … }` is in the subset
             // (v0.169): the initializer values walk in source order (the
@@ -2579,6 +3090,7 @@ pub const Em = struct {
         var u: usize = @as(usize, n);
         var k: u8 = self.nodes[u].kind;
         if (k == ND_INT) { return ET_I64; }
+        if (k == ND_FLOAT) { return ET_F64; }
         if (k == ND_BOOL) { return ET_BOOL; }
         if (k == ND_STR) { return ET_SLICE_U8; }
         if (k == ND_IDENT) { return self.vt_lookup(self.xname(n)); }
@@ -2909,6 +3421,11 @@ pub const Em = struct {
             var s: []u8 = sb.build(a);
             sb.deinit(a);
             return s;
+        }
+        if (k == ND_FLOAT) {
+            // A float literal → the shortest round-tripping C `double`
+            // literal (`c_double_literal`, v0.177).
+            return fp_fmt(a, fp_parse(a, self.src, self.nodes[u].off, self.nodes[u].len));
         }
         if (k == ND_BOOL) {
             if (self.nodes[u].val != 0) { return "true"; }
@@ -3494,8 +4011,7 @@ pub const Em = struct {
                 var arg: i32 = self.nodes[u].a;
                 // `print(s)` of a `[]u8` string (SPEC §23.2): hoist the
                 // slice into a fresh `__kd_str{N}` temporary so it is
-                // evaluated once, then `fwrite` + newline. (The f64 route
-                // cannot appear in the subset.)
+                // evaluated once, then `fwrite` + newline.
                 if (arg >= 0 and self.type_of_expr(arg) == ET_SLICE_U8) {
                     var sstr: []u8 = self.emit_expr(a, arg);
                     var nn: i64 = self.str_count;
@@ -3513,6 +4029,17 @@ pub const Em = struct {
                     var ss: []u8 = sbs.build(a);
                     sbs.deinit(a);
                     return ss;
+                }
+                // `print(<f64>)` → the `double` helper (SPEC §38.1).
+                if (arg >= 0 and self.type_of_expr(arg) == ET_F64) {
+                    var fstr2: []u8 = self.emit_expr(a, arg);
+                    var sbf2: StrBuilder = StrBuilder.init(a);
+                    sbf2.append(a, "kd_print_f64(");
+                    sbf2.append(a, fstr2);
+                    sbf2.append(a, ")");
+                    var sf2: []u8 = sbf2.build(a);
+                    sbf2.deinit(a);
+                    return sf2;
                 }
                 // `print(<int>)` → `kd_print((long long)(<e>))`.
                 var astr: []u8 = "0";
