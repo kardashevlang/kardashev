@@ -18,6 +18,46 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.175.0] — Self-hosting stage 17: pointers `*T`
+
+The self-hosted emitter's subset gains POINTERS — the C-identical
+corpus climbs 249/268 → 275/294 (Program/Test), absorbing
+`s15_ptr_slices`, `s30_ptr_receivers` and the pointer-receiver
+leftovers of `s10_methods`.
+
+- `selfhost/emit.ks` (stage 17): `*T` over bare subset pointees. NO
+  typedef — the C spelling is structural (`<pointee cty>*`), so
+  pointer ids never reach the output and pointers add NO intern-order
+  concerns. The WRITTEN-`*T` PRE-PASS registry mirrors
+  `collect_ptr_types` exactly (fn/method signatures, local/const
+  annotations, test bodies; struct FIELDS excluded — they register
+  non-locally): `resolve_ty` misses fall to the index-0 slot and
+  `type_of(&place)` misses are UNTYPEABLE — the load-bearing mirror
+  (an unregistered `&x` infers to the i64 fallback exactly like Rust).
+- `&place` lowers `(&(<lvalue>))` — an index place IS its
+  bounds-checked `_at` element pointer, a chain through an index takes
+  `&` of its `_at` lvalue; `p.*` reads `(*(<p>))` and writes
+  `*(<p>) = (<e>);` (a compound re-spells the deref on both sides;
+  deref places root a place-assignment chain regardless of their inner
+  expression); field and method access through a `*Struct` auto-derefs
+  `(*(<base>)).kd_f`.
+- Pointer RECEIVERS: `self: *S` methods lower as ordinary `T*` first
+  parameters; the call-site auto-ref/deref matrix mirrors Rust — a
+  value receiver takes `(&(v))`, an ELEMENT receiver its `_at` pointer,
+  an index-chained receiver `&` of its place lvalue, a pointer receiver
+  passes through, and a value-method over a pointer derefs `(*(p))`.
+- Differential (`selfhost_emit.rs`): the mirrored detector admits `*T`
+  (subset pointee names), `&place`, `p.*` (including as a
+  place-assignment root). 5 new sema-invalid pins (E0230/E0231/E0233
+  across s15/s30); floors 240/260 → 265/285 (275/294 observed); 3 new
+  in-subset targeted cases (addrof/deref round-trip incl. `&xs[1]`,
+  the receiver matrix, `*Inner` struct fields with write-through
+  chains) and 1 reworked skip case (`*f64` pointee). Suite: 65 → 66
+  tests; 4 stale detector tests updated.
+- All 705 corpus files keep three-bucket agreement in both modes;
+  pointer programs verified end-to-end at runtime (write-through,
+  element mutation in place).
+
 ## [0.174.0] — Self-hosting stage 16: error unions `!T`
 
 The self-hosted emitter's subset gains ERROR UNIONS — the biggest single

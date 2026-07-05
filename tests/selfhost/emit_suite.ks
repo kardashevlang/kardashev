@@ -5,7 +5,7 @@
 // arrays `[N]T` and `for` loops + v0.169 plain data structs + v0.170
 // struct methods and associated functions + v0.171 enums + v0.172
 // switch with contextual enum literals + v0.173 optionals ?T + v0.174
-// error unions !T).
+// error unions !T + v0.175 pointers *T).
 //
 // Run: kard test tests/selfhost/emit_suite.ks (driven from
 // `crates/kardc/tests/selfhost_emit.rs` so it is part of `cargo test`).
@@ -248,9 +248,16 @@ test "detect: composite type forms and non-subset type names" {
     expect(str_eq(d.word, "type-name"));
     var d1: Det = eh_detect(a, "fn main() void { var s: []i32 = q(); var t: []usize = q(); var w: []bool = q(); }");
     expect(!d1.found);
+    // (`*i32` joined in v0.175 — a comptime-sized array keeps the form
+    // verdict, and a non-subset pointee is a type-name)
     var d2: Det = eh_detect(a, "fn main() void { var p: *i32 = q(); }");
-    expect(d2.found);
-    expect(str_eq(d2.word, "type-form"));
+    expect(!d2.found);
+    var d2b: Det = eh_detect(a, "fn f(xs: [n]i64) void {}\nfn main() void { }");
+    expect(d2b.found);
+    expect(str_eq(d2b.word, "type-form"));
+    var d2c: Det = eh_detect(a, "fn main() void { var p: *f64 = q(); }");
+    expect(d2c.found);
+    expect(str_eq(d2c.word, "type-name"));
     var d3: Det = eh_detect(a, "fn main() f64 { return q(); }");
     expect(d3.found);
     expect(str_eq(d3.word, "type-name"));
@@ -294,10 +301,11 @@ test "detect: out-of-subset statements" {
     expect(d.found);
     expect(str_eq(d.word, "label"));
     expect(d.pos == 17);
-    // (`switch` v0.172, `try` v0.174 — the addr-of place keeps a verdict)
-    var d2: Det = eh_detect(a, "fn main() void { var p = &x; }");
+    // (`switch` v0.172, `try` v0.174, `&x` v0.175 — a generic call
+    // parameter keeps a verdict)
+    var d2: Det = eh_detect(a, "fn id(comptime T: type, x: i64) i64 { return x; }\nfn main() void { print(id(i64, 1)); }");
     expect(d2.found);
-    expect(str_eq(d2.word, "addrof"));
+    expect(str_eq(d2.word, "generic-param"));
     // (`errdefer` joined in v0.174; its body still walks)
     var d3: Det = eh_detect(a, "fn main() void { errdefer print(1.5); }");
     expect(d3.found);
@@ -335,9 +343,11 @@ test "detect: out-of-subset items and parameters" {
     // POINTER receiver stays out, and a non-subset FIELD type skips.
     var d5: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: i32, fn m(self: S) void {} };");
     expect(!d5.found);
-    var d5b: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: i32, fn m(self: *S) void {} };");
+    // (pointer receivers joined in v0.175 — a generic method parameter
+    // keeps a verdict)
+    var d5b: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: i32, fn m(comptime T: type) void {} };");
     expect(d5b.found);
-    expect(str_eq(d5b.word, "type-form"));
+    expect(str_eq(d5b.word, "generic-param"));
     var d6: Det = eh_detect(a, "pub fn main() void {}\nconst S = struct { x: f64 };");
     expect(d6.found);
     expect(str_eq(d6.word, "type-name"));
@@ -392,10 +402,10 @@ test "detect: place chains in (v0.169), non-name roots out" {
     expect(!d2.found);
     var d3: Det = eh_detect(a, "pub fn main() void { var s: []u8 = \"ab\"; s[0][1] = 1; }");
     expect(!d3.found);
-    // A deref place (pointers) and a call-rooted place stay out.
+    // (deref places joined in v0.175 — sema's E0230/E0100 territory; a
+    // call-rooted place still stays out)
     var d4: Det = eh_detect(a, "pub fn main() void { p.* = 1; }");
-    expect(d4.found);
-    expect(str_eq(d4.word, "place-assign"));
+    expect(!d4.found);
     var d5: Det = eh_detect(a, "pub fn main() void { g()[0] = 1; }");
     expect(d5.found);
     expect(str_eq(d5.word, "place-assign"));
@@ -1190,4 +1200,25 @@ test "errunions: !void — no helper, lazy catch, fallthrough success" {
     // Both catch forms over !void hoist and run the handler lazily.
     expect(eh_find(c, "    kd_err_void __kd_eu0 = kd_run(1);\n    if (__kd_eu0.err != 0) {\n        kd_print((long long)((0 - 1)));\n    }\n"));
     expect(eh_find(c, "        int32_t kd_e = __kd_eu1.err;\n        kd_print((long long)((100 + kd_e)));\n"));
+}
+
+test "pointers: addrof/deref, auto-ref matrix, field auto-deref (v0.175)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const Counter = struct {\n    n: i64,\n\n    fn bump(self: *Counter, k: i64) void {\n        self.n += k;\n    }\n};\npub fn main() void {\n    var x: i64 = 41;\n    var p: *i64 = &x;\n    p.* += 1;\n    print(p.*);\n    var c: Counter = Counter{ .n = 1 };\n    c.bump(4);\n    var pc: *Counter = &c;\n    pc.bump(10);\n    print(pc.n);\n    var cs: [2]Counter = [2]Counter{ Counter{ .n = 0 }, Counter{ .n = 5 } };\n    cs[1].bump(7);\n    print(cs[1].n);\n}");
+    // `*T` spells structurally; `&x` parenthesizes; `p.*` reads/writes
+    // re-spell the deref (compound: both sides).
+    expect(eh_find(c, "    int64_t* kd_p = (&(kd_x));\n"));
+    expect(eh_find(c, "    *(kd_p) = *(kd_p) + (1);\n"));
+    expect(eh_find(c, "kd_print((long long)((*(kd_p))));\n"));
+    // A pointer receiver is an ordinary `T*` first parameter; the value
+    // receiver auto-refs `(&(c))`, a pointer receiver passes through,
+    // and an ELEMENT receiver refs its bounds-checked `_at` pointer.
+    expect(eh_find(c, "void kd_Counter_bump(kd_struct_Counter* kd_self, int64_t kd_k);\n"));
+    expect(eh_find(c, "    kd_Counter_bump((&(kd_c)), 4);\n"));
+    expect(eh_find(c, "    kd_Counter_bump(kd_pc, 10);\n"));
+    expect(eh_find(c, "    kd_Counter_bump((kd_arr_struct_Counter_2_at(&(kd_cs), 1)), 7);\n"));
+    // Field access through `*Struct` auto-derefs — reads and the
+    // compound write inside the method body alike.
+    expect(eh_find(c, "kd_print((long long)((*(kd_pc)).kd_n));\n"));
+    expect(eh_find(c, "    ((*(kd_self)).kd_n) = ((*(kd_self)).kd_n) + (kd_k);\n"));
 }

@@ -1,4 +1,4 @@
-//! Self-host stages 3–16 (v0.161–v0.174): differential test of
+//! Self-host stages 3–17 (v0.161–v0.175): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -24,7 +24,11 @@
 //! then body-order `error.X` literals), `kd_err_<tag>` typedefs (+
 //! `_catch`; the payload-less `!void` variant), `try` propagation with
 //! errdefer-inclusive flushes, both `catch` forms, `errdefer`, and named
-//! error sets whose membership stays sema's concern) written
+//! error sets whose membership stays sema's concern — and, v0.175,
+//! POINTERS `*T`: the written-`*T` pre-pass registry with its
+//! miss-untypeable `&place` mirror, `p.*` reads/writes, field/method
+//! auto-deref through `*Struct`, and pointer receivers with the
+//! auto-ref/deref call matrix) written
 //! in kardashev —
 //! against the Rust
 //! reference emitter. Since v0.166 every corpus file is classified and
@@ -188,9 +192,14 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s37_enum_values/enum_from_int_first_arg_err.ks",      // E0321
     "tests/spec/s37_enum_values/enum_from_int_value_not_integer_err.ks", // E0321
     "tests/spec/s37_enum_values/int_from_enum_non_enum_err.ks",       // E0321
+    "tests/spec/s15_ptr_slices/addr_of_non_lvalue_err.ks",            // E0231
+    "tests/spec/s15_ptr_slices/deref_non_pointer_err.ks",             // E0230
+    "tests/spec/s15_ptr_slices/err_addr_of_const_binding.ks",         // E0233
     "tests/spec/s18_inference/infer_enum_lit_err.ks",                 // E0215
     "tests/spec/s18_inference/infer_error_lit_err.ks",                // E0193
     "tests/spec/s18_inference/infer_null_err.ks",                     // E0180
+    "tests/spec/s30_ptr_receivers/err_const_receiver_mutation.ks",    // E0233
+    "tests/spec/s30_ptr_receivers/err_temp_receiver_autoref.ks",      // E0231
     "tests/spec/s34_error_sets/cross_set_nonmember_err.ks",           // E0330
     "tests/spec/s34_error_sets/dup_member_err.ks",                    // E0331
     "tests/spec/s34_error_sets/init_site_nonmember_err.ks",           // E0330
@@ -220,8 +229,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 240;
-const MIN_C_COMPARED_TEST: usize = 260;
+const MIN_C_COMPARED_PROGRAM: usize = 265;
+const MIN_C_COMPARED_TEST: usize = 285;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -272,11 +281,17 @@ fn chain_has_index(e: &Expr) -> bool {
 /// one — the selfhost side reports its `F_THIS` flag identically, sliced or
 /// not).
 fn det_type(sn: &HashSet<String>, t: &TypeExpr) -> Option<Hit> {
-    if t.pointer
-        || t.ctor_args.is_some()
+    if t.ctor_args.is_some()
         || matches!(&t.array_len, Some(kardc::ast::ArraySize::Param(_)))
     {
         return Some(("type-form", t.span.start));
+    }
+    if t.pointer {
+        // `*T` over a bare subset pointee name (v0.175).
+        if !subset_type_name(&t.name) && !sn.contains(&t.name) {
+            return Some(("type-name", t.span.start));
+        }
+        return None;
     }
     if t.error_union {
         // `!T` / `Set!T` over a bare subset payload name (v0.174; the set
@@ -400,8 +415,9 @@ fn det_expr(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
         Expr::SliceExpr { base, lo, hi, .. } => det_expr(sn, base)
             .or_else(|| det_expr(sn, lo))
             .or_else(|| det_expr(sn, hi)),
-        Expr::AddrOf { .. } => Some(("addrof", pos)),
-        Expr::Deref { .. } => Some(("deref", pos)),
+        // `&place` and `p.*` are in the subset (v0.175).
+        Expr::AddrOf { place, .. } => det_expr(sn, place),
+        Expr::Deref { expr, .. } => det_expr(sn, expr),
         // `try e` and both `catch` forms are in the subset (v0.174).
         Expr::Try { expr, .. } => det_expr(sn, expr),
         Expr::Catch { expr, default, .. } => {
@@ -510,6 +526,9 @@ fn det_stmt(sn: &HashSet<String>, s: &Stmt) -> Option<Hit> {
 fn place_rooted_in_name(e: &Expr) -> bool {
     match e {
         Expr::Ident { .. } => true,
+        // A deref step roots a place regardless of its inner expression
+        // (sema checks it as an ordinary expr — v0.175).
+        Expr::Deref { .. } => true,
         Expr::Field { base, .. } | Expr::Index { base, .. } => place_rooted_in_name(base),
         _ => false,
     }
@@ -522,6 +541,7 @@ fn det_place(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
             det_place(sn, base).or_else(|| det_expr(sn, index))
         }
         Expr::Field { base, .. } => det_place(sn, base),
+        Expr::Deref { expr, .. } => det_expr(sn, expr),
         _ => None,
     }
 }
@@ -1374,6 +1394,19 @@ fn selfhost_emit_differential_targeted_inputs() {
             "errunions_coercion_sites",
             "const Box = struct {\n    r: !i64,\n};\nfn wrap(v: !i64) !i64 { return v; }\npub fn main() void {\n    var b: Box = Box{ .r = 7 };\n    b.r = error.Bad;\n    var x: !i64 = 5;\n    x = wrap(x);\n    print(x catch 0);\n    print(b.r catch |e| @as(i64, e));\n}\n",
         ),
+        // -- pointers *T (v0.175) --------------------------------------------------
+        (
+            "pointers_addrof_deref_writes",
+            "fn bump(p: *i64) void {\n    p.* += 1;\n}\npub fn main() void {\n    var x: i64 = 41;\n    var p: *i64 = &x;\n    bump(p);\n    print(p.*);\n    p.* = 5;\n    print(x);\n    var xs: [2]i64 = [2]i64{ 7, 8 };\n    var q: *i64 = &xs[1];\n    q.* *= 3;\n    print(xs[1]);\n}\n",
+        ),
+        (
+            "pointers_receivers_autoref_matrix",
+            "const Counter = struct {\n    n: i64,\n\n    fn bump(self: *Counter, k: i64) void {\n        self.n += k;\n    }\n\n    fn get(self: Counter) i64 {\n        return self.n;\n    }\n};\npub fn main() void {\n    var c: Counter = Counter{ .n = 1 };\n    c.bump(4);\n    print(c.get());\n    var pc: *Counter = &c;\n    pc.bump(10);\n    print(pc.get());\n    print(pc.n);\n    var cs: [2]Counter = [2]Counter{ Counter{ .n = 0 }, Counter{ .n = 5 } };\n    cs[1].bump(7);\n    print(cs[1].get());\n}\n",
+        ),
+        (
+            "pointers_struct_fields_and_chains",
+            "const Inner = struct {\n    v: i64,\n};\nconst Holder = struct {\n    ptr: *Inner,\n};\npub fn main() void {\n    var i: Inner = Inner{ .v = 3 };\n    var h: Holder = Holder{ .ptr = &i };\n    h.ptr.v = 9;\n    print(i.v);\n    print(h.ptr.v);\n    var pp: *Inner = h.ptr;\n    pp.v += 1;\n    print(i.v);\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
             "skip_slice_elem_f64",
@@ -1408,8 +1441,8 @@ fn selfhost_emit_differential_targeted_inputs() {
             "pub fn main() void {\n    var x: ?f64 = null;\n}\n",
         ),
         (
-            "skip_addrof_expr",
-            "pub fn main() void {\n    var x: i64 = 1;\n    var p = &x;\n}\n",
+            "skip_ptr_f64_pointee",
+            "pub fn main() void {\n    var x: f64 = 1.5;\n    var p: *f64 = &x;\n}\n",
         ),
         ("skip_nomain", "fn helper() void {}\n"),
         ("skip_empty_module", ""),

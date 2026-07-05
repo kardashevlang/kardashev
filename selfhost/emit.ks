@@ -3,7 +3,8 @@
 // `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
 // `[N]T` with array literals and `for` loops, plain data STRUCTS, struct
 // METHODS + associated functions, ENUMS, `switch` with contextual `.V`
-// literals, OPTIONALS `?T`, and — v0.174 — ERROR UNIONS `!T`), written in
+// literals, OPTIONALS `?T`, ERROR UNIONS `!T`, and — v0.175 — POINTERS
+// `*T`), written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
 // the Rust emitter's output in BOTH `EmitMode::Program` and (v0.166)
@@ -89,6 +90,20 @@
 // error edges flush (`return error.X` and try-propagation; plain
 // returns/breaks skip them); a `fn … !void` falling off its end
 // returns success — at COLUMN 0, the Rust indent quirk, mirrored.
+// v0.175 adds POINTERS `*T` (bare pointees only): NO typedef — the C
+// spelling is structural `<pointee cty>*`, so pointer ids never reach
+// the output and there is NO intern-order concern; the WRITTEN-`*T`
+// PRE-PASS registry (fn/method signatures, local/const annotations,
+// test bodies — mirroring collect_ptr_types' walk exactly, struct
+// FIELDS excluded) backs `resolve_ty` (miss → the index-0 fallback)
+// and `type_of(&place)` (miss → UNTYPEABLE — the load-bearing mirror:
+// an unregistered `&x` infers to the i64 fallback exactly like Rust);
+// `&place` lowers `(&(<lvalue>))` (an index place IS its `_at`
+// pointer), `p.*` reads `(*(<p>))` and writes `*(<p>) = (<e>);`
+// (compound re-spells); field/method access through `*Struct`
+// auto-derefs `(*(<base>)).kd_f`; pointer RECEIVERS take the
+// auto-ref/deref matrix (value→&, element→`_at`, chain→&place,
+// ptr→pass-through / value-method over ptr → deref):
 // v0.173 adds OPTIONALS `?T` — over bare subset names only (a
 // composite inner `?[]u8`/`??T` is a PARSE error): `kd_opt_<mangle>`
 // typedefs + `_orelse`/`_unwrap` helpers seed between structs and
@@ -249,6 +264,7 @@ pub const ET_ENUM_BASE: i64 = 3000000000;
 pub const ET_SLICE_ENUM_BASE: i64 = 4000000000;
 pub const ET_OPT_BASE: i64 = 5000000000;
 pub const ET_ERRU_BASE: i64 = 6000000000;
+pub const ET_PTR_BASE: i64 = 7000000000;
 
 pub fn et_slice_of(elem: i64) i64 {
     if (elem >= ET_ENUM_BASE) {
@@ -291,7 +307,11 @@ pub fn et_is_opt(t: i64) bool {
 }
 
 pub fn et_is_erru(t: i64) bool {
-    return t >= ET_ERRU_BASE;
+    return t >= ET_ERRU_BASE and t < ET_PTR_BASE;
+}
+
+pub fn et_is_ptr(t: i64) bool {
+    return t >= ET_PTR_BASE;
 }
 
 /// `StructTable::slice_c_name` over the subset: `kd_slice_<type_mangle(elem)>`
@@ -462,7 +482,7 @@ pub const Det = struct {
         if (self.found or n < 0) { return; }
         var u: usize = @as(usize, n);
         var fl: i64 = self.nodes[u].flags;
-        var forms: i64 = F_PTR | F_ARRPARAM | F_APP | F_ESETTHIS;
+        var forms: i64 = F_ARRPARAM | F_APP | F_ESETTHIS;
         if ((fl & forms) != 0) {
             self.hit("type-form", self.nodes[u].off);
             return;
@@ -481,6 +501,15 @@ pub const Det = struct {
             // set name is sema's E0330 membership concern).
             var pname: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
             if (et_from_name(pname) == ET_NONE and !self.is_struct_name(pname)) {
+                self.hit("type-name", self.nodes[u].off);
+            }
+            return;
+        }
+        if ((fl & F_PTR) != 0) {
+            // `*T` over a bare subset pointee name (v0.175; `*` never
+            // combines with the other forms in the grammar).
+            var ptn: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
+            if (et_from_name(ptn) == ET_NONE and !self.is_struct_name(ptn)) {
                 self.hit("type-name", self.nodes[u].off);
             }
             return;
@@ -511,6 +540,9 @@ pub const Det = struct {
         var u: usize = @as(usize, n);
         var k: u8 = self.nodes[u].kind;
         if (k == ND_IDENT) { return true; }
+        // A deref step roots a place regardless of its inner expression
+        // (sema checks it as an ordinary expr — v0.175).
+        if (k == ND_DEREF) { return true; }
         if (k == ND_FIELD or k == ND_INDEX) {
             return self.place_rooted_in_name(self.nodes[u].a);
         }
@@ -530,6 +562,10 @@ pub const Det = struct {
         }
         if (k == ND_FIELD) {
             self.check_place(self.nodes[u].a);
+            return;
+        }
+        if (k == ND_DEREF) {
+            self.check_expr(self.nodes[u].a);
             return;
         }
     }
@@ -726,8 +762,18 @@ pub const Det = struct {
             self.check_expr(self.nodes[u].c);
             return;
         }
-        if (k == ND_ADDROF) { self.hit("addrof", off); return; }
-        if (k == ND_DEREF) { self.hit("deref", off); return; }
+        if (k == ND_ADDROF) {
+            // `&place` is in the subset (v0.175): the place walks (an
+            // index place lowers through `_at`; non-places are sema's
+            // E0231, const roots E0233).
+            self.check_expr(self.nodes[u].a);
+            return;
+        }
+        if (k == ND_DEREF) {
+            // `p.*` is in the subset (v0.175).
+            self.check_expr(self.nodes[u].a);
+            return;
+        }
         if (k == ND_TRY) {
             // `try e` is in the subset (v0.174); its statement-position
             // rule is sema's E0191.
@@ -1258,6 +1304,14 @@ pub const Em = struct {
     // `error_union_payloads` mirror; codes are `ET_ERRU_BASE + index`.
     eu_payloads: []i64,
     eu_count: usize,
+    // The pointer-pointee registry (v0.175) — `local_ptr_pointees` plus
+    // struct-field pointees, dedup by pointee. `pt_local` marks entries
+    // the Rust PRE-PASS registers (written `*T` in signatures, local/
+    // const annotations, method signatures/bodies): `type_of(&place)`
+    // consults ONLY those (the miss → untypeable mirror).
+    pt_pointees: []i64,
+    pt_local: []bool,
+    pt_count: usize,
     // The GLOBAL error-name table (`error_names` mirror): 1-based codes
     // in first-intern order — error-set members (pass 0), then `error.X`
     // literals in body-check order.
@@ -1332,6 +1386,9 @@ pub const Em = struct {
             .opt_count = 0,
             .eu_payloads = alloc(a, i64, 4),
             .eu_count = 0,
+            .pt_pointees = alloc(a, i64, 4),
+            .pt_local = alloc(a, bool, 4),
+            .pt_count = 0,
             .er_off = alloc(a, i64, 8),
             .er_len = alloc(a, i64, 8),
             .er_count = 0,
@@ -1412,6 +1469,15 @@ pub const Em = struct {
         if (et_is_enum(t)) { return self.en_c_name(a, t); }
         if (et_is_opt(t)) { return self.opt_c_name(a, t); }
         if (et_is_erru(t)) { return self.eu_c_name(a, t); }
+        if (et_is_ptr(t)) {
+            // `*T` has no typedef: its C spelling is `<pointee cty>*`.
+            var sbp: StrBuilder = StrBuilder.init(a);
+            sbp.append(a, self.cty_of(a, self.pt_pointee_of(t)));
+            sbp.append(a, "*");
+            var sp: []u8 = sbp.build(a);
+            sbp.deinit(a);
+            return sp;
+        }
         if (et_is_slice(t)) { return self.sl_c_name(a, t); }
         return et_c_name(t);
     }
@@ -1593,6 +1659,12 @@ pub const Em = struct {
         var u: usize = @as(usize, tn);
         var base: i64 = et_from_name(self.xname(tn));
         if (base == ET_NONE) { base = self.st_code_of(self.xname(tn)); }
+        if ((self.nodes[u].flags & F_PTR) != 0) {
+            // A `*T` field: register the pointee (NOT a pre-pass entry —
+            // the Rust local registry excludes field types).
+            if (base == ET_NONE) { return ET_I64; }
+            return self.pt_intern(a, base, false);
+        }
         if ((self.nodes[u].flags & F_SLICE) != 0) {
             if (base == ET_NONE) { return ET_I64; }
             self.intern_elem(a, base);
@@ -1724,6 +1796,147 @@ pub const Em = struct {
         var out: []u8 = sb.build(a);
         sb.deinit(a);
         return out;
+    }
+
+    /// Register a pointer pointee (dedup); `local` marks pre-pass
+    /// entries. Returns the pointer TYPE CODE (`ET_PTR_BASE + index`).
+    fn pt_intern(self: *Self, a: Allocator, pointee: i64, local: bool) i64 {
+        var i: usize = 0;
+        while (i < self.pt_count) : (i += 1) {
+            if (self.pt_pointees[i] == pointee) {
+                if (local and !self.pt_local[i]) { self.pt_local[i] = true; }
+                return ET_PTR_BASE + @as(i64, i);
+            }
+        }
+        if (self.pt_count == self.pt_pointees.len) {
+            var g: []i64 = alloc(a, i64, self.pt_pointees.len * 2);
+            var g2: []bool = alloc(a, bool, self.pt_local.len * 2);
+            var j: usize = 0;
+            while (j < self.pt_count) : (j += 1) {
+                g[j] = self.pt_pointees[j];
+                g2[j] = self.pt_local[j];
+            }
+            free(a, self.pt_pointees);
+            free(a, self.pt_local);
+            self.pt_pointees = g;
+            self.pt_local = g2;
+        }
+        self.pt_pointees[self.pt_count] = pointee;
+        self.pt_local[self.pt_count] = local;
+        self.pt_count += 1;
+        return ET_PTR_BASE + @as(i64, self.pt_count) - 1;
+    }
+
+    fn pt_pointee_of(self: *Self, t: i64) i64 {
+        return self.pt_pointees[@as(usize, t - ET_PTR_BASE)];
+    }
+
+    /// The LOCAL-registry code for a pointee (`type_of(&place)`): only
+    /// pre-pass entries count; a miss is `ET_NONE` (untypeable, exactly
+    /// the Rust `position(..)` → `None`).
+    fn pt_local_code(self: *Self, pointee: i64) i64 {
+        var i: usize = 0;
+        while (i < self.pt_count) : (i += 1) {
+            if (self.pt_pointees[i] == pointee and self.pt_local[i]) {
+                return ET_PTR_BASE + @as(i64, i);
+            }
+        }
+        return ET_NONE;
+    }
+
+    /// `collect_ptr_types` (v0.175): register every `*T` WRITTEN in a
+    /// fn/method signature, a local/const annotation or a test body —
+    /// before any `resolve_ty` (the items loop of `collect_signatures`).
+    fn pt_collect(self: *Self, a: Allocator) void {
+        var cur: i32 = self.root;
+        while (cur >= 0) {
+            var u: usize = @as(usize, cur);
+            var k: u8 = self.nodes[u].kind;
+            if (k == ND_FN) {
+                self.pt_note_fn(a, cur);
+            } else if (k == ND_STRUCT) {
+                var m: i32 = self.nodes[u].b;
+                while (m >= 0) {
+                    self.pt_note_fn(a, m);
+                    m = self.nodes[@as(usize, m)].next;
+                }
+            } else if (k == ND_CONST) {
+                self.pt_note_ty(a, self.nodes[u].a);
+            } else if (k == ND_TEST) {
+                self.pt_note_block(a, self.nodes[u].a);
+            }
+            cur = self.nodes[u].next;
+        }
+    }
+
+    fn pt_note_fn(self: *Self, a: Allocator, fnode: i32) void {
+        var u: usize = @as(usize, fnode);
+        self.pt_note_ty(a, self.nodes[u].b);
+        var p: i32 = self.nodes[u].a;
+        while (p >= 0) {
+            self.pt_note_ty(a, self.nodes[@as(usize, p)].a);
+            p = self.nodes[@as(usize, p)].next;
+        }
+        self.pt_note_block(a, self.nodes[u].c);
+    }
+
+    fn pt_note_block(self: *Self, a: Allocator, block: i32) void {
+        if (block < 0) { return; }
+        var cur: i32 = self.nodes[@as(usize, block)].a;
+        while (cur >= 0) {
+            self.pt_note_stmt(a, cur);
+            cur = self.nodes[@as(usize, cur)].next;
+        }
+    }
+
+    fn pt_note_stmt(self: *Self, a: Allocator, n: i32) void {
+        if (n < 0) { return; }
+        var u: usize = @as(usize, n);
+        var k: u8 = self.nodes[u].kind;
+        if (k == ND_LET) {
+            self.pt_note_ty(a, self.nodes[u].a);
+            return;
+        }
+        if (k == ND_IF) {
+            self.pt_note_block(a, self.nodes[u].b);
+            self.pt_note_stmt(a, self.nodes[u].c);
+            return;
+        }
+        if (k == ND_WHILE) {
+            self.pt_note_block(a, self.nodes[u].c);
+            return;
+        }
+        if (k == ND_FOR) {
+            self.pt_note_block(a, self.nodes[u].b);
+            return;
+        }
+        if (k == ND_BLOCK) {
+            self.pt_note_block(a, n);
+            return;
+        }
+        if (k == ND_DEFER or k == ND_ERRDEFER) {
+            self.pt_note_stmt(a, self.nodes[u].a);
+            return;
+        }
+        if (k == ND_SWITCH) {
+            var arm: i32 = self.nodes[u].b;
+            while (arm >= 0) {
+                self.pt_note_block(a, self.nodes[@as(usize, arm)].c);
+                arm = self.nodes[@as(usize, arm)].next;
+            }
+            self.pt_note_block(a, self.nodes[u].c);
+            return;
+        }
+    }
+
+    fn pt_note_ty(self: *Self, a: Allocator, tn: i32) void {
+        if (tn < 0) { return; }
+        var u: usize = @as(usize, tn);
+        if ((self.nodes[u].flags & F_PTR) == 0) { return; }
+        var base: i64 = self.base_code(self.xname(tn));
+        if (base == ET_NONE) { base = ET_VOID; }
+        var unused: i64 = self.pt_intern(a, base, true);
+        if (unused == 0) { }
     }
 
     /// `intern_error`: the global error-name table — dedup by NAME, codes
@@ -2115,6 +2328,20 @@ pub const Em = struct {
             }
             return ee;
         }
+        if ((self.nodes[u].flags & F_PTR) != 0) {
+            // `*T` maps through the pre-pass registry; the miss falls to
+            // the FIRST registry slot (the Rust `unwrap_or(PTR_LOCAL_BASE)`
+            // arm — index 0 regardless of pointee).
+            var pe: i64 = self.base_code(self.xname(n));
+            if (pe == ET_NONE) { pe = ET_VOID; }
+            var pi: usize = 0;
+            while (pi < self.pt_count) : (pi += 1) {
+                if (self.pt_pointees[pi] == pe and self.pt_local[pi]) {
+                    return ET_PTR_BASE + @as(i64, pi);
+                }
+            }
+            return ET_PTR_BASE;
+        }
         var t: i64 = self.base_code(self.xname(n));
         if (t == ET_NONE) { return ET_VOID; }
         return t;
@@ -2169,6 +2396,18 @@ pub const Em = struct {
             var se: []u8 = sbe.build(a);
             sbe.deinit(a);
             return se;
+        }
+        if ((self.nodes[u].flags & F_PTR) != 0) {
+            // `<pointee cty>*` spelled structurally (no typedef, no id).
+            var pe2: i64 = self.base_code(self.xname(n));
+            var ptag: []u8 = "int64_t";
+            if (pe2 != ET_NONE) { ptag = self.cty_of(a, pe2); }
+            var sbp2: StrBuilder = StrBuilder.init(a);
+            sbp2.append(a, ptag);
+            sbp2.append(a, "*");
+            var sp2: []u8 = sbp2.build(a);
+            sbp2.deinit(a);
+            return sp2;
         }
         var t: i64 = self.base_code(self.xname(n));
         if (t == ET_NONE) { return "int64_t"; }
@@ -2299,6 +2538,14 @@ pub const Em = struct {
     /// `ET_NONE` for "cannot be determined" — including the mirrored quirk
     /// that a top-level const name is NOT resolvable here (only locals and
     /// params are), so an initializer referencing one infers `i64`.
+    /// Whether `e` types as a `*Struct` (the field/method auto-deref
+    /// gate, SPEC §30.1).
+    fn is_ptr_to_struct(self: *Self, n: i32) bool {
+        var t: i64 = self.type_of_expr(n);
+        if (!et_is_ptr(t)) { return false; }
+        return et_is_struct(self.pt_pointee_of(t));
+    }
+
     fn type_of_expr(self: *Self, n: i32) i64 {
         if (n < 0) { return ET_NONE; }
         var u: usize = @as(usize, n);
@@ -2383,6 +2630,12 @@ pub const Em = struct {
                 if (ft == ET_NONE) { return ET_NONE; }
                 return ft;
             }
+            if (et_is_ptr(bt) and et_is_struct(self.pt_pointee_of(bt))) {
+                // `p.field` on a `*Struct` auto-derefs (SPEC §30.1).
+                var ft2: i64 = self.st_field_ty(self.pt_pointee_of(bt), self.xname(n));
+                if (ft2 == ET_NONE) { return ET_NONE; }
+                return ft2;
+            }
             if (str_eq(self.xname(n), "len")) {
                 if (et_is_arr(bt) or et_is_slice(bt)) { return ET_USIZE; }
             }
@@ -2395,6 +2648,19 @@ pub const Em = struct {
         }
         if (k == ND_NULL) { return ET_NONE; }
         if (k == ND_ERRLIT) { return ET_NONE; }
+        if (k == ND_ADDROF) {
+            // `&place` is `*T` — but ONLY when the pointee was registered
+            // by the written-`*T` pre-pass (the Rust local-registry
+            // position lookup; a miss is untypeable).
+            var apt: i64 = self.type_of_expr(self.nodes[u].a);
+            if (apt == ET_NONE) { return ET_NONE; }
+            return self.pt_local_code(apt);
+        }
+        if (k == ND_DEREF) {
+            var dpt: i64 = self.type_of_expr(self.nodes[u].a);
+            if (et_is_ptr(dpt)) { return self.pt_pointee_of(dpt); }
+            return dpt;
+        }
         if (k == ND_TRY) {
             var tt: i64 = self.type_of_expr(self.nodes[u].a);
             if (et_is_erru(tt)) { return self.eu_payload_of(tt); }
@@ -2428,6 +2694,9 @@ pub const Em = struct {
             if (rsid == ET_NONE) {
                 var rt: i64 = self.type_of_expr(rn);
                 if (et_is_struct(rt)) { rsid = rt; }
+                if (et_is_ptr(rt) and et_is_struct(self.pt_pointee_of(rt))) {
+                    rsid = self.pt_pointee_of(rt);
+                }
             }
             if (rsid == ET_NONE) { return ET_NONE; }
             return self.mt_ret_of(rsid, self.xname(n));
@@ -2832,13 +3101,20 @@ pub const Em = struct {
                     return s;
                 }
             }
-            // Ordinary field access — sema-invalid in the subset; mirrored
-            // for totality (`(<base>).kd_<field>`, no pointer auto-deref).
+            // Ordinary field access `(<base>).kd_<field>`; a `*Struct`
+            // base auto-derefs through the pointer (`(*(<base>)).kd_f`,
+            // SPEC §30.1) — v0.175.
             var b2: []u8 = self.emit_expr(a, self.nodes[u].a);
             var sb2: StrBuilder = StrBuilder.init(a);
-            sb2.append(a, "(");
-            sb2.append(a, b2);
-            sb2.append(a, ").kd_");
+            if (self.is_ptr_to_struct(self.nodes[u].a)) {
+                sb2.append(a, "(*(");
+                sb2.append(a, b2);
+                sb2.append(a, ")).kd_");
+            } else {
+                sb2.append(a, "(");
+                sb2.append(a, b2);
+                sb2.append(a, ").kd_");
+            }
             sb2.append(a, fname);
             var s2: []u8 = sb2.build(a);
             sb2.deinit(a);
@@ -2894,6 +3170,10 @@ pub const Em = struct {
             if (!is_assoc) {
                 var mrt: i64 = self.type_of_expr(mrecv);
                 if (et_is_struct(mrt)) { msid = mrt; }
+                if (et_is_ptr(mrt) and et_is_struct(self.pt_pointee_of(mrt))) {
+                    // A `*Struct` receiver auto-derefs (SPEC §30.1).
+                    msid = self.pt_pointee_of(mrt);
+                }
             }
             var mrow: i64 = self.mt_row_of(msid, self.xname(n));
             var moffset: i64 = 0;
@@ -2906,7 +3186,49 @@ pub const Em = struct {
             msb.append(a, "(");
             var first: bool = true;
             if (!is_assoc) {
-                msb.append(a, self.emit_expr(a, mrecv));
+                // The auto-ref/deref matrix (SPEC §30.2): a POINTER-
+                // receiver method over a value receiver takes `&` (an
+                // element receiver refs its `_at` pointer); a VALUE-
+                // receiver method over a `*Struct` receiver derefs.
+                var ptr_recv: bool = false;
+                if (mrow >= 0 and self.mt_p_count[@as(usize, mrow)] > 0) {
+                    ptr_recv = et_is_ptr(self.fp_ty[@as(usize, self.mt_p_start[@as(usize, mrow)])]);
+                }
+                var recv_is_ptr: bool = self.is_ptr_to_struct(mrecv);
+                if (ptr_recv and !recv_is_ptr) {
+                    var ru: usize = @as(usize, mrecv);
+                    if (self.nodes[ru].kind == ND_INDEX) {
+                        var sbr: StrBuilder = StrBuilder.init(a);
+                        sbr.append(a, "(");
+                        sbr.append(a, self.emit_index_addr(a, self.nodes[ru].a, self.nodes[ru].b));
+                        sbr.append(a, ")");
+                        msb.append(a, sbr.build(a));
+                        sbr.deinit(a);
+                    } else if (es_chain_has_index(self.nodes, mrecv)) {
+                        var sbr2: StrBuilder = StrBuilder.init(a);
+                        sbr2.append(a, "(&(");
+                        sbr2.append(a, self.emit_place(a, mrecv));
+                        sbr2.append(a, "))");
+                        msb.append(a, sbr2.build(a));
+                        sbr2.deinit(a);
+                    } else {
+                        var sbr3: StrBuilder = StrBuilder.init(a);
+                        sbr3.append(a, "(&(");
+                        sbr3.append(a, self.emit_expr(a, mrecv));
+                        sbr3.append(a, "))");
+                        msb.append(a, sbr3.build(a));
+                        sbr3.deinit(a);
+                    }
+                } else if (!ptr_recv and recv_is_ptr) {
+                    var sbr4: StrBuilder = StrBuilder.init(a);
+                    sbr4.append(a, "(*(");
+                    sbr4.append(a, self.emit_expr(a, mrecv));
+                    sbr4.append(a, "))");
+                    msb.append(a, sbr4.build(a));
+                    sbr4.deinit(a);
+                } else {
+                    msb.append(a, self.emit_expr(a, mrecv));
+                }
                 first = false;
             }
             var marg: i32 = self.nodes[u].b;
@@ -3029,6 +3351,45 @@ pub const Em = struct {
             var sf: []u8 = sbf.build(a);
             sbf.deinit(a);
             return sf;
+        }
+        if (k == ND_ADDROF) {
+            // `&place` (SPEC §15.1): an index place IS the bounds-checked
+            // `_at` element pointer; a chain through an index takes `&` of
+            // its `_at` lvalue; anything else is already a C lvalue.
+            var apl: i32 = self.nodes[u].a;
+            if (apl >= 0 and self.nodes[@as(usize, apl)].kind == ND_INDEX) {
+                var sba: StrBuilder = StrBuilder.init(a);
+                sba.append(a, "(");
+                sba.append(a, self.emit_index_addr(a, self.nodes[@as(usize, apl)].a, self.nodes[@as(usize, apl)].b));
+                sba.append(a, ")");
+                var sa: []u8 = sba.build(a);
+                sba.deinit(a);
+                return sa;
+            }
+            var alv: []u8 = "";
+            if (apl >= 0 and es_chain_has_index(self.nodes, apl)) {
+                alv = self.emit_place(a, apl);
+            } else {
+                alv = self.emit_expr(a, apl);
+            }
+            var sba2: StrBuilder = StrBuilder.init(a);
+            sba2.append(a, "(&(");
+            sba2.append(a, alv);
+            sba2.append(a, "))");
+            var sa2: []u8 = sba2.build(a);
+            sba2.deinit(a);
+            return sa2;
+        }
+        if (k == ND_DEREF) {
+            // `p.*` (read) → `(*(<p>))` (SPEC §15.1).
+            var din: []u8 = self.emit_expr(a, self.nodes[u].a);
+            var sbd: StrBuilder = StrBuilder.init(a);
+            sbd.append(a, "(*(");
+            sbd.append(a, din);
+            sbd.append(a, "))");
+            var sd: []u8 = sbd.build(a);
+            sbd.deinit(a);
+            return sd;
         }
         if (k == ND_SLICEX) {
             // `base[lo..hi]` (SPEC §15.2): a `{ptr, len}` view over the
@@ -3523,9 +3884,16 @@ pub const Em = struct {
                 sb2.append(a, "->kd_");
                 sb2.append(a, self.xname(n));
             } else {
-                sb2.append(a, "(");
-                sb2.append(a, self.emit_place(a, basen));
-                sb2.append(a, ").kd_");
+                var pb: []u8 = self.emit_place(a, basen);
+                if (self.is_ptr_to_struct(basen)) {
+                    sb2.append(a, "(*(");
+                    sb2.append(a, pb);
+                    sb2.append(a, ")).kd_");
+                } else {
+                    sb2.append(a, "(");
+                    sb2.append(a, pb);
+                    sb2.append(a, ").kd_");
+                }
                 sb2.append(a, self.xname(n));
             }
             var out2: []u8 = sb2.build(a);
@@ -3646,6 +4014,25 @@ pub const Em = struct {
             var s: []u8 = sb.build(a);
             sb.deinit(a);
             self.line(a, s);
+            return;
+        }
+        if (place >= 0 and self.nodes[@as(usize, place)].kind == ND_DEREF) {
+            // Deref-assignment `p.* = e;` → `*(<p>) = (<e>);` (SPEC §15.1);
+            // the pointer expression is side-effect-free, so a compound
+            // form re-spells the dereference on both sides.
+            var dpin: []u8 = self.emit_expr(a, self.nodes[@as(usize, place)].a);
+            var des: []u8 = self.emit_coerced(a, value, self.type_of_expr(place));
+            var dtsb: StrBuilder = StrBuilder.init(a);
+            dtsb.append(a, "*(");
+            dtsb.append(a, dpin);
+            dtsb.append(a, ")");
+            var dtarget: []u8 = dtsb.build(a);
+            dtsb.deinit(a);
+            var dsb: StrBuilder = StrBuilder.init(a);
+            self.put_store(a, &dsb, dtarget, op, des);
+            var dls: []u8 = dsb.build(a);
+            dsb.deinit(a);
+            self.line(a, dls);
             return;
         }
         // The field-chain place: `(<place>) (op)= (<value>);` — the value
@@ -4604,7 +4991,7 @@ pub const Em = struct {
             }
             return;
         }
-        if (k == ND_UNARY or k == ND_COMPTIME or k == ND_FIELD or k == ND_UNWRAP or k == ND_TRY) {
+        if (k == ND_UNARY or k == ND_COMPTIME or k == ND_FIELD or k == ND_UNWRAP or k == ND_TRY or k == ND_ADDROF or k == ND_DEREF) {
             self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
             return;
         }
@@ -4841,6 +5228,8 @@ pub const Em = struct {
     /// `collect_signatures` for the subset: name span + resolved return type
     /// of every top-level `fn`.
     fn collect_signatures(self: *Self, a: Allocator) void {
+        // The `*T` pre-pass MUST precede any resolve_ty below (v0.175).
+        self.pt_collect(a);
         var cur: i32 = self.root;
         while (cur >= 0) {
             var u: usize = @as(usize, cur);
@@ -5048,6 +5437,11 @@ pub const Em = struct {
             }
             return;
         }
+        if ((self.nodes[u].flags & F_PTR) != 0) {
+            // `*T` has no typedef table — sema's intern_ptr never affects
+            // the emitted bytes (ids are structural `T*` spellings).
+            return;
+        }
         if ((self.nodes[u].flags & F_SLICE) == 0) { return; }
         var e: i64 = self.base_code(self.xname(n));
         if (e != ET_NONE) { self.intern_elem(a, e); }
@@ -5068,6 +5462,11 @@ pub const Em = struct {
         }
         if (k == ND_FIELD) {
             self.intern_place(a, self.nodes[u].a);
+            return;
+        }
+        if (k == ND_DEREF) {
+            // `p.* = e` / `&p.*`: the pointer expression checks fully.
+            self.intern_expr(a, self.nodes[u].a);
             return;
         }
         // A non-chain place (unreachable behind the detector) checks as an
@@ -5156,8 +5555,15 @@ pub const Em = struct {
             }
             return;
         }
-        if (k == ND_UNARY or k == ND_FIELD or k == ND_UNWRAP) {
+        if (k == ND_UNARY or k == ND_FIELD or k == ND_UNWRAP or k == ND_DEREF) {
             self.intern_expr(a, self.nodes[u].a);
+            return;
+        }
+        if (k == ND_ADDROF) {
+            // `resolve_lvalue_type`: each INDEX step checks its index
+            // first, then the base; FIELD steps descend; a DEREF place
+            // checks its pointer expression.
+            self.intern_place(a, self.nodes[u].a);
             return;
         }
         if (k == ND_BIN or k == ND_INDEX or k == ND_ORELSE) {
