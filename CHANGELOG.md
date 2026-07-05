@@ -18,6 +18,49 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.173.0] — Self-hosting stage 15: optionals `?T`
+
+The self-hosted emitter's subset gains OPTIONALS — the v0.172 coercion
+plumbing pays off immediately: the C-identical corpus climbs
+181/200 → 205/224 (Program/Test), taking `s11_optionals`, the
+`s21_captures` if-capture files and stray optional users elsewhere.
+
+- `selfhost/emit.ks` (stage 15): `?T` over bare subset names (a
+  composite inner `?[]u8` / `??T` is a PARSE error — pinned).
+  `kd_opt_<mangle>` typedefs + inline `_orelse` / `_unwrap` helpers
+  (`_unwrap` panics with exit 101) seed between structs and arrays in
+  the dependency walk; an optional over a struct/enum visits its inner
+  first, and a `?T` STRUCT FIELD pulls the optional typedef above its
+  struct. `null` and `T` widen through `emit_coerced`
+  (`{ .has = false }` / `{ .has = true, .val = e }`, already-optional
+  values passing through) at all eight v0.172 coercion sites;
+  `orelse` / `x.?` lower via the helpers (defensive `({e})` arms for
+  non-optional operands, mirroring Rust); `if (opt) |v|` hoists the
+  optional into `__kd_if{N}` (a NEW per-function/per-test counter),
+  tests `.has`, binds `<inner> kd_<v> = __kd_if{N}.val;` inside its
+  own scope, and never diverges.
+- `?T` interns ONLY from written type forms — annotations, params,
+  returns, const annotations and struct fields, in first-intern order
+  (`optional_inners` mirror); the scan's if-capture arm binds the
+  payload type around the then-block, `orelse` walks lhs→rhs and
+  `.?` its operand.
+- Differential (`selfhost_emit.rs`): the mirrored detector admits `?T`
+  (subset base names), `null`, `orelse`, `.?` and if-captures (switch
+  payload captures keep the `capture` verdict). 9 new sema-invalid
+  pins (E0180/E0181/E0182/E0280/E0110 across s11/s18/s21); floors
+  175/190 → 195/215 (205/224 observed); 4 new in-subset targeted cases
+  (widen/orelse/unwrap/capture round-trip, struct+enum payloads and
+  `?u8` fields, optional params with defer/for interplay, capture
+  counter nesting) and 1 new skip case (`?f64` inner).
+- Suite (`tests/selfhost/emit_suite.ks`): 61 → 63 tests — the typedef
+  + helper block byte-for-byte, all widening spellings, orelse/unwrap
+  lowerings, and the full if-capture block with the `__kd_if{N}`
+  counter. Updated 2 pre-v0.173 detector tests (`?i32` return,
+  if-capture) whose constructs joined the subset. All 705 corpus files
+  keep three-bucket agreement in both modes; optional programs
+  verified end-to-end at runtime (including the unwrap-null 101
+  panic).
+
 ## [0.172.0] — Self-hosting stage 14: `switch` + contextual enum literals
 
 The self-hosted emitter's subset gains `switch` AND the expected-type

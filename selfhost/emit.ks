@@ -1,9 +1,9 @@
-// emit.ks — self-host stages 3–14 (v0.161–v0.172): a C emitter for the
+// emit.ks — self-host stages 3–15 (v0.161–v0.173): a C emitter for the
 // SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
 // `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
 // `[N]T` with array literals and `for` loops, plain data STRUCTS, struct
-// METHODS + associated functions, ENUMS, and — v0.172 — `switch` with
-// contextual `.V` literals), written in
+// METHODS + associated functions, ENUMS, `switch` with contextual `.V`
+// literals, and — v0.173 — OPTIONALS `?T`), written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
 // the Rust emitter's output in BOTH `EmitMode::Program` and (v0.166)
@@ -68,7 +68,21 @@
 // are `.V`/matching `Enum.V` never check as expressions, every other
 // label checks fully (an INTEGER label checks + const-folds); an
 // unswitchable scrutinee checks bodies only; arm bodies per arm, else
-// last:
+// last. v0.173 adds OPTIONALS `?T` — over bare subset names only (a
+// composite inner `?[]u8`/`??T` is a PARSE error): `kd_opt_<mangle>`
+// typedefs + `_orelse`/`_unwrap` helpers seed between structs and
+// arrays in the dependency walk (an optional-over-struct/enum visits
+// its inner first; a `?T` struct FIELD pulls the optional above the
+// struct); `null` and `T` widen through `emit_coerced`
+// (`{ .has = false }` / `{ .has = true, .val = e }`, an
+// already-optional value passing through); `orelse`/`x.?` lower via
+// the helpers (non-optional operands keep the defensive `({e})`
+// arms); `if (opt) |v|` hoists into `__kd_if{N}` (a NEW per-fn/test
+// counter), tests `.has`, binds `<inner> kd_<v> = .val` in its own
+// scope, never diverges. `?T` interns ONLY from written type forms
+// (annotations, params, returns, const annotations, struct fields —
+// first-intern order); the scan's IF-capture arm binds the payload
+// type around the then-block, and orelse/unwrap walk lhs→rhs / inner:
 //
 //   - types: `i32`, `i64`, `bool`, `void`, `u8`, `usize`, `Allocator` bare
 //     names, plus `[]T` slices AND `[N]T` fixed arrays (literal `N` only —
@@ -212,6 +226,7 @@ pub const ET_STRUCT_BASE: i64 = 1000000000;
 pub const ET_SLICE_STRUCT_BASE: i64 = 2000000000;
 pub const ET_ENUM_BASE: i64 = 3000000000;
 pub const ET_SLICE_ENUM_BASE: i64 = 4000000000;
+pub const ET_OPT_BASE: i64 = 5000000000;
 
 pub fn et_slice_of(elem: i64) i64 {
     if (elem >= ET_ENUM_BASE) {
@@ -224,7 +239,7 @@ pub fn et_slice_of(elem: i64) i64 {
 }
 
 pub fn et_is_slice(t: i64) bool {
-    return (t >= ET_SLICE_BASE and t < ET_ARR_BASE) or (t >= ET_SLICE_STRUCT_BASE and t < ET_ENUM_BASE) or t >= ET_SLICE_ENUM_BASE;
+    return (t >= ET_SLICE_BASE and t < ET_ARR_BASE) or (t >= ET_SLICE_STRUCT_BASE and t < ET_ENUM_BASE) or (t >= ET_SLICE_ENUM_BASE and t < ET_OPT_BASE);
 }
 
 pub fn et_slice_elem(t: i64) i64 {
@@ -247,6 +262,10 @@ pub fn et_is_struct(t: i64) bool {
 
 pub fn et_is_enum(t: i64) bool {
     return t >= ET_ENUM_BASE and t < ET_SLICE_ENUM_BASE;
+}
+
+pub fn et_is_opt(t: i64) bool {
+    return t >= ET_OPT_BASE;
 }
 
 /// `StructTable::slice_c_name` over the subset: `kd_slice_<type_mangle(elem)>`
@@ -417,9 +436,18 @@ pub const Det = struct {
         if (self.found or n < 0) { return; }
         var u: usize = @as(usize, n);
         var fl: i64 = self.nodes[u].flags;
-        var forms: i64 = F_OPT | F_ERR | F_PTR | F_ARRPARAM | F_ERRSET | F_APP | F_ESETTHIS;
+        var forms: i64 = F_ERR | F_PTR | F_ARRPARAM | F_ERRSET | F_APP | F_ESETTHIS;
         if ((fl & forms) != 0) {
             self.hit("type-form", self.nodes[u].off);
+            return;
+        }
+        if ((fl & F_OPT) != 0) {
+            // `?T` over a bare subset name (v0.173; a composite inner is a
+            // PARSE error, so `?` never coexists with the other forms).
+            var oname: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
+            if (et_from_name(oname) == ET_NONE and !self.is_struct_name(oname)) {
+                self.hit("type-name", self.nodes[u].off);
+            }
             return;
         }
         if ((fl & F_THIS) != 0) {
@@ -621,9 +649,22 @@ pub const Det = struct {
             self.check_expr_list(self.nodes[u].b);
             return;
         }
-        if (k == ND_NULL) { self.hit("null", off); return; }
-        if (k == ND_ORELSE) { self.hit("orelse", off); return; }
-        if (k == ND_UNWRAP) { self.hit("unwrap", off); return; }
+        if (k == ND_NULL) {
+            // `null` is in the subset (v0.173): its `?T` comes from the
+            // expected-type context (no context is sema's E0180).
+            return;
+        }
+        if (k == ND_ORELSE) {
+            // `x orelse y` is in the subset (v0.173).
+            self.check_expr(self.nodes[u].a);
+            self.check_expr(self.nodes[u].b);
+            return;
+        }
+        if (k == ND_UNWRAP) {
+            // `x.?` is in the subset (v0.173).
+            self.check_expr(self.nodes[u].a);
+            return;
+        }
         if (k == ND_ERRLIT) { self.hit("error-lit", off); return; }
         if (k == ND_ENUMLIT) {
             // An unqualified `.V` is in the subset (v0.172): its enum
@@ -700,7 +741,8 @@ pub const Det = struct {
             return;
         }
         if (k == ND_IF) {
-            if ((fl & F_CAP) != 0) { self.hit("capture", off); return; }
+            // The `if (opt) |v|` capture is in the subset (v0.173); the
+            // walk sees cond, then, else like a plain if.
             self.check_expr(self.nodes[u].a);
             self.check_block(self.nodes[u].b);
             self.check_stmt(self.nodes[u].c);
@@ -1150,6 +1192,14 @@ pub const Em = struct {
     en_v_start: []i64,
     en_v_count: []i64,
     en_count: usize,
+    // The interned OPTIONAL inner-type codes, in sema's first-intern
+    // order (v0.173) — the `optional_inners` mirror. Optional codes are
+    // `ET_OPT_BASE + index`.
+    opt_inners: []i64,
+    opt_count: usize,
+    // Monotonic counter for the `__kd_if{N}` if-capture temporaries
+    // (`Emitter::if_counter`), reset per function AND per test body.
+    if_count: i64,
     ev_name_off: []i64,
     ev_name_len: []i64,
     ev_val: []i64,
@@ -1206,6 +1256,9 @@ pub const Em = struct {
             .fp_count = 0,
             .mt_p_start = alloc(a, i64, 8),
             .mt_p_count = alloc(a, i64, 8),
+            .opt_inners = alloc(a, i64, 4),
+            .opt_count = 0,
+            .if_count = 0,
             .en_name_off = alloc(a, i64, 4),
             .en_name_len = alloc(a, i64, 4),
             .en_v_start = alloc(a, i64, 4),
@@ -1278,6 +1331,7 @@ pub const Em = struct {
         if (et_is_arr(t)) { return self.arr_c_name(a, t); }
         if (et_is_struct(t)) { return self.st_c_name(a, t); }
         if (et_is_enum(t)) { return self.en_c_name(a, t); }
+        if (et_is_opt(t)) { return self.opt_c_name(a, t); }
         if (et_is_slice(t)) { return self.sl_c_name(a, t); }
         return et_c_name(t);
     }
@@ -1468,6 +1522,10 @@ pub const Em = struct {
             if (base == ET_NONE) { return ET_I64; }
             return self.arr_intern(a, base, self.nodes[u].val);
         }
+        if ((self.nodes[u].flags & F_OPT) != 0) {
+            if (base == ET_NONE) { return ET_I64; }
+            return self.opt_intern(a, base);
+        }
         if (base == ET_NONE) { return ET_I64; }
         return base;
     }
@@ -1512,6 +1570,40 @@ pub const Em = struct {
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, "kd_enum_");
         sb.append(a, self.en_name_of(ecode));
+        var out: []u8 = sb.build(a);
+        sb.deinit(a);
+        return out;
+    }
+
+    /// `intern_optional`: dedup-append of an inner code; returns the
+    /// optional TYPE CODE (`ET_OPT_BASE + index`).
+    fn opt_intern(self: *Self, a: Allocator, inner: i64) i64 {
+        var i: usize = 0;
+        while (i < self.opt_count) : (i += 1) {
+            if (self.opt_inners[i] == inner) { return ET_OPT_BASE + @as(i64, i); }
+        }
+        if (self.opt_count == self.opt_inners.len) {
+            var g: []i64 = alloc(a, i64, self.opt_inners.len * 2);
+            var j: usize = 0;
+            while (j < self.opt_count) : (j += 1) { g[j] = self.opt_inners[j]; }
+            free(a, self.opt_inners);
+            self.opt_inners = g;
+        }
+        self.opt_inners[self.opt_count] = inner;
+        self.opt_count += 1;
+        return ET_OPT_BASE + @as(i64, self.opt_count) - 1;
+    }
+
+    /// The inner code of an interned optional.
+    fn opt_inner_of(self: *Self, t: i64) i64 {
+        return self.opt_inners[@as(usize, t - ET_OPT_BASE)];
+    }
+
+    /// `optional_c_name`: `kd_opt_<type_mangle(inner)>`.
+    fn opt_c_name(self: *Self, a: Allocator, t: i64) []u8 {
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "kd_opt_");
+        sb.append(a, self.mangle_of(a, self.opt_inner_of(t)));
         var out: []u8 = sb.build(a);
         sb.deinit(a);
         return out;
@@ -1814,6 +1906,17 @@ pub const Em = struct {
             if (e == ET_NONE) { return ET_VOID; }
             return et_slice_of(e);
         }
+        if ((self.nodes[u].flags & F_OPT) != 0) {
+            // `?T` maps back to the interned optional (sema interned every
+            // written one); the miss mirrors the Rust `unwrap_or(base)`.
+            var oe: i64 = self.base_code(self.xname(n));
+            if (oe == ET_NONE) { return ET_VOID; }
+            var oi: usize = 0;
+            while (oi < self.opt_count) : (oi += 1) {
+                if (self.opt_inners[oi] == oe) { return ET_OPT_BASE + @as(i64, oi); }
+            }
+            return oe;
+        }
         var t: i64 = self.base_code(self.xname(n));
         if (t == ET_NONE) { return ET_VOID; }
         return t;
@@ -1845,6 +1948,18 @@ pub const Em = struct {
             var e: i64 = self.base_code(self.xname(n));
             if (e == ET_NONE) { return "kd_slice_int64_t"; }
             return self.sl_c_name(a, et_slice_of(e));
+        }
+        if ((self.nodes[u].flags & F_OPT) != 0) {
+            // `kd_opt_<type_mangle(base)>` spelled directly (the Rust cty
+            // optional arm); an unresolvable base falls to `int64_t`.
+            var oe: i64 = self.base_code(self.xname(n));
+            if (oe == ET_NONE) { return "kd_opt_int64_t"; }
+            var sbo: StrBuilder = StrBuilder.init(a);
+            sbo.append(a, "kd_opt_");
+            sbo.append(a, self.mangle_of(a, oe));
+            var so: []u8 = sbo.build(a);
+            sbo.deinit(a);
+            return so;
         }
         var t: i64 = self.base_code(self.xname(n));
         if (t == ET_NONE) { return "int64_t"; }
@@ -2069,6 +2184,18 @@ pub const Em = struct {
             // sema's E0163 — untypeable here).
             return self.st_code_of(self.xname(n));
         }
+        if (k == ND_NULL) { return ET_NONE; }
+        if (k == ND_ORELSE) {
+            // `x orelse y` yields the inner `T` of the `?T` lhs.
+            var olt: i64 = self.type_of_expr(self.nodes[u].a);
+            if (et_is_opt(olt)) { return self.opt_inner_of(olt); }
+            return ET_NONE;
+        }
+        if (k == ND_UNWRAP) {
+            var ut: i64 = self.type_of_expr(self.nodes[u].a);
+            if (et_is_opt(ut)) { return self.opt_inner_of(ut); }
+            return ET_NONE;
+        }
         if (k == ND_MCALL) {
             // A method call's type is the invoked struct function's
             // recorded return: a type-name receiver resolves through the
@@ -2126,6 +2253,34 @@ pub const Em = struct {
             sb.deinit(a);
             return out;
         }
+        if (n >= 0 and et_is_opt(expected)) {
+            // The `?T` widenings (v0.173, SPEC §11.2): `null` → the empty
+            // optional; an already-optional value passes through; a `T`
+            // value wraps `{ .has = true, .val = <e> }`.
+            var oname: []u8 = self.opt_c_name(a, expected);
+            if (self.nodes[@as(usize, n)].kind == ND_NULL) {
+                var sb1: StrBuilder = StrBuilder.init(a);
+                sb1.append(a, "((");
+                sb1.append(a, oname);
+                sb1.append(a, "){ .has = false })");
+                var o1: []u8 = sb1.build(a);
+                sb1.deinit(a);
+                return o1;
+            }
+            if (et_is_opt(self.type_of_expr(n))) {
+                return self.emit_expr(a, n);
+            }
+            var inner: []u8 = self.emit_expr(a, n);
+            var sb2: StrBuilder = StrBuilder.init(a);
+            sb2.append(a, "((");
+            sb2.append(a, oname);
+            sb2.append(a, "){ .has = true, .val = ");
+            sb2.append(a, inner);
+            sb2.append(a, " })");
+            var o2: []u8 = sb2.build(a);
+            sb2.deinit(a);
+            return o2;
+        }
         return self.emit_expr(a, n);
     }
 
@@ -2175,6 +2330,54 @@ pub const Em = struct {
             // A bare `.V` with no expected type is sema-invalid (E0215);
             // the Rust arm emits a harmless `0` placeholder.
             return "0";
+        }
+        if (k == ND_NULL) {
+            // A bare `null` with no expected `?T` is sema-invalid (E0180);
+            // the Rust arm emits a harmless `0` placeholder.
+            return "0";
+        }
+        if (k == ND_ORELSE) {
+            // `x orelse y` → `kd_opt_<tag>_orelse(<x>, <y>)` (`y` eager);
+            // the non-optional lhs fallback mirrors the Rust `({l})` arm.
+            var ol: []u8 = self.emit_expr(a, self.nodes[u].a);
+            var orr: []u8 = self.emit_expr(a, self.nodes[u].b);
+            var olt: i64 = self.type_of_expr(self.nodes[u].a);
+            var sbo: StrBuilder = StrBuilder.init(a);
+            if (et_is_opt(olt)) {
+                sbo.append(a, self.opt_c_name(a, olt));
+                sbo.append(a, "_orelse(");
+                sbo.append(a, ol);
+                sbo.append(a, ", ");
+                sbo.append(a, orr);
+                sbo.append(a, ")");
+            } else {
+                sbo.append(a, "(");
+                sbo.append(a, ol);
+                sbo.append(a, ")");
+            }
+            var so: []u8 = sbo.build(a);
+            sbo.deinit(a);
+            return so;
+        }
+        if (k == ND_UNWRAP) {
+            // `x.?` → `kd_opt_<tag>_unwrap(<x>)` (panics + exit 101 on
+            // null); the non-optional fallback mirrors `({x})`.
+            var ui2: []u8 = self.emit_expr(a, self.nodes[u].a);
+            var ut: i64 = self.type_of_expr(self.nodes[u].a);
+            var sbu: StrBuilder = StrBuilder.init(a);
+            if (et_is_opt(ut)) {
+                sbu.append(a, self.opt_c_name(a, ut));
+                sbu.append(a, "_unwrap(");
+                sbu.append(a, ui2);
+                sbu.append(a, ")");
+            } else {
+                sbu.append(a, "(");
+                sbu.append(a, ui2);
+                sbu.append(a, ")");
+            }
+            var su: []u8 = sbu.build(a);
+            sbu.deinit(a);
+            return su;
         }
         if (k == ND_IDENT) {
             var sb: StrBuilder = StrBuilder.init(a);
@@ -3140,6 +3343,83 @@ pub const Em = struct {
 
     /// `emit_if`: flatten the `else if` chain into one C ladder. Returns
     /// whether every arm AND a final `else` diverge.
+    /// `Emitter::emit_if_capture` (v0.173): `if (opt) |v| { … } else …` —
+    /// the optional hoists into `__kd_if{N}` (evaluated once), the then
+    /// branch runs under `.has` with the payload bound
+    /// `<inner> kd_<v> = __kd_if{N}.val;` inside its own scope; a
+    /// non-optional condition (unreachable for validated input) falls
+    /// back to the plain `if`. Never diverges.
+    fn emit_if_capture(self: *Self, a: Allocator, n: i32) bool {
+        var u: usize = @as(usize, n);
+        var ct: i64 = self.type_of_expr(self.nodes[u].a);
+        if (!et_is_opt(ct)) {
+            return self.emit_if(a, n);
+        }
+        var inner_ty: i64 = self.opt_inner_of(ct);
+        var nctr: i64 = self.if_count;
+        self.if_count += 1;
+        var cs: []u8 = self.emit_expr(a, self.nodes[u].a);
+        self.line(a, "{");
+        self.indent += 1;
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, self.opt_c_name(a, ct));
+        sb.append(a, " __kd_if");
+        sb.append_i64(a, nctr);
+        sb.append(a, " = ");
+        sb.append(a, cs);
+        sb.append(a, ";");
+        var s1: []u8 = sb.build(a);
+        sb.deinit(a);
+        self.line(a, s1);
+        var sb2: StrBuilder = StrBuilder.init(a);
+        sb2.append(a, "if (__kd_if");
+        sb2.append_i64(a, nctr);
+        sb2.append(a, ".has) {");
+        var s2: []u8 = sb2.build(a);
+        sb2.deinit(a);
+        self.line(a, s2);
+        self.indent += 1;
+        // The then branch: a plain scope binding the payload.
+        self.push_scope(a, false, 0 - 1, 0 - 1);
+        self.push_vt(a, self.nodes[u].xoff, self.nodes[u].xlen, inner_ty);
+        var sb3: StrBuilder = StrBuilder.init(a);
+        sb3.append(a, self.cty_of(a, inner_ty));
+        sb3.append(a, " kd_");
+        sb3.append(a, self.xname(n));
+        sb3.append(a, " = __kd_if");
+        sb3.append_i64(a, nctr);
+        sb3.append(a, ".val;");
+        var s3: []u8 = sb3.build(a);
+        sb3.deinit(a);
+        self.line(a, s3);
+        var diverged: bool = false;
+        var cur: i32 = self.nodes[@as(usize, self.nodes[u].b)].a;
+        while (cur >= 0) {
+            diverged = self.emit_stmt(a, cur);
+            if (diverged) { break; }
+            cur = self.nodes[@as(usize, cur)].next;
+        }
+        if (!diverged) {
+            self.flush_current(a);
+        }
+        self.pop_scope();
+        self.indent -= 1;
+        var els: i32 = self.nodes[u].c;
+        if (els >= 0) {
+            self.line(a, "} else {");
+            self.indent += 1;
+            var du: bool = self.emit_stmt(a, els);
+            if (du) { }
+            self.indent -= 1;
+            self.line(a, "}");
+        } else {
+            self.line(a, "}");
+        }
+        self.indent -= 1;
+        self.line(a, "}");
+        return false;
+    }
+
     fn emit_if(self: *Self, a: Allocator, n: i32) bool {
         var u: usize = @as(usize, n);
         var cs: []u8 = self.emit_expr(a, self.nodes[u].a);
@@ -3365,6 +3645,9 @@ pub const Em = struct {
             return true;
         }
         if (k == ND_IF) {
+            if ((self.nodes[u].flags & F_CAP) != 0) {
+                return self.emit_if_capture(a, n);
+            }
             return self.emit_if(a, n);
         }
         if (k == ND_WHILE) {
@@ -3607,6 +3890,7 @@ pub const Em = struct {
         self.str_count = 0;
         self.idx_count = 0;
         self.for_count = 0;
+        self.if_count = 0;
         self.cur_ret = self.resolve_ty(self.nodes[u].b);
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, self.cty(a, self.nodes[u].b));
@@ -3663,11 +3947,11 @@ pub const Em = struct {
             }
             return;
         }
-        if (k == ND_UNARY or k == ND_COMPTIME or k == ND_FIELD) {
+        if (k == ND_UNARY or k == ND_COMPTIME or k == ND_FIELD or k == ND_UNWRAP) {
             self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
             return;
         }
-        if (k == ND_BIN or k == ND_INDEX) {
+        if (k == ND_BIN or k == ND_INDEX or k == ND_ORELSE) {
             self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
             self.collect_calls_expr(a, pend, pendm, self.nodes[u].b);
             return;
@@ -4091,6 +4375,14 @@ pub const Em = struct {
             }
             return;
         }
+        if ((self.nodes[u].flags & F_OPT) != 0) {
+            var oe: i64 = self.base_code(self.xname(n));
+            if (oe != ET_NONE) {
+                var unused2: i64 = self.opt_intern(a, oe);
+                if (unused2 == 0) { }
+            }
+            return;
+        }
         if ((self.nodes[u].flags & F_SLICE) == 0) { return; }
         var e: i64 = self.base_code(self.xname(n));
         if (e != ET_NONE) { self.intern_elem(a, e); }
@@ -4173,11 +4465,11 @@ pub const Em = struct {
             }
             return;
         }
-        if (k == ND_UNARY or k == ND_FIELD) {
+        if (k == ND_UNARY or k == ND_FIELD or k == ND_UNWRAP) {
             self.intern_expr(a, self.nodes[u].a);
             return;
         }
-        if (k == ND_BIN or k == ND_INDEX) {
+        if (k == ND_BIN or k == ND_INDEX or k == ND_ORELSE) {
             self.intern_expr(a, self.nodes[u].a);
             self.intern_expr(a, self.nodes[u].b);
             return;
@@ -4332,8 +4624,21 @@ pub const Em = struct {
             return;
         }
         if (k == ND_IF) {
+            // Cond first; a capture `|v|` (v0.173) binds the optional's
+            // inner type in a scope wrapping the then-block (check_block
+            // nests its own scope inside), else no binding.
             self.intern_expr(a, self.nodes[u].a);
-            self.intern_block(a, self.nodes[u].b);
+            if ((self.nodes[u].flags & F_CAP) != 0) {
+                var ict: i64 = self.type_of_expr(self.nodes[u].a);
+                var iinner: i64 = ET_I64;
+                if (et_is_opt(ict)) { iinner = self.opt_inner_of(ict); }
+                self.push_scope(a, false, 0 - 1, 0 - 1);
+                self.push_vt(a, self.nodes[u].xoff, self.nodes[u].xlen, iinner);
+                self.intern_block(a, self.nodes[u].b);
+                self.pop_scope();
+            } else {
+                self.intern_block(a, self.nodes[u].b);
+            }
             self.intern_stmt(a, self.nodes[u].c);
             return;
         }
@@ -4637,8 +4942,8 @@ pub const Em = struct {
     /// first, deduplicated by a seen-set. v0.168's arrays-then-slices was
     /// this walk's struct-free special case.
     fn emit_type_defs(self: *Self, a: Allocator) void {
-        if (self.sl_len == 0 and self.ar_count == 0 and self.st_count == 0 and self.en_count == 0) { return; }
-        var total: usize = self.en_count + self.st_count + self.ar_count + self.sl_len;
+        if (self.sl_len == 0 and self.ar_count == 0 and self.st_count == 0 and self.en_count == 0 and self.opt_count == 0) { return; }
+        var total: usize = self.en_count + self.st_count + self.opt_count + self.ar_count + self.sl_len;
         var seen: []bool = alloc(a, bool, total);
         var si: usize = 0;
         while (si < total) : (si += 1) { seen[si] = false; }
@@ -4651,6 +4956,11 @@ pub const Em = struct {
         var st_i: usize = 0;
         while (st_i < self.st_count) : (st_i += 1) {
             self.visit_type_def(a, seen, ET_STRUCT_BASE + @as(i64, st_i));
+        }
+        // Optionals seed after structs, before error unions/arrays/slices.
+        var op_i: usize = 0;
+        while (op_i < self.opt_count) : (op_i += 1) {
+            self.visit_type_def(a, seen, ET_OPT_BASE + @as(i64, op_i));
         }
         var ai: usize = 0;
         while (ai < self.ar_count) : (ai += 1) {
@@ -4669,13 +4979,14 @@ pub const Em = struct {
     fn type_def_slot(self: *Self, t: i64) i64 {
         if (et_is_enum(t)) { return t - ET_ENUM_BASE; }
         if (et_is_struct(t)) { return @as(i64, self.en_count) + (t - ET_STRUCT_BASE); }
-        if (et_is_arr(t)) { return @as(i64, self.en_count + self.st_count) + (t - ET_ARR_BASE); }
+        if (et_is_opt(t)) { return @as(i64, self.en_count + self.st_count) + (t - ET_OPT_BASE); }
+        if (et_is_arr(t)) { return @as(i64, self.en_count + self.st_count + self.opt_count) + (t - ET_ARR_BASE); }
         // A slice: find its element's intern index.
         var e: i64 = et_slice_elem(t);
         var i: usize = 0;
         while (i < self.sl_len) : (i += 1) {
             if (self.slices[i] == e) {
-                return @as(i64, self.en_count + self.st_count + self.ar_count + i);
+                return @as(i64, self.en_count + self.st_count + self.opt_count + self.ar_count + i);
             }
         }
         return 0 - 1;
@@ -4690,6 +5001,14 @@ pub const Em = struct {
             self.emit_one_enum(a, t);
             return;
         }
+        if (et_is_opt(t)) {
+            var oin: i64 = self.opt_inner_of(t);
+            if (et_is_struct(oin) or et_is_arr(oin) or et_is_slice(oin) or et_is_enum(oin) or et_is_opt(oin)) {
+                self.visit_type_def(a, seen, oin);
+            }
+            self.emit_one_optional(a, t);
+            return;
+        }
         if (et_is_struct(t)) {
             var i: usize = @as(usize, t - ET_STRUCT_BASE);
             var start: usize = @as(usize, self.st_f_start[i]);
@@ -4697,7 +5016,7 @@ pub const Em = struct {
             var j: usize = 0;
             while (j < n) : (j += 1) {
                 var ft: i64 = self.sf_ty[start + j];
-                if (et_is_struct(ft) or et_is_arr(ft) or et_is_slice(ft) or et_is_enum(ft)) {
+                if (et_is_struct(ft) or et_is_arr(ft) or et_is_slice(ft) or et_is_enum(ft) or et_is_opt(ft)) {
                     self.visit_type_def(a, seen, ft);
                 }
             }
@@ -4752,6 +5071,47 @@ pub const Em = struct {
         var out: []u8 = sb.build(a);
         sb.deinit(a);
         self.line(a, out);
+    }
+
+    /// `emit_one_optional`: `typedef struct { bool has; <inner> val; }`
+    /// plus the inline `_orelse` / `_unwrap` helpers (`_unwrap` panics
+    /// with exit 101 on null, SPEC §11.3).
+    fn emit_one_optional(self: *Self, a: Allocator, t: i64) void {
+        var oname: []u8 = self.opt_c_name(a, t);
+        var icty: []u8 = self.cty_of(a, self.opt_inner_of(t));
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "typedef struct { bool has; ");
+        sb.append(a, icty);
+        sb.append(a, " val; } ");
+        sb.append(a, oname);
+        sb.append(a, ";");
+        var s1: []u8 = sb.build(a);
+        sb.deinit(a);
+        self.line(a, s1);
+        var g: StrBuilder = StrBuilder.init(a);
+        g.append(a, "static inline ");
+        g.append(a, icty);
+        g.append(a, " ");
+        g.append(a, oname);
+        g.append(a, "_orelse(");
+        g.append(a, oname);
+        g.append(a, " o, ");
+        g.append(a, icty);
+        g.append(a, " d) { return o.has ? o.val : d; }");
+        var s2: []u8 = g.build(a);
+        g.deinit(a);
+        self.line(a, s2);
+        var h: StrBuilder = StrBuilder.init(a);
+        h.append(a, "static inline ");
+        h.append(a, icty);
+        h.append(a, " ");
+        h.append(a, oname);
+        h.append(a, "_unwrap(");
+        h.append(a, oname);
+        h.append(a, " o) { if (!o.has) { fputs(\"panic: unwrapped a null optional\\n\", stderr); exit(101); } return o.val; }");
+        var s3: []u8 = h.build(a);
+        h.deinit(a);
+        self.line(a, s3);
     }
 
     /// `emit_one_struct`: `typedef struct { <cty> kd_<f>; … } kd_struct_<Name>;`
@@ -4947,6 +5307,7 @@ pub const Em = struct {
         self.vt_len = 0;
         self.idx_count = 0;
         self.for_count = 0;
+        self.if_count = 0;
         self.cur_ret = ET_I32;
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, "static int kd_test_");

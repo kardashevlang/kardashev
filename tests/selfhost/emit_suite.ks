@@ -4,7 +4,7 @@
 // test blocks / EmitMode::Test + v0.167 `@import` resolution + v0.168 fixed
 // arrays `[N]T` and `for` loops + v0.169 plain data structs + v0.170
 // struct methods and associated functions + v0.171 enums + v0.172
-// switch with contextual enum literals).
+// switch with contextual enum literals + v0.173 optionals ?T).
 //
 // Run: kard test tests/selfhost/emit_suite.ks (driven from
 // `crates/kardc/tests/selfhost_emit.rs` so it is part of `cargo test`).
@@ -253,9 +253,16 @@ test "detect: composite type forms and non-subset type names" {
     var d3: Det = eh_detect(a, "fn main() f64 { return q(); }");
     expect(d3.found);
     expect(str_eq(d3.word, "type-name"));
-    var d4: Det = eh_detect(a, "fn main() ?i32 { return q(); }");
+    // (`?i32` joined the subset in v0.173 — an error union `!T` keeps
+    // the verdict, and a non-subset optional inner is a type-name)
+    var d4: Det = eh_detect(a, "fn main() !i32 { return q(); }");
     expect(d4.found);
     expect(str_eq(d4.word, "type-form"));
+    var d5: Det = eh_detect(a, "fn main() ?f64 { return q(); }");
+    expect(d5.found);
+    expect(str_eq(d5.word, "type-name"));
+    var d6: Det = eh_detect(a, "fn main() ?i32 { return q(); }");
+    expect(!d6.found);
 }
 
 test "detect: field access (v0.169) and method calls (v0.170) are in" {
@@ -364,9 +371,13 @@ test "detect: allocator builtins and deep expressions" {
     var d4: Det = eh_detect(a, "fn main() void { defer { print(g(1.25)); } }");
     expect(d4.found);
     expect(str_eq(d4.word, "float"));
+    // (`if (o) |v|` joined the subset in v0.173 — a switch payload
+    // capture keeps the verdict)
     var d5: Det = eh_detect(a, "fn main() void { var o = q(); if (o) |v| { } }");
-    expect(d5.found);
-    expect(str_eq(d5.word, "capture"));
+    expect(!d5.found);
+    var d6: Det = eh_detect(a, "fn main() void { var o = q(); switch (o) { .A => |v| { }, else => { } } }");
+    expect(d6.found);
+    expect(str_eq(d6.word, "capture"));
 }
 
 test "detect: place chains in (v0.169), non-name roots out" {
@@ -1115,4 +1126,31 @@ test "coercion: contextual .V at let/assign/return/args/array elems" {
     // Array-literal elements coerce; call arguments coerce by position.
     expect(eh_find(c, "((kd_arr_enum_C_2){ .data = { kd_enum_C_G, kd_enum_C_B } })"));
     expect(eh_find(c, "kd_pick(kd_enum_C_B, kd_arr_enum_C_2_get(kd_cs, 0))"));
+}
+
+test "optionals: typedef + helpers, widenings, orelse/unwrap (v0.173)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "fn find(n: i64) ?i64 {\n    if (n > 0) { return n * 2; }\n    return null;\n}\npub fn main() void {\n    var x: ?i64 = find(5);\n    print(find(0) orelse 99);\n    var y: ?i64 = null;\n    y = 7;\n    print(y.?);\n    print(x orelse 0);\n}");
+    // The typedef block: struct + _orelse + _unwrap, exact bytes.
+    expect(eh_find(c, "typedef struct { bool has; int64_t val; } kd_opt_int64_t;\n"));
+    expect(eh_find(c, "static inline int64_t kd_opt_int64_t_orelse(kd_opt_int64_t o, int64_t d) { return o.has ? o.val : d; }\n"));
+    expect(eh_find(c, "static inline int64_t kd_opt_int64_t_unwrap(kd_opt_int64_t o) { if (!o.has) { fputs(\"panic: unwrapped a null optional\\n\", stderr); exit(101); } return o.val; }\n"));
+    // Widenings: a `T` return wraps; `null` is the empty optional (at
+    // return, let and assignment positions).
+    expect(eh_find(c, "        return (((kd_opt_int64_t){ .has = true, .val = (kd_n * 2) }));\n"));
+    expect(eh_find(c, "    return (((kd_opt_int64_t){ .has = false }));\n"));
+    expect(eh_find(c, "    kd_opt_int64_t kd_y = ((kd_opt_int64_t){ .has = false });\n"));
+    expect(eh_find(c, "    kd_y = ((kd_opt_int64_t){ .has = true, .val = 7 });\n"));
+    // orelse / unwrap lower through the inline helpers.
+    expect(eh_find(c, "kd_print((long long)(kd_opt_int64_t_orelse(kd_find(0), 99)));\n"));
+    expect(eh_find(c, "kd_print((long long)(kd_opt_int64_t_unwrap(kd_y)));\n"));
+}
+
+test "optionals: if-capture hoists once, binds payload, __kd_if counter" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "fn side(n: i64) ?i64 {\n    return n;\n}\npub fn main() void {\n    if (side(41)) |v| {\n        print(v);\n    } else {\n        print(0 - 1);\n    }\n    if (side(1)) |w| {\n        print(w);\n    }\n}");
+    // The capture block: hoisted __kd_if temp, .has test, payload bind.
+    expect(eh_find(c, "    {\n        kd_opt_int64_t __kd_if0 = kd_side(41);\n        if (__kd_if0.has) {\n            int64_t kd_v = __kd_if0.val;\n            kd_print((long long)(kd_v));\n        } else {\n            {\n                kd_print((long long)((0 - 1)));\n            }\n        }\n    }\n"));
+    // The counter advances per capture within one function.
+    expect(eh_find(c, "__kd_if1 = kd_side(1);"));
 }
