@@ -1,8 +1,9 @@
-// emit.ks — self-host stages 3–13 (v0.161–v0.171): a C emitter for the
+// emit.ks — self-host stages 3–14 (v0.161–v0.172): a C emitter for the
 // SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
 // `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
 // `[N]T` with array literals and `for` loops, plain data STRUCTS, struct
-// METHODS + associated functions, and — v0.171 — ENUMS), written in
+// METHODS + associated functions, ENUMS, and — v0.172 — `switch` with
+// contextual `.V` literals), written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
 // the Rust emitter's output in BOTH `EmitMode::Program` and (v0.166)
@@ -46,12 +47,28 @@
 // arms, exactly like Rust); enum equality is plain C `==`/`!=`; the
 // conversions `@intFromEnum(e)` → `((int64_t)(<e>))` and
 // `@enumFromInt(E, n)` → `((kd_enum_E)(<n>))` join `@as` in the builtin
-// arm (the type argument never walks); unqualified `.V` literals stay
-// OUT (`enum-lit`) — they need expected-type plumbing — as does
-// `switch`. Enum names join struct names as nominal types anywhere a
-// type may appear, including `[N]Enum` / `[]Enum` (mangle `enum_<N>`);
-// enum-typed STRUCT FIELDS are sema-invalid (E0161 — resolve_field_type
-// has no enum arm), a pinned language limit:
+// arm (the type argument never walks). Enum names join struct names as
+// nominal types anywhere a type may appear, including `[N]Enum` /
+// `[]Enum` (mangle `enum_<N>`); enum-typed STRUCT FIELDS are
+// sema-invalid (E0161 — resolve_field_type has no enum arm), a pinned
+// language limit. v0.172 adds `switch` — enum/integer scrutinees,
+// multi-label arms (`case a:` chains, the LAST label opening the arm's
+// brace), GNU `case lo ... hi:` ranges, `else` → `default:`, every arm
+// closed `} break;` (no fallthrough), divergence = (else present OR
+// enum scrutinee) AND every arm diverges; payload-capture arms (tagged
+// unions) stay out (`capture`) — and CONTEXTUAL `.V` literals through
+// the expected-type plumbing: `emit_coerced` maps an `.V` against an
+// expected enum to its enumerator at let/assign/place-assign/return/
+// call-arg/method-arg/struct-field/array-element positions (fn and
+// method parameter types are recorded in a flat positional table);
+// sema supplies NO context in comparisons — `x == .V` is E0215 both
+// ways (the emitter's sibling-context arm is defensive only) — and a
+// bare `.V` in a switch LABEL takes the SCRUTINEE's enum. The scan
+// mirrors check_switch: scrutinee first; enum-scrutinee labels that
+// are `.V`/matching `Enum.V` never check as expressions, every other
+// label checks fully (an INTEGER label checks + const-folds); an
+// unswitchable scrutinee checks bodies only; arm bodies per arm, else
+// last:
 //
 //   - types: `i32`, `i64`, `bool`, `void`, `u8`, `usize`, `Allocator` bare
 //     names, plus `[]T` slices AND `[N]T` fixed arrays (literal `N` only —
@@ -608,7 +625,12 @@ pub const Det = struct {
         if (k == ND_ORELSE) { self.hit("orelse", off); return; }
         if (k == ND_UNWRAP) { self.hit("unwrap", off); return; }
         if (k == ND_ERRLIT) { self.hit("error-lit", off); return; }
-        if (k == ND_ENUMLIT) { self.hit("enum-lit", off); return; }
+        if (k == ND_ENUMLIT) {
+            // An unqualified `.V` is in the subset (v0.172): its enum
+            // comes from the expected-type context (a no-context use is
+            // sema's E0215); it carries nothing to walk.
+            return;
+        }
         if (k == ND_ALIT) {
             // An array literal `[N]T{ … }` is in the subset (v0.168): its
             // `[N]T` reference, then the elements, in order.
@@ -713,7 +735,33 @@ pub const Det = struct {
             self.check_block(n);
             return;
         }
-        if (k == ND_SWITCH) { self.hit("switch", off); return; }
+        if (k == ND_SWITCH) {
+            // `switch` is in the subset (v0.172): the scrutinee walks,
+            // then per arm — a payload capture (tagged unions) is out —
+            // each label (an unqualified `.V` is ADMITTED as a label; it
+            // takes its enum from the scrutinee) and the body; the `else`
+            // block last. Range labels carry literal bounds only.
+            self.check_expr(self.nodes[u].a);
+            var swa: i32 = self.nodes[u].b;
+            while (swa >= 0) {
+                if (self.found) { return; }
+                var swu: usize = @as(usize, swa);
+                if ((self.nodes[swu].flags & F_CAP) != 0) {
+                    self.hit("capture", self.nodes[swu].off);
+                    return;
+                }
+                var swl: i32 = self.nodes[swu].a;
+                while (swl >= 0) {
+                    if (self.found) { return; }
+                    self.check_expr(swl);
+                    swl = self.nodes[@as(usize, swl)].next;
+                }
+                self.check_block(self.nodes[swu].c);
+                swa = self.nodes[swu].next;
+            }
+            self.check_block(self.nodes[u].c);
+            return;
+        }
         // An expression statement.
         self.check_expr(n);
     }
@@ -1000,6 +1048,11 @@ pub const FnSig = struct {
     ret: i64,
     node: i32,
     live: bool,
+    // The `fn_params` window (v0.172): `pcount` parameter ET codes
+    // starting at `pstart` in the emitter's flat `fp_ty` table — argument
+    // coercion (a contextual `.V` argument) reads them by position.
+    pstart: i64,
+    pcount: i64,
 };
 
 /// One folded top-level constant: name span, kind, value.
@@ -1085,6 +1138,13 @@ pub const Em = struct {
     // The enum table (v0.171) — sema pass 0's mirror. Ids are declaration
     // order; variants live flat in the `ev_*` arrays (name span + resolved
     // integer value), one `(start, count)` window per enum.
+    // The flat parameter-type table backing `FnSig.pstart/pcount` AND the
+    // method rows' `mt_p_*` windows (both are `resolve_ty`-resolved, in
+    // declaration order — the `fn_params` / `method_params` mirror).
+    fp_ty: []i64,
+    fp_count: usize,
+    mt_p_start: []i64,
+    mt_p_count: []i64,
     en_name_off: []i64,
     en_name_len: []i64,
     en_v_start: []i64,
@@ -1142,6 +1202,10 @@ pub const Em = struct {
             .mt_node = alloc(a, i32, 8),
             .mt_live = alloc(a, bool, 8),
             .mt_count = 0,
+            .fp_ty = alloc(a, i64, 16),
+            .fp_count = 0,
+            .mt_p_start = alloc(a, i64, 8),
+            .mt_p_count = alloc(a, i64, 8),
             .en_name_off = alloc(a, i64, 4),
             .en_name_len = alloc(a, i64, 4),
             .en_v_start = alloc(a, i64, 4),
@@ -1636,7 +1700,7 @@ pub const Em = struct {
         self.vt_len += 1;
     }
 
-    fn push_fn(self: *Self, a: Allocator, off: usize, len: usize, ret: i64, node: i32) void {
+    fn push_fn(self: *Self, a: Allocator, off: usize, len: usize, ret: i64, node: i32, pstart: i64, pcount: i64) void {
         if (self.fn_len == self.fns.len) {
             var grown: []FnSig = alloc(a, FnSig, self.fns.len * 2);
             var i: usize = 0;
@@ -1644,8 +1708,21 @@ pub const Em = struct {
             free(a, self.fns);
             self.fns = grown;
         }
-        self.fns[self.fn_len] = FnSig{ .off = off, .len = len, .ret = ret, .node = node, .live = false };
+        self.fns[self.fn_len] = FnSig{ .off = off, .len = len, .ret = ret, .node = node, .live = false, .pstart = pstart, .pcount = pcount };
         self.fn_len += 1;
+    }
+
+    /// Append one parameter ET code to the flat `fp_ty` table.
+    fn push_fp(self: *Self, a: Allocator, t: i64) void {
+        if (self.fp_count == self.fp_ty.len) {
+            var grown: []i64 = alloc(a, i64, self.fp_ty.len * 2);
+            var i: usize = 0;
+            while (i < self.fp_count) : (i += 1) { grown[i] = self.fp_ty[i]; }
+            free(a, self.fp_ty);
+            self.fp_ty = grown;
+        }
+        self.fp_ty[self.fp_count] = t;
+        self.fp_count += 1;
     }
 
     fn push_const(self: *Self, a: Allocator, off: usize, len: usize, isb: bool, val: i64) void {
@@ -1671,6 +1748,17 @@ pub const Em = struct {
             if (str_eq(ent, name)) { return self.vts[u].ty; }
         }
         return ET_NONE;
+    }
+
+    /// The row index of the top-level `fn` named `name`, or -1 (backs the
+    /// positional `fn_params` lookups).
+    fn fn_row_of(self: *Self, name: []u8) i64 {
+        var i: usize = 0;
+        while (i < self.fn_len) : (i += 1) {
+            var ent: []u8 = self.src[self.fns[i].off .. self.fns[i].off + self.fns[i].len];
+            if (str_eq(ent, name)) { return @as(i64, i); }
+        }
+        return 0 - 1;
     }
 
     /// The collected return type of the top-level `fn` named `name`, or
@@ -2024,8 +2112,35 @@ pub const Em = struct {
 
     // -- expressions --------------------------------------------------------------------
 
+    /// `Emitter::emit_coerced` over the subset (v0.172): the ONLY
+    /// non-identity coercion is an unqualified enum literal `.V` against
+    /// an expected enum — it lowers to that enum's C enumerator. (The
+    /// optional/error-union widenings stay out of the subset.)
+    fn emit_coerced(self: *Self, a: Allocator, n: i32, expected: i64) []u8 {
+        if (n >= 0 and et_is_enum(expected) and self.nodes[@as(usize, n)].kind == ND_ENUMLIT) {
+            var sb: StrBuilder = StrBuilder.init(a);
+            sb.append(a, self.en_c_name(a, expected));
+            sb.append(a, "_");
+            sb.append(a, self.xname(n));
+            var out: []u8 = sb.build(a);
+            sb.deinit(a);
+            return out;
+        }
+        return self.emit_expr(a, n);
+    }
+
+    /// `Emitter::emit_binop_operand`: an `.V` operand takes its enum from
+    /// the SIBLING operand's type (`c == .Red`); anything else is plain.
+    fn emit_binop_operand(self: *Self, a: Allocator, n: i32, sibling: i32) []u8 {
+        if (n >= 0 and self.nodes[@as(usize, n)].kind == ND_ENUMLIT) {
+            var st: i64 = self.type_of_expr(sibling);
+            if (et_is_enum(st)) { return self.emit_coerced(a, n, st); }
+        }
+        return self.emit_expr(a, n);
+    }
+
     /// `Emitter::emit_expr`: lower an expression to a C expression string.
-    /// Scalar coercion is the identity, so `emit_coerced` collapses to this.
+    /// Scalar coercion (beyond the `.V` arm above) is the identity.
     fn emit_expr(self: *Self, a: Allocator, n: i32) []u8 {
         var u: usize = @as(usize, n);
         var k: u8 = self.nodes[u].kind;
@@ -2055,6 +2170,11 @@ pub const Em = struct {
             var s: []u8 = sb.build(a);
             sb.deinit(a);
             return s;
+        }
+        if (k == ND_ENUMLIT) {
+            // A bare `.V` with no expected type is sema-invalid (E0215);
+            // the Rust arm emits a harmless `0` placeholder.
+            return "0";
         }
         if (k == ND_IDENT) {
             var sb: StrBuilder = StrBuilder.init(a);
@@ -2087,8 +2207,8 @@ pub const Em = struct {
             return s;
         }
         if (k == ND_BIN) {
-            var l: []u8 = self.emit_expr(a, self.nodes[u].a);
-            var r: []u8 = self.emit_expr(a, self.nodes[u].b);
+            var l: []u8 = self.emit_binop_operand(a, self.nodes[u].a, self.nodes[u].b);
+            var r: []u8 = self.emit_binop_operand(a, self.nodes[u].b, self.nodes[u].a);
             var sb: StrBuilder = StrBuilder.init(a);
             sb.append(a, "(");
             sb.append(a, l);
@@ -2218,6 +2338,9 @@ pub const Em = struct {
                 var mrt: i64 = self.type_of_expr(mrecv);
                 if (et_is_struct(mrt)) { msid = mrt; }
             }
+            var mrow: i64 = self.mt_row_of(msid, self.xname(n));
+            var moffset: i64 = 0;
+            if (!is_assoc) { moffset = 1; }
             var msb: StrBuilder = StrBuilder.init(a);
             msb.append(a, "kd_");
             if (msid != ET_NONE) { msb.append(a, self.st_name_of(msid)); }
@@ -2230,10 +2353,16 @@ pub const Em = struct {
                 first = false;
             }
             var marg: i32 = self.nodes[u].b;
+            var margi: i64 = 0;
             while (marg >= 0) {
                 if (!first) { msb.append(a, ", "); }
                 first = false;
-                msb.append(a, self.emit_expr(a, marg));
+                var mex: i64 = ET_NONE;
+                if (mrow >= 0 and margi + moffset < self.mt_p_count[@as(usize, mrow)]) {
+                    mex = self.fp_ty[@as(usize, self.mt_p_start[@as(usize, mrow)] + margi + moffset)];
+                }
+                msb.append(a, self.emit_coerced(a, marg, mex));
+                margi += 1;
                 marg = self.nodes[@as(usize, marg)].next;
             }
             msb.append(a, ")");
@@ -2281,7 +2410,11 @@ pub const Em = struct {
                 sbl.append(a, ".kd_");
                 sbl.append(a, self.src[self.nodes[fu].xoff .. self.nodes[fu].xoff + self.nodes[fu].xlen]);
                 sbl.append(a, " = ");
-                sbl.append(a, self.emit_expr(a, self.nodes[fu].a));
+                var fexp: i64 = ET_NONE;
+                if (slc != ET_NONE) {
+                    fexp = self.st_field_ty(slc, self.src[self.nodes[fu].xoff .. self.nodes[fu].xoff + self.nodes[fu].xlen]);
+                }
+                sbl.append(a, self.emit_coerced(a, self.nodes[fu].a, fexp));
                 fin = self.nodes[fu].next;
             }
             sbl.append(a, " })");
@@ -2306,6 +2439,7 @@ pub const Em = struct {
                     sbz.deinit(a);
                     return sz;
                 }
+                var aelem: i64 = self.arr_elem_of(alt);
                 var sbal: StrBuilder = StrBuilder.init(a);
                 sbal.append(a, "((");
                 sbal.append(a, acn);
@@ -2315,7 +2449,7 @@ pub const Em = struct {
                 while (acur >= 0) {
                     if (!afirst) { sbal.append(a, ", "); }
                     afirst = false;
-                    sbal.append(a, self.emit_expr(a, acur));
+                    sbal.append(a, self.emit_coerced(a, acur, aelem));
                     acur = self.nodes[@as(usize, acur)].next;
                 }
                 sbal.append(a, " } })");
@@ -2498,17 +2632,26 @@ pub const Em = struct {
                 sbf.deinit(a);
                 return sf;
             }
+            // Coerce each argument to its parameter type (a contextual
+            // `.V` argument takes the enum from the signature, v0.172).
+            var frow: i64 = self.fn_row_of(callee);
             var sb: StrBuilder = StrBuilder.init(a);
             sb.append(a, "kd_");
             sb.append(a, callee);
             sb.append(a, "(");
             var cur: i32 = self.nodes[u].a;
             var first: bool = true;
+            var argi: i64 = 0;
             while (cur >= 0) {
                 if (!first) { sb.append(a, ", "); }
                 first = false;
-                var e: []u8 = self.emit_expr(a, cur);
+                var expct: i64 = ET_NONE;
+                if (frow >= 0 and argi < self.fns[@as(usize, frow)].pcount) {
+                    expct = self.fp_ty[@as(usize, self.fns[@as(usize, frow)].pstart + argi)];
+                }
+                var e: []u8 = self.emit_coerced(a, cur, expct);
                 sb.append(a, e);
+                argi += 1;
                 cur = self.nodes[@as(usize, cur)].next;
             }
             sb.append(a, ")");
@@ -2699,7 +2842,7 @@ pub const Em = struct {
     fn emit_assign(self: *Self, a: Allocator, n: i32) void {
         var u: usize = @as(usize, n);
         var name: []u8 = self.xname(n);
-        var es: []u8 = self.emit_expr(a, self.nodes[u].a);
+        var es: []u8 = self.emit_coerced(a, self.nodes[u].a, self.vt_lookup(name));
         var op: i64 = self.nodes[u].val;
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, "kd_");
@@ -2848,7 +2991,7 @@ pub const Em = struct {
         if (needs_at) {
             var lv: []u8 = self.emit_place(a, place);
             var pt: i64 = self.type_of_expr(place);
-            var es0: []u8 = self.emit_expr(a, value);
+            var es0: []u8 = self.emit_coerced(a, value, pt);
             if (op < 0) {
                 var sbp: StrBuilder = StrBuilder.init(a);
                 sbp.append(a, "(");
@@ -2893,7 +3036,10 @@ pub const Em = struct {
             var idx: []u8 = self.emit_expr(a, self.nodes[pu].b);
             var base_str: []u8 = self.emit_expr(a, self.nodes[pu].a);
             var bt: i64 = self.type_of_expr(self.nodes[pu].a);
-            var val: []u8 = self.emit_expr(a, value);
+            var pelem: i64 = ET_NONE;
+            if (et_is_slice(bt)) { pelem = et_slice_elem(bt); }
+            if (et_is_arr(bt)) { pelem = self.arr_elem_of(bt); }
+            var val: []u8 = self.emit_coerced(a, value, pelem);
             // The hoisted-slot target: `(<base>).ptr[__kd_idx{k}]` for a
             // slice, `(<base>).data[__kd_idx{k}]` for the fallback arm.
             var tsb: StrBuilder = StrBuilder.init(a);
@@ -2937,11 +3083,11 @@ pub const Em = struct {
             self.line(a, s);
             return;
         }
-        // Non-index place (unreachable behind the detector): the Rust
-        // field-chain default — `(<place>) (op)= (<value>);`.
+        // The field-chain place: `(<place>) (op)= (<value>);` — the value
+        // coerced to the place's type.
         var ps: []u8 = "0";
         if (place >= 0) { ps = self.emit_expr(a, place); }
-        var es: []u8 = self.emit_expr(a, value);
+        var es: []u8 = self.emit_coerced(a, value, self.type_of_expr(place));
         var tsb2: StrBuilder = StrBuilder.init(a);
         tsb2.append(a, "(");
         tsb2.append(a, ps);
@@ -3185,7 +3331,7 @@ pub const Em = struct {
                 if (lty == ET_NONE) { lty = ET_I64; }
                 ct = self.cty_of(a, lty);
             }
-            var es: []u8 = self.emit_expr(a, self.nodes[u].b);
+            var es: []u8 = self.emit_coerced(a, self.nodes[u].b, lty);
             var sb: StrBuilder = StrBuilder.init(a);
             if ((self.nodes[u].flags & F_CONST) != 0) { sb.append(a, "const "); }
             sb.append(a, ct);
@@ -3211,7 +3357,7 @@ pub const Em = struct {
         if (k == ND_RETURN) {
             var v: i32 = self.nodes[u].a;
             if (v >= 0) {
-                var es: []u8 = self.emit_expr(a, v);
+                var es: []u8 = self.emit_coerced(a, v, self.cur_ret);
                 self.finish_return(a, true, es);
             } else {
                 self.finish_return(a, false, "");
@@ -3262,6 +3408,9 @@ pub const Em = struct {
             var d: bool = self.emit_block(a, n, false, 0 - 1);
             self.line(a, "}");
             return d;
+        }
+        if (k == ND_SWITCH) {
+            return self.emit_switch(a, n);
         }
         // In Test mode, `expect(c)` is a statement-level construct returning
         // a failure code through the deferred-return path (SPEC §4.5):
@@ -3318,6 +3467,101 @@ pub const Em = struct {
         self.pop_scope();
         self.indent -= 1;
         return diverged;
+    }
+
+    /// `Emitter::emit_switch` (v0.172): a C `switch` — one `case` line per
+    /// value label (the LAST label overall opens the arm's brace), then a
+    /// GNU `case <lo> ... <hi>:` per inclusive range; each arm body is a
+    /// plain scope closed by `} break;` (SPEC's no-fallthrough); `else` is
+    /// `default:`. The statement diverges iff it is TOTAL — an `else`
+    /// present, or an enum scrutinee (sema proved coverage) — and every
+    /// arm (and the else) diverges.
+    fn emit_switch(self: *Self, a: Allocator, n: i32) bool {
+        var u: usize = @as(usize, n);
+        var scrut_ty: i64 = self.type_of_expr(self.nodes[u].a);
+        var scrut: []u8 = self.emit_expr(a, self.nodes[u].a);
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "switch (");
+        sb.append(a, scrut);
+        sb.append(a, ") {");
+        var hl: []u8 = sb.build(a);
+        sb.deinit(a);
+        self.line(a, hl);
+        self.indent += 1;
+        var all_diverge: bool = true;
+        var arm: i32 = self.nodes[u].b;
+        while (arm >= 0) {
+            var au: usize = @as(usize, arm);
+            // Count the labels + ranges so the LAST case line opens `{`.
+            var total: i64 = 0;
+            var lc0: i32 = self.nodes[au].a;
+            while (lc0 >= 0) : (lc0 = self.nodes[@as(usize, lc0)].next) { total += 1; }
+            var rc0: i32 = self.nodes[au].b;
+            while (rc0 >= 0) : (rc0 = self.nodes[@as(usize, rc0)].next) { total += 1; }
+            var i: i64 = 0;
+            var lcur: i32 = self.nodes[au].a;
+            while (lcur >= 0) {
+                var lc: []u8 = self.emit_switch_label(a, lcur, scrut_ty);
+                var lsb: StrBuilder = StrBuilder.init(a);
+                lsb.append(a, "case ");
+                lsb.append(a, lc);
+                lsb.append(a, ":");
+                if (i + 1 >= total) { lsb.append(a, " {"); }
+                var ll: []u8 = lsb.build(a);
+                lsb.deinit(a);
+                self.line(a, ll);
+                i += 1;
+                lcur = self.nodes[@as(usize, lcur)].next;
+            }
+            var rcur: i32 = self.nodes[au].b;
+            while (rcur >= 0) {
+                var ru: usize = @as(usize, rcur);
+                var rsb: StrBuilder = StrBuilder.init(a);
+                rsb.append(a, "case ");
+                rsb.append_i64(a, self.nodes[ru].val);
+                rsb.append(a, " ... ");
+                rsb.append_i64(a, self.nodes[ru].val2);
+                rsb.append(a, ":");
+                if (i + 1 >= total) { rsb.append(a, " {"); }
+                var rl: []u8 = rsb.build(a);
+                rsb.deinit(a);
+                self.line(a, rl);
+                i += 1;
+                rcur = self.nodes[ru].next;
+            }
+            if (total == 0) { self.line(a, "{"); }
+            var d: bool = self.emit_block(a, self.nodes[au].c, false, 0 - 1);
+            self.line(a, "} break;");
+            all_diverge = all_diverge and d;
+            arm = self.nodes[au].next;
+        }
+        if (self.nodes[u].c >= 0) {
+            self.line(a, "default: {");
+            var d2: bool = self.emit_block(a, self.nodes[u].c, false, 0 - 1);
+            self.line(a, "} break;");
+            all_diverge = all_diverge and d2;
+        }
+        self.indent -= 1;
+        self.line(a, "}");
+        var total_sw: bool = self.nodes[u].c >= 0 or et_is_enum(scrut_ty);
+        return total_sw and all_diverge;
+    }
+
+    /// `emit_switch_label`: a bare `.V` takes its enum from the scrutinee;
+    /// everything else (a qualified `Enum.V` Field, an integer literal, a
+    /// named const) lowers through the ordinary expression path.
+    fn emit_switch_label(self: *Self, a: Allocator, label: i32, scrut_ty: i64) []u8 {
+        var lu: usize = @as(usize, label);
+        if (self.nodes[lu].kind == ND_ENUMLIT and et_is_enum(scrut_ty)) {
+            var sb: StrBuilder = StrBuilder.init(a);
+            sb.append(a, self.en_c_name(a, scrut_ty));
+            sb.append(a, "_");
+            sb.append(a, self.xname(label));
+            var out: []u8 = sb.build(a);
+            sb.deinit(a);
+            return out;
+        }
+        return self.emit_expr(a, label);
     }
 
     // -- functions ----------------------------------------------------------------------
@@ -3529,6 +3773,24 @@ pub const Em = struct {
             self.collect_calls_block(a, pend, pendm, n);
             return;
         }
+        if (k == ND_SWITCH) {
+            // `visit_stmt_exprs`: scrutinee, then per arm its labels and
+            // body, then the default block.
+            self.collect_calls_expr(a, pend, pendm, self.nodes[u].a);
+            var sw: i32 = self.nodes[u].b;
+            while (sw >= 0) {
+                var swu: usize = @as(usize, sw);
+                var swl: i32 = self.nodes[swu].a;
+                while (swl >= 0) {
+                    self.collect_calls_expr(a, pend, pendm, swl);
+                    swl = self.nodes[@as(usize, swl)].next;
+                }
+                self.collect_calls_block(a, pend, pendm, self.nodes[swu].c);
+                sw = self.nodes[swu].next;
+            }
+            self.collect_calls_block(a, pend, pendm, self.nodes[u].c);
+            return;
+        }
         if (k == ND_BREAK or k == ND_CONTINUE) { return; }
         // An expression statement.
         self.collect_calls_expr(a, pend, pendm, n);
@@ -3642,17 +3904,36 @@ pub const Em = struct {
         while (cur >= 0) {
             var u: usize = @as(usize, cur);
             if (self.nodes[u].kind == ND_FN) {
-                self.push_fn(a, self.nodes[u].xoff, self.nodes[u].xlen, self.resolve_ty(self.nodes[u].b), cur);
+                var ps: i64 = @as(i64, self.fp_count);
+                var pc: i64 = 0;
+                var pp: i32 = self.nodes[u].a;
+                while (pp >= 0) {
+                    self.push_fp(a, self.resolve_ty(self.nodes[@as(usize, pp)].a));
+                    pc += 1;
+                    pp = self.nodes[@as(usize, pp)].next;
+                }
+                self.push_fn(a, self.nodes[u].xoff, self.nodes[u].xlen, self.resolve_ty(self.nodes[u].b), cur, ps, pc);
             }
             if (self.nodes[u].kind == ND_STRUCT) {
-                // Register every struct function's return type under
-                // (struct, name) — the `method_ret` mirror (v0.170); the
-                // rows double as the emission worklist (nodes + liveness).
+                // Register every struct function's return AND parameter
+                // types under (struct, name) — the `method_ret` /
+                // `method_params` mirror (v0.170/v0.172; every param
+                // resolves via `resolve_ty`, `self`'s annotation included
+                // — the EMITTER rule). The rows double as the emission
+                // worklist (nodes + liveness).
                 var scode: i64 = ET_STRUCT_BASE + @as(i64, self.st_index_of(self.nodes[u].xoff, self.nodes[u].xlen));
                 var m: i32 = self.nodes[u].b;
                 while (m >= 0) {
                     var mu: usize = @as(usize, m);
-                    self.push_mt(a, scode, self.nodes[mu].xoff, self.nodes[mu].xlen, self.resolve_ty(self.nodes[mu].b), m);
+                    var mps: i64 = @as(i64, self.fp_count);
+                    var mpc: i64 = 0;
+                    var mp: i32 = self.nodes[mu].a;
+                    while (mp >= 0) {
+                        self.push_fp(a, self.resolve_ty(self.nodes[@as(usize, mp)].a));
+                        mpc += 1;
+                        mp = self.nodes[@as(usize, mp)].next;
+                    }
+                    self.push_mt(a, scode, self.nodes[mu].xoff, self.nodes[mu].xlen, self.resolve_ty(self.nodes[mu].b), m, mps, mpc);
                     m = self.nodes[mu].next;
                 }
             }
@@ -3673,7 +3954,7 @@ pub const Em = struct {
         return 0;
     }
 
-    fn push_mt(self: *Self, a: Allocator, sid: i64, noff: usize, nlen: usize, ret: i64, node: i32) void {
+    fn push_mt(self: *Self, a: Allocator, sid: i64, noff: usize, nlen: usize, ret: i64, node: i32, pstart: i64, pcount: i64) void {
         if (self.mt_count == self.mt_sid.len) {
             var g0: []i64 = alloc(a, i64, self.mt_sid.len * 2);
             var g1: []i64 = alloc(a, i64, self.mt_noff.len * 2);
@@ -3681,6 +3962,8 @@ pub const Em = struct {
             var g3: []i64 = alloc(a, i64, self.mt_ret.len * 2);
             var g4: []i32 = alloc(a, i32, self.mt_node.len * 2);
             var g5: []bool = alloc(a, bool, self.mt_live.len * 2);
+            var g6: []i64 = alloc(a, i64, self.mt_p_start.len * 2);
+            var g7: []i64 = alloc(a, i64, self.mt_p_count.len * 2);
             var i: usize = 0;
             while (i < self.mt_count) : (i += 1) {
                 g0[i] = self.mt_sid[i];
@@ -3689,6 +3972,8 @@ pub const Em = struct {
                 g3[i] = self.mt_ret[i];
                 g4[i] = self.mt_node[i];
                 g5[i] = self.mt_live[i];
+                g6[i] = self.mt_p_start[i];
+                g7[i] = self.mt_p_count[i];
             }
             free(a, self.mt_sid);
             free(a, self.mt_noff);
@@ -3696,12 +3981,16 @@ pub const Em = struct {
             free(a, self.mt_ret);
             free(a, self.mt_node);
             free(a, self.mt_live);
+            free(a, self.mt_p_start);
+            free(a, self.mt_p_count);
             self.mt_sid = g0;
             self.mt_noff = g1;
             self.mt_nlen = g2;
             self.mt_ret = g3;
             self.mt_node = g4;
             self.mt_live = g5;
+            self.mt_p_start = g6;
+            self.mt_p_count = g7;
         }
         self.mt_sid[self.mt_count] = sid;
         self.mt_noff[self.mt_count] = @as(i64, noff);
@@ -3709,7 +3998,24 @@ pub const Em = struct {
         self.mt_ret[self.mt_count] = ret;
         self.mt_node[self.mt_count] = node;
         self.mt_live[self.mt_count] = false;
+        self.mt_p_start[self.mt_count] = pstart;
+        self.mt_p_count[self.mt_count] = pcount;
         self.mt_count += 1;
+    }
+
+    /// The method-table row for `(struct, name)`, or -1.
+    fn mt_row_of(self: *Self, scode: i64, name: []u8) i64 {
+        var i: usize = 0;
+        while (i < self.mt_count) : (i += 1) {
+            if (self.mt_sid[i] == scode) {
+                var off: usize = @as(usize, self.mt_noff[i]);
+                var len: usize = @as(usize, self.mt_nlen[i]);
+                if (str_eq(self.src[off .. off + len], name)) {
+                    return @as(i64, i);
+                }
+            }
+        }
+        return 0 - 1;
     }
 
     /// `method_ret[(sid, name)]`: the recorded return ET of the named
@@ -4045,6 +4351,45 @@ pub const Em = struct {
         }
         if (k == ND_BLOCK) {
             self.intern_block(a, n);
+            return;
+        }
+        if (k == ND_SWITCH) {
+            // `check_switch` (v0.172): the scrutinee first (full check).
+            // Enum scrutinee: an `.V` label and a MATCHING qualified
+            // `Enum.V` are index lookups (never checked as expressions);
+            // any other label checks fully. Integer scrutinee: EVERY value
+            // label checks fully (then const-folds — folding never
+            // interns). Any other scrutinee kind: labels are skipped
+            // entirely (`check_switch_blocks`). Arm bodies check per arm
+            // AFTER its labels; the `else` block last. Ranges carry only
+            // literal bounds — nothing to walk.
+            self.intern_expr(a, self.nodes[u].a);
+            var swt: i64 = self.type_of_expr(self.nodes[u].a);
+            var sarm: i32 = self.nodes[u].b;
+            while (sarm >= 0) {
+                var sau: usize = @as(usize, sarm);
+                if (et_is_enum(swt) or et_is_int(swt)) {
+                    var slab: i32 = self.nodes[sau].a;
+                    while (slab >= 0) {
+                        var slu: usize = @as(usize, slab);
+                        var skip_label: bool = false;
+                        if (et_is_enum(swt)) {
+                            if (self.nodes[slu].kind == ND_ENUMLIT) { skip_label = true; }
+                            if (self.nodes[slu].kind == ND_FIELD) {
+                                var sfb: i32 = self.nodes[slu].a;
+                                if (sfb >= 0 and self.nodes[@as(usize, sfb)].kind == ND_IDENT) {
+                                    if (self.en_code_of(self.xname(sfb)) == swt) { skip_label = true; }
+                                }
+                            }
+                        }
+                        if (!skip_label) { self.intern_expr(a, slab); }
+                        slab = self.nodes[slu].next;
+                    }
+                }
+                self.intern_block(a, self.nodes[sau].c);
+                sarm = self.nodes[sau].next;
+            }
+            self.intern_block(a, self.nodes[u].c);
             return;
         }
         if (k == ND_BREAK or k == ND_CONTINUE) { return; }

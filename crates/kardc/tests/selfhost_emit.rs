@@ -1,4 +1,4 @@
-//! Self-host stages 3–13 (v0.161–v0.171): differential test of
+//! Self-host stages 3–14 (v0.161–v0.172): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -11,7 +11,12 @@
 //! the receiver, explicit-self and `Type.assoc(…)` call forms, with
 //! name-level method liveness — and, v0.171, ENUMS: declarations with
 //! explicit values + C auto-increment, qualified `Enum.V` literals, enum
-//! equality, and the `@intFromEnum`/`@enumFromInt` conversions) written
+//! equality, and the `@intFromEnum`/`@enumFromInt` conversions — and,
+//! v0.172, `switch` with enum/integer scrutinees, multi-label arms, GNU
+//! range cases, exhaustiveness-aware divergence, plus CONTEXTUAL `.V`
+//! literals through the expected-type coercion plumbing at every site:
+//! let/assign/place-assign/return/call args/method args/struct-literal
+//! fields/array elements/binary siblings) written
 //! in kardashev —
 //! against the Rust
 //! reference emitter. Since v0.166 every corpus file is classified and
@@ -134,7 +139,15 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s10_methods/err_static_call_missing_self.ks",         // E0171
     "tests/spec/s10_methods/err_unknown_assoc_fn.ks",                 // E0173
     "tests/spec/s10_methods/err_unknown_method.ks",                   // E0171
+    "tests/spec/s13_enums/bool_scrutinee_err.ks",                     // E0213
+    "tests/spec/s13_enums/dup_switch_label_enum_err.ks",              // E0211
+    "tests/spec/s13_enums/dup_switch_label_int_err.ks",               // E0211
     "tests/spec/s13_enums/dup_variant_decl_err.ks",                   // E0211
+    "tests/spec/s13_enums/enum_lit_no_context_err.ks",                // E0215
+    "tests/spec/s13_enums/int_switch_no_else_err.ks",                 // E0214
+    "tests/spec/s13_enums/nonexhaustive_switch_err.ks",               // E0210
+    "tests/spec/s13_enums/range_label_on_enum_err.ks",                // E0212
+    "tests/spec/s13_enums/unknown_variant_label_err.ks",              // E0212
     "tests/spec/s13_enums/unknown_variant_qualified_err.ks",          // E0212
     "tests/spec/s14_arrays/index_assign_const_err.ks",                // E0223
     "tests/spec/s14_arrays/index_assign_param_err.ks",                // E0223
@@ -156,6 +169,9 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s37_enum_values/enum_from_int_first_arg_err.ks",      // E0321
     "tests/spec/s37_enum_values/enum_from_int_value_not_integer_err.ks", // E0321
     "tests/spec/s37_enum_values/int_from_enum_non_enum_err.ks",       // E0321
+    "tests/spec/s18_inference/infer_enum_lit_err.ks",                 // E0215
+    "tests/spec/s39_switch_ranges/else_required_with_ranges_err.ks",  // E0214
+    "tests/spec/s39_switch_ranges/overlapping_ranges_err.ks",         // E0211
     "tests/spec/s28_bitwise/bitand_bool_err.ks",                      // E0110
     "tests/spec/s28_bitwise/bitnot_bool_err.ks",                      // E0110
     "tests/spec/s29_for/elem_immutable_err.ks",                       // E0110
@@ -174,8 +190,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 155;
-const MIN_C_COMPARED_TEST: usize = 170;
+const MIN_C_COMPARED_PROGRAM: usize = 175;
+const MIN_C_COMPARED_TEST: usize = 190;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -319,7 +335,9 @@ fn det_expr(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
         Expr::Orelse { .. } => Some(("orelse", pos)),
         Expr::Unwrap { .. } => Some(("unwrap", pos)),
         Expr::ErrorLit { .. } => Some(("error-lit", pos)),
-        Expr::EnumLit { .. } => Some(("enum-lit", pos)),
+        // An unqualified `.V` is in the subset (v0.172): its enum comes
+        // from the expected-type context (no-context = sema's E0215).
+        Expr::EnumLit { .. } => None,
         // An array literal `[N]T{ … }` is in the subset (v0.168): its
         // `[N]T` reference, then the elements, in order.
         Expr::ArrayLit { elem, elems, .. } => {
@@ -407,7 +425,27 @@ fn det_stmt(sn: &HashSet<String>, s: &Stmt) -> Option<Hit> {
         Stmt::Defer { stmt, .. } => det_stmt(sn, stmt),
         Stmt::ErrDefer { .. } => Some(("errdefer", pos)),
         Stmt::Block(b) => det_block(sn, b),
-        Stmt::Switch { .. } => Some(("switch", pos)),
+        // `switch` is in the subset (v0.172): scrutinee, then per arm —
+        // a payload capture (tagged unions) stays out — labels and body;
+        // the `else` block last. Ranges carry literal bounds only.
+        Stmt::Switch {
+            scrutinee,
+            arms,
+            default,
+            ..
+        } => det_expr(sn, scrutinee)
+            .or_else(|| {
+                arms.iter().find_map(|arm| {
+                    if arm.capture.is_some() {
+                        return Some(("capture", arm.span.start));
+                    }
+                    arm.labels
+                        .iter()
+                        .find_map(|l| det_expr(sn, l))
+                        .or_else(|| det_block(sn, &arm.body))
+                })
+            })
+            .or_else(|| default.as_ref().and_then(|d| det_block(sn, d))),
     }
 }
 
@@ -1223,6 +1261,27 @@ fn selfhost_emit_differential_targeted_inputs() {
             "enums_values_wrap_and_negative_start",
             "const T = enum { A = 9223372036854775807, B, C = 0 - 3, D };\npub fn main() void {\n    print(@intFromEnum(T.A));\n    print(@intFromEnum(T.B));\n    print(@intFromEnum(T.C));\n    print(@intFromEnum(T.D));\n}\n",
         ),
+        // -- switch + contextual enum literals (v0.172) ---------------------------
+        (
+            "switch_enum_exhaustive_diverging",
+            "const Op = enum { Add, Sub, Mul };\nfn apply(op: Op, x: i64, y: i64) i64 {\n    switch (op) {\n        .Add => { return x + y; },\n        .Sub => { return x - y; },\n        .Mul => { return x * y; },\n    }\n}\npub fn main() void {\n    print(apply(.Add, 6, 4));\n    print(apply(Op.Sub, 6, 4));\n    print(apply(.Mul, 6, 4));\n}\n",
+        ),
+        (
+            "switch_int_labels_ranges_else",
+            "pub fn main() void {\n    var i: i64 = 0;\n    while (i < 8) : (i += 1) {\n        switch (i) {\n            0, 1 => { print(10); },\n            2 .. 4 => { print(20); },\n            5 => { print(50); },\n            else => { print(99); },\n        }\n    }\n}\n",
+        ),
+        (
+            "switch_contextual_literals_everywhere",
+            "const Color = enum { Red, Green, Blue };\nfn classify(c: Color) i64 {\n    if (c == Color.Red) { return 1; }\n    switch (c) {\n        .Green => { return 2; },\n        else => { return 3; },\n    }\n}\nfn first(c: Color, d: Color) Color {\n    var out: Color = c;\n    out = d;\n    out = .Red;\n    return .Green;\n}\npub fn main() void {\n    print(classify(.Red));\n    print(classify(.Green));\n    print(classify(Color.Blue));\n    print(@intFromEnum(first(.Blue, Color.Red)));\n    var cs: [2]Color = [2]Color{ .Green, Color.Blue };\n    print(@intFromEnum(cs[0]));\n    print(@intFromEnum(cs[1]));\n}\n",
+        ),
+        (
+            "switch_nested_in_loops_with_defer",
+            "const S = enum { A, B };\npub fn main() void {\n    var xs: [4]i64 = [4]i64{ 0, 1, 0, 1 };\n    for (xs) |x| {\n        defer print(100 + x);\n        switch (x) {\n            0 => { print(0); },\n            else => {\n                var s: S = .B;\n                switch (s) {\n                    .A => { print(701); },\n                    .B => { print(702); },\n                }\n            },\n        }\n    }\n}\n",
+        ),
+        (
+            "switch_divergence_shapes",
+            "fn f(n: i64) i64 {\n    switch (n) {\n        0 => { return 10; },\n        else => { return 20; },\n    }\n}\nfn g(n: i64) i64 {\n    switch (n) {\n        0 => { print(1); },\n        else => { return 5; },\n    }\n    return 6;\n}\npub fn main() void {\n    print(f(0));\n    print(g(0));\n    print(g(1));\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
             "skip_slice_elem_f64",
@@ -1303,12 +1362,12 @@ fn selfhost_emit_differential_targeted_inputs() {
             "const P = struct {\n    x: f64,\n};\npub fn main() void { print(1); }\n",
         ),
         (
-            "skip_unqualified_enum_lit",
+            "contextual_enum_lit_let",
             "const Color = enum { Red, Green };\npub fn main() void {\n    var c: Color = .Red;\n    if (c == Color.Red) { print(1); }\n}\n",
         ),
         (
-            "skip_switch_on_enum",
-            "const Color = enum { Red, Green };\npub fn main() void {\n    var c: Color = Color.Red;\n    switch (c) {\n        Color.Red => { print(1); },\n        else => { print(2); },\n    }\n}\n",
+            "skip_switch_capture_arm",
+            "const Color = enum { Red, Green };\npub fn main() void {\n    var c: Color = Color.Red;\n    switch (c) {\n        .Red => |v| { print(1); },\n        else => { print(2); },\n    }\n}\n",
         ),
         (
             "skip_unreachable_stmt",

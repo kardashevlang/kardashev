@@ -18,6 +18,53 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.172.0] — Self-hosting stage 14: `switch` + contextual enum literals
+
+The self-hosted emitter's subset gains `switch` AND the expected-type
+coercion plumbing that powers contextual `.V` literals — the C-identical
+corpus jumps 160/179 → 181/200 (Program/Test), completing the enum story
+(`s13_enums`, `s39_switch_ranges`, the rest of `s37_enum_values`).
+
+- `selfhost/emit.ks` (stage 14): `switch` over enum and integer
+  scrutinees — multi-label arms (`case a:` chains, the LAST label
+  opening the arm's brace), GNU `case lo ... hi:` inclusive ranges,
+  `else` → `default:`, every arm closed `} break;` (the SPEC's
+  no-fallthrough), and exhaustiveness-aware DIVERGENCE: a switch
+  diverges iff it is total (an `else` present, or an enum scrutinee —
+  sema proved coverage) and every arm diverges, so an exhaustive
+  all-returning enum switch ends its function with no trailing code.
+  A bare `.V` label takes the SCRUTINEE's enum; payload-capture arms
+  (tagged unions) stay out (`capture`).
+- The CONTEXTUAL `.V` plumbing: `emit_coerced` lowers an enum literal
+  against an expected enum to its C enumerator at every coercion site —
+  let initializers, assignments, place-assignments, returns, call and
+  method arguments (fn/method parameter types now recorded in a flat
+  positional table — the `fn_params`/`method_params` mirror),
+  struct-literal fields, and array-literal elements. Discovered pinned
+  limits: sema supplies NO context in comparisons (`x == .V` is E0215
+  in BOTH directions — the emitter's sibling-context arm is defensive
+  dead code) and enum-typed struct fields stay E0161.
+- The intern replay mirrors `check_switch`: the scrutinee checks first;
+  on an ENUM scrutinee, `.V` and matching `Enum.V` labels are index
+  lookups (never checked as expressions) while any other label checks
+  fully; on an INTEGER scrutinee every value label checks fully (the
+  const-fold never interns); an unswitchable scrutinee checks arm
+  bodies only; bodies check per arm after its labels, the `else` last.
+- Differential (`selfhost_emit.rs`): the mirrored detector admits
+  `switch` (capture arms out) and bare `.V` everywhere; 11 new
+  sema-invalid pins (the switch error family E0210/E0211/E0212/E0213/
+  E0214/E0215 across s13/s18/s39); floors 155/170 → 175/190 (181/200
+  observed); 5 new in-subset targeted cases (exhaustive-diverging
+  switches, integer labels + ranges + else, contextual literals at
+  every site, switch nested in `for` with `defer`, divergence shapes)
+  and 1 new skip case (a payload-capture arm).
+- Suite (`tests/selfhost/emit_suite.ks`): 58 → 61 tests — the full
+  enum-switch block byte-for-byte (case chains, `} break;`, the
+  divergence-ends-the-function shape), integer/range/default lowering,
+  and the contextual-literal coercion sites. All 705 corpus files keep
+  three-bucket agreement in both modes; switch programs verified
+  end-to-end at runtime.
+
 ## [0.171.0] — Self-hosting stage 13: enums
 
 The self-hosted emitter's subset gains ENUMS — declarations, qualified
