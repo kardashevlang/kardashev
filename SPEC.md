@@ -988,7 +988,9 @@ Per instantiation the emitter holds a value substitution (`name → i64`) beside
 the type substitution. `ArraySize::Param(n)` resolves to the bound value when
 forming the array type; a reference to a value param `n` in the body emits the
 literal value; the instance is emitted as `kd_<fn>__<args>` (a value arg mangles
-to its digits). Non-generic literal-sized arrays are unchanged.
+to its digits; a negative value to `m<digits>` — `-` is not a C identifier
+character, so `kd_addk__-3` would not compile; v0.178). Non-generic
+literal-sized arrays are unchanged.
 
 ## 25. Generic structs / type-returning functions (v0.129)
 

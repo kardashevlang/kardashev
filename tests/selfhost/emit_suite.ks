@@ -306,11 +306,14 @@ test "detect: out-of-subset statements" {
     expect(d.found);
     expect(str_eq(d.word, "union"));
     expect(d.pos == 0);
-    // (`switch` v0.172, `try` v0.174, `&x` v0.175 — a generic call
-    // parameter keeps a verdict)
+    // (`switch` v0.172, `try` v0.174, `&x` v0.175; a top-level generic
+    // fn + its call joined in v0.178 — but a NON-subset type argument
+    // keeps a verdict at the argument)
     var d2: Det = eh_detect(a, "fn id(comptime T: type, x: i64) i64 { return x; }\nfn main() void { print(id(i64, 1)); }");
-    expect(d2.found);
-    expect(str_eq(d2.word, "generic-param"));
+    expect(!d2.found);
+    var d2b: Det = eh_detect(a, "fn id(comptime T: type, x: i64) i64 { return x; }\nfn main() void { print(id(u16, 1)); }");
+    expect(d2b.found);
+    expect(str_eq(d2b.word, "type-name"));
     // (`errdefer` joined in v0.174, floats in v0.177; the body still
     // walks — an unknown TYPE inside surfaces)
     var d3: Det = eh_detect(a, "fn main() void { errdefer { var t: Foo = 1; } }");
@@ -335,10 +338,17 @@ test "detect: out-of-subset items and parameters" {
     expect(!d.found);
     var d0: Det = eh_detect(a, "pub fn main() void {}\ntest \"t\" { print(1.5); }");
     expect(!d0.found);
+    // A top-level generic fn is a subset item since v0.178: type params
+    // bind, value params take a bare subset-int annotation; a NON-int
+    // value annotation keeps a verdict at the annotation.
     var d2: Det = eh_detect(a, "fn id(comptime T: type, x: i64) i64 { return x; }\npub fn main() void { print(id(i64, 1)); }");
-    expect(d2.found);
-    expect(str_eq(d2.word, "generic-param"));
-    expect(d2.pos == 6);
+    expect(!d2.found);
+    var d2v: Det = eh_detect(a, "fn rep(comptime n: usize, x: i64) i64 { return x + @as(i64, n); }\npub fn main() void { print(rep(3, 4)); }");
+    expect(!d2v.found);
+    var d2w: Det = eh_detect(a, "fn rep(comptime b: bool, x: i64) i64 { return x; }\npub fn main() void { print(rep(true, 4)); }");
+    expect(d2w.found);
+    expect(str_eq(d2w.word, "type-name"));
+    expect(d2w.pos == 19);
     var d3: Det = eh_detect(a, "pub fn main() void {}\n@import(\"other.ks\");");
     expect(d3.found);
     expect(str_eq(d3.word, "import"));
@@ -1267,4 +1277,50 @@ test "f64: shortest-roundtrip literals, print route, casts (v0.177)" {
     expect(eh_find(c, "kd_print((long long)(((int64_t)(kd_y))));\n"));
     expect(eh_find(c, "((double)(7))"));
     expect(eh_find(c, "    kd_print_f64((kd_z + kd_w));\n"));
+}
+
+test "generics: instances, value params, negative mangle (v0.178)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "fn imax(comptime T: type, x: T, y: T) T {\n    if (x > y) { return x; }\n    return y;\n}\nfn addk(comptime k: i64, x: i64) i64 {\n    return x + k;\n}\npub fn main() void {\n    print(imax(i64, 3, 9));\n    print(imax(i32, @as(i32, 4), @as(i32, 2)));\n    print(addk(-3, 10));\n    print(imax(i64, 1, 2));\n}");
+    // One specialised C function per distinct instantiation, in
+    // discovery order, forward-declared right after the plain fns; the
+    // repeat i64 call dedups; a negative value arg mangles `m<digits>`
+    // (`-` is not a C identifier character); calls pass ONLY the
+    // runtime args.
+    expect(eh_find(c, "int64_t kd_imax__int64_t(int64_t kd_x, int64_t kd_y);\nint32_t kd_imax__int32_t(int32_t kd_x, int32_t kd_y);\nint64_t kd_addk__m3(int64_t kd_x);\n"));
+    expect(eh_find(c, "kd_print((long long)(kd_imax__int64_t(3, 9)));\n"));
+    expect(eh_find(c, "kd_print((long long)(kd_addk__m3(10)));\n"));
+    // The instance body: the value param reference emits the bound
+    // literal, never a C variable.
+    expect(eh_find(c, "int64_t kd_addk__m3(int64_t kd_x) {\n    return ((kd_x + -3));\n}\n"));
+    expect(!eh_find(c, "kd_k"));
+}
+
+test "generics: [n]T value-size params + comptime-arg const env (v0.178)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const BASE = 3;\nfn total(comptime n: usize, xs: [n]i64) i64 {\n    var s: i64 = 0;\n    var i: usize = 0;\n    while (i < n) : (i = i + 1) { s = s + xs[i]; }\n    return s;\n}\nfn addn(comptime n: i64, x: i64) i64 {\n    return n + x;\n}\npub fn main() void {\n    var z: [4]i64 = [4]i64{ 1, 2, 3, 4 };\n    print(total(4, z));\n    print(addn(BASE * 2, 1));\n}");
+    // `[n]T` resolves to the BOUND length (the `[4]i64` array typedef is
+    // shared with the literal); the value argument const-evaluates over
+    // the top-level consts (BASE * 2 = 6); the size use in the body is
+    // the literal 4.
+    expect(eh_find(c, "int64_t kd_total__4(kd_arr_int64_t_4 kd_xs);\n"));
+    expect(eh_find(c, "int64_t kd_addn__6(int64_t kd_x);\n"));
+    expect(eh_find(c, "    while ((kd_i < 4)) {\n"));
+    expect(eh_find(c, "kd_print((long long)(kd_total__4(kd_z)));\n"));
+}
+
+test "generics: liveness sources + test-discovered instances (v0.178)" {
+    var a: Allocator = c_allocator();
+    // A zero-instantiation generic's body still contributes its called
+    // names (§43.1): `kept` stays; the generic itself is never emitted
+    // under its plain name.
+    var c: []u8 = eh_emit(a, "fn kept() i64 { return 41; }\nfn unused_gen(comptime T: type, x: T) T {\n    return @as(T, kept()) + x;\n}\npub fn main() void {\n    print(1);\n}");
+    expect(eh_find(c, "int64_t kd_kept(void);\n"));
+    expect(!eh_find(c, "kd_unused_gen"));
+    // An instance discovered in a TEST body is recorded in sema's single
+    // table and therefore emitted in Program mode too (§43.1: every
+    // recorded instantiation, liveness notwithstanding).
+    var c2: []u8 = eh_emit(a, "fn id(comptime T: type, x: T) T { return x; }\npub fn main() void { print(2); }\ntest \"t\" { expect(id(i64, 1) == 1); }");
+    expect(eh_find(c2, "int64_t kd_id__int64_t(int64_t kd_x);\n"));
+    expect(eh_find(c2, "int64_t kd_id__int64_t(int64_t kd_x) {\n    return (kd_x);\n}\n"));
 }

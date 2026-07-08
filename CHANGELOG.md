@@ -18,6 +18,69 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.178.0] — Self-hosting stage 21: generic functions
+
+The monomorphisation mirror lands: `selfhost/emit.ks` compiles generic
+functions — comptime type AND value parameters — byte-identically to the
+Rust emitter, and the C-identical corpus climbs 304/323 → 326/345
+(Program/Test), absorbing most of `s17_generics`/`s24_comptime_vals` and
+the generic pockets across sections.
+
+- `selfhost/emit.ks` (stage 21): the intern replay mirrors
+  `check_generic_call` exactly — at a call to a registered generic, the
+  comptime args resolve (type args under the ACTIVE substitution;
+  value args const-evaluate over the consts plus the active value
+  substitution), the runtime parameter types + return type resolve and
+  intern UNDER the inner substitution in declaration order, the runtime
+  ARGUMENTS walk under the OUTER substitution, and a NEW instantiation
+  records + notes its written-`*T` pointees + type-checks (walks) its
+  body under the inner substitution — recursively discovering nested
+  instantiations, deduped like `intern_instantiation`. Sema's bails are
+  mirrored precisely: fewer args than comptime params (E0252) walks
+  NOTHING; a failed comptime arg (E0251/E0253) walks only the runtime
+  args and records nothing.
+- The substitution is a STACK of (name, kind, payload) rows with an
+  active window: `base_code` consults it first (`base_type_in` order),
+  `[n]T` resolves its bound length through it (`intern_array` keys on
+  the RESOLVED pair, so each instantiated size is a distinct array
+  type), a value-param reference emits the bound literal, and
+  `@as`/`alloc` type names resolve through it. Instances emit as
+  `kd_<fn>__<mangles>`, forward-declared right after the plain fns but
+  DEFINED after the struct methods; every recorded instance emits
+  regardless of liveness, every generic body is an always-walked §43.1
+  name source (a zero-instance generic keeps its callees live), and an
+  instance discovered in a TEST body emits in Program mode too (sema's
+  table is mode-blind). `ct_collect` now folds the top-level consts
+  BEFORE the body scan (previously folded during emission) so a value
+  argument like `addn(BASE * 4, …)` binds at scan time.
+- **Found + fixed (the 11th selfhost-found compiler bug):** a NEGATIVE
+  comptime value argument emitted an invalid C identifier —
+  `addk(-3, 10)` produced `kd_addk__-3` and failed to compile. The
+  mangle is now `m<digits>` (`kd_addk__m3`); `i64::MIN` is exact via
+  `unsigned_abs`. Pinned by an e2e test, a new `//OUT`-pinned spec
+  corpus file (`s24_comptime_vals/negative_value_arg.ks`), and the
+  in-language suite.
+- The detector (both mirrors): a comptime param on a TOP-LEVEL fn is in
+  the subset — bare-`type` annotations bind type params usable
+  everywhere a type may appear (including `[]T`/`[N]T` elements, `?T`/
+  `!T`/`*T` positions, `alloc(a, T, n)` and `@as(T, e)`); any other
+  annotation is a value param and must be a bare subset-int spelling.
+  `[n]T` requires `n` bound by the enclosing generic. A generic CALL's
+  type arguments must name subset scalars / declared structs+enums /
+  bound type params (`type-name` at the argument otherwise); a METHOD's
+  comptime param stays `generic-param`; a type-constructor's bare-`type`
+  return stays out (SPEC §25 is a later stage). Subset membership stays
+  differentially tested on all 706 files in both modes.
+- Differential (`selfhost_emit.rs`): 5 new sema-invalid pins (E0224/
+  E0251/E0252/E0253×2 — now subset-shaped); floors 295/315 → 320/339
+  (326/345 observed); 15 new in-subset targeted cases (two-instance
+  dedup, `[n]T` sizes, negative mangles, transitive + recursive
+  instantiation, zero-instance liveness sources, test-discovered
+  instances in Program mode, const-env value args, comptime folds over
+  value params, `alloc`/`@as`/`?T`/`*T` over `T`, all-comptime `(void)`
+  signatures, enum type args) and 5 SKIP-verdict cases. Suite: 68 → 71
+  in-language tests; 2 stale pre-v0.178 verdict pins updated.
+
 ## [0.177.0] — Self-hosting stage 19: f64
 
 The scalar story completes: f64 lands with a full float-formatting
