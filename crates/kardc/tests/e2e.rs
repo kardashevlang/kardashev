@@ -603,6 +603,26 @@ pub fn main() i32 {
     assert_eq!(out, "32\n110\n");
 }
 
+/// A NEGATIVE comptime value argument (v0.178): the instance mangles as
+/// `m<digits>` — the naive digits would put a bare `-` in the C identifier
+/// (`kd_addk__-3`) and fail to compile.
+#[test]
+fn comptime_value_params_negative_argument() {
+    let src = r#"
+fn addk(comptime k: i64, x: i64) i64 {
+    return x + k;
+}
+pub fn main() i32 {
+    print(addk(-3, 10));
+    print(addk(3, 10));
+    return 0;
+}
+"#;
+    let (code, out) = build_and_capture(src, EmitMode::Program);
+    assert_eq!(code, 0);
+    assert_eq!(out, "7\n13\n");
+}
+
 // --- v0.129 generic structs (type-returning functions) ---------------------
 
 #[test]

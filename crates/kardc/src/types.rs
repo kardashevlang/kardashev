@@ -602,7 +602,9 @@ impl StructTable {
     }
 
     /// The C name for an instantiation, e.g. `kd_max__int32_t` or
-    /// `kd_zeros__5` (a comptime value arg mangles to its decimal digits).
+    /// `kd_zeros__5` (a comptime value arg mangles to its decimal digits; a
+    /// NEGATIVE value to `m<digits>` — `-` is not a C identifier character,
+    /// so `kd_addk__-3` would fail to compile).
     pub fn instantiation_c_name(&self, inst: &Instantiation) -> String {
         let mut s = format!("kd_{}__", inst.fn_name);
         for (i, a) in inst.args.iter().enumerate() {
@@ -611,6 +613,10 @@ impl StructTable {
             }
             match a {
                 ComptimeArg::Type(t) => s.push_str(&self.type_mangle(*t)),
+                ComptimeArg::Value(v) if *v < 0 => {
+                    s.push('m');
+                    s.push_str(&v.unsigned_abs().to_string());
+                }
                 ComptimeArg::Value(v) => s.push_str(&v.to_string()),
             }
         }

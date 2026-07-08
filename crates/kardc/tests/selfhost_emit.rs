@@ -1,4 +1,4 @@
-//! Self-host stages 3–19 (v0.161–v0.177): differential test of
+//! Self-host stages 3–21 (v0.161–v0.178): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -33,7 +33,21 @@
 //! label-targeted defer flushes, and the diverged-body clause rule —
 //! and, v0.177, F64: correctly-rounded literal parsing (big-integer
 //! exact division for any digit count) and the `{:?}` shortest-nearest
-//! formatting mirror with the Debug exponent thresholds) written
+//! formatting mirror with the Debug exponent thresholds
+//! — and, v0.178, GENERIC FUNCTIONS (SPEC §17 + §24): comptime type
+//! params (`comptime T: type`) and comptime value params over bare
+//! subset-int annotations, with full monomorphisation — the intern replay
+//! mirrors `check_generic_call` (comptime args, then runtime param types +
+//! return UNDER the inner substitution, then runtime args under the OUTER,
+//! then a new instantiation's recursive instance-body walk), instances
+//! emit as `kd_<fn>__<mangles>` (a negative value arg mangles `m<digits>`
+//! — the v0.178 fix; `-` broke the C identifier), every recorded instance
+//! emits regardless of liveness, every generic body is an always-walked
+//! §43.1 name source, `[n]T` sizes resolve through the value substitution,
+//! and the detector admits generic calls whose type arguments name subset
+//! scalars / declared structs+enums / bound type params (a method's
+//! comptime param stays `generic-param`; a type-constructor's bare-`type`
+//! return stays out) — written
 //! in kardashev —
 //! against the Rust
 //! reference emitter. Since v0.166 every corpus file is classified and
@@ -183,6 +197,11 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s14_arrays/index_not_integer_err.ks",                 // E0110
     "tests/spec/s14_arrays/literal_count_mismatch_err.ks",            // E0221
     "tests/spec/s14_arrays/literal_element_type_err.ks",              // E0110
+    "tests/spec/s14_arrays/negative_array_len_err.ks",                // E0224 (v0.178: `[n]T` subset-shaped)
+    "tests/spec/s17_generics/err_too_few_type_args.ks",               // E0252 (v0.178)
+    "tests/spec/s17_generics/err_type_arg_not_identifier.ks",         // E0251 (v0.178)
+    "tests/spec/s24_comptime_vals/err_value_arg_bool.ks",             // E0253 (v0.178)
+    "tests/spec/s24_comptime_vals/err_value_arg_runtime_var.ks",      // E0253 (v0.178)
     "tests/spec/s15_ptr_slices/slice_non_sliceable_err.ks",           // E0232
     "tests/spec/s16_alloc/free_non_slice_err.ks",                     // E0242
     "tests/spec/s18_inference/infer_const_stays_immutable_err.ks",    // E0110
@@ -239,8 +258,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 295;
-const MIN_C_COMPARED_TEST: usize = 315;
+const MIN_C_COMPARED_PROGRAM: usize = 320;
+const MIN_C_COMPARED_TEST: usize = 339;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -285,20 +304,55 @@ fn chain_has_index(e: &Expr) -> bool {
     }
 }
 
-/// A type reference: any composite form other than a slice is out; a slice
-/// must be exactly `[]u8` (v0.162); a bare base name must be a subset
-/// spelling (`@This()` parses to the synthesized name `Self`, which is not
-/// one — the selfhost side reports its `F_THIS` flag identically, sliced or
-/// not).
-fn det_type(sn: &HashSet<String>, t: &TypeExpr) -> Option<Hit> {
-    if t.ctor_args.is_some()
-        || matches!(&t.array_len, Some(kardc::ast::ArraySize::Param(_)))
-    {
+/// The detector's name context (v0.178): the declared struct/enum names,
+/// the top-level GENERIC-fn registry (any comptime param, type-constructors
+/// excluded — first declaration wins, duplicates are sema's E0103), and the
+/// ENCLOSING top-level generic's bound comptime param names — `tp` (type
+/// params) and `vp` (value params), both EMPTY outside a top-level fn and
+/// inside struct methods. Mirrors `Det`'s walk-by-need lookups.
+struct Cx<'a> {
+    sn: &'a HashSet<String>,
+    gens: &'a std::collections::HashMap<String, &'a Func>,
+    tp: HashSet<String>,
+    vp: HashSet<String>,
+}
+
+/// Sema's `is_type_kw` (SPEC §17.1): the annotation is the bare `type`
+/// keyword — no composite form bits.
+fn ty_is_type_kw(t: &TypeExpr) -> bool {
+    t.name == "type"
+        && !t.optional
+        && !t.error_union
+        && t.array_len.is_none()
+        && !t.pointer
+        && !t.slice
+}
+
+/// A type reference: any composite form other than a slice or a
+/// literal-length array is out; `[n]T` requires a bound comptime VALUE
+/// param (v0.178); a bare base name must be a subset spelling, a declared
+/// struct/enum, or a bound type param (`@This()` parses to the synthesized
+/// name `Self`, which is none of those — the selfhost side reports its
+/// `F_THIS` flag identically, sliced or not).
+fn det_type(cx: &Cx, t: &TypeExpr) -> Option<Hit> {
+    if let Some(kardc::ast::ArraySize::Param(name)) = &t.array_len {
+        // `[n]T` (v0.178): in the subset iff `n` names a comptime VALUE
+        // parameter of the enclosing top-level generic; the element rule
+        // matches `[N]T` (a bound type param included).
+        if !cx.vp.contains(name) {
+            return Some(("type-form", t.span.start));
+        }
+        if !subset_slice_elem(&t.name) && !cx.sn.contains(&t.name) && !cx.tp.contains(&t.name) {
+            return Some(("type-name", t.span.start));
+        }
+        return None;
+    }
+    if t.ctor_args.is_some() {
         return Some(("type-form", t.span.start));
     }
     if t.pointer {
         // `*T` over a bare subset pointee name (v0.175).
-        if !subset_type_name(&t.name) && !sn.contains(&t.name) {
+        if !subset_type_name(&t.name) && !cx.sn.contains(&t.name) && !cx.tp.contains(&t.name) {
             return Some(("type-name", t.span.start));
         }
         return None;
@@ -310,7 +364,7 @@ fn det_type(sn: &HashSet<String>, t: &TypeExpr) -> Option<Hit> {
         if t.error_set.as_deref() == Some("Self") {
             return Some(("type-form", t.span.start));
         }
-        if !subset_type_name(&t.name) && !sn.contains(&t.name) {
+        if !subset_type_name(&t.name) && !cx.sn.contains(&t.name) && !cx.tp.contains(&t.name) {
             return Some(("type-name", t.span.start));
         }
         return None;
@@ -321,70 +375,109 @@ fn det_type(sn: &HashSet<String>, t: &TypeExpr) -> Option<Hit> {
     if t.optional {
         // `?T` over a bare subset name (v0.173; a composite inner is a
         // parse error, so `?` never coexists with the other forms).
-        if !subset_type_name(&t.name) && !sn.contains(&t.name) {
+        if !subset_type_name(&t.name) && !cx.sn.contains(&t.name) && !cx.tp.contains(&t.name) {
             return Some(("type-name", t.span.start));
         }
         return None;
     }
     if t.array_len.is_some() || t.slice {
         // `[N]T` (v0.168) / `[]T` (v0.164) over the five scalar elements,
-        // or a declared struct element (v0.169).
-        if !subset_slice_elem(&t.name) && !sn.contains(&t.name) {
+        // a declared struct element (v0.169), or a bound type param.
+        if !subset_slice_elem(&t.name) && !cx.sn.contains(&t.name) && !cx.tp.contains(&t.name) {
             return Some(("type-name", t.span.start));
         }
         return None;
     }
-    if !subset_type_name(&t.name) && !sn.contains(&t.name) {
+    if !subset_type_name(&t.name) && !cx.sn.contains(&t.name) && !cx.tp.contains(&t.name) {
         return Some(("type-name", t.span.start));
     }
     None
 }
 
-fn det_expr(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
+fn det_expr(cx: &Cx, e: &Expr) -> Option<Hit> {
     let pos = e.span().start;
     match e {
         Expr::Int { .. } | Expr::Bool { .. } | Expr::Ident { .. } => None,
-        Expr::Unary { expr, .. } => det_expr(sn, expr),
-        Expr::Binary { lhs, rhs, .. } => det_expr(sn, lhs).or_else(|| det_expr(sn, rhs)),
+        Expr::Unary { expr, .. } => det_expr(cx, expr),
+        Expr::Binary { lhs, rhs, .. } => det_expr(cx, lhs).or_else(|| det_expr(cx, rhs)),
         Expr::Call { callee, args, .. } => {
             // `alloc(a, T, n)` is in the subset (v0.163, elements
-            // generalized in v0.164) — exactly three arguments with a
-            // scalar element type; any other shape is out. `free(a, s)` /
-            // `c_allocator()` walk their arguments like ordinary calls.
+            // generalized in v0.164; a bound type param since v0.178) —
+            // exactly three arguments with a scalar element type; any
+            // other shape is out. `free(a, s)` / `c_allocator()` walk
+            // their arguments like ordinary calls.
             if callee == "alloc" {
                 let shaped = args.len() == 3
-                    && matches!(&args[1], Expr::Ident { name, .. } if subset_slice_elem(name));
+                    && matches!(&args[1], Expr::Ident { name, .. }
+                        if subset_slice_elem(name) || cx.tp.contains(name));
                 if !shaped {
                     return Some(("builtin-call", pos));
                 }
+                return args.iter().find_map(|x| det_expr(cx, x));
             }
-            args.iter().find_map(|x| det_expr(sn, x))
+            if let Some(g) = cx.gens.get(callee.as_str()) {
+                // A call to a top-level GENERIC fn (v0.178): the leading
+                // comptime arguments check per parameter kind — a TYPE
+                // argument must be an identifier naming a subset scalar,
+                // a declared struct/enum, or a bound type param (any
+                // other name is `type-name` at the argument; a
+                // non-identifier walks as an expression — sema's E0251);
+                // a VALUE argument walks as an ordinary expression
+                // (const-ness is sema's E0253). The remaining runtime
+                // arguments walk in order; fewer args than comptime
+                // params is sema's E0252.
+                let mut ai = 0usize;
+                for p in g.params.iter().filter(|p| p.is_comptime) {
+                    if ai >= args.len() {
+                        break;
+                    }
+                    if ty_is_type_kw(&p.ty) {
+                        if let Expr::Ident { name, .. } = &args[ai] {
+                            if !subset_type_name(name)
+                                && !cx.sn.contains(name)
+                                && !cx.tp.contains(name)
+                            {
+                                return Some(("type-name", args[ai].span().start));
+                            }
+                        } else if let Some(hit) = det_expr(cx, &args[ai]) {
+                            return Some(hit);
+                        }
+                    } else if let Some(hit) = det_expr(cx, &args[ai]) {
+                        return Some(hit);
+                    }
+                    ai += 1;
+                }
+                return args[ai..].iter().find_map(|x| det_expr(cx, x));
+            }
+            args.iter().find_map(|x| det_expr(cx, x))
         }
-        Expr::Comptime { expr, .. } => det_expr(sn, expr),
+        Expr::Comptime { expr, .. } => det_expr(cx, expr),
         // A string literal is in the subset (v0.162).
         Expr::StrLit { .. } => None,
         // Field access is in the subset (v0.169: struct fields; `.len`
         // since v0.162) — only the base walks, names are sema's business.
-        Expr::Field { base, .. } => det_expr(sn, base),
+        Expr::Field { base, .. } => det_expr(cx, base),
         // A read index `s[i]` is in the subset (v0.162).
         Expr::Index { base, index, .. } => {
-            det_expr(sn, base).or_else(|| det_expr(sn, index))
+            det_expr(cx, base).or_else(|| det_expr(cx, index))
         }
         // A float literal is in the subset (v0.177).
         Expr::Float { .. } => None,
         // `@as(T, e)` is in the subset (v0.164): exactly two arguments, the
-        // first an identifier naming a subset type; only the VALUE argument
-        // is walked. Every other `@`-builtin stays out.
+        // first an identifier naming a subset type or a bound type param
+        // (v0.178); only the VALUE argument is walked. Every other
+        // `@`-builtin stays out.
         Expr::Builtin { name, args, .. } => {
             if name == "as"
                 && args.len() == 2
-                && matches!(&args[0], Expr::Ident { name, .. } if subset_type_name(name))
+                && matches!(&args[0], Expr::Ident { name, .. }
+                    if subset_type_name(name) || cx.tp.contains(name))
             {
-                return det_expr(sn, &args[1]);
+                return det_expr(cx, &args[1]);
             }
             // `@intFromEnum(e)` — exactly one argument, walked (v0.171).
             if name == "intFromEnum" && args.len() == 1 {
-                return det_expr(sn, &args[0]);
+                return det_expr(cx, &args[0]);
             }
             // `@enumFromInt(E, n)` — exactly two, the first an identifier
             // (ANY name; a non-enum is sema's E0321); only `n` walks.
@@ -392,25 +485,25 @@ fn det_expr(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
                 && args.len() == 2
                 && matches!(&args[0], Expr::Ident { .. })
             {
-                return det_expr(sn, &args[1]);
+                return det_expr(cx, &args[1]);
             }
             Some(("builtin", pos))
         }
         // A struct literal `Name{ .f = e, … }` is in the subset (v0.169):
         // the initializer values walk in source order.
         Expr::StructLit { fields, .. } => {
-            fields.iter().find_map(|fi| det_expr(sn, &fi.value))
+            fields.iter().find_map(|fi| det_expr(cx, &fi.value))
         }
         Expr::StructType { .. } => Some(("struct-type", pos)),
         // A method / associated call is in the subset (v0.170): the
         // receiver walks, then the arguments in order.
         Expr::MethodCall { receiver, args, .. } => {
-            det_expr(sn, receiver).or_else(|| args.iter().find_map(|x| det_expr(sn, x)))
+            det_expr(cx, receiver).or_else(|| args.iter().find_map(|x| det_expr(cx, x)))
         }
         // `null`, `orelse` and `.?` are in the subset (v0.173).
         Expr::Null { .. } => None,
-        Expr::Orelse { lhs, rhs, .. } => det_expr(sn, lhs).or_else(|| det_expr(sn, rhs)),
-        Expr::Unwrap { expr, .. } => det_expr(sn, expr),
+        Expr::Orelse { lhs, rhs, .. } => det_expr(cx, lhs).or_else(|| det_expr(cx, rhs)),
+        Expr::Unwrap { expr, .. } => det_expr(cx, expr),
         // `error.X` is in the subset (v0.174): its `!T` comes from the
         // expected-type context (no context is sema's E0193).
         Expr::ErrorLit { .. } => None,
@@ -420,36 +513,36 @@ fn det_expr(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
         // An array literal `[N]T{ … }` is in the subset (v0.168): its
         // `[N]T` reference, then the elements, in order.
         Expr::ArrayLit { elem, elems, .. } => {
-            det_type(sn, elem).or_else(|| elems.iter().find_map(|x| det_expr(sn, x)))
+            det_type(cx, elem).or_else(|| elems.iter().find_map(|x| det_expr(cx, x)))
         }
         // The slicing view `base[lo..hi]` is in the subset (v0.165).
-        Expr::SliceExpr { base, lo, hi, .. } => det_expr(sn, base)
-            .or_else(|| det_expr(sn, lo))
-            .or_else(|| det_expr(sn, hi)),
+        Expr::SliceExpr { base, lo, hi, .. } => det_expr(cx, base)
+            .or_else(|| det_expr(cx, lo))
+            .or_else(|| det_expr(cx, hi)),
         // `&place` and `p.*` are in the subset (v0.175).
-        Expr::AddrOf { place, .. } => det_expr(sn, place),
-        Expr::Deref { expr, .. } => det_expr(sn, expr),
+        Expr::AddrOf { place, .. } => det_expr(cx, place),
+        Expr::Deref { expr, .. } => det_expr(cx, expr),
         // `try e` and both `catch` forms are in the subset (v0.174).
-        Expr::Try { expr, .. } => det_expr(sn, expr),
+        Expr::Try { expr, .. } => det_expr(cx, expr),
         Expr::Catch { expr, default, .. } => {
-            det_expr(sn, expr).or_else(|| det_expr(sn, default))
+            det_expr(cx, expr).or_else(|| det_expr(cx, default))
         }
         Expr::Unreachable { .. } => Some(("unreachable", pos)),
     }
 }
 
-fn det_block(sn: &HashSet<String>, b: &kardc::ast::Block) -> Option<Hit> {
-    b.stmts.iter().find_map(|x| det_stmt(sn, x))
+fn det_block(cx: &Cx, b: &kardc::ast::Block) -> Option<Hit> {
+    b.stmts.iter().find_map(|x| det_stmt(cx, x))
 }
 
-fn det_stmt(sn: &HashSet<String>, s: &Stmt) -> Option<Hit> {
+fn det_stmt(cx: &Cx, s: &Stmt) -> Option<Hit> {
     let pos = s.span().start;
     match s {
         Stmt::Let { ty, value, .. } => ty
             .as_ref()
-            .and_then(|t| det_type(sn, t))
-            .or_else(|| det_expr(sn, value)),
-        Stmt::Assign { value, .. } => det_expr(sn, value),
+            .and_then(|t| det_type(cx, t))
+            .or_else(|| det_expr(cx, value)),
+        Stmt::Assign { value, .. } => det_expr(cx, value),
         // A place-assignment over any FIELD/INDEX chain rooted at a NAME
         // is in the subset (v0.169; v0.163 admitted the direct index
         // write). Bases descend first, each index expression where it
@@ -458,10 +551,10 @@ fn det_stmt(sn: &HashSet<String>, s: &Stmt) -> Option<Hit> {
             if !place_rooted_in_name(place) {
                 return Some(("place-assign", pos));
             }
-            det_place(sn, place).or_else(|| det_expr(sn, value))
+            det_place(cx, place).or_else(|| det_expr(cx, value))
         }
-        Stmt::Expr(e) => det_expr(sn, e),
-        Stmt::Return { value, .. } => value.as_ref().and_then(|v| det_expr(sn, v)),
+        Stmt::Expr(e) => det_expr(cx, e),
+        Stmt::Return { value, .. } => value.as_ref().and_then(|v| det_expr(cx, v)),
         Stmt::If {
             cond,
             capture,
@@ -471,25 +564,25 @@ fn det_stmt(sn: &HashSet<String>, s: &Stmt) -> Option<Hit> {
         } => {
             // The `if (opt) |v|` capture is in the subset (v0.173).
             let _ = capture;
-            det_expr(sn, cond)
-                .or_else(|| det_block(sn, then))
-                .or_else(|| els.as_deref().and_then(|e| det_stmt(sn, e)))
+            det_expr(cx, cond)
+                .or_else(|| det_block(cx, then))
+                .or_else(|| els.as_deref().and_then(|e| det_stmt(cx, e)))
         }
         // Labeled loops and labeled break/continue are in the subset
         // since v0.176 (an unknown target label is sema's E0301).
         Stmt::While {
             cond, cont, body, ..
-        } => det_expr(sn, cond)
-            .or_else(|| cont.as_deref().and_then(|c| det_stmt(sn, c)))
-            .or_else(|| det_block(sn, body)),
+        } => det_expr(cx, cond)
+            .or_else(|| cont.as_deref().and_then(|c| det_stmt(cx, c)))
+            .or_else(|| det_block(cx, body)),
         Stmt::For { iter, body, .. } => {
-            det_expr(sn, iter).or_else(|| det_block(sn, body))
+            det_expr(cx, iter).or_else(|| det_block(cx, body))
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => None,
-        Stmt::Defer { stmt, .. } => det_stmt(sn, stmt),
+        Stmt::Defer { stmt, .. } => det_stmt(cx, stmt),
         // `errdefer <stmt>` is in the subset (v0.174).
-        Stmt::ErrDefer { stmt, .. } => det_stmt(sn, stmt),
-        Stmt::Block(b) => det_block(sn, b),
+        Stmt::ErrDefer { stmt, .. } => det_stmt(cx, stmt),
+        Stmt::Block(b) => det_block(cx, b),
         // `switch` is in the subset (v0.172): scrutinee, then per arm —
         // a payload capture (tagged unions) stays out — labels and body;
         // the `else` block last. Ranges carry literal bounds only.
@@ -498,7 +591,7 @@ fn det_stmt(sn: &HashSet<String>, s: &Stmt) -> Option<Hit> {
             arms,
             default,
             ..
-        } => det_expr(sn, scrutinee)
+        } => det_expr(cx, scrutinee)
             .or_else(|| {
                 arms.iter().find_map(|arm| {
                     if arm.capture.is_some() {
@@ -506,11 +599,11 @@ fn det_stmt(sn: &HashSet<String>, s: &Stmt) -> Option<Hit> {
                     }
                     arm.labels
                         .iter()
-                        .find_map(|l| det_expr(sn, l))
-                        .or_else(|| det_block(sn, &arm.body))
+                        .find_map(|l| det_expr(cx, l))
+                        .or_else(|| det_block(cx, &arm.body))
                 })
             })
-            .or_else(|| default.as_ref().and_then(|d| det_block(sn, d))),
+            .or_else(|| default.as_ref().and_then(|d| det_block(cx, d))),
     }
 }
 
@@ -528,27 +621,74 @@ fn place_rooted_in_name(e: &Expr) -> bool {
 }
 
 /// Walk a place chain: bases inward, each index expression where it sits.
-fn det_place(sn: &HashSet<String>, e: &Expr) -> Option<Hit> {
+fn det_place(cx: &Cx, e: &Expr) -> Option<Hit> {
     match e {
         Expr::Index { base, index, .. } => {
-            det_place(sn, base).or_else(|| det_expr(sn, index))
+            det_place(cx, base).or_else(|| det_expr(cx, index))
         }
-        Expr::Field { base, .. } => det_place(sn, base),
-        Expr::Deref { expr, .. } => det_expr(sn, expr),
+        Expr::Field { base, .. } => det_place(cx, base),
+        Expr::Deref { expr, .. } => det_expr(cx, expr),
         _ => None,
     }
 }
 
-fn det_fn(sn: &HashSet<String>, f: &Func) -> Option<Hit> {
-    for p in &f.params {
-        if p.is_comptime {
-            return Some(("generic-param", p.span.start));
-        }
-        if let Some(hit) = det_type(sn, &p.ty) {
-            return Some(hit);
+/// One fn's walk. A comptime param on a TOP-LEVEL fn is in the subset
+/// (v0.178): a bare-`type` annotation binds a type param; any other
+/// annotation is a VALUE param and must be a bare subset INT scalar. A
+/// METHOD's comptime param stays out entirely. The bound sets are
+/// POSITION-BLIND (sema binds by filter-zip, not source position), so they
+/// pre-collect before any check.
+fn det_fn(cx: &mut Cx, f: &Func, method: bool) -> Option<Hit> {
+    cx.tp.clear();
+    cx.vp.clear();
+    if !method {
+        for p in &f.params {
+            if p.is_comptime {
+                if ty_is_type_kw(&p.ty) {
+                    cx.tp.insert(p.name.clone());
+                } else {
+                    cx.vp.insert(p.name.clone());
+                }
+            }
         }
     }
-    det_type(sn, &f.ret).or_else(|| det_block(sn, &f.body))
+    let mut hit = None;
+    for p in &f.params {
+        if p.is_comptime {
+            if method {
+                hit = Some(("generic-param", p.span.start));
+                break;
+            }
+            if !ty_is_type_kw(&p.ty) {
+                // The VALUE-param annotation: a bare subset INT scalar
+                // (`comptime n: usize`); composites, `type`-adjacent
+                // forms and non-int scalars are out.
+                let bare = !p.ty.optional
+                    && !p.ty.error_union
+                    && p.ty.array_len.is_none()
+                    && !p.ty.pointer
+                    && !p.ty.slice
+                    && p.ty.ctor_args.is_none()
+                    && p.ty.error_set.is_none();
+                let int_ok = matches!(p.ty.name.as_str(), "i32" | "i64" | "u8" | "usize");
+                if !bare || !int_ok {
+                    hit = Some(("type-name", p.ty.span.start));
+                    break;
+                }
+            }
+            continue;
+        }
+        if let Some(h) = det_type(cx, &p.ty) {
+            hit = Some(h);
+            break;
+        }
+    }
+    let out = hit
+        .or_else(|| det_type(cx, &f.ret))
+        .or_else(|| det_block(cx, &f.body));
+    cx.tp.clear();
+    cx.vp.clear();
+    out
 }
 
 // (The single-file `detect_subset` of v0.161–v0.166 is superseded by
@@ -772,28 +912,51 @@ fn detect_flat(files: &[FlatFile], program_mode: bool) -> Option<(String, usize)
             _ => None,
         })
         .collect();
+    // The top-level GENERIC-fn registry (v0.178): any comptime param,
+    // type-constructors excluded; first declaration wins.
+    let mut gens: std::collections::HashMap<String, &Func> = std::collections::HashMap::new();
+    for ff in files {
+        for item in &ff.module.items {
+            if let Item::Func(f) = item {
+                if f.params.iter().any(|p| p.is_comptime) && !ty_is_type_kw(&f.ret) {
+                    gens.entry(f.name.clone()).or_insert(f);
+                }
+            }
+        }
+    }
+    let mut cx = Cx {
+        sn: &sn,
+        gens: &gens,
+        tp: HashSet::new(),
+        vp: HashSet::new(),
+    };
     for ff in files {
         for item in &ff.module.items {
             if matches!(item, Item::Import(_)) {
                 continue;
             }
             let hit = match item {
-                Item::Func(f) => det_fn(&sn, f),
+                Item::Func(f) => det_fn(&mut cx, f, false),
                 Item::Const(c) => c
                     .ty
                     .as_ref()
-                    .and_then(|t| det_type(&sn, t))
-                    .or_else(|| det_expr(&sn, &c.value)),
-                Item::Test(t) => det_block(&sn, &t.body),
+                    .and_then(|t| det_type(&cx, t))
+                    .or_else(|| det_expr(&cx, &c.value)),
+                Item::Test(t) => det_block(&cx, &t.body),
                 // A struct declaration is a subset item (v0.169 fields;
                 // v0.170 admits its METHODS): field types walk in order,
                 // then every struct function exactly like a top-level one
-                // (a pointer receiver is a `type-form` skip).
+                // (a pointer receiver is a `type-form` skip; a comptime
+                // METHOD param stays a `generic-param` skip, v0.178).
                 Item::Struct(s) => s
                     .fields
                     .iter()
-                    .find_map(|fd| det_type(&sn, &fd.ty))
-                    .or_else(|| s.methods.iter().find_map(|m| det_fn(&sn, m))),
+                    .find_map(|fd| det_type(&cx, &fd.ty))
+                    .or_else(|| {
+                        s.methods
+                            .iter()
+                            .find_map(|m| det_fn(&mut cx, m, true))
+                    }),
                 // An enum declaration is a subset item (v0.171): variant
                 // names and literal values carry nothing to walk.
                 Item::Enum(_) => None,
@@ -1418,6 +1581,67 @@ fn selfhost_emit_differential_targeted_inputs() {
             "f64_formatting_edges",
             "pub fn main() void {\n    var xs: [6]f64 = [6]f64{ 100.0, 0.0001, 0.30000000000000004, 1000000000000000.0, 9007199254740993.0, 123456789.123456789 };\n    for (xs) |x| { print(x); }\n    var s: []f64 = xs[1..4];\n    print(s[0]);\n    print(s.len);\n}\n",
         ),
+        // -- generic functions (v0.178) --------------------------------------------
+        (
+            "generic_type_params_two_instances",
+            "fn imax(comptime T: type, x: T, y: T) T {\n    if (x > y) { return x; }\n    return y;\n}\npub fn main() void {\n    print(imax(i64, 3, 9));\n    print(imax(i32, @as(i32, 4), @as(i32, 2)));\n    print(imax(i64, 8, 1));\n}\n",
+        ),
+        (
+            "generic_value_param_array_size",
+            "fn total(comptime n: usize, xs: [n]i64) i64 {\n    var s: i64 = 0;\n    var i: usize = 0;\n    while (i < n) : (i = i + 1) { s = s + xs[i]; }\n    return s;\n}\npub fn main() void {\n    var z: [4]i64 = [4]i64{ 1, 2, 3, 4 };\n    print(total(4, z));\n    var w: [2]i64 = [2]i64{ 10, 20 };\n    print(total(2, w));\n}\n",
+        ),
+        (
+            "generic_negative_value_arg_mangle",
+            "fn addk(comptime k: i64, x: i64) i64 {\n    return x + k;\n}\npub fn main() void {\n    print(addk(-3, 10));\n    print(addk(3, 10));\n}\n",
+        ),
+        (
+            "generic_nested_transitive_instantiation",
+            "fn imax(comptime T: type, x: T, y: T) T {\n    if (x > y) { return x; }\n    return y;\n}\nfn twice(comptime T: type, x: T) T {\n    return imax(T, x, x);\n}\npub fn main() void {\n    print(twice(i64, 21));\n    print(twice(i32, @as(i32, 7)));\n}\n",
+        ),
+        (
+            "generic_recursive_dedup",
+            "fn down(comptime T: type, n: T) T {\n    if (n <= 0) { return n; }\n    return down(T, n - 1);\n}\npub fn main() void {\n    print(down(i64, 5));\n}\n",
+        ),
+        (
+            "generic_zero_instantiation_liveness_source",
+            "fn kept() i64 { return 41; }\nfn unused_gen(comptime T: type, x: T) T {\n    return @as(T, kept()) + x;\n}\npub fn main() void {\n    print(1);\n}\n",
+        ),
+        (
+            "generic_instance_from_test_body_in_program_mode",
+            "fn id(comptime T: type, x: T) T { return x; }\npub fn main() void { print(2); }\ntest \"t\" { expect(id(i64, 1) == 1); }\n",
+        ),
+        (
+            "generic_value_arg_const_env_and_shadow",
+            "const BASE = 3;\nfn addn(comptime n: i64, x: i64) i64 {\n    return n + x;\n}\nfn thru(comptime n: i64, x: i64) i64 {\n    return addn(n * 2, x);\n}\npub fn main() void {\n    print(addn(BASE, 5));\n    print(thru(BASE, 1));\n}\n",
+        ),
+        (
+            "generic_comptime_fold_with_value_param",
+            "fn f(comptime n: i64, x: i64) i64 {\n    return comptime (n * 2) + x;\n}\npub fn main() void {\n    print(f(5, 1));\n}\n",
+        ),
+        (
+            "generic_alloc_and_slice_of_t",
+            "fn head(comptime T: type, xs: []T) T {\n    return xs[0];\n}\nfn make(comptime T: type, al: Allocator, v: T) []T {\n    var s: []T = alloc(al, T, 2);\n    s[0] = v;\n    s[1] = v;\n    return s;\n}\npub fn main() void {\n    var al: Allocator = c_allocator();\n    var s: []i32 = make(i32, al, @as(i32, 7));\n    print(head(i32, s));\n    free(al, s);\n}\n",
+        ),
+        (
+            "generic_composite_forms_opt_err_ptr",
+            "fn pick(comptime T: type, o: ?T, d: T) T {\n    return o orelse d;\n}\nfn bump(comptime T: type, p: *T) void {\n    p.* = p.* + 1;\n}\npub fn main() void {\n    var o: ?i64 = 5;\n    print(pick(i64, o, 0));\n    print(pick(i64, null, 9));\n    var x: i64 = 41;\n    bump(i64, &x);\n    print(x);\n}\n",
+        ),
+        (
+            "generic_only_comptime_params_void_c_signature",
+            "fn k(comptime T: type) T {\n    return @as(T, 12);\n}\npub fn main() void {\n    print(k(i64));\n}\n",
+        ),
+        (
+            "generic_dead_call_site_instance_still_emitted",
+            "fn id(comptime T: type, x: T) T { return x; }\nfn dead() void { print(id(i32, @as(i32, 3))); }\npub fn main() void { print(id(i64, 4)); print(dead_gate()); }\nfn dead_gate() i64 { return 0; }\n",
+        ),
+        (
+            "generic_enum_type_arg",
+            "const Color = enum { Red, Green };\nfn same(comptime T: type, x: T, y: T) bool {\n    return x == y;\n}\npub fn main() void {\n    var c: Color = Color.Red;\n    if (same(Color, c, Color.Red)) { print(1); }\n}\n",
+        ),
+        (
+            "generic_value_param_in_body_and_cond",
+            "fn rep(comptime n: usize, v: i64) i64 {\n    var s: i64 = 0;\n    var i: usize = 0;\n    while (i < n) : (i = i + 1) { s = s + v; }\n    if (n > 2) { s = s + 100; }\n    return s;\n}\npub fn main() void {\n    print(rep(3, 5));\n    print(rep(1, 7));\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
             "skip_slice_elem_f64",
@@ -1466,8 +1690,24 @@ fn selfhost_emit_differential_targeted_inputs() {
             "pub fn main() void { print(1); }\ntest \"t\" { expect(true); }\n",
         ),
         (
-            "skip_comptime_param",
+            "generic_in_subset_since_v178",
             "fn id(comptime T: type, x: i64) i64 { return x; }\npub fn main() void { print(id(i64, 1)); }\n",
+        ),
+        (
+            "skip_generic_type_arg_not_subset",
+            "fn id(comptime T: type, x: i64) i64 { return x; }\npub fn main() void { print(id(u16, 1)); }\n",
+        ),
+        (
+            "skip_generic_method_comptime_param",
+            "pub fn main() void {}\nconst S = struct { x: i32, fn m(comptime T: type) void {} };\n",
+        ),
+        (
+            "skip_generic_value_annotation_not_int",
+            "fn rep(comptime b: bool, x: i64) i64 { return x; }\npub fn main() void { print(rep(true, 4)); }\n",
+        ),
+        (
+            "skip_arrparam_outside_generic",
+            "fn f(xs: [n]i64) i64 { return 0; }\npub fn main() void { print(0); }\n",
         ),
         (
             "labeled_while_minimal",
