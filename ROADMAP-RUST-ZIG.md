@@ -14,6 +14,13 @@
 
 The semantics of each version are specified in `SPEC.md`; this file is the plan.
 
+> **Status (v0.179.0):** Arc 1 (v0.112–v0.123), Arc 2 (v0.124–v0.130), Arc 3
+> (v0.131–v0.140) and Arc 4 (v0.141–v0.150) are ✅ complete, as are the
+> numbered Arc-5 versions v0.151–v0.158. The self-hosting arc is underway:
+> stages shipped as v0.159–v0.179 have the self-hosted emitter reproducing
+> the Rust emitter's C byte-for-byte on 365/384 of the conformance corpus
+> (Program/Test mode). Details per version in [CHANGELOG.md](CHANGELOG.md).
+
 ## Generation policy
 
 Pre-1.0, each completed roadmap version is a MINOR bump. The Gen-2 reboot opens
@@ -291,7 +298,7 @@ case-ranges), combinable with value labels in one arm. Multi-label arms
 (`1, 2, 3 =>`, `.A, .B =>`) already worked (labels are a `Vec`), so this added
 the range form.
 
-### v0.147.0 — Labeled `break` / `continue`
+### v0.147.0 — Labeled `break` / `continue` ✅
 Loops may carry a label (`outer: while (…) { … }`) and `break :outer` /
 `continue :outer` target an enclosing loop, lowered with C `goto` (defers flush
 to the targeted loop). Value-yielding block expressions (`blk: { break :blk v;
@@ -338,47 +345,87 @@ every line pins behaviour, implements a real library, or moves self-hosting —
 while keeping the toolchain fast (optimize/efficiency first where growth would
 otherwise tax every user).
 
-### v0.153.0 — Dead-function elimination (reachability-based emit)
-`@import("std")` currently emits *every* std function into *every* program's C
-(`str_concat` in hello-world). Before std grows, the emitter computes the set
-of functions reachable from the mode's roots (`main` for programs, the `test`
-blocks for the harness) over the call graph — free fns, struct methods,
-associated fns; generic instantiations are already demand-driven — and emits
-only those. Unused-library programs get byte-leaner C and faster cc.
+### v0.153.0 — Dead-function elimination (reachability-based emit) ✅
+`@import("std")` used to emit *every* std function into *every* program's C
+(`str_concat` in hello-world). Before std grew, the emitter gained a
+reachability pass: only functions reachable from the mode's roots (`main` for
+programs, the `test` blocks for the harness) over the call graph — free fns,
+struct methods, associated fns; generic instantiations are already
+demand-driven — are emitted (SPEC §43). Hello-world with `@import("std")`
+dropped from 108 to 34 lines of generated C.
 
-### v0.154.0 — std wave 1: algorithms & data structures
-In-language, each with `test` blocks: `sort`/`sorted` (insertion+quick),
-`binary_search`, `Deque(T)`, `BitSet`, `StrBuilder`, integer parse/format
-(`parse_i64`, `fmt_i64`), `min`/`max`/`clamp`/`abs` over i64, `gcd`/`lcm`/
-`ipow`/`isqrt`, `PRNG` (xorshift). Pure library: no compiler change.
+### v0.154.0 — std wave 1: algorithms & data structures ✅
+In-language, each with `test` blocks: generic `sort` (quicksort + insertion
+below 17), `reverse`, `binary_search`, `Deque(T)`, `BitSet`, `StrBuilder`,
+integer parse/format (`parse_i64`, `fmt_i64`, `fmt_u64_hex`), `imin64`/
+`imax64`/`clamp64`/`iabs64`/`sign`, `gcd`/`lcm`/`ipow`/`isqrt`,
+`div_floor`/`mod_floor`, and a deterministic xorshift64* `Rng` + `shuffle`.
+Pure library (no compiler change); std grew 246 → 1,136 in-language lines,
+with the `tests/std/` in-language suites driven by `std_suite.rs`.
 
-### v0.155.0 — Conformance suite A (runner + SPEC §1–§21)
-`tests/spec/` corpus: directive-driven `.ks` programs (`// RUN-EXIT:`,
-`// RUN-OUT:` …) pinning exact behaviour per SPEC section, with a parallel
-Rust runner (std threads, `-O0` dev builds from v0.151) and `--filter`
-sharding for CI.
+### v0.155.0 — Conformance suite A (runner + SPEC §1–§21) ✅
+`tests/spec/` is born: **311 directive-driven conformance programs**
+(`//SPEC:`, `//EXIT:`, `//OUT:`, `//STDIN:`, `//ERR:`) pinning exact behaviour
+per SPEC section, with a parallel Rust runner (`spec_suite.rs`, std threads,
+`-O0` dev builds from v0.151). The corpus immediately found **4 real bugs**
+(all fixed) — including a clang-only zero-length-array lowering bug caught by
+macOS CI.
 
-### v0.156.0 — Conformance suite B (SPEC §22–§42 + interaction matrix)
-The second half, plus pairwise feature-interaction tests (optionals×generics,
+### v0.156.0 — Conformance suite B (SPEC §22–§42 + interaction matrix) ✅
+The second half: the corpus grew to **606 programs** across 25 section
+directories plus two feature-interaction matrices (optionals×generics,
 defer×error-unions, switch×enums×ranges, …) — where compilers actually break.
+**5 more real bugs** found and fixed (9 total across the two waves), and
+`!void` error unions gained real support along the way. Verified under gcc
+**and** clang.
 
-### v0.157.0 — std wave 2: formats & text
-JSON (parse+emit), base64, hex, crc32/fnv1a, `split`/`trim`/`join`/`replace`,
-glob matching. In-language with tests.
+### v0.157.0 — std wave 2: formats & text ✅
+JSON (arena-style parse + minified emit), base64 + hex codecs, crc32 (one-shot
++ streaming) / fnv1a32/64 / adler32 / djb2, `split`/`trim`/`join`/`replace`
+splitters, glob matching, and `parse_f64`/`fmt_f64`/`parse_u64`/`fmt_u64`/
+`fmt_i64_pad` + ASCII case utils. In-language with tests; std grew 1,136 →
+3,092 lines, all pay-as-you-go under DCE. Also locked cross-platform float
+determinism (`-ffp-contract=off`, SPEC §38.x).
 
-### v0.158.0 — `@writeFile` / `@appendFile` / `@args` (self-host prerequisites)
-Output and argv access — the minimal OS surface a self-hosted compiler needs.
+### v0.158.0 — `@writeFile` / `@appendFile` / `@argc` / `@arg` (self-host prerequisites) ✅
+Output and argv access — the minimal OS surface a self-hosted compiler needs
+(SPEC §44). Shipped as the indexed accessor pair `@argc()` / `@arg(a, i)`
+(rather than a single `@args`) because `[][]u8` stays inexpressible (§15.2).
 
-### v0.159.0+ — Self-hosting stages
-`selfhost/lexer.ks` (differential-tested against the Rust lexer), then
-`parser.ks` + AST as tagged unions (differential vs `kard fmt`), then
-`emit.ks` for a growing subset — the compiler compiling itself, version by
-version. LSP and the package registry follow.
+### v0.159.0 – v0.179.0 — Self-hosting stages ✅ (arc in progress)
+The compiler is being rewritten in kardashev itself, under `selfhost/`, one
+differentially-tested stage per release. Every mirror is compared against the
+Rust implementation **over the whole repo corpus** (700+ source files) — the
+lexer byte-for-byte on token dumps, the parser on AST dumps, the emitter on
+the generated C itself — so a mirror can never silently drift. Files outside
+the mirrored subset are explicitly detected and verdict-pinned as SKIPs,
+never silently diverged. Along the way the differential harness has caught
+**real bugs in the Rust compiler** (11 by v0.178).
+
+| Version | Stage | Milestone |
+|---------|------:|-----------|
+| v0.159.0 | 1 | `selfhost/lexer.ks` — the full lexer (73 token kinds), byte-identical token dumps over every repo source |
+| v0.160.0 | 2 | `selfhost/parser.ks` + `ast.ks` — the parser, AST-dump differential vs the Rust parser |
+| v0.161.0 | 3 | `selfhost/emit.ks` — the C emitter opens (scalar subset, byte-identical C) |
+| v0.162.0 – v0.166.0 | 4–8 | emitter growth: strings; index writes + allocator builtins; generalized `[]T` + `@as` casts; slicing `s[lo..hi]`; `test` blocks (Test mode) |
+| v0.167.0 – v0.172.0 | 9–14 | `@import` resolution (`modres.ks`); fixed arrays `[N]T` + `for`; plain structs; struct methods + associated fns; enums; `switch` + contextual enum literals |
+| v0.173.0 – v0.177.0 | 15–19 | optionals `?T`; error unions `!T`; pointers `*T`; labeled loops; `f64` (a full correctly-rounded, shortest-round-trip float-formatting mirror) |
+| v0.178.0 – v0.179.0 | 21–22 | generic functions (comptime type + value params, monomorphisation); generic structs (type-constructors, aliases, direct application, instance methods) |
+
+(Stage labels as recorded in the changelog; the sequence has no stage 20.)
+
+As of v0.179.0 the self-hosted emitter reproduces the Rust emitter's C
+byte-for-byte on **365/384 of the conformance corpus** (Program/Test mode),
+including the `ArrayList`/`HashMap` examples. **Remaining** for a full
+mirror: the sema mirror (today sema-invalid inputs are pinned by diagnostic
+code), the last emitter subset corners, and the driver — then the compiler
+compiling itself. LSP and the package registry follow.
 
 ### Beyond (Arc 5+, each multi-session)
 Bundled cross-compilation sysroots; the full imperative `build.ks` graph (a
-`build(*Builder)` entry point); re-self-hosting (the compiler in kardashev); a
-package registry; an LSP; and a mechanized spec → 1.0 stability commitment.
+`build(*Builder)` entry point); completing re-self-hosting (in progress —
+the stages above); a package registry; an LSP; and a mechanized spec → 1.0
+stability commitment.
 
 ---
 

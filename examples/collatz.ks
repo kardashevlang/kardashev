@@ -1,4 +1,4 @@
-// collatz.kd — control flow: the Collatz sequence starting at 27.
+// collatz.ks — control flow: the Collatz sequence starting at 27.
 //
 // Demonstrates `while (cond) : (cont)`, `if/else`, and `break`.
 

@@ -1,4 +1,4 @@
-// fib.kd — recursion. Prints the first 10 Fibonacci numbers.
+// fib.ks — recursion. Prints the first 10 Fibonacci numbers.
 
 fn fib(n: i32) i32 {
     if (n < 2) {
