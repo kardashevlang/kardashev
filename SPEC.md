@@ -1,17 +1,23 @@
-# kardashev Gen 2 — Language & Toolchain Specification (v0.111.0)
+# kardashev Gen 2 — Language & Toolchain Specification
 
 > This is the **single source of truth** for the Gen-2 reboot: a Rust
 > implementation of a small systems language built around Zig's philosophy.
 > Every compiler module is implemented against this document and the type
 > contract in `crates/kardc/src/{span,diag,token,types,ast}.rs`.
+>
+> §0–§8 specify the v0.111.0 baseline; every later section is annotated with
+> the version that introduced it, and sections are amended **in place** as
+> behaviour evolves (with the amending version noted). The deliberate gaps
+> are collected in §8.
 
 ## 0. Design laws (Zig-philosophy)
 
 1. **No hidden control flow.** No exceptions, no operator overloading, no
-   implicit destructors. The *only* deferred-execution construct is `defer`,
-   and it is explicit.
-2. **No hidden allocations.** v1 has no heap; when containers arrive they will
-   take an explicit allocator. There is never an implicit global allocator.
+   implicit destructors. The *only* deferred-execution constructs are `defer`
+   and its error-path variant `errdefer` (§21), and they are explicit.
+2. **No hidden allocations.** Heap allocation exists only through an explicit
+   `Allocator` value (§16), and everything in std that allocates takes one.
+   There is never an implicit global allocator.
 3. **Compile-time evaluation, not macros.** `comptime` folds expressions at
    compile time. There is no preprocessor and no textual macros.
 4. **Tests are first-class.** `test "name" { ... }` blocks live in the source
@@ -223,27 +229,43 @@ cc + process execution.
 ## 6. CLI (`cli`) — the `kard` binary
 
 ```
-kard build [FILE] [-o OUT] [-target TRIPLE]   # compile to a native executable
-kard run   [FILE] [-- ARGS...]                 # build to temp, run, propagate exit code
-kard test  [FILE]                              # build+run the test harness
+kard build [FILE|TARGET] [-o OUT] [-target TRIPLE] [-c | --emit obj]
+                                               # compile to a native executable / object
+kard run   [FILE|TARGET] [--release] [-- ARGS...]
+                                               # build to temp, run, propagate exit code
+kard test  [FILE|TARGET] [--filter SUBSTR] [--release]
+                                               # build + run the test harness
+kard bench [FILE|TARGET]                       # tests with per-test wall-clock timing (v0.150)
 kard fmt   FILE [--check | -w]                 # canonical formatting
+kard doc   FILE                                # Markdown API docs from `///` comments (v0.140)
 kard init  [NAME]                              # scaffold a new project
+kard targets                                   # known cross-compilation triples (v0.123, §19)
 kard version                                   # print the version (also --version, -V)
 kard help                                      # usage (also --help, -h, no args)
 ```
 
-- With no `FILE`, `build`/`run`/`test` read `./build.ks` for the `root` source
-  and (for `build`) the output `name`.
-- `-target` is accepted and, for v1, passed through to the C compiler's
-  `-target` flag where supported; the full cross-compilation matrix is a
-  roadmap item, documented honestly.
+- With no `FILE`, `build`/`run`/`test` read `./build.ks` (§7); a positional
+  argument that does not end in `.ks` names a build-graph TARGET.
+- `run`/`test` build unoptimized dev binaries at `-O0` (v0.151) and
+  `--release` restores `-O2`; `build`, `bench` and cross-compiles are always
+  `-O2` (§5).
+- `test --filter SUBSTR` runs only the tests whose name contains SUBSTR; a
+  filtered harness reports `<passed>/<total> tests passed (filtered)`
+  (v0.150).
+- `-target TRIPLE` cross-compiles via the C compiler's `--target=`, and
+  `-c` / `--emit obj` emits an object file without linking — see §19 for the
+  mechanism and its honest sysroot limitation.
+- `doc FILE` (v0.140) renders the file's `pub` items as Markdown: one-line
+  signatures from the AST, each preceded by the contiguous `///` lines
+  directly above the item in the source (`_No documentation._` when absent;
+  `///` is an ordinary ignored comment to the compiler).
 - Compile diagnostics are rendered with `diag::render_all` (filename + line/col
   + caret) to stderr; the process exits non-zero.
 - `fmt --check` exits non-zero if the file is not already canonical; `-w`
   rewrites in place; otherwise canonical source is printed to stdout.
-- v1 formats from the AST, which carries no comment trivia, so **comments are
-  not yet preserved** by `fmt` (the code is reproduced faithfully and the
-  result is idempotent). Comment-preserving formatting is a roadmap item.
+- `fmt` formats from the AST, which carries no comment trivia, so **comments
+  are not yet preserved** (the code is reproduced faithfully and the result is
+  idempotent). Comment-preserving formatting is a roadmap item.
 
 ## 7. `build.ks` — the build graph (v0.122)
 
@@ -282,13 +304,38 @@ artifacts) remains a future item.
 
 ## 8. Honest deferrals (tracked in ROADMAP-RUST-ZIG.md)
 
-Optionals `?T`, error unions `!T` + `try`/`catch`/`errdefer`, struct **methods /
-associated functions** (struct *data* lands in v0.112 — see §9), enums,
-tagged unions, arrays/slices/pointers, the allocator interface and an
-allocator-based stdlib, generics via `comptime T: type`, type inference for
-`var`/`const`, the full imperative `build.ks`, the real cross-compilation
-matrix, comment-preserving `fmt`, and re-self-hosting. None of these are stubbed
-— they are absent and scheduled.
+Everything the numbered roadmap has shipped is specified in §9–§44 below;
+each section carries its own "Deferred (honest)" notes. The deliberate gaps,
+as of v0.179:
+
+- **Value-yielding block expressions** `blk: { … break :blk v; }` — loop
+  labels shipped (§40); value blocks are a larger AST change.
+- **`try` in nested expression positions** (§12): `try e` is allowed only as
+  the whole value of a `var`/`const` initializer, a `return`, or an
+  expression statement (`E0191` otherwise).
+- **Generic-application corners** (§42.4): the literal form `Name(T){ … }`,
+  composite type *arguments* (`ArrayList([]u8)`), applications as generic-fn
+  type arguments, and application-typed fields in plain structs.
+- **Slices of slices** `[][]u8` (§15.2) — hence the `@argc()`/`@arg(a, i)`
+  accessor pair (§44) rather than an args slice.
+- **Allocator breadth** (§16.3): error-returning `alloc` (`![]T`), custom
+  allocators / a vtable interface, `realloc`, aligned allocation.
+- **comptime breadth**: comptime control flow and `anytype` (§17.4); float
+  top-level `const`s (floats are runtime-only, §38).
+- **Lexical breadth**: hex/binary integer literals and `_` separators (§1);
+  block comments.
+- **Namespaced modules** (§22.2): `@import` flattens — bare-name access, no
+  `m.member` qualified access, `pub` not yet enforced across files.
+- **I/O breadth** (§44.3): no `@deleteFile`/`@renameFile`, no error causes
+  (the `bool` / empty-slice conventions carry one bit).
+- **DCE precision** (§43.3): receiver-precise method liveness,
+  instantiation-level liveness, typedef/`const` pruning.
+- **Toolchain**: comment-preserving `fmt` (§6), the imperative
+  `build(*Builder)` build graph (§7), bundled cross-compilation sysroots
+  (§19).
+
+None of these are stubbed — absent features are absent, rejected with a
+diagnostic where reachable, and scheduled in the roadmap.
 
 ## 9. Structs (v0.112) — data aggregates
 

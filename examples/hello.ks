@@ -1,7 +1,7 @@
-// hello.kd — the canonical first program.
+// hello.ks — the canonical first program.
 //
-//   kard run examples/hello.kd     # prints 45 then 999
-//   kard test examples/hello.kd    # runs the test block below
+//   kard run examples/hello.ks     # prints 45 then 999
+//   kard test examples/hello.ks    # runs the test block below
 
 const LIMIT: i32 = comptime (5 * 2);
 

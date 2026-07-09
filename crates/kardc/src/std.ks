@@ -7,6 +7,7 @@
 
 // --- small numeric helpers -------------------------------------------------
 
+/// The smaller of `a` and `b`.
 pub fn imin(a: i32, b: i32) i32 {
     if (a < b) {
         return a;
@@ -14,6 +15,7 @@ pub fn imin(a: i32, b: i32) i32 {
     return b;
 }
 
+/// The larger of `a` and `b`.
 pub fn imax(a: i32, b: i32) i32 {
     if (a > b) {
         return a;
@@ -21,6 +23,7 @@ pub fn imax(a: i32, b: i32) i32 {
     return b;
 }
 
+/// The absolute value of `x`.
 pub fn iabs(x: i32) i32 {
     if (x < 0) {
         return 0 - x;
@@ -30,7 +33,7 @@ pub fn iabs(x: i32) i32 {
 
 // --- string utilities (over `[]u8`) ----------------------------------------
 
-// Byte-for-byte equality of two strings.
+/// Byte-for-byte equality of two strings.
 pub fn str_eq(a: []u8, b: []u8) bool {
     if (a.len != b.len) {
         return false;
@@ -44,7 +47,7 @@ pub fn str_eq(a: []u8, b: []u8) bool {
     return true;
 }
 
-// Does `s` begin with `prefix`?
+/// Does `s` begin with `prefix`?
 pub fn str_starts_with(s: []u8, prefix: []u8) bool {
     if (prefix.len > s.len) {
         return false;
@@ -58,7 +61,7 @@ pub fn str_starts_with(s: []u8, prefix: []u8) bool {
     return true;
 }
 
-// Index of the first byte equal to `c`, or -1 if absent.
+/// Index of the first byte equal to `c`, or -1 if absent.
 pub fn str_index_of(s: []u8, c: u8) i32 {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
@@ -69,8 +72,8 @@ pub fn str_index_of(s: []u8, c: u8) i32 {
     return 0 - 1;
 }
 
-// Concatenate `x` and `y` into a freshly-allocated `[]u8` (free it with
-// `free(a, result)`).
+/// Concatenate `x` and `y` into a freshly-allocated `[]u8` (free it with
+/// `free(a, result)`).
 pub fn str_concat(a: Allocator, x: []u8, y: []u8) []u8 {
     var out: []u8 = alloc(a, u8, x.len + y.len);
     var i: usize = 0;
@@ -86,6 +89,8 @@ pub fn str_concat(a: Allocator, x: []u8, y: []u8) []u8 {
 
 // --- ArrayList(V) — a growable list -----------------------------------------
 
+/// A growable list of `V` on an explicit allocator — `init(a)`, `push(a, x)`,
+/// `get(i)`, `set(i, x)`, `len()`, `deinit(a)` — doubling capacity on growth.
 pub fn ArrayList(comptime V: type) type {
     return struct {
         items: []V,
@@ -133,6 +138,9 @@ const SLOT_EMPTY: i32 = 0;
 const SLOT_FULL: i32 = 1;
 const SLOT_TOMB: i32 = 2;
 
+/// An `i32`-keyed open-addressing hash map of `V` values — `init(a)`,
+/// `put(a, key, val)`, `get(key, fallback)`, `has(key)`, `remove(key)`,
+/// `len()`, `deinit(a)` — with tombstone deletion and grow-and-rehash.
 pub fn HashMap(comptime V: type) type {
     return struct {
         keys: []i32,
