@@ -1,0 +1,39 @@
+# Pings kardashevlang.org the moment user-facing docs change on main, so the
+# site re-syncs and redeploys immediately — the site has no cron polling; this
+# dispatch (plus the site's own pushes) is its only rebuild trigger.
+#
+# Requires the DOCS_SITE_DISPATCH_TOKEN repository secret: a token allowed to
+# create a `repository_dispatch` on kardashevlang/kardashevlang.org (a
+# fine-grained PAT with "Contents: read & write" on that repo, or a classic
+# PAT with `repo` scope).
+name: Notify docs site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "SPEC.md"
+      - "README.md"
+      - "ROADMAP-RUST-ZIG.md"
+      - "docs/**"
+      - "examples/**"
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger kardashevlang.org rebuild
+        env:
+          TOKEN: ${{ secrets.DOCS_SITE_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::DOCS_SITE_DISPATCH_TOKEN is not set; skipping the site ping."
+            exit 0
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/kardashevlang/kardashevlang.org/dispatches \
+            -d '{"event_type":"upstream-updated"}'
