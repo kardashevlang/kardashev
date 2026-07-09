@@ -1,4 +1,4 @@
-//! Self-host stages 3–21 (v0.161–v0.178): differential test of
+//! Self-host stages 3–22 (v0.161–v0.179): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -46,8 +46,19 @@
 //! §43.1 name source, `[n]T` sizes resolve through the value substitution,
 //! and the detector admits generic calls whose type arguments name subset
 //! scalars / declared structs+enums / bound type params (a method's
-//! comptime param stays `generic-param`; a type-constructor's bare-`type`
-//! return stays out) — written
+//! comptime param stays `generic-param`) — and, v0.179, GENERIC STRUCTS
+//! (SPEC §25/§26/§31/§42): type-constructors (`fn Name(comptime T: type)
+//! type { return struct { … }; }` — params all comptime-type or
+//! `generic-param`; a non-conforming body walks as plain statements,
+//! sema's E0310), `const Alias = Ctor(…);` aliases, direct applications
+//! `Name(A, …)` in every type position and as assoc-call receivers
+//! (arguments: admissible bare names or nested applications), instance
+//! METHODS under `{ params → args, Self → instance }` (emitted per
+//! recorded instance, liveness notwithstanding; an instantiated ctor's
+//! body is an always-walked §43.1 name source), `Self`/`@This()` in
+//! plain-struct methods (§32.2), `alloc(a, T, n)` over a ctor-bound `T`,
+//! and instance names (`Ctor__<tags>`) memoised across every spelling —
+//! written
 //! in kardashev —
 //! against the Rust
 //! reference emitter. Since v0.166 every corpus file is classified and
@@ -210,6 +221,15 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s23_strings/string_print_non_u8_slice_err.ks",        // E0110
     "tests/spec/s23_strings/string_plus_operator_err.ks",             // E0110
     "tests/spec/s25_generic_structs/err_alias_of_non_ctor.ks",        // E0311
+    "tests/spec/s25_generic_structs/err_alias_arg_not_ident.ks",      // E0311 (v0.179: ctor calls subset-shaped)
+    "tests/spec/s25_generic_structs/err_alias_arity.ks",              // E0311 (v0.179)
+    "tests/spec/s25_generic_structs/err_alias_as_value.ks",           // E0100 (v0.179)
+    "tests/spec/s25_generic_structs/err_distinct_args_distinct_types.ks", // E0110 (v0.179)
+    "tests/spec/s31_multi_typeparams/err_ctor_arity_mismatch.ks",     // E0311 (v0.179)
+    "tests/spec/s31_multi_typeparams/err_distinct_tuples_type_mismatch.ks", // E0110 (v0.179)
+    "tests/spec/s42_direct_generics/err_app_generic_fn_type_arg_deferred.ks", // E0251 (v0.179)
+    "tests/spec/s42_direct_generics/err_e0311_arity_type_pos.ks",     // E0311 (v0.179)
+    "tests/spec/s42_direct_generics/err_e0312_app_as_value.ks",       // E0312 (v0.179)
     "tests/spec/s27_compound/bool_rhs_err.ks",                        // E0110
     "tests/spec/s27_compound/const_place_err.ks",                     // E0110
     "tests/spec/s27_compound/mismatch_err.ks",                        // E0110
@@ -258,8 +278,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 320;
-const MIN_C_COMPARED_TEST: usize = 339;
+const MIN_C_COMPARED_PROGRAM: usize = 360;
+const MIN_C_COMPARED_TEST: usize = 379;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -294,16 +314,6 @@ fn subset_slice_elem(name: &str) -> bool {
     matches!(name, "i32" | "i64" | "bool" | "u8" | "usize" | "f64")
 }
 
-/// `Emitter::place_chain_has_index` (the `es_chain_has_index` mirror):
-/// whether a place reaches its target THROUGH an index via value links.
-fn chain_has_index(e: &Expr) -> bool {
-    match e {
-        Expr::Index { .. } => true,
-        Expr::Field { base, .. } => chain_has_index(base),
-        _ => false,
-    }
-}
-
 /// The detector's name context (v0.178): the declared struct/enum names,
 /// the top-level GENERIC-fn registry (any comptime param, type-constructors
 /// excluded — first declaration wins, duplicates are sema's E0103), and the
@@ -313,8 +323,64 @@ fn chain_has_index(e: &Expr) -> bool {
 struct Cx<'a> {
     sn: &'a HashSet<String>,
     gens: &'a std::collections::HashMap<String, &'a Func>,
+    /// The top-level TYPE-CONSTRUCTOR registry (bare-`type` return, v0.179).
+    tc: &'a std::collections::HashMap<String, &'a Func>,
+    /// Type-ALIAS names — `const Alias = Ctor(…);` items (v0.179).
+    an: &'a HashSet<String>,
     tp: HashSet<String>,
     vp: HashSet<String>,
+    /// The enclosing type-constructor's params (inside its struct body).
+    ctp: HashSet<String>,
+    /// Whether `Self`/`@This()` is admissible — inside any struct method
+    /// (plain §32.2 or generic-struct §26.1).
+    dself: bool,
+}
+
+/// A bare base name in a general type position (v0.179): a subset scalar,
+/// a declared struct/enum, a bound type param (fn or ctor), an alias, or
+/// a method's `Self`.
+fn base_name_ok(cx: &Cx, name: &str) -> bool {
+    subset_type_name(name)
+        || cx.sn.contains(name)
+        || cx.tp.contains(name)
+        || cx.ctp.contains(name)
+        || cx.an.contains(name)
+        || (cx.dself && name == "Self")
+}
+
+/// The slice/array ELEMENT variant: scalars restrict to the slice-element
+/// set; named types as `base_name_ok`.
+fn elem_name_ok(cx: &Cx, name: &str) -> bool {
+    if subset_type_name(name) {
+        return subset_slice_elem(name);
+    }
+    cx.sn.contains(name)
+        || cx.tp.contains(name)
+        || cx.ctp.contains(name)
+        || cx.an.contains(name)
+        || (cx.dself && name == "Self")
+}
+
+/// A type-position APPLICATION `Name(A, …)` (v0.179, SPEC §42): the name
+/// must be a type-constructor (`type-form` otherwise); each argument — a
+/// bare name or a nested application — checks recursively. Arity is
+/// sema's E0311, never subset membership.
+fn det_app(cx: &Cx, t: &TypeExpr) -> Option<Hit> {
+    if !cx.tc.contains_key(&t.name) {
+        return Some(("type-form", t.span.start));
+    }
+    if let Some(args) = &t.ctor_args {
+        for a in args {
+            if a.ctor_args.is_some() {
+                if let Some(h) = det_app(cx, a) {
+                    return Some(h);
+                }
+            } else if !base_name_ok(cx, &a.name) {
+                return Some(("type-name", a.span.start));
+            }
+        }
+    }
+    None
 }
 
 /// Sema's `is_type_kw` (SPEC §17.1): the annotation is the bare `type`
@@ -338,33 +404,40 @@ fn det_type(cx: &Cx, t: &TypeExpr) -> Option<Hit> {
     if let Some(kardc::ast::ArraySize::Param(name)) = &t.array_len {
         // `[n]T` (v0.178): in the subset iff `n` names a comptime VALUE
         // parameter of the enclosing top-level generic; the element rule
-        // matches `[N]T` (a bound type param included).
+        // matches `[N]T`.
         if !cx.vp.contains(name) {
             return Some(("type-form", t.span.start));
         }
-        if !subset_slice_elem(&t.name) && !cx.sn.contains(&t.name) && !cx.tp.contains(&t.name) {
+        if t.ctor_args.is_some() {
+            return det_app(cx, t);
+        }
+        if !elem_name_ok(cx, &t.name) {
             return Some(("type-name", t.span.start));
         }
         return None;
     }
-    if t.ctor_args.is_some() {
+    if t.error_union && t.error_set.as_deref() == Some("Self") {
+        // A `Self`-referencing set spelling stays a type-form.
         return Some(("type-form", t.span.start));
     }
+    if t.ctor_args.is_some() {
+        // A direct application `Name(A, …)` (v0.179, SPEC §42) — every
+        // prefix wrapper composes over it, so the base check is the
+        // whole check.
+        return det_app(cx, t);
+    }
     if t.pointer {
-        // `*T` over a bare subset pointee name (v0.175).
-        if !subset_type_name(&t.name) && !cx.sn.contains(&t.name) && !cx.tp.contains(&t.name) {
+        // `*T` over a bare subset pointee name (v0.175); `*Self` /
+        // `*@This()` are method receivers (v0.179).
+        if !base_name_ok(cx, &t.name) {
             return Some(("type-name", t.span.start));
         }
         return None;
     }
     if t.error_union {
         // `!T` / `Set!T` over a bare subset payload name (v0.174; the set
-        // name is sema's E0330 membership concern). A `Self`-referencing
-        // set spelling stays a type-form.
-        if t.error_set.as_deref() == Some("Self") {
-            return Some(("type-form", t.span.start));
-        }
-        if !subset_type_name(&t.name) && !cx.sn.contains(&t.name) && !cx.tp.contains(&t.name) {
+        // name is sema's E0330 membership concern).
+        if !base_name_ok(cx, &t.name) {
             return Some(("type-name", t.span.start));
         }
         return None;
@@ -375,20 +448,21 @@ fn det_type(cx: &Cx, t: &TypeExpr) -> Option<Hit> {
     if t.optional {
         // `?T` over a bare subset name (v0.173; a composite inner is a
         // parse error, so `?` never coexists with the other forms).
-        if !subset_type_name(&t.name) && !cx.sn.contains(&t.name) && !cx.tp.contains(&t.name) {
+        if !base_name_ok(cx, &t.name) {
             return Some(("type-name", t.span.start));
         }
         return None;
     }
     if t.array_len.is_some() || t.slice {
         // `[N]T` (v0.168) / `[]T` (v0.164) over the five scalar elements,
-        // a declared struct element (v0.169), or a bound type param.
-        if !subset_slice_elem(&t.name) && !cx.sn.contains(&t.name) && !cx.tp.contains(&t.name) {
+        // a declared struct element (v0.169), a bound type param (v0.178),
+        // an alias, or a method's `Self` (v0.179).
+        if !elem_name_ok(cx, &t.name) {
             return Some(("type-name", t.span.start));
         }
         return None;
     }
-    if !subset_type_name(&t.name) && !cx.sn.contains(&t.name) && !cx.tp.contains(&t.name) {
+    if !base_name_ok(cx, &t.name) {
         return Some(("type-name", t.span.start));
     }
     None
@@ -409,11 +483,30 @@ fn det_expr(cx: &Cx, e: &Expr) -> Option<Hit> {
             if callee == "alloc" {
                 let shaped = args.len() == 3
                     && matches!(&args[1], Expr::Ident { name, .. }
-                        if subset_slice_elem(name) || cx.tp.contains(name));
+                        if subset_slice_elem(name) || cx.tp.contains(name) || cx.ctp.contains(name));
                 if !shaped {
                     return Some(("builtin-call", pos));
                 }
                 return args.iter().find_map(|x| det_expr(cx, x));
+            }
+            if cx.tc.contains_key(callee.as_str()) {
+                // A type-constructor application in VALUE position
+                // (v0.179): the associated-call receiver, an alias
+                // initializer, or a stray value use (sema's E0312). The
+                // arguments are TYPE arguments — an identifier must name
+                // an admissible base; a nested constructor call recurses
+                // through this same branch; anything else walks as an
+                // expression (sema's E0311).
+                for a in args {
+                    if let Expr::Ident { name, span } = a {
+                        if !base_name_ok(cx, name) {
+                            return Some(("type-name", span.start));
+                        }
+                    } else if let Some(h) = det_expr(cx, a) {
+                        return Some(h);
+                    }
+                }
+                return None;
             }
             if let Some(g) = cx.gens.get(callee.as_str()) {
                 // A call to a top-level GENERIC fn (v0.178): the leading
@@ -433,10 +526,10 @@ fn det_expr(cx: &Cx, e: &Expr) -> Option<Hit> {
                     }
                     if ty_is_type_kw(&p.ty) {
                         if let Expr::Ident { name, .. } = &args[ai] {
-                            if !subset_type_name(name)
-                                && !cx.sn.contains(name)
-                                && !cx.tp.contains(name)
-                            {
+                            // An alias or a method's `Self` also names a
+                            // concrete type here (v0.179 — the subst →
+                            // `resolve_base` chain, aliases included).
+                            if !base_name_ok(cx, name) {
                                 return Some(("type-name", args[ai].span().start));
                             }
                         } else if let Some(hit) = det_expr(cx, &args[ai]) {
@@ -471,7 +564,7 @@ fn det_expr(cx: &Cx, e: &Expr) -> Option<Hit> {
             if name == "as"
                 && args.len() == 2
                 && matches!(&args[0], Expr::Ident { name, .. }
-                    if subset_type_name(name) || cx.tp.contains(name))
+                    if subset_type_name(name) || cx.tp.contains(name) || cx.ctp.contains(name))
             {
                 return det_expr(cx, &args[1]);
             }
@@ -641,6 +734,9 @@ fn det_place(cx: &Cx, e: &Expr) -> Option<Hit> {
 fn det_fn(cx: &mut Cx, f: &Func, method: bool) -> Option<Hit> {
     cx.tp.clear();
     cx.vp.clear();
+    // `Self` binds inside ANY struct method — plain (§32.2) or
+    // generic-struct (§26.1) — for the signature and body alike.
+    cx.dself = method;
     if !method {
         for p in &f.params {
             if p.is_comptime {
@@ -688,6 +784,41 @@ fn det_fn(cx: &mut Cx, f: &Func, method: bool) -> Option<Hit> {
         .or_else(|| det_block(cx, &f.body));
     cx.tp.clear();
     cx.vp.clear();
+    cx.dself = false;
+    out
+}
+
+/// A TYPE-CONSTRUCTOR item (v0.179, SPEC §25): every parameter must be a
+/// comptime TYPE parameter (`generic-param` at the first violation); a
+/// conforming body (`return struct { … };`) walks its field types (ctor
+/// params bound) then its methods (params + `Self` bound); any other
+/// body shape walks as ordinary statements — sema's E0310 remainder.
+fn det_ctor(cx: &mut Cx, f: &Func) -> Option<Hit> {
+    for p in &f.params {
+        if !p.is_comptime || !ty_is_type_kw(&p.ty) {
+            return Some(("generic-param", p.span.start));
+        }
+    }
+    cx.ctp.clear();
+    for p in &f.params {
+        cx.ctp.insert(p.name.clone());
+    }
+    let st = match f.body.stmts.as_slice() {
+        [Stmt::Return {
+            value: Some(Expr::StructType { fields, methods, .. }),
+            ..
+        }] => Some((fields, methods)),
+        _ => None,
+    };
+    let out = if let Some((fields, methods)) = st {
+        fields
+            .iter()
+            .find_map(|fd| det_type(cx, &fd.ty))
+            .or_else(|| methods.iter().find_map(|m| det_fn(cx, m, true)))
+    } else {
+        det_block(cx, &f.body)
+    };
+    cx.ctp.clear();
     out
 }
 
@@ -924,11 +1055,39 @@ fn detect_flat(files: &[FlatFile], program_mode: bool) -> Option<(String, usize)
             }
         }
     }
+    // The TYPE-CONSTRUCTOR registry (v0.179): bare-`type` returns; then
+    // the ALIAS names — `const A = Ctor(…);` items.
+    let mut tc: std::collections::HashMap<String, &Func> = std::collections::HashMap::new();
+    for ff in files {
+        for item in &ff.module.items {
+            if let Item::Func(f) = item {
+                if ty_is_type_kw(&f.ret) {
+                    tc.entry(f.name.clone()).or_insert(f);
+                }
+            }
+        }
+    }
+    let mut an: HashSet<String> = HashSet::new();
+    for ff in files {
+        for item in &ff.module.items {
+            if let Item::Const(c) = item {
+                if let Expr::Call { callee, .. } = &c.value {
+                    if tc.contains_key(callee.as_str()) {
+                        an.insert(c.name.clone());
+                    }
+                }
+            }
+        }
+    }
     let mut cx = Cx {
         sn: &sn,
         gens: &gens,
+        tc: &tc,
+        an: &an,
         tp: HashSet::new(),
         vp: HashSet::new(),
+        ctp: HashSet::new(),
+        dself: false,
     };
     for ff in files {
         for item in &ff.module.items {
@@ -936,6 +1095,8 @@ fn detect_flat(files: &[FlatFile], program_mode: bool) -> Option<(String, usize)
                 continue;
             }
             let hit = match item {
+                // A type-returning fn is a TYPE CONSTRUCTOR (v0.179).
+                Item::Func(f) if ty_is_type_kw(&f.ret) => det_ctor(&mut cx, f),
                 Item::Func(f) => det_fn(&mut cx, f, false),
                 Item::Const(c) => c
                     .ty
@@ -1641,6 +1802,59 @@ fn selfhost_emit_differential_targeted_inputs() {
         (
             "generic_value_param_in_body_and_cond",
             "fn rep(comptime n: usize, v: i64) i64 {\n    var s: i64 = 0;\n    var i: usize = 0;\n    while (i < n) : (i = i + 1) { s = s + v; }\n    if (n > 2) { s = s + 100; }\n    return s;\n}\npub fn main() void {\n    print(rep(3, 5));\n    print(rep(1, 7));\n}\n",
+        ),
+        // -- generic structs / type-constructors (v0.179) ----------------------------
+        (
+            "gstruct_alias_fields_methods_ptr_receiver",
+            "fn Box(comptime T: type) type {\n    return struct {\n        val: T,\n        fn init(v: T) Self { return Self{ .val = v }; }\n        fn get(self: Self) T { return self.val; }\n        fn set(self: *Self, v: T) void { self.val = v; }\n    };\n}\nconst IntBox = Box(i64);\npub fn main() void {\n    var b: IntBox = IntBox.init(41);\n    print(b.get());\n    b.set(7);\n    print(b.get());\n}\n",
+        ),
+        (
+            "gstruct_direct_application_forms",
+            "fn Box(comptime T: type) type {\n    return struct {\n        val: T,\n        fn init(v: T) Self { return Self{ .val = v }; }\n        fn get(self: Self) T { return self.val; }\n    };\n}\npub fn main() void {\n    var c: Box(i32) = Box(i32).init(@as(i32, 5));\n    print(c.get());\n    var d: Box(i64) = Box(i64).init(9);\n    print(d.get());\n}\n",
+        ),
+        (
+            "gstruct_multi_type_params",
+            "fn Pair(comptime A: type, comptime B: type) type {\n    return struct {\n        a: A,\n        b: B,\n        fn mk(x: A, y: B) Self { return Self{ .a = x, .b = y }; }\n        fn sum(self: Self) i64 { return @as(i64, self.a) + @as(i64, self.b); }\n    };\n}\nconst PI = Pair(i32, i64);\npub fn main() void {\n    var p: PI = PI.mk(@as(i32, 3), 4);\n    print(p.sum());\n    var q: Pair(i64, i32) = Pair(i64, i32).mk(10, @as(i32, 20));\n    print(q.sum());\n}\n",
+        ),
+        (
+            "gstruct_nested_composition_fields",
+            "fn Slot(comptime T: type) type {\n    return struct {\n        v: T,\n        fn of(x: T) Self { return Self{ .v = x }; }\n    };\n}\nfn Pair(comptime T: type) type {\n    return struct {\n        lo: Slot(T),\n        hi: Slot(T),\n        fn mk(x: T, y: T) Self { return Self{ .lo = Slot(T).of(x), .hi = Slot(T).of(y) }; }\n        fn total(self: Self) T { return self.lo.v + self.hi.v; }\n    };\n}\npub fn main() void {\n    var p: Pair(i64) = Pair(i64).mk(4, 5);\n    print(p.total());\n}\n",
+        ),
+        (
+            "gstruct_alloc_t_growable",
+            "fn Vec(comptime T: type) type {\n    return struct {\n        buf: []T,\n        n: i64,\n        fn init(al: Allocator) Self {\n            return Self{ .buf = alloc(al, T, 2), .n = 0 };\n        }\n        fn push(self: *Self, al: Allocator, v: T) void {\n            if (@as(usize, self.n) == self.buf.len) {\n                var nb: []T = alloc(al, T, self.buf.len * 2);\n                var i: usize = 0;\n                while (i < self.buf.len) : (i = i + 1) { nb[i] = self.buf[i]; }\n                free(al, self.buf);\n                self.buf = nb;\n            }\n            self.buf[@as(usize, self.n)] = v;\n            self.n = self.n + 1;\n        }\n        fn get(self: Self, i: i64) T { return self.buf[@as(usize, i)]; }\n        fn deinit(self: Self, al: Allocator) void { free(al, self.buf); }\n    };\n}\npub fn main() void {\n    var al: Allocator = c_allocator();\n    var v: Vec(i64) = Vec(i64).init(al);\n    var i: i64 = 0;\n    while (i < 5) : (i = i + 1) { v.push(al, i * 10); }\n    print(v.get(0));\n    print(v.get(4));\n    v.deinit(al);\n}\n",
+        ),
+        (
+            "gstruct_app_in_method_signature",
+            "fn Box(comptime T: type) type {\n    return struct {\n        v: T,\n        fn init(x: T) Self { return Self{ .v = x }; }\n        fn get(self: Self) T { return self.v; }\n    };\n}\nfn Wrap(comptime T: type) type {\n    return struct {\n        x: T,\n        fn boxed(self: Self) Box(T) { return Box(T).init(self.x); }\n    };\n}\nconst W = Wrap(i64);\npub fn main() void {\n    var w: W = W{ .x = 6 };\n    print(w.boxed().get());\n}\n",
+        ),
+        (
+            "plain_struct_self_this_methods",
+            "const Point = struct {\n    x: i64,\n    y: i64,\n    fn mk(x: i64, y: i64) Self { return Self{ .x = x, .y = y }; }\n    fn norm1(self: Self) i64 { return self.x + self.y; }\n    fn bump(self: *@This()) void { self.x = self.x + 1; }\n};\npub fn main() void {\n    var p: Point = Point.mk(3, 4);\n    print(p.norm1());\n    p.bump();\n    print(p.norm1());\n}\n",
+        ),
+        (
+            "gstruct_generic_fn_with_alias_type_arg",
+            "fn Box(comptime T: type) type {\n    return struct {\n        v: T,\n        fn init(x: T) Self { return Self{ .v = x }; }\n        fn get(self: Self) T { return self.v; }\n    };\n}\nconst IB = Box(i64);\nfn pick(comptime T: type, x: T, y: T) T {\n    if (x > y) { return x; }\n    return y;\n}\nfn peek(b: IB) i64 { return b.get(); }\npub fn main() void {\n    print(pick(i64, 2, 8));\n    var b: IB = IB.init(5);\n    print(peek(b));\n}\n",
+        ),
+        (
+            "gstruct_slice_of_instance_and_ptr_param",
+            "fn Cnt(comptime T: type) type {\n    return struct {\n        v: T,\n        fn init(x: T) Self { return Self{ .v = x }; }\n    };\n}\nconst C64 = Cnt(i64);\nfn bump(p: *C64) void {\n    p.v = p.v + 1;\n}\npub fn main() void {\n    var c: C64 = C64.init(41);\n    bump(&c);\n    print(c.v);\n    var al: Allocator = c_allocator();\n    var s: []C64 = alloc(al, C64, 2);\n    s[0] = C64.init(7);\n    print(s[0].v);\n    free(al, s);\n}\n",
+        ),
+        (
+            "skip_app_not_a_ctor",
+            "fn f() i64 { return 1; }\npub fn main() void {\n    var x: f(i64) = 0;\n}\n",
+        ),
+        (
+            "skip_app_arg_not_subset",
+            "fn Box(comptime T: type) type {\n    return struct { v: T, fn get(self: Self) T { return self.v; } };\n}\npub fn main() void {\n    var b: Box(u16) = Box(u16).init(1);\n}\n",
+        ),
+        (
+            "skip_ctor_body_not_struct_return",
+            "fn F(comptime T: type) type {\n    var x: i64 = 1.5;\n    return struct { v: T };\n}\npub fn main() void { print(1); }\n",
+        ),
+        (
+            "skip_self_outside_method",
+            "fn f(x: Self) i64 { return 0; }\npub fn main() void { print(1); }\n",
         ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (

@@ -18,6 +18,68 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.179.0] — Self-hosting stage 22: generic structs
+
+Type metaprogramming lands in the mirror: `selfhost/emit.ks` compiles
+type-constructors, aliases, direct applications and monomorphised
+instance methods byte-identically to the Rust emitter, and the
+C-identical corpus jumps 326/345 → 365/384 (Program/Test), absorbing
+`s25_generic_structs`, `s31_multi_typeparams`, `s42_direct_generics`
+and the `ArrayList`/`HashMap` examples.
+
+- `selfhost/emit.ks` (stage 22, SPEC §25/§26/§31/§42): the
+  type-constructor registry (bare-`type` returns — compile-time only),
+  the Pass-0d alias loop (`const A = Ctor(…);` instantiates and binds,
+  item order, before signatures), and LAZY application instantiation at
+  every type-resolution point (`var l: ArrayList(i32)`, composite
+  wrappers, generic-struct fields, assoc-call receivers `Ctor(T).init`)
+  — every spelling memoised by the `Ctor__<tags>` mangle into ONE
+  struct row whose synthesized name lives in a new name arena (struct
+  offsets past `src.len`).
+- An instantiation resolves FIELDS in two phases (types into a scratch,
+  rows pushed contiguously — a nested `lo: Slot(T)` field's recursive
+  instantiation must not interleave the outer window), notes the
+  methods' written-`*T` pointees, registers each method SIGNATURE under
+  `{ params → args, Self → instance }` (a `*Self` first param is the
+  pointer receiver), and records the instance AFTER those signatures —
+  a signature's nested application (`fn lo_boxed(self) Box(T)`) records
+  first, exactly like `record_struct_instance`'s position in sema. The
+  method BODIES drain from the pending queue after the const fold
+  (pass 2b) and after the body scan (pass 3b), looping — a drained body
+  may instantiate further (the v0.152 rule).
+- `Self` is a first-class binding beside the substitution stack
+  (`self_code`): plain-struct methods bind it through signature
+  interning, collection, the body scan, `*T` notes and emission
+  (§32.2 — `Self`/`@This()`/`*Self` receivers now in the subset);
+  `base_code` gains the `Self` arm and the ALIAS arm (last, mirroring
+  `alias_of`). `alloc(a, T, n)` admits a ctor-bound `T` whose concrete
+  element is a STRUCT — the slice tag now spells `type_mangle` (the
+  `kd_slice_struct_<Name>_alloc` helpers of the `ArrayList` grow path).
+- Emission: instance-method DECLS follow the plain struct methods,
+  their DEFS come last; every recorded instance emits regardless of
+  liveness, and an instantiated constructor's body is an always-walked
+  §43.1 name source (the ND_STRUCTTYPE walk reaches method bodies) — a
+  never-instantiated constructor stays pay-as-you-go.
+- The detector (both mirrors): type-constructor items (params all
+  comptime-type, else `generic-param`; a conforming `return struct
+  {…};` walks fields with the ctor params bound and methods with
+  `Self` too; any other body walks as plain statements — sema's E0310
+  remainder), applications admissible wherever a type may appear (name
+  must be a registered ctor, arguments admissible bare names or nested
+  applications), aliases + `Self` join every named-type position, and
+  ctor-call VALUE positions check their type arguments (the E0311/
+  E0312 remainders pin). Subset membership stays differentially tested
+  on all 706 files in both modes.
+- Differential (`selfhost_emit.rs`): 9 new sema-invalid pins (E0311×4/
+  E0312/E0110×2/E0251/E0100); floors 320/339 → 360/379 (365/384
+  observed); 13 new targeted cases (alias+application forms, multi
+  type params, nested composition fields, application-in-signature
+  transitive instantiation, the growable `Vec(T)` alloc-`T` pattern,
+  plain-struct `Self`, slices of instances, pointer params to
+  instances, 4 SKIP/verdict shapes). Suite: 71 → 73 in-language tests.
+  End-to-end: the selfhost-emitted C for a growable generic vector
+  compiles and runs byte-identically to the Rust pipeline.
+
 ## [0.178.0] — Self-hosting stage 21: generic functions
 
 The monomorphisation mirror lands: `selfhost/emit.ks` compiles generic
