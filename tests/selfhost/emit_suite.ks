@@ -307,11 +307,12 @@ test "detect: out-of-subset statements" {
     expect(str_eq(d.word, "union"));
     expect(d.pos == 0);
     // (`switch` v0.172, `try` v0.174, `&x` v0.175; a top-level generic
-    // fn + its call joined in v0.178 — but a NON-subset type argument
-    // keeps a verdict at the argument)
-    var d2: Det = eh_detect(a, "fn id(comptime T: type, x: i64) i64 { return x; }\nfn main() void { print(id(i64, 1)); }");
+    // fn + its call joined in v0.178; every integer width joined in
+    // v0.180 — an INADMISSIBLE type argument keeps a verdict at the
+    // argument)
+    var d2: Det = eh_detect(a, "fn id(comptime T: type, x: i64) i64 { return x; }\nfn main() void { print(id(u16, 1)); }");
     expect(!d2.found);
-    var d2b: Det = eh_detect(a, "fn id(comptime T: type, x: i64) i64 { return x; }\nfn main() void { print(id(u16, 1)); }");
+    var d2b: Det = eh_detect(a, "fn id(comptime T: type, x: i64) i64 { return x; }\nfn main() void { print(id(NoSuch, 1)); }");
     expect(d2b.found);
     expect(str_eq(d2b.word, "type-name"));
     // (`errdefer` joined in v0.174, floats in v0.177; the body still
@@ -1361,4 +1362,34 @@ test "generic structs: plain-struct Self + composition (v0.179)" {
     expect(eh_find(c2, "typedef struct { int64_t kd_v; } kd_struct_Slot__int64_t;"));
     expect(eh_find(c2, "typedef struct { kd_struct_Slot__int64_t kd_lo; kd_struct_Slot__int64_t kd_hi; } kd_struct_Pair__int64_t;"));
     expect(eh_find(c2, "kd_struct_Pair__int64_t kd_Pair__int64_t_mk(int64_t kd_x, int64_t kd_y);\n"));
+}
+
+test "integer widths: spellings, trunc-back, print routes (v0.180)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void {\n    var a2: i8 = @as(i8, 100);\n    var b: i16 = @as(i16, 30000);\n    var c2: u16 = 43690;\n    var d: u32 = 4294967295;\n    var e: u64 = @as(u64, 0) - 1;\n    print(@as(i64, ~c2));\n    print(@as(i64, c2 << 1));\n    print(d);\n    print(e);\n}");
+    // The five new widths spell their C types; `~`/`<<` over the
+    // sub-`int` widths (i8/i16/u16 — §28.4) truncate back through the
+    // operand's C type; u32/u64 do NOT promote and stay bare; every
+    // integer print routes `kd_print((long long)(…))`.
+    expect(eh_find(c, "    int8_t kd_a2 = ((int8_t)(100));\n"));
+    expect(eh_find(c, "    int16_t kd_b = ((int16_t)(30000));\n"));
+    expect(eh_find(c, "    uint16_t kd_c2 = 43690;\n"));
+    expect(eh_find(c, "    uint32_t kd_d = 4294967295;\n"));
+    expect(eh_find(c, "    uint64_t kd_e = (((uint64_t)(0)) - 1);\n"));
+    expect(eh_find(c, "((uint16_t)(~kd_c2))"));
+    expect(eh_find(c, "((uint16_t)(kd_c2 << 1))"));
+    expect(eh_find(c, "    kd_print((long long)(kd_d));\n"));
+    expect(eh_find(c, "    kd_print((long long)(kd_e));\n"));
+}
+
+test "integer widths: slices, arrays, generics (v0.180)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "fn pick(comptime T: type, x: T, y: T) T {\n    if (x > y) { return x; }\n    return y;\n}\npub fn main() void {\n    var al: Allocator = c_allocator();\n    var xs: []u32 = alloc(al, u32, 2);\n    xs[0] = 7;\n    print(@as(i64, xs[0]));\n    free(al, xs);\n    var a2: [2]u64 = [2]u64{ 1, 2 };\n    print(@as(i64, a2[1]));\n    print(@as(i64, pick(u32, 10, 20)));\n}");
+    // `[]u32` gets its typedef + helpers; `[2]u64` its array typedef;
+    // a generic instantiates at a new width with the mangled C name.
+    expect(eh_find(c, "typedef struct { uint32_t *ptr; uintptr_t len; } kd_slice_uint32_t;"));
+    expect(eh_find(c, "typedef struct { uint64_t data[2]; } kd_arr_uint64_t_2;"));
+    expect(eh_find(c, "kd_slice_uint32_t_alloc((uintptr_t)(2))"));
+    expect(eh_find(c, "uint32_t kd_pick__uint32_t(uint32_t kd_x, uint32_t kd_y);\n"));
+    expect(eh_find(c, "kd_pick__uint32_t(10, 20)"));
 }

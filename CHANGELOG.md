@@ -18,6 +18,38 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.180.0] — Self-hosting stage 23: every integer width
+
+The scalar story completes in the mirror: i8/i16/u16/u32/u64 join
+i32/i64/u8/usize, and the C-identical corpus climbs 365/384 → 384/403
+(Program/Test) — absorbing the width zoos (`s28_bitwise`, the `s33`
+widening casts, `s03` same-type arithmetic) and the width pockets across
+inference/compound/interaction sections.
+
+- `selfhost/emit.ks` (stage 23): five new ET codes with their
+  spellings (`int8_t`/`int16_t`/`uint16_t`/`uint32_t`/`uint64_t`), the
+  slice tags, and the membership predicates — `et_is_int` (all nine
+  integers, the `Type::is_int` mirror), `et_is_slice_elem` (every
+  scalar), and `et_promotes_in_c` = {i8, i16, u8, u16}: exactly the
+  sub-`int` widths whose `~`/`<<` results truncate back through the
+  operand's C type (§28.4); u32/u64 never promote and stay bare. Every
+  integer `print` keeps the `(long long)` route. The v0.156/§28.4
+  width-fidelity machinery absorbed the rest — the corpus went green on
+  the first run after the ET extension, zero emitter divergences.
+- The detector needed NO emit.ks change (the `et_*` predicates feed
+  `base_name_ok`/`elem_name_ok`/the value-param annotation rule); the
+  harness mirror extends `subset_type_name`/`subset_slice_elem` and the
+  value-param int set.
+- Differential (`selfhost_emit.rs`): 3 new sema-invalid pins (E0110 —
+  width-mismatch fixtures now subset-shaped); floors 360/379 → 379/398
+  (384/403 observed); 6 new targeted cases (the narrow trunc-back zoo,
+  u64 boundary ops, sign/zero-extending casts, `[]u32`/`[2]u64`/alloc,
+  generics + value params over the new widths, all print routes); one
+  v0.179 SKIP case re-anchored (its `u16` argument is subset now).
+  Suite: 73 → 75 in-language tests. End-to-end: a generic `Crc(u32)`
+  shift/xor accumulator, u64 boundaries and the i8 minimum run
+  identically through the selfhost C and the Rust pipeline.
+
 ## [0.179.0] — Self-hosting stage 22: generic structs
 
 Type metaprogramming lands in the mirror: `selfhost/emit.ks` compiles

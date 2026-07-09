@@ -1,13 +1,17 @@
-// emit.ks — self-host stages 3–22 (v0.161–v0.179): a C emitter for the
+// emit.ks — self-host stages 3–23 (v0.161–v0.180): a C emitter for the
 // SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
 // `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
 // `[N]T` with array literals and `for` loops, plain data STRUCTS, struct
 // METHODS + associated functions, ENUMS, `switch` with contextual `.V`
 // literals, OPTIONALS `?T`, ERROR UNIONS `!T`, POINTERS `*T`, LABELED
 // LOOPS, F64, GENERIC FUNCTIONS (v0.178: comptime type + value
-// parameters with full monomorphisation), and — v0.179 — GENERIC
-// STRUCTS: type-constructors, aliases, direct applications `Name(T)`,
-// instance methods with `Self`, and plain-struct `Self`/`@This()`),
+// parameters with full monomorphisation), GENERIC STRUCTS (v0.179:
+// type-constructors, aliases, direct applications `Name(T)`, instance
+// methods with `Self`, plain-struct `Self`/`@This()`), and — v0.180 —
+// EVERY INTEGER WIDTH: i8/i16/u16/u32/u64 join i32/i64/u8/usize (the
+// scalar story completes; `~`/`<<` truncate back through the four
+// sub-`int` widths per §28.4, u32/u64 never promote, every integer
+// print routes `(long long)`)),
 // written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
@@ -331,6 +335,12 @@ pub const ET_U8: i64 = 5;
 pub const ET_USIZE: i64 = 6;
 pub const ET_F64: i64 = 7;
 pub const ET_ALLOC: i64 = 8;
+// The remaining integer widths (v0.180) — the scalar story completes.
+pub const ET_I8: i64 = 9;
+pub const ET_I16: i64 = 10;
+pub const ET_U16: i64 = 11;
+pub const ET_U32: i64 = 12;
+pub const ET_U64: i64 = 13;
 
 // Slice types are a code FAMILY (v0.164): `ET_SLICE_BASE + <elem code>`,
 // one code per element type. `[]u8` keeps a named constant since the string
@@ -412,6 +422,11 @@ pub fn et_slice_c_name(t: i64) []u8 {
     if (e == ET_USIZE) { return "kd_slice_uintptr_t"; }
     if (e == ET_F64) { return "kd_slice_double"; }
     if (e == ET_ALLOC) { return "kd_slice_kd_allocator"; }
+    if (e == ET_I8) { return "kd_slice_int8_t"; }
+    if (e == ET_I16) { return "kd_slice_int16_t"; }
+    if (e == ET_U16) { return "kd_slice_uint16_t"; }
+    if (e == ET_U32) { return "kd_slice_uint32_t"; }
+    if (e == ET_U64) { return "kd_slice_uint64_t"; }
     return "kd_slice_void";
 }
 
@@ -428,6 +443,11 @@ pub fn et_from_name(name: []u8) i64 {
     if (str_eq(name, "usize")) { return ET_USIZE; }
     if (str_eq(name, "f64")) { return ET_F64; }
     if (str_eq(name, "Allocator")) { return ET_ALLOC; }
+    if (str_eq(name, "i8")) { return ET_I8; }
+    if (str_eq(name, "i16")) { return ET_I16; }
+    if (str_eq(name, "u16")) { return ET_U16; }
+    if (str_eq(name, "u32")) { return ET_U32; }
+    if (str_eq(name, "u64")) { return ET_U64; }
     return ET_NONE;
 }
 
@@ -446,24 +466,29 @@ pub fn et_c_name(t: i64) []u8 {
     if (t == ET_USIZE) { return "uintptr_t"; }
     if (t == ET_F64) { return "double"; }
     if (t == ET_ALLOC) { return "kd_allocator"; }
+    if (t == ET_I8) { return "int8_t"; }
+    if (t == ET_I16) { return "int16_t"; }
+    if (t == ET_U16) { return "uint16_t"; }
+    if (t == ET_U32) { return "uint32_t"; }
+    if (t == ET_U64) { return "uint64_t"; }
     return "int64_t";
 }
 
-/// `Type::is_int` over the subset (`i32`/`i64`/`u8`/`usize`).
+/// `Type::is_int` — every integer width (v0.180).
 pub fn et_is_int(t: i64) bool {
-    return t == ET_I32 or t == ET_I64 or t == ET_U8 or t == ET_USIZE;
+    return t == ET_I32 or t == ET_I64 or t == ET_U8 or t == ET_USIZE or t == ET_I8 or t == ET_I16 or t == ET_U16 or t == ET_U32 or t == ET_U64;
 }
 
-/// Whether `t` is a subset slice ELEMENT type — the five scalars `[]T` and
-/// `alloc(a, T, n)` range over (v0.164).
+/// Whether `t` is a subset slice ELEMENT type — every scalar `[]T` and
+/// `alloc(a, T, n)` range over (v0.164; all integer widths v0.180).
 pub fn et_is_slice_elem(t: i64) bool {
-    return t == ET_I32 or t == ET_I64 or t == ET_BOOL or t == ET_U8 or t == ET_USIZE or t == ET_F64;
+    return t == ET_I32 or t == ET_I64 or t == ET_BOOL or t == ET_U8 or t == ET_USIZE or t == ET_F64 or t == ET_I8 or t == ET_I16 or t == ET_U16 or t == ET_U32 or t == ET_U64;
 }
 
-/// `Emitter::promotes_in_c` over the subset: `u8` is the only sub-32-bit
-/// integer here, so a `~`/`<<` over it must truncate back (§28.2).
+/// `Emitter::promotes_in_c`: the sub-`int` integer widths — a `~`/`<<`
+/// over one must truncate back (§28.2/§28.4; i8/i16/u16 joined in v0.180).
 pub fn et_promotes_in_c(t: i64) bool {
-    return t == ET_U8;
+    return t == ET_U8 or t == ET_I8 or t == ET_I16 or t == ET_U16;
 }
 
 // --- float literals (`c_double_literal` mirror, v0.177) ---------------------------

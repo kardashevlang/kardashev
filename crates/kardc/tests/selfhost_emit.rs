@@ -1,4 +1,4 @@
-//! Self-host stages 3–22 (v0.161–v0.179): differential test of
+//! Self-host stages 3–23 (v0.161–v0.180): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -58,6 +58,10 @@
 //! body is an always-walked §43.1 name source), `Self`/`@This()` in
 //! plain-struct methods (§32.2), `alloc(a, T, n)` over a ctor-bound `T`,
 //! and instance names (`Ctor__<tags>`) memoised across every spelling —
+//! and, v0.180, EVERY INTEGER WIDTH (i8/i16/u16/u32/u64 join the subset's
+//! scalars everywhere a scalar may appear: bare, slice/array elements,
+//! `alloc`/`@as` arguments, generic type/value-param annotations; the
+//! §28.4 sub-`int` trunc-back set grows to i8/i16/u16) —
 //! written
 //! in kardashev —
 //! against the Rust
@@ -160,6 +164,9 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s03_sema/return_type_mismatch_err.ks",                // E0110
     "tests/spec/s03_sema/return_void_rules_err.ks",                   // E0110
     "tests/spec/s03_sema/unknown_name_err.ks",                        // E0100
+    "tests/spec/s03_sema/unary_operand_rules_err.ks",                 // E0110 (v0.180: int widths subset-shaped)
+    "tests/spec/s03_sema/usize_distinct_from_u64_err.ks",             // E0110 (v0.180)
+    "tests/spec/s28_bitwise/shift_same_type_err.ks",                  // E0110 (v0.180)
     "tests/spec/s03_sema/void_result_unusable_err.ks",                // E0110
     "tests/spec/s09_structs/err_duplicate_field_decl.ks",             // E0162
     "tests/spec/s09_structs/err_field_access_on_non_struct.ks",       // E0165
@@ -278,8 +285,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 360;
-const MIN_C_COMPARED_TEST: usize = 379;
+const MIN_C_COMPARED_PROGRAM: usize = 379;
+const MIN_C_COMPARED_TEST: usize = 398;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -306,12 +313,16 @@ fn subset_type_name(name: &str) -> bool {
     matches!(
         name,
         "i32" | "i64" | "bool" | "void" | "u8" | "usize" | "f64" | "Allocator"
+            | "i8" | "i16" | "u16" | "u32" | "u64"
     )
 }
 
 /// The subset slice ELEMENT spellings (`[]T` and `alloc(a, T, n)`, v0.164).
 fn subset_slice_elem(name: &str) -> bool {
-    matches!(name, "i32" | "i64" | "bool" | "u8" | "usize" | "f64")
+    matches!(
+        name,
+        "i32" | "i64" | "bool" | "u8" | "usize" | "f64" | "i8" | "i16" | "u16" | "u32" | "u64"
+    )
 }
 
 /// The detector's name context (v0.178): the declared struct/enum names,
@@ -766,7 +777,10 @@ fn det_fn(cx: &mut Cx, f: &Func, method: bool) -> Option<Hit> {
                     && !p.ty.slice
                     && p.ty.ctor_args.is_none()
                     && p.ty.error_set.is_none();
-                let int_ok = matches!(p.ty.name.as_str(), "i32" | "i64" | "u8" | "usize");
+                let int_ok = matches!(
+                    p.ty.name.as_str(),
+                    "i32" | "i64" | "u8" | "usize" | "i8" | "i16" | "u16" | "u32" | "u64"
+                );
                 if !bare || !int_ok {
                     hit = Some(("type-name", p.ty.span.start));
                     break;
@@ -1845,8 +1859,8 @@ fn selfhost_emit_differential_targeted_inputs() {
             "fn f() i64 { return 1; }\npub fn main() void {\n    var x: f(i64) = 0;\n}\n",
         ),
         (
-            "skip_app_arg_not_subset",
-            "fn Box(comptime T: type) type {\n    return struct { v: T, fn get(self: Self) T { return self.v; } };\n}\npub fn main() void {\n    var b: Box(u16) = Box(u16).init(1);\n}\n",
+            "skip_app_arg_inadmissible_name",
+            "fn Box(comptime T: type) type {\n    return struct { v: T, fn get(self: Self) T { return self.v; } };\n}\npub fn main() void {\n    var b: Box(NoSuch) = Box(NoSuch).init(1);\n}\n",
         ),
         (
             "skip_ctor_body_not_struct_return",
@@ -1855,6 +1869,31 @@ fn selfhost_emit_differential_targeted_inputs() {
         (
             "skip_self_outside_method",
             "fn f(x: Self) i64 { return 0; }\npub fn main() void { print(1); }\n",
+        ),
+        // -- the remaining integer widths (v0.180) -----------------------------------
+        (
+            "widths_narrow_trunc_back_zoo",
+            "pub fn main() void {\n    var a2: u8 = 200;\n    var b: i8 = @as(i8, 100);\n    var c: i16 = @as(i16, 30000);\n    var d: u16 = 43690;\n    print(@as(i64, ~a2));\n    print(@as(i64, ~b));\n    print(@as(i64, ~c));\n    print(@as(i64, ~d));\n    print(@as(i64, d << 1));\n    print(@as(i64, b << 1));\n}\n",
+        ),
+        (
+            "widths_u64_boundary_ops",
+            "pub fn main() void {\n    var ones: u64 = @as(u64, 0) - 1;\n    var hi: u64 = ones >> 1;\n    print(@as(i64, hi & 255));\n    var x: u32 = 4294967295;\n    print(@as(i64, x >> 16));\n    print(@as(i64, x & 65535));\n}\n",
+        ),
+        (
+            "widths_widening_casts_sign_zero_extend",
+            "pub fn main() void {\n    var a2: i8 = @as(i8, 0) - 100;\n    var w: i64 = @as(i64, a2);\n    print(w);\n    var b: u16 = 40000;\n    var wu: u32 = @as(u32, b);\n    print(@as(i64, wu));\n    var c: u8 = 255;\n    print(@as(i64, @as(u64, c)));\n}\n",
+        ),
+        (
+            "widths_slices_arrays_alloc",
+            "fn total(xs: []u32) i64 {\n    var s: i64 = 0;\n    var i: usize = 0;\n    while (i < xs.len) : (i = i + 1) { s = s + @as(i64, xs[i]); }\n    return s;\n}\npub fn main() void {\n    var al: Allocator = c_allocator();\n    var xs: []u32 = alloc(al, u32, 3);\n    xs[0] = 7;\n    xs[1] = 9;\n    xs[2] = 16;\n    print(total(xs));\n    free(al, xs);\n    var a2: [2]u64 = [2]u64{ 1, 2 };\n    print(@as(i64, a2[0] + a2[1]));\n    var b: [3]i16 = [3]i16{ @as(i16, 1), @as(i16, 2), @as(i16, 3) };\n    print(@as(i64, b[2]));\n}\n",
+        ),
+        (
+            "widths_generics_and_value_params",
+            "fn pick(comptime T: type, x: T, y: T) T {\n    if (x > y) { return x; }\n    return y;\n}\nfn repw(comptime n: u16, v: i64) i64 {\n    var s: i64 = 0;\n    var i: i64 = 0;\n    while (i < @as(i64, n)) : (i = i + 1) { s = s + v; }\n    return s;\n}\nfn Box(comptime T: type) type {\n    return struct { v: T, fn init(x: T) Self { return Self{ .v = x }; } };\n}\npub fn main() void {\n    print(@as(i64, pick(u32, 10, 20)));\n    print(@as(i64, pick(i16, @as(i16, 5), @as(i16, 3))));\n    print(repw(3, 7));\n    var b: Box(u64) = Box(u64).init(@as(u64, 9));\n    print(@as(i64, b.v));\n}\n",
+        ),
+        (
+            "widths_print_all_int_routes",
+            "pub fn main() void {\n    var a2: i8 = @as(i8, 0) - 8;\n    var b: i16 = @as(i16, 0) - 16;\n    var c: u16 = 16;\n    var d: u32 = 32;\n    var e: u64 = 64;\n    print(a2);\n    print(b);\n    print(c);\n    print(d);\n    print(e);\n}\n",
         ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
