@@ -1,4 +1,4 @@
-//! Self-host stages 3–23 (v0.161–v0.180): differential test of
+//! Self-host stages 3–24 (v0.161–v0.181): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -61,7 +61,13 @@
 //! and, v0.180, EVERY INTEGER WIDTH (i8/i16/u16/u32/u64 join the subset's
 //! scalars everywhere a scalar may appear: bare, slice/array elements,
 //! `alloc`/`@as` arguments, generic type/value-param annotations; the
-//! §28.4 sub-`int` trunc-back set grows to i8/i16/u16) —
+//! §28.4 sub-`int` trunc-back set grows to i8/i16/u16) — and, v0.181, the
+//! §32/§35/§41/§44 BUILTINS: `@sizeOf`/`@typeName` (one admissible
+//! identifier argument), `@panic`/`@readLine` (one argument, walked),
+//! `@readFile`/`@writeFile`/`@appendFile`/`@arg` (two, walked),
+//! `@argc()` (none), plus bare `unreachable` — with the runtime helpers
+//! gated on actual use, the `@argc`/`@arg` main-store wiring, and
+//! statement-position panic/unreachable divergence —
 //! written
 //! in kardashev —
 //! against the Rust
@@ -272,6 +278,13 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s29_for/elem_immutable_err.ks",                       // E0110
     "tests/spec/s29_for/index_type_err.ks",                           // E0110
     "tests/spec/s29_for/non_iterable_err.ks",                         // E0300
+    "tests/spec/s32_reflection/err_builtin_not_constant.ks",          // E0130 (v0.181: builtins subset-shaped)
+    "tests/spec/s35_panic/panic_msg_not_string_err.ks",               // E0110 (v0.181)
+    "tests/spec/s41_io/read_builtin_not_const_err.ks",                // E0130 (v0.181)
+    "tests/spec/s41_io/readfile_first_arg_not_allocator_err.ks",      // E0321 (v0.181)
+    "tests/spec/s41_io/readfile_path_not_slice_err.ks",               // E0110 (v0.181)
+    "tests/spec/s44_output_args/arg_index_not_int_err.ks",            // E0110 (v0.181)
+    "tests/spec/s44_output_args/output_builtin_not_const_err.ks",     // E0130 (v0.181)
     "tests/spec/s33_casts/err_as_not_constant.ks",                    // E0130
     "tests/spec/s33_casts/err_as_value_not_numeric.ks",               // E0321
 ];
@@ -285,8 +298,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 379;
-const MIN_C_COMPARED_TEST: usize = 398;
+const MIN_C_COMPARED_PROGRAM: usize = 409;
+const MIN_C_COMPARED_TEST: usize = 428;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -591,6 +604,30 @@ fn det_expr(cx: &Cx, e: &Expr) -> Option<Hit> {
             {
                 return det_expr(cx, &args[1]);
             }
+            // The §32.1 reflection builtins (v0.181): one identifier
+            // argument naming an admissible base.
+            if (name == "sizeOf" || name == "typeName")
+                && args.len() == 1
+                && matches!(&args[0], Expr::Ident { name, .. } if base_name_ok(cx, name))
+            {
+                return None;
+            }
+            // `@panic(msg)` / `@readLine(a)` — one argument, walked
+            // (§35.2 / §41.2, v0.181).
+            if (name == "panic" || name == "readLine") && args.len() == 1 {
+                return det_expr(cx, &args[0]);
+            }
+            // `@readFile` / `@writeFile` / `@appendFile` / `@arg` — two
+            // arguments, walked in order (§41.2 / §44.2, v0.181).
+            if (name == "readFile" || name == "writeFile" || name == "appendFile" || name == "arg")
+                && args.len() == 2
+            {
+                return args.iter().find_map(|x| det_expr(cx, x));
+            }
+            // `@argc()` — no arguments (§44.2, v0.181).
+            if name == "argc" && args.is_empty() {
+                return None;
+            }
             Some(("builtin", pos))
         }
         // A struct literal `Name{ .f = e, … }` is in the subset (v0.169):
@@ -631,7 +668,8 @@ fn det_expr(cx: &Cx, e: &Expr) -> Option<Hit> {
         Expr::Catch { expr, default, .. } => {
             det_expr(cx, expr).or_else(|| det_expr(cx, default))
         }
-        Expr::Unreachable { .. } => Some(("unreachable", pos)),
+        // `unreachable` is in the subset (v0.181, SPEC §35.2).
+        Expr::Unreachable { .. } => None,
     }
 }
 
@@ -1894,6 +1932,39 @@ fn selfhost_emit_differential_targeted_inputs() {
         (
             "widths_print_all_int_routes",
             "pub fn main() void {\n    var a2: i8 = @as(i8, 0) - 8;\n    var b: i16 = @as(i16, 0) - 16;\n    var c: u16 = 16;\n    var d: u32 = 32;\n    var e: u64 = 64;\n    print(a2);\n    print(b);\n    print(c);\n    print(d);\n    print(e);\n}\n",
+        ),
+        // -- the §32/§35/§41/§44 builtins (v0.181) ------------------------------------
+        (
+            "builtin_sizeof_typename_reflection",
+            "const Point = struct { x: i64, y: i64 };\nfn Box(comptime T: type) type {\n    return struct {\n        v: T,\n        fn describe(self: Self) usize {\n            print(@typeName(T));\n            print(@typeName(Self));\n            return @sizeOf(T);\n        }\n    };\n}\nconst IB = Box(i64);\npub fn main() void {\n    print(@as(i64, @sizeOf(i32)));\n    print(@as(i64, @sizeOf(Point)));\n    print(@typeName(i64));\n    print(@typeName(Point));\n    var b: IB = IB{ .v = 0 };\n    print(@as(i64, b.describe()));\n}\n",
+        ),
+        (
+            "builtin_panic_positions_and_divergence",
+            "fn pick(x: i64) i64 {\n    if (x > 0) { return x; }\n    @panic(\"non-positive\");\n}\nfn fallback(o: ?i64) i64 {\n    return o orelse @panic(\"absent\");\n}\npub fn main() void {\n    print(pick(3));\n    var o: ?i64 = 9;\n    print(fallback(o));\n    var n: i64 = 2;\n    switch (n) {\n        1 => { print(10); }\n        2 => { print(20); }\n        else => { @panic(\"handler missing\"); }\n    }\n}\n",
+        ),
+        (
+            "builtin_unreachable_positions",
+            "fn classify(n: i64) i64 {\n    if (n == 1) { return 100; }\n    if (n == 2) { return 200; }\n    unreachable;\n}\npub fn main() void {\n    print(classify(1));\n    print(classify(2));\n}\n",
+        ),
+        (
+            "builtin_file_roundtrip",
+            "pub fn main() void {\n    var al: Allocator = c_allocator();\n    var path: []u8 = \"/tmp/kd_v181_targeted.txt\";\n    if (@writeFile(path, \"alpha\\n\")) { print(1); }\n    if (@appendFile(path, \"beta\")) { print(2); }\n    var got: []u8 = @readFile(al, path);\n    print(got.len);\n    print(got);\n    free(al, got);\n    var missing: []u8 = @readFile(al, \"/nonexistent_kd_v181\");\n    print(missing.len);\n    free(al, missing);\n}\n",
+        ),
+        (
+            "builtin_argc_arg",
+            "pub fn main() void {\n    if (@argc() >= 1) { print(1); }\n    var al: Allocator = c_allocator();\n    var a0: []u8 = @arg(al, 0);\n    if (a0.len > 0) { print(2); }\n    free(al, a0);\n    var oob: []u8 = @arg(al, 9999);\n    print(oob.len);\n    free(al, oob);\n}\n",
+        ),
+        (
+            "builtin_argc_only_no_arg_helper",
+            "pub fn main() void {\n    print(@argc());\n}\n",
+        ),
+        (
+            "skip_builtin_bogus_name",
+            "pub fn main() void {\n    print(@bogus(1));\n}\n",
+        ),
+        (
+            "skip_sizeof_wrong_shape",
+            "pub fn main() void {\n    print(@as(i64, @sizeOf(42)));\n}\n",
         ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (

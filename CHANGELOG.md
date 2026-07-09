@@ -18,6 +18,49 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.181.0] — Self-hosting stage 24: the OS + reflection builtins
+
+The last language surface before `@import("std")`: `selfhost/emit.ks`
+compiles the §32/§35/§41/§44 builtins byte-identically, and the
+C-identical corpus climbs 384/403 → 414/433 (Program/Test) — absorbing
+`s32_reflection`, `s35_panic`, `s41_io`, `s44_output_args`, and every
+builtin pocket across sections.
+
+- `selfhost/emit.ks` (stage 24): `@sizeOf(T)` → `sizeof(<cty>)` and
+  `@typeName(T)` → a static `[]u8` — both substitution-aware (a bound
+  argument displays the concrete type's SOURCE name via the new
+  `et_source_name` `Type::name` mirror; `Self` displays its instance's
+  table name; an unbound argument spells exactly as written). `@panic`
+  and `unreachable`: the comma form `(kd_panic(m), 0)` in expression
+  position, the bare `_Noreturn` call + DIVERGENCE as a statement or
+  switch arm (the enclosing block stops, no fall-through flush).
+  `@readFile`/`@readLine`, `@writeFile`/`@appendFile` (the `!= 0`
+  bool carry, `"ab"`/`"wb"` append flag), `@argc`/`@arg`.
+- The runtime helpers land at the TYPE-DEF TAIL in the fixed order
+  (panic → readers → writer → arg), each gated on ACTUAL use by the
+  `module_uses_builtin` mirror — `bu_uses`, a whole-module walk covering
+  generic-fn and type-constructor bodies — AND the `[]u8` intern (always
+  satisfied for valid input: the builtins make sema intern it, which the
+  scan replays: `@panic`/readers/writers/`@arg` intern `[]u8` BEFORE
+  their argument walks, `@typeName` after its type argument, `@sizeOf`/
+  `@argc` never). `@argc`/`@arg` add the `kd_argc_v`/`kd_argv_v` prelude
+  statics and switch BOTH `main` wirings (program + test harness) to the
+  parameter store; without them every byte stays pre-v0.158.
+- The detector (both mirrors): shape rules per builtin — `@sizeOf`/
+  `@typeName` take one admissible identifier; `@panic`/`@readLine` one
+  walked argument; `@readFile`/`@writeFile`/`@appendFile`/`@arg` two;
+  `@argc` none; bare `unreachable` joins the subset. Mis-shapes keep the
+  `builtin` verdict; argument-TYPE errors are sema's E0110/E0130/E0321
+  remainders (7 new pins).
+- Differential (`selfhost_emit.rs`): floors 379/398 → 409/428 (414/433
+  observed); 8 new targeted cases (reflection over generics + `Self`,
+  panic in return/orelse/switch positions, unreachable divergence, a
+  file write→append→read roundtrip, argc/arg incl. out-of-range, the
+  argc-only no-helper module, 2 SKIP shapes). Suite: 75 → 77 in-language
+  tests. End-to-end: the file-I/O roundtrip and a panicking program
+  (exit 101) run byte-identically through the selfhost C and the Rust
+  pipeline.
+
 ## [0.180.0] — Self-hosting stage 23: every integer width
 
 The scalar story completes in the mirror: i8/i16/u16/u32/u64 join
