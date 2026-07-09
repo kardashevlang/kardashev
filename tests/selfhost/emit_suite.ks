@@ -1393,3 +1393,36 @@ test "integer widths: slices, arrays, generics (v0.180)" {
     expect(eh_find(c, "uint32_t kd_pick__uint32_t(uint32_t kd_x, uint32_t kd_y);\n"));
     expect(eh_find(c, "kd_pick__uint32_t(10, 20)"));
 }
+
+test "builtins: panic/unreachable divergence + reflection (v0.181)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "fn pick(x: i64) i64 {\n    if (x > 0) { return x; }\n    @panic(\"boom\");\n}\nfn nx(n: i64) i64 {\n    if (n == 1) { return 7; }\n    unreachable;\n}\npub fn main() void {\n    print(pick(1));\n    print(nx(1));\n    print(@as(i64, @sizeOf(i32)));\n    print(@typeName(i64));\n}");
+    // Statement-position `@panic`/`unreachable` lower to the bare
+    // `_Noreturn` call and DIVERGE (no fall-through flush); `kd_panic`
+    // emits at the type-def tail gated on use; `@sizeOf` spells
+    // `sizeof(<cty>)`; `@typeName` a static `[]u8` over the written name.
+    expect(eh_find(c, "_Noreturn void kd_panic(kd_slice_uint8_t m) { fwrite(m.ptr, 1, m.len, stderr); fputc(0x0a, stderr); exit(101); }"));
+    expect(eh_find(c, "    kd_panic(((kd_slice_uint8_t){ .ptr = (uint8_t *)\"boom\", .len = 4 }));\n"));
+    expect(eh_find(c, "    kd_unreachable();\n"));
+    expect(eh_find(c, "sizeof(int32_t)"));
+    expect(eh_find(c, "((kd_slice_uint8_t){ .ptr = (uint8_t *)\"i64\", .len = 3 })"));
+}
+
+test "builtins: io/argv helpers + main wiring (v0.181)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "pub fn main() void {\n    var al: Allocator = c_allocator();\n    if (@writeFile(\"/tmp/x\", \"d\")) { print(1); }\n    var s: []u8 = @readFile(al, \"/tmp/x\");\n    print(s.len);\n    free(al, s);\n    print(@argc());\n    var a0: []u8 = @arg(al, 0);\n    free(al, a0);\n}");
+    // The helpers emit at the type-def tail in a fixed order (panic →
+    // readers → writer → arg); `@argc`/`@arg` add the prelude statics and
+    // switch `main`'s parameter store on.
+    expect(eh_find(c, "static int kd_argc_v = 0;\nstatic char **kd_argv_v = 0;\n"));
+    expect(eh_find(c, "static kd_slice_uint8_t kd_read_file(kd_allocator a, kd_slice_uint8_t path)"));
+    expect(eh_find(c, "static int kd_write_file(kd_slice_uint8_t path, kd_slice_uint8_t data, int append)"));
+    expect(eh_find(c, "static kd_slice_uint8_t kd_arg(kd_allocator a, int64_t i)"));
+    expect(eh_find(c, "(kd_write_file((((kd_slice_uint8_t)"));
+    expect(eh_find(c, "((int64_t)kd_argc_v)"));
+    expect(eh_find(c, "int main(int argc, char **argv){ kd_argc_v = argc; kd_argv_v = argv; kd_main(); return 0; }"));
+    // An argc-less module keeps the pre-v0.158 `(void)` main untouched.
+    var c2: []u8 = eh_emit(a, "pub fn main() void { print(1); }");
+    expect(eh_find(c2, "int main(int argc, char **argv){ (void)argc;(void)argv; kd_main(); return 0; }"));
+    expect(!eh_find(c2, "kd_argc_v"));
+}

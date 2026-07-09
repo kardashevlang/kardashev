@@ -1,4 +1,4 @@
-// emit.ks — self-host stages 3–23 (v0.161–v0.180): a C emitter for the
+// emit.ks — self-host stages 3–24 (v0.161–v0.181): a C emitter for the
 // SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
 // `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
 // `[N]T` with array literals and `for` loops, plain data STRUCTS, struct
@@ -8,10 +8,20 @@
 // parameters with full monomorphisation), GENERIC STRUCTS (v0.179:
 // type-constructors, aliases, direct applications `Name(T)`, instance
 // methods with `Self`, plain-struct `Self`/`@This()`), and — v0.180 —
-// EVERY INTEGER WIDTH: i8/i16/u16/u32/u64 join i32/i64/u8/usize (the
-// scalar story completes; `~`/`<<` truncate back through the four
-// sub-`int` widths per §28.4, u32/u64 never promote, every integer
-// print routes `(long long)`)),
+// EVERY INTEGER WIDTH (v0.180: i8/i16/u16/u32/u64 join i32/i64/u8/usize;
+// `~`/`<<` truncate back through the four sub-`int` widths per §28.4,
+// u32/u64 never promote, every integer print routes `(long long)`), and
+// — v0.181 — the §32/§35/§41/§44 BUILTINS: `@sizeOf`/`@typeName`
+// (substitution-aware; a bound argument displays the concrete type's
+// source name, `Self` its instance), `@panic` + `unreachable` (comma-form
+// `(kd_panic(m), 0)` in expression position, the bare `_Noreturn` call +
+// DIVERGENCE as a statement/switch arm), `@readFile`/`@readLine`,
+// `@writeFile`/`@appendFile`, and `@argc`/`@arg` — each runtime helper
+// gated on ACTUAL use by the `module_uses_builtin` mirror (`bu_uses`, a
+// whole-module walk covering generic and constructor bodies) and emitted
+// at the type-def tail in the fixed panic → readers → writer → arg
+// order; `@argc`/`@arg` add the prelude statics and switch `main`'s
+// parameter store on (both program and test-harness wiring)),
 // written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
@@ -1591,6 +1601,52 @@ pub const Det = struct {
                     return;
                 }
             }
+            // The §32.1 reflection builtins (v0.181): exactly one
+            // identifier argument naming an admissible base (a scalar, a
+            // declared struct/enum, an alias, a bound type param, or a
+            // method's `Self`).
+            if (str_eq(bname, "sizeOf") or str_eq(bname, "typeName")) {
+                var s0: i32 = self.nodes[u].a;
+                if (s0 >= 0 and self.nodes[@as(usize, s0)].next < 0 and self.nodes[@as(usize, s0)].kind == ND_IDENT) {
+                    if (self.base_name_ok(self.dt_name(s0))) { return; }
+                }
+                self.hit("builtin", off);
+                return;
+            }
+            // `@panic(msg)` / `@readLine(a)` — exactly one argument, walked
+            // (SPEC §35.2 / §41.2, v0.181).
+            if (str_eq(bname, "panic") or str_eq(bname, "readLine")) {
+                var p0: i32 = self.nodes[u].a;
+                if (p0 >= 0 and self.nodes[@as(usize, p0)].next < 0) {
+                    self.check_expr(p0);
+                    return;
+                }
+                self.hit("builtin", off);
+                return;
+            }
+            // `@readFile(a, path)` / `@writeFile(p, d)` / `@appendFile(p, d)`
+            // / `@arg(a, i)` — exactly two arguments, walked in order
+            // (SPEC §41.2 / §44.2, v0.181).
+            if (str_eq(bname, "readFile") or str_eq(bname, "writeFile") or str_eq(bname, "appendFile") or str_eq(bname, "arg")) {
+                var q0: i32 = self.nodes[u].a;
+                var q1: i32 = 0 - 1;
+                var q2: i32 = 0 - 1;
+                if (q0 >= 0) { q1 = self.nodes[@as(usize, q0)].next; }
+                if (q1 >= 0) { q2 = self.nodes[@as(usize, q1)].next; }
+                if (q0 >= 0 and q1 >= 0 and q2 < 0) {
+                    self.check_expr(q0);
+                    self.check_expr(q1);
+                    return;
+                }
+                self.hit("builtin", off);
+                return;
+            }
+            // `@argc()` — no arguments (SPEC §44.2, v0.181).
+            if (str_eq(bname, "argc")) {
+                if (self.nodes[u].a < 0) { return; }
+                self.hit("builtin", off);
+                return;
+            }
             self.hit("builtin", off);
             return;
         }
@@ -1686,7 +1742,11 @@ pub const Det = struct {
             self.check_expr(self.nodes[u].b);
             return;
         }
-        if (k == ND_UNREACHABLE) { self.hit("unreachable", off); return; }
+        if (k == ND_UNREACHABLE) {
+            // `unreachable` is in the subset (v0.181, SPEC §35.2): it
+            // carries nothing to walk.
+            return;
+        }
         // Any other kind in expression position is a walker bug; surface it
         // as a mismatch rather than silently accepting.
         self.hit("bad-expr", off);
@@ -2407,6 +2467,17 @@ pub const Em = struct {
     // a separate per-instance loop under the instance substitution, and
     // the plain decl/def/liveness loops skip them.
     mt_si: []i64,
+    // The §35/§41/§44 runtime-helper gates (v0.181): whether the module
+    // uses `@panic`, `@readFile`/`@readLine`, `@writeFile`/`@appendFile`,
+    // `@argc`/`@arg` (the prelude statics + `main` store), and `@arg`
+    // specifically (the `kd_arg` helper) — the `module_uses_builtin`
+    // mirrors, scanned over EVERY item body (generic and constructor
+    // bodies included; over-counting only keeps an unused helper).
+    uses_panic: bool,
+    uses_io: bool,
+    uses_fileout: bool,
+    uses_argv: bool,
+    uses_arg: bool,
     // `EmitMode::Test` (v0.166): swaps the entry-point wiring for the test
     // harness, roots liveness at the test bodies (every function live when
     // there are none), and enables the statement-level `expect` lowering.
@@ -2525,6 +2596,11 @@ pub const Em = struct {
             .al_count = 0,
             .self_code = ET_NONE,
             .mt_si = alloc(a, i64, 8),
+            .uses_panic = false,
+            .uses_io = false,
+            .uses_fileout = false,
+            .uses_argv = false,
+            .uses_arg = false,
             .is_test = false,
         };
     }
@@ -4819,6 +4895,16 @@ pub const Em = struct {
                 }
             }
             if (str_eq(self.xname(n), "intFromEnum")) { return ET_I64; }
+            if (str_eq(self.xname(n), "sizeOf")) { return ET_USIZE; }
+            if (str_eq(self.xname(n), "typeName")) { return ET_SLICE_U8; }
+            if (str_eq(self.xname(n), "readFile")) { return ET_SLICE_U8; }
+            if (str_eq(self.xname(n), "readLine")) { return ET_SLICE_U8; }
+            if (str_eq(self.xname(n), "arg")) { return ET_SLICE_U8; }
+            if (str_eq(self.xname(n), "writeFile")) { return ET_BOOL; }
+            if (str_eq(self.xname(n), "appendFile")) { return ET_BOOL; }
+            if (str_eq(self.xname(n), "argc")) { return ET_I64; }
+            // `@panic` adopts the EXPECTED type (it diverges) — untypeable
+            // here, exactly like the Rust `None` arm.
             if (str_eq(self.xname(n), "enumFromInt")) {
                 // The enum type named by the first argument (`base_type`
                 // fallback = the Rust `None` arm).
@@ -6004,7 +6090,144 @@ pub const Em = struct {
                 sbb.deinit(a);
                 return sv;
             }
+            if (str_eq(bname0, "sizeOf")) {
+                // `@sizeOf(T)` → `sizeof(<cty T>)` (SPEC §32.1); the type
+                // argument resolves under the active substitution.
+                var z0: i32 = self.nodes[u].a;
+                var zt: i64 = ET_VOID;
+                if (z0 >= 0 and self.nodes[@as(usize, z0)].kind == ND_IDENT) {
+                    var z1: i64 = self.base_code(self.xname(z0));
+                    if (z1 != ET_NONE) { zt = z1; }
+                }
+                var sbz: StrBuilder = StrBuilder.init(a);
+                sbz.append(a, "sizeof(");
+                sbz.append(a, self.cty_of(a, zt));
+                sbz.append(a, ")");
+                var sz: []u8 = sbz.build(a);
+                sbz.deinit(a);
+                return sz;
+            }
+            if (str_eq(bname0, "typeName")) {
+                // `@typeName(T)` → a `[]u8` over a static string (SPEC
+                // §32.1): the bound type's DISPLAY name for a
+                // substitution-bound argument (`Self` included), else the
+                // name exactly as written.
+                var y0: i32 = self.nodes[u].a;
+                var disp: []u8 = "";
+                if (y0 >= 0 and self.nodes[@as(usize, y0)].kind == ND_IDENT) {
+                    var yn: []u8 = self.xname(y0);
+                    var bound: bool = self.sb_find(yn, true) >= 0;
+                    if (!bound and self.self_code != ET_NONE and str_eq(yn, "Self")) { bound = true; }
+                    if (bound) {
+                        disp = self.et_source_name(self.base_code(yn));
+                    } else {
+                        disp = yn;
+                    }
+                }
+                var lit: []u8 = es_c_string_literal(a, disp);
+                var sby: StrBuilder = StrBuilder.init(a);
+                sby.append(a, "((kd_slice_uint8_t){ .ptr = (uint8_t *)");
+                sby.append(a, lit);
+                sby.append(a, ", .len = ");
+                sby.append_i64(a, @as(i64, disp.len));
+                sby.append(a, " })");
+                var sy: []u8 = sby.build(a);
+                sby.deinit(a);
+                return sy;
+            }
+            if (str_eq(bname0, "panic")) {
+                // `@panic(msg)` in EXPRESSION position (SPEC §35.2): the
+                // comma form `(kd_panic(<msg>), 0)` — the trailing `0` is
+                // dead (`kd_panic` is `_Noreturn`).
+                var pmsg: []u8 = "((kd_slice_uint8_t){0})";
+                if (self.nodes[u].a >= 0) { pmsg = self.emit_expr(a, self.nodes[u].a); }
+                var sbp: StrBuilder = StrBuilder.init(a);
+                sbp.append(a, "(kd_panic(");
+                sbp.append(a, pmsg);
+                sbp.append(a, "), 0)");
+                var sp: []u8 = sbp.build(a);
+                sbp.deinit(a);
+                return sp;
+            }
+            if (str_eq(bname0, "readFile")) {
+                var r0: i32 = self.nodes[u].a;
+                var r1: i32 = 0 - 1;
+                if (r0 >= 0) { r1 = self.nodes[@as(usize, r0)].next; }
+                var ra: []u8 = "((kd_allocator){0})";
+                var rp: []u8 = "((kd_slice_uint8_t){0})";
+                if (r0 >= 0) { ra = self.emit_expr(a, r0); }
+                if (r1 >= 0) { rp = self.emit_expr(a, r1); }
+                var sbr: StrBuilder = StrBuilder.init(a);
+                sbr.append(a, "kd_read_file((");
+                sbr.append(a, ra);
+                sbr.append(a, "), (");
+                sbr.append(a, rp);
+                sbr.append(a, "))");
+                var sr: []u8 = sbr.build(a);
+                sbr.deinit(a);
+                return sr;
+            }
+            if (str_eq(bname0, "readLine")) {
+                var l0: i32 = self.nodes[u].a;
+                var la: []u8 = "((kd_allocator){0})";
+                if (l0 >= 0) { la = self.emit_expr(a, l0); }
+                var sbl: StrBuilder = StrBuilder.init(a);
+                sbl.append(a, "kd_read_line((");
+                sbl.append(a, la);
+                sbl.append(a, "))");
+                var sl: []u8 = sbl.build(a);
+                sbl.deinit(a);
+                return sl;
+            }
+            if (str_eq(bname0, "writeFile") or str_eq(bname0, "appendFile")) {
+                var w0: i32 = self.nodes[u].a;
+                var w1: i32 = 0 - 1;
+                if (w0 >= 0) { w1 = self.nodes[@as(usize, w0)].next; }
+                var wp: []u8 = "((kd_slice_uint8_t){0})";
+                var wd: []u8 = "((kd_slice_uint8_t){0})";
+                if (w0 >= 0) { wp = self.emit_expr(a, w0); }
+                if (w1 >= 0) { wd = self.emit_expr(a, w1); }
+                var apf: []u8 = "0";
+                if (str_eq(bname0, "appendFile")) { apf = "1"; }
+                var sbw: StrBuilder = StrBuilder.init(a);
+                sbw.append(a, "(kd_write_file((");
+                sbw.append(a, wp);
+                sbw.append(a, "), (");
+                sbw.append(a, wd);
+                sbw.append(a, "), ");
+                sbw.append(a, apf);
+                sbw.append(a, ") != 0)");
+                var sw: []u8 = sbw.build(a);
+                sbw.deinit(a);
+                return sw;
+            }
+            if (str_eq(bname0, "argc")) {
+                return "((int64_t)kd_argc_v)";
+            }
+            if (str_eq(bname0, "arg")) {
+                var g0: i32 = self.nodes[u].a;
+                var g1: i32 = 0 - 1;
+                if (g0 >= 0) { g1 = self.nodes[@as(usize, g0)].next; }
+                var ga: []u8 = "((kd_allocator){0})";
+                var gi: []u8 = "0";
+                if (g0 >= 0) { ga = self.emit_expr(a, g0); }
+                if (g1 >= 0) { gi = self.emit_expr(a, g1); }
+                var sbg: StrBuilder = StrBuilder.init(a);
+                sbg.append(a, "kd_arg((");
+                sbg.append(a, ga);
+                sbg.append(a, "), (");
+                sbg.append(a, gi);
+                sbg.append(a, "))");
+                var sg: []u8 = sbg.build(a);
+                sbg.deinit(a);
+                return sg;
+            }
             return "0";
+        }
+        if (k == ND_UNREACHABLE) {
+            // `unreachable` in EXPRESSION position (SPEC §35.2): the comma
+            // form, exactly like `@panic`.
+            return "(kd_unreachable(), 0)";
         }
         // Unreachable behind the detector: keep the output well-formed.
         return "0";
@@ -7174,6 +7397,26 @@ pub const Em = struct {
         if (k == ND_SWITCH) {
             return self.emit_switch(a, n);
         }
+        // v0.141 runtime-safety traps as statements / switch arms (SPEC
+        // §35.2): the bare `_Noreturn` call (no `, 0` comma form), and the
+        // statement DIVERGES — the enclosing block stops, no fall-through
+        // flush (v0.181).
+        if (k == ND_UNREACHABLE) {
+            self.line(a, "kd_unreachable();");
+            return true;
+        }
+        if (k == ND_BUILTIN and str_eq(self.xname(n), "panic")) {
+            var pm: []u8 = "((kd_slice_uint8_t){0})";
+            if (self.nodes[u].a >= 0) { pm = self.emit_expr(a, self.nodes[u].a); }
+            var sbpn: StrBuilder = StrBuilder.init(a);
+            sbpn.append(a, "kd_panic(");
+            sbpn.append(a, pm);
+            sbpn.append(a, ");");
+            var spn: []u8 = sbpn.build(a);
+            sbpn.deinit(a);
+            self.line(a, spn);
+            return true;
+        }
         // In Test mode, `expect(c)` is a statement-level construct returning
         // a failure code through the deferred-return path (SPEC §4.5):
         // `if (!(<c>)) { <flush all defers> return 1; }`.
@@ -7612,6 +7855,179 @@ pub const Em = struct {
         if (k == ND_BREAK or k == ND_CONTINUE) { return; }
         // An expression statement.
         self.collect_calls_expr(a, pend, pendm, n);
+    }
+
+    /// Whether a `@builtin` whose name is in the `which` class appears
+    /// ANYWHERE (the `module_uses_builtin` mirror, v0.181): classes are
+    /// 1 = panic, 2 = readFile/readLine, 3 = writeFile/appendFile,
+    /// 4 = argc/arg, 5 = arg. The walk covers every item body — generic
+    /// fns and type-constructor struct methods included.
+    fn bu_name_hits(self: *Self, n: i32, which: i64) bool {
+        var bn: []u8 = self.xname(n);
+        if (which == 1) { return str_eq(bn, "panic"); }
+        if (which == 2) { return str_eq(bn, "readFile") or str_eq(bn, "readLine"); }
+        if (which == 3) { return str_eq(bn, "writeFile") or str_eq(bn, "appendFile"); }
+        if (which == 4) { return str_eq(bn, "argc") or str_eq(bn, "arg"); }
+        return str_eq(bn, "arg");
+    }
+
+    fn bu_scan_expr(self: *Self, n: i32, which: i64) bool {
+        if (n < 0) { return false; }
+        var u: usize = @as(usize, n);
+        var k: u8 = self.nodes[u].kind;
+        if (k == ND_BUILTIN and self.bu_name_hits(n, which)) { return true; }
+        // Chained children (args / list heads) walk via their `next` links.
+        if (k == ND_CALL or k == ND_BUILTIN or k == ND_ALIT or k == ND_MCALL or k == ND_SLIT) {
+            var c0: i32 = self.nodes[u].a;
+            if (k == ND_ALIT or k == ND_MCALL) { c0 = self.nodes[u].b; }
+            if (k == ND_MCALL) {
+                if (self.bu_scan_expr(self.nodes[u].a, which)) { return true; }
+            }
+            if (k == ND_SLIT) {
+                var fcur: i32 = self.nodes[u].a;
+                while (fcur >= 0) {
+                    if (self.bu_scan_expr(self.nodes[@as(usize, fcur)].a, which)) { return true; }
+                    fcur = self.nodes[@as(usize, fcur)].next;
+                }
+                return false;
+            }
+            var cc: i32 = c0;
+            while (cc >= 0) {
+                if (self.bu_scan_expr(cc, which)) { return true; }
+                cc = self.nodes[@as(usize, cc)].next;
+            }
+            return false;
+        }
+        if (k == ND_UNARY or k == ND_COMPTIME or k == ND_FIELD or k == ND_UNWRAP or k == ND_TRY or k == ND_ADDROF or k == ND_DEREF) {
+            return self.bu_scan_expr(self.nodes[u].a, which);
+        }
+        if (k == ND_BIN or k == ND_INDEX or k == ND_ORELSE or k == ND_CATCH) {
+            if (self.bu_scan_expr(self.nodes[u].a, which)) { return true; }
+            return self.bu_scan_expr(self.nodes[u].b, which);
+        }
+        if (k == ND_SLICEX) {
+            if (self.bu_scan_expr(self.nodes[u].a, which)) { return true; }
+            if (self.bu_scan_expr(self.nodes[u].b, which)) { return true; }
+            return self.bu_scan_expr(self.nodes[u].c, which);
+        }
+        if (k == ND_STRUCTTYPE) {
+            var stm: i32 = self.nodes[u].b;
+            while (stm >= 0) {
+                if (self.bu_scan_block(self.nodes[@as(usize, stm)].c, which)) { return true; }
+                stm = self.nodes[@as(usize, stm)].next;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    fn bu_scan_block(self: *Self, block: i32, which: i64) bool {
+        if (block < 0) { return false; }
+        var cur: i32 = self.nodes[@as(usize, block)].a;
+        while (cur >= 0) {
+            if (self.bu_scan_stmt(cur, which)) { return true; }
+            cur = self.nodes[@as(usize, cur)].next;
+        }
+        return false;
+    }
+
+    fn bu_scan_stmt(self: *Self, n: i32, which: i64) bool {
+        if (n < 0) { return false; }
+        var u: usize = @as(usize, n);
+        var k: u8 = self.nodes[u].kind;
+        if (k == ND_LET) { return self.bu_scan_expr(self.nodes[u].b, which); }
+        if (k == ND_ASSIGN) { return self.bu_scan_expr(self.nodes[u].a, which); }
+        if (k == ND_PASSIGN) {
+            if (self.bu_scan_expr(self.nodes[u].a, which)) { return true; }
+            return self.bu_scan_expr(self.nodes[u].b, which);
+        }
+        if (k == ND_RETURN) { return self.bu_scan_expr(self.nodes[u].a, which); }
+        if (k == ND_IF) {
+            if (self.bu_scan_expr(self.nodes[u].a, which)) { return true; }
+            if (self.bu_scan_block(self.nodes[u].b, which)) { return true; }
+            return self.bu_scan_stmt(self.nodes[u].c, which);
+        }
+        if (k == ND_WHILE) {
+            if (self.bu_scan_expr(self.nodes[u].a, which)) { return true; }
+            if (self.bu_scan_stmt(self.nodes[u].b, which)) { return true; }
+            return self.bu_scan_block(self.nodes[u].c, which);
+        }
+        if (k == ND_FOR) {
+            if (self.bu_scan_expr(self.nodes[u].a, which)) { return true; }
+            return self.bu_scan_block(self.nodes[u].b, which);
+        }
+        if (k == ND_DEFER or k == ND_ERRDEFER) { return self.bu_scan_stmt(self.nodes[u].a, which); }
+        if (k == ND_BLOCK) { return self.bu_scan_block(n, which); }
+        if (k == ND_SWITCH) {
+            if (self.bu_scan_expr(self.nodes[u].a, which)) { return true; }
+            var arm: i32 = self.nodes[u].b;
+            while (arm >= 0) {
+                var au: usize = @as(usize, arm);
+                var lab: i32 = self.nodes[au].a;
+                while (lab >= 0) {
+                    if (self.bu_scan_expr(lab, which)) { return true; }
+                    lab = self.nodes[@as(usize, lab)].next;
+                }
+                if (self.bu_scan_block(self.nodes[au].c, which)) { return true; }
+                arm = self.nodes[au].next;
+            }
+            return self.bu_scan_block(self.nodes[u].c, which);
+        }
+        if (k == ND_BREAK or k == ND_CONTINUE) { return false; }
+        return self.bu_scan_expr(n, which);
+    }
+
+    fn bu_uses(self: *Self, which: i64) bool {
+        var cur: i32 = self.root;
+        while (cur >= 0) {
+            var u: usize = @as(usize, cur);
+            var k: u8 = self.nodes[u].kind;
+            var hit: bool = false;
+            if (k == ND_FN) {
+                hit = self.bu_scan_block(self.nodes[u].c, which);
+            } else if (k == ND_CONST) {
+                hit = self.bu_scan_expr(self.nodes[u].b, which);
+            } else if (k == ND_TEST) {
+                hit = self.bu_scan_block(self.nodes[u].a, which);
+            } else if (k == ND_STRUCT) {
+                var m: i32 = self.nodes[u].b;
+                while (m >= 0 and !hit) {
+                    hit = self.bu_scan_block(self.nodes[@as(usize, m)].c, which);
+                    m = self.nodes[@as(usize, m)].next;
+                }
+            }
+            if (hit) { return true; }
+            cur = self.nodes[u].next;
+        }
+        return false;
+    }
+
+    /// `Type::name` over the subset — the SOURCE spelling (`@typeName`'s
+    /// display for a substitution-bound scalar; a struct displays its
+    /// table name, an enum the generic word, mirroring
+    /// `type_display_name`).
+    fn et_source_name(self: *Self, t: i64) []u8 {
+        if (t == ET_I8) { return "i8"; }
+        if (t == ET_I16) { return "i16"; }
+        if (t == ET_I32) { return "i32"; }
+        if (t == ET_I64) { return "i64"; }
+        if (t == ET_U8) { return "u8"; }
+        if (t == ET_U16) { return "u16"; }
+        if (t == ET_U32) { return "u32"; }
+        if (t == ET_U64) { return "u64"; }
+        if (t == ET_USIZE) { return "usize"; }
+        if (t == ET_F64) { return "f64"; }
+        if (t == ET_BOOL) { return "bool"; }
+        if (t == ET_VOID) { return "void"; }
+        if (t == ET_ALLOC) { return "Allocator"; }
+        if (et_is_struct(t)) { return self.st_name_of(t); }
+        if (et_is_enum(t)) { return "enum"; }
+        if (et_is_slice(t)) { return "slice"; }
+        if (et_is_arr(t)) { return "array"; }
+        if (et_is_opt(t)) { return "optional"; }
+        if (et_is_erru(t)) { return "error union"; }
+        if (et_is_ptr(t)) { return "pointer"; }
+        return "void";
     }
 
     /// `live_functions` for the subset: the worklist closure of called
@@ -8327,15 +8743,40 @@ pub const Em = struct {
             // arg resolves through `resolve_type_arg`, identifier-only).
             // v0.171: `@intFromEnum(e)` checks its one value argument;
             // `@enumFromInt(E, n)` resolves `E` without walking it and
-            // checks only `n` — the same shape as `@as`.
-            if (str_eq(self.xname(n), "as") or str_eq(self.xname(n), "enumFromInt")) {
+            // checks only `n` — the same shape as `@as`. v0.181: the
+            // §35/§41/§44 builtins intern `[]u8` BEFORE their argument
+            // walks (sema computes the expected slice first); `@typeName`
+            // interns it after resolving its type argument; `@sizeOf` and
+            // `@argc` intern nothing.
+            var bnm: []u8 = self.xname(n);
+            if (str_eq(bnm, "as") or str_eq(bnm, "enumFromInt")) {
                 var b0: i32 = self.nodes[u].a;
                 var b1: i32 = 0 - 1;
                 if (b0 >= 0) { b1 = self.nodes[@as(usize, b0)].next; }
                 self.intern_expr(a, b1);
+                return;
             }
-            if (str_eq(self.xname(n), "intFromEnum")) {
+            if (str_eq(bnm, "intFromEnum")) {
                 self.intern_expr(a, self.nodes[u].a);
+                return;
+            }
+            if (str_eq(bnm, "typeName")) {
+                self.intern_elem(a, ET_U8);
+                return;
+            }
+            if (str_eq(bnm, "panic") or str_eq(bnm, "readLine")) {
+                self.intern_elem(a, ET_U8);
+                self.intern_expr(a, self.nodes[u].a);
+                return;
+            }
+            if (str_eq(bnm, "readFile") or str_eq(bnm, "writeFile") or str_eq(bnm, "appendFile") or str_eq(bnm, "arg")) {
+                self.intern_elem(a, ET_U8);
+                var f0: i32 = self.nodes[u].a;
+                while (f0 >= 0) {
+                    self.intern_expr(a, f0);
+                    f0 = self.nodes[@as(usize, f0)].next;
+                }
+                return;
             }
             return;
         }
@@ -8780,6 +9221,28 @@ pub const Em = struct {
             self.visit_type_def(a, seen, et_slice_of(self.slices[i]));
         }
         free(a, seen);
+        // The §35/§41/§44 runtime helpers (v0.181) — at the TAIL of the
+        // type-def section (each takes/returns `kd_slice_uint8_t`), gated
+        // on actual use AND the `[]u8` intern (always satisfied for valid
+        // input — the builtins themselves make sema intern it).
+        var has_u8: bool = false;
+        var hi: usize = 0;
+        while (hi < self.sl_len) : (hi += 1) {
+            if (self.slices[hi] == ET_U8) { has_u8 = true; }
+        }
+        if (self.uses_panic and has_u8) {
+            self.line(a, "_Noreturn void kd_panic(kd_slice_uint8_t m) { fwrite(m.ptr, 1, m.len, stderr); fputc(0x0a, stderr); exit(101); }");
+        }
+        if (self.uses_io and has_u8) {
+            self.line(a, "static kd_slice_uint8_t kd_read_file(kd_allocator a, kd_slice_uint8_t path) { (void)a; kd_slice_uint8_t r; r.ptr = 0; r.len = 0; char* p = (char*)malloc(path.len + 1); if (!p) return r; for (uintptr_t i = 0; i < path.len; i++) p[i] = (char)path.ptr[i]; p[path.len] = 0; FILE* f = fopen(p, \"rb\"); free(p); if (!f) return r; if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return r; } long sz = ftell(f); if (sz < 0) { fclose(f); return r; } fseek(f, 0, SEEK_SET); uint8_t* buf = (uint8_t*)malloc((uintptr_t)sz + 1); if (!buf) { fclose(f); return r; } size_t got = fread(buf, 1, (size_t)sz, f); fclose(f); r.ptr = buf; r.len = (uintptr_t)got; return r; }");
+            self.line(a, "static kd_slice_uint8_t kd_read_line(kd_allocator a) { (void)a; uintptr_t cap = 64, len = 0; uint8_t* buf = (uint8_t*)malloc(cap); kd_slice_uint8_t r; r.ptr = buf; r.len = 0; if (!buf) return r; int c; while ((c = getchar()) != EOF && c != 10) { if (len + 1 > cap) { cap *= 2; uint8_t* nb = (uint8_t*)realloc(buf, cap); if (!nb) { r.ptr = buf; r.len = len; return r; } buf = nb; } buf[len++] = (uint8_t)c; } r.ptr = buf; r.len = len; return r; }");
+        }
+        if (self.uses_fileout and has_u8) {
+            self.line(a, "static int kd_write_file(kd_slice_uint8_t path, kd_slice_uint8_t data, int append) { char* p = (char*)malloc(path.len + 1); if (!p) return 0; for (uintptr_t i = 0; i < path.len; i++) p[i] = (char)path.ptr[i]; p[path.len] = 0; FILE* f = fopen(p, append ? \"ab\" : \"wb\"); free(p); if (!f) return 0; size_t put = data.len ? fwrite(data.ptr, 1, data.len, f) : 0; int ok = (put == data.len); if (fclose(f) != 0) ok = 0; return ok; }");
+        }
+        if (self.uses_arg and has_u8) {
+            self.line(a, "static kd_slice_uint8_t kd_arg(kd_allocator a, int64_t i) { (void)a; kd_slice_uint8_t r; r.ptr = 0; r.len = 0; if (i < 0 || i >= (int64_t)kd_argc_v || !kd_argv_v) return r; const char* s = kd_argv_v[i]; size_t n = strlen(s); uint8_t* buf = (uint8_t*)malloc(n + 1); if (!buf) return r; for (size_t j = 0; j < n; j++) buf[j] = (uint8_t)s[j]; r.ptr = buf; r.len = (uintptr_t)n; return r; }");
+        }
         self.blank(a);
     }
 
@@ -9015,6 +9478,11 @@ pub const Em = struct {
         self.put(a, "static void kd_print(long long v) { printf(\"%lld\\n\", v); }\n");
         self.put(a, "static void kd_print_f64(double x) { printf(\"%g\\n\", x); }\n");
         self.put(a, "_Noreturn void kd_unreachable(void) { fputs(\"reached unreachable code\\n\", stderr); exit(101); }\n");
+        // v0.158 argv access (SPEC §44.2): the statics `main` stores its
+        // parameters into — gated on actual `@argc`/`@arg` use.
+        if (self.uses_argv) {
+            self.put(a, "static int kd_argc_v = 0;\nstatic char **kd_argv_v = 0;\n");
+        }
         self.blank(a);
     }
 
@@ -9292,10 +9760,19 @@ pub const Em = struct {
             }
             cur = self.nodes[u].next;
         }
+        // v0.158 (SPEC §44.2): with `@argc`/`@arg` in use, `main` stores
+        // its parameters into the prelude statics; otherwise byte-identical
+        // to the pre-v0.158 output.
+        var store: []u8 = "(void)argc;(void)argv;";
+        if (self.uses_argv) { store = "kd_argc_v = argc; kd_argv_v = argv;"; }
         if (is_int) {
-            self.put(a, "int main(int argc, char **argv){ (void)argc;(void)argv; return (int) kd_main(); }\n");
+            self.put(a, "int main(int argc, char **argv){ ");
+            self.put(a, store);
+            self.put(a, " return (int) kd_main(); }\n");
         } else {
-            self.put(a, "int main(int argc, char **argv){ (void)argc;(void)argv; kd_main(); return 0; }\n");
+            self.put(a, "int main(int argc, char **argv){ ");
+            self.put(a, store);
+            self.put(a, " kd_main(); return 0; }\n");
         }
     }
 
@@ -9394,6 +9871,11 @@ pub const Em = struct {
         self.blank(a);
         self.line(a, "int main(int argc, char **argv) {");
         self.indent += 1;
+        // A test body may use `@argc`/`@arg` too (SPEC §44.2) — store the
+        // parameters exactly like program `main` (v0.181).
+        if (self.uses_argv) {
+            self.line(a, "kd_argc_v = argc; kd_argv_v = argv;");
+        }
         self.line(a, "const char *filter = 0; int bench = 0;");
         self.line(a, "for (int ai = 1; ai < argc; ai++) {");
         self.indent += 1;
@@ -9469,6 +9951,13 @@ pub const Em = struct {
         // enqueued after the 2b drain ran; drain again.
         self.drain_pending(a);
         self.compute_live(a);
+        // The §35/§41/§44 helper gates (v0.181) — scanned over the whole
+        // module, mirroring the Rust `module_uses_*` pre-passes.
+        self.uses_panic = self.bu_uses(1);
+        self.uses_io = self.bu_uses(2);
+        self.uses_fileout = self.bu_uses(3);
+        self.uses_argv = self.bu_uses(4);
+        self.uses_arg = self.bu_uses(5);
         self.emit_prelude(a);
         self.emit_type_defs(a);
         self.emit_consts(a);
