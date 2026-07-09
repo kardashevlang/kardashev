@@ -1324,3 +1324,41 @@ test "generics: liveness sources + test-discovered instances (v0.178)" {
     expect(eh_find(c2, "int64_t kd_id__int64_t(int64_t kd_x);\n"));
     expect(eh_find(c2, "int64_t kd_id__int64_t(int64_t kd_x) {\n    return (kd_x);\n}\n"));
 }
+
+test "generic structs: instances, Self, applications (v0.179)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "fn Box(comptime T: type) type {\n    return struct {\n        val: T,\n        fn init(v: T) Self { return Self{ .val = v }; }\n        fn get(self: Self) T { return self.val; }\n        fn set(self: *Self, v: T) void { self.val = v; }\n    };\n}\nconst IntBox = Box(i64);\npub fn main() void {\n    var b: IntBox = IntBox.init(41);\n    print(b.get());\n    b.set(7);\n    var c2: Box(i32) = Box(i32).init(@as(i32, 5));\n    print(c2.get());\n}");
+    // One monomorphised struct per (ctor, args) tuple — the alias and the
+    // direct application share `Box__int64_t`; methods emit per instance
+    // as `kd_<Instance>_<method>` with `Self` resolved to the instance; a
+    // `*Self` receiver takes the auto-ref matrix.
+    expect(eh_find(c, "typedef struct { int64_t kd_val; } kd_struct_Box__int64_t;"));
+    expect(eh_find(c, "typedef struct { int32_t kd_val; } kd_struct_Box__int32_t;"));
+    expect(eh_find(c, "kd_struct_Box__int64_t kd_Box__int64_t_init(int64_t kd_v);\n"));
+    expect(eh_find(c, "void kd_Box__int64_t_set(kd_struct_Box__int64_t* kd_self, int64_t kd_v);\n"));
+    expect(eh_find(c, "    kd_struct_Box__int64_t kd_b = kd_Box__int64_t_init(41);\n"));
+    expect(eh_find(c, "    kd_Box__int64_t_set((&(kd_b)), 7);\n"));
+    expect(eh_find(c, "    kd_struct_Box__int32_t kd_c2 = kd_Box__int32_t_init(((int32_t)(5)));\n"));
+    expect(eh_find(c, "int64_t kd_Box__int64_t_init(int64_t kd_v) {\n    return (((kd_struct_Box__int64_t){ .kd_val = (kd_v) }));\n}\n") == false);
+    // The instance methods define AFTER the plain functions, under the
+    // instance substitution: `Self{ … }` spells the instance compound
+    // literal.
+    expect(eh_find(c, "kd_struct_Box__int64_t kd_Box__int64_t_init(int64_t kd_v) {\n    return (((kd_struct_Box__int64_t){ .kd_val = kd_v }));\n}\n"));
+}
+
+test "generic structs: plain-struct Self + composition (v0.179)" {
+    var a: Allocator = c_allocator();
+    // `Self`/`@This()` in a PLAIN struct's methods (§32.2) resolve to the
+    // enclosing struct in signatures and bodies.
+    var c: []u8 = eh_emit(a, "const Point = struct {\n    x: i64,\n    fn mk(x: i64) Self { return Self{ .x = x }; }\n    fn bump(self: *@This()) void { self.x = self.x + 1; }\n};\npub fn main() void {\n    var p: Point = Point.mk(3);\n    p.bump();\n    print(p.x);\n}");
+    expect(eh_find(c, "kd_struct_Point kd_Point_mk(int64_t kd_x);\n"));
+    expect(eh_find(c, "void kd_Point_bump(kd_struct_Point* kd_self);\n"));
+    expect(eh_find(c, "    kd_Point_bump((&(kd_p)));\n"));
+    // Composition: a ctor field of ANOTHER instance type keeps windows
+    // intact (two-phase field resolution) and the dependency walk orders
+    // the inner typedef first.
+    var c2: []u8 = eh_emit(a, "fn Slot(comptime T: type) type {\n    return struct { v: T, fn of(x: T) Self { return Self{ .v = x }; } };\n}\nfn Pair(comptime T: type) type {\n    return struct {\n        lo: Slot(T),\n        hi: Slot(T),\n        fn mk(x: T, y: T) Self { return Self{ .lo = Slot(T).of(x), .hi = Slot(T).of(y) }; }\n    };\n}\npub fn main() void {\n    var p: Pair(i64) = Pair(i64).mk(4, 5);\n    print(p.lo.v + p.hi.v);\n}");
+    expect(eh_find(c2, "typedef struct { int64_t kd_v; } kd_struct_Slot__int64_t;"));
+    expect(eh_find(c2, "typedef struct { kd_struct_Slot__int64_t kd_lo; kd_struct_Slot__int64_t kd_hi; } kd_struct_Pair__int64_t;"));
+    expect(eh_find(c2, "kd_struct_Pair__int64_t kd_Pair__int64_t_mk(int64_t kd_x, int64_t kd_y);\n"));
+}

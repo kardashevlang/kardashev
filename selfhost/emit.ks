@@ -1,11 +1,14 @@
-// emit.ks — self-host stages 3–21 (v0.161–v0.178): a C emitter for the
+// emit.ks — self-host stages 3–22 (v0.161–v0.179): a C emitter for the
 // SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
 // `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
 // `[N]T` with array literals and `for` loops, plain data STRUCTS, struct
 // METHODS + associated functions, ENUMS, `switch` with contextual `.V`
 // literals, OPTIONALS `?T`, ERROR UNIONS `!T`, POINTERS `*T`, LABELED
-// LOOPS, F64, and — v0.178 — GENERIC FUNCTIONS: comptime type + value
-// parameters with full monomorphisation), written in
+// LOOPS, F64, GENERIC FUNCTIONS (v0.178: comptime type + value
+// parameters with full monomorphisation), and — v0.179 — GENERIC
+// STRUCTS: type-constructors, aliases, direct applications `Name(T)`,
+// instance methods with `Self`, and plain-struct `Self`/`@This()`),
+// written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
 // the Rust emitter's output in BOTH `EmitMode::Program` and (v0.166)
@@ -155,7 +158,37 @@
 // pointee first registered by a LATER-discovered instance is not yet
 // in the registry while an EARLIER instance's body is scanned (Rust
 // registers all instance pointees up front from sema's completed
-// table) — no corpus shape reaches the difference:
+// table) — no corpus shape reaches the difference. v0.179 adds GENERIC
+// STRUCTS (SPEC §25/§26/§31/§42): the type-constructor registry
+// (bare-`type` returns, compile-time only), the Pass-0d alias loop
+// (`const A = Ctor(…);` — instantiate + bind, item order, before
+// signatures), and LAZY application instantiation at every type
+// resolution point (`intern_ty`/`st_resolve_field`/the MCALL
+// application receiver), all memoised by the `Ctor__<tags>` mangle
+// into ONE struct row whose synthesized name lives in the `nm_buf`
+// arena (a struct-table offset >= src.len). An instantiation resolves
+// FIELDS first (two-phase: types into a scratch, rows pushed
+// contiguously — a nested `lo: Slot(T)` field recursion must not
+// interleave the windows), then notes the methods' `*T` pointees,
+// registers each method SIGNATURE row under `{ params → args }` plus
+// `Self` (the `self_code` binding beside the substitution stack; a
+// `*Self`/`*<Instance>` first param is the pointer receiver), and
+// RECORDS the instance AFTER those signatures (a signature's nested
+// application — `fn lo() Box(T)` — records first, exactly like
+// `record_struct_instance`'s position in sema); the method BODIES
+// drain from the pending queue after the const fold (2b) and after
+// the body scan (3b), looping. `base_code` gains the `Self` arm and
+// the ALIAS arm (last, mirroring `alias_of`); plain-struct methods
+// bind `self_code` through signature interning, collection, the body
+// scan, pt notes, and emission (§32.2). Emission: instance-method
+// decls follow the plain methods, their DEFS come last; every
+// recorded instance emits (liveness notwithstanding) while an
+// instantiated ctor's body is an always-walked name source (the
+// ND_STRUCTTYPE walk reaches method bodies) — a never-instantiated
+// ctor stays pay-as-you-go. `alloc(a, T, n)` admits a bound `T` whose
+// concrete element is a STRUCT (the tag spells `type_mangle`), and
+// the assoc-call receiver set grows to aliases, `Self`, struct-bound
+// type params, and direct applications:
 // v0.173 adds OPTIONALS `?T` — over bare subset names only (a
 // composite inner `?[]u8`/`??T` is a PARSE error): `kd_opt_<mangle>`
 // typedefs + `_orelse`/`_unwrap` helpers seed between structs and
@@ -1007,9 +1040,23 @@ pub const Det = struct {
     // lookups walk the node by need (zero-allocation, like is_struct_name).
     dfn: i32,
     dmeth: bool,
+    // The enclosing TYPE-CONSTRUCTOR while walking its struct body (v0.179,
+    // SPEC §25/§26): its comptime params bind type names inside the fields
+    // and methods. `dself` = `Self`/`@This()` is admissible — inside ANY
+    // struct method (plain since §32.2, generic-struct since §26.1).
+    dctor: i32,
+    dself: bool,
 
     fn init(src: []u8, nodes: []Node, root: i32) Self {
-        return Det{ .src = src, .nodes = nodes, .found = false, .word = "", .pos = 0, .droot = root, .dfn = 0 - 1, .dmeth = false };
+        return Det{ .src = src, .nodes = nodes, .found = false, .word = "", .pos = 0, .droot = root, .dfn = 0 - 1, .dmeth = false, .dctor = 0 - 1, .dself = false };
+    }
+
+    /// The base-name spelling of a type node: an `@This()` node carries no
+    /// source bytes and reads as the synthesized `Self` (v0.179).
+    fn dt_name(self: *Self, n: i32) []u8 {
+        var u: usize = @as(usize, n);
+        if ((self.nodes[u].flags & F_THIS) != 0) { return "Self"; }
+        return self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
     }
 
     /// Whether the current fn is a top-level generic binding `name` as a
@@ -1017,18 +1064,122 @@ pub const Det = struct {
     /// sema binds comptime params by filter-zip, not source position, so a
     /// comptime param after a runtime param still binds.
     fn is_type_param(self: *Self, name: []u8) bool {
-        if (self.dfn < 0 or self.dmeth) { return false; }
-        var p: i32 = self.nodes[@as(usize, self.dfn)].a;
-        while (p >= 0) {
-            var pu: usize = @as(usize, p);
-            if ((self.nodes[pu].flags & F_COMPTIME) != 0 and es_ty_is_type_kw(self.src, self.nodes, self.nodes[pu].a)) {
-                if (str_eq(self.src[self.nodes[pu].xoff .. self.nodes[pu].xoff + self.nodes[pu].xlen], name)) {
-                    return true;
+        if (self.dfn >= 0 and !self.dmeth) {
+            var p: i32 = self.nodes[@as(usize, self.dfn)].a;
+            while (p >= 0) {
+                var pu: usize = @as(usize, p);
+                if ((self.nodes[pu].flags & F_COMPTIME) != 0 and es_ty_is_type_kw(self.src, self.nodes, self.nodes[pu].a)) {
+                    if (str_eq(self.src[self.nodes[pu].xoff .. self.nodes[pu].xoff + self.nodes[pu].xlen], name)) {
+                        return true;
+                    }
                 }
+                p = self.nodes[pu].next;
             }
-            p = self.nodes[pu].next;
+        }
+        // The enclosing type-constructor's params (v0.179) bind inside its
+        // struct body — fields AND methods (a valid ctor's params are all
+        // comptime type params; malformed ones are rejected at the item).
+        if (self.dctor >= 0) {
+            var cp: i32 = self.nodes[@as(usize, self.dctor)].a;
+            while (cp >= 0) {
+                var cpu: usize = @as(usize, cp);
+                if ((self.nodes[cpu].flags & F_COMPTIME) != 0 and es_ty_is_type_kw(self.src, self.nodes, self.nodes[cpu].a)) {
+                    if (str_eq(self.src[self.nodes[cpu].xoff .. self.nodes[cpu].xoff + self.nodes[cpu].xlen], name)) {
+                        return true;
+                    }
+                }
+                cp = self.nodes[cpu].next;
+            }
         }
         return false;
+    }
+
+    /// The top-level TYPE-CONSTRUCTOR (bare-`type` return) named `name`,
+    /// or -1 (v0.179, SPEC §25). First declaration wins.
+    fn tc_node_of(self: *Self, name: []u8) i32 {
+        var cur: i32 = self.droot;
+        while (cur >= 0) {
+            var u: usize = @as(usize, cur);
+            if (self.nodes[u].kind == ND_FN and es_ty_is_type_kw(self.src, self.nodes, self.nodes[u].b)) {
+                if (str_eq(self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen], name)) {
+                    return cur;
+                }
+            }
+            cur = self.nodes[u].next;
+        }
+        return 0 - 1;
+    }
+
+    /// Whether `name` is a TYPE ALIAS — a top-level `const Alias = Ctor(…);`
+    /// whose initializer calls a registered type-constructor (v0.179).
+    fn is_alias_name(self: *Self, name: []u8) bool {
+        var cur: i32 = self.droot;
+        while (cur >= 0) {
+            var u: usize = @as(usize, cur);
+            if (self.nodes[u].kind == ND_CONST and self.nodes[u].b >= 0) {
+                var bu: usize = @as(usize, self.nodes[u].b);
+                if (self.nodes[bu].kind == ND_CALL) {
+                    if (self.tc_node_of(self.src[self.nodes[bu].xoff .. self.nodes[bu].xoff + self.nodes[bu].xlen]) >= 0) {
+                        if (str_eq(self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen], name)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            cur = self.nodes[u].next;
+        }
+        return false;
+    }
+
+    /// Whether a BARE base name is admissible in a general type position
+    /// (v0.179): a subset scalar, a declared struct/enum, a bound type
+    /// param, a type alias, or — inside a struct method (plain §32.2 or
+    /// generic-struct §26.1) — `Self`.
+    fn base_name_ok(self: *Self, name: []u8) bool {
+        if (et_from_name(name) != ET_NONE) { return true; }
+        if (self.is_struct_name(name)) { return true; }
+        if (self.is_type_param(name)) { return true; }
+        if (self.is_alias_name(name)) { return true; }
+        if (self.dself and str_eq(name, "Self")) { return true; }
+        return false;
+    }
+
+    /// The slice/array ELEMENT variant: a scalar must be a slice-element
+    /// spelling (`void`/`Allocator` stay out); named types as above.
+    fn elem_name_ok(self: *Self, name: []u8) bool {
+        var e: i64 = et_from_name(name);
+        if (e != ET_NONE) { return et_is_slice_elem(e); }
+        if (self.is_struct_name(name)) { return true; }
+        if (self.is_type_param(name)) { return true; }
+        if (self.is_alias_name(name)) { return true; }
+        if (self.dself and str_eq(name, "Self")) { return true; }
+        return false;
+    }
+
+    /// A type-position APPLICATION `Name(A, …)` (v0.179, SPEC §42): the
+    /// name must be a type-constructor (`type-form` otherwise — the
+    /// pre-v0.179 verdict); each argument — grammar-guaranteed a bare name
+    /// or a nested application — checks recursively. Arity is sema's
+    /// E0311 concern, never subset membership.
+    fn check_app(self: *Self, n: i32) void {
+        if (self.found) { return; }
+        var u: usize = @as(usize, n);
+        if (self.tc_node_of(self.dt_name(n)) < 0) {
+            self.hit("type-form", self.nodes[u].off);
+            return;
+        }
+        var arg: i32 = self.nodes[u].a;
+        while (arg >= 0) {
+            if (self.found) { return; }
+            var au: usize = @as(usize, arg);
+            if ((self.nodes[au].flags & F_APP) != 0) {
+                self.check_app(arg);
+            } else if (!self.base_name_ok(self.dt_name(arg))) {
+                self.hit("type-name", self.nodes[au].off);
+                return;
+            }
+            arg = self.nodes[au].next;
+        }
     }
 
     /// Whether the current fn binds `name` as a comptime VALUE parameter
@@ -1112,29 +1263,38 @@ pub const Det = struct {
         if ((fl & F_ARRPARAM) != 0) {
             // `[n]T` (v0.178): in the subset iff `n` names a comptime VALUE
             // parameter of the enclosing top-level generic; the element rule
-            // matches `[N]T` (a bound type param included). Otherwise the
-            // pre-v0.178 `type-form` verdict stands.
+            // matches `[N]T`. Otherwise the pre-v0.178 `type-form` verdict
+            // stands.
             if (!self.is_value_param(self.src[self.nodes[u].yoff .. self.nodes[u].yoff + self.nodes[u].ylen])) {
                 self.hit("type-form", self.nodes[u].off);
                 return;
             }
-            var apn: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
-            if (!et_is_slice_elem(et_from_name(apn)) and !self.is_struct_name(apn) and !self.is_type_param(apn)) {
+            if ((fl & F_APP) != 0) {
+                self.check_app(n);
+                return;
+            }
+            if (!self.elem_name_ok(self.dt_name(n))) {
                 self.hit("type-name", self.nodes[u].off);
             }
             return;
         }
-        var forms: i64 = F_APP | F_ESETTHIS;
-        if ((fl & forms) != 0) {
+        if ((fl & F_ESETTHIS) != 0) {
             self.hit("type-form", self.nodes[u].off);
+            return;
+        }
+        if ((fl & F_APP) != 0) {
+            // A direct application `Name(A, …)` (v0.179, SPEC §42) — every
+            // prefix wrapper (`?`/`!`/`*`/`[]`/`[N]`) composes over it, so
+            // the base check is the whole check.
+            self.check_app(n);
             return;
         }
         if ((fl & F_OPT) != 0) {
             // `?T` over a bare subset name (v0.173; a composite inner is a
             // PARSE error, so `?` never coexists with the other forms). A
-            // bound type param is a subset name (v0.178).
-            var oname: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
-            if (et_from_name(oname) == ET_NONE and !self.is_struct_name(oname) and !self.is_type_param(oname)) {
+            // bound type param (v0.178), an alias, or a method's `Self`
+            // (v0.179) are subset names.
+            if (!self.base_name_ok(self.dt_name(n))) {
                 self.hit("type-name", self.nodes[u].off);
             }
             return;
@@ -1142,35 +1302,30 @@ pub const Det = struct {
         if ((fl & F_ERR) != 0) {
             // `!T` / `Set!T` over a bare subset payload name (v0.174; the
             // set name is sema's E0330 membership concern).
-            var pname: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
-            if (et_from_name(pname) == ET_NONE and !self.is_struct_name(pname) and !self.is_type_param(pname)) {
+            if (!self.base_name_ok(self.dt_name(n))) {
                 self.hit("type-name", self.nodes[u].off);
             }
             return;
         }
         if ((fl & F_PTR) != 0) {
             // `*T` over a bare subset pointee name (v0.175; `*` never
-            // combines with the other forms in the grammar).
-            var ptn: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
-            if (et_from_name(ptn) == ET_NONE and !self.is_struct_name(ptn) and !self.is_type_param(ptn)) {
+            // combines with the other forms in the grammar). `*Self` /
+            // `*@This()` are method receivers (v0.179).
+            if (!self.base_name_ok(self.dt_name(n))) {
                 self.hit("type-name", self.nodes[u].off);
             }
             return;
         }
-        if ((fl & F_THIS) != 0) {
-            self.hit("type-name", self.nodes[u].off);
-            return;
-        }
-        var name: []u8 = self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen];
         if ((fl & F_ARRLIT) != 0 or (fl & F_SLICE) != 0) {
             // `[N]T` / `[]T` over the five scalar element types, a declared
-            // struct element (v0.169), or a bound type param (v0.178).
-            if (!et_is_slice_elem(et_from_name(name)) and !self.is_struct_name(name) and !self.is_type_param(name)) {
+            // struct element (v0.169), a bound type param (v0.178), an
+            // alias, or a method's `Self` (v0.179).
+            if (!self.elem_name_ok(self.dt_name(n))) {
                 self.hit("type-name", self.nodes[u].off);
             }
             return;
         }
-        if (et_from_name(name) == ET_NONE and !self.is_struct_name(name) and !self.is_type_param(name)) {
+        if (!self.base_name_ok(self.dt_name(n))) {
             self.hit("type-name", self.nodes[u].off);
         }
     }
@@ -1267,6 +1422,32 @@ pub const Det = struct {
                 self.check_expr_list(self.nodes[u].a);
                 return;
             }
+            var tcn: i32 = self.tc_node_of(callee);
+            if (tcn >= 0) {
+                // A type-constructor application in VALUE position (v0.179):
+                // the associated-call receiver `List(i32).init(…)`, an alias
+                // initializer `const L = List(i32);`, or a stray value use
+                // (sema's E0312). The arguments are TYPE arguments — an
+                // identifier must name an admissible base, a nested
+                // application recurses through this same branch; any other
+                // shape walks as an expression (sema's E0311).
+                var targ: i32 = self.nodes[u].a;
+                while (targ >= 0) {
+                    if (self.found) { return; }
+                    var tau: usize = @as(usize, targ);
+                    if (self.nodes[tau].kind == ND_IDENT) {
+                        var tn4: []u8 = self.src[self.nodes[tau].xoff .. self.nodes[tau].xoff + self.nodes[tau].xlen];
+                        if (!self.base_name_ok(tn4)) {
+                            self.hit("type-name", self.nodes[tau].off);
+                            return;
+                        }
+                    } else {
+                        self.check_expr(targ);
+                    }
+                    targ = self.nodes[tau].next;
+                }
+                return;
+            }
             var gfn: i32 = self.gf_node_of(callee);
             if (gfn >= 0) {
                 // A call to a top-level GENERIC fn (v0.178): the leading
@@ -1288,8 +1469,12 @@ pub const Det = struct {
                         if (es_ty_is_type_kw(self.src, self.nodes, self.nodes[gpu].a)) {
                             var gau: usize = @as(usize, garg);
                             if (self.nodes[gau].kind == ND_IDENT) {
+                                // An alias or a method's `Self` also names
+                                // a concrete type here (v0.179 —
+                                // `resolve_type_arg_generic` goes subst →
+                                // `resolve_base`, aliases included).
                                 var tn2: []u8 = self.src[self.nodes[gau].xoff .. self.nodes[gau].xoff + self.nodes[gau].xlen];
-                                if (et_from_name(tn2) == ET_NONE and !self.is_struct_name(tn2) and !self.is_type_param(tn2)) {
+                                if (!self.base_name_ok(tn2)) {
                                     self.hit("type-name", self.nodes[gau].off);
                                     return;
                                 }
@@ -1601,9 +1786,56 @@ pub const Det = struct {
         if (self.found) { return; }
         self.dfn = n;
         self.dmeth = method;
+        // `Self` binds inside ANY struct method — plain (§32.2) or
+        // generic-struct (§26.1) — for the signature and body alike.
+        self.dself = method;
         self.check_fn_inner(n, method);
         self.dfn = 0 - 1;
         self.dmeth = false;
+        self.dself = false;
+    }
+
+    /// A TYPE-CONSTRUCTOR item (v0.179, SPEC §25): every parameter must be
+    /// a comptime TYPE parameter (`generic-param` at the first violation);
+    /// a conforming body (`return struct { … };`) walks its field types
+    /// (ctor params bound) then its methods (params + `Self` bound); any
+    /// other body shape walks as ordinary statements — sema's E0310
+    /// remainder, never subset membership.
+    fn check_ctor(self: *Self, n: i32) void {
+        if (self.found) { return; }
+        var u: usize = @as(usize, n);
+        var p: i32 = self.nodes[u].a;
+        while (p >= 0) {
+            if (self.found) { return; }
+            var pu: usize = @as(usize, p);
+            if ((self.nodes[pu].flags & F_COMPTIME) == 0 or !es_ty_is_type_kw(self.src, self.nodes, self.nodes[pu].a)) {
+                self.hit("generic-param", self.nodes[pu].off);
+                return;
+            }
+            p = self.nodes[pu].next;
+        }
+        self.dctor = n;
+        var body: i32 = self.nodes[u].c;
+        var s0: i32 = self.nodes[@as(usize, body)].a;
+        var stn: i32 = 0 - 1;
+        if (s0 >= 0 and self.nodes[@as(usize, s0)].next < 0 and self.nodes[@as(usize, s0)].kind == ND_RETURN) {
+            stn = self.nodes[@as(usize, s0)].a;
+        }
+        if (stn >= 0 and self.nodes[@as(usize, stn)].kind == ND_STRUCTTYPE) {
+            var fcur: i32 = self.nodes[@as(usize, stn)].a;
+            while (fcur >= 0 and !self.found) {
+                self.check_type(self.nodes[@as(usize, fcur)].a);
+                fcur = self.nodes[@as(usize, fcur)].next;
+            }
+            var mcur: i32 = self.nodes[@as(usize, stn)].b;
+            while (mcur >= 0 and !self.found) {
+                self.check_fn(mcur, true);
+                mcur = self.nodes[@as(usize, mcur)].next;
+            }
+        } else {
+            self.check_block(body);
+        }
+        self.dctor = 0 - 1;
     }
 
     fn check_fn_inner(self: *Self, n: i32, method: bool) void {
@@ -1686,7 +1918,10 @@ pub fn es_detect_mode(src: []u8, nodes: []Node, root: i32, program_mode: bool) D
         if (d.found) { return d; }
         var u: usize = @as(usize, cur);
         var k: u8 = nodes[u].kind;
-        if (k == ND_FN) {
+        if (k == ND_FN and es_ty_is_type_kw(src, nodes, nodes[u].b)) {
+            // A type-returning fn is a TYPE CONSTRUCTOR (v0.179, SPEC §25).
+            d.check_ctor(cur);
+        } else if (k == ND_FN) {
             d.check_fn(cur, false);
         } else if (k == ND_CONST) {
             d.check_type(nodes[u].a);
@@ -2103,6 +2338,50 @@ pub const Em = struct {
     // identifier (generic-call value args — sema's `const_env`; the plain
     // `comptime`-fold keeps the Rust consts-only environment).
     ev_vsubst: bool,
+    // The TYPE-CONSTRUCTOR registry (v0.179, SPEC §25): top-level fns whose
+    // return type is the bare `type` keyword — compile-time only, never in
+    // `fns`/`gf`, never emitted.
+    tc_noff: []i64,
+    tc_nlen: []i64,
+    tc_node: []i32,
+    tc_count: usize,
+    // The synthesized-name arena (v0.179): a monomorphised instance
+    // struct's name (`Ctor__<tags>`) has no source span; a struct-table
+    // name offset >= src.len indexes here at (offset - src.len).
+    nm_buf: []u8,
+    nm_len: usize,
+    // Recorded generic-struct instances (`struct_instances` mirror), in
+    // discovery order: instance struct code + ctor row + an argument
+    // window (TYPE codes) into the flat table. Only method-carrying
+    // instances are recorded (a fields-only instance stays off, v0.129).
+    si_st: []i64,
+    si_tc: []i64,
+    si_astart: []i64,
+    si_acount: []i64,
+    si_count: usize,
+    sa_code: []i64,
+    sa_count: usize,
+    // The pending instance-method queue (`pending_ctor_methods` mirror):
+    // si rows whose method BODIES await their walk; drained after the
+    // const fold (pass 2b) and after the body scan (pass 3b), looping —
+    // a drained body may instantiate further (v0.152).
+    pq_si: []i64,
+    pq_count: usize,
+    pq_next: usize,
+    // Type aliases (`type_aliases` mirror): alias name span -> struct code.
+    al_noff: []i64,
+    al_nlen: []i64,
+    al_code: []i64,
+    al_count: usize,
+    // The contextual `Self` binding (`with_self_bound` / the instance
+    // msubst): the enclosing struct's code during struct-method signature
+    // resolution, scanning and emission; ET_NONE outside methods.
+    self_code: i64,
+    // Which si row an mt row belongs to (-1 = a plain struct's method):
+    // instance rows serve TYPING (mt_ret/params); their emission runs in
+    // a separate per-instance loop under the instance substitution, and
+    // the plain decl/def/liveness loops skip them.
+    mt_si: []i64,
     // `EmitMode::Test` (v0.166): swaps the entry-point wiring for the test
     // harness, roots liveness at the test bodies (every function live when
     // there are none), and enables the statement-level `expect` lowering.
@@ -2199,6 +2478,28 @@ pub const Em = struct {
             .sb_start = 0,
             .sb_end = 0,
             .ev_vsubst = false,
+            .tc_noff = alloc(a, i64, 4),
+            .tc_nlen = alloc(a, i64, 4),
+            .tc_node = alloc(a, i32, 4),
+            .tc_count = 0,
+            .nm_buf = alloc(a, u8, 64),
+            .nm_len = 0,
+            .si_st = alloc(a, i64, 4),
+            .si_tc = alloc(a, i64, 4),
+            .si_astart = alloc(a, i64, 4),
+            .si_acount = alloc(a, i64, 4),
+            .si_count = 0,
+            .sa_code = alloc(a, i64, 8),
+            .sa_count = 0,
+            .pq_si = alloc(a, i64, 4),
+            .pq_count = 0,
+            .pq_next = 0,
+            .al_noff = alloc(a, i64, 4),
+            .al_nlen = alloc(a, i64, 4),
+            .al_code = alloc(a, i64, 4),
+            .al_count = 0,
+            .self_code = ET_NONE,
+            .mt_si = alloc(a, i64, 8),
             .is_test = false,
         };
     }
@@ -2284,9 +2585,7 @@ pub const Em = struct {
     fn st_code_of(self: *Self, name: []u8) i64 {
         var i: usize = 0;
         while (i < self.st_count) : (i += 1) {
-            var off: usize = @as(usize, self.st_name_off[i]);
-            var len: usize = @as(usize, self.st_name_len[i]);
-            if (str_eq(self.src[off .. off + len], name)) {
+            if (str_eq(self.st_name_text(i), name)) {
                 return ET_STRUCT_BASE + @as(i64, i);
             }
         }
@@ -2296,11 +2595,9 @@ pub const Em = struct {
     /// `StructTable::c_name`: `kd_struct_<Name>`.
     fn st_c_name(self: *Self, a: Allocator, t: i64) []u8 {
         var i: usize = @as(usize, t - ET_STRUCT_BASE);
-        var off: usize = @as(usize, self.st_name_off[i]);
-        var len: usize = @as(usize, self.st_name_len[i]);
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, "kd_struct_");
-        sb.append(a, self.src[off .. off + len]);
+        sb.append(a, self.st_name_text(i));
         var out: []u8 = sb.build(a);
         sb.deinit(a);
         return out;
@@ -2336,11 +2633,9 @@ pub const Em = struct {
         }
         if (et_is_struct(t)) {
             var i: usize = @as(usize, t - ET_STRUCT_BASE);
-            var off: usize = @as(usize, self.st_name_off[i]);
-            var len: usize = @as(usize, self.st_name_len[i]);
             var sb: StrBuilder = StrBuilder.init(a);
             sb.append(a, "struct_");
-            sb.append(a, self.src[off .. off + len]);
+            sb.append(a, self.st_name_text(i));
             var out: []u8 = sb.build(a);
             sb.deinit(a);
             return out;
@@ -2646,6 +2941,668 @@ pub const Em = struct {
         self.sb_end = self.sb_len;
     }
 
+    // -- generic structs / type-constructors (v0.179, SPEC §25/§26/§31/§42) ------
+    //
+    // The type-metaprogramming mirror. Sema collects type-constructors in
+    // Pass 0d, instantiates `const Alias = Ctor(…);` aliases immediately
+    // after (item order), and instantiates APPLICATIONS lazily wherever a
+    // type resolves; each method-carrying instantiation registers its
+    // method SIGNATURES at once and defers the method-BODY checks to the
+    // pending queue, drained after the const fold (pass 2b) and again
+    // after the body pass (pass 3b) — looping, since a drained body may
+    // instantiate further. The replay below reproduces that walk; the
+    // emission loops then emit each instance's methods under
+    // `{ params → args, Self → the instance }`.
+
+    /// The base-name spelling of a type node: an `@This()` node carries no
+    /// source bytes and reads as the synthesized `Self` (v0.179).
+    fn tname(self: *Self, n: i32) []u8 {
+        var u: usize = @as(usize, n);
+        if ((self.nodes[u].flags & F_THIS) != 0) { return "Self"; }
+        return self.xname(n);
+    }
+
+    /// Whether a fn node is a TYPE CONSTRUCTOR (bare-`type` return).
+    fn fn_is_ctor(self: *Self, fnode: i32) bool {
+        return es_ty_is_type_kw(self.src, self.nodes, self.nodes[@as(usize, fnode)].b);
+    }
+
+    /// The struct-table NAME text of struct row `i` — a source span, or a
+    /// synthesized-arena slice when the offset is past the source (v0.179).
+    fn st_name_text(self: *Self, i: usize) []u8 {
+        var off: usize = @as(usize, self.st_name_off[i]);
+        var len: usize = @as(usize, self.st_name_len[i]);
+        if (off >= self.src.len) {
+            var p: usize = off - self.src.len;
+            return self.nm_buf[p .. p + len];
+        }
+        return self.src[off .. off + len];
+    }
+
+    /// Append `bytes` to the synthesized-name arena, returning the ENCODED
+    /// offset (`src.len + position`) a struct-table row stores.
+    fn nm_add(self: *Self, a: Allocator, bytes: []u8) usize {
+        while (self.nm_len + bytes.len > self.nm_buf.len) {
+            var g: []u8 = alloc(a, u8, self.nm_buf.len * 2);
+            var i: usize = 0;
+            while (i < self.nm_len) : (i += 1) { g[i] = self.nm_buf[i]; }
+            free(a, self.nm_buf);
+            self.nm_buf = g;
+        }
+        var j: usize = 0;
+        while (j < bytes.len) : (j += 1) { self.nm_buf[self.nm_len + j] = bytes[j]; }
+        var enc: usize = self.src.len + self.nm_len;
+        self.nm_len += bytes.len;
+        return enc;
+    }
+
+    /// The type-constructor row for `name`, or -1. First declaration wins.
+    fn tc_row_of(self: *Self, name: []u8) i64 {
+        var i: usize = 0;
+        while (i < self.tc_count) : (i += 1) {
+            var off: usize = @as(usize, self.tc_noff[i]);
+            var len: usize = @as(usize, self.tc_nlen[i]);
+            if (str_eq(self.src[off .. off + len], name)) { return @as(i64, i); }
+        }
+        return 0 - 1;
+    }
+
+    /// The aliased struct code for `name`, or ET_NONE (the `alias_of`
+    /// mirror — consulted LAST in `base_code`, after enums).
+    fn al_code_of(self: *Self, name: []u8) i64 {
+        var i: usize = 0;
+        while (i < self.al_count) : (i += 1) {
+            var off: usize = @as(usize, self.al_noff[i]);
+            var len: usize = @as(usize, self.al_nlen[i]);
+            if (str_eq(self.src[off .. off + len], name)) { return self.al_code[i]; }
+        }
+        return ET_NONE;
+    }
+
+    /// Register every top-level type-constructor (Pass 0d's first loop).
+    fn tc_collect(self: *Self, a: Allocator) void {
+        var cur: i32 = self.root;
+        while (cur >= 0) {
+            var u: usize = @as(usize, cur);
+            if (self.nodes[u].kind == ND_FN and self.fn_is_ctor(cur)) {
+                if (self.tc_count == self.tc_node.len) {
+                    var g1: []i64 = alloc(a, i64, self.tc_noff.len * 2);
+                    var g2: []i64 = alloc(a, i64, self.tc_nlen.len * 2);
+                    var g3: []i32 = alloc(a, i32, self.tc_node.len * 2);
+                    var i: usize = 0;
+                    while (i < self.tc_count) : (i += 1) {
+                        g1[i] = self.tc_noff[i];
+                        g2[i] = self.tc_nlen[i];
+                        g3[i] = self.tc_node[i];
+                    }
+                    free(a, self.tc_noff);
+                    free(a, self.tc_nlen);
+                    free(a, self.tc_node);
+                    self.tc_noff = g1;
+                    self.tc_nlen = g2;
+                    self.tc_node = g3;
+                }
+                self.tc_noff[self.tc_count] = @as(i64, self.nodes[u].xoff);
+                self.tc_nlen[self.tc_count] = @as(i64, self.nodes[u].xlen);
+                self.tc_node[self.tc_count] = cur;
+                self.tc_count += 1;
+            }
+            cur = self.nodes[u].next;
+        }
+    }
+
+    /// The `return struct { … };` node of a conforming constructor body,
+    /// or -1 (`type_ctor_struct_fields`' shape rule).
+    fn tc_struct_node(self: *Self, tcrow: i64) i32 {
+        var gnode: i32 = self.tc_node[@as(usize, tcrow)];
+        var body: i32 = self.nodes[@as(usize, gnode)].c;
+        var s0: i32 = self.nodes[@as(usize, body)].a;
+        if (s0 < 0 or self.nodes[@as(usize, s0)].next >= 0) { return 0 - 1; }
+        if (self.nodes[@as(usize, s0)].kind != ND_RETURN) { return 0 - 1; }
+        var stn: i32 = self.nodes[@as(usize, s0)].a;
+        if (stn < 0 or self.nodes[@as(usize, stn)].kind != ND_STRUCTTYPE) { return 0 - 1; }
+        return stn;
+    }
+
+    /// The application/instance NAME `Ctor__<tag1>_<tag2>…` (the
+    /// `instantiate_type_ctor` / `application_mangle` naming contract —
+    /// the two mirrors must stay byte-identical).
+    fn app_name(self: *Self, a: Allocator, tcrow: i64, args: []i64, nargs: usize) []u8 {
+        var off: usize = @as(usize, self.tc_noff[@as(usize, tcrow)]);
+        var len: usize = @as(usize, self.tc_nlen[@as(usize, tcrow)]);
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, self.src[off .. off + len]);
+        sb.append(a, "__");
+        var i: usize = 0;
+        while (i < nargs) : (i += 1) {
+            if (i > 0) { sb.append(a, "_"); }
+            sb.append(a, self.mangle_of(a, args[i]));
+        }
+        var out: []u8 = sb.build(a);
+        sb.deinit(a);
+        return out;
+    }
+
+    /// The si row whose instance struct is `stcode`, or -1 (the
+    /// `record_struct_instance` per-id dedup).
+    fn si_find(self: *Self, stcode: i64) i64 {
+        var i: usize = 0;
+        while (i < self.si_count) : (i += 1) {
+            if (self.si_st[i] == stcode) { return @as(i64, i); }
+        }
+        return 0 - 1;
+    }
+
+    /// Push + activate the substitution window for instance row `ii` —
+    /// ctor params (declaration order) × the recorded argument codes, plus
+    /// `Self` → the instance (via `self_code`). The caller saves/restores
+    /// (sb_start, sb_end, sb_len, self_code).
+    fn sb_activate_si(self: *Self, a: Allocator, ii: usize) void {
+        var start: usize = self.sb_len;
+        var gnode: i32 = self.tc_node[@as(usize, self.si_tc[ii])];
+        var ai: i64 = self.si_astart[ii];
+        var aend: i64 = self.si_astart[ii] + self.si_acount[ii];
+        var p: i32 = self.nodes[@as(usize, gnode)].a;
+        while (p >= 0) {
+            var pu: usize = @as(usize, p);
+            if ((self.nodes[pu].flags & F_COMPTIME) != 0 and ai < aend) {
+                self.sb_push(a, self.nodes[pu].xoff, self.nodes[pu].xlen, true, self.sa_code[@as(usize, ai)]);
+                ai += 1;
+            }
+            p = self.nodes[pu].next;
+        }
+        self.sb_start = start;
+        self.sb_end = self.sb_len;
+        self.self_code = self.si_st[ii];
+    }
+
+    /// Instantiate constructor row `tcrow` at the concrete codes
+    /// `args[0..nargs]` (the `instantiate_type_ctor` mirror): memoised by
+    /// the mangled name; a NEW instance registers a struct row (fields
+    /// resolved + interned under `{ params → args }`, declaration order),
+    /// then — when the constructor declares methods — notes their written
+    /// `*T` pointees, registers each method's SIGNATURE row under the
+    /// method substitution (+ `Self`), enqueues the body walks, and
+    /// records the si row. Returns the instance struct CODE.
+    fn instantiate_ctor(self: *Self, a: Allocator, tcrow: i64, args: []i64, nargs: usize) i64 {
+        var mangled: []u8 = self.app_name(a, tcrow, args, nargs);
+        var existing: i64 = self.st_code_of(mangled);
+        if (existing != ET_NONE) {
+            free(a, mangled);
+            return existing;
+        }
+        // A fresh struct-table row, named in the synthesized arena.
+        var noff: usize = self.nm_add(a, mangled);
+        var nlen: usize = mangled.len;
+        free(a, mangled);
+        if (self.st_count == self.st_name_off.len) {
+            var g0: []i64 = alloc(a, i64, self.st_name_off.len * 2);
+            var g1: []i64 = alloc(a, i64, self.st_name_len.len * 2);
+            var g2: []i64 = alloc(a, i64, self.st_f_start.len * 2);
+            var g3: []i64 = alloc(a, i64, self.st_f_count.len * 2);
+            var i0: usize = 0;
+            while (i0 < self.st_count) : (i0 += 1) {
+                g0[i0] = self.st_name_off[i0];
+                g1[i0] = self.st_name_len[i0];
+                g2[i0] = self.st_f_start[i0];
+                g3[i0] = self.st_f_count[i0];
+            }
+            free(a, self.st_name_off);
+            free(a, self.st_name_len);
+            free(a, self.st_f_start);
+            free(a, self.st_f_count);
+            self.st_name_off = g0;
+            self.st_name_len = g1;
+            self.st_f_start = g2;
+            self.st_f_count = g3;
+        }
+        self.st_name_off[self.st_count] = @as(i64, noff);
+        self.st_name_len[self.st_count] = @as(i64, nlen);
+        self.st_f_start[self.st_count] = 0;
+        self.st_f_count[self.st_count] = 0;
+        var strow: usize = self.st_count;
+        self.st_count += 1;
+        var stcode: i64 = ET_STRUCT_BASE + @as(i64, strow);
+        var stn: i32 = self.tc_struct_node(tcrow);
+        // The field substitution `{ params → args }` (NO `Self` — sema
+        // binds it for METHODS only, §26.2).
+        var s0: usize = self.sb_start;
+        var s1: usize = self.sb_end;
+        var cand: usize = self.sb_len;
+        var gnode: i32 = self.tc_node[@as(usize, tcrow)];
+        var pp: i32 = self.nodes[@as(usize, gnode)].a;
+        var pi: usize = 0;
+        while (pp >= 0) {
+            var ppu: usize = @as(usize, pp);
+            if ((self.nodes[ppu].flags & F_COMPTIME) != 0 and pi < nargs) {
+                self.sb_push(a, self.nodes[ppu].xoff, self.nodes[ppu].xlen, true, args[pi]);
+                pi += 1;
+            }
+            pp = self.nodes[ppu].next;
+        }
+        var cend: usize = self.sb_len;
+        self.sb_start = cand;
+        self.sb_end = cend;
+        // The field substitution carries NO `Self` and no ambient method
+        // context (sema builds a FRESH map for fields, §26.2).
+        var sv_self0: i64 = self.self_code;
+        self.self_code = ET_NONE;
+        // Fields (declaration order), interning composites exactly where
+        // sema's `resolve_type_opt_with` does. TWO PHASES: resolving a
+        // field may RECURSE into a nested instantiation (`lo: Slot(T)`),
+        // whose own sf rows must not interleave with this window — so the
+        // types resolve into a scratch first (Rust builds a local Vec and
+        // `set_fields` once), then the rows push contiguously.
+        var nf: i64 = 0;
+        if (stn >= 0) {
+            var fc0: i32 = self.nodes[@as(usize, stn)].a;
+            while (fc0 >= 0) {
+                nf += 1;
+                fc0 = self.nodes[@as(usize, fc0)].next;
+            }
+        }
+        var fcap: usize = @as(usize, nf);
+        if (fcap == 0) { fcap = 1; }
+        var ftys: []i64 = alloc(a, i64, fcap);
+        var fidx: usize = 0;
+        if (stn >= 0) {
+            var fcur0: i32 = self.nodes[@as(usize, stn)].a;
+            while (fcur0 >= 0) {
+                ftys[fidx] = self.st_resolve_field(a, self.nodes[@as(usize, fcur0)].a);
+                fidx += 1;
+                fcur0 = self.nodes[@as(usize, fcur0)].next;
+            }
+        }
+        self.st_f_start[strow] = @as(i64, self.sf_count);
+        if (stn >= 0) {
+            var fcur: i32 = self.nodes[@as(usize, stn)].a;
+            fidx = 0;
+            while (fcur >= 0) {
+                var fu: usize = @as(usize, fcur);
+                if (self.sf_count == self.sf_name_off.len) {
+                    var h0: []i64 = alloc(a, i64, self.sf_name_off.len * 2);
+                    var h1: []i64 = alloc(a, i64, self.sf_name_len.len * 2);
+                    var h2: []i64 = alloc(a, i64, self.sf_ty.len * 2);
+                    var j0: usize = 0;
+                    while (j0 < self.sf_count) : (j0 += 1) {
+                        h0[j0] = self.sf_name_off[j0];
+                        h1[j0] = self.sf_name_len[j0];
+                        h2[j0] = self.sf_ty[j0];
+                    }
+                    free(a, self.sf_name_off);
+                    free(a, self.sf_name_len);
+                    free(a, self.sf_ty);
+                    self.sf_name_off = h0;
+                    self.sf_name_len = h1;
+                    self.sf_ty = h2;
+                }
+                self.sf_name_off[self.sf_count] = @as(i64, self.nodes[fu].xoff);
+                self.sf_name_len[self.sf_count] = @as(i64, self.nodes[fu].xlen);
+                self.sf_ty[self.sf_count] = ftys[fidx];
+                self.sf_count += 1;
+                fidx += 1;
+                fcur = self.nodes[fu].next;
+            }
+        }
+        free(a, ftys);
+        self.st_f_count[strow] = nf;
+        // Methods (v0.130): note pointees, register signatures under the
+        // method substitution (+ `Self`), enqueue the body walks, record
+        // the instance. A fields-only struct records nothing (v0.129).
+        var m0: i32 = 0 - 1;
+        if (stn >= 0) { m0 = self.nodes[@as(usize, stn)].b; }
+        if (m0 >= 0) {
+            var sv_self: i64 = self.self_code;
+            self.self_code = stcode;
+            // The written-`*T` pointees of every method, under the method
+            // substitution — the `each_instance_method` pre-pass, landing
+            // at discovery in recorded order.
+            var mp: i32 = m0;
+            while (mp >= 0) {
+                self.pt_note_fn(a, mp);
+                mp = self.nodes[@as(usize, mp)].next;
+            }
+            // Method signatures FIRST, in declaration order (the Rust
+            // registration loop): `self` binds the instance (a `*Self`
+            // receiver its pointer); the remaining parameter and return
+            // types intern + resolve under the substitution — a nested
+            // application there (`fn lo() Box(T)`) instantiates NOW and
+            // records BEFORE this instance, exactly like sema.
+            var m: i32 = m0;
+            while (m >= 0) {
+                var mu: usize = @as(usize, m);
+                var mps: i64 = @as(i64, self.fp_count);
+                var mpc: i64 = 0;
+                var p1: i32 = self.nodes[mu].a;
+                var pidx: i64 = 0;
+                while (p1 >= 0) {
+                    var pu1: usize = @as(usize, p1);
+                    var is_self: bool = pidx == 0 and str_eq(self.src[self.nodes[pu1].xoff .. self.nodes[pu1].xoff + self.nodes[pu1].xlen], "self");
+                    if (is_self) {
+                        self.push_fp(a, self.mt_self_ty(a, p1, stcode, strow));
+                    } else {
+                        self.intern_ty(a, self.nodes[pu1].a);
+                        self.push_fp(a, self.resolve_ty(a, self.nodes[pu1].a));
+                    }
+                    mpc += 1;
+                    pidx += 1;
+                    p1 = self.nodes[pu1].next;
+                }
+                self.intern_ty(a, self.nodes[mu].b);
+                self.push_mt(a, stcode, self.nodes[mu].xoff, self.nodes[mu].xlen, self.resolve_ty(a, self.nodes[mu].b), m, mps, mpc);
+                // An INSTANCE method row — stamped with the instance
+                // struct CODE (the plain decl/def/liveness loops skip
+                // stamped rows; emission runs per si row instead).
+                self.mt_si[self.mt_count - 1] = stcode;
+                m = self.nodes[mu].next;
+            }
+            // Record the instance (after the signatures, mirroring
+            // `record_struct_instance`'s position), then enqueue the body
+            // walks (drained at pass 2b / 3b).
+            var sarow: usize = self.sa_count;
+            var k: usize = 0;
+            while (k < nargs) : (k += 1) {
+                if (self.sa_count == self.sa_code.len) {
+                    var sg: []i64 = alloc(a, i64, self.sa_code.len * 2);
+                    var sk: usize = 0;
+                    while (sk < self.sa_count) : (sk += 1) { sg[sk] = self.sa_code[sk]; }
+                    free(a, self.sa_code);
+                    self.sa_code = sg;
+                }
+                self.sa_code[self.sa_count] = args[k];
+                self.sa_count += 1;
+            }
+            if (self.si_count == self.si_st.len) {
+                var v1: []i64 = alloc(a, i64, self.si_st.len * 2);
+                var v2: []i64 = alloc(a, i64, self.si_tc.len * 2);
+                var v3: []i64 = alloc(a, i64, self.si_astart.len * 2);
+                var v4: []i64 = alloc(a, i64, self.si_acount.len * 2);
+                var iv: usize = 0;
+                while (iv < self.si_count) : (iv += 1) {
+                    v1[iv] = self.si_st[iv];
+                    v2[iv] = self.si_tc[iv];
+                    v3[iv] = self.si_astart[iv];
+                    v4[iv] = self.si_acount[iv];
+                }
+                free(a, self.si_st);
+                free(a, self.si_tc);
+                free(a, self.si_astart);
+                free(a, self.si_acount);
+                self.si_st = v1;
+                self.si_tc = v2;
+                self.si_astart = v3;
+                self.si_acount = v4;
+            }
+            self.si_st[self.si_count] = stcode;
+            self.si_tc[self.si_count] = tcrow;
+            self.si_astart[self.si_count] = @as(i64, sarow);
+            self.si_acount[self.si_count] = @as(i64, nargs);
+            var sirow: i64 = @as(i64, self.si_count);
+            self.si_count += 1;
+            if (self.pq_count == self.pq_si.len) {
+                var qg: []i64 = alloc(a, i64, self.pq_si.len * 2);
+                var qi: usize = 0;
+                while (qi < self.pq_count) : (qi += 1) { qg[qi] = self.pq_si[qi]; }
+                free(a, self.pq_si);
+                self.pq_si = qg;
+            }
+            self.pq_si[self.pq_count] = sirow;
+            self.pq_count += 1;
+            self.self_code = sv_self;
+        }
+        self.self_code = sv_self0;
+        self.sb_start = s0;
+        self.sb_end = s1;
+        self.sb_len = cand;
+        return stcode;
+    }
+
+    /// The `self` receiver's fp code: a `*Self` / `*<InstanceName>` pointer
+    /// receiver is a pointer to the instance (`is_ptr_receiver_param`),
+    /// else the instance by value.
+    fn mt_self_ty(self: *Self, a: Allocator, pnode: i32, stcode: i64, strow: usize) i64 {
+        var pu: usize = @as(usize, pnode);
+        var tn: i32 = self.nodes[pu].a;
+        if (tn >= 0) {
+            var tu: usize = @as(usize, tn);
+            var comp: i64 = F_OPT | F_ERR | F_SLICE | F_ARRLIT | F_ARRPARAM;
+            if ((self.nodes[tu].flags & F_PTR) != 0 and (self.nodes[tu].flags & comp) == 0) {
+                var pn: []u8 = self.tname(tn);
+                if (str_eq(pn, "Self") or str_eq(pn, self.st_name_text(strow))) {
+                    return self.pt_intern(a, stcode, true);
+                }
+            }
+        }
+        return stcode;
+    }
+
+    /// Resolve a type-position APPLICATION node to its instance struct
+    /// code. `inst = true` INSTANTIATES on a miss (the sema resolution
+    /// points — intern-time); `inst = false` is the pure backend lookup
+    /// (`resolve_type_application`; a miss is the caller's fallback).
+    /// An unresolvable argument returns ET_NONE without instantiating
+    /// (sema's E0311 bail).
+    fn app_ty(self: *Self, a: Allocator, n: i32, inst: bool) i64 {
+        var tcrow: i64 = self.tc_row_of(self.tname(n));
+        if (tcrow < 0) { return ET_NONE; }
+        var nargs: usize = 0;
+        var arg: i32 = self.nodes[@as(usize, n)].a;
+        while (arg >= 0) {
+            nargs += 1;
+            arg = self.nodes[@as(usize, arg)].next;
+        }
+        var cap: usize = nargs;
+        if (cap == 0) { cap = 1; }
+        var codes: []i64 = alloc(a, i64, cap);
+        var ok: bool = true;
+        var i: usize = 0;
+        arg = self.nodes[@as(usize, n)].a;
+        while (arg >= 0) {
+            var au: usize = @as(usize, arg);
+            var c: i64 = ET_NONE;
+            if ((self.nodes[au].flags & F_APP) != 0) {
+                c = self.app_ty(a, arg, inst);
+            } else {
+                c = self.base_code(self.tname(arg));
+            }
+            if (c == ET_NONE) { ok = false; }
+            codes[i] = c;
+            i += 1;
+            arg = self.nodes[au].next;
+        }
+        var out: i64 = ET_NONE;
+        if (ok) {
+            if (inst) {
+                out = self.instantiate_ctor(a, tcrow, codes, nargs);
+            } else {
+                var mangled: []u8 = self.app_name(a, tcrow, codes, nargs);
+                out = self.st_code_of(mangled);
+                free(a, mangled);
+            }
+        }
+        free(a, codes);
+        return out;
+    }
+
+    /// Pass 0d's alias loop: `const Alias = Ctor(…);` instantiates (arity
+    /// mismatch / an unresolvable argument is sema's E0311 bail — the
+    /// alias stays unbound) and binds the alias name. EXPRESSION
+    /// arguments: an identifier resolves as a base name, a nested call to
+    /// a constructor recurses (`instantiate_application_expr`).
+    fn alias_collect(self: *Self, a: Allocator) void {
+        var cur: i32 = self.root;
+        while (cur >= 0) {
+            var u: usize = @as(usize, cur);
+            if (self.nodes[u].kind == ND_CONST and self.nodes[u].b >= 0) {
+                var bu: usize = @as(usize, self.nodes[u].b);
+                if (self.nodes[bu].kind == ND_CALL) {
+                    var tcrow: i64 = self.tc_row_of(self.xname(self.nodes[u].b));
+                    if (tcrow >= 0) {
+                        var code: i64 = self.app_expr_ty(a, tcrow, self.nodes[u].b);
+                        if (code != ET_NONE) {
+                            if (self.al_count == self.al_noff.len) {
+                                var g1: []i64 = alloc(a, i64, self.al_noff.len * 2);
+                                var g2: []i64 = alloc(a, i64, self.al_nlen.len * 2);
+                                var g3: []i64 = alloc(a, i64, self.al_code.len * 2);
+                                var i: usize = 0;
+                                while (i < self.al_count) : (i += 1) {
+                                    g1[i] = self.al_noff[i];
+                                    g2[i] = self.al_nlen[i];
+                                    g3[i] = self.al_code[i];
+                                }
+                                free(a, self.al_noff);
+                                free(a, self.al_nlen);
+                                free(a, self.al_code);
+                                self.al_noff = g1;
+                                self.al_nlen = g2;
+                                self.al_code = g3;
+                            }
+                            self.al_noff[self.al_count] = @as(i64, self.nodes[u].xoff);
+                            self.al_nlen[self.al_count] = @as(i64, self.nodes[u].xlen);
+                            self.al_code[self.al_count] = code;
+                            self.al_count += 1;
+                        }
+                    }
+                }
+            }
+            cur = self.nodes[u].next;
+        }
+    }
+
+    /// Instantiate an application written with EXPRESSION arguments — an
+    /// alias initializer or an associated-call receiver `Ctor(i32).init(…)`
+    /// (`instantiate_application_expr`): arity must match exactly; an
+    /// identifier argument resolves as a base name, a nested constructor
+    /// call recurses; any failure returns ET_NONE without instantiating.
+    fn app_expr_ty(self: *Self, a: Allocator, tcrow: i64, calln: i32) i64 {
+        var gnode: i32 = self.tc_node[@as(usize, tcrow)];
+        var nparams: i64 = 0;
+        var p: i32 = self.nodes[@as(usize, gnode)].a;
+        while (p >= 0) {
+            nparams += 1;
+            p = self.nodes[@as(usize, p)].next;
+        }
+        var nargs: i64 = 0;
+        var arg: i32 = self.nodes[@as(usize, calln)].a;
+        while (arg >= 0) {
+            nargs += 1;
+            arg = self.nodes[@as(usize, arg)].next;
+        }
+        if (nargs != nparams) { return ET_NONE; }
+        var cap: usize = @as(usize, nargs);
+        if (cap == 0) { cap = 1; }
+        var codes: []i64 = alloc(a, i64, cap);
+        var ok: bool = true;
+        var i: usize = 0;
+        arg = self.nodes[@as(usize, calln)].a;
+        while (arg >= 0) {
+            var au: usize = @as(usize, arg);
+            var c: i64 = ET_NONE;
+            if (self.nodes[au].kind == ND_IDENT) {
+                c = self.base_code(self.xname(arg));
+            } else if (self.nodes[au].kind == ND_CALL) {
+                var ntc: i64 = self.tc_row_of(self.xname(arg));
+                if (ntc >= 0) { c = self.app_expr_ty(a, ntc, arg); }
+            }
+            if (c == ET_NONE) { ok = false; }
+            codes[i] = c;
+            i += 1;
+            arg = self.nodes[au].next;
+        }
+        var out: i64 = ET_NONE;
+        if (ok) { out = self.instantiate_ctor(a, tcrow, codes, @as(usize, nargs)); }
+        free(a, codes);
+        return out;
+    }
+
+    /// The PURE-lookup twin of `app_expr_ty` for the backend paths (the
+    /// emitter never instantiates, §42.3): resolve the expression
+    /// arguments, mangle, look the instance up — ET_NONE on any miss.
+    fn app_expr_lookup(self: *Self, a: Allocator, tcrow: i64, calln: i32) i64 {
+        var nargs: usize = 0;
+        var arg: i32 = self.nodes[@as(usize, calln)].a;
+        while (arg >= 0) {
+            nargs += 1;
+            arg = self.nodes[@as(usize, arg)].next;
+        }
+        var cap: usize = nargs;
+        if (cap == 0) { cap = 1; }
+        var codes: []i64 = alloc(a, i64, cap);
+        var ok: bool = true;
+        var i: usize = 0;
+        arg = self.nodes[@as(usize, calln)].a;
+        while (arg >= 0) {
+            var au: usize = @as(usize, arg);
+            var c: i64 = ET_NONE;
+            if (self.nodes[au].kind == ND_IDENT) {
+                c = self.base_code(self.xname(arg));
+            } else if (self.nodes[au].kind == ND_CALL) {
+                var ntc: i64 = self.tc_row_of(self.xname(arg));
+                if (ntc >= 0) { c = self.app_expr_lookup(a, ntc, arg); }
+            }
+            if (c == ET_NONE) { ok = false; }
+            codes[i] = c;
+            i += 1;
+            arg = self.nodes[au].next;
+        }
+        var out: i64 = ET_NONE;
+        if (ok) {
+            var mangled: []u8 = self.app_name(a, tcrow, codes, nargs);
+            out = self.st_code_of(mangled);
+            free(a, mangled);
+        }
+        free(a, codes);
+        return out;
+    }
+
+    /// Drain the pending instance-method queue (`drain_pending_ctor_methods`):
+    /// per queued instance, walk each constructor method BODY under the
+    /// method substitution — a walk may instantiate further constructors,
+    /// growing the queue; the cursor loop preserves FIFO order.
+    fn drain_pending(self: *Self, a: Allocator) void {
+        while (self.pq_next < self.pq_count) {
+            var ii: usize = @as(usize, self.pq_si[self.pq_next]);
+            self.pq_next += 1;
+            var s0: usize = self.sb_start;
+            var s1: usize = self.sb_end;
+            var cand: usize = self.sb_len;
+            var sv_self: i64 = self.self_code;
+            self.sb_activate_si(a, ii);
+            var strow: usize = @as(usize, self.si_st[ii] - ET_STRUCT_BASE);
+            var stn: i32 = self.tc_struct_node(self.si_tc[ii]);
+            var m: i32 = 0 - 1;
+            if (stn >= 0) { m = self.nodes[@as(usize, stn)].b; }
+            while (m >= 0) {
+                var mu: usize = @as(usize, m);
+                self.push_scope(a, false, 0 - 1, 0 - 1);
+                var p1: i32 = self.nodes[mu].a;
+                var pidx: i64 = 0;
+                while (p1 >= 0) {
+                    var pu1: usize = @as(usize, p1);
+                    var is_self: bool = pidx == 0 and str_eq(self.src[self.nodes[pu1].xoff .. self.nodes[pu1].xoff + self.nodes[pu1].xlen], "self");
+                    if (is_self) {
+                        self.push_vt(a, self.nodes[pu1].xoff, self.nodes[pu1].xlen, self.mt_self_ty(a, p1, self.si_st[ii], strow));
+                    } else {
+                        self.push_vt(a, self.nodes[pu1].xoff, self.nodes[pu1].xlen, self.resolve_ty(a, self.nodes[pu1].a));
+                    }
+                    pidx += 1;
+                    p1 = self.nodes[pu1].next;
+                }
+                var bs: i32 = self.nodes[@as(usize, self.nodes[mu].c)].a;
+                while (bs >= 0) {
+                    self.intern_stmt(a, bs);
+                    bs = self.nodes[@as(usize, bs)].next;
+                }
+                self.pop_scope();
+                m = self.nodes[mu].next;
+            }
+            self.sb_start = s0;
+            self.sb_end = s1;
+            self.sb_len = cand;
+            self.self_code = sv_self;
+        }
+    }
+
     /// Sema pass 0a/0b (v0.169): register every struct name in item order,
     /// then resolve every field type in item order (fields in declaration
     /// order) — interning any `[]T`/`[N]T` field exactly where sema's
@@ -2736,8 +3693,27 @@ pub const Em = struct {
     /// the same fallback so field lookups still succeed).
     fn st_resolve_field(self: *Self, a: Allocator, tn: i32) i64 {
         var u: usize = @as(usize, tn);
-        var base: i64 = et_from_name(self.xname(tn));
-        if (base == ET_NONE) { base = self.st_code_of(self.xname(tn)); }
+        // The base: an APPLICATION field (`items: ArrayList(T)`, §42.2 —
+        // generic-struct fields only) INSTANTIATES; a bare name resolves
+        // through the active substitution (a ctor's type params, v0.179),
+        // then builtin → struct → alias. Plain structs resolve in Pass 0b
+        // with no substitution and BEFORE the alias pass, so their
+        // behaviour is unchanged (application/alias fields there keep the
+        // unresolved `i64` fallback — the §42.4 Pass-0b ordering rule).
+        var base: i64 = ET_NONE;
+        if ((self.nodes[u].flags & F_APP) != 0) {
+            base = self.app_ty(a, tn, true);
+        } else {
+            var fbn: []u8 = self.tname(tn);
+            var fbi: i64 = self.sb_find(fbn, true);
+            if (fbi >= 0) {
+                base = self.sb_val[@as(usize, fbi)];
+            } else {
+                base = et_from_name(fbn);
+                if (base == ET_NONE) { base = self.st_code_of(fbn); }
+                if (base == ET_NONE) { base = self.al_code_of(fbn); }
+            }
+        }
         if ((self.nodes[u].flags & F_PTR) != 0) {
             // A `*T` field: register the pointee (NOT a pre-pass entry —
             // the Rust local registry excludes field types).
@@ -2771,14 +3747,20 @@ pub const Em = struct {
     fn base_code(self: *Self, name: []u8) i64 {
         // A name bound in the ACTIVE substitution is a generic type
         // parameter and resolves to its concrete code (`base_type_in`
-        // consults `subst` FIRST, v0.178); otherwise normal resolution.
+        // consults `subst` FIRST, v0.178); the contextual `Self` (bound
+        // for struct methods, §32.2/§26.2) lives beside it; then normal
+        // resolution — builtins, structs, enums, and (LAST, mirroring
+        // `alias_of`) type aliases (v0.179).
         var bi: i64 = self.sb_find(name, true);
         if (bi >= 0) { return self.sb_val[@as(usize, bi)]; }
+        if (self.self_code != ET_NONE and str_eq(name, "Self")) { return self.self_code; }
         var t: i64 = et_from_name(name);
         if (t != ET_NONE) { return t; }
         var st: i64 = self.st_code_of(name);
         if (st != ET_NONE) { return st; }
-        return self.en_code_of(name);
+        var en: i64 = self.en_code_of(name);
+        if (en != ET_NONE) { return en; }
+        return self.al_code_of(name);
     }
 
     // -- the enum table (sema pass 0 mirror, v0.171) -----------------------------
@@ -2941,16 +3923,23 @@ pub const Em = struct {
                 // under its substitution (v0.178) — its pointees register
                 // at instance-DISCOVERY time, appending after every plain
                 // entry here in recorded order: the same table as Rust's
-                // plain-pass-then-`each_instantiation` sequence.
-                if (!self.fn_has_comptime(cur)) {
+                // plain-pass-then-`each_instantiation` sequence. A type-
+                // constructor's methods likewise register per instance
+                // (v0.179).
+                if (!self.fn_has_comptime(cur) and !self.fn_is_ctor(cur)) {
                     self.pt_note_fn(a, cur);
                 }
             } else if (k == ND_STRUCT) {
+                // Bind `Self` so a `*Self` receiver/local registers THIS
+                // struct as a pointee (§32.2; admitted v0.179).
+                var svsp: i64 = self.self_code;
+                self.self_code = ET_STRUCT_BASE + @as(i64, self.st_index_of(self.nodes[u].xoff, self.nodes[u].xlen));
                 var m: i32 = self.nodes[u].b;
                 while (m >= 0) {
                     self.pt_note_fn(a, m);
                     m = self.nodes[@as(usize, m)].next;
                 }
+                self.self_code = svsp;
             } else if (k == ND_CONST) {
                 self.pt_note_ty(a, self.nodes[u].a);
             } else if (k == ND_TEST) {
@@ -3024,7 +4013,12 @@ pub const Em = struct {
         if (tn < 0) { return; }
         var u: usize = @as(usize, tn);
         if ((self.nodes[u].flags & F_PTR) == 0) { return; }
-        var base: i64 = self.base_code(self.xname(tn));
+        // `*Self` / `*@This()` note the bound struct (v0.179); a `*T`
+        // under a substitution notes the concrete pointee (v0.178); an
+        // application / alias pointee notes its instance (LOOKUP-only —
+        // the alias pass has run; a signature-first application pointee
+        // with no alias would miss, like the v0.178 scan-order caveat).
+        var base: i64 = self.ty_base(a, tn);
         if (base == ET_NONE) { base = ET_VOID; }
         var unused: i64 = self.pt_intern(a, base, true);
         if (unused == 0) { }
@@ -3386,6 +4380,26 @@ pub const Em = struct {
     /// element mirrors the Rust `unwrap_or(base)` fallback (base = `Void`).
     /// A bare name goes through `from_name`, else the `Void` fallback
     /// (struct/enum/... paths are empty in the subset).
+    /// The BASE code of a type node: an APPLICATION (`Name(A, …)`, v0.179)
+    /// resolves through the pure table lookup (`resolve_type_application`
+    /// — the backend never instantiates); a bare name — `@This()` reading
+    /// as `Self` — resolves through `base_code`.
+    fn ty_base(self: *Self, a: Allocator, n: i32) i64 {
+        if ((self.nodes[@as(usize, n)].flags & F_APP) != 0) {
+            return self.app_ty(a, n, false);
+        }
+        return self.base_code(self.tname(n));
+    }
+
+    /// The INTERN-time variant: an application INSTANTIATES on a miss
+    /// (sema's lazy resolution points, §42.2).
+    fn ty_base_inst(self: *Self, a: Allocator, n: i32) i64 {
+        if ((self.nodes[@as(usize, n)].flags & F_APP) != 0) {
+            return self.app_ty(a, n, true);
+        }
+        return self.base_code(self.tname(n));
+    }
+
     /// The concrete length of a `[n]T` node (v0.178): the ACTIVE value
     /// substitution's binding for the size-param name; an unbound name is
     /// 0 (the Rust `array_size_in` `unwrap_or(0)` — impossible for
@@ -3397,12 +4411,12 @@ pub const Em = struct {
         return 0;
     }
 
-    fn resolve_ty(self: *Self, n: i32) i64 {
+    fn resolve_ty(self: *Self, a: Allocator, n: i32) i64 {
         var u: usize = @as(usize, n);
         if ((self.nodes[u].flags & F_ARRPARAM) != 0) {
             // `[n]T` (v0.178) maps back to the interned array at the BOUND
             // length, exactly like a literal-sized `[N]T`.
-            var pe0: i64 = self.base_code(self.xname(n));
+            var pe0: i64 = self.ty_base(a, n);
             if (pe0 == ET_NONE) { return ET_VOID; }
             var plen: i64 = self.arrparam_len(n);
             var pi0: usize = 0;
@@ -3417,7 +4431,7 @@ pub const Em = struct {
             // `[N]T` maps back to the interned array (the scan interned
             // every written one); the miss fallback mirrors the Rust
             // `unwrap_or(base)` (base = the element, `Void` if unknown).
-            var ae: i64 = self.base_code(self.xname(n));
+            var ae: i64 = self.ty_base(a, n);
             if (ae == ET_NONE) { return ET_VOID; }
             var alen: i64 = self.nodes[u].val;
             var i: usize = 0;
@@ -3429,14 +4443,14 @@ pub const Em = struct {
             return ae;
         }
         if ((self.nodes[u].flags & F_SLICE) != 0) {
-            var e: i64 = self.base_code(self.xname(n));
+            var e: i64 = self.ty_base(a, n);
             if (e == ET_NONE) { return ET_VOID; }
             return et_slice_of(e);
         }
         if ((self.nodes[u].flags & F_OPT) != 0) {
             // `?T` maps back to the interned optional (sema interned every
             // written one); the miss mirrors the Rust `unwrap_or(base)`.
-            var oe: i64 = self.base_code(self.xname(n));
+            var oe: i64 = self.ty_base(a, n);
             if (oe == ET_NONE) { return ET_VOID; }
             var oi: usize = 0;
             while (oi < self.opt_count) : (oi += 1) {
@@ -3448,7 +4462,7 @@ pub const Em = struct {
             // `!T` / `Set!T` maps back to the interned error union (the set
             // name is sema's membership concern; the runtime type is the
             // payload's union either way).
-            var ee: i64 = self.base_code(self.xname(n));
+            var ee: i64 = self.ty_base(a, n);
             if (ee == ET_NONE) { return ET_VOID; }
             var ei: usize = 0;
             while (ei < self.eu_count) : (ei += 1) {
@@ -3460,7 +4474,7 @@ pub const Em = struct {
             // `*T` maps through the pre-pass registry; the miss falls to
             // the FIRST registry slot (the Rust `unwrap_or(PTR_LOCAL_BASE)`
             // arm — index 0 regardless of pointee).
-            var pe: i64 = self.base_code(self.xname(n));
+            var pe: i64 = self.ty_base(a, n);
             if (pe == ET_NONE) { pe = ET_VOID; }
             var pi: usize = 0;
             while (pi < self.pt_count) : (pi += 1) {
@@ -3470,7 +4484,7 @@ pub const Em = struct {
             }
             return ET_PTR_BASE;
         }
-        var t: i64 = self.base_code(self.xname(n));
+        var t: i64 = self.ty_base(a, n);
         if (t == ET_NONE) { return ET_VOID; }
         return t;
     }
@@ -3484,7 +4498,7 @@ pub const Em = struct {
         if ((self.nodes[u].flags & F_ARRPARAM) != 0) {
             // `[n]T` (v0.178): `kd_arr_<type_mangle(base)>_<bound n>` —
             // the literal-size arm with the substituted length.
-            var pae: i64 = self.base_code(self.xname(n));
+            var pae: i64 = self.ty_base(a, n);
             var ptag: []u8 = "int64_t";
             if (pae != ET_NONE) { ptag = self.mangle_of(a, pae); }
             var sbp0: StrBuilder = StrBuilder.init(a);
@@ -3500,7 +4514,7 @@ pub const Em = struct {
             // `kd_arr_<type_mangle(base)>_<N>` spelled directly; an
             // unresolvable element goes through the cty base fallback
             // (`int64_t`), mirroring the Rust arm.
-            var ae: i64 = self.base_code(self.xname(n));
+            var ae: i64 = self.ty_base(a, n);
             var tag: []u8 = "int64_t";
             if (ae != ET_NONE) { tag = self.mangle_of(a, ae); }
             var sb: StrBuilder = StrBuilder.init(a);
@@ -3513,14 +4527,14 @@ pub const Em = struct {
             return s;
         }
         if ((self.nodes[u].flags & F_SLICE) != 0) {
-            var e: i64 = self.base_code(self.xname(n));
+            var e: i64 = self.ty_base(a, n);
             if (e == ET_NONE) { return "kd_slice_int64_t"; }
             return self.sl_c_name(a, et_slice_of(e));
         }
         if ((self.nodes[u].flags & F_OPT) != 0) {
             // `kd_opt_<type_mangle(base)>` spelled directly (the Rust cty
             // optional arm); an unresolvable base falls to `int64_t`.
-            var oe: i64 = self.base_code(self.xname(n));
+            var oe: i64 = self.ty_base(a, n);
             if (oe == ET_NONE) { return "kd_opt_int64_t"; }
             var sbo: StrBuilder = StrBuilder.init(a);
             sbo.append(a, "kd_opt_");
@@ -3531,7 +4545,7 @@ pub const Em = struct {
         }
         if ((self.nodes[u].flags & F_ERR) != 0) {
             // `kd_err_<type_mangle(base)>` spelled directly.
-            var ee: i64 = self.base_code(self.xname(n));
+            var ee: i64 = self.ty_base(a, n);
             if (ee == ET_NONE) { return "kd_err_int64_t"; }
             var sbe: StrBuilder = StrBuilder.init(a);
             sbe.append(a, "kd_err_");
@@ -3542,7 +4556,7 @@ pub const Em = struct {
         }
         if ((self.nodes[u].flags & F_PTR) != 0) {
             // `<pointee cty>*` spelled structurally (no typedef, no id).
-            var pe2: i64 = self.base_code(self.xname(n));
+            var pe2: i64 = self.ty_base(a, n);
             var ptag: []u8 = "int64_t";
             if (pe2 != ET_NONE) { ptag = self.cty_of(a, pe2); }
             var sbp2: StrBuilder = StrBuilder.init(a);
@@ -3552,7 +4566,7 @@ pub const Em = struct {
             sbp2.deinit(a);
             return sp2;
         }
-        var t: i64 = self.base_code(self.xname(n));
+        var t: i64 = self.ty_base(a, n);
         if (t == ET_NONE) { return "int64_t"; }
         return self.cty_of(a, t);
     }
@@ -3732,8 +4746,12 @@ pub const Em = struct {
                 var a1: i32 = 0 - 1;
                 if (a0 >= 0) { a1 = self.nodes[@as(usize, a0)].next; }
                 if (a1 >= 0 and self.nodes[@as(usize, a1)].kind == ND_IDENT) {
+                    // Any resolvable element (a struct through a bound `T`
+                    // included, v0.179) — the alloc call itself made sema
+                    // intern that slice, so the lookup always succeeds for
+                    // validated input.
                     var e: i64 = self.base_code(self.xname(a1));
-                    if (et_is_slice_elem(e)) { return et_slice_of(e); }
+                    if (e != ET_NONE) { return et_slice_of(e); }
                 }
                 return ET_NONE;
             }
@@ -3750,7 +4768,7 @@ pub const Em = struct {
                 if (tgs.ok) { }
                 self.sb_start = tcand;
                 self.sb_end = self.sb_len;
-                var trt: i64 = self.resolve_ty(self.nodes[@as(usize, tgn)].b);
+                var trt: i64 = self.resolve_ty(a, self.nodes[@as(usize, tgn)].b);
                 self.sb_start = ts0;
                 self.sb_end = ts1;
                 self.sb_len = tcand;
@@ -3818,9 +4836,15 @@ pub const Em = struct {
             return ET_NONE;
         }
         if (k == ND_SLIT) {
-            // `Name{ … }` has the named struct's type (an unknown name is
-            // sema's E0163 — untypeable here).
-            return self.st_code_of(self.xname(n));
+            // `Name{ … }` has the named struct's type — a declared struct,
+            // or (v0.179) `Self` / a struct-bound type param / an ALIAS,
+            // the Rust StructLit arm's struct → subst → alias chain (an
+            // unknown name is sema's E0163 — untypeable here).
+            var slt: i64 = self.st_code_of(self.xname(n));
+            if (slt != ET_NONE) { return slt; }
+            var slb2: i64 = self.base_code(self.xname(n));
+            if (et_is_struct(slb2)) { return slb2; }
+            return ET_NONE;
         }
         if (k == ND_NULL) { return ET_NONE; }
         if (k == ND_ERRLIT) { return ET_NONE; }
@@ -3860,12 +4884,23 @@ pub const Em = struct {
         }
         if (k == ND_MCALL) {
             // A method call's type is the invoked struct function's
-            // recorded return: a type-name receiver resolves through the
-            // struct table FIRST, else the receiver expression's struct.
+            // recorded return: a type-name receiver — a struct, an ALIAS,
+            // `Self`, or a struct-bound type param (v0.179, `base_code`) —
+            // resolves FIRST; an APPLICATION receiver (`Ctor(i32).m(…)`,
+            // §42.3) resolves to its instance; else the receiver
+            // expression's struct.
             var rn: i32 = self.nodes[u].a;
             var rsid: i64 = ET_NONE;
             if (rn >= 0 and self.nodes[@as(usize, rn)].kind == ND_IDENT) {
-                rsid = self.st_code_of(self.xname(rn));
+                var rb: i64 = self.base_code(self.xname(rn));
+                if (et_is_struct(rb)) { rsid = rb; }
+            }
+            if (rsid == ET_NONE and rn >= 0 and self.nodes[@as(usize, rn)].kind == ND_CALL) {
+                var rtc2: i64 = self.tc_row_of(self.xname(rn));
+                if (rtc2 >= 0) {
+                    var rapp: i64 = self.app_expr_lookup(a, rtc2, rn);
+                    if (et_is_struct(rapp)) { rsid = rapp; }
+                }
             }
             if (rsid == ET_NONE) {
                 var rt: i64 = self.type_of_expr(a, rn);
@@ -3895,7 +4930,7 @@ pub const Em = struct {
         }
         if (k == ND_ALIT) {
             // `[N]T{ … }` has the array type of its full `elem` reference.
-            var at: i64 = self.resolve_ty(self.nodes[u].a);
+            var at: i64 = self.resolve_ty(a, self.nodes[u].a);
             if (et_is_arr(at)) { return at; }
             return ET_NONE;
         }
@@ -4356,8 +5391,27 @@ pub const Em = struct {
             var msid: i64 = ET_NONE;
             var is_assoc: bool = false;
             if (mrecv >= 0 and self.nodes[@as(usize, mrecv)].kind == ND_IDENT) {
-                msid = self.st_code_of(self.xname(mrecv));
-                if (msid != ET_NONE) { is_assoc = true; }
+                // A struct name, an ALIAS, `Self`, or a struct-bound type
+                // param (v0.179 — the `id_of` → `alias_of` → subst chain).
+                var mrb: i64 = self.base_code(self.xname(mrecv));
+                if (et_is_struct(mrb)) {
+                    msid = mrb;
+                    is_assoc = true;
+                }
+            }
+            if (!is_assoc and mrecv >= 0 and self.nodes[@as(usize, mrecv)].kind == ND_CALL) {
+                // A direct application receiver `Ctor(i32).init(…)` —
+                // `expr_type_application` (§42.3): the instance struct
+                // sema interned; a non-application call falls through to
+                // the value path.
+                var mtc: i64 = self.tc_row_of(self.xname(mrecv));
+                if (mtc >= 0) {
+                    var mapp: i64 = self.app_expr_lookup(a, mtc, mrecv);
+                    if (et_is_struct(mapp)) {
+                        msid = mapp;
+                        is_assoc = true;
+                    }
+                }
             }
             if (!is_assoc) {
                 var mrt: i64 = self.type_of_expr(a, mrecv);
@@ -4450,6 +5504,13 @@ pub const Em = struct {
             // Rust defensive arm.
             var scn: []u8 = "";
             var slc: i64 = self.st_code_of(self.xname(n));
+            if (slc == ET_NONE) {
+                // An ALIAS name (`IL{ … }`), `Self{ … }` inside a method,
+                // or a struct-bound type param (v0.179): the subst → alias
+                // chain of the Rust StructLit arm.
+                var slb: i64 = self.base_code(self.xname(n));
+                if (et_is_struct(slb)) { slc = slb; }
+            }
             if (slc != ET_NONE) {
                 scn = self.st_c_name(a, slc);
             } else {
@@ -4497,7 +5558,7 @@ pub const Em = struct {
             // `[N]T{ e0, e1, … }` → `((kd_arr_<tag>_<N>){ .data = { … } })`
             // (SPEC §14.3); a zero-element literal zero-initialises; an
             // unresolvable literal type takes the Rust brace-init fallback.
-            var alt: i64 = self.resolve_ty(self.nodes[u].a);
+            var alt: i64 = self.resolve_ty(a, self.nodes[u].a);
             if (et_is_arr(alt)) {
                 var acn: []u8 = self.arr_c_name(a, alt);
                 var e0: i32 = self.nodes[u].b;
@@ -4723,9 +5784,11 @@ pub const Em = struct {
                 if (a1 >= 0 and self.nodes[@as(usize, a1)].kind == ND_IDENT) {
                     // The element resolves under the active substitution
                     // (`base_type`) so `alloc(a, T, n)` works inside an
-                    // instance (v0.178).
+                    // instance (v0.178); the tag is `type_mangle(elem)` —
+                    // `struct_<Name>` for a struct element (a ctor method's
+                    // `T` bound to one, v0.179), the C name for scalars.
                     var et: i64 = self.base_code(self.xname(a1));
-                    if (et != ET_NONE) { tag = et_c_name(et); }
+                    if (et != ET_NONE) { tag = self.mangle_of(a, et); }
                 }
                 var nstr: []u8 = "0";
                 if (a2 >= 0) { nstr = self.emit_expr(a, a2); }
@@ -4785,7 +5848,7 @@ pub const Em = struct {
                 while (ep >= 0) {
                     var epu: usize = @as(usize, ep);
                     if ((self.nodes[epu].flags & F_COMPTIME) == 0) {
-                        exp[ei] = self.resolve_ty(self.nodes[epu].a);
+                        exp[ei] = self.resolve_ty(a, self.nodes[epu].a);
                         ei += 1;
                     }
                     ep = self.nodes[epu].next;
@@ -5897,7 +6960,7 @@ pub const Em = struct {
             var lty: i64 = ET_NONE;
             var ct: []u8 = "";
             if (ann >= 0) {
-                lty = self.resolve_ty(ann);
+                lty = self.resolve_ty(a, ann);
                 ct = self.cty(a, ann);
             } else {
                 lty = self.type_of_expr(a, self.nodes[u].b);
@@ -6306,7 +7369,7 @@ pub const Em = struct {
         self.if_count = 0;
         self.try_count = 0;
         self.catch_count = 0;
-        self.cur_ret = self.resolve_ty(self.nodes[u].b);
+        self.cur_ret = self.resolve_ty(a, self.nodes[u].b);
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, self.cty(a, self.nodes[u].b));
         sb.append(a, " kd_");
@@ -6330,7 +7393,7 @@ pub const Em = struct {
                 p = self.nodes[pu].next;
                 continue;
             }
-            self.push_vt(a, self.nodes[pu].xoff, self.nodes[pu].xlen, self.resolve_ty(self.nodes[pu].a));
+            self.push_vt(a, self.nodes[pu].xoff, self.nodes[pu].xlen, self.resolve_ty(a, self.nodes[pu].a));
             p = self.nodes[pu].next;
         }
         // The body statements run inside the function scope itself — mirror
@@ -6433,6 +7496,17 @@ pub const Em = struct {
             while (bcur >= 0) {
                 self.collect_calls_expr(a, pend, pendm, bcur);
                 bcur = self.nodes[@as(usize, bcur)].next;
+            }
+            return;
+        }
+        if (k == ND_STRUCTTYPE) {
+            // A type-constructor's `struct { … }` body: the unified
+            // walker reaches its METHOD bodies (v0.179 — this is how an
+            // instantiated constructor's methods become name sources).
+            var stm: i32 = self.nodes[u].b;
+            while (stm >= 0) {
+                self.collect_calls_block(a, pend, pendm, self.nodes[@as(usize, stm)].c);
+                stm = self.nodes[@as(usize, stm)].next;
             }
             return;
         }
@@ -6569,6 +7643,22 @@ pub const Em = struct {
             var gnu: usize = @as(usize, self.gf_node[gseed]);
             self.collect_calls_block(a, &pend, &pendm, self.nodes[gnu].c);
         }
+        // …and every INSTANTIATED type-constructor's body (v0.179): the
+        // methods `each_instance_method` emits are reached through the
+        // ND_STRUCTTYPE walk; a constructor never instantiated seeds
+        // nothing (pay-as-you-go, §43.1).
+        var tseed: usize = 0;
+        while (tseed < self.tc_count) : (tseed += 1) {
+            var any_inst: bool = false;
+            var sic: usize = 0;
+            while (sic < self.si_count) : (sic += 1) {
+                if (self.si_tc[sic] == @as(i64, tseed)) { any_inst = true; }
+            }
+            if (any_inst) {
+                var tnu: usize = @as(usize, self.tc_node[tseed]);
+                self.collect_calls_block(a, &pend, &pendm, self.nodes[tnu].c);
+            }
+        }
         // Worklist closure over BOTH name spaces (SPEC §43.1): free names
         // drain first, then method names (drain order does not affect the
         // final sets — both queues feed each other until empty).
@@ -6601,6 +7691,7 @@ pub const Em = struct {
                 // live; each of their bodies is walked.
                 var mi: usize = 0;
                 while (mi < self.mt_count) : (mi += 1) {
+                    if (self.mt_si[mi] >= 0) { continue; }
                     var off2: usize = @as(usize, self.mt_noff[mi]);
                     var len2: usize = @as(usize, self.mt_nlen[mi]);
                     if (str_eq(self.src[off2 .. off2 + len2], mname)) {
@@ -6636,15 +7727,18 @@ pub const Em = struct {
         while (cur >= 0) {
             var u: usize = @as(usize, cur);
             if (self.nodes[u].kind == ND_FN) {
+                if (self.fn_is_ctor(cur)) {
+                    // A type-constructor (SPEC §25) is compile-time only —
+                    // registered in `tc_collect`, never in `fns`.
+                    cur = self.nodes[u].next;
+                    continue;
+                }
                 if (self.fn_has_comptime(cur)) {
                     // A generic fn (v0.178) has no resolvable signature
                     // without a substitution — it never enters `fns` /
                     // `fp_ty`; the REGISTRY row drives call lowering and
-                    // per-instantiation emission. A type-constructor
-                    // (bare-`type` return, SPEC §25) stays out entirely.
-                    if (!es_ty_is_type_kw(self.src, self.nodes, self.nodes[u].b)) {
-                        self.push_gf(a, self.nodes[u].xoff, self.nodes[u].xlen, cur);
-                    }
+                    // per-instantiation emission.
+                    self.push_gf(a, self.nodes[u].xoff, self.nodes[u].xlen, cur);
                     cur = self.nodes[u].next;
                     continue;
                 }
@@ -6652,11 +7746,11 @@ pub const Em = struct {
                 var pc: i64 = 0;
                 var pp: i32 = self.nodes[u].a;
                 while (pp >= 0) {
-                    self.push_fp(a, self.resolve_ty(self.nodes[@as(usize, pp)].a));
+                    self.push_fp(a, self.resolve_ty(a, self.nodes[@as(usize, pp)].a));
                     pc += 1;
                     pp = self.nodes[@as(usize, pp)].next;
                 }
-                self.push_fn(a, self.nodes[u].xoff, self.nodes[u].xlen, self.resolve_ty(self.nodes[u].b), cur, ps, pc);
+                self.push_fn(a, self.nodes[u].xoff, self.nodes[u].xlen, self.resolve_ty(a, self.nodes[u].b), cur, ps, pc);
             }
             if (self.nodes[u].kind == ND_STRUCT) {
                 // Register every struct function's return AND parameter
@@ -6666,6 +7760,10 @@ pub const Em = struct {
                 // — the EMITTER rule). The rows double as the emission
                 // worklist (nodes + liveness).
                 var scode: i64 = ET_STRUCT_BASE + @as(i64, self.st_index_of(self.nodes[u].xoff, self.nodes[u].xlen));
+                // Bind `Self` -> this struct while resolving the method
+                // signatures (v0.136, SPEC §32.2; admitted v0.179).
+                var svsc: i64 = self.self_code;
+                self.self_code = scode;
                 var m: i32 = self.nodes[u].b;
                 while (m >= 0) {
                     var mu: usize = @as(usize, m);
@@ -6673,13 +7771,14 @@ pub const Em = struct {
                     var mpc: i64 = 0;
                     var mp: i32 = self.nodes[mu].a;
                     while (mp >= 0) {
-                        self.push_fp(a, self.resolve_ty(self.nodes[@as(usize, mp)].a));
+                        self.push_fp(a, self.resolve_ty(a, self.nodes[@as(usize, mp)].a));
                         mpc += 1;
                         mp = self.nodes[@as(usize, mp)].next;
                     }
-                    self.push_mt(a, scode, self.nodes[mu].xoff, self.nodes[mu].xlen, self.resolve_ty(self.nodes[mu].b), m, mps, mpc);
+                    self.push_mt(a, scode, self.nodes[mu].xoff, self.nodes[mu].xlen, self.resolve_ty(a, self.nodes[mu].b), m, mps, mpc);
                     m = self.nodes[mu].next;
                 }
+                self.self_code = svsc;
             }
             cur = self.nodes[u].next;
         }
@@ -6708,6 +7807,7 @@ pub const Em = struct {
             var g5: []bool = alloc(a, bool, self.mt_live.len * 2);
             var g6: []i64 = alloc(a, i64, self.mt_p_start.len * 2);
             var g7: []i64 = alloc(a, i64, self.mt_p_count.len * 2);
+            var g8: []i64 = alloc(a, i64, self.mt_si.len * 2);
             var i: usize = 0;
             while (i < self.mt_count) : (i += 1) {
                 g0[i] = self.mt_sid[i];
@@ -6718,6 +7818,7 @@ pub const Em = struct {
                 g5[i] = self.mt_live[i];
                 g6[i] = self.mt_p_start[i];
                 g7[i] = self.mt_p_count[i];
+                g8[i] = self.mt_si[i];
             }
             free(a, self.mt_sid);
             free(a, self.mt_noff);
@@ -6727,6 +7828,7 @@ pub const Em = struct {
             free(a, self.mt_live);
             free(a, self.mt_p_start);
             free(a, self.mt_p_count);
+            free(a, self.mt_si);
             self.mt_sid = g0;
             self.mt_noff = g1;
             self.mt_nlen = g2;
@@ -6735,6 +7837,7 @@ pub const Em = struct {
             self.mt_live = g5;
             self.mt_p_start = g6;
             self.mt_p_count = g7;
+            self.mt_si = g8;
         }
         self.mt_sid[self.mt_count] = sid;
         self.mt_noff[self.mt_count] = @as(i64, noff);
@@ -6744,6 +7847,9 @@ pub const Em = struct {
         self.mt_live[self.mt_count] = false;
         self.mt_p_start[self.mt_count] = pstart;
         self.mt_p_count[self.mt_count] = pcount;
+        // A plain struct's method by default; `instantiate_ctor` stamps
+        // the instance row right after pushing (v0.179).
+        self.mt_si[self.mt_count] = 0 - 1;
         self.mt_count += 1;
     }
 
@@ -6831,7 +7937,7 @@ pub const Em = struct {
             // A written `[n]T` interns the `(elem, BOUND len)` pair
             // (v0.178) — `StructTable::intern_array` keys on the resolved
             // pair, so each instantiated size is a distinct array type.
-            var pae: i64 = self.base_code(self.xname(n));
+            var pae: i64 = self.ty_base_inst(a, n);
             if (pae != ET_NONE) {
                 var unused0: i64 = self.arr_intern(a, pae, self.arrparam_len(n));
                 if (unused0 == 0) { }
@@ -6839,7 +7945,7 @@ pub const Em = struct {
             return;
         }
         if ((self.nodes[u].flags & F_ARRLIT) != 0) {
-            var ae: i64 = self.base_code(self.xname(n));
+            var ae: i64 = self.ty_base_inst(a, n);
             if (ae != ET_NONE) {
                 var unused: i64 = self.arr_intern(a, ae, self.nodes[u].val);
                 if (unused == 0) { }
@@ -6847,7 +7953,7 @@ pub const Em = struct {
             return;
         }
         if ((self.nodes[u].flags & F_OPT) != 0) {
-            var oe: i64 = self.base_code(self.xname(n));
+            var oe: i64 = self.ty_base_inst(a, n);
             if (oe != ET_NONE) {
                 var unused2: i64 = self.opt_intern(a, oe);
                 if (unused2 == 0) { }
@@ -6855,7 +7961,7 @@ pub const Em = struct {
             return;
         }
         if ((self.nodes[u].flags & F_ERR) != 0) {
-            var ee: i64 = self.base_code(self.xname(n));
+            var ee: i64 = self.ty_base_inst(a, n);
             if (ee != ET_NONE) {
                 var unused3: i64 = self.eu_intern(a, ee);
                 if (unused3 == 0) { }
@@ -6864,12 +7970,26 @@ pub const Em = struct {
         }
         if ((self.nodes[u].flags & F_PTR) != 0) {
             // `*T` has no typedef table — sema's intern_ptr never affects
-            // the emitted bytes (ids are structural `T*` spellings).
+            // the emitted bytes (structural `T*` spellings) — but an
+            // APPLICATION pointee (`*List(i32)`, v0.179) still resolves,
+            // INSTANTIATING on first sight exactly like sema.
+            if ((self.nodes[u].flags & F_APP) != 0) {
+                var unusedp: i64 = self.app_ty(a, n, true);
+                if (unusedp == 0) { }
+            }
             return;
         }
-        if ((self.nodes[u].flags & F_SLICE) == 0) { return; }
-        var e: i64 = self.base_code(self.xname(n));
-        if (e != ET_NONE) { self.intern_elem(a, e); }
+        if ((self.nodes[u].flags & F_SLICE) != 0) {
+            var e: i64 = self.ty_base_inst(a, n);
+            if (e != ET_NONE) { self.intern_elem(a, e); }
+            return;
+        }
+        // A BARE application (`var l: ArrayList(i32)`, v0.179) resolves —
+        // instantiating on first sight; other bare names intern nothing.
+        if ((self.nodes[u].flags & F_APP) != 0) {
+            var unusedb: i64 = self.app_ty(a, n, true);
+            if (unusedb == 0) { }
+        }
     }
 
     /// The `resolve_place`/`resolve_index_base` interning order over a
@@ -6921,15 +8041,29 @@ pub const Em = struct {
             return;
         }
         if (k == ND_MCALL) {
-            // `check_method_call`: an Ident receiver naming a struct and
-            // NOT shadowed by a value binding is the associated/static
-            // form — only the args check (in order). Otherwise the
-            // receiver checks first, then the args (L→R), each against
-            // its parameter type.
+            // `check_method_call`: an Ident receiver naming a struct TYPE —
+            // a struct, an alias, or the substitution's `Self` / a
+            // struct-bound type param (v0.179) — and NOT shadowed by a
+            // value binding is the associated/static form: only the args
+            // check (in order). An application receiver
+            // `Ctor(i32).init(…)` instantiates (memoised) and proceeds
+            // statically (§42.2 case b'). Otherwise the receiver checks
+            // first, then the args (L→R), each against its parameter type.
             var mrecv: i32 = self.nodes[u].a;
             var massoc: bool = false;
             if (mrecv >= 0 and self.nodes[@as(usize, mrecv)].kind == ND_IDENT) {
-                if (!self.vt_has(self.xname(mrecv)) and self.st_code_of(self.xname(mrecv)) != ET_NONE) {
+                if (!self.vt_has(self.xname(mrecv)) and et_is_struct(self.base_code(self.xname(mrecv)))) {
+                    massoc = true;
+                }
+            }
+            if (!massoc and mrecv >= 0 and self.nodes[@as(usize, mrecv)].kind == ND_CALL) {
+                var rtc: i64 = self.tc_row_of(self.xname(mrecv));
+                if (rtc >= 0) {
+                    // The instantiation lands here — the check's lazy
+                    // resolution point; a failed application (sema's
+                    // E0311) still walks the value arguments below.
+                    var unusedi: i64 = self.app_expr_ty(a, rtc, mrecv);
+                    if (unusedi == 0) { }
                     massoc = true;
                 }
             }
@@ -7052,6 +8186,14 @@ pub const Em = struct {
                 if (a2 >= 0) { self.intern_expr(a, a2); }
                 return;
             }
+            if (self.tc_row_of(callee) >= 0) {
+                // A type-constructor application in bare VALUE position is
+                // sema's E0312 ("a generic type is not a value") — checked
+                // BEFORE the generics lookup, with the arguments unwalked
+                // (they are type names). The associated-call receiver form
+                // never reaches here (the ND_MCALL arm intercepts it).
+                return;
+            }
             var grow: i64 = self.gf_row_of(callee);
             if (grow >= 0) {
                 // `check_generic_call` (v0.178) — the intern-order replay:
@@ -7129,10 +8271,10 @@ pub const Em = struct {
                             // A type param is not a runtime value; a VALUE
                             // param is a constant of its declared type.
                             if (!es_ty_is_type_kw(self.src, self.nodes, self.nodes[bpu].a)) {
-                                self.push_vt(a, self.nodes[bpu].xoff, self.nodes[bpu].xlen, self.resolve_ty(self.nodes[bpu].a));
+                                self.push_vt(a, self.nodes[bpu].xoff, self.nodes[bpu].xlen, self.resolve_ty(a, self.nodes[bpu].a));
                             }
                         } else {
-                            self.push_vt(a, self.nodes[bpu].xoff, self.nodes[bpu].xlen, self.resolve_ty(self.nodes[bpu].a));
+                            self.push_vt(a, self.nodes[bpu].xoff, self.nodes[bpu].xlen, self.resolve_ty(a, self.nodes[bpu].a));
                         }
                         bp = self.nodes[bpu].next;
                     }
@@ -7198,7 +8340,7 @@ pub const Em = struct {
             // (annotation first, else the emit-identical inference).
             var slty: i64 = ET_NONE;
             if (self.nodes[u].a >= 0) {
-                slty = self.resolve_ty(self.nodes[u].a);
+                slty = self.resolve_ty(a, self.nodes[u].a);
             } else {
                 slty = self.type_of_expr(a, self.nodes[u].b);
                 if (slty == ET_NONE) { slty = ET_I64; }
@@ -7332,7 +8474,7 @@ pub const Em = struct {
         var cur: i32 = self.root;
         while (cur >= 0) {
             var u: usize = @as(usize, cur);
-            if (self.nodes[u].kind == ND_FN and !self.fn_has_comptime(cur)) {
+            if (self.nodes[u].kind == ND_FN and !self.fn_has_comptime(cur) and !self.fn_is_ctor(cur)) {
                 var p: i32 = self.nodes[u].a;
                 while (p >= 0) {
                     self.intern_ty(a, self.nodes[@as(usize, p)].a);
@@ -7351,6 +8493,11 @@ pub const Em = struct {
         while (cur >= 0) {
             var u1: usize = @as(usize, cur);
             if (self.nodes[u1].kind == ND_STRUCT) {
+                // Bind `Self` for the signature interning too (§32.2): a
+                // non-receiver `?Self`/`[]Self` parameter or return interns
+                // its composite over THIS struct (v0.179).
+                var svs1: i64 = self.self_code;
+                self.self_code = ET_STRUCT_BASE + @as(i64, self.st_index_of(self.nodes[u1].xoff, self.nodes[u1].xlen));
                 var m1: i32 = self.nodes[u1].b;
                 while (m1 >= 0) {
                     var mu1: usize = @as(usize, m1);
@@ -7368,6 +8515,7 @@ pub const Em = struct {
                     self.intern_ty(a, self.nodes[mu1].b);
                     m1 = self.nodes[mu1].next;
                 }
+                self.self_code = svs1;
             }
             cur = self.nodes[u1].next;
         }
@@ -7394,16 +8542,16 @@ pub const Em = struct {
         if (cur < 0) { cur = self.root; }
         while (cur >= 0) {
             var u3: usize = @as(usize, cur);
-            if (self.nodes[u3].kind == ND_FN and self.fn_has_comptime(cur)) {
-                // A generic fn's body is checked per INSTANTIATION (v0.178)
-                // — the ND_CALL replay walks it at each new instance, under
-                // that instance's substitution. Nothing to do here.
+            if (self.nodes[u3].kind == ND_FN and (self.fn_has_comptime(cur) or self.fn_is_ctor(cur))) {
+                // A generic fn's body is checked per INSTANTIATION (v0.178);
+                // a type-constructor is compile-time only — its methods are
+                // walked per instance at the pending-queue drains (v0.179).
             } else if (self.nodes[u3].kind == ND_FN) {
                 self.push_scope(a, false, 0 - 1, 0 - 1);
                 var p3: i32 = self.nodes[u3].a;
                 while (p3 >= 0) {
                     var pu3: usize = @as(usize, p3);
-                    self.push_vt(a, self.nodes[pu3].xoff, self.nodes[pu3].xlen, self.resolve_ty(self.nodes[pu3].a));
+                    self.push_vt(a, self.nodes[pu3].xoff, self.nodes[pu3].xlen, self.resolve_ty(a, self.nodes[pu3].a));
                     p3 = self.nodes[pu3].next;
                 }
                 var bc3: i32 = self.nodes[@as(usize, self.nodes[u3].c)].a;
@@ -7421,6 +8569,9 @@ pub const Em = struct {
                 // annotation (sema never resolves it); other params
                 // resolve normally.
                 var scode3: i64 = ET_STRUCT_BASE + @as(i64, self.st_index_of(self.nodes[u3].xoff, self.nodes[u3].xlen));
+                // `Self` binds in a plain struct's method bodies (§32.2).
+                var svs3: i64 = self.self_code;
+                self.self_code = scode3;
                 var m3: i32 = self.nodes[u3].b;
                 while (m3 >= 0) {
                     var mu3: usize = @as(usize, m3);
@@ -7433,7 +8584,7 @@ pub const Em = struct {
                         if (is_self) {
                             self.push_vt(a, self.nodes[mpu3].xoff, self.nodes[mpu3].xlen, scode3);
                         } else {
-                            self.push_vt(a, self.nodes[mpu3].xoff, self.nodes[mpu3].xlen, self.resolve_ty(self.nodes[mpu3].a));
+                            self.push_vt(a, self.nodes[mpu3].xoff, self.nodes[mpu3].xlen, self.resolve_ty(a, self.nodes[mpu3].a));
                         }
                         mpi += 1;
                         mp3 = self.nodes[mpu3].next;
@@ -7446,6 +8597,7 @@ pub const Em = struct {
                     self.pop_scope();
                     m3 = self.nodes[mu3].next;
                 }
+                self.self_code = svs3;
             }
             cur = self.nodes[u3].next;
         }
@@ -7956,10 +9108,14 @@ pub const Em = struct {
             any = true;
         }
         // Then every struct function (v0.170), declared alongside ordinary
-        // ones as `kd_<Struct>_<method>` — name-level liveness gated.
+        // ones as `kd_<Struct>_<method>` — name-level liveness gated, with
+        // `Self` bound to the enclosing struct (§32.2).
         var mi: usize = 0;
         while (mi < self.mt_count) : (mi += 1) {
+            if (self.mt_si[mi] >= 0) { continue; }
             if (!self.mt_live[mi]) { continue; }
+            var svsd: i64 = self.self_code;
+            self.self_code = self.mt_sid[mi];
             var mnode: i32 = self.mt_node[mi];
             var mu: usize = @as(usize, mnode);
             var sb2: StrBuilder = StrBuilder.init(a);
@@ -7974,17 +9130,50 @@ pub const Em = struct {
             var s2: []u8 = sb2.build(a);
             sb2.deinit(a);
             self.line(a, s2);
+            self.self_code = svsd;
             any = true;
+        }
+        // Finally every generic-struct INSTANCE's methods (v0.179, SPEC
+        // §26.3) — every recorded instance, liveness notwithstanding,
+        // each under `{ params → args, Self → the instance }`.
+        var di: usize = 0;
+        while (di < self.si_count) : (di += 1) {
+            var ds0: usize = self.sb_start;
+            var ds1: usize = self.sb_end;
+            var dcand: usize = self.sb_len;
+            var dself: i64 = self.self_code;
+            self.sb_activate_si(a, di);
+            var dstn: i32 = self.tc_struct_node(self.si_tc[di]);
+            var dm: i32 = 0 - 1;
+            if (dstn >= 0) { dm = self.nodes[@as(usize, dstn)].b; }
+            while (dm >= 0) {
+                var dmu: usize = @as(usize, dm);
+                var sb3: StrBuilder = StrBuilder.init(a);
+                sb3.append(a, self.cty(a, self.nodes[dmu].b));
+                sb3.append(a, " kd_");
+                sb3.append(a, self.st_name_of(self.si_st[di]));
+                sb3.append(a, "_");
+                sb3.append(a, self.xname(dm));
+                sb3.append(a, "(");
+                self.put_params(a, &sb3, dm);
+                sb3.append(a, ");");
+                var s3: []u8 = sb3.build(a);
+                sb3.deinit(a);
+                self.line(a, s3);
+                any = true;
+                dm = self.nodes[dmu].next;
+            }
+            self.sb_start = ds0;
+            self.sb_end = ds1;
+            self.sb_len = dcand;
+            self.self_code = dself;
         }
         if (any) { self.blank(a); }
     }
 
     /// The bare source name of a struct code (no `kd_struct_` prefix).
     fn st_name_of(self: *Self, scode: i64) []u8 {
-        var i: usize = @as(usize, scode - ET_STRUCT_BASE);
-        var off: usize = @as(usize, self.st_name_off[i]);
-        var len: usize = @as(usize, self.st_name_len[i]);
-        return self.src[off .. off + len];
+        return self.st_name_text(@as(usize, scode - ET_STRUCT_BASE));
     }
 
     /// `emit_func_defs`: every live function, each followed by a blank —
@@ -7999,7 +9188,11 @@ pub const Em = struct {
         }
         var mi: usize = 0;
         while (mi < self.mt_count) : (mi += 1) {
+            if (self.mt_si[mi] >= 0) { continue; }
             if (!self.mt_live[mi]) { continue; }
+            // `Self` binds to the enclosing struct for the body (§32.2).
+            var svse: i64 = self.self_code;
+            self.self_code = self.mt_sid[mi];
             var pfx: StrBuilder = StrBuilder.init(a);
             pfx.append(a, self.st_name_of(self.mt_sid[mi]));
             pfx.append(a, "_");
@@ -8008,6 +9201,7 @@ pub const Em = struct {
             self.emit_func_named(a, self.mt_node[mi], pl, self.xname(self.mt_node[mi]));
             self.blank(a);
             free(a, pl);
+            self.self_code = svse;
         }
         // One specialised C function per recorded INSTANTIATION (SPEC
         // §17.3), in discovery order, each under its substitution — AFTER
@@ -8027,6 +9221,36 @@ pub const Em = struct {
             self.sb_start = is0;
             self.sb_end = is1;
             self.sb_len = icand;
+        }
+        // Then one C function per generic-struct INSTANCE method (SPEC
+        // §26.3), each under `{ params → args, Self → the instance }` —
+        // every recorded instance, liveness notwithstanding (v0.179).
+        var fi: usize = 0;
+        while (fi < self.si_count) : (fi += 1) {
+            var fs0: usize = self.sb_start;
+            var fs1: usize = self.sb_end;
+            var fcand: usize = self.sb_len;
+            var fself: i64 = self.self_code;
+            self.sb_activate_si(a, fi);
+            var fstn: i32 = self.tc_struct_node(self.si_tc[fi]);
+            var fm: i32 = 0 - 1;
+            if (fstn >= 0) { fm = self.nodes[@as(usize, fstn)].b; }
+            while (fm >= 0) {
+                var fmu: usize = @as(usize, fm);
+                var fpfx: StrBuilder = StrBuilder.init(a);
+                fpfx.append(a, self.st_name_of(self.si_st[fi]));
+                fpfx.append(a, "_");
+                var fpl: []u8 = fpfx.build(a);
+                fpfx.deinit(a);
+                self.emit_func_named(a, fm, fpl, self.xname(fm));
+                self.blank(a);
+                free(a, fpl);
+                fm = self.nodes[fmu].next;
+            }
+            self.sb_start = fs0;
+            self.sb_end = fs1;
+            self.sb_len = fcand;
+            self.self_code = fself;
         }
     }
 
@@ -8202,12 +9426,23 @@ pub const Em = struct {
         self.en_collect(a);
         self.er_collect(a);
         self.st_collect(a);
+        // Pass 0d (v0.179, SPEC §25): the type-constructor registry, then
+        // the `const Alias = Ctor(…);` instantiations — item order, BEFORE
+        // signatures, so an alias in a signature resolves.
+        self.tc_collect(a);
+        self.alias_collect(a);
         self.intern_scan_sigs(a);
         self.collect_signatures(a);
         // The folded consts precede the body scan (v0.178): a generic
         // call's comptime VALUE argument const-evaluates over them.
         self.ct_collect(a);
+        // Pass 2b (v0.179): the deferred instance-method bodies — after
+        // the consts so a body may reference them; the drain loops.
+        self.drain_pending(a);
         self.intern_scan_bodies(a);
+        // Pass 3b (v0.179): a body-pass application with no prior alias
+        // enqueued after the 2b drain ran; drain again.
+        self.drain_pending(a);
         self.compute_live(a);
         self.emit_prelude(a);
         self.emit_type_defs(a);
