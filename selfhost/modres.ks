@@ -24,10 +24,11 @@
 // Rust differential mirror assigns identical bases.
 //
 // `@import("std")` (a path whose basename is `std`/`std.ks` naming no
-// readable file — mirroring the `!path.exists()` rule) resolves to the
-// std library EMBEDDED IN THE RUST COMPILER, which is far outside the
-// subset — the resolver reports it as the SKIP verdict `import` at the
-// import's position instead of pulling 3k lines in.
+// real file) resolves to the bundled standard library (v0.182): the
+// driver supplies the on-disk path of the SAME source the Rust compiler
+// `include_str!`s, and std joins the flattened module like any import —
+// dedup key `<std>`, silent on re-reach. Without a supplied path the
+// pre-v0.182 `SKIP import` verdict stands at the import's position.
 //
 // Mirrored-with-documented-limits (both sides of the differential apply
 // the SAME rule, so no comparison can diverge):
@@ -87,6 +88,12 @@ pub const Mr = struct {
     kind: i64,
     code: i64,
     pos: usize,
+    // The bundled std's source path (v0.182): the selfhost pipeline has
+    // no `include_str!`, so the DRIVER supplies where the compiler's
+    // embedded `std.ks` lives on disk. Empty = unavailable, and a `std`
+    // import keeps the pre-v0.182 `SKIP import` verdict.
+    std_off: usize,
+    std_len: usize,
 
     fn init(a: Allocator) Self {
         return Mr{
@@ -103,6 +110,8 @@ pub const Mr = struct {
             .kind = MR_OK,
             .code = 0,
             .pos = 0,
+            .std_off = 0,
+            .std_len = 0,
         };
     }
 
@@ -362,35 +371,54 @@ fn mr_resolve_file(mr: *Mr, a: Allocator, norm: []u8, import_pos: usize, is_root
     if (mr.kind != MR_OK) { return; }
 
     // `@import("std")` — a `std`/`std.ks` basename naming no readable file
-    // — is the compiler-embedded library: out of the subset by definition.
-    // (The `.exists()` mirror: a readable non-empty file of that name next
-    // to the importer wins and resolves normally.)
+    // — is the compiler-embedded library (v0.182): it JOINS the flattened
+    // module, loaded from the driver-supplied bundled-source path (the
+    // same bytes `include_str!` embeds). The dedup key is `<std>`, and a
+    // std reached again — on the stack or done — stops SILENTLY (the Rust
+    // arm never reports a std cycle). Without a supplied path the
+    // pre-v0.182 `SKIP import` verdict stands. (The `.exists()` mirror:
+    // a readable non-empty file of that name next to the importer wins
+    // and resolves normally.)
     var base: []u8 = mr_basename(norm);
     var fsrc: []u8 = @readFile(a, norm);
+    var key: []u8 = norm;
+    var is_std: bool = false;
     if ((str_eq(base, "std") or str_eq(base, "std.ks")) and fsrc.len == 0) {
-        mr.skip_std(import_pos);
-        return;
-    }
-
-    // Cycle check before the dedup, so a true cycle is never swallowed as
-    // "already included".
-    var slot: i64 = mr.find_file(norm);
-    if (slot >= 0) {
-        if (mr.files[@as(usize, slot)].state == 1) {
-            mr.fail(292, import_pos);
+        var stdsrc: []u8 = "";
+        if (mr.std_len > 0) {
+            stdsrc = @readFile(a, mr.pbuf[mr.std_off .. mr.std_off + mr.std_len]);
         }
-        return;
+        if (stdsrc.len == 0) {
+            mr.skip_std(import_pos);
+            return;
+        }
+        is_std = true;
+        key = "<std>";
+        fsrc = stdsrc;
+        if (mr.find_file(key) >= 0) { return; }
     }
 
-    // A missing/unreadable (or, through `@readFile`, empty) import is
-    // E0291. The ROOT keeps the pre-v0.167 behavior: an empty read parses
-    // as the empty module.
-    if (fsrc.len == 0 and !is_root) {
-        mr.fail(291, import_pos);
-        return;
+    if (!is_std) {
+        // Cycle check before the dedup, so a true cycle is never
+        // swallowed as "already included".
+        var slot: i64 = mr.find_file(norm);
+        if (slot >= 0) {
+            if (mr.files[@as(usize, slot)].state == 1) {
+                mr.fail(292, import_pos);
+            }
+            return;
+        }
+
+        // A missing/unreadable (or, through `@readFile`, empty) import is
+        // E0291. The ROOT keeps the pre-v0.167 behavior: an empty read
+        // parses as the empty module.
+        if (fsrc.len == 0 and !is_root) {
+            mr.fail(291, import_pos);
+            return;
+        }
     }
 
-    var me: usize = mr.add_file(a, norm, 1);
+    var me: usize = mr.add_file(a, key, 1);
 
     var items: i32 = mr_load(mr, a, fsrc, is_root);
     if (mr.kind != MR_OK) {
@@ -399,7 +427,7 @@ fn mr_resolve_file(mr: *Mr, a: Allocator, norm: []u8, import_pos: usize, is_root
     }
 
     // Pass 1 — imports, depth-first, in item order.
-    var dir: []u8 = mr_dir_of(a, norm);
+    var dir: []u8 = mr_dir_of(a, key);
     var cur: i32 = items;
     while (cur >= 0) {
         if (mr.kind != MR_OK) { break; }
@@ -439,8 +467,14 @@ fn mr_named(nodes: []Node, n: i32) bool {
 }
 
 /// Resolve `root_path` into one flattened module (see the module header).
-pub fn mr_resolve(a: Allocator, root_path: []u8) MrOut {
+/// `std_path` names the bundled std's on-disk source (v0.182); empty
+/// keeps a `std` import at the pre-v0.182 `SKIP import` verdict.
+pub fn mr_resolve(a: Allocator, root_path: []u8, std_path: []u8) MrOut {
     var mr: Mr = Mr.init(a);
+    if (std_path.len > 0) {
+        mr.std_off = mr.put_path(a, std_path);
+        mr.std_len = std_path.len;
+    }
     var norm: []u8 = mr_normalize(a, root_path);
     mr_resolve_file(&mr, a, norm, 0, true);
 

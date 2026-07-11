@@ -1,4 +1,4 @@
-//! Self-host stages 3–24 (v0.161–v0.181): differential test of
+//! Self-host stages 3–25 (v0.161–v0.182): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -67,7 +67,13 @@
 //! `@readFile`/`@writeFile`/`@appendFile`/`@arg` (two, walked),
 //! `@argc()` (none), plus bare `unreachable` — with the runtime helpers
 //! gated on actual use, the `@argc`/`@arg` main-store wiring, and
-//! statement-position panic/unreachable divergence —
+//! statement-position panic/unreachable divergence — and, v0.182, the
+//! CLOSED SELF-HOST LOOP: `@import("std")` resolves to the bundled
+//! library (the same bytes `include_str!` embeds; dedup key `<std>`,
+//! silent re-reach, driver-supplied path in argv[3]), std joins every
+//! flattened module, the whole selfhost pipeline C-compares, alloc's
+//! element admits every `[]T` element name, and the bootstrap fixed
+//! point is pinned (`selfhost_bootstrap_fixed_point`) —
 //! written
 //! in kardashev —
 //! against the Rust
@@ -296,10 +302,14 @@ const SEMA_INVALID: &[&str] = &[
 /// reaches sema in Test mode, where its cross-module reference is E0100.
 const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "tests/spec/s22_modules/_back_calls_root.ks",                     // E0100
+    // v0.182: standalone modres flattens (std resolves) but references
+    // emit.ks's `es_decode_str` without importing it — the cdump flatten
+    // provides it; the standalone Test-mode module does not.
+    "selfhost/modres.ks",                                             // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 409;
-const MIN_C_COMPARED_TEST: usize = 428;
+const MIN_C_COMPARED_PROGRAM: usize = 444;
+const MIN_C_COMPARED_TEST: usize = 484;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -506,8 +516,7 @@ fn det_expr(cx: &Cx, e: &Expr) -> Option<Hit> {
             // their arguments like ordinary calls.
             if callee == "alloc" {
                 let shaped = args.len() == 3
-                    && matches!(&args[1], Expr::Ident { name, .. }
-                        if subset_slice_elem(name) || cx.tp.contains(name) || cx.ctp.contains(name));
+                    && matches!(&args[1], Expr::Ident { name, .. } if elem_name_ok(cx, name));
                 if !shaped {
                     return Some(("builtin-call", pos));
                 }
@@ -956,21 +965,31 @@ impl Resolver {
         if self.fail.is_some() {
             return;
         }
-        let content = std::fs::read_to_string(norm).unwrap_or_default();
+        let mut content = std::fs::read_to_string(norm).unwrap_or_default();
         let base_name = basename(norm);
+        let mut norm = norm;
         if (base_name == "std" || base_name == "std.ks") && content.is_empty() {
-            self.fail = Some(format!("SKIP import {}\n", import_pos));
-            return;
-        }
-        if let Some(&on_stack) = self.states.get(norm) {
-            if on_stack {
-                self.fail = Some(format!("ERROR 292 {}\n", import_pos));
+            // v0.182: the bundled std JOINS the flattened module — the same
+            // bytes `include_str!` embeds into the compiler (this file IS
+            // that file). Dedup key `<std>`; a std reached again — on the
+            // stack or done — stops SILENTLY (the Rust arm never reports a
+            // std cycle).
+            if self.states.contains_key("<std>") {
+                return;
             }
-            return;
-        }
-        if content.is_empty() && !is_root {
-            self.fail = Some(format!("ERROR 291 {}\n", import_pos));
-            return;
+            norm = "<std>";
+            content = include_str!("../src/std.ks").to_string();
+        } else {
+            if let Some(&on_stack) = self.states.get(norm) {
+                if on_stack {
+                    self.fail = Some(format!("ERROR 292 {}\n", import_pos));
+                }
+                return;
+            }
+            if content.is_empty() && !is_root {
+                self.fail = Some(format!("ERROR 291 {}\n", import_pos));
+                return;
+            }
         }
         self.states.insert(norm.to_string(), true);
 
@@ -1258,9 +1277,10 @@ fn collect_ks(dir: &Path, out: &mut Vec<PathBuf>) {
 fn run_driver(exe: &Path, input: &Path, mode: EmitMode) -> Result<String, String> {
     let mut cmd = Command::new(exe);
     cmd.arg(input);
-    if mode == EmitMode::Test {
-        cmd.arg("test");
-    }
+    // The mode is always explicit so argv[3] can carry the bundled std's
+    // source path (v0.182) — the very file the compiler `include_str!`s.
+    cmd.arg(if mode == EmitMode::Test { "test" } else { "program" });
+    cmd.arg(repo_root().join("crates/kardc/src/std.ks"));
     let out = cmd
         .output()
         .unwrap_or_else(|e| panic!("failed to run cdump on {}: {e}", input.display()));
@@ -1423,6 +1443,69 @@ fn selfhost_emit_differential_corpus() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// THE BOOTSTRAP FIXED POINT (v0.182 — the self-host loop): the
+/// kardashev-written emitter, compiled by the Rust pipeline, emits C for
+/// ITSELF byte-identical to the Rust emitter; that self-emitted C compiles
+/// into a STAGE-2 driver; and stage 2 reproduces stage 1's output — on the
+/// driver's own source (the classic fixed point) and on a spread of corpus
+/// inputs across every classification kind (C, SKIP, ERROR).
+#[test]
+fn selfhost_bootstrap_fixed_point() {
+    let root = repo_root();
+    let stage1 = build_cdump();
+    let cdump_src = root.join("selfhost/cdump.ks");
+
+    // Stage 1 emits ITSELF; the bytes must equal the Rust emitter's.
+    let self_c = run_driver(&stage1, &cdump_src, EmitMode::Program)
+        .expect("stage 1 should classify its own source");
+    let rust_c = kardc::compile_program(&cdump_src, EmitMode::Program)
+        .expect("the Rust pipeline should compile cdump.ks");
+    assert_eq!(
+        self_c, rust_c,
+        "the self-emitted C for cdump.ks diverged from the Rust emitter"
+    );
+
+    // The self-emitted C builds into a stage-2 driver...
+    let c_path = temp_path("boot_c").with_extension("c");
+    std::fs::write(&c_path, &self_c).expect("write the self-emitted C");
+    let stage2 = temp_path("boot_stage2");
+    let opts = BuildOptions {
+        opt: OptLevel::O0,
+        ..BuildOptions::default()
+    };
+    kardc::backend::cc_build(&std::fs::read_to_string(&c_path).unwrap(), &stage2, &opts)
+        .expect("cc should build the stage-2 driver from self-emitted C");
+
+    // ...and stage 2 reproduces stage 1 — the fixed point on its own
+    // source, then across classification kinds.
+    let mut probes: Vec<PathBuf> = vec![
+        cdump_src.clone(),
+        root.join("selfhost/emit.ks"),
+        root.join("tests/std/hashes.ks"),
+        root.join("tests/std/json.ks"),
+        root.join("examples/arraylist.ks"),
+        root.join("tests/spec/s17_generics/explicit_type_arg_call.ks"),
+        root.join("tests/spec/s25_generic_structs/err_ctor_runtime_param.ks"),
+    ];
+    probes.retain(|p| p.exists());
+    assert!(probes.len() >= 6, "bootstrap probe set shrank");
+    for input in &probes {
+        for mode in [EmitMode::Program, EmitMode::Test] {
+            let a = run_driver(&stage1, input, mode).expect("stage 1 runs");
+            let b = run_driver(&stage2, input, mode).expect("stage 2 runs");
+            assert_eq!(
+                a, b,
+                "stage 2 diverged from stage 1 on {} [{:?}]",
+                input.display(),
+                mode
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&stage1);
+    let _ = std::fs::remove_file(&stage2);
+    let _ = std::fs::remove_file(&c_path);
 }
 
 /// (b) Targeted inputs (written to temp files): emit-specific edges the
@@ -1890,7 +1973,7 @@ fn selfhost_emit_differential_targeted_inputs() {
         ),
         (
             "gstruct_slice_of_instance_and_ptr_param",
-            "fn Cnt(comptime T: type) type {\n    return struct {\n        v: T,\n        fn init(x: T) Self { return Self{ .v = x }; }\n    };\n}\nconst C64 = Cnt(i64);\nfn bump(p: *C64) void {\n    p.v = p.v + 1;\n}\npub fn main() void {\n    var c: C64 = C64.init(41);\n    bump(&c);\n    print(c.v);\n    var al: Allocator = c_allocator();\n    var s: []C64 = alloc(al, C64, 2);\n    s[0] = C64.init(7);\n    print(s[0].v);\n    free(al, s);\n}\n",
+            "fn Cnt(comptime T: type) type {\n    return struct {\n        v: T,\n        fn init(x: T) Self { return Self{ .v = x }; }\n    };\n}\nconst C64 = Cnt(i64);\nfn bump(p: *C64) void {\n    p.v = p.v + 1;\n}\nfn head(s: []C64) i64 {\n    return s[0].v;\n}\npub fn main() void {\n    var c: C64 = C64.init(41);\n    bump(&c);\n    print(c.v);\n    var arr: [2]C64 = [2]C64{ C64.init(7), C64.init(9) };\n    print(head(arr[0..2]));\n}\n",
         ),
         (
             "skip_app_not_a_ctor",
@@ -1965,6 +2048,15 @@ fn selfhost_emit_differential_targeted_inputs() {
         (
             "skip_sizeof_wrong_shape",
             "pub fn main() void {\n    print(@as(i64, @sizeOf(42)));\n}\n",
+        ),
+        // -- `@import("std")` resolution (v0.182 — the loop closes) -------------------
+        (
+            "std_import_free_fns_and_container",
+            "@import(\"std\");\npub fn main() void {\n    print(gcd(54, 24));\n    print(imax64(3, 9));\n    var al: Allocator = c_allocator();\n    var xs: ArrayList(i64) = ArrayList(i64).init(al);\n    xs.push(al, 7);\n    xs.push(al, 40);\n    print(xs.get(0) + xs.get(1));\n    xs.deinit(al);\n    var t: []u8 = fmt_i64(al, 0 - 42);\n    print(t);\n    free(al, t);\n}\n",
+        ),
+        (
+            "std_import_dead_code_stays_lean",
+            "@import(\"std\");\npub fn main() void {\n    print(gcd(8, 12));\n}\n",
         ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (

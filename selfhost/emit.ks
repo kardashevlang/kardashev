@@ -1,4 +1,4 @@
-// emit.ks — self-host stages 3–24 (v0.161–v0.181): a C emitter for the
+// emit.ks — self-host stages 3–25 (v0.161–v0.182): a C emitter for the
 // SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
 // `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
 // `[N]T` with array literals and `for` loops, plain data STRUCTS, struct
@@ -21,7 +21,13 @@
 // whole-module walk covering generic and constructor bodies) and emitted
 // at the type-def tail in the fixed panic → readers → writer → arg
 // order; `@argc`/`@arg` add the prelude statics and switch `main`'s
-// parameter store on (both program and test-harness wiring)),
+// parameter store on (both program and test-harness wiring)). v0.182
+// closes THE SELF-HOST LOOP: `@import("std")` resolves in modres.ks
+// (the driver-supplied bundled source), std joins every flattened
+// module, and THIS FILE — the whole selfhost pipeline plus std —
+// emits byte-identical to the Rust emitter; the self-emitted C builds
+// a stage-2 driver whose outputs reproduce stage 1's (the bootstrap
+// fixed point, pinned by `selfhost_bootstrap_fixed_point`),
 // written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
@@ -1446,8 +1452,13 @@ pub const Det = struct {
                     var eu: usize = @as(usize, a1);
                     if (self.nodes[eu].kind != ND_IDENT) { shaped = false; }
                     if (shaped) {
+                        // Any admissible slice ELEMENT name (v0.182):
+                        // scalars, declared structs/enums, aliases, bound
+                        // type params, a method's `Self` — the same set
+                        // `[]T` ranges over (the emitter's alloc arm has
+                        // been struct-capable since v0.179).
                         var ename: []u8 = self.src[self.nodes[eu].xoff .. self.nodes[eu].xoff + self.nodes[eu].xlen];
-                        if (!et_is_slice_elem(et_from_name(ename)) and !self.is_type_param(ename)) { shaped = false; }
+                        if (!self.elem_name_ok(ename)) { shaped = false; }
                     }
                 }
                 if (!shaped) {

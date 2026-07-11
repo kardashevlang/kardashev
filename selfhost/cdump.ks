@@ -68,14 +68,20 @@ pub fn main() i32 {
     var path: []u8 = @arg(a, 1);
     var mode: []u8 = @arg(a, 2);
     var testmode: bool = str_eq(mode, "test");
+    // The bundled std's source path (v0.182): argv[3]; the harness passes
+    // `crates/kardc/src/std.ks` — the very file `include_str!` embeds —
+    // so `@import("std")` resolves to the same bytes. Without it a std
+    // import keeps the pre-v0.182 `SKIP import` verdict.
+    var stdp: []u8 = @arg(a, 3);
 
     // Resolve the root and its transitive imports into one flattened
     // module over a concatenated virtual source (v0.167): a root lex/parse
     // failure keeps its structural code; an imported file's is E0294; a
     // missing import E0291, a cycle E0292, a duplicate top-level name
-    // E0293 — all positions in concatenated coordinates. A `std` import is
-    // the SKIP verdict `import` (the embedded library is out of subset).
-    var m: MrOut = mr_resolve(a, path);
+    // E0293 — all positions in concatenated coordinates. A `std` import
+    // resolves to the bundled library (v0.182 — THE SELF-HOST LOOP: this
+    // very pipeline, std included, is what the emitter emits).
+    var m: MrOut = mr_resolve(a, path, stdp);
     if (m.kind == MR_ERROR) {
         cd_error(a, m.code, m.pos);
         return 0;

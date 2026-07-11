@@ -18,6 +18,49 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.182.0] — Self-hosting stage 25: `@import("std")` — THE LOOP CLOSES
+
+**The bootstrap milestone.** `@import("std")` resolves in the selfhost
+resolver, std joins every flattened module, and the ENTIRE selfhost
+pipeline — lexer.ks, ast.ks, parser.ks, modres.ks, emit.ks, cdump.ks,
+plus the bundled std — now emits byte-identical to the Rust emitter.
+The self-emitted C builds a STAGE-2 driver whose outputs reproduce
+stage 1's exactly: the classic bootstrap fixed point, now pinned in CI
+(`selfhost_bootstrap_fixed_point` — self-emit == Rust-emit, cc the
+result, stage2(cdump.ks) == stage1(cdump.ks), and stage 2 == stage 1
+across C/SKIP/ERROR classifications).
+
+- `selfhost/modres.ks`: a `std`/`std.ks` basename naming no real file
+  resolves to the bundled library — read from the DRIVER-SUPPLIED path
+  (`mr_resolve` gains `std_path`; `cdump <file> <mode> <stdpath>` —
+  the harness passes `crates/kardc/src/std.ks`, the very file
+  `include_str!` embeds, so the bytes are identical by construction).
+  Dedup key `<std>`; a std reached again — on the stack or done —
+  stops SILENTLY (the Rust arm never reports a std cycle). Without a
+  supplied path the pre-v0.182 `SKIP import` verdict stands.
+- The detector's `alloc(a, T, n)` element rule widens to every
+  admissible `[]T` element name (declared structs/enums, aliases,
+  bound params, `Self`) — std's `alloc(a, JsonNode, n)` was the last
+  out-of-subset construct in the library (the emitter's alloc arm has
+  been struct-capable since v0.179). An ALIAS element is det-admitted
+  but sema-rejected (E0241) — pin territory, exercised by no corpus
+  file.
+- The corpus consequences: **449/489 C byte-identical** (Program/Test)
+  from 414/433 — the C payload grows 0.67 MB → 2.24 MB (Program) and
+  0.88 MB → **8.6 MB** (Test: the std test files with every std
+  function live). `selfhost/modres.ks` standalone becomes a Test-mode
+  sema-invalid pin (it references emit.ks's `es_decode_str` without
+  importing it — the cdump flatten provides it). Corpus wall-time
+  grows ~8s → ~70s (std re-flattens per importing file; a future
+  optimization pass can cache).
+- Differential: floors 409/428 → 444/484; 2 new std-import targeted
+  cases (free fns + an `ArrayList(i64)` container roundtrip through
+  std, and the dead-code-lean module); 1 stale v0.179 case re-anchored
+  (its alias-element `alloc` is sema-invalid now that the shape is
+  subset-admitted). End-to-end: a std-importing program (gcd,
+  ArrayList push/get, `fmt_i64`) runs identically through the selfhost
+  C and the Rust pipeline.
+
 ## [0.181.0] — Self-hosting stage 24: the OS + reflection builtins
 
 The last language surface before `@import("std")`: `selfhost/emit.ks`
