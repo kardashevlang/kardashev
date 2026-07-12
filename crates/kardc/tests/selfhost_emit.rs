@@ -1,4 +1,5 @@
-//! Self-host stages 3–26 (v0.161–v0.183): differential test of
+//! Self-host stages 3–26 (v0.161–v0.183; harness parallelised v0.184):
+//! differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -1256,6 +1257,11 @@ fn rust_expected(path: &Path, _src: &str, mode: EmitMode) -> Expected {
 // ---- harness --------------------------------------------------------------------
 
 /// Compile `selfhost/cdump.ks` (program mode, `-O0`) to a temp executable.
+fn shared_cdump() -> &'static Path {
+    static CDUMP: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CDUMP.get_or_init(build_cdump)
+}
+
 fn build_cdump() -> PathBuf {
     let src = repo_root().join("selfhost/cdump.ks");
     let c = kardc::compile_program(&src, EmitMode::Program).unwrap_or_else(|diags| {
@@ -1355,7 +1361,7 @@ fn diff_one(
 #[test]
 fn selfhost_emit_differential_corpus() {
     let root = repo_root();
-    let exe = build_cdump();
+    let exe = shared_cdump();
 
     let mut corpus: Vec<PathBuf> = Vec::new();
     collect_ks(&root.join("tests/spec"), &mut corpus);
@@ -1385,45 +1391,86 @@ fn selfhost_emit_differential_corpus() {
             MIN_C_COMPARED_TEST,
         ),
     ] {
-        let mut sema_invalid_seen: BTreeSet<String> = BTreeSet::new();
-        let mut n_error = 0usize;
-        let mut n_skip = 0usize;
-        let mut n_c = 0usize;
-        let mut c_bytes = 0usize;
-        for file in &corpus {
-            let src = match std::fs::read_to_string(file) {
-                Ok(s) => s,
-                Err(e) => {
-                    failures.push(format!("{}: unreadable corpus file: {e}", file.display()));
-                    continue;
-                }
-            };
-            let expected = rust_expected(file, &src, mode);
-            match &expected {
-                Expected::Bytes(b) if b.starts_with("ERROR ") => n_error += 1,
-                Expected::Bytes(b) if b.starts_with("SKIP ") => n_skip += 1,
-                Expected::Bytes(_) => {}
-                Expected::SemaInvalid(_) => {
-                    let rel = file
-                        .strip_prefix(&root)
-                        .expect("corpus file under repo root")
-                        .display()
-                        .to_string();
-                    sema_invalid_seen.insert(rel);
-                }
-            }
-            match diff_one(&exe, file, &expected, mode) {
-                Ok(Some(bytes)) => {
-                    if matches!(&expected, Expected::Bytes(b) if !b.starts_with("ERROR ") && !b.starts_with("SKIP "))
-                    {
-                        n_c += 1;
-                        c_bytes += bytes;
-                    }
-                }
-                Ok(None) => {}
-                Err(msg) => failures.push(msg),
-            }
+        // The per-file work — the Rust reference classification AND the
+        // driver subprocess — is embarrassingly parallel; a work-stealing
+        // pool (the spec-runner pattern, v0.155) turns the ~500 full-emit
+        // comparisons per mode from a ~35 s serial crawl into a few
+        // seconds. All accumulation happens behind one mutex; the
+        // assertions below are unchanged (v0.184).
+        struct ModeTally {
+            sema_invalid_seen: BTreeSet<String>,
+            n_error: usize,
+            n_skip: usize,
+            n_c: usize,
+            c_bytes: usize,
+            failures: Vec<String>,
         }
+        let tally = std::sync::Mutex::new(ModeTally {
+            sema_invalid_seen: BTreeSet::new(),
+            n_error: 0,
+            n_skip: 0,
+            n_c: 0,
+            c_bytes: 0,
+            failures: Vec::new(),
+        });
+        let next = AtomicUsize::new(0);
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get().min(8))
+            .unwrap_or(4);
+        std::thread::scope(|sc| {
+            for _ in 0..workers {
+                sc.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(file) = corpus.get(i) else { break };
+                    let src = match std::fs::read_to_string(file) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tally.lock().unwrap().failures.push(format!(
+                                "{}: unreadable corpus file: {e}",
+                                file.display()
+                            ));
+                            continue;
+                        }
+                    };
+                    let expected = rust_expected(file, &src, mode);
+                    let diffed = diff_one(exe, file, &expected, mode);
+                    let mut t = tally.lock().unwrap();
+                    match &expected {
+                        Expected::Bytes(b) if b.starts_with("ERROR ") => t.n_error += 1,
+                        Expected::Bytes(b) if b.starts_with("SKIP ") => t.n_skip += 1,
+                        Expected::Bytes(_) => {}
+                        Expected::SemaInvalid(_) => {
+                            let rel = file
+                                .strip_prefix(&root)
+                                .expect("corpus file under repo root")
+                                .display()
+                                .to_string();
+                            t.sema_invalid_seen.insert(rel);
+                        }
+                    }
+                    match diffed {
+                        Ok(Some(bytes)) => {
+                            if matches!(&expected, Expected::Bytes(b) if !b.starts_with("ERROR ") && !b.starts_with("SKIP "))
+                            {
+                                t.n_c += 1;
+                                t.c_bytes += bytes;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(msg) => t.failures.push(msg),
+                    }
+                });
+            }
+        });
+        let ModeTally {
+            sema_invalid_seen,
+            n_error,
+            n_skip,
+            n_c,
+            c_bytes,
+            failures: mode_failures,
+        } = tally.into_inner().unwrap();
+        failures.extend(mode_failures);
 
         // The sema-invalid remainder is pinned exactly PER MODE: a drift in
         // either direction (a new uncompared file, or a file that became
@@ -1451,7 +1498,6 @@ fn selfhost_emit_differential_corpus() {
             sema_invalid_seen.len()
         );
     }
-    let _ = std::fs::remove_file(&exe);
 
     assert!(
         failures.is_empty(),
@@ -1470,7 +1516,7 @@ fn selfhost_emit_differential_corpus() {
 #[test]
 fn selfhost_bootstrap_fixed_point() {
     let root = repo_root();
-    let stage1 = build_cdump();
+    let stage1 = shared_cdump();
     let cdump_src = root.join("selfhost/cdump.ks");
 
     // Stage 1 emits ITSELF; the bytes must equal the Rust emitter's.
@@ -1519,7 +1565,6 @@ fn selfhost_bootstrap_fixed_point() {
             );
         }
     }
-    let _ = std::fs::remove_file(&stage1);
     let _ = std::fs::remove_file(&stage2);
     let _ = std::fs::remove_file(&c_path);
 }
@@ -1531,7 +1576,7 @@ fn selfhost_bootstrap_fixed_point() {
 /// Every case must produce byte-identical driver output.
 #[test]
 fn selfhost_emit_differential_targeted_inputs() {
-    let exe = build_cdump();
+    let exe = shared_cdump();
     let cases: &[(&str, &str)] = &[
         // -- the defer matrix ------------------------------------------------
         (
@@ -2203,28 +2248,41 @@ fn selfhost_emit_differential_targeted_inputs() {
             "pub fn main() void {\n    if (false) { unreachable; }\n    print(1);\n}\n",
         ),
     ];
-    let mut failures: Vec<String> = Vec::new();
-    for (tag, src) in cases {
-        let input = temp_path(&format!("cerr_{tag}"));
-        std::fs::write(&input, src).expect("write temp emit input");
-        // Every targeted case is checked in BOTH modes (v0.166): the same
-        // source must byte-agree as a Program lowering and as a Test-mode
-        // harness (with its distinct liveness and expect lowering).
-        for mode in [EmitMode::Program, EmitMode::Test] {
-            let expected = rust_expected(&input, src, mode);
-            if let Expected::SemaInvalid(code) = &expected {
-                failures.push(format!(
-                    "[{tag} {mode:?}] targeted input is sema-invalid ({code}) — every case must classify as ERROR, SKIP or valid C"
-                ));
-                continue;
-            }
-            if let Err(msg) = diff_one(&exe, &input, &expected, mode) {
-                failures.push(format!("[{tag}] {msg}"));
-            }
+    // Each case is independent — the same work-stealing pool as the
+    // corpus loop (v0.184).
+    let failures: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let next = AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4);
+    std::thread::scope(|sc| {
+        for _ in 0..workers {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some((tag, src)) = cases.get(i) else { break };
+                let input = temp_path(&format!("cerr_{tag}"));
+                std::fs::write(&input, src).expect("write temp emit input");
+                // Every targeted case is checked in BOTH modes (v0.166):
+                // the same source must byte-agree as a Program lowering and
+                // as a Test-mode harness (with its distinct liveness and
+                // expect lowering).
+                for mode in [EmitMode::Program, EmitMode::Test] {
+                    let expected = rust_expected(&input, src, mode);
+                    if let Expected::SemaInvalid(code) = &expected {
+                        failures.lock().unwrap().push(format!(
+                            "[{tag} {mode:?}] targeted input is sema-invalid ({code}) — every case must classify as ERROR, SKIP or valid C"
+                        ));
+                        continue;
+                    }
+                    if let Err(msg) = diff_one(exe, &input, &expected, mode) {
+                        failures.lock().unwrap().push(format!("[{tag}] {msg}"));
+                    }
+                }
+                let _ = std::fs::remove_file(&input);
+            });
         }
-        let _ = std::fs::remove_file(&input);
-    }
-    let _ = std::fs::remove_file(&exe);
+    });
+    let failures = failures.into_inner().unwrap();
     assert!(
         failures.is_empty(),
         "{} targeted inputs mismatched:\n{}",
@@ -2240,7 +2298,7 @@ fn selfhost_emit_differential_targeted_inputs() {
 /// wrapped sub-file errors (E0294), and root/nested `std` imports (SKIP).
 #[test]
 fn selfhost_emit_differential_import_fixtures() {
-    let exe = build_cdump();
+    let exe = shared_cdump();
     // (tag, &[(filename, source)], root-filename)
     let cases: &[(&str, &[(&str, &str)], &str)] = &[
         (
@@ -2378,7 +2436,6 @@ fn selfhost_emit_differential_import_fixtures() {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
-    let _ = std::fs::remove_file(&exe);
     assert!(
         failures.is_empty(),
         "{} import fixtures mismatched:\n{}",
@@ -2406,7 +2463,6 @@ fn selfhost_emit_suite_passes() {
     };
     kardc::backend::cc_build(&c, &exe, &opts).expect("cc should build the suite harness");
     let output = Command::new(&exe).output().expect("should run the harness");
-    let _ = std::fs::remove_file(&exe);
     assert_eq!(
         output.status.code(),
         Some(0),
