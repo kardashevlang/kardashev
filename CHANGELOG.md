@@ -18,6 +18,33 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.184.0] — The differential harness goes parallel
+
+An efficiency release (the 13th-goal charter: optimize before growth
+taxes every run): the selfhost differential suite drops from ~110 s to
+~21 s wall — protecting CI before conformance-wave-C grows the corpus
+further.
+
+- `selfhost_emit.rs`: the per-file corpus work — the Rust reference
+  classification AND the driver subprocess — is embarrassingly
+  parallel; the corpus loop now runs on the v0.155 spec-runner
+  work-stealing pool (`available_parallelism().min(8)` workers, one
+  atomic index, all accumulation behind one mutex). Every assertion —
+  the per-mode sema-invalid pin sets, the C-compared floors, the
+  failure reporting — is byte-for-byte unchanged; only the wall clock
+  moved (~70 s → ~9 s for the corpus pass). The targeted-input runner
+  takes the same pool.
+- The driver builds ONCE per test process (`shared_cdump`, a
+  `OnceLock`): the four driver tests each rebuilt cdump.ks through the
+  full Rust pipeline + cc (~7 s apiece) — now one build, shared, and
+  the per-test deletions are gone (the temp file lives for the process,
+  like any temp artifact).
+- Measured (8 cores): the five `selfhost_emit` tests together 21.5 s
+  (corpus 15.8 s cold incl. the shared build); the WHOLE `cargo test`
+  suite 35.8 s wall. An `-O2` driver build was measured and rejected:
+  the -O0 cdump is within ~3% of -O2 on the differential workload (the
+  time is parse + emit, not compute), so dev-speed builds stay.
+
 ## [0.183.0] — Self-hosting stage 26: tagged unions
 
 The LAST language bucket: `selfhost/emit.ks` compiles `union(enum)`
