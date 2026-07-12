@@ -18,6 +18,50 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.183.0] — Self-hosting stage 26: tagged unions
+
+The LAST language bucket: `selfhost/emit.ks` compiles `union(enum)`
+declarations, construction, and payload-capturing switches
+byte-identically, and the C-identical corpus climbs 449/489 → 459/499
+(Program/Test) — absorbing `s20_unions` and the union interaction files.
+The remaining SKIPs are now exclusively deliberate out-of-subset
+fixtures.
+
+- `selfhost/emit.ks` (stage 26): pass 0c interns union NAMES first,
+  then resolves variant payloads in declaration order (interning
+  composites; a `*T` payload registers its pointee like a struct
+  field's). Unions join `base_code` between enums and aliases, the
+  `ET_UNION_BASE` band bounds `et_is_ptr`, and `type_mangle` spells
+  `union_<Name>`. The typedef — `typedef struct { int32_t tag; union {
+  <T> kd_<v>; … } data; } kd_union_<Name>;` — seeds between error
+  unions and arrays in the dependency walk, its payloads by-value
+  dependencies.
+- Construction `Name{ .v = e }` → `((kd_union_<N>){ .tag = <idx>,
+  .data = { .kd_<v> = <e> } })` with the payload COERCED to the
+  variant's type (`?T` widening included). A union `switch` dispatches
+  on `(<u>).tag` with 0-based `case <idx>:` labels; a captured arm
+  opens with `<payload cty> kd_<cap> = (<u>).data.kd_<v>;` at one
+  extra indent — the scrutinee TEXT re-emitted, exactly like Rust.
+  Union labels are index lookups (never expressions); the scan binds
+  each capture to its FIRST label's payload (missing → i64, sema's
+  fallback) so payload-typed bodies intern correctly.
+- The detector (both mirrors): union declarations admit (payload types
+  walk), union names join the named-type set everywhere a type may
+  appear, and switch captures admit unconditionally (a capture on an
+  enum/int switch is sema's E0272 remainder). Plain-struct fields of
+  union type stay E0161 — the pass-0b-before-0c ordering, exactly like
+  alias fields.
+- Differential (`selfhost_emit.rs`): 7 new sema-invalid pins (E0270/
+  E0271×2/E0110/E0210/E0272/E0212); floors 444/484 → 454/494 (459/499
+  observed); 5 new targeted cases (the construct/switch/capture matrix
+  over i64/array/slice payloads, multi-label + else arms, `?T` payload
+  coercion, unions through generics + defer, nested capture
+  shadowing); 2 stale pre-v0.183 pins updated (the `union` item
+  verdict, the `capture` verdict). Suite: 77 → 78 in-language tests.
+  End-to-end: a three-variant shape union (i64 / `[2]i64` / `[]u8`
+  payloads) runs identically through the selfhost C and the Rust
+  pipeline.
+
 ## [0.182.0] — Self-hosting stage 25: `@import("std")` — THE LOOP CLOSES
 
 **The bootstrap milestone.** `@import("std")` resolves in the selfhost
