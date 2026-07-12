@@ -1,4 +1,4 @@
-// emit.ks — self-host stages 3–25 (v0.161–v0.182): a C emitter for the
+// emit.ks — self-host stages 3–26 (v0.161–v0.183): a C emitter for the
 // SCALAR + STRING + HEAP-BUFFER SUBSET (with generalized `[]T` slices,
 // `@as` casts, the `s[lo..hi]` slicing view, `test` blocks, fixed arrays
 // `[N]T` with array literals and `for` loops, plain data STRUCTS, struct
@@ -27,7 +27,20 @@
 // module, and THIS FILE — the whole selfhost pipeline plus std —
 // emits byte-identical to the Rust emitter; the self-emitted C builds
 // a stage-2 driver whose outputs reproduce stage 1's (the bootstrap
-// fixed point, pinned by `selfhost_bootstrap_fixed_point`),
+// fixed point, pinned by `selfhost_bootstrap_fixed_point`). v0.183
+// adds TAGGED UNIONS (SPEC §20): pass 0c interns union names then
+// resolves variant payloads (interning composites; unions resolve in
+// `base_code` between enums and aliases); the typedef is the tagged C
+// struct `{ int32_t tag; union { … } data; }` seeded between error
+// unions and arrays in the dependency walk (payloads are by-value
+// dependencies); construction `Name{ .v = e }` lowers to the 0-based
+// tag + the COERCED payload; a union `switch` dispatches on
+// `(<u>).tag` with `case <idx>:` labels (the scrutinee TEXT re-emitted
+// in each capture line `<cty> kd_<cap> = (<u>).data.kd_<v>;`, one
+// extra indent) — union labels are index lookups, never expressions,
+// and the scan binds each capture to its FIRST label's payload
+// (missing → i64, sema's fallback). Plain-struct fields of union type
+// stay E0161 (the 0b-before-0c ordering, like alias fields),
 // written in
 // kardashev, mirroring `crates/kardc/src/emit_c.rs` decision for decision
 // so that — for every subset program — the emitted C is BYTE-IDENTICAL to
@@ -377,6 +390,7 @@ pub const ET_SLICE_ENUM_BASE: i64 = 4000000000;
 pub const ET_OPT_BASE: i64 = 5000000000;
 pub const ET_ERRU_BASE: i64 = 6000000000;
 pub const ET_PTR_BASE: i64 = 7000000000;
+pub const ET_UNION_BASE: i64 = 8000000000;
 
 pub fn et_slice_of(elem: i64) i64 {
     if (elem >= ET_ENUM_BASE) {
@@ -423,7 +437,11 @@ pub fn et_is_erru(t: i64) bool {
 }
 
 pub fn et_is_ptr(t: i64) bool {
-    return t >= ET_PTR_BASE;
+    return t >= ET_PTR_BASE and t < ET_UNION_BASE;
+}
+
+pub fn et_is_union(t: i64) bool {
+    return t >= ET_UNION_BASE;
 }
 
 /// `StructTable::slice_c_name` over the subset: `kd_slice_<type_mangle(elem)>`
@@ -1272,7 +1290,7 @@ pub const Det = struct {
         var cur: i32 = self.droot;
         while (cur >= 0) {
             var u: usize = @as(usize, cur);
-            if (self.nodes[u].kind == ND_STRUCT or self.nodes[u].kind == ND_ENUM) {
+            if (self.nodes[u].kind == ND_STRUCT or self.nodes[u].kind == ND_ENUM or self.nodes[u].kind == ND_UNION) {
                 if (str_eq(self.src[self.nodes[u].xoff .. self.nodes[u].xoff + self.nodes[u].xlen], name)) {
                     return true;
                 }
@@ -1858,10 +1876,9 @@ pub const Det = struct {
             while (swa >= 0) {
                 if (self.found) { return; }
                 var swu: usize = @as(usize, swa);
-                if ((self.nodes[swu].flags & F_CAP) != 0) {
-                    self.hit("capture", self.nodes[swu].off);
-                    return;
-                }
+                // A payload capture is in the subset (v0.183) — its
+                // union-ness is sema's E0272; the name binds nothing the
+                // walk needs.
                 var swl: i32 = self.nodes[swu].a;
                 while (swl >= 0) {
                     if (self.found) { return; }
@@ -2047,7 +2064,14 @@ pub fn es_detect_mode(src: []u8, nodes: []Node, root: i32, program_mode: bool) D
             // and literal integer values carry nothing to walk (a
             // duplicate variant is sema's E0211).
         } else if (k == ND_UNION) {
-            d.hit("union", nodes[u].off);
+            // A tagged-union declaration is a subset item (v0.183): every
+            // variant payload type must be admissible (a duplicate variant
+            // is sema's E0211).
+            var uvc: i32 = nodes[u].a;
+            while (uvc >= 0 and !d.found) {
+                d.check_type(nodes[@as(usize, uvc)].a);
+                uvc = nodes[@as(usize, uvc)].next;
+            }
         } else if (k == ND_IMPORT) {
             d.hit("import", nodes[u].off);
         } else if (k == ND_ERRSET) {
@@ -2361,6 +2385,19 @@ pub const Em = struct {
     en_v_start: []i64,
     en_v_count: []i64,
     en_count: usize,
+    // The tagged-union table (v0.183, SPEC §20) — sema pass 0c's mirror.
+    // Ids are declaration order; variants live flat in the `uv_*` arrays
+    // (name span + resolved payload ET code), one `(start, count)` window
+    // per union.
+    un_name_off: []i64,
+    un_name_len: []i64,
+    un_v_start: []i64,
+    un_v_count: []i64,
+    un_count: usize,
+    uv_name_off: []i64,
+    uv_name_len: []i64,
+    uv_ty: []i64,
+    uv_count: usize,
     // The interned OPTIONAL inner-type codes, in sema's first-intern
     // order (v0.173) — the `optional_inners` mirror. Optional codes are
     // `ET_OPT_BASE + index`.
@@ -2562,6 +2599,15 @@ pub const Em = struct {
             .en_v_start = alloc(a, i64, 4),
             .en_v_count = alloc(a, i64, 4),
             .en_count = 0,
+            .un_name_off = alloc(a, i64, 4),
+            .un_name_len = alloc(a, i64, 4),
+            .un_v_start = alloc(a, i64, 4),
+            .un_v_count = alloc(a, i64, 4),
+            .un_count = 0,
+            .uv_name_off = alloc(a, i64, 8),
+            .uv_name_len = alloc(a, i64, 8),
+            .uv_ty = alloc(a, i64, 8),
+            .uv_count = 0,
             .ev_name_off = alloc(a, i64, 8),
             .ev_name_len = alloc(a, i64, 8),
             .ev_val = alloc(a, i64, 8),
@@ -2675,6 +2721,7 @@ pub const Em = struct {
         if (et_is_arr(t)) { return self.arr_c_name(a, t); }
         if (et_is_struct(t)) { return self.st_c_name(a, t); }
         if (et_is_enum(t)) { return self.en_c_name(a, t); }
+        if (et_is_union(t)) { return self.un_c_name(a, t); }
         if (et_is_opt(t)) { return self.opt_c_name(a, t); }
         if (et_is_erru(t)) { return self.eu_c_name(a, t); }
         if (et_is_ptr(t)) {
@@ -2735,6 +2782,14 @@ pub const Em = struct {
     /// `StructTable::type_mangle` over the subset: scalars spell their C
     /// name, a struct spells `struct_<Name>` (no `kd_` prefix).
     fn mangle_of(self: *Self, a: Allocator, t: i64) []u8 {
+        if (et_is_union(t)) {
+            var sbu: StrBuilder = StrBuilder.init(a);
+            sbu.append(a, "union_");
+            sbu.append(a, self.un_name_of(t));
+            var ou: []u8 = sbu.build(a);
+            sbu.deinit(a);
+            return ou;
+        }
         if (et_is_enum(t)) {
             var sbz: StrBuilder = StrBuilder.init(a);
             sbz.append(a, "enum_");
@@ -3872,6 +3927,8 @@ pub const Em = struct {
         if (st != ET_NONE) { return st; }
         var en: i64 = self.en_code_of(name);
         if (en != ET_NONE) { return en; }
+        var un: i64 = self.un_code_of(name);
+        if (un != ET_NONE) { return un; }
         return self.al_code_of(name);
     }
 
@@ -4205,6 +4262,181 @@ pub const Em = struct {
     /// value plus one, wrapping as i64). A duplicate variant name (E0211,
     /// sema-invalid) still advances the counter but records nothing —
     /// replayed exactly for totality.
+    /// The union id for a source name, as an ET code
+    /// (`ET_UNION_BASE + id`), or `ET_NONE` (v0.183).
+    fn un_code_of(self: *Self, name: []u8) i64 {
+        var i: usize = 0;
+        while (i < self.un_count) : (i += 1) {
+            var off: usize = @as(usize, self.un_name_off[i]);
+            var len: usize = @as(usize, self.un_name_len[i]);
+            if (str_eq(self.src[off .. off + len], name)) {
+                return ET_UNION_BASE + @as(i64, i);
+            }
+        }
+        return ET_NONE;
+    }
+
+    /// The bare source name of a union code.
+    fn un_name_of(self: *Self, ucode: i64) []u8 {
+        var i: usize = @as(usize, ucode - ET_UNION_BASE);
+        var off: usize = @as(usize, self.un_name_off[i]);
+        var len: usize = @as(usize, self.un_name_len[i]);
+        return self.src[off .. off + len];
+    }
+
+    /// `union_c_name`: `kd_union_<Name>`.
+    fn un_c_name(self: *Self, a: Allocator, ucode: i64) []u8 {
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "kd_union_");
+        sb.append(a, self.un_name_of(ucode));
+        var out: []u8 = sb.build(a);
+        sb.deinit(a);
+        return out;
+    }
+
+    /// The 0-based variant index of `vname` in union `ucode`, or -1.
+    fn un_var_index(self: *Self, ucode: i64, vname: []u8) i64 {
+        var i: usize = @as(usize, ucode - ET_UNION_BASE);
+        var start: usize = @as(usize, self.un_v_start[i]);
+        var n: usize = @as(usize, self.un_v_count[i]);
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            var off: usize = @as(usize, self.uv_name_off[start + j]);
+            var len: usize = @as(usize, self.uv_name_len[start + j]);
+            if (str_eq(self.src[off .. off + len], vname)) { return @as(i64, j); }
+        }
+        return 0 - 1;
+    }
+
+    /// The payload ET code of variant `idx` of union `ucode`.
+    fn un_payload(self: *Self, ucode: i64, idx: i64) i64 {
+        var i: usize = @as(usize, ucode - ET_UNION_BASE);
+        return self.uv_ty[@as(usize, self.un_v_start[i] + idx)];
+    }
+
+    /// The variant NAME span text of variant `idx` of union `ucode`.
+    fn un_var_name(self: *Self, ucode: i64, idx: i64) []u8 {
+        var i: usize = @as(usize, ucode - ET_UNION_BASE);
+        var off: usize = @as(usize, self.uv_name_off[@as(usize, self.un_v_start[i] + idx)]);
+        var len: usize = @as(usize, self.uv_name_len[@as(usize, self.un_v_start[i] + idx)]);
+        return self.src[off .. off + len];
+    }
+
+    /// Resolve one union-variant PAYLOAD type (pass 0c's `resolve_type`
+    /// mirror, v0.183): the base resolves through the full chain
+    /// (builtins, structs, enums, unions — a payload may nest one), and a
+    /// composite wrapper INTERNS exactly like a body annotation. An
+    /// unresolvable payload falls back to `i64` (sema records the same so
+    /// downstream checks still see a usable type). Applications cannot
+    /// resolve here (pass 0c precedes 0d, mirroring sema).
+    fn un_resolve_payload(self: *Self, a: Allocator, tn: i32) i64 {
+        var u: usize = @as(usize, tn);
+        var base: i64 = self.base_code(self.tname(tn));
+        if ((self.nodes[u].flags & F_PTR) != 0) {
+            if (base == ET_NONE) { return ET_I64; }
+            return self.pt_intern(a, base, false);
+        }
+        if ((self.nodes[u].flags & F_SLICE) != 0) {
+            if (base == ET_NONE) { return ET_I64; }
+            self.intern_elem(a, base);
+            return et_slice_of(base);
+        }
+        if ((self.nodes[u].flags & F_ARRLIT) != 0) {
+            if (base == ET_NONE) { return ET_I64; }
+            return self.arr_intern(a, base, self.nodes[u].val);
+        }
+        if ((self.nodes[u].flags & F_OPT) != 0) {
+            if (base == ET_NONE) { return ET_I64; }
+            return self.opt_intern(a, base);
+        }
+        if ((self.nodes[u].flags & F_ERR) != 0) {
+            if (base == ET_NONE) { return ET_I64; }
+            return self.eu_intern(a, base);
+        }
+        if (base == ET_NONE) { return ET_I64; }
+        return base;
+    }
+
+    /// Sema pass 0c (v0.183, SPEC §20.2): intern every union NAME first
+    /// (so a payload may reference any union), then resolve each union's
+    /// variant payloads in declaration order (a duplicate variant is
+    /// sema's E0211).
+    fn un_collect(self: *Self, a: Allocator) void {
+        var cur: i32 = self.root;
+        while (cur >= 0) {
+            var u: usize = @as(usize, cur);
+            if (self.nodes[u].kind == ND_UNION) {
+                if (self.un_count == self.un_name_off.len) {
+                    var g0: []i64 = alloc(a, i64, self.un_name_off.len * 2);
+                    var g1: []i64 = alloc(a, i64, self.un_name_len.len * 2);
+                    var g2: []i64 = alloc(a, i64, self.un_v_start.len * 2);
+                    var g3: []i64 = alloc(a, i64, self.un_v_count.len * 2);
+                    var i0: usize = 0;
+                    while (i0 < self.un_count) : (i0 += 1) {
+                        g0[i0] = self.un_name_off[i0];
+                        g1[i0] = self.un_name_len[i0];
+                        g2[i0] = self.un_v_start[i0];
+                        g3[i0] = self.un_v_count[i0];
+                    }
+                    free(a, self.un_name_off);
+                    free(a, self.un_name_len);
+                    free(a, self.un_v_start);
+                    free(a, self.un_v_count);
+                    self.un_name_off = g0;
+                    self.un_name_len = g1;
+                    self.un_v_start = g2;
+                    self.un_v_count = g3;
+                }
+                self.un_name_off[self.un_count] = @as(i64, self.nodes[u].xoff);
+                self.un_name_len[self.un_count] = @as(i64, self.nodes[u].xlen);
+                self.un_v_start[self.un_count] = 0;
+                self.un_v_count[self.un_count] = 0;
+                self.un_count += 1;
+            }
+            cur = self.nodes[u].next;
+        }
+        var uid: usize = 0;
+        cur = self.root;
+        while (cur >= 0) {
+            var u2: usize = @as(usize, cur);
+            if (self.nodes[u2].kind == ND_UNION) {
+                self.un_v_start[uid] = @as(i64, self.uv_count);
+                var nv: i64 = 0;
+                var vcur: i32 = self.nodes[u2].a;
+                while (vcur >= 0) {
+                    var vu: usize = @as(usize, vcur);
+                    var pty: i64 = self.un_resolve_payload(a, self.nodes[vu].a);
+                    if (self.uv_count == self.uv_name_off.len) {
+                        var h0: []i64 = alloc(a, i64, self.uv_name_off.len * 2);
+                        var h1: []i64 = alloc(a, i64, self.uv_name_len.len * 2);
+                        var h2: []i64 = alloc(a, i64, self.uv_ty.len * 2);
+                        var j0: usize = 0;
+                        while (j0 < self.uv_count) : (j0 += 1) {
+                            h0[j0] = self.uv_name_off[j0];
+                            h1[j0] = self.uv_name_len[j0];
+                            h2[j0] = self.uv_ty[j0];
+                        }
+                        free(a, self.uv_name_off);
+                        free(a, self.uv_name_len);
+                        free(a, self.uv_ty);
+                        self.uv_name_off = h0;
+                        self.uv_name_len = h1;
+                        self.uv_ty = h2;
+                    }
+                    self.uv_name_off[self.uv_count] = @as(i64, self.nodes[vu].xoff);
+                    self.uv_name_len[self.uv_count] = @as(i64, self.nodes[vu].xlen);
+                    self.uv_ty[self.uv_count] = pty;
+                    self.uv_count += 1;
+                    nv += 1;
+                    vcur = self.nodes[vu].next;
+                }
+                self.un_v_count[uid] = nv;
+                uid += 1;
+            }
+            cur = self.nodes[u2].next;
+        }
+    }
+
     fn en_collect(self: *Self, a: Allocator) void {
         var cur: i32 = self.root;
         while (cur >= 0) {
@@ -4958,10 +5190,13 @@ pub const Em = struct {
             return ET_NONE;
         }
         if (k == ND_SLIT) {
-            // `Name{ … }` has the named struct's type — a declared struct,
-            // or (v0.179) `Self` / a struct-bound type param / an ALIAS,
-            // the Rust StructLit arm's struct → subst → alias chain (an
+            // `Name{ … }` — a UNION literal has the union's type (checked
+            // FIRST, v0.183); else a declared struct, `Self` / a
+            // struct-bound type param / an ALIAS (v0.179) — the Rust
+            // StructLit arm's union → struct → subst → alias chain (an
             // unknown name is sema's E0163 — untypeable here).
+            var slu: i64 = self.un_code_of(self.xname(n));
+            if (slu != ET_NONE) { return slu; }
             var slt: i64 = self.st_code_of(self.xname(n));
             if (slt != ET_NONE) { return slt; }
             var slb2: i64 = self.base_code(self.xname(n));
@@ -5624,6 +5859,49 @@ pub const Em = struct {
             // literal zero-initialises. An unresolvable name falls back to
             // the canonical spelling (`kd_struct_<name>`), mirroring the
             // Rust defensive arm.
+            var ulc: i64 = self.un_code_of(self.xname(n));
+            if (ulc != ET_NONE) {
+                // A tagged-union construction `Name{ .v = e }` (v0.183,
+                // SPEC §20.3): exactly one field for validated input —
+                // `((kd_union_<N>){ .tag = <idx>, .data = { .kd_<v> = <e> } })`,
+                // the value COERCED to the variant's payload type.
+                var ufin: i32 = self.nodes[u].a;
+                if (ufin < 0) {
+                    // Unreachable for validated input (one field always).
+                    var sbu0: StrBuilder = StrBuilder.init(a);
+                    sbu0.append(a, "((");
+                    sbu0.append(a, self.un_c_name(a, ulc));
+                    sbu0.append(a, "){0})");
+                    var su0: []u8 = sbu0.build(a);
+                    sbu0.deinit(a);
+                    return su0;
+                }
+                var uvn: []u8 = "";
+                var uidx: i64 = 0;
+                var uval: []u8 = "0";
+                if (ufin >= 0) {
+                    var ufu: usize = @as(usize, ufin);
+                    uvn = self.src[self.nodes[ufu].xoff .. self.nodes[ufu].xoff + self.nodes[ufu].xlen];
+                    var uix: i64 = self.un_var_index(ulc, uvn);
+                    if (uix >= 0) { uidx = uix; }
+                    var upt: i64 = ET_NONE;
+                    if (uix >= 0) { upt = self.un_payload(ulc, uix); }
+                    uval = self.emit_coerced(a, self.nodes[ufu].a, upt);
+                }
+                var sbul: StrBuilder = StrBuilder.init(a);
+                sbul.append(a, "((");
+                sbul.append(a, self.un_c_name(a, ulc));
+                sbul.append(a, "){ .tag = ");
+                sbul.append_i64(a, uidx);
+                sbul.append(a, ", .data = { .kd_");
+                sbul.append(a, uvn);
+                sbul.append(a, " = ");
+                sbul.append(a, uval);
+                sbul.append(a, " } })");
+                var sul: []u8 = sbul.build(a);
+                sbul.deinit(a);
+                return sul;
+            }
             var scn: []u8 = "";
             var slc: i64 = self.st_code_of(self.xname(n));
             if (slc == ET_NONE) {
@@ -7508,9 +7786,120 @@ pub const Em = struct {
     /// `default:`. The statement diverges iff it is TOTAL — an `else`
     /// present, or an enum scrutinee (sema proved coverage) — and every
     /// arm (and the else) diverges.
+    /// `emit_union_switch` (v0.183, SPEC §20.3): `switch ((<u>).tag) {`;
+    /// a `case <idx>:` per variant label (0-based tag indexes; the LAST
+    /// opens `{`); a captured arm begins with
+    /// `<payload cty> kd_<cap> = (<u>).data.kd_<v>;` (the scrutinee TEXT
+    /// re-emitted, exactly like Rust) at one extra indent; `} break;`
+    /// closes each arm; `default: {` for the `else`. A validated union
+    /// switch is total, so divergence is the AND of the arms.
+    fn emit_union_switch(self: *Self, a: Allocator, n: i32, ucode: i64) bool {
+        var u: usize = @as(usize, n);
+        var scrut: []u8 = self.emit_expr(a, self.nodes[u].a);
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "switch ((");
+        sb.append(a, scrut);
+        sb.append(a, ").tag) {");
+        var hl: []u8 = sb.build(a);
+        sb.deinit(a);
+        self.line(a, hl);
+        self.indent += 1;
+        var all_diverge: bool = true;
+        var arm: i32 = self.nodes[u].b;
+        while (arm >= 0) {
+            var au: usize = @as(usize, arm);
+            var total: i64 = 0;
+            var lc0: i32 = self.nodes[au].a;
+            while (lc0 >= 0) : (lc0 = self.nodes[@as(usize, lc0)].next) { total += 1; }
+            // The variant named by the arm's FIRST label drives both the
+            // captured member and its payload type.
+            var vidx: i64 = 0 - 1;
+            var li: i64 = 0;
+            var lc: i32 = self.nodes[au].a;
+            while (lc >= 0) {
+                var lu: usize = @as(usize, lc);
+                var cidx: []u8 = "0";
+                if (self.nodes[lu].kind == ND_ENUMLIT) {
+                    var lvi: i64 = self.un_var_index(ucode, self.xname(lc));
+                    if (lvi >= 0) {
+                        if (vidx < 0) { vidx = lvi; }
+                        var sbi: StrBuilder = StrBuilder.init(a);
+                        sbi.append_i64(a, lvi);
+                        cidx = sbi.build(a);
+                        sbi.deinit(a);
+                    } else {
+                        cidx = self.emit_expr(a, lc);
+                    }
+                } else {
+                    // Unreachable for validated input — ordinary lowering.
+                    cidx = self.emit_expr(a, lc);
+                }
+                var sbc: StrBuilder = StrBuilder.init(a);
+                sbc.append(a, "case ");
+                sbc.append(a, cidx);
+                sbc.append(a, ":");
+                if (li + 1 == total) { sbc.append(a, " {"); }
+                var slc2: []u8 = sbc.build(a);
+                sbc.deinit(a);
+                self.line(a, slc2);
+                li += 1;
+                lc = self.nodes[lu].next;
+            }
+            if (total == 0) { self.line(a, "{"); }
+            // Bind the captured payload (if any) inside the arm scope.
+            var capty: i64 = ET_NONE;
+            if ((self.nodes[au].flags & F_CAP) != 0) {
+                var pt2: i64 = ET_VOID;
+                if (vidx >= 0) { pt2 = self.un_payload(ucode, vidx); }
+                capty = pt2;
+                var vn2: []u8 = "";
+                if (vidx >= 0) { vn2 = self.un_var_name(ucode, vidx); }
+                self.indent += 1;
+                var sbcap: StrBuilder = StrBuilder.init(a);
+                sbcap.append(a, self.cty_of(a, pt2));
+                sbcap.append(a, " kd_");
+                sbcap.append(a, self.src[self.nodes[au].xoff .. self.nodes[au].xoff + self.nodes[au].xlen]);
+                sbcap.append(a, " = (");
+                sbcap.append(a, scrut);
+                sbcap.append(a, ").data.kd_");
+                sbcap.append(a, vn2);
+                sbcap.append(a, ";");
+                var scap: []u8 = sbcap.build(a);
+                sbcap.deinit(a);
+                self.line(a, scap);
+                self.indent -= 1;
+            }
+            // The arm body in its own scope, seeded with the capture.
+            self.push_scope(a, false, 0 - 1, 0 - 1);
+            if ((self.nodes[au].flags & F_CAP) != 0) {
+                self.push_vt(a, self.nodes[au].xoff, self.nodes[au].xlen, capty);
+            }
+            var d: bool = self.emit_block(a, self.nodes[au].c, false, 0 - 1);
+            self.pop_scope();
+            self.line(a, "} break;");
+            if (!d) { all_diverge = false; }
+            arm = self.nodes[au].next;
+        }
+        if (self.nodes[u].c >= 0) {
+            self.line(a, "default: {");
+            var d2: bool = self.emit_block(a, self.nodes[u].c, false, 0 - 1);
+            self.line(a, "} break;");
+            if (!d2) { all_diverge = false; }
+        }
+        self.indent -= 1;
+        self.line(a, "}");
+        return all_diverge;
+    }
+
     fn emit_switch(self: *Self, a: Allocator, n: i32) bool {
         var u: usize = @as(usize, n);
         var scrut_ty: i64 = self.type_of_expr(a, self.nodes[u].a);
+        if (et_is_union(scrut_ty)) {
+            // A union scrutinee switches on the runtime `.tag` and may
+            // capture the active variant's payload — a distinct lowering
+            // (v0.183, SPEC §20.3).
+            return self.emit_union_switch(a, n, scrut_ty);
+        }
         var scrut: []u8 = self.emit_expr(a, self.nodes[u].a);
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, "switch (");
@@ -8033,6 +8422,7 @@ pub const Em = struct {
         if (t == ET_ALLOC) { return "Allocator"; }
         if (et_is_struct(t)) { return self.st_name_of(t); }
         if (et_is_enum(t)) { return "enum"; }
+        if (et_is_union(t)) { return "union"; }
         if (et_is_slice(t)) { return "slice"; }
         if (et_is_arr(t)) { return "array"; }
         if (et_is_opt(t)) { return "optional"; }
@@ -8931,7 +9321,24 @@ pub const Em = struct {
                         slab = self.nodes[slu].next;
                     }
                 }
-                self.intern_block(a, self.nodes[sau].c);
+                if (et_is_union(swt) and (self.nodes[sau].flags & F_CAP) != 0) {
+                    // A UNION arm's capture binds the FIRST matched
+                    // variant's payload in a scope wrapping the body
+                    // (`check_union_switch`, v0.183); union labels are
+                    // index lookups, never expressions.
+                    var upt3: i64 = ET_I64;
+                    var slab2: i32 = self.nodes[sau].a;
+                    if (slab2 >= 0 and self.nodes[@as(usize, slab2)].kind == ND_ENUMLIT) {
+                        var uvi3: i64 = self.un_var_index(swt, self.xname(slab2));
+                        if (uvi3 >= 0) { upt3 = self.un_payload(swt, uvi3); }
+                    }
+                    self.push_scope(a, false, 0 - 1, 0 - 1);
+                    self.push_vt(a, self.nodes[sau].xoff, self.nodes[sau].xlen, upt3);
+                    self.intern_block(a, self.nodes[sau].c);
+                    self.pop_scope();
+                } else {
+                    self.intern_block(a, self.nodes[sau].c);
+                }
                 sarm = self.nodes[sau].next;
             }
             self.intern_block(a, self.nodes[u].c);
@@ -9198,8 +9605,8 @@ pub const Em = struct {
     /// first, deduplicated by a seen-set. v0.168's arrays-then-slices was
     /// this walk's struct-free special case.
     fn emit_type_defs(self: *Self, a: Allocator) void {
-        if (self.sl_len == 0 and self.ar_count == 0 and self.st_count == 0 and self.en_count == 0 and self.opt_count == 0 and self.eu_count == 0) { return; }
-        var total: usize = self.en_count + self.st_count + self.opt_count + self.eu_count + self.ar_count + self.sl_len;
+        if (self.sl_len == 0 and self.ar_count == 0 and self.st_count == 0 and self.en_count == 0 and self.opt_count == 0 and self.eu_count == 0 and self.un_count == 0) { return; }
+        var total: usize = self.en_count + self.st_count + self.opt_count + self.eu_count + self.un_count + self.ar_count + self.sl_len;
         var seen: []bool = alloc(a, bool, total);
         var si: usize = 0;
         while (si < total) : (si += 1) { seen[si] = false; }
@@ -9222,6 +9629,12 @@ pub const Em = struct {
         var eu_i: usize = 0;
         while (eu_i < self.eu_count) : (eu_i += 1) {
             self.visit_type_def(a, seen, ET_ERRU_BASE + @as(i64, eu_i));
+        }
+        // Tagged unions seed after error unions, before arrays (the Rust
+        // seed order, v0.183).
+        var un_i: usize = 0;
+        while (un_i < self.un_count) : (un_i += 1) {
+            self.visit_type_def(a, seen, ET_UNION_BASE + @as(i64, un_i));
         }
         var ai: usize = 0;
         while (ai < self.ar_count) : (ai += 1) {
@@ -9264,13 +9677,14 @@ pub const Em = struct {
         if (et_is_struct(t)) { return @as(i64, self.en_count) + (t - ET_STRUCT_BASE); }
         if (et_is_opt(t)) { return @as(i64, self.en_count + self.st_count) + (t - ET_OPT_BASE); }
         if (et_is_erru(t)) { return @as(i64, self.en_count + self.st_count + self.opt_count) + (t - ET_ERRU_BASE); }
-        if (et_is_arr(t)) { return @as(i64, self.en_count + self.st_count + self.opt_count + self.eu_count) + (t - ET_ARR_BASE); }
+        if (et_is_union(t)) { return @as(i64, self.en_count + self.st_count + self.opt_count + self.eu_count) + (t - ET_UNION_BASE); }
+        if (et_is_arr(t)) { return @as(i64, self.en_count + self.st_count + self.opt_count + self.eu_count + self.un_count) + (t - ET_ARR_BASE); }
         // A slice: find its element's intern index.
         var e: i64 = et_slice_elem(t);
         var i: usize = 0;
         while (i < self.sl_len) : (i += 1) {
             if (self.slices[i] == e) {
-                return @as(i64, self.en_count + self.st_count + self.opt_count + self.eu_count + self.ar_count + i);
+                return @as(i64, self.en_count + self.st_count + self.opt_count + self.eu_count + self.un_count + self.ar_count + i);
             }
         }
         return 0 - 1;
@@ -9287,7 +9701,7 @@ pub const Em = struct {
         }
         if (et_is_opt(t)) {
             var oin: i64 = self.opt_inner_of(t);
-            if (et_is_struct(oin) or et_is_arr(oin) or et_is_slice(oin) or et_is_enum(oin) or et_is_opt(oin) or et_is_erru(oin)) {
+            if (et_is_struct(oin) or et_is_arr(oin) or et_is_slice(oin) or et_is_enum(oin) or et_is_opt(oin) or et_is_erru(oin) or et_is_union(oin)) {
                 self.visit_type_def(a, seen, oin);
             }
             self.emit_one_optional(a, t);
@@ -9295,10 +9709,27 @@ pub const Em = struct {
         }
         if (et_is_erru(t)) {
             var epl: i64 = self.eu_payload_of(t);
-            if (et_is_struct(epl) or et_is_arr(epl) or et_is_slice(epl) or et_is_enum(epl) or et_is_opt(epl) or et_is_erru(epl)) {
+            if (et_is_struct(epl) or et_is_arr(epl) or et_is_slice(epl) or et_is_enum(epl) or et_is_opt(epl) or et_is_erru(epl) or et_is_union(epl)) {
                 self.visit_type_def(a, seen, epl);
             }
             self.emit_one_error_union(a, t);
+            return;
+        }
+        if (et_is_union(t)) {
+            // A tagged union embeds each variant's payload by value inside
+            // its `data` union (SPEC §20.3) — every payload declares first,
+            // exactly like a struct's fields.
+            var ui: usize = @as(usize, t - ET_UNION_BASE);
+            var ustart: usize = @as(usize, self.un_v_start[ui]);
+            var un: usize = @as(usize, self.un_v_count[ui]);
+            var uj: usize = 0;
+            while (uj < un) : (uj += 1) {
+                var upt: i64 = self.uv_ty[ustart + uj];
+                if (et_is_struct(upt) or et_is_arr(upt) or et_is_slice(upt) or et_is_enum(upt) or et_is_opt(upt) or et_is_erru(upt) or et_is_union(upt)) {
+                    self.visit_type_def(a, seen, upt);
+                }
+            }
+            self.emit_one_union(a, t);
             return;
         }
         if (et_is_struct(t)) {
@@ -9308,7 +9739,7 @@ pub const Em = struct {
             var j: usize = 0;
             while (j < n) : (j += 1) {
                 var ft: i64 = self.sf_ty[start + j];
-                if (et_is_struct(ft) or et_is_arr(ft) or et_is_slice(ft) or et_is_enum(ft) or et_is_opt(ft) or et_is_erru(ft)) {
+                if (et_is_struct(ft) or et_is_arr(ft) or et_is_slice(ft) or et_is_enum(ft) or et_is_opt(ft) or et_is_erru(ft) or et_is_union(ft)) {
                     self.visit_type_def(a, seen, ft);
                 }
             }
@@ -9317,14 +9748,14 @@ pub const Em = struct {
         }
         if (et_is_arr(t)) {
             var ae: i64 = self.arr_elem_of(t);
-            if (et_is_struct(ae) or et_is_arr(ae) or et_is_slice(ae) or et_is_enum(ae)) {
+            if (et_is_struct(ae) or et_is_arr(ae) or et_is_slice(ae) or et_is_enum(ae) or et_is_union(ae)) {
                 self.visit_type_def(a, seen, ae);
             }
             self.emit_one_array(a, t);
             return;
         }
         var se: i64 = et_slice_elem(t);
-        if (et_is_struct(se) or et_is_arr(se) or et_is_slice(se) or et_is_enum(se)) {
+        if (et_is_struct(se) or et_is_arr(se) or et_is_slice(se) or et_is_enum(se) or et_is_union(se)) {
             self.visit_type_def(a, seen, se);
         }
         self.emit_one_slice(a, se);
@@ -9359,6 +9790,37 @@ pub const Em = struct {
         }
         sb.append(a, " } ");
         sb.append(a, cn);
+        sb.append(a, ";");
+        var out: []u8 = sb.build(a);
+        sb.deinit(a);
+        self.line(a, out);
+    }
+
+    /// `emit_one_union` (v0.183, SPEC §20.3): the tagged C struct —
+    /// `typedef struct { int32_t tag; union { <T> kd_<v>; … } data; } kd_union_<N>;`
+    /// (an impossible variant-less union keeps a `char _unused;`).
+    fn emit_one_union(self: *Self, a: Allocator, t: i64) void {
+        var i: usize = @as(usize, t - ET_UNION_BASE);
+        var start: usize = @as(usize, self.un_v_start[i]);
+        var n: usize = @as(usize, self.un_v_count[i]);
+        var sb: StrBuilder = StrBuilder.init(a);
+        sb.append(a, "typedef struct { int32_t tag; union { ");
+        if (n == 0) {
+            sb.append(a, "char _unused;");
+        } else {
+            var j: usize = 0;
+            while (j < n) : (j += 1) {
+                if (j > 0) { sb.append(a, " "); }
+                sb.append(a, self.cty_of(a, self.uv_ty[start + j]));
+                sb.append(a, " kd_");
+                var noff: usize = @as(usize, self.uv_name_off[start + j]);
+                var nlen: usize = @as(usize, self.uv_name_len[start + j]);
+                sb.append(a, self.src[noff .. noff + nlen]);
+                sb.append(a, ";");
+            }
+        }
+        sb.append(a, " } data; } ");
+        sb.append(a, self.un_c_name(a, t));
         sb.append(a, ";");
         var out: []u8 = sb.build(a);
         sb.deinit(a);
@@ -9944,6 +10406,9 @@ pub const Em = struct {
         self.en_collect(a);
         self.er_collect(a);
         self.st_collect(a);
+        // Pass 0c (v0.183, SPEC §20): tagged unions — names first, then
+        // variant payloads (interning composites in declaration order).
+        self.un_collect(a);
         // Pass 0d (v0.179, SPEC §25): the type-constructor registry, then
         // the `const Alias = Ctor(…);` instantiations — item order, BEFORE
         // signatures, so an alias in a signature resolves.

@@ -300,12 +300,14 @@ test "detect: field access (v0.169) and method calls (v0.170) are in" {
 
 test "detect: out-of-subset statements" {
     var a: Allocator = c_allocator();
-    // (labeled loops joined the subset in v0.176 — a tagged-union item
-    // keeps a verdict)
+    // (labeled loops joined the subset in v0.176)
+    // (tagged unions joined the subset in v0.183 — an admissible payload
+    // passes; an inadmissible one keeps a type-name verdict at the payload)
     var d: Det = eh_detect(a, "const U = union(enum) { a: i64 };\nfn main() void { }");
-    expect(d.found);
-    expect(str_eq(d.word, "union"));
-    expect(d.pos == 0);
+    expect(!d.found);
+    var dz: Det = eh_detect(a, "const U = union(enum) { a: NoSuch };\nfn main() void { }");
+    expect(dz.found);
+    expect(str_eq(dz.word, "type-name"));
     // (`switch` v0.172, `try` v0.174, `&x` v0.175; a top-level generic
     // fn + its call joined in v0.178; every integer width joined in
     // v0.180 — an INADMISSIBLE type argument keeps a verdict at the
@@ -400,13 +402,12 @@ test "detect: allocator builtins and deep expressions" {
     var d4: Det = eh_detect(a, "fn main() void { defer { var z: Foo = g(); } }");
     expect(d4.found);
     expect(str_eq(d4.word, "type-name"));
-    // (`if (o) |v|` joined the subset in v0.173 — a switch payload
-    // capture keeps the verdict)
+    // (`if (o) |v|` joined the subset in v0.173; a switch payload
+    // capture joined in v0.183 — its union-ness is sema's E0272)
     var d5: Det = eh_detect(a, "fn main() void { var o = q(); if (o) |v| { } }");
     expect(!d5.found);
     var d6: Det = eh_detect(a, "fn main() void { var o = q(); switch (o) { .A => |v| { }, else => { } } }");
-    expect(d6.found);
-    expect(str_eq(d6.word, "capture"));
+    expect(!d6.found);
 }
 
 test "detect: place chains in (v0.169), non-name roots out" {
@@ -1425,4 +1426,18 @@ test "builtins: io/argv helpers + main wiring (v0.181)" {
     var c2: []u8 = eh_emit(a, "pub fn main() void { print(1); }");
     expect(eh_find(c2, "int main(int argc, char **argv){ (void)argc;(void)argv; kd_main(); return 0; }"));
     expect(!eh_find(c2, "kd_argc_v"));
+}
+
+test "unions: tagged struct, literal, switch capture (v0.183)" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const Shape = union(enum) {\n    circle: i64,\n    label: []u8,\n};\nfn f(s: Shape) i64 {\n    switch (s) {\n        .circle => |r| { return r * 2; }\n        .label => |t| { return @as(i64, t.len); }\n    }\n}\npub fn main() void {\n    print(f(Shape{ .circle = 21 }));\n    print(f(Shape{ .label = \"abc\" }));\n}");
+    // The tagged C struct (payloads by value inside `data`), the
+    // construction with a 0-based tag + coerced payload, and the
+    // tag-switch with the payload bound at one extra indent.
+    expect(eh_find(c, "typedef struct { int32_t tag; union { int64_t kd_circle; kd_slice_uint8_t kd_label; } data; } kd_union_Shape;"));
+    expect(eh_find(c, "kd_print((long long)(kd_f(((kd_union_Shape){ .tag = 0, .data = { .kd_circle = 21 } }))));\n"));
+    expect(eh_find(c, "    switch ((kd_s).tag) {\n"));
+    expect(eh_find(c, "        case 0: {\n            int64_t kd_r = (kd_s).data.kd_circle;\n"));
+    expect(eh_find(c, "        case 1: {\n            kd_slice_uint8_t kd_t = (kd_s).data.kd_label;\n"));
+    expect(eh_find(c, "        } break;\n"));
 }

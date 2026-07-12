@@ -1,4 +1,4 @@
-//! Self-host stages 3–25 (v0.161–v0.182): differential test of
+//! Self-host stages 3–26 (v0.161–v0.183): differential test of
 //! `selfhost/emit.ks` — a C emitter for the SCALAR + STRING + HEAP-BUFFER
 //! SUBSET (with generalized `[]T` slices, `@as` casts, the `s[lo..hi]`
 //! slicing view, `test` blocks with the full `EmitMode::Test` harness,
@@ -73,7 +73,11 @@
 //! silent re-reach, driver-supplied path in argv[3]), std joins every
 //! flattened module, the whole selfhost pipeline C-compares, alloc's
 //! element admits every `[]T` element name, and the bootstrap fixed
-//! point is pinned (`selfhost_bootstrap_fixed_point`) —
+//! point is pinned (`selfhost_bootstrap_fixed_point`) — and, v0.183,
+//! TAGGED UNIONS (SPEC §20): declarations (payload types walk; unions
+//! join the named-type set), `Name{ .v = e }` construction, tag-switches
+//! with payload captures (a capture is subset-shaped everywhere — its
+//! union-ness is sema's E0272) —
 //! written
 //! in kardashev —
 //! against the Rust
@@ -276,6 +280,13 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s36_catch/capture_requires_error_union_err.ks",       // E0195
     "tests/spec/s21_captures/err_capture_non_optional.ks",            // E0280
     "tests/spec/s21_captures/err_capture_not_visible_in_else.ks",     // E0100
+    "tests/spec/s20_unions/err_capture_on_enum_switch.ks",            // E0272 (v0.183: unions subset-shaped)
+    "tests/spec/s20_unions/err_construct_two_fields.ks",              // E0270 (v0.183)
+    "tests/spec/s20_unions/err_construct_unknown_variant.ks",         // E0271 (v0.183)
+    "tests/spec/s20_unions/err_payload_type_mismatch.ks",             // E0110 (v0.183)
+    "tests/spec/s20_unions/err_switch_label_unknown_variant.ks",      // E0271 (v0.183)
+    "tests/spec/s20_unions/err_switch_nonexhaustive.ks",              // E0210 (v0.183)
+    "tests/spec/s39_switch_ranges/range_on_union_switch_err.ks",      // E0212 (v0.183)
     "tests/spec/s39_switch_ranges/else_required_with_ranges_err.ks",  // E0214
     "tests/spec/s39_switch_ranges/overlapping_ranges_err.ks",         // E0211
     "tests/spec/s27_compound/f64_place_err.ks",                       // E0110
@@ -308,8 +319,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "selfhost/modres.ks",                                             // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 444;
-const MIN_C_COMPARED_TEST: usize = 484;
+const MIN_C_COMPARED_PROGRAM: usize = 454;
+const MIN_C_COMPARED_TEST: usize = 494;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -745,9 +756,8 @@ fn det_stmt(cx: &Cx, s: &Stmt) -> Option<Hit> {
         } => det_expr(cx, scrutinee)
             .or_else(|| {
                 arms.iter().find_map(|arm| {
-                    if arm.capture.is_some() {
-                        return Some(("capture", arm.span.start));
-                    }
+                    // A payload capture is in the subset (v0.183) — its
+                    // union-ness is sema's E0272.
                     arm.labels
                         .iter()
                         .find_map(|l| det_expr(cx, l))
@@ -1111,6 +1121,9 @@ fn detect_flat(files: &[FlatFile], program_mode: bool) -> Option<(String, usize)
         .filter_map(|it| match it {
             Item::Struct(s) => Some(s.name.clone()),
             Item::Enum(e) => Some(e.name.clone()),
+            // A tagged union is a named type anywhere a type may appear
+            // (v0.183).
+            Item::Union(u) => Some(u.name.clone()),
             _ => None,
         })
         .collect();
@@ -1192,7 +1205,10 @@ fn detect_flat(files: &[FlatFile], program_mode: bool) -> Option<(String, usize)
                 // An enum declaration is a subset item (v0.171): variant
                 // names and literal values carry nothing to walk.
                 Item::Enum(_) => None,
-                Item::Union(u) => Some(("union", u.span.start)),
+                // A tagged-union declaration is a subset item (v0.183):
+                // every variant payload type must be admissible (a
+                // duplicate variant is sema's E0211).
+                Item::Union(u) => u.variants.iter().find_map(|v| det_type(&cx, &v.payload)),
                 Item::Import(_) => None,
                 // A named error set is a subset item (v0.174): members
                 // carry nothing to walk (a duplicate is sema's E0331).
@@ -2058,6 +2074,23 @@ fn selfhost_emit_differential_targeted_inputs() {
             "std_import_dead_code_stays_lean",
             "@import(\"std\");\npub fn main() void {\n    print(gcd(8, 12));\n}\n",
         ),
+        // -- tagged unions + switch captures (v0.183) --------------------------------
+        (
+            "union_construct_switch_capture_matrix",
+            "const Shape = union(enum) {\n    circle: i64,\n    rect: [2]i64,\n    label: []u8,\n};\nfn area2(s: Shape) i64 {\n    switch (s) {\n        .circle => |r| { return r * r * 3; }\n        .rect => |wh| { return wh[0] * wh[1]; }\n        .label => |t| { return @as(i64, t.len); }\n    }\n}\npub fn main() void {\n    print(area2(Shape{ .circle = 5 }));\n    print(area2(Shape{ .rect = [2]i64{ 4, 6 } }));\n    print(area2(Shape{ .label = \"hi\" }));\n}\n",
+        ),
+        (
+            "union_multilabel_else_no_capture",
+            "const Ev = union(enum) {\n    add: i64,\n    sub: i64,\n    quit: bool,\n};\nfn go(e: Ev) i64 {\n    var acc: i64 = 100;\n    switch (e) {\n        .add,\n        .sub => {\n            acc = acc + 1;\n        }\n        else => {\n            acc = 0;\n        }\n    }\n    return acc;\n}\npub fn main() void {\n    print(go(Ev{ .add = 3 }));\n    print(go(Ev{ .quit = true }));\n}\n",
+        ),
+        (
+            "union_payload_coercion_optional",
+            "const Slot = union(enum) {\n    some: ?i64,\n    none: bool,\n};\nfn peek(s: Slot) i64 {\n    switch (s) {\n        .some => |o| { return o orelse 0 - 1; }\n        .none => { return 0 - 2; }\n    }\n}\npub fn main() void {\n    print(peek(Slot{ .some = 42 }));\n    print(peek(Slot{ .none = true }));\n}\n",
+        ),
+        (
+            "union_in_generics_and_defer",
+            "const R = union(enum) {\n    ok: i64,\n    err: []u8,\n};\nfn pick(comptime T: type, x: T, y: T) T {\n    if (x > y) { return x; }\n    return y;\n}\nfn eval2(r: R) i64 {\n    defer print(999);\n    switch (r) {\n        .ok => |v| { return pick(i64, v, 10); }\n        .err => |m| { return @as(i64, m.len); }\n    }\n}\npub fn main() void {\n    print(eval2(R{ .ok = 25 }));\n    print(eval2(R{ .err = \"bad\" }));\n}\n",
+        ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
             "skip_slice_elem_f64",
@@ -2162,8 +2195,8 @@ fn selfhost_emit_differential_targeted_inputs() {
             "const Color = enum { Red, Green };\npub fn main() void {\n    var c: Color = .Red;\n    if (c == Color.Red) { print(1); }\n}\n",
         ),
         (
-            "skip_switch_capture_arm",
-            "const Color = enum { Red, Green };\npub fn main() void {\n    var c: Color = Color.Red;\n    switch (c) {\n        .Red => |v| { print(1); },\n        else => { print(2); },\n    }\n}\n",
+            "union_nested_switch_capture_shadow",
+            "const U = union(enum) {\n    a: i64,\n    b: i64,\n};\npub fn main() void {\n    var u: U = U{ .a = 7 };\n    switch (u) {\n        .a => |v| {\n            var w: U = U{ .b = v + 1 };\n            switch (w) {\n                .a => |x| { print(x); }\n                .b => |x| { print(x + 100); }\n            }\n        }\n        .b => |v| { print(v); }\n    }\n}\n",
         ),
         (
             "skip_unreachable_stmt",
