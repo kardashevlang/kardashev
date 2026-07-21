@@ -3732,14 +3732,16 @@ impl<'a> Emitter<'a> {
                     UnOp::BitNot => "~",
                 };
                 let s = format!("({}{})", opc, inner);
-                // §28.2: `~x` yields the OPERAND's type. C promotes sub-`int`
-                // operands before `~`, so a narrow complement consumed
-                // directly would otherwise leak the promoted value (u8 170 →
-                // -171 instead of 85; found by the wave-B corpus). Truncate
-                // back to the operand's C type — the same two's-complement
-                // narrowing `@as` (§33) and stores already perform. 32/64-bit
-                // operands never promote, so they keep the bare form.
-                if matches!(op, UnOp::BitNot) {
+                // §28.2/§28.4: `~x` and `-x` yield the OPERAND's type. C
+                // promotes sub-`int` operands first, so a narrow result
+                // consumed directly would otherwise leak the promoted value
+                // (u8 170 → `~` → -171 instead of 85, found by the wave-B
+                // corpus; i8 -128 → `-` → 128 instead of -128, found by the
+                // wave-C corpus). Truncate back to the operand's C type — the
+                // same two's-complement narrowing `@as` (§33) and stores
+                // already perform. `!` yields `bool` and 32/64-bit operands
+                // never promote, so those keep the bare form.
+                if matches!(op, UnOp::BitNot | UnOp::Neg) {
                     if let Some(t) = self.type_of_expr(expr) {
                         if Self::promotes_in_c(t) {
                             return format!("(({}){})", self.cty_of(t), s);
@@ -3752,12 +3754,20 @@ impl<'a> Emitter<'a> {
                 let l = self.emit_binop_operand(lhs, rhs);
                 let r = self.emit_binop_operand(rhs, lhs);
                 let s = format!("({} {} {})", l, op.c_op(), r);
-                // §28.2: `x << n` yields `x`'s type. As with `~` above, a
-                // narrow left-shift would leak C's promoted value when read
-                // directly (u8 200 << 1 → 400 instead of 144); truncate back.
-                // `>>` never grows a value and the other operators cannot
-                // exceed the operand width, so only `<<` needs the cast.
-                if matches!(op, BinOp::Shl) {
+                // §28.2/§28.4: an arithmetic/shift result has the OPERANDS'
+                // type. As with `~` above, a narrow (8/16-bit) result read
+                // directly would leak C's promoted value (u8 200 << 1 → 400
+                // instead of 144, found by the wave-B corpus; u8 200 + 100 →
+                // 300 instead of 44, and i8 -128 / -1 → 128 instead of -128,
+                // found by the wave-C corpus); truncate back. `>>` and the
+                // masking operators (`& | ^`) cannot exceed the operand
+                // width, `%`'s magnitude is bounded by its operands, and the
+                // comparisons/logicals yield `bool` — those keep the bare
+                // form.
+                if matches!(
+                    op,
+                    BinOp::Shl | BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
+                ) {
                     if let Some(t) = self.type_of_expr(lhs) {
                         if Self::promotes_in_c(t) {
                             return format!("(({}){})", self.cty_of(t), s);
@@ -3967,12 +3977,16 @@ impl<'a> Emitter<'a> {
                 "0".to_string()
             }
             Expr::Orelse { lhs, rhs, .. } => {
-                // `x orelse y` → `kd_opt_<tag>_orelse(<x>, <y>)`; `y` is eager.
+                // `x orelse y` → `kd_opt_<tag>_orelse(<x>, <y>)`; `y` is eager
+                // and COERCED to the optional's inner type `T` (v0.185, found
+                // by the wave-C corpus: a contextual `.Variant` alternative
+                // lost its enum and emitted the bare-literal `0` fallback).
                 let l = self.emit_expr(lhs);
-                let r = self.emit_expr(rhs);
                 match self.type_of_expr(lhs) {
                     Some(Type::Optional(oid)) => {
                         let oname = self.structs.optional_c_name(oid);
+                        let inner = self.structs.optional_inner(oid);
+                        let r = self.emit_coerced(rhs, inner);
                         format!("{}_orelse({}, {})", oname, l, r)
                     }
                     // Unreachable for validated input (`lhs` is always `?T`).
@@ -4901,8 +4915,11 @@ impl<'a> Emitter<'a> {
             if matches!(self.type_of_expr(e), Some(Type::Optional(_))) {
                 return self.emit_expr(e);
             }
-            // Otherwise it is a `T` value being widened to `?T`.
-            let inner = self.emit_expr(e);
+            // Otherwise it is a `T` value being widened to `?T` — coerced
+            // RECURSIVELY against the inner type (v0.185, found by the wave-C
+            // corpus: a contextual `.Variant` widening into a `?Enum` lost
+            // its enum and emitted the bare-literal `0` fallback).
+            let inner = self.emit_coerced(e, self.structs.optional_inner(oid));
             return format!("(({}){{ .has = true, .val = {} }})", oname, inner);
         }
         if let Type::ErrorUnion(eid) = expected {
@@ -4924,8 +4941,11 @@ impl<'a> Emitter<'a> {
                 let inner = self.emit_expr(e);
                 return format!("(({}), (({}){{ .err = 0 }}))", inner, ename);
             }
-            // Otherwise it is a `T` value being widened to a success `!T`.
-            let inner = self.emit_expr(e);
+            // Otherwise it is a `T` value being widened to a success `!T` —
+            // coerced recursively against the payload type (v0.185, the same
+            // wave-C find as the `?T` arm: a contextual `.Variant` payload
+            // must resolve against its enum, not fall back to `0`).
+            let inner = self.emit_coerced(e, self.structs.error_union_payload(eid));
             return format!("(({}){{ .err = 0, .val = {} }})", ename, inner);
         }
         self.emit_expr(e)
@@ -12499,6 +12519,71 @@ mod tests {
         assert_eq!(
             stdout, "3.5\n3.5\n3\n",
             "f64 program printed wrong values:\nstdout={stdout}\n--- C ---\n{c}"
+        );
+    }
+
+    #[test]
+    fn narrow_arithmetic_truncates_back_when_read_directly() {
+        // SPEC §28.4 (v0.185): `+ - * /` and unary `-` on 8/16-bit operands
+        // truncate back to the operand's C type so a directly-consumed result
+        // matches the stored one (u8 200 + 100 must print 44, not C's
+        // promoted 300). The masking operators keep the bare form.
+        //   fn main() void {
+        //       var a: u8 = 200; var b: u8 = 100; var d: i8 = 5;
+        //       print(a + b); print(-d); print(a & b);
+        //   }
+        let main = Func {
+            is_pub: false,
+            name: "main".to_string(),
+            params: vec![],
+            ret: ty("void"),
+            body: block(vec![
+                Stmt::Let {
+                    is_const: false,
+                    name: "a".to_string(),
+                    ty: Some(ty("u8")),
+                    value: int(200),
+                    span: Span::DUMMY,
+                },
+                Stmt::Let {
+                    is_const: false,
+                    name: "b".to_string(),
+                    ty: Some(ty("u8")),
+                    value: int(100),
+                    span: Span::DUMMY,
+                },
+                Stmt::Let {
+                    is_const: false,
+                    name: "d".to_string(),
+                    ty: Some(ty("i8")),
+                    value: int(5),
+                    span: Span::DUMMY,
+                },
+                print(binary(BinOp::Add, ident("a"), ident("b"))),
+                print(Expr::Unary {
+                    op: UnOp::Neg,
+                    expr: Box::new(ident("d")),
+                    span: Span::DUMMY,
+                }),
+                print(binary(BinOp::BitAnd, ident("a"), ident("b"))),
+            ]),
+            span: Span::DUMMY,
+        };
+        let m = Module {
+            items: vec![Item::Func(main)],
+        };
+        let c = emit(&m, &StructTable::new(), EmitMode::Program);
+        assert!(
+            c.contains("kd_print((long long)(((uint8_t)(kd_a + kd_b))));"),
+            "narrow `+` must truncate back when read directly:\n{c}"
+        );
+        assert!(
+            c.contains("kd_print((long long)(((int8_t)(-kd_d))));"),
+            "narrow unary `-` must truncate back when read directly:\n{c}"
+        );
+        assert!(
+            c.contains("kd_print((long long)((kd_a & kd_b)));"),
+            "`&` cannot exceed the operand width and must keep the bare form:\n{c}"
         );
     }
 

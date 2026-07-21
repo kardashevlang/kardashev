@@ -391,8 +391,16 @@ pub const ET_OPT_BASE: i64 = 5000000000;
 pub const ET_ERRU_BASE: i64 = 6000000000;
 pub const ET_PTR_BASE: i64 = 7000000000;
 pub const ET_UNION_BASE: i64 = 8000000000;
+// A slice over a UNION element (v0.185): its own disjoint top band
+// `ET_SLICE_UNION_BASE + <union id>` — before it existed, a `[]Union`
+// element folded into the ENUM-slice band and indexed the enum table out
+// of bounds (found by the wave-C corpus).
+pub const ET_SLICE_UNION_BASE: i64 = 9000000000;
 
 pub fn et_slice_of(elem: i64) i64 {
+    if (elem >= ET_UNION_BASE) {
+        return ET_SLICE_UNION_BASE + (elem - ET_UNION_BASE);
+    }
     if (elem >= ET_ENUM_BASE) {
         return ET_SLICE_ENUM_BASE + (elem - ET_ENUM_BASE);
     }
@@ -403,10 +411,13 @@ pub fn et_slice_of(elem: i64) i64 {
 }
 
 pub fn et_is_slice(t: i64) bool {
-    return (t >= ET_SLICE_BASE and t < ET_ARR_BASE) or (t >= ET_SLICE_STRUCT_BASE and t < ET_ENUM_BASE) or (t >= ET_SLICE_ENUM_BASE and t < ET_OPT_BASE);
+    return (t >= ET_SLICE_BASE and t < ET_ARR_BASE) or (t >= ET_SLICE_STRUCT_BASE and t < ET_ENUM_BASE) or (t >= ET_SLICE_ENUM_BASE and t < ET_OPT_BASE) or (t >= ET_SLICE_UNION_BASE);
 }
 
 pub fn et_slice_elem(t: i64) i64 {
+    if (t >= ET_SLICE_UNION_BASE) {
+        return ET_UNION_BASE + (t - ET_SLICE_UNION_BASE);
+    }
     if (t >= ET_SLICE_ENUM_BASE) {
         return ET_ENUM_BASE + (t - ET_SLICE_ENUM_BASE);
     }
@@ -441,7 +452,7 @@ pub fn et_is_ptr(t: i64) bool {
 }
 
 pub fn et_is_union(t: i64) bool {
-    return t >= ET_UNION_BASE;
+    return t >= ET_UNION_BASE and t < ET_SLICE_UNION_BASE;
 }
 
 /// `StructTable::slice_c_name` over the subset: `kd_slice_<type_mangle(elem)>`
@@ -2811,11 +2822,12 @@ pub const Em = struct {
     }
 
     /// `slice_c_name`: `kd_slice_<type_mangle(elem)>` — the static-string
-    /// fast path for scalar elements, built fresh for struct and enum
-    /// elements (v0.171 fixed the enum arm falling to `kd_slice_void`).
+    /// fast path for scalar elements, built fresh for struct, enum and
+    /// union elements (v0.171 fixed the enum arm falling to
+    /// `kd_slice_void`; v0.185 the union arm, found by the wave-C corpus).
     fn sl_c_name(self: *Self, a: Allocator, t: i64) []u8 {
         var e: i64 = et_slice_elem(t);
-        if (!et_is_struct(e) and !et_is_enum(e)) { return et_slice_c_name(t); }
+        if (!et_is_struct(e) and !et_is_enum(e) and !et_is_union(e)) { return et_slice_c_name(t); }
         var sb: StrBuilder = StrBuilder.init(a);
         sb.append(a, "kd_slice_");
         sb.append(a, self.mangle_of(a, e));
@@ -5327,7 +5339,10 @@ pub const Em = struct {
             if (et_is_opt(self.type_of_expr(a, n))) {
                 return self.emit_expr(a, n);
             }
-            var inner: []u8 = self.emit_expr(a, n);
+            // The widened `T` is coerced RECURSIVELY against the inner type
+            // (v0.185): a contextual `.Variant` resolves against its enum
+            // instead of falling back to the bare-literal `0`.
+            var inner: []u8 = self.emit_coerced(a, n, self.opt_inner_of(expected));
             var sb2: StrBuilder = StrBuilder.init(a);
             sb2.append(a, "((");
             sb2.append(a, oname);
@@ -5371,7 +5386,9 @@ pub const Em = struct {
                 sb4.deinit(a);
                 return o4;
             }
-            var succ: []u8 = self.emit_expr(a, n);
+            // The success payload is coerced RECURSIVELY against the payload
+            // type (v0.185, the same wave-C find as the `?T` arm).
+            var succ: []u8 = self.emit_coerced(a, n, self.eu_payload_of(expected));
             var sb5: StrBuilder = StrBuilder.init(a);
             sb5.append(a, "((");
             sb5.append(a, ename);
@@ -5533,13 +5550,15 @@ pub const Em = struct {
             return sc2;
         }
         if (k == ND_ORELSE) {
-            // `x orelse y` → `kd_opt_<tag>_orelse(<x>, <y>)` (`y` eager);
+            // `x orelse y` → `kd_opt_<tag>_orelse(<x>, <y>)` (`y` eager and
+            // COERCED to the inner type `T`, v0.185 — a contextual `.Variant`
+            // alternative must resolve against its enum, not fall back);
             // the non-optional lhs fallback mirrors the Rust `({l})` arm.
             var ol: []u8 = self.emit_expr(a, self.nodes[u].a);
-            var orr: []u8 = self.emit_expr(a, self.nodes[u].b);
             var olt: i64 = self.type_of_expr(a, self.nodes[u].a);
             var sbo: StrBuilder = StrBuilder.init(a);
             if (et_is_opt(olt)) {
+                var orr: []u8 = self.emit_coerced(a, self.nodes[u].b, self.opt_inner_of(olt));
                 sbo.append(a, self.opt_c_name(a, olt));
                 sbo.append(a, "_orelse(");
                 sbo.append(a, ol);
@@ -5606,9 +5625,10 @@ pub const Em = struct {
             sb.append(a, ")");
             var s: []u8 = sb.build(a);
             sb.deinit(a);
-            // §28.2: `~x` yields the operand's type; a narrow (`u8`) operand
-            // would leak C's `int` promotion, so truncate back.
-            if (op == UOP_BNOT) {
+            // §28.2/§28.4: `~x` and `-x` yield the operand's type; a narrow
+            // operand would leak C's `int` promotion (i8 -128 → `-` → 128),
+            // so truncate back. `!` yields bool and never promotes.
+            if (op == UOP_BNOT or op == UOP_NEG) {
                 var t: i64 = self.type_of_expr(a, self.nodes[u].a);
                 if (et_promotes_in_c(t)) {
                     return self.trunc_back(a, t, s);
@@ -5629,9 +5649,12 @@ pub const Em = struct {
             sb.append(a, ")");
             var s: []u8 = sb.build(a);
             sb.deinit(a);
-            // §28.2: `x << n` yields `x`'s type; only `<<` can outgrow a
-            // narrow operand, so only it truncates back.
-            if (self.nodes[u].val == OPC_SHL) {
+            // §28.2/§28.4: an arithmetic/shift result has the operands'
+            // type; `<< + - * /` can outgrow a narrow operand under C's
+            // `int` promotion, so those truncate back (`>> & | ^ %` cannot,
+            // comparisons/logicals yield bool).
+            var bop: i64 = self.nodes[u].val;
+            if (bop == OPC_SHL or bop == OPC_ADD or bop == OPC_SUB or bop == OPC_MUL or bop == OPC_DIV) {
                 var t: i64 = self.type_of_expr(a, self.nodes[u].a);
                 if (et_promotes_in_c(t)) {
                     return self.trunc_back(a, t, s);
