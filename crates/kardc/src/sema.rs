@@ -3164,9 +3164,34 @@ impl Checker {
                         self.error(*span, "E0320", msg);
                         return None;
                     }
-                    // Validate (and intern) the type argument; the result type of
-                    // each builtin does not otherwise depend on which type it is.
-                    let _ = self.resolve_type_arg(&args[0]);
+                    // Validate the type argument: an identifier resolved
+                    // substitution-first (a bound type parameter), then like any
+                    // base type name — builtins, structs, enums, tagged unions,
+                    // and type aliases all reflect (v0.185; before that the
+                    // argument went through `alloc`'s narrower resolver, which
+                    // rejected unions and aliases with `alloc`'s own message).
+                    // The result type does not depend on which type it is.
+                    match &args[0] {
+                        Expr::Ident { name: arg, span: aspan } => {
+                            let resolved = self
+                                .subst
+                                .get(arg)
+                                .copied()
+                                .or_else(|| self.resolve_base(arg));
+                            if resolved.is_none() {
+                                let msg = format!(
+                                    "`@{}`'s argument `{}` does not name a type",
+                                    name, arg
+                                );
+                                self.error(*aspan, "E0321", msg);
+                            }
+                        }
+                        other => {
+                            let msg =
+                                format!("`@{}` takes a type NAME as its argument", name);
+                            self.error(other.span(), "E0321", msg);
+                        }
+                    }
                     if name == "sizeOf" {
                         Some(Type::Usize)
                     } else {

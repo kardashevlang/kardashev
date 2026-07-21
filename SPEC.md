@@ -744,7 +744,11 @@ Lower `c_allocator()` → `((kd_allocator){0})`; `alloc(a, T, n)` →
 ### 16.3 Deferred (honest)
 Error-returning `alloc` (`![]T`), custom allocators / a vtable interface,
 `realloc`, aligned allocation, and comptime-generic `alloc` (the type argument
-is a builtin special-case until comptime generics land in v0.120).
+is a builtin special-case until comptime generics land in v0.120). `alloc`'s
+**literal** type argument still resolves builtins, structs and enums only — a
+tagged-union or type-alias element is `E0241` (pinned by the v0.185 corpus)
+and is reachable instead through a bound type parameter (`alloc(a, T, n)`
+inside a generic, which is how `ArrayList(SomeUnion)` allocates).
 
 ## 17. `comptime` generics (v0.120)
 
@@ -1176,14 +1180,19 @@ Direct C lowering: `a & b`, `a | b`, `a ^ b`, `a << b`, `a >> b`, `~a` (the
 operands keep their C integer types). `const_eval` folds all of them (and `~`)
 on integer constants, so `const MASK = (1 << 8) - 1;` works.
 
-### 28.4 Width fidelity on narrow operands (v0.156)
-`~x` and `x << n` yield the **operand's** type (§28.2) even where C's integer
-promotion would widen the intermediate: for 8/16-bit operands the backend
-truncates the result back to the operand's C type (two's-complement, exactly
-the `@as` narrowing of §33), so `~(u8 170)` is `85` and `(u8 200) << 1` is
-`144` whether stored or consumed directly. 32/64-bit operands never promote.
-`>>` and the masking operators cannot exceed the operand width and keep the
-bare lowering. (Found by the v0.156 conformance corpus.)
+### 28.4 Width fidelity on narrow operands (v0.156; arithmetic v0.185)
+`~x`, `x << n`, the arithmetic operators `+ - * /` and unary `-` yield the
+**operand's** type (§3/§28.2) even where C's integer promotion would widen the
+intermediate: for 8/16-bit operands the backend truncates the result back to
+the operand's C type (two's-complement, exactly the `@as` narrowing of §33),
+so `~(u8 170)` is `85`, `(u8 200) << 1` is `144`, `(u8 200) + (u8 100)` is
+`44`, and `-(i8 -128)` is `-128` whether stored or consumed directly.
+32/64-bit operands never promote. `>>` and the masking operators cannot
+exceed the operand width, `%`'s magnitude is bounded by its operands, and
+those keep the bare lowering. (`~`/`<<` found by the v0.156 conformance
+corpus; the arithmetic operators by the v0.185 wave-C corpus — before that,
+`print((u8 200) + (u8 100))` leaked C's promoted `300` while a store
+truncated to `44`.)
 
 ## 29. `for` loops over arrays & slices (v0.133)
 
@@ -1278,8 +1287,12 @@ Three `@`-builtins (the `@` token, §22):
 
 ### 32.1 `@sizeOf(T)` and `@typeName(T)` (expressions)
 `Expr::Builtin{ name, args }` in expression position; the single argument names
-a type (an `Ident`, resolved like `alloc`'s type argument §16 — substitution-
-aware, so it works inside a generic body).
+a type: an `Ident` resolved substitution-first (a bound type parameter, so it
+works inside a generic body), then like any base type name — builtins,
+structs, enums, tagged unions, and type aliases all reflect (v0.185; before
+that the argument went through `alloc`'s narrower §16 resolver, which rejected
+unions and aliases — with `alloc`'s own message). A non-identifier argument,
+or an identifier that does not name a type, is `E0321`.
 - `@sizeOf(T)` → `usize`, the size in bytes of `T`. Lowers to C `sizeof(<cty
   T>)`.
 - `@typeName(T)` → `[]u8`, the source name of `T`. Lowers to a `[]u8` slice over

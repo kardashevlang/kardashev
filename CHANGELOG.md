@@ -18,6 +18,59 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.185.0] — Conformance suite C: 62 new pins, 4 bugs found & fixed
+
+Arc-5 conformance wave C: the corpus grows **641 → 703 programs** — a
+third interaction matrix (`s92_interactions`, 36 files: unions ×
+slices/containers/generics/optionals/error-unions/f64/IO/argv,
+error-code-order pins, labeled-loop × errdefer edges, for-snapshot
+semantics) plus depth for the thin post-B sections (the union rule
+pins including the v0.182-flagged `alloc`-alias gap, `@enumFromInt`
+range-freedom, u8-domain switch ranges, the `print` `long long` wrap,
+f64 truncation matrices). Every expectation hand-computed; the wave
+found **4 real bugs**, all fixed with both emitters updated in
+lockstep:
+
+- **Narrow arithmetic leaked C's `int` promotion when read directly**
+  (`print((u8 200) + (u8 100))` printed `300` while a store truncated
+  to `44`): `+ - * /` and unary `-` on 8/16-bit operands now truncate
+  back exactly like v0.156's `~`/`<<` (SPEC §28.4 amended; `>> & | ^ %`
+  cannot exceed the operand width and keep the bare form). Both
+  emitters.
+- **A contextual `.Variant` lost its enum in three positions** — the
+  `?T` widening, the `!T` success widening, and the `orelse`
+  alternative — and emitted the bare-literal `0` fallback
+  (`var oc: ?Color = .Green; print(code(oc orelse .Blue))` printed
+  `0 0`): `emit_coerced` now recurses into the inner/payload type and
+  the `orelse` RHS is coerced against the optional's inner. Both
+  emitters.
+- **`@sizeOf`/`@typeName` rejected tagged unions and type aliases** —
+  the argument went through `alloc`'s narrower resolver and failed
+  with `alloc`'s own message: it now resolves substitution-first then
+  like any base name (builtins/structs/enums/unions/aliases; a
+  non-type is `E0321`; SPEC §32.1). The emit-side name/mangle paths
+  already agreed, so sema was the only blocker.
+- **The selfhost emitter had no slice-of-union code band**: a
+  `[]Union` element folded into the enum-slice band and indexed the
+  enum table out of bounds — an exit-101 crash on 4 new corpus files
+  (`ArrayList(Union)`, `HashMap(Union)`, sliced union arrays).
+  `ET_SLICE_UNION_BASE` joins the code families, `et_is_union` is
+  bounded by it, and `sl_c_name` mangles union elements
+  (`kd_slice_union_<N>`). Selfhost-only; the Rust emitter was already
+  correct — the differential caught the mirror drifting on constructs
+  no earlier corpus file had ever exercised.
+
+- Differential: C byte-identical **459/499 → 508/548** (Program/Test),
+  floors 454/494 → 503/543; 8 new sema-invalid pins (the union / f64 /
+  `print(bool)` / `alloc`-element rules); 4 new targeted cases (the
+  trunc-back matrix, slice-of-union views + writes, coerced
+  enum-literal plumbing, reflection over unions/aliases); in-language
+  suite 78 → 79 blocks (+ the §28.4 store pin updated to the cast
+  form). Unit pin: `narrow_arithmetic_truncates_back_when_read_directly`.
+- `alloc`'s literal type argument staying struct/enum-only is now an
+  explicit §16.3 honest deferral (reachable via a bound `T`, which is
+  how `ArrayList(SomeUnion)` allocates), pinned by two corpus files.
+
 ## [0.184.0] — The differential harness goes parallel
 
 An efficiency release (the 13th-goal charter: optimize before growth

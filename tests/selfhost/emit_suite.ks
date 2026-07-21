@@ -670,8 +670,9 @@ test "strings: .len, s[i] and u8 lowering with truncate-back" {
     // §28.2: `~`/`<<` over a u8 operand truncate back through a cast.
     expect(eh_find(c, "kd_print((long long)(((uint8_t)(~kd_c))));"));
     expect(eh_find(c, "kd_print((long long)(((uint8_t)(kd_c << 1))));"));
-    // Ordinary u8 arithmetic keeps the operand type but needs no cast.
-    expect(eh_find(c, "uint8_t kd_d = (kd_c - 32);"));
+    // §28.4 (v0.185): narrow arithmetic ALSO truncates back — a u8
+    // subtraction read at any position carries the cast.
+    expect(eh_find(c, "uint8_t kd_d = ((uint8_t)(kd_c - 32));"));
 }
 
 test "strings: whole-program byte equality with the typedef section" {
@@ -1440,4 +1441,19 @@ test "unions: tagged struct, literal, switch capture (v0.183)" {
     expect(eh_find(c, "        case 0: {\n            int64_t kd_r = (kd_s).data.kd_circle;\n"));
     expect(eh_find(c, "        case 1: {\n            kd_slice_uint8_t kd_t = (kd_s).data.kd_label;\n"));
     expect(eh_find(c, "        } break;\n"));
+}
+
+test "wave C (v0.185): coerced orelse alternative + slice-of-union band" {
+    var a: Allocator = c_allocator();
+    var c: []u8 = eh_emit(a, "const Color = enum { Red, Green, Blue };\npub fn main() void {\n    var oc: ?Color = .Green;\n    var pick: Color = oc orelse .Blue;\n    if (pick == Color.Green) { print(1); }\n}");
+    // The contextual `.Green` widens THROUGH the optional (the enumerator,
+    // never the bare-literal `0` fallback), and the `.Blue` alternative is
+    // coerced against the inner enum.
+    expect(eh_find(c, "{ .has = true, .val = kd_enum_Color_Green }"));
+    expect(eh_find(c, "kd_opt_enum_Color_orelse(kd_oc, kd_enum_Color_Blue)"));
+    var c2: []u8 = eh_emit(a, "const N = union(enum) { leaf: i64 };\npub fn main() void {\n    var xs: [1]N = [1]N{ N{ .leaf = 3 } };\n    var s: []N = xs[0..1];\n    switch (s[0]) {\n        .leaf => |v| { print(v); }\n    }\n}");
+    // A `[]Union` gets its own slice typedef over the union C type — the
+    // v0.185 band (before it, the element folded into the enum band).
+    expect(eh_find(c2, "typedef struct { kd_union_N *ptr; uintptr_t len; } kd_slice_union_N;"));
+    expect(eh_find(c2, "kd_slice_union_N_get(kd_s, 0)"));
 }

@@ -78,7 +78,14 @@
 //! TAGGED UNIONS (SPEC §20): declarations (payload types walk; unions
 //! join the named-type set), `Name{ .v = e }` construction, tag-switches
 //! with payload captures (a capture is subset-shaped everywhere — its
-//! union-ness is sema's E0272) —
+//! union-ness is sema's E0272) — and, v0.185, the WAVE-C consequences:
+//! the `ET_SLICE_UNION_BASE` code band (`[]Union` typedefs + accessors
+//! over `kd_slice_union_<N>`; before it a union element folded into the
+//! enum-slice band and crashed), the §28.4 arithmetic truncate-back
+//! (`+ - * /` and unary `-` join `~`/`<<` on the sub-`int` widths), and
+//! the COERCED `orelse` alternative + recursive `?T`/`!T` widening (a
+//! contextual `.Variant` resolves against its enum at every coercion
+//! site instead of falling back to `0`) —
 //! written
 //! in kardashev —
 //! against the Rust
@@ -305,6 +312,14 @@ const SEMA_INVALID: &[&str] = &[
     "tests/spec/s44_output_args/output_builtin_not_const_err.ks",     // E0130 (v0.181)
     "tests/spec/s33_casts/err_as_not_constant.ks",                    // E0130
     "tests/spec/s33_casts/err_as_value_not_numeric.ks",               // E0321
+    "tests/spec/s03_sema/print_bool_err.ks",                          // E0110 (v0.185: wave-C pins)
+    "tests/spec/s20_unions/err_alloc_union_elem.ks",                  // E0241 (v0.185)
+    "tests/spec/s20_unions/err_struct_field_union_type.ks",           // E0161 (v0.185)
+    "tests/spec/s20_unions/err_union_eq.ks",                          // E0110 (v0.185)
+    "tests/spec/s20_unions/err_union_print.ks",                       // E0110 (v0.185)
+    "tests/spec/s25_generic_structs/err_alloc_alias_elem.ks",         // E0241 (v0.185)
+    "tests/spec/s38_floats/switch_f64_scrutinee_err.ks",              // E0213 (v0.185)
+    "tests/spec/s38_floats/unary_neg_f64_err.ks",                     // E0110 (v0.185)
 ];
 
 /// Floor on the number of corpus files whose C is byte-compared: catches a
@@ -320,8 +335,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "selfhost/modres.ks",                                             // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 454;
-const MIN_C_COMPARED_TEST: usize = 494;
+const MIN_C_COMPARED_PROGRAM: usize = 503;
+const MIN_C_COMPARED_TEST: usize = 543;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -2135,6 +2150,23 @@ fn selfhost_emit_differential_targeted_inputs() {
         (
             "union_in_generics_and_defer",
             "const R = union(enum) {\n    ok: i64,\n    err: []u8,\n};\nfn pick(comptime T: type, x: T, y: T) T {\n    if (x > y) { return x; }\n    return y;\n}\nfn eval2(r: R) i64 {\n    defer print(999);\n    switch (r) {\n        .ok => |v| { return pick(i64, v, 10); }\n        .err => |m| { return @as(i64, m.len); }\n    }\n}\npub fn main() void {\n    print(eval2(R{ .ok = 25 }));\n    print(eval2(R{ .err = \"bad\" }));\n}\n",
+        ),
+        // -- wave-C behaviors (v0.185) ------------------------------------------------
+        (
+            "narrow_arith_trunc_back_matrix",
+            "pub fn main() void {\n    var a: u8 = 200;\n    var b: u8 = 100;\n    print(a + b);\n    print(a * b);\n    print(b - a);\n    var d: i8 = 0 - 128;\n    var e: i8 = 0 - 1;\n    print(-d);\n    print(d / e);\n    var f: u16 = 40000;\n    print(f + f);\n    var stored: u8 = a + b;\n    print(stored);\n    print(a % b);\n    print(a & b);\n}\n",
+        ),
+        (
+            "slice_of_union_view_and_writes",
+            "const N = union(enum) {\n    leaf: i64,\n    tag: bool,\n};\nfn total(s: []N) i64 {\n    var acc: i64 = 0;\n    for (s) |n| {\n        switch (n) {\n            .leaf => |v| { acc += v; }\n            .tag => |b| {\n                if (b) { acc += 1000; }\n            }\n        }\n    }\n    return acc;\n}\npub fn main() void {\n    var xs: [3]N = [3]N{ N{ .leaf = 7 }, N{ .tag = true }, N{ .leaf = 30 } };\n    var s: []N = xs[0..3];\n    print(total(s));\n    s[1] = N{ .leaf = 5 };\n    print(total(xs[0..3]));\n    print(s[2..3].len);\n}\n",
+        ),
+        (
+            "enum_lit_coerced_orelse_and_widenings",
+            "const Color = enum { Red, Green, Blue };\nfn code(c: Color) i64 {\n    switch (c) {\n        .Red => { return 0; }\n        .Green => { return 1; }\n        .Blue => { return 2; }\n    }\n}\nfn pick(ok: bool) !Color {\n    if (ok) { return .Green; }\n    return error.Nope;\n}\npub fn main() void {\n    var oc: ?Color = .Green;\n    print(code(oc orelse .Blue));\n    var none: ?Color = null;\n    print(code(none orelse .Blue));\n    print(code(pick(true) catch .Red));\n    print(code(pick(false) catch .Blue));\n}\n",
+        ),
+        (
+            "reflection_union_and_alias_args",
+            "const Shape = union(enum) {\n    n: i64,\n};\nfn Box(comptime T: type) type {\n    return struct { v: T };\n}\nconst IntBox = Box(i32);\npub fn main() void {\n    print(@typeName(Shape));\n    print(@sizeOf(IntBox));\n    print(@typeName(IntBox));\n    print(@sizeOf(Shape));\n}\n",
         ),
         // -- SKIP verdict positions on tricky shapes ---------------------------
         (
