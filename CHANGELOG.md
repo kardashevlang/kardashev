@@ -18,6 +18,55 @@ in `Cargo.toml` and `crates/kardc/src/lib.rs` (`VERSION`, reported by
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.186.0] — Self-hosting stage 27: the sema mirror OPENS
+
+The remaining-work list's headline item begins: `selfhost/sema.ks` is a
+semantic checker written in kardashev, differentially compared — against
+the REAL `sema::check`, not a hand-built reference — over the whole repo
+corpus. Stage 27 covers the SCALAR CORE of SINGLE-FILE modules (the
+v0.111 procedural language at every integer width: fn/const/test items,
+bare scalar types, let/assign/if/while/defer/blocks/return, the full
+operator ladder, free calls, `print`/`expect`, `comptime`), reporting
+the FIRST diagnostic — code AND byte position — or OK.
+
+- `selfhost/sema.ks` (1,215 lines): the stage-27 subset detector
+  (`ss_detect`, a fixed depth-first walk mirrored word-for-word by the
+  Rust twin) and the checker (`ss_verdict`), which replays sema's pass
+  order — builtin redefinition (E0101) → const folding (the
+  `const_eval` mirror: E0130/E0131/E0132, plus the `const X = f();`
+  E0311 arm and the annotation-kind check) → bodies (scope stack,
+  E0100/E0110/E0120/E0140, the §3 type rules at sema's exact span
+  choices: operand errors at the operand, same-type mismatches at the
+  operator node, immutable-assignment at the statement, initializer /
+  return mismatches at the value). Integer-literal polymorphism
+  reproduces `check_int_operands`' anchoring ORDER (a flexible lhs
+  anchors on the concrete rhs, which is then checked FIRST — pinned by
+  a targeted case where the rhs's E0100 must precede). Because only the
+  first diagnostic is reported, the mirror SHORT-CIRCUITS — the Rust
+  recovery paths never need replaying.
+- `selfhost/semadump.ks`: the fourth dump driver — `ERROR <code> <pos>`
+  / `SKIP <word> <pos>` / `OK` / `DIAG <code> <pos>`, one line per
+  input, resolver behaviour identical to cdump (std path in argv[2]).
+- `selfhost/modres.ks`: the flattener now records the FIRST erased
+  `@import` item's position (`MrOut.first_import`, append order) — the
+  single-file gate's SKIP position, so both sides agree byte-for-byte
+  on every multi-file module without replaying the flatten.
+- Differential (`selfhost_sema.rs`): **78 OK-agreed + 35 DIAG-agreed**
+  (622 SKIP-agreed, 36 ERROR-agreed) across the 771-file corpus, floors
+  73/30; 33 targeted cases (pass ordering, span choices, the anchoring
+  order, const-eval corners, scope death, SKIP positions) — all
+  byte-identical on the first full run. In-language suite:
+  `tests/selfhost/sema_suite.ks`, 11 blocks pinning verdict words,
+  positions and diagnostic codes by hand.
+- The new mirrors join the EMIT corpus too: the selfhost emitter
+  compiles sema.ks/semadump.ks/sema_suite.ks byte-identically —
+  C-compared 508/548 → **512/554** (Program/Test), floors 507/549.
+
+Remaining for the sema arc (deferrals, not stubs): the composite types
+(aggregates, optionals, error unions), multi-file/flattened modules,
+f64, generics/switch/for/captures/labels — stage by stage, exactly as
+the emitter grew.
+
 ## [0.185.0] — Conformance suite C: 62 new pins, 4 bugs found & fixed
 
 Arc-5 conformance wave C: the corpus grows **641 → 703 programs** — a

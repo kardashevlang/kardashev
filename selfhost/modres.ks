@@ -60,6 +60,9 @@ pub const MrOut = struct {
     src: []u8,
     nodes: []Node,
     root: i32,
+    // The first erased `@import` item's position (append order), -1 when
+    // the module was single-file (v0.186 — see `Mr.first_import`).
+    first_import: i64,
 };
 
 /// A registered file: its normalized path (a span into `pbuf`) and its
@@ -94,6 +97,12 @@ pub const Mr = struct {
     // import keeps the pre-v0.182 `SKIP import` verdict.
     std_off: usize,
     std_len: usize,
+    // The FIRST erased `@import` item's concatenated position in flat
+    // append order, or -1 when the flattened module had none (v0.186):
+    // the stage-27 sema differential is single-file, so its drivers
+    // report `SKIP import <pos>` for any multi-file module — this is
+    // that position, recorded as pass 2 skips the item.
+    first_import: i64,
 
     fn init(a: Allocator) Self {
         return Mr{
@@ -112,6 +121,7 @@ pub const Mr = struct {
             .pos = 0,
             .std_off = 0,
             .std_len = 0,
+            .first_import = 0 - 1,
         };
     }
 
@@ -446,12 +456,19 @@ fn mr_resolve_file(mr: *Mr, a: Allocator, norm: []u8, import_pos: usize, is_root
         return;
     }
 
-    // Pass 2 — this file's own non-import items, in order.
+    // Pass 2 — this file's own non-import items, in order. The first
+    // ERASED import's position is recorded for the single-file sema
+    // differential (v0.186) — append order, exactly the order the Rust
+    // twin walks the flattened files.
     cur = items;
     while (cur >= 0) {
         var u2: usize = @as(usize, cur);
         if (mr.nodes[u2].kind != ND_IMPORT) {
             mr.put_flat(a, cur);
+        } else {
+            if (mr.first_import < 0) {
+                mr.first_import = @as(i64, mr.nodes[u2].off);
+            }
         }
         cur = mr.nodes[u2].next;
     }
@@ -525,5 +542,6 @@ pub fn mr_resolve(a: Allocator, root_path: []u8, std_path: []u8) MrOut {
         .src = mr.src[0 .. mr.src_len],
         .nodes = mr.nodes,
         .root = head,
+        .first_import = mr.first_import,
     };
 }

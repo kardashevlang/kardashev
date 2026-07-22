@@ -335,8 +335,8 @@ const SEMA_INVALID_TEST_ONLY: &[&str] = &[
     "selfhost/modres.ks",                                             // E0100
 ];
 
-const MIN_C_COMPARED_PROGRAM: usize = 503;
-const MIN_C_COMPARED_TEST: usize = 543;
+const MIN_C_COMPARED_PROGRAM: usize = 507;
+const MIN_C_COMPARED_TEST: usize = 549;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
